@@ -128,30 +128,6 @@ async fn main() -> Result<()> {
         label: "ls .",
         input: json!({"path": "."}),
     });
-    // Exercises the compass_query-first enforcement through the real binary:
-    // with compass_query registered (default full toolset) and
-    // prefer_compass_query on (default), an agentgrep call must be redirected,
-    // and the explicit raw fallback must run grep.
-    cases.push(ToolCase {
-        name: "agentgrep",
-        label: "agentgrep (expect redirect to compass_query)",
-        input: json!({"query": "fn main"}),
-    });
-    cases.push(ToolCase {
-        name: "agentgrep",
-        label: "agentgrep with allow_raw_fallback (expect real grep)",
-        input: json!({"query": "alpha", "allow_raw_fallback": true}),
-    });
-    cases.push(ToolCase {
-        name: "batch",
-        label: "batch ls + agentgrep (agentgrep subcall redirected)",
-        input: json!({
-            "tool_calls": [
-                {"tool": "ls", "parameters": {"path": "."}},
-                {"tool": "agentgrep", "parameters": {"query": "fn main"}}
-            ]
-        }),
-    });
     cases.push(ToolCase {
         name: "bash",
         label: "bash pwd",

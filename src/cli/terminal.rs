@@ -1,41 +1,8 @@
 use anyhow::Result;
 use std::io::{self, IsTerminal, Write};
 use std::panic;
-use std::sync::RwLock;
 
 use crate::{id, session, telemetry, tui};
-use jcode_tui::tui::terminal_writer::AppTerminal;
-
-/// A function usable as (part of) a Rust panic hook.
-type PanicHook = dyn Fn(&panic::PanicHookInfo<'_>) + Sync + Send;
-
-/// The original Rust default panic hook, captured the first time jcode installs
-/// its own hook (see [`install_panic_hook`]).
-///
-/// An `RwLock` rather than a `OnceLock` so that unit tests can install test
-/// doubles: `OnceLock::set` silently ignores the second write, which makes
-/// sibling tests that each install their own default hook order-dependent.
-/// In production the write happens once at startup, and the panic-path read is
-/// a cheap read lock that never contends a write (no write occurs during a
-/// panic).
-static DEFAULT_HOOK: RwLock<Option<Box<PanicHook>>> = RwLock::new(None);
-
-/// True once the TUI has entered raw mode and the alternate screen, i.e. after
-/// `ratatui::init()` (or the resume path) has run. The panic hook only restores
-/// the terminal from inside a live TUI; outside one there is nothing to restore
-/// and `try_restore()` would just emit escape sequences onto stdout.
-static TUI_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-fn tui_is_active() -> bool {
-    TUI_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
-}
-
-/// Serializes the tests that read or write the process-global panic-hook / TUI
-/// state (`DEFAULT_HOOK`, `TUI_ACTIVE`, the current session). Those globals are
-/// shared across the test binaries, so without this lock sibling tests running
-/// on parallel threads race each other and flake.
-#[cfg(test)]
-static GLOBAL_HOOK_TEST_LOCK: RwLock<()> = RwLock::new(());
 
 pub struct TuiRuntimeState {
     mouse_capture: bool,
@@ -216,45 +183,8 @@ fn should_record_panic_as_crash(status: &session::SessionStatus) -> bool {
 
 pub fn install_panic_hook() {
     let default_hook = panic::take_hook();
-    set_default_hook(default_hook);
-    reinstall_panic_hook();
-}
-
-/// The original Rust default panic hook, captured the first time we install our
-/// hook. We keep it so that after `ratatui::init()` wraps the hook, we can
-/// rebuild a healthy chain that still prints a backtrace without ratatui's
-/// panicking `restore()`.
-fn set_default_hook(hook: Box<PanicHook>) {
-    *DEFAULT_HOOK.write().expect("DEFAULT_HOOK lock poisoned") = Some(hook);
-}
-
-/// Install jcode's panic hook chain: restore the terminal safely (non-panicking),
-/// then print the standard backtrace, then mark the current session crashed.
-/// Used at startup and re-run after `ratatui::init()`.
-fn reinstall_panic_hook() {
     panic::set_hook(Box::new(move |info| {
-        // Restore the terminal safely before doing anything that could itself
-        // panic again. std's default hook (below) prints through `eprintln!`,
-        // which aborts on a dead stderr; restoring first guarantees the terminal
-        // is left in a good state even if the backtrace print aborts. Doing it
-        // only from inside a live TUI (gated on `tui_is_active()`) keeps the
-        // restore off the non-TUI/CLI panic path, where it would just emit escape
-        // sequences onto stdout. Covering this here (rather than relying only on
-        // `TuiRuntimeGuard::Drop`) also protects the window before the guard is
-        // constructed during `init_tui_runtime`.
-        if tui_is_active() {
-            jcode_tui_style::restore_terminal_quietly();
-            TUI_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
-        }
-
-        // Printing the backtrace last also means it lands on the cooked screen
-        // (after leaving the alternate screen) instead of being torn down with
-        // the alternate buffer.
-        if let Ok(guard) = DEFAULT_HOOK.read()
-            && let Some(default_hook) = guard.as_deref()
-        {
-            default_hook(info);
-        }
+        default_hook(info);
 
         if let Some(session_id) = get_current_session() {
             print_session_resume_hint(&session_id);
@@ -271,23 +201,6 @@ fn reinstall_panic_hook() {
             }
         }
     }));
-}
-
-/// Make jcode's panic hook the outermost hook, again.
-///
-/// `ratatui::init()` installs its own panic hook that runs `ratatui::restore()`
-/// before chaining to the previous hook. `restore()` reports failures with
-/// `eprintln!`, which panics on a dead terminal (dropped SSH, closed window) —
-/// the exact scenario a panic hook is most likely to run in. That second panic
-/// aborts the process (SIGABRT) and, worse, can clobber a live session's
-/// snapshot (see #599).
-///
-/// Calling this after `ratatui::init()` (in `init_tui_runtime`) replaces the
-/// wrapped hook with our own chain that prints the backtrace and restores the
-/// terminal via the safe, non-panicking `restore_terminal_quietly`. The
-/// panicking `ratatui::restore()` therefore never runs.
-pub fn reinstall_panic_hook_outermost() {
-    reinstall_panic_hook();
 }
 
 pub fn mark_current_session_crashed(message: String) {
@@ -330,12 +243,9 @@ pub fn show_crash_resume_hint() {
     };
 
     for line in crash_resume_hint_lines(&crashed, yellow, bold, reset) {
-        crate::cli::output::tolerant_write_line(
-            &mut std::io::stderr(),
-            &crate::output_style::terminal_text(&line),
-        );
+        eprintln!("{}", crate::output_style::terminal_text(&line));
     }
-    crate::cli::output::tolerant_write(&mut std::io::stderr(), "\n");
+    eprintln!();
 }
 
 /// Build the crash-resume hint lines for `crashed`, newest first.
@@ -429,56 +339,23 @@ mod crash_resume_hint_tests {
     }
 }
 
-fn init_tui_terminal(inherited_terminal: bool) -> Result<AppTerminal> {
+fn init_tui_terminal(inherited_terminal: bool) -> Result<ratatui::DefaultTerminal> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         anyhow::bail!("jcode TUI requires an interactive terminal (stdin/stdout must be a TTY)");
     }
     if inherited_terminal {
         init_tui_terminal_resume()
     } else {
-        init_tui_terminal_fresh()
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(ratatui::init)).map_err(|payload| {
+            anyhow::anyhow!(
+                "failed to initialize terminal: {}",
+                panic_payload_to_string(payload.as_ref())
+            )
+        })
     }
 }
 
-/// Build an [`AppTerminal`] whose backend writes through a [`TerminalWriter`]
-/// so the render loop never blocks on a wedged pty.
-///
-/// On unix the writer thread runs over a `dup` of fd 1 (a raw `File`, no
-/// process-wide `Stdout` lock), so a wedged pty write never blocks other
-/// `io::stdout()` callers on the render loop.
-fn build_app_terminal() -> Result<AppTerminal> {
-    #[cfg(unix)]
-    let writer = jcode_tui::tui::terminal_writer::TerminalWriter::stdout()
-        .map_err(|e| anyhow::anyhow!("failed to set up terminal writer: {e}"))?;
-    #[cfg(not(unix))]
-    let writer = jcode_tui::tui::terminal_writer::TerminalWriter::new(io::stdout());
-    let backend = ratatui::backend::CrosstermBackend::new(writer);
-    ratatui::Terminal::new(backend).map_err(|e| anyhow::anyhow!("failed to create terminal: {e}"))
-}
-
-/// Fresh (non-resume) init: equivalent to `ratatui::init()` but routes output
-/// through the non-blocking [`TerminalWriter`].
-fn init_tui_terminal_fresh() -> Result<AppTerminal> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crossterm::terminal::enable_raw_mode()
-            .map_err(|e| anyhow::anyhow!("failed to enable raw mode: {}", e))?;
-        crossterm::execute!(
-            io::stdout(),
-            crossterm::terminal::EnterAlternateScreen,
-            crossterm::cursor::Hide
-        )
-        .map_err(|e| anyhow::anyhow!("failed to enter alternate screen: {}", e))?;
-        build_app_terminal()
-    }))
-    .map_err(|payload| {
-        anyhow::anyhow!(
-            "failed to initialize terminal: {}",
-            panic_payload_to_string(payload.as_ref())
-        )
-    })?
-}
-
-pub fn init_tui_runtime() -> Result<(AppTerminal, TuiRuntimeGuard)> {
+pub fn init_tui_runtime() -> Result<(ratatui::DefaultTerminal, TuiRuntimeGuard)> {
     let is_resuming = std::env::var_os("JCODE_RESUMING").is_some();
     let inherited_theme = std::env::var(INHERITED_THEME_ENV).ok();
     let inherited_modes_raw = std::env::var(INHERITED_MODES_ENV).ok();
@@ -500,15 +377,6 @@ pub fn init_tui_runtime() -> Result<(AppTerminal, TuiRuntimeGuard)> {
         crate::tui::theme_detect::init_theme_mode();
     }
     let terminal = init_tui_terminal(inherited_terminal)?;
-    // From here the terminal is in raw mode + alternate screen, so the panic
-    // hook's restore (below) should run if we unwind.
-    TUI_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
-    // `ratatui::init()` installed a panic hook that calls the panicking
-    // `restore()`. Put our own hook back as the outermost so any restore runs
-    // through the safe, non-panicking `restore_terminal_quietly` path instead
-    // of `eprintln!`-ing on a dead terminal and double-panic aborting (see
-    // #599).
-    reinstall_panic_hook_outermost();
     crate::tui::mermaid::install_jcode_mermaid_hooks();
     crate::tui::markdown::install_jcode_markdown_hooks();
     crate::tui::mermaid::init_picker();
@@ -629,11 +497,6 @@ fn cleanup_tui_runtime(state: &TuiRuntimeState, restore_terminal: bool) {
             tui::disable_keyboard_enhancement();
         }
         jcode_tui_style::restore_terminal_quietly();
-        // The terminal is back to a fully cooked state, so a later panic (e.g. in
-        // CLI code after the TUI exited, or before a re-entered TUI is re-
-        // initialized) must not try to restore it again. Re-entry sets this back
-        // to true when ratatui::init() runs again.
-        TUI_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -688,11 +551,14 @@ fn write_session_resume_hint(mut writer: impl Write, session_id: &str) -> io::Re
     Ok(())
 }
 
-fn init_tui_terminal_resume() -> Result<AppTerminal> {
+fn init_tui_terminal_resume() -> Result<ratatui::DefaultTerminal> {
+    use ratatui::{Terminal, backend::CrosstermBackend};
+
     crossterm::terminal::enable_raw_mode()
         .map_err(|e| anyhow::anyhow!("failed to enable raw mode on resume: {}", e))?;
 
-    let mut terminal = build_app_terminal()
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend)
         .map_err(|e| anyhow::anyhow!("failed to create terminal on resume: {}", e))?;
 
     terminal
@@ -909,54 +775,6 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_clears_tui_active_after_full_restore() {
-        let _lock = GLOBAL_HOOK_TEST_LOCK.write().unwrap();
-        // The panic-hook restore only runs while `TUI_ACTIVE` is set, so a full
-        // teardown must clear it; otherwise a later panic in CLI code would try
-        // to restore a no-longer-live terminal and emit escape sequences.
-        let saved = TUI_ACTIVE.load(std::sync::atomic::Ordering::SeqCst);
-        TUI_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
-        let state = TuiRuntimeState {
-            mouse_capture: false,
-            keyboard_enhanced: false,
-            focus_change: false,
-        };
-        cleanup_tui_runtime(&state, true);
-        assert!(
-            !tui_is_active(),
-            "a full terminal restore must clear TUI_ACTIVE"
-        );
-        TUI_ACTIVE.store(saved, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    #[test]
-    fn cleanup_keeps_tui_active_on_exec_handoff() {
-        let _lock = GLOBAL_HOOK_TEST_LOCK.write().unwrap();
-        // When the terminal is handed off across exec (reload/rebuild/update),
-        // the restore does not run and `TUI_ACTIVE` must stay set so the next
-        // process's early panics still attempt a safe restore.
-        TUI_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
-        let state = TuiRuntimeState {
-            mouse_capture: false,
-            keyboard_enhanced: false,
-            focus_change: false,
-        };
-        cleanup_tui_runtime_for_run_result(
-            &state,
-            &crate::tui::RunResult {
-                reload_session: Some("session_test".into()),
-                ..Default::default()
-            },
-            false,
-        );
-        assert!(
-            tui_is_active(),
-            "an exec handoff must keep TUI_ACTIVE set for the next process"
-        );
-        TUI_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    #[test]
     fn test_session_recovery_tracking() {
         let _guard = TEST_SESSION_LOCK.lock().unwrap();
         set_current_session("test_session_123");
@@ -1048,61 +866,5 @@ mod panic_crash_labeling_tests {
                 "non-active status {status:?} must not be relabeled as crashed"
             );
         }
-    }
-
-    #[test]
-    fn reinstall_panic_hook_outermost_keeps_default_backtrace_chain() {
-        // Serialize against sibling tests that touch the shared DEFAULT_HOOK /
-        // TUI_ACTIVE globals.
-        let _lock = GLOBAL_HOOK_TEST_LOCK.write().unwrap();
-        // Simulate ratatui::init() wrapping our hook: install our hook first,
-        // then call reinstall_panic_hook_outermost() the way init_tui_runtime
-        // does after ratatui::init(). A panicking closure must unwind normally
-        // (no double-panic abort) and the captured default hook must run.
-        //
-        // Force `TUI_ACTIVE` to a known state so this test is independent of
-        // ordering with sibling tests, and verify the hook does not touch it
-        // when there is no live TUI (so no escape sequences reach the console).
-        let saved = TUI_ACTIVE.load(std::sync::atomic::Ordering::SeqCst);
-        TUI_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
-        let default_hook_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = default_hook_called.clone();
-        let synthetic_default = Box::new(move |_info: &panic::PanicHookInfo<'_>| {
-            flag.store(true, std::sync::atomic::Ordering::SeqCst);
-        });
-        set_default_hook(synthetic_default);
-        reinstall_panic_hook_outermost();
-
-        let result = std::panic::catch_unwind(|| panic!("test panic"));
-        assert!(result.is_err(), "the panic must still propagate normally");
-        assert!(
-            default_hook_called.load(std::sync::atomic::Ordering::SeqCst),
-            "the captured default hook must run so backtraces still print"
-        );
-        // With no live TUI the hook must not have flipped the terminal-active
-        // flag (it would only do so after restoring an actual TUI).
-        assert!(
-            !tui_is_active(),
-            "a non-TUI panic must not flip the TUI-active flag on"
-        );
-
-        TUI_ACTIVE.store(saved, std::sync::atomic::Ordering::SeqCst);
-        // Restore a sane default hook so later tests keep their own backtrace.
-        std::panic::set_hook(Box::new(|_| {}));
-    }
-
-    #[test]
-    fn tui_active_flag_toggles_with_restore() {
-        // The flag should not be toggled concurrently by sibling tests, which
-        // would race on this shared global.
-        let _lock = GLOBAL_HOOK_TEST_LOCK.write().unwrap();
-        // The flag starts false, is set true on TUI init, and is cleared when
-        // the terminal is restored. On restore it ends false again.
-        let save = TUI_ACTIVE.load(std::sync::atomic::Ordering::SeqCst);
-        TUI_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
-        assert!(tui_is_active());
-        TUI_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
-        assert!(!tui_is_active());
-        TUI_ACTIVE.store(save, std::sync::atomic::Ordering::SeqCst);
     }
 }

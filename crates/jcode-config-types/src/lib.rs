@@ -894,37 +894,13 @@ impl Default for HooksConfig {
 }
 
 /// Automatic end-of-turn code review configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AutoReviewConfig {
-    /// Enable autoreview by default for new/resumed sessions (default: true)
+    /// Enable autoreview by default for new/resumed sessions (default: false)
     pub enabled: bool,
     /// Optional model override for autoreview reviewer sessions.
     pub model: Option<String>,
-    /// When true, autoreview runs as a post-completion review loop: after the
-    /// completion gates pass, an independent per-lens reviewer inspects the
-    /// batch diff, findings are fixed, and the loop re-reviews until clean or a
-    /// stall cap is hit. Enabled by default; when false, autoreview stays
-    /// one-shot per turn (no loop).
-    pub loop_mode: bool,
-    /// Churn cap for the review loop: max consecutive rounds that report no new
-    /// findings but do not converge before force-stop. Default 3. `0` means
-    /// unlimited (rely on convergence + the finding-fingerprint guard).
-    pub max_stalled_turns: u32,
-}
-
-impl Default for AutoReviewConfig {
-    fn default() -> Self {
-        Self {
-            // Enabled by default: end-of-turn review runs as part of the flow.
-            enabled: true,
-            model: None,
-            // Loop mode on by default: review rounds are part of the flow.
-            loop_mode: true,
-            // Mirror the proposal's documented default churn cap.
-            max_stalled_turns: 3,
-        }
-    }
 }
 
 /// Integration discovery configuration (legacy `[sponsors]` section name).
@@ -1424,24 +1400,6 @@ pub struct SafetyConfig {
     pub telegram_chat_id: Option<String>,
     /// Enable Telegram reply → agent directive feature (default: false)
     pub telegram_reply_enabled: bool,
-    /// Telegram Bot API base URL with a trailing `/bot`, e.g. a reverse proxy
-    /// mirror or an alternate data-center IP. Defaults to the official
-    /// `https://api.telegram.org/bot`. Env override: `JCODE_TELEGRAM_API_BASE`.
-    pub telegram_api_base: Option<String>,
-    /// Optional proxy for Telegram Bot API traffic (e.g. `socks5://127.0.0.1:1080`
-    /// or `http://user:pass@host:3128`). Env override: `JCODE_TELEGRAM_PROXY`.
-    pub telegram_proxy: Option<String>,
-    /// Optional alternate Telegram data-center IP to connect to instead of the
-    /// DNS-resolved one (e.g. `149.154.167.220`). Pins the `api.telegram.org`
-    /// hostname to this IP while keeping its real name for TLS/SNI, so no
-    /// proxy is needed even when the default DC IP is blocked. Env override:
-    /// `JCODE_TELEGRAM_API_IP`.
-    pub telegram_api_ip: Option<String>,
-    /// Optional Telegram user ID whitelist (numeric). When set, only a message
-    /// whose sender id matches is acted upon (permission replies, commands, and
-    /// ambient prompts). Keeps a publicly-known bot from being driven by anyone.
-    /// Env override: `JCODE_TELEGRAM_ALLOWED_USER_ID`.
-    pub telegram_allowed_user_id: Option<String>,
     /// Enable Discord notifications (default: false)
     pub discord_enabled: bool,
     /// Discord bot token
@@ -1491,10 +1449,6 @@ impl Default for SafetyConfig {
             telegram_bot_token: None,
             telegram_chat_id: None,
             telegram_reply_enabled: false,
-            telegram_api_base: None,
-            telegram_proxy: None,
-            telegram_api_ip: None,
-            telegram_allowed_user_id: None,
             discord_enabled: false,
             discord_bot_token: None,
             discord_channel_id: None,

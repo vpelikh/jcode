@@ -6,7 +6,7 @@ pub use jcode_tui_core::keybind::{
     WorkspaceNavigationDirection, WorkspaceNavigationKeys,
 };
 use jcode_tui_core::keybind::{
-    alt_label, format_binding, is_disabled, macos_option_char_to_ascii_key, parse_bindings_or_default,
+    format_binding, is_disabled, macos_option_char_to_ascii_key, parse_bindings_or_default,
     parse_keybinding, parse_optional, parse_or_default,
 };
 
@@ -653,7 +653,7 @@ mod tests {
         assert!(binding.matches(KeyCode::Enter, KeyModifiers::ALT));
         assert!(!binding.matches(KeyCode::Enter, KeyModifiers::empty()));
         assert!(!binding.matches(KeyCode::Enter, KeyModifiers::SHIFT));
-        assert_eq!(format_binding(&binding), format!("{}+Enter", alt_label()));
+        assert_eq!(format_binding(&binding), "Alt+Enter");
     }
 
     #[test]

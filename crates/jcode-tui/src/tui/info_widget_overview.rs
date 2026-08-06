@@ -1,6 +1,6 @@
-use super::info_widget::todos_compact_line_count;
-use super::info_widget::todos_widget_line_count;
 use super::info_widget::{AuthMethod, InfoWidgetData, UsageProvider, is_traceworthy_memory_event};
+
+pub(crate) const MAX_TODO_LINES: usize = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InfoPageKind {
@@ -23,10 +23,10 @@ pub(crate) struct PageLayout {
 
 pub(crate) fn compute_page_layout(
     data: &InfoWidgetData,
-    inner_width: usize,
+    _inner_width: usize,
     inner_height: u16,
 ) -> PageLayout {
-    let compact_height = compact_overview_height(data, inner_width);
+    let compact_height = compact_overview_height(data);
     if compact_height == 0 {
         return PageLayout {
             pages: Vec::new(),
@@ -36,9 +36,9 @@ pub(crate) fn compute_page_layout(
     }
 
     let mut candidates: Vec<InfoPage> = Vec::new();
-    let todos_compact = compact_todos_height(data, inner_width);
+    let todos_compact = compact_todos_height(data);
 
-    let todos_expanded = expanded_todos_height(data, inner_width);
+    let todos_expanded = expanded_todos_height(data);
     if todos_expanded > 0 {
         candidates.push(InfoPage {
             kind: InfoPageKind::TodosExpanded,
@@ -112,13 +112,8 @@ fn compact_context_height(data: &InfoWidgetData) -> u16 {
     0
 }
 
-fn compact_todos_height(data: &InfoWidgetData, inner_width: usize) -> u16 {
-    if data.todos.is_empty() {
-        0
-    } else {
-        // label row + wrapped summary rows, matching render_todos_compact.
-        u16::try_from(todos_compact_line_count(data, inner_width as u16)).unwrap_or(u16::MAX)
-    }
+fn compact_todos_height(data: &InfoWidgetData) -> u16 {
+    if data.todos.is_empty() { 0 } else { 2 }
 }
 
 fn compact_memory_height(data: &InfoWidgetData) -> u16 {
@@ -203,10 +198,10 @@ fn compact_git_height(data: &InfoWidgetData) -> u16 {
     0
 }
 
-fn compact_overview_height(data: &InfoWidgetData, inner_width: usize) -> u16 {
+fn compact_overview_height(data: &InfoWidgetData) -> u16 {
     compact_model_height(data)
         + compact_context_height(data)
-        + compact_todos_height(data, inner_width)
+        + compact_todos_height(data)
         + compact_memory_height(data)
         + compact_background_height(data)
         + compact_usage_height(data)
@@ -214,11 +209,18 @@ fn compact_overview_height(data: &InfoWidgetData, inner_width: usize) -> u16 {
         + compact_git_height(data)
 }
 
-fn expanded_todos_height(data: &InfoWidgetData, inner_width: usize) -> u16 {
+fn expanded_todos_height(data: &InfoWidgetData) -> u16 {
     if data.todos.is_empty() {
         return 0;
     }
-    u16::try_from(todos_widget_line_count(data, inner_width as u16)).unwrap_or(u16::MAX)
+
+    let available_lines = MAX_TODO_LINES.saturating_sub(1);
+    let todo_lines = data.todos.len().min(available_lines);
+    let mut height = 1 + u16::try_from(todo_lines).unwrap_or(u16::MAX);
+    if data.todos.len() > available_lines {
+        height += 1;
+    }
+    height
 }
 
 fn expanded_memory_height(data: &InfoWidgetData) -> u16 {
@@ -305,70 +307,6 @@ mod tests {
                 .pages
                 .iter()
                 .any(|page| page.kind == InfoPageKind::MemoryExpanded)
-        );
-    }
-
-    fn mk_todo(i: usize) -> TodoItem {
-        TodoItem {
-            content: format!("task {i}"),
-            status: "pending".to_string(),
-            priority: "medium".to_string(),
-            id: format!("t{i}"),
-            group: None,
-            blocked_by: Vec::new(),
-            assigned_to: None,
-            confidence: None,
-            completion_confidence: None,
-            confidence_history: Vec::new(),
-        }
-    }
-
-    /// `expanded_todos_height` is now render-based (unbounded): a tall todo list
-    /// must still produce a TodosExpanded page when the overview height allows,
-    /// and must degrade to CompactOnly (not an oversized page) when it would
-    /// exceed the overview height. This pins the interaction introduced by the
-    /// render-based height.
-    #[test]
-    fn compute_page_layout_scales_todos_page_with_rendered_height() {
-        // 7 todos -> a TodosExpanded page that fits in a 30-row overview.
-        let data = InfoWidgetData {
-            todos: (0..7).map(mk_todo).collect(),
-            ..Default::default()
-        };
-        let tall = compute_page_layout(&data, 40, 30);
-        assert!(
-            tall
-                .pages
-                .iter()
-                .any(|p| p.kind == InfoPageKind::TodosExpanded),
-            "moderate todo list should offer an expanded page: {:?}",
-            tall.pages
-        );
-        let expanded = tall
-            .pages
-            .iter()
-            .find(|p| p.kind == InfoPageKind::TodosExpanded)
-            .unwrap();
-        // header + 7 wrapped rows (rendered height, border-exclusive here).
-        assert!(expanded.height >= 1 + 7, "height {0}", expanded.height);
-
-        // A huge list that cannot fit the overview height must degrade to the
-        // compact summary page, not produce an oversized/truncated page.
-        let big = InfoWidgetData {
-            todos: (0..200).map(mk_todo).collect(),
-            ..Default::default()
-        };
-        let cramped = compute_page_layout(&big, 40, 8);
-        assert!(
-            !cramped.pages.iter().any(|p| p.kind == InfoPageKind::TodosExpanded),
-            "oversized todo list must not offer an expanded page that can't fit"
-        );
-        assert!(
-            cramped
-                .pages
-                .iter()
-                .any(|p| p.kind == InfoPageKind::CompactOnly),
-            "oversized list falls back to compact"
         );
     }
 }

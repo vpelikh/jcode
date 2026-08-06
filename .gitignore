@@ -11,8 +11,6 @@ ios_simulator_screenshot.png
 /telemetry-worker/backups/
 target-ttest/
 target-ttest*/
-target-worktree/
-target-worktree*/
 
 # Local capture artefacts are not committed baselines.
 captures/
@@ -23,6 +21,3 @@ captures/
 /*.avif
 /*.mp4
 /*.png
-
-# JetBrains IDE workspace files
-/.idea/

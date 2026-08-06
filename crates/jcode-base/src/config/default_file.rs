@@ -194,18 +194,15 @@ prompt_entry_animation = true
 # results directly in the chat.
 # show_agentgrep_output = false
 
-# Render the full, untrimmed bash command output beneath the tool summary
-# (default: true). When false, no bash output is shown at all. This flag is
-# the sole owner of bash command output.
-# show_bash_output = true
+# Show up to the last three non-empty lines of bash output beneath the tool
+# summary (default: false).
+# show_bash_output = false
 
-# Show the technical detail on tool rows (default: true). When on, bash tool
-# rows render a verbose block with the full executed command (wrapped), the
-# working directory (when known), the execution time, and the exit code; other
-# tool rows show their technical detail (command, file path, args) next to the
-# intent. When off, rows with an intent show just the intent; rows without an
-# intent still show the technical detail.
-# tool_call_details = true
+# Show the dimmed technical detail (command, file path, args) next to the
+# model-provided intent on tool rows (default: false). When false, tool rows
+# with an intent show just the intent; rows without an intent still show the
+# technical detail.
+# tool_call_details = false
 
 # Occasionally surface a "learn this keybinding" nudge (in a distinct color)
 # when you keep doing something the slow way (e.g. /resume) instead of using
@@ -338,31 +335,6 @@ disable_base_tools = false
 # Env overrides: JCODE_MCP_TOOLS, JCODE_MCP_TOOLS_TOKEN_THRESHOLD.
 mcp_tools = "auto"
 mcp_tools_token_threshold = 8000
-# Avoid re-sending a file range to the model when it was already read earlier
-# in this session, the file has not changed since, and the earlier result is
-# still in the active (un-compacted) context. When all hold, `read` returns a
-# compact pointer to the earlier result instead of the full text. Because it
-# changes the tool result from content to a pointer, this only ever fires for
-# unchanged re-reads (the file mtime must predate the prior read), so fresh
-# content is always returned when the file changed. Set to false to disable.
-read_dedup = true
-# When on (default), a full-text `agentgrep` grep search is redirected to
-# `compass_query` at the tool level instead of running grep, as long as
-# `compass_query` is available (registered, not disabled by the session tool
-# policy) and the session has a working directory to search. Filename and
-# file-inspection modes (find/outline/trace) are left to run normally because
-# compass does not replace them. This makes the "try semantic search first"
-# guidance enforceable rather than advisory. The model can still force raw grep
-# for a single call by passing allow_raw_fallback:true to agentgrep.
-# prefer_compass_query = true
-# When on (default), a background Compass knowledge-graph build is kicked off
-# when a session binds to a working directory whose index is missing, so the
-# agent's first `compass_query` finds a warm index instead of blocking the turn
-# on a (potentially multi-minute) cold build. The build runs off the query path
-# on a background thread under the per-project build lock, deduplicated per
-# commit, and a failed build backs off for ~5 minutes before retrying. Skipped
-# when the session cannot use compass_query. Set to false to disable.
-# prewarm_compass_index = true
 
 [acp]
 # Agent Client Protocol adapter compatibility profile: standard, extended, or full.
@@ -698,19 +670,6 @@ desktop_notifications = true
 # telegram_bot_token = ""  # From @BotFather (prefer JCODE_TELEGRAM_BOT_TOKEN env var)
 # telegram_chat_id = ""    # Your user/chat ID
 # telegram_reply_enabled = false  # Reply to bot messages to send directives
-# telegram_api_base = ""  # Optional Bot API override (default https://api.telegram.org/bot);
-#                         # e.g. a reverse-proxy mirror or alternate data-center IP.
-#                         # Env override: JCODE_TELEGRAM_API_BASE
-# telegram_proxy = ""     # Optional proxy for Telegram traffic, e.g. socks5://127.0.0.1:1080
-#                         # or http://user:pass@host:3128. Env override: JCODE_TELEGRAM_PROXY
-# telegram_api_ip = ""    # Optional LAST-RESORT override: pin api.telegram.org to a specific
-#                         # DC IP (e.g. 149.154.167.220) keeping its name for TLS. Usually leave
-#                         # empty: when the default endpoint is blocked, jcode auto-discovers a
-#                         # reachable DC from a built-in candidate list. Set this only if that
-#                         # list is stale or you have a known-good IP. Env: JCODE_TELEGRAM_API_IP
-# telegram_allowed_user_id = ""  # Optional numeric user-ID whitelist for the bot.
-#                                # When set, only that Telegram user can drive/command it.
-#                                # Env override: JCODE_TELEGRAM_ALLOWED_USER_ID
 
 # Discord notifications via Bot API (https://discord.com/developers)
 # discord_enabled = false

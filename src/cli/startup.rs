@@ -374,10 +374,7 @@ fn spawn_background_update_check(args: &Args) {
                             .args(&args)
                             .arg("--no-update"),
                     );
-                    output::tolerant_write(
-                        &mut std::io::stderr(),
-                        &format!("Failed to exec new binary: {}\n", err),
-                    );
+                    eprintln!("Failed to exec new binary: {}", err);
                 }
                 update::UpdateCheckResult::Error(e) => {
                     logging::info(&format!("Update check failed: {}", e));

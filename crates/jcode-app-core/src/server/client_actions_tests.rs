@@ -245,10 +245,7 @@ async fn enabling_swarm_does_not_auto_elect_coordinator() {
             .get(session_id)
             .and_then(|member| member.swarm_id.clone())
             .as_deref(),
-        // `swarm_id_for_session` derives the swarm id from the session id (see
-        // `default_swarm_id_for_session`); enabling the feature on a session ids
-        // it into the `session:<session_id>` swarm, not its working directory.
-        Some("session:session_test_swarm_toggle")
+        Some("/tmp/jcode-passive-swarm")
     );
     assert_eq!(
         swarm_members

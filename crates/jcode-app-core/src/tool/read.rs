@@ -2,9 +2,6 @@
 
 use super::{Tool, ToolContext, ToolOutput};
 use crate::bus::{Bus, BusEvent, FileOp, FileTouch};
-use crate::config;
-use crate::message::ContentBlock;
-use crate::session::Session;
 use anyhow::Result;
 use async_trait::async_trait;
 use jcode_terminal_image::{ImageDisplayParams, ImageProtocol, display_image};
@@ -14,32 +11,6 @@ use std::path::Path;
 
 const DEFAULT_LIMIT: usize = 5000;
 const MAX_LINE_LEN: usize = 2000;
-
-/// Hard cap on rendered characters for a single `read` call.
-///
-/// The default `limit` is 5000 lines, so an unbounded read of a large file can
-/// emit tens of thousands of normal-width lines. That is a real token cost, and
-/// past the downstream context guard's ~50k-token single-output ceiling the
-/// whole result is *withheld* rather than returned, so the model loses the
-/// content entirely and often re-issues a narrower call.
-///
-/// Capping the rendered output here (well under that ceiling) keeps the useful
-/// *beginning* of the file and always appends an explicit continuation hint, so
-/// a default full-file read degrades to a bounded, useful prefix rather than a
-/// refusal. Explicitly bounded calls (small `limit`/`end_line`) are unaffected
-/// because they almost always land under the cap.
-const MAX_READ_OUTPUT_CHARS: usize = 120_000;
-
-/// Minimum requested line count before we bother attempting read dedup.
-///
-/// `dedup_already_read` loads the persisted session from disk to find prior
-/// reads of the same range, which is a real per-call IO cost (and now that
-/// `read_dedup` is on by default, it runs on every `read`). For small reads the
-/// pointer-vs-content saving is negligible, so gating them here skips the
-/// session load entirely and keeps the common "read a few lines" case free of
-/// that overhead. Only reads requesting at least this many lines pay for the
-/// dedup lookup.
-const READ_DEDUP_MIN_LINES: usize = 50;
 
 pub struct ReadTool;
 
@@ -73,6 +44,16 @@ struct NormalizedReadRange {
     offset: usize,
     limit: usize,
     style: ReadRangeStyle,
+}
+
+impl NormalizedReadRange {
+    fn next_offset(self) -> usize {
+        self.offset + self.limit
+    }
+
+    fn next_start_line(self) -> usize {
+        self.next_offset() + 1
+    }
 }
 
 fn normalize_read_range(params: &ReadInput) -> Result<NormalizedReadRange> {
@@ -145,11 +126,6 @@ impl Tool for ReadTool {
         "Read a file. Supports text files, image files, and PDFs."
     }
 
-    fn concurrency_safe_marker(&self) -> bool {
-        // Read-only: pure function of its input plus the filesystem.
-        true
-    }
-
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
@@ -211,49 +187,13 @@ impl Tool for ReadTool {
             )));
         }
 
-        // Dedup: if enabled, and this exact file range was already read earlier
-        // in this session (still in active context, file unchanged), return a
-        // compact pointer instead of re-reading the file.
-        //
-        // Only bother for reads of a meaningful size: attempting it loads the
-        // persisted session from disk, so tiny reads (under READ_DEDUP_MIN_LINES)
-        // skip that overhead entirely since the saving would be negligible.
-        if config::config().tools.read_dedup
-            && range.limit >= READ_DEDUP_MIN_LINES
-            && let Some(pointer) = dedup_already_read(&ctx, &path, &range)
-        {
-            Bus::global().publish(BusEvent::FileTouch(FileTouch {
-                session_id: ctx.session_id.clone(),
-                path: path.to_path_buf(),
-                op: FileOp::Read,
-                intent: None,
-                summary: Some(format!(
-                    "read dedup: lines {}-{} of {} already in context",
-                    range.offset + 1,
-                    range.offset + range.limit,
-                    Path::new(&params.file_path).display()
-                )),
-                detail: None,
-            }));
-            crate::logging::info(&format!(
-                "[tool:read] dedup for {} in session {} (range={}..{})",
-                params.file_path, ctx.session_id, range.offset + 1, range.offset + range.limit
-            ));
-            return Ok(ToolOutput::new(pointer));
-        }
-
         // Read file
         let content = tokio::fs::read_to_string(&path).await?;
 
-        // Single-pass: count lines while building output, bounded by the limit
-        // and the max rendered character cap. We still count every line up to the
-        // requested range so `total_lines` and the continuation hint stay exact.
+        // Single-pass: count lines while building output
         let mut output = String::with_capacity(range.limit.min(2000) * 80);
         let mut total_lines = 0usize;
         let mut truncated_line_count = 0usize;
-        let mut budget_exhausted = false;
-        let mut rendered_chars = 0usize;
-        let mut last_rendered_line = range.offset;
         let end_exclusive = range.offset + range.limit;
         {
             use std::fmt::Write;
@@ -266,34 +206,22 @@ impl Tool for ReadTool {
                     // Still need to count remaining lines
                     continue;
                 }
-                if rendered_chars >= MAX_READ_OUTPUT_CHARS {
-                    // Stop rendering, but keep counting remaining lines so the
-                    // continuation hint below is exact. Once the budget is
-                    // exhausted it stays exhausted for the rest of the range.
-                    budget_exhausted = true;
-                    continue;
-                }
                 let line_num = i + 1;
-                last_rendered_line = i;
                 if line.len() > MAX_LINE_LEN {
                     truncated_line_count += 1;
-                    let window = crate::util::truncate_str(line, MAX_LINE_LEN);
-                    let _ = writeln!(output, "{:>5}\t{}...", line_num, window);
-                    // `{:>5}` pads the number to width 5, then tab + content +
-                    // the "..." suffix + newline.
-                    rendered_chars += 5 + 1 + window.chars().count() + 3 + 1;
+                    let _ = writeln!(
+                        output,
+                        "{:>5}\t{}...",
+                        line_num,
+                        crate::util::truncate_str(line, MAX_LINE_LEN)
+                    );
                 } else {
                     let _ = writeln!(output, "{:>5}\t{}", line_num, line);
-                    rendered_chars += 5 + 1 + line.chars().count() + 1;
                 }
             }
         }
 
-        let end = if budget_exhausted {
-            last_rendered_line + 1
-        } else {
-            end_exclusive.min(total_lines)
-        };
+        let end = end_exclusive.min(total_lines);
 
         // Publish file touch event for swarm coordination
         Bus::global().publish(BusEvent::FileTouch(FileTouch {
@@ -326,12 +254,8 @@ impl Tool for ReadTool {
         // Add metadata
         if end < total_lines {
             let continuation_hint = match range.style {
-                // The next line after the last *rendered* line. When the output
-                // budget is exhausted this is earlier than offset+limit, so it
-                // tells the model exactly where to resume rather than skipping
-                // the unrendered portion of the requested range.
-                ReadRangeStyle::OffsetLimit => format!("offset={}", end),
-                ReadRangeStyle::StartEnd => format!("start_line={}", end + 1),
+                ReadRangeStyle::OffsetLimit => format!("offset={}", range.next_offset()),
+                ReadRangeStyle::StartEnd => format!("start_line={}", range.next_start_line()),
             };
             output.push_str(&format!(
                 "\n... {} more lines (use {} to continue)\n",
@@ -350,197 +274,6 @@ impl Tool for ReadTool {
 
 #[cfg(test)]
 mod tests;
-
-/// Try to deduplicate this read against an earlier read in the same session.
-///
-/// Returns `Some(pointer)` when the exact requested range was already read
-/// earlier in this session, that earlier result is still part of the *active*
-/// (un-compacted) context, and the file has not changed since that read. The
-/// returned pointer tells the model the content is already in context rather
-/// than re-emitting the full text. Repeated reads of unchanged file ranges are
-/// collapsed to a pointer. Fully conservative gating means we never serve stale or
-/// already-summarized content.
-///
-/// Returns `None` (meaning "read normally") when dedup does not apply.
-fn dedup_already_read(
-    ctx: &ToolContext,
-    path: &Path,
-    range: &NormalizedReadRange,
-) -> Option<String> {
-    // File freshness anchor: the file must not be newer than the prior read.
-    let metadata = std::fs::metadata(path).ok()?;
-    let current_mtime = metadata.modified().ok()?;
-
-    // Load the session (cheap disk read; only reached when read_dedup is on).
-    let session = Session::load(&ctx.session_id).ok()?;
-
-    // Compaction cutoff: messages before this index were summarized away, so a
-    // prior read there is no longer verbatim in context.
-    let compaction_cutoff = session
-        .compaction
-        .as_ref()
-        .map(|state| state.covers_up_to_turn)
-        .unwrap_or(0);
-
-    let prior_candidates =
-        collect_prior_read_candidates(&session.messages, compaction_cutoff);
-
-    decide_dedup(path, range, current_mtime, &prior_candidates)
-}
-
-/// Collect prior `read` tool calls from session messages that are still in the
-/// active (un-compacted) context, as `(file_path, prior_range, read_at)` triples.
-///
-/// Separated from the rest of dedup so the session-scrape -> candidate
-/// conversion is unit-testable without a persisted on-disk session.
-fn collect_prior_read_candidates(
-    messages: &[crate::session::StoredMessage],
-    compaction_cutoff: usize,
-) -> Vec<(String, (usize, usize), chrono::DateTime<chrono::Utc>)> {
-    let mut prior_candidates = Vec::new();
-    for (message_index, msg) in messages.iter().enumerate() {
-        if message_index < compaction_cutoff {
-            // Compacted away; the content is no longer verbatim in context.
-            continue;
-        }
-        for block in &msg.content {
-            if let ContentBlock::ToolUse { name, input, .. } = block
-                && name == "read"
-            {
-                let prior = range_from_tool_input(input);
-                let Some(prior_file) = prior.file_path else { continue };
-                let Some(ts) = msg.timestamp else { continue };
-                prior_candidates.push((prior_file, prior.range, ts));
-            }
-        }
-    }
-    prior_candidates
-}
-
-/// Core dedup decision, separated from session IO so it is unit-testable.
-///
-/// `prior_candidates` are `(path_str, prior 1-based inclusive range, read_at)`.
-/// Returns the pointer message when a prior read of the same file, still in
-/// active context, unchanged since it was read, fully covers the requested
-/// range.
-fn decide_dedup(
-    path: &Path,
-    range: &NormalizedReadRange,
-    current_mtime: std::time::SystemTime,
-    prior_candidates: &[(String, (usize, usize), chrono::DateTime<chrono::Utc>)],
-) -> Option<String> {
-    for (prior_file, prior_range, ts) in prior_candidates {
-        if paths_equivalent(prior_file, path)
-            && file_unchanged_since(current_mtime, ts)
-            && coverage_covers(*prior_range, range)
-        {
-            return Some(dedup_pointer_message(path, *prior_range, ts));
-        }
-    }
-    None
-}
-
-/// A prior read's file path and normalized line range, parsed from a read tool
-/// input object.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RangeRequest {
-    file_path: Option<String>,
-    range: (usize, usize), // (start_line, end_line), 1-based inclusive
-}
-
-fn range_from_tool_input(input: &Value) -> RangeRequest {
-    let file_path = input
-        .get("file_path")
-        .and_then(|value| value.as_str())
-        .map(str::to_string);
-    let range = normalize_read_range_from_tool_input(input);
-    RangeRequest { file_path, range }
-}
-
-/// Normalize a read tool input's `start_line`/`end_line`/`offset`/`limit` into
-/// a 1-based inclusive `(start_line, end_line)` range. Mirrors
-/// [`normalize_read_range`] but for already-serialized tool inputs.
-fn normalize_read_range_from_tool_input(input: &Value) -> (usize, usize) {
-    let start_line = input
-        .get("start_line")
-        .and_then(|value| value.as_u64())
-        .map(|value| value as usize);
-    let end_line = input
-        .get("end_line")
-        .and_then(|value| value.as_u64())
-        .map(|value| value as usize);
-    let offset = input
-        .get("offset")
-        .and_then(|value| value.as_u64())
-        .unwrap_or(0) as usize;
-    let limit = input
-        .get("limit")
-        .and_then(|value| value.as_u64())
-        .unwrap_or(DEFAULT_LIMIT as u64) as usize;
-
-    match (start_line, end_line) {
-        (Some(start), Some(end)) => (start.max(1), end.max(start.max(1))),
-        (Some(start), None) => (start.max(1), start.saturating_add(limit.saturating_sub(1))),
-        (None, Some(end)) => (1, end),
-        (None, None) => (offset.saturating_add(1), offset.saturating_add(limit)),
-    }
-}
-
-/// Whether a requested range is fully covered by a prior range, both as
-/// 1-based inclusive `(start_line, end_line)`.
-fn coverage_covers(prior: (usize, usize), requested: &NormalizedReadRange) -> bool {
-    // NormalizedReadRange is 0-based `offset` + `limit`; convert to 1-based
-    // inclusive end for comparison.
-    let requested_start = requested.offset + 1;
-    let requested_end = requested.offset + requested.limit;
-    prior.0 <= requested_start && prior.1 >= requested_end
-}
-
-/// Whether two paths resolve to the same file (by canonicalized absolute path).
-fn paths_equivalent(a: &str, b: &Path) -> bool {
-    let a_path = Path::new(a);
-    let canon_a = std::fs::canonicalize(a_path).unwrap_or_else(|_| a_path.to_path_buf());
-    let canon_b = std::fs::canonicalize(b).unwrap_or_else(|_| b.to_path_buf());
-    canon_a == canon_b
-}
-
-/// Whether the file was not modified after the prior-read time `since`.
-///
-/// We pass the file's *current* mtime and compare it to the prior read's
-/// recorded time. The prior read time is the message timestamp, which is set
-/// when the read happened. If the file's mtime is strictly earlier than that
-/// read time, the file was not edited after the read (editing bumps mtime to a
-/// newer value), so dedup is safe. If mtime is at or after the read time, the
-/// file may have changed since, so we do not dedup.
-fn file_unchanged_since(
-    current_mtime: std::time::SystemTime,
-    since: &chrono::DateTime<chrono::Utc>,
-) -> bool {
-    // `Err` means current_mtime < since (strictly before the read) => the file
-    // was not modified after the read => unchanged => safe to dedup.
-    current_mtime
-        .duration_since(std::time::SystemTime::from(*since))
-        .is_err()
-}
-
-/// Build the compact pointer message returned instead of re-reading.
-fn dedup_pointer_message(
-    path: &Path,
-    prior: (usize, usize),
-    read_at: &chrono::DateTime<chrono::Utc>,
-) -> String {
-    format!(
-        "Already in context: {} (lines {}-{}), read in this session at {}.\n\
-         The file has not changed since that read, so re-reading would return the exact same \
-         bytes; they are already available in the earlier tool result and are not re-sent here. \
-         If you expected different content, the file must have been edited (in that case this \
-         pointer would not have been returned).",
-        path.display(),
-        prior.0,
-        prior.1,
-        read_at
-    )
-}
 
 fn is_binary_file(path: &Path) -> bool {
     // Check by extension first (no I/O needed)

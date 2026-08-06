@@ -3463,7 +3463,7 @@ fn filter_cli_model_routes_for_choice(
             route.api_method_kind(),
             crate::provider::ModelRouteApiMethod::OpenAIApiKey
         ),
-        ProviderChoice::Openrouter | ProviderChoice::Azure | ProviderChoice::OrcaRouter => {
+        ProviderChoice::Openrouter | ProviderChoice::Azure => {
             route.api_method_kind().is_openrouter()
         }
         ProviderChoice::Copilot => route.api_method_kind().is_copilot(),

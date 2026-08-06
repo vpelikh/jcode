@@ -33,13 +33,9 @@ use crate::message::{
 };
 use crate::protocol::{HistoryMessage, ServerEvent};
 use crate::provider::{NativeToolResult, Provider, ProviderRuntimeState};
-use crate::session::{
-    GitState, Session, SessionStatus, StoredDisplayRole, StoredMessage,
-    event_types::{SessionEvent, SessionEventOp},
-};
+use crate::session::{GitState, Session, SessionStatus, StoredDisplayRole, StoredMessage};
 use crate::skill::SkillRegistry;
 use crate::tool::{Registry, ToolContext, ToolExecutionMode};
-use chrono::Utc;
 use anyhow::Result;
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
@@ -471,12 +467,9 @@ impl Agent {
     }
 
     fn seed_compaction_from_session(&mut self) {
-        // Read the event-sourced log once; on resume this is hydrated from disk
-        // in Session::load_from_path so it reflects the full transcript.
-        let messages = self.session.derive_messages();
         logging::info(&format!(
-            "seed_compaction_from_session: session has {} messages via event log",
-            messages.len()
+            "seed_compaction_from_session: session has {} messages",
+            self.session.messages.len()
         ));
         let compaction = self.registry.compaction();
         let mut manager = match compaction.try_write() {
@@ -491,11 +484,10 @@ impl Agent {
         manager.reset();
         let budget = self.provider.context_window();
         manager.set_budget(budget);
-        let current_compaction = self.session.derive_compaction();
-        if let Some(state) = current_compaction {
-            manager.restore_persisted_stored_state_with(&state, &messages);
+        if let Some(state) = self.session.compaction.as_ref() {
+            manager.restore_persisted_stored_state_with(state, &self.session.messages);
         } else {
-            manager.seed_restored_stored_messages_with(&messages);
+            manager.seed_restored_stored_messages_with(&self.session.messages);
         }
         let sanitized_state = if manager.discard_oversized_openai_native_compaction() {
             Some(manager.persisted_state())
@@ -503,31 +495,12 @@ impl Agent {
             None
         };
         logging::info(&format!(
-            "seed_compaction_from_session: seeded compaction with {} messages via event log",
-            messages.len()
+            "seed_compaction_from_session: seeded compaction with {} messages",
+            self.session.messages.len()
         ));
         drop(manager);
         if let Some(state) = sanitized_state {
-            self.session.compaction = state.clone();
-            match state {
-                Some(inner) => {
-                    // Emit a SetCompaction event so the event log stays in sync
-                    // with the sanitized compaction state.
-                    self.session.append_session_event(SessionEvent {
-                        timestamp: Utc::now(),
-                        event_id: crate::id::new_id("compaction"),
-                        op: SessionEventOp::SetCompaction { compaction: inner },
-                        parent_id: None,
-                        version: 1,
-                    });
-                }
-                None => {
-                    // Sanitizing cleared the compaction entirely. Rebuild the
-                    // event log so derive_compaction() agrees with the cleared
-                    // legacy state instead of returning a stale SetCompaction.
-                    self.session.rebuild_event_map();
-                }
-            }
+            self.session.compaction = state;
             self.persist_session_best_effort("sanitized oversized OpenAI native compaction");
         }
     }
@@ -641,22 +614,6 @@ impl Agent {
         let new_state = manager.persisted_state();
         if self.session.compaction != new_state {
             self.session.compaction = new_state;
-            match self.session.compaction.clone() {
-                Some(state) => {
-                    // Emit a SetCompaction event so the event log stays in sync
-                    // with the compaction mutation. `set_compaction` also
-                    // updates `self.compaction`, so the direct assignment above
-                    // is redundant but makes the intent explicit.
-                    self.session.set_compaction(state);
-                }
-                None => {
-                    // Compaction was cleared (active_summary is None). There is
-                    // no dedicated clear op, so rebuild the event log from the
-                    // legacy vectors to drop any stale SetCompaction event;
-                    // otherwise derive_compaction() would still return it.
-                    self.session.rebuild_event_map();
-                }
-            }
             if let Err(err) = self.session.save() {
                 logging::error(&format!(
                     "Failed to persist compaction state for session {}: {}",
@@ -698,10 +655,6 @@ impl Agent {
         };
 
         self.session.compaction = Some(state.clone());
-        // Emit a SetCompaction event so the event log stays in sync with the
-        // compaction mutation. `set_compaction` also sets `self.compaction`,
-        // making the direct assignment above redundant but explicit.
-        self.session.set_compaction(state.clone());
         let compaction = self.registry.compaction();
         if let Ok(mut manager) = compaction.try_write() {
             manager.set_budget(self.provider.context_window());
@@ -848,9 +801,7 @@ impl Agent {
     }
 
     fn repair_missing_tool_outputs(&mut self) -> usize {
-        let messages = self.session.derive_messages();
-        
-        if self.tool_output_scan_index > messages.len() {
+        if self.tool_output_scan_index > self.session.messages.len() {
             self.reset_tool_output_tracking();
         }
 
@@ -858,7 +809,7 @@ impl Agent {
         let mut new_result_ids = Vec::new();
         let mut assistant_tool_uses: Vec<(usize, Vec<String>)> = Vec::new();
 
-        for (index, msg) in messages.iter().enumerate().skip(scan_start) {
+        for (index, msg) in self.session.messages.iter().enumerate().skip(scan_start) {
             match msg.role {
                 Role::User => {
                     for block in &msg.content {
@@ -910,6 +861,8 @@ impl Agent {
             }
         }
 
+        self.tool_output_scan_index = self.session.messages.len();
+
         let mut repaired = 0usize;
         let mut inserted = 0usize;
         for (index, missing_for_message) in missing_repairs {
@@ -924,18 +877,19 @@ impl Agent {
                     role: Role::User,
                     content: vec![tool_block],
                     display_role: None,
-                    timestamp: Some(Utc::now()),
+                    timestamp: Some(chrono::Utc::now()),
                     tool_duration_ms: None,
                     token_usage: None,
                 };
-                self.session.insert_message(index + 1 + inserted + offset, stored_message);
+                self.session
+                    .insert_message(index + 1 + inserted + offset, stored_message);
                 self.tool_result_ids.insert(id.clone());
                 repaired += 1;
             }
             inserted += missing_for_message.len();
         }
 
-        self.tool_output_scan_index = self.session.derive_messages().len();
+        self.tool_output_scan_index = self.session.messages.len();
 
         if repaired > 0 {
             self.persist_session_best_effort("missing tool-output repair");

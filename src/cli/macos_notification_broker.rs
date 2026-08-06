@@ -149,6 +149,7 @@ mod platform {
         let ticks = AtomicU32::new(0);
         let block = block2::RcBlock::new(move |_timer: NonNull<NSTimer>| {
             match authorization.load(Ordering::Acquire) {
+                AUTHORIZATION_GRANTED => drain_inbox(&center),
                 AUTHORIZATION_DENIED
                     if ticks.fetch_add(1, Ordering::Relaxed) % AUTHORIZATION_RETRY_TICKS == 0 =>
                 {
@@ -159,14 +160,6 @@ mod platform {
                 }
                 _ => {}
             }
-            // Drain the inbox on every tick regardless of authorization. If
-            // UNUserNotificationCenter authorization was denied or is stuck
-            // pending, `submit` falls back to an `osascript` notification so
-            // queued turn notifications are still delivered (macOS presents
-            // those via the owning user session, no app authorization needed).
-            // Previously this gate skipped draining entirely when the callback
-            // never reached GRANTED, silently dropping every queued payload.
-            drain_inbox(&center, authorization.load(Ordering::Acquire));
         });
         unsafe {
             let timer =
@@ -195,7 +188,7 @@ mod platform {
         }
     }
 
-    fn drain_inbox(center: &UNUserNotificationCenter, authorization: u8) {
+    fn drain_inbox(center: &UNUserNotificationCenter) {
         let Some(inbox) = crate::notifications::macos_notification_inbox_dir() else {
             return;
         };
@@ -211,9 +204,6 @@ mod platform {
             .collect();
         paths.sort();
 
-        // Local, asynchronous ack when an UNUserNotificationCenter submission
-        // settles (Notification Center may reject when authorization is denied).
-        let submitted_via_center = authorization == AUTHORIZATION_GRANTED;
         for path in paths {
             let result = std::fs::read(&path)
                 .context("read queued notification")
@@ -223,17 +213,10 @@ mod platform {
                     )
                     .context("decode queued notification")
                 })
-                .and_then(|envelope| {
-                    if submitted_via_center {
-                        submit(center, &envelope, &path)
-                    } else {
-                        submit_via_osascript(&envelope, &path)
-                    }
-                });
+                .and_then(|envelope| submit(center, &envelope, &path));
             match result {
                 // The Notification Center completion handler owns removal or
-                // retry after this point; the osascript fallback removes the
-                // payload synchronously.
+                // retry after this point.
                 Ok(()) => {}
                 Err(error) => {
                     crate::logging::warn(&format!(
@@ -317,64 +300,6 @@ mod platform {
             }
         });
         center.addNotificationRequest_withCompletionHandler(&request, Some(&completion));
-        Ok(())
-    }
-
-    /// Deliver a queued notification through `osascript` instead of
-    /// `UNUserNotificationCenter`. Used when the broker's authorization was
-    /// denied or is stuck pending: `display notification` posts via the owning
-    /// user session and does not require app-level notification authorization,
-    /// so a denied/stuck `UNUserNotificationCenter` must not strand queued turn
-    /// notifications indefinitely.
-    ///
-    /// Removes the queued payload synchronously on success.
-    fn submit_via_osascript(
-        envelope: &crate::notifications::MacosNotificationEnvelope,
-        queued_path: &std::path::Path,
-    ) -> anyhow::Result<()> {
-        fn applescript_escape(s: &str) -> String {
-            let mut out = String::with_capacity(s.len());
-            for ch in s.chars() {
-                match ch {
-                    '\\' => out.push_str("\\\\"),
-                    '"' => out.push_str("\\\""),
-                    '\n' => out.push_str("\\n"),
-                    '\r' => {}
-                    _ => out.push(ch),
-                }
-            }
-            out
-        }
-
-        let mut script = format!(
-            "display notification \"{}\" with title \"{}\"",
-            applescript_escape(&envelope.body),
-            applescript_escape(&envelope.title)
-        );
-        if let Some(subtitle) = envelope
-            .subtitle
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-        {
-            script.push_str(&format!(" subtitle \"{}\"", applescript_escape(subtitle)));
-        }
-        if let Some(sound) = envelope
-            .sound
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-        {
-            script.push_str(&format!(" sound name \"{}\"", applescript_escape(sound)));
-        }
-
-        let status = std::process::Command::new("osascript")
-            .arg("-e")
-            .arg(script)
-            .stdin(std::process::Stdio::null())
-            .status()?;
-        if !status.success() {
-            anyhow::bail!("osascript exited with {}", status);
-        }
-        std::fs::remove_file(queued_path)?;
         Ok(())
     }
 }

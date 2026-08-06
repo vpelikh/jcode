@@ -2068,50 +2068,12 @@ async fn stream_response(
         req = req.header("anthropic-beta", beta_header);
     }
 
-    // Surface the upload size right away so a long "sending context" phase is
-    // explainable (large payload draining on a slow uplink).
-    let payload = serde_json::to_vec(&request).unwrap_or_default();
-    let payload_bytes = payload.len() as u64;
-    if payload_bytes > 0 {
-        let _ = tx
-            .send(Ok(StreamEvent::StatusDetail {
-                detail: format!(
-                    "sending {}",
-                    jcode_provider_core::transport::readable_bytes(payload_bytes)
-                ),
-            }))
-            .await;
-    }
-
-    let upload_tx = tx.clone();
-    let response =
-        jcode_provider_core::transport::send_body_with_upload_progress(
-            req,
-            payload,
-            stream_idle_timeout,
-            move |sent| {
-                let detail = jcode_provider_core::transport::upload_progress_label(
-                    sent,
-                    payload_bytes,
-                );
-                if !detail.is_empty() {
-                    let _ = upload_tx.try_send(Ok(StreamEvent::StatusDetail {
-                        detail,
-                    }));
-                }
-            },
-            |msg: &str| {
-                let tx = tx.clone();
-                let msg = msg.to_string();
-                async move {
-                    let _ = tx
-                        .send(Ok(StreamEvent::StatusDetail { detail: msg }))
-                        .await;
-                }
-            },
-        )
-        .await
-        .context("Failed to send request to Anthropic API")?;
+    let response = jcode_provider_core::transport::send_with_initial_response_timeout(
+        req.json(&request),
+        stream_idle_timeout,
+    )
+    .await
+    .context("Failed to send request to Anthropic API")?;
 
     let connect_ms = connect_start.elapsed().as_millis();
     jcode_base::logging::info(&format!(

@@ -521,17 +521,6 @@ fn schema_only_advertises_common_public_fields() {
     assert!(props.contains_key("max_files"));
     assert!(props.contains_key("max_regions"));
     assert!(props.contains_key("paths_only"));
-    assert!(
-        props.contains_key("allow_raw_fallback"),
-        "agentgrep must advertise the raw-fallback escape hatch so the model can
-         bypass the compass_query-first redirect when it genuinely needs grep"
-    );
-    assert_eq!(
-        props["allow_raw_fallback"]["type"],
-        json!("boolean"),
-        "allow_raw_fallback must stay boolean in the schema so the model emits a
-         literal true/false for the bypass flag"
-    );
     assert_eq!(
         mode_enum,
         &vec![

@@ -32,7 +32,6 @@ fn cargo_wrapper_path_is_shell_quoted() {
     assert_eq!(shell_single_quote("a'b"), "'a'\"'\"'b'");
 }
 
-
 #[tokio::test]
 async fn background_command_stdin_is_null() {
     let mut command =

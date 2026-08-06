@@ -234,11 +234,7 @@ fn test_copy_badge_reserves_right_margin_for_info_widgets() {
     reserve_copy_badge_margins(&mut margins, 10, 13, &[(11, 'a')], &copy_badge_ui, Instant::now());
 
     assert_eq!(margins.right_widths[0], 30);
-    // The reserved width is platform-dependent (`[Alt]` vs `[⌥]`, see
-    // `copy_badge_alt_badge`), so derive the expected margin from the same
-    // function instead of a hardcoded value.
-    let reserved = copy_badge_reserved_width('a', &copy_badge_ui, Instant::now());
-    assert_eq!(margins.right_widths[1], 30u16.saturating_sub(reserved as u16));
+    assert_eq!(margins.right_widths[1], 16);
     assert_eq!(margins.right_widths[2], 30);
 }
 
@@ -273,10 +269,9 @@ fn test_copy_badge_truncates_full_width_line_before_appending_shortcut() {
     let mut line = Line::from("x".repeat(viewport_width));
 
     truncate_copy_badge_line_to_width(&mut line, viewport_width.saturating_sub(reserved));
-    // Matches the render path: one separator space, then the shortcut badges
-    // (platform-dependent `[Alt]` vs `[⌥]` badge label).
+    // Matches the render path: one separator space, then the shortcut badges.
     line.spans.push(Span::raw(" "));
-    line.spans.push(Span::raw(format!("{} [⇧] [A]", copy_badge_alt_badge())));
+    line.spans.push(Span::raw("[Alt] [⇧] [A]"));
 
     assert_eq!(line.width(), viewport_width);
     assert!(line.width() <= viewport_width);

@@ -160,13 +160,9 @@ fn test_reload_preserves_completed_confidence_spike_challenge() {
         // re-arming; this test is about the spike-challenge flag, not the
         // default-on re-arm behavior.
         reloaded_app.auto_poke_default_on = false;
-        // With all todos complete, validation passing, and the spike already
-        // challenged, the clean finish queues one final-response continuation
-        // (so the call returns true), disarms auto-poke (default off), and
-        // keeps the challenge latched so the unchanged spike is not re-raised.
-        assert!(reloaded_app.schedule_auto_poke_followup_if_needed());
+        assert!(!reloaded_app.schedule_auto_poke_followup_if_needed());
         assert!(!reloaded_app.auto_poke_incomplete_todos);
-        assert!(reloaded_app.todo_confidence_spike_challenged);
+        assert!(!reloaded_app.todo_confidence_spike_challenged);
         assert!(reloaded_app.hidden_queued_system_messages.is_empty());
     });
 }
@@ -308,16 +304,8 @@ fn remote_ownership_gate_reads_the_remote_goal_assessment() {
         )
         .expect("save remote goal assessment");
 
-        // The remote session's goal assessment clears the ownership gate, so
-        // no ownership continuation is queued. Post-1bd235b5f the clean
-        // completion path still returns true because it requests the concise
-        // final-response turn ("All todos done"), not a poke.
-        assert!(app.schedule_auto_poke_followup_if_needed());
-        assert_eq!(
-            app.queued_messages,
-            vec![crate::todo::TODO_FINAL_RESPONSE_CONTINUATION_MESSAGE.to_string()],
-            "a passing remote goal yields the final-response turn, not a poke"
-        );
+        assert!(!app.schedule_auto_poke_followup_if_needed());
+        assert!(app.queued_messages.is_empty());
     });
 }
 
@@ -488,7 +476,7 @@ fn test_gate_digest_is_delivered_at_turn_end_and_rearms_next_cycle() {
                 confidence: Some(crate::todo::ConfidenceState::from_legacy_score(100)),
                 completion_confidence: Some(crate::todo::ConfidenceState::from_legacy_score(100)),
                 confidence_history: vec![
-                    crate::todo::ConfidenceState::from_legacy_score(100),
+                    crate::todo::ConfidenceState::from_legacy_score(97),
                     crate::todo::ConfidenceState::from_legacy_score(100),
                 ],
                 ..Default::default()
@@ -546,15 +534,9 @@ fn test_gate_digest_is_delivered_at_turn_end_and_rearms_next_cycle() {
         // Simulate the turn running, then the cycle completing.
         app.queued_messages.clear();
         app.pending_queued_dispatch = false;
-        // With the digest consumed and no other outstanding point, the clean
-        // cycle closes by queuing the concise final response.
         assert!(
-            app.schedule_auto_poke_followup_if_needed(),
-            "after the digest, the cycle should queue the final response"
-        );
-        assert_eq!(
-            app.queued_messages,
-            vec![crate::todo::TODO_FINAL_RESPONSE_CONTINUATION_MESSAGE.to_string()]
+            !app.schedule_auto_poke_followup_if_needed(),
+            "with nothing left outstanding the cycle should finish"
         );
         assert!(
             !app.todo_gate_digest_delivered,
@@ -686,13 +668,7 @@ fn completed_cycle_rearms_auto_poke_only_when_default_on() {
             }],
         )
         .expect("save passing goal");
-        // Post-1bd235b5f a clean completion returns true because it requests
-        // the concise final-response turn; it is not a poke or a gate retry.
-        assert!(app.schedule_auto_poke_followup_if_needed());
-        assert_eq!(
-            app.queued_messages,
-            vec![crate::todo::TODO_FINAL_RESPONSE_CONTINUATION_MESSAGE.to_string()]
-        );
+        assert!(!app.schedule_auto_poke_followup_if_needed());
         assert!(
             app.auto_poke_incomplete_todos,
             "default-on auto-poke should cover the next batch of work too"
@@ -718,10 +694,7 @@ fn completed_cycle_rearms_auto_poke_only_when_default_on() {
         )
         .expect("save passing goal");
         app.auto_poke_incomplete_todos = true; // pretend a stale arm survived
-        // Even though a stale arm lets the call proceed and it returns true to
-        // request the final-response turn, the disarmed default must win: the
-        // default-on re-arm never re-arms because auto_poke_default_on is false.
-        assert!(app.schedule_auto_poke_followup_if_needed());
+        assert!(!app.schedule_auto_poke_followup_if_needed());
         assert!(
             !app.auto_poke_incomplete_todos,
             "/poke off must not be undone by the default-on re-arm"

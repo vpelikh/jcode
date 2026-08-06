@@ -14,14 +14,12 @@ pub(super) use super::commands_review::queue_autojudge_remote;
 pub(super) use super::commands_review::{
     ImproveCommand, ManualSubagentSpec, RefactorCommand, autojudge_status_message,
     autoreview_status_message, build_autojudge_startup_message, build_autoreview_startup_message,
-    build_judge_startup_message, build_review_startup_message, clear_review_loop_on_improve,
-    current_feedback_target_session_id, handle_autojudge_command_local, handle_autoreview_command_local,
-    handle_judge_command_local, handle_observe_command, handle_review_command_local,
-    handle_review_loop_command_local, is_review_loop_active, launch_forked_session_local,
-    launch_prompt_in_new_session_local, maybe_enter_review_loop, maybe_trigger_autojudge_local,
+    build_judge_startup_message, build_review_startup_message, current_feedback_target_session_id,
+    handle_autojudge_command_local, handle_autoreview_command_local, handle_judge_command_local,
+    handle_observe_command, handle_review_command_local, launch_forked_session_local,
+    launch_prompt_in_new_session_local, maybe_trigger_autojudge_local,
     maybe_trigger_autoreview_local, preferred_one_shot_review_override,
     prepare_review_spawned_session, queue_review_spawn_remote, reset_current_session,
-    step_review_loop,
 };
 pub(super) use super::todos_view::handle_todos_view_command;
 use super::{App, DisplayMessage, LocalRewindUndoSnapshot, ProcessingStatus};
@@ -377,7 +375,6 @@ pub(super) fn create_transfer_session_from_parent(
     child.testing_build = parent.testing_build.clone();
     child.status = crate::session::SessionStatus::Closed;
     child.provider_session_id = None;
-    child.rebuild_event_map();
     child.save()?;
     crate::todo::save_todos(&child.id, &todos)?;
     Ok((child.id.clone(), child.display_name().to_string()))
@@ -1668,7 +1665,6 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
         || handle_back_command(app, trimmed)
         || handle_autoreview_command_local(app, trimmed)
         || handle_autojudge_command_local(app, trimmed)
-        || handle_review_loop_command_local(app, trimmed)
         || handle_review_command_local(app, trimmed)
         || handle_judge_command_local(app, trimmed)
         || handle_selfdev_command(app, trimmed)

@@ -284,66 +284,6 @@ impl App {
         self.rate_limit_reset = None;
     }
 
-    /// Schedule the pending remote turn to retry after the provider-suggested
-    /// wait (e.g. a token-limit 422 telling us to retry in N minutes). Unlike
-    /// the fixed-backoff auto-retry, this honors the upstream wait exactly (so
-    /// we do not hammer an endpoint that is still over its completion-token
-    /// quota) and does not re-send context immediately. Returns `false` when
-    /// there is no pending message to reschedule.
-    pub(super) fn schedule_pending_remote_retry_in(&mut self, wait: Duration, reason: &str) -> bool {
-        let Some(pending) = self.rate_limit_pending_message.as_mut() else {
-            return false;
-        };
-        let retry_at = Instant::now() + wait;
-        pending.retry_attempts = pending.retry_attempts.saturating_add(1);
-        pending.retry_at = Some(retry_at);
-        self.rate_limit_reset = Some(retry_at);
-        self.status = ProcessingStatus::Idle;
-        self.status_detail = None;
-
-        let content = format!(
-            "⏳ {} - retrying automatically in {}.",
-            reason,
-            Self::format_duration_for_message(wait)
-        );
-        if let Some(idx) = self.display_messages.iter().rposition(|message| {
-            message.role == "system"
-                && (message.title.as_deref() == Some("Connection")
-                    || message.content.starts_with("⏳ "))
-        }) {
-            self.replace_display_message_title_and_content(idx, Some("Wait".to_string()), content);
-        } else {
-            self.push_display_message(DisplayMessage {
-                role: "system".to_string(),
-                content,
-                tool_calls: Vec::new(),
-                duration_secs: None,
-                title: Some("Wait".to_string()),
-                tool_data: None,
-            });
-        }
-        true
-    }
-
-    /// Format a `Duration` as a short human string (e.g. "6 minutes").
-    fn format_duration_for_message(wait: Duration) -> String {
-        let secs = wait.as_secs();
-        if secs >= 60 && secs % 60 == 0 {
-            let minutes = secs / 60;
-            if minutes == 1 {
-                "1 minute".to_string()
-            } else {
-                format!("{minutes} minutes")
-            }
-        } else if secs == 1 {
-            "1 second".to_string()
-        } else if secs > 0 {
-            format!("{secs} seconds")
-        } else {
-            "a moment".to_string()
-        }
-    }
-
     /// Track a failed turn for the credential-failure circuit breaker.
     ///
     /// Returns `true` when the error classifies as a credential/auth failure

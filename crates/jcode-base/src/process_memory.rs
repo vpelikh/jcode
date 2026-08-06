@@ -72,14 +72,6 @@ pub struct OsProcessMemoryInfo {
     pub shared_clean_bytes: Option<u64>,
     pub shared_dirty_bytes: Option<u64>,
     pub swap_bytes: Option<u64>,
-    /// macOS physical footprint (`proc_pid_rusage` `ri_phys_footprint`). This
-    /// is the real resident memory the process holds, which excludes reserved-
-    /// but-unwritten malloc arena VM that `ps` RSS counts on macOS (the same
-    /// number the `footprint` tool prints). See the memory-footprint
-    /// investigation for why `ps` RSS over-accounts on macOS system malloc
-    /// (retained arenas show up as resident but are mostly untouched pages).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub phys_footprint_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -185,92 +177,7 @@ pub fn snapshot_with_source(source: impl Into<String>) -> ProcessMemorySnapshot 
     snapshot
 }
 
-#[cfg(target_os = "macos")]
-pub fn snapshot_with_source(source: impl Into<String>) -> ProcessMemorySnapshot {
-    let source = source.into();
-    let rusage = macos_rusage_v4();
-    // Note on metrics: macOS has no single "RSS" that is trustworthy (ps RSS
-    // over-counts reserved arenas). `rss_bytes` carries the current resident
-    // set size (`ri_resident_size`) and `peak_rss_bytes` carries the lifetime
-    // peak PHYSICAL FOOTPRINT (`ri_lifetime_max_phys_footprint`) — there is no
-    // peak-resident field in rusage_info_v4, so these are two different
-    // metrics (resident vs footprint). Both are honest real numbers (not the
-    // inflated ps-RSS), which is what matters for pressure; `phys_footprint`
-    // is exposed separately in `os.phys_footprint_bytes`.
-    let snapshot = ProcessMemorySnapshot {
-        rss_bytes: rusage.map(|r| r.ri_resident_size),
-        peak_rss_bytes: rusage.map(|r| r.ri_lifetime_max_phys_footprint),
-        virtual_bytes: None,
-        thread_count: None,
-        main_stack_bytes: None,
-        os: rusage.map(|r| OsProcessMemoryInfo {
-            phys_footprint_bytes: Some(r.ri_phys_footprint),
-            ..Default::default()
-        }),
-        allocator: allocator_info(),
-    };
-    logging::debug(&format!(
-        "process memory snapshot source={source} rss={:?} footprint={:?} allocator={}",
-        snapshot.rss_bytes,
-        snapshot.os.as_ref().and_then(|os| os.phys_footprint_bytes),
-        snapshot.allocator.name
-    ));
-    record_snapshot(source, snapshot.clone());
-    snapshot
-}
-
-/// macOS resident and physical-footprint numbers from the per-process rusage
-/// info (v4).
-///
-/// Fields relevant to memory reporting:
-/// - `ri_resident_size`: resident set size.
-/// - `ri_phys_footprint`: the *physical footprint* — bytes the process
-///   actually holds resident (the same number the `footprint` tool prints).
-///   On macOS `ps` RSS counts reserved-but-unwritten malloc arena VM, so a
-///   long-running daemon that ever touched GB of heap shows GBs of RSS even
-///   though only a few hundred MB are real. `phys_footprint` excludes that
-///   reserved-but-untouched arena VM and is the honest number for memory
-///   pressure (see the memory-footprint investigation).
-/// - `ri_lifetime_max_phys_footprint`: peak physical footprint (surrogate for
-///   peak RSS).
-///
-/// Uses `proc_pid_rusage(pid, RUSAGE_INFO_V4, ...)`.
-/// `rusage_info_v4` adds `ri_phys_footprint`; earlier versions only have
-/// `ri_resident_size`.
-#[cfg(target_os = "macos")]
-fn macos_rusage_v4() -> Option<libc::rusage_info_v4> {
-    // Declare `proc_pid_rusage` ourselves with the real XNU signature
-    // (`void *buffer`) instead of libc's `rusage_info_t`-indirected binding
-    // (`*mut *mut c_void`), which does not match how the syscall dereferences
-    // the caller's buffer and returns all-zeros.
-    unsafe extern "C" {
-        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut libc::c_void) -> i32;
-    }
-    // SAFETY: `proc_pid_rusage` is the macOS kernel's own exported syscall-
-    // wrapper. We pass (a) our own PID, (b) `RUSAGE_INFO_V4` (a valid flavor), and
-    // (c) a pointer to a fully zero-initialized `rusage_info_v4` buffer that is
-    // the correct size for that flavor. The kernel fills exactly that struct and
-    // returns an error code if anything is invalid rather than writing out of
-    // bounds, so the only observer of `info` is us after a 0 (success) return.
-    // There is no safe std API for macOS process rusage, so this FFI call is the
-    // minimal, contained `unsafe` surface; its caller (`snapshot_with_source`) is
-    // fully safe.
-    unsafe {
-        let pid = std::process::id() as i32;
-        let mut info: libc::rusage_info_v4 = std::mem::zeroed();
-        let ret = proc_pid_rusage(
-            pid,
-            libc::RUSAGE_INFO_V4,
-            &mut info as *mut libc::rusage_info_v4 as *mut libc::c_void,
-        );
-        if ret != 0 {
-            return None;
-        }
-        Some(info)
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(target_os = "linux"))]
 pub fn snapshot_with_source(source: impl Into<String>) -> ProcessMemorySnapshot {
     let source = source.into();
     logging::debug(&format!(
@@ -821,8 +728,6 @@ fn read_linux_memory_info(status: &str) -> Option<OsProcessMemoryInfo> {
                 .as_deref()
                 .and_then(|text| parse_proc_value_bytes(text, "Swap:"))
         }),
-        // The rest (e.g. the macOS-only `phys_footprint_bytes`) default empty.
-        ..Default::default()
     };
 
     if info.pss_bytes.is_none()
@@ -1063,22 +968,6 @@ mod tests {
         let buffer = vec![0u8; 8 * 1024 * 1024];
         drop(buffer);
         release_retained_heap("unit_test");
-
-        // Under jemalloc, the purge path is the actual memory-reclamation
-        // mechanism (used by `allocator:purge`): assert it fully succeeds and
-        // reports the tuned allocator, not a silent no-op or error.
-        #[cfg(feature = "jemalloc")]
-        {
-            let tuning = purge_allocator()
-                .expect("jemalloc arena purge should succeed under jemalloc builds");
-            assert_eq!(
-                tuning.dirty_decay_ms,
-                Some(1000),
-                "purged allocator should report the build-time decay tuning (dirty_decay_ms=1000)"
-            );
-            // A second release must keep succeeding (idempotent).
-            release_retained_heap("unit_test_again");
-        }
     }
 
     #[test]
@@ -1224,70 +1113,6 @@ mod tests {
             assert_eq!(info.stats_available, info.stats.is_some());
             assert!(info.profiling.is_none());
         }
-    }
-
-    #[cfg(feature = "jemalloc")]
-    #[test]
-    fn jemalloc_build_applies_decay_tuning_reported_through_public_api() {
-        // Acceptance check: the whole point of making jemalloc a default
-        // feature plus the build-time `JEMALLOC_SYS_WITH_MALLOC_CONF` env
-        // (see .cargo/config.toml) is that jemalloc actually returns dirty
-        // pages to the OS after a short decay so a long-running daemon's RSS
-        // stays bounded. Through the public `allocator_info()` interface, the
-        // effective tuning must report the configured slowdown:
-        // dirty_decay_ms == 1000 (not jemalloc's default 10000).
-        //
-        // This only holds when the build applied the env (i.e. the value was
-        // baked into jemalloc via --with-malloc-conf). If someone overrides or
-        // unsets JEMALLOC_SYS_WITH_MALLOC_CONF, jemalloc's default 10000 would
-        // be reported and this test will fail loudly — which is the point.
-        let info = allocator_info();
-        assert_eq!(info.name, "jemalloc");
-        let tuning = info
-            .tuning
-            .as_ref()
-            .expect("jemalloc build should report tuning info");
-        assert_eq!(
-            tuning.dirty_decay_ms,
-            Some(1000),
-            "jemalloc decay tuning should be applied at build time (dirty_decay_ms=1000); \
-             got {:?}. Ensure .cargo/config.toml sets JEMALLOC_SYS_WITH_MALLOC_CONF to \
-             dirty_decay_ms:1000,... (the runtime malloc_conf static is not reliably read).",
-            tuning.dirty_decay_ms
-        );
-        assert_eq!(
-            tuning.muzzy_decay_ms,
-            Some(1000),
-            "muzzy_decay_ms should also be tuned to 1000, got {:?}",
-            tuning.muzzy_decay_ms
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_snapshot_populates_physical_footprint() {
-        // The whole point of the macOS snapshot is to report `phys_footprint`
-        // (real resident bytes) rather than leave all memory fields empty or
-        // rely on `ps`-style RSS that over-accounts reserved malloc arenas.
-        let snapshot = snapshot();
-        let os = snapshot
-            .os
-            .as_ref()
-            .expect("macOS snapshot should populate os info");
-        let footprint = os
-            .phys_footprint_bytes
-            .expect("macOS snapshot should report phys_footprint");
-        // A small test process still holds at least a handful of MB resident.
-        assert!(
-            footprint > 1 * 1024 * 1024,
-            "physical footprint should be a plausible resident size, got {footprint} bytes"
-        );
-        assert!(
-            footprint < 8 * 1024 * 1024 * 1024,
-            "physical footprint should not exceed a plausible ceiling, got {footprint} bytes"
-        );
-        // rss_bytes is a surrogate convenience; ensure it is at least present.
-        assert!(snapshot.rss_bytes.is_some());
     }
 
     #[cfg(all(target_os = "linux", target_env = "gnu", not(feature = "jemalloc")))]

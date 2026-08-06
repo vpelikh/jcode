@@ -1,5 +1,4 @@
 mod agentgrep;
-pub(crate) mod compass_query;
 pub mod ambient;
 mod apply_patch;
 mod bash;
@@ -114,26 +113,6 @@ fn session_tool_policy(session_id: &str) -> Option<SessionToolPolicy> {
         .cloned()
 }
 
-/// Whether the session's tool policy disables `name` for `session_id`. Mirrors
-/// the allow/deny logic in [`Registry::execute`] so callers can skip work for
-/// tools the session cannot actually invoke. Used to (a) gate the Compass
-/// pre-warm on session bind, and (b) decide whether the agentgrep→compass_query
-/// enforcement redirect is safe (i.e. `compass_query` is actually invokable).
-pub(crate) fn session_tool_is_disabled(session_id: &str, name: &str) -> bool {
-    let Some(policy) = session_tool_policy(session_id) else {
-        return false;
-    };
-    if tool_name_is_disabled(&policy.disabled_tools, name) {
-        return true;
-    }
-    if let Some(allowed) = policy.allowed_tools.as_ref() {
-        // If a caller-facing allow-list is present, disabled unless named.
-        !tool_name_is_allowed(allowed, name)
-    } else {
-        false
-    }
-}
-
 /// Apply the current session policy to an MCP server tool invoked through a
 /// fixed deferred surface. Explicitly enabling the fixed surface authorizes its
 /// underlying MCP calls, while per-tool allow/deny entries remain effective.
@@ -175,110 +154,6 @@ fn accepts_large_output(input: &Value) -> bool {
         Some(Value::String(raw)) => raw.trim().eq_ignore_ascii_case("true"),
         _ => false,
     }
-}
-
-/// The input key that disables the "redirect agentgrep to compass_query"
-/// enforcement for a single call. Mirrored in the agentgrep schema.
-const AGENTGREP_RAW_FALLBACK_KEY: &str = "allow_raw_fallback";
-
-/// Whether an agentgrep call explicitly opted out of `compass_query`-first
-/// enforcement. This is the caller's documented escape hatch for searches that
-/// Compass cannot serve: building outputs, logs, and files outside the indexed
-/// tree (see the redirected message and the agentgrep schema).
-fn agentgrep_requests_raw_fallback(input: &Value) -> bool {
-    match input.get(AGENTGREP_RAW_FALLBACK_KEY) {
-        Some(Value::Bool(opted_out)) => *opted_out,
-        Some(Value::String(raw)) => raw.trim().eq_ignore_ascii_case("true"),
-        _ => false,
-    }
-}
-
-/// Whether an agentgrep call is a full-text/pattern grep search (mode "grep"
-/// or omitted, which defaults to grep). Filename (`find`), single-file
-/// (`outline`), and relationship (`trace`) lookups are distinct operations that
-/// Compass's semantic search does not replace, so enforcement targets only the
-/// grep mode.
-fn agentgrep_call_is_grep_mode(input: &Value) -> bool {
-    match input.get("mode").and_then(|v| v.as_str()) {
-        Some(m) => m.eq_ignore_ascii_case("grep"),
-        None => true,
-    }
-}
-
-/// The redirecting output returned when an `agentgrep` call is intercepted by
-/// the `compass_query`-first code-enforcement tier. It explains why grep did
-/// not run, directs the model to `compass_query`, and gives the explicit,
-/// self-documenting escape hatch (retry with `allow_raw_fallback`) for searches
-/// that genuinely need raw grep.
-fn compass_redirect_output(input: &Value) -> ToolOutput {
-    let query = input
-        .get("query")
-        .or_else(|| input.get("pattern")) // legacy grep-alias calls pass `pattern`
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    let query_text = if query.trim().is_empty() {
-        String::new()
-    } else {
-        format!(" (query: {})", truncate_middle(query, 200))
-    };
-    // Preserve explicit search filters so the follow-up compass_query stays
-    // confined to the same subset the grep call was targeting.
-    //
-    // Only `path` maps cleanly onto `compass_query`'s `path` filter (a file or
-    // directory substring). `glob` is a filename pattern that has no direct
-    // compass_query equivalent, so it is surfaced separately as a narrowing
-    // hint rather than as a `path` value the model would blindly re-use.
-    let path = input
-        .get("path")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty());
-    let glob = input
-        .get("glob")
-        .or_else(|| input.get("include")) // legacy grep-alias calls pass `include`
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty());
-    let path_text = path
-        .map(|s| format!(", keeping the search path `{}`", truncate_middle(s, 120)))
-        .unwrap_or_default();
-    let glob_text = glob
-        .map(|s| format!(", and only files matching `{}`", truncate_middle(s, 120)))
-        .unwrap_or_default();
-    ToolOutput::new(format!(
-        "⚠️ `agentgrep` was intercepted before running: `compass_query` is available \
-         for this workspace and must be attempted before raw grep.\n\n\
-         Do not repeat this `agentgrep` call unchanged. Instead call `compass_query` \
-         with the same intent (natural language query + optional `path`{path_text}) to search the \
-         code graph first{query_text}{glob_text}. The first call may build the index for this \
-         workspace; that is expected.\n\n\
-         Only if `compass_query` genuinely cannot answer (for example you need to search \
-         files outside the indexed tree, build outputs, or logs; or the index fails to \
-         build) retry `agentgrep` with `\"allow_raw_fallback\": true` to force raw grep \
-         for this one call."
-    ))
-    .with_title("agentgrep redirected to compass_query")
-    .with_metadata(serde_json::json!({
-        "redirected_to": "compass_query",
-        "reason": "compass-first enforcement",
-    }))
-}
-
-fn truncate_middle(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    // Below 3 chars the ellipsis itself cannot fit, so fall back to a plain
-    // prefix to preserve the invariant that the result is at most `max` chars.
-    if max < 3 {
-        return s.chars().take(max).collect();
-    }
-    let half = (max.saturating_sub(3)) / 2;
-    let mut prefix: Vec<char> = s.chars().take(half).collect();
-    let mut suffix: Vec<char> = s.chars().rev().take(half).collect();
-    suffix.reverse();
-    let mut out: String = prefix.drain(..).collect();
-    out.push_str("...");
-    out.push_str(&suffix.iter().collect::<String>());
-    out
 }
 
 /// Registry of available tools (Arc-wrapped for sharing)
@@ -354,12 +229,6 @@ impl Registry {
                 &mut timings,
                 "agentgrep",
                 agentgrep::AgentGrepTool::new,
-            );
-            Self::insert_tool_timed(
-                &mut m,
-                &mut timings,
-                "compass_query",
-                compass_query::CompassQueryTool::new,
             );
             Self::insert_tool_timed(
                 &mut m,
@@ -806,18 +675,8 @@ impl Registry {
         // interrupted one and inject a duplicate synthetic result. See
         // `tool::inflight`.
         let _in_flight = inflight::mark_tool_in_flight(&ctx.tool_call_id);
-        // Resolve the canonical tool name up front (pure, no lock needed) so we
-        // can snapshot the compass-first enforcement flag for agentgrep calls
-        // before taking the tools lock. `config()` can trigger a reload (disk
-        // read + listener dispatch) on a cold or stale cache, and doing that
-        // while holding the read lock would risk a deadlock if a reload listener
-        // ever re-entered the tool registry. Keeping this snapshot to the
-        // agentgrep path also avoids paying a config read on every unrelated
-        // tool call.
-        let resolved_name = Self::resolve_tool_name(name);
-        let prefer_compass_query = resolved_name == "agentgrep"
-            && crate::config::config().tools.prefer_compass_query;
         let tools = self.tools.read().await;
+        let resolved_name = Self::resolve_tool_name(name);
         if let Some(policy) = session_tool_policy(&ctx.session_id) {
             if let Some(allowed) = policy.allowed_tools.as_ref()
                 && !tool_name_is_allowed(allowed, resolved_name)
@@ -845,72 +704,7 @@ impl Registry {
             }
         };
 
-        // Code-enforcement tier for the "use `compass_query` before `agentgrep`"
-        // guidance. The prompt tier only *asks* the model to try semantic search
-        // first; this tier makes it impossible for an `agentgrep` call to run grep
-        // when a Compass index is available, guaranteeing `compass_query` is
-        // attempted before raw grep at the tool level.
-        //
-        // Enforcement is deliberately skipped when:
-        //   - the caller passed the explicit `allow_raw_fallback` bypass flag
-        //     (agentgrep's documented escape hatch for building outputs, logs,
-        //     and files outside the indexed tree);
-        //   - the call is not a full-text grep search (find/outline/trace are
-        //     distinct operations compass does not replace);
-        //   - `compass_query` is not authoritative here: it is not registered
-        //     (removed/unknown) or the session tool policy disables it, so
-        //     redirecting the call would dead-end the model against a tool it
-        //     cannot actually invoke; or
-        //   - the session has no working directory to search (compass_query
-        //     requires one and would otherwise only error); or
-        //   - the operator opted out via `tools.prefer_compass_query = false`.
-        //
-        // The interception sits before the `pre_tool` policy hook because a
-        // redirected call executes no tool and so has nothing for the gate to
-        // block; the model's follow-up `compass_query` (or bypassed agentgrep)
-        // is what the hook gates. If enforcement ever needs the pre_tool gate
-        // to observe the original grep intent, move this block to after it.
-        if resolved_name == "agentgrep"
-            && prefer_compass_query
-            && !agentgrep_requests_raw_fallback(&input)
-            // Only full-text grep searches are redirected; find/outline/trace
-            // are distinct operations compass does not replace.
-            && agentgrep_call_is_grep_mode(&input)
-            && tools.contains_key("compass_query")
-            && !session_tool_is_disabled(&ctx.session_id, "compass_query")
-            // `compass_query` needs a real workspace to search (it fails with
-            // "requires a working directory" otherwise). In a session with no
-            // working dir there is nothing to index, so redirecting would send
-            // the model to a tool that can only error; let agentgrep run instead.
-            && ctx.working_dir.is_some()
-        {
-            // Release the tools read lock before running the observer/telemetry
-            // hooks, matching the normal execution path (which drops it before
-            // any post-processing). This keeps the guard scoped to the lookup so
-            // a future hook change that re-enters the registry can't deadlock.
-            drop(tools);
-            let redirect = compass_redirect_output(&input);
-            // Route the interception through the same observer/telemetry
-            // surfaces as a normal tool outcome so dashboards, hooks, and the
-            // session tool-usage counters all see the redirected call (recorded
-            // as successful, since it resolved to a coherent result), rather
-            // than treating it as a silent short-circuit.
-            crate::telemetry::record_tool_execution(resolved_name, &input, true, 0);
-            Self::fire_post_tool_hook(resolved_name, &ctx, &Ok(redirect.clone()), 0);
-            crate::logging::event_info(
-                "TOOL_LIFECYCLE",
-                Self::tool_lifecycle_fields(
-                    "redirected_to_compass",
-                    name,
-                    resolved_name,
-                    &input,
-                    &ctx,
-                ),
-            );
-            return Ok(redirect);
-        }
-
-        // (Not on the redirect path) drop the lock before executing
+        // Drop the lock before executing
         drop(tools);
 
         // User-configured pre_tool gate: external policy hook that can block
@@ -1121,18 +915,6 @@ impl Registry {
             title: output.title,
             metadata: output.metadata,
             images: output.images,
-        }
-    }
-
-    /// Whether a tool is safe to execute concurrently with sibling calls in the
-    /// same agent step. Read-only inspection tools opt in via
-    /// [`Tool::concurrency_safe_marker`]; every other tool (the default) is
-    /// unsafe and the loop runs it strictly sequentially.
-    pub async fn is_concurrency_safe(&self, name: &str) -> bool {
-        let tools = self.tools.read().await;
-        match tools.get(Self::resolve_tool_name(name)) {
-            Some(tool) => tool.concurrency_safe_marker(),
-            None => false,
         }
     }
 

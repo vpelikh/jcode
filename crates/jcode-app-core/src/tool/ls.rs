@@ -53,11 +53,6 @@ impl Tool for LsTool {
         "List directory contents."
     }
 
-    fn concurrency_safe_marker(&self) -> bool {
-        // Read-only: pure function of its input plus the filesystem.
-        true
-    }
-
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",

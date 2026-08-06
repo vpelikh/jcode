@@ -20,13 +20,6 @@ pub(crate) struct FramePerfStats {
     pub full_prep_batch_ms: f64,
     pub full_prep_streaming_ms: f64,
     pub full_prep_compose_ms: f64,
-    /// Diagnostic: time building the pinned-inline/anchor-images section
-    /// (previously untimed), one average per frame.
-    pub full_prep_inline_ms: f64,
-    /// Diagnostic: total wall time of one `prepare_messages_inner` call,
-    /// accumulated. `total_inner - (header+body+batch+streaming+compose+inline)`
-    /// exposes any remaining un-attributed cost inside the function.
-    pub full_prep_total_inner_ms: f64,
     pub full_prep_last_path: String,
     pub full_prep_last_prepared_bytes: usize,
     pub full_prep_last_total_wrapped_lines: usize,
@@ -352,14 +345,6 @@ pub(super) struct FullPrepPhaseMetrics {
     pub batch_ms: f64,
     pub streaming_ms: f64,
     pub compose_ms: f64,
-    /// Time spent building the pinned-inline/anchor-images section (previously
-    /// untimed). Diagnostic: helps attribute the un-timed ~47 ms of
-    /// `prepare_messages_inner` during streaming.
-    pub inline_ms: f64,
-    /// Total wall time of one `prepare_messages_inner` call.
-    /// Diagnostic: `total_inner_ms - (header+body+batch+streaming+compose+inline)`
-    /// exposes any remaining un-attributed cost in the function.
-    pub total_inner_ms: f64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -583,8 +568,6 @@ pub(super) fn note_full_prep_phase_metrics(metrics: FullPrepPhaseMetrics) {
         stats.full_prep_batch_ms += metrics.batch_ms;
         stats.full_prep_streaming_ms += metrics.streaming_ms;
         stats.full_prep_compose_ms += metrics.compose_ms;
-        stats.full_prep_inline_ms += metrics.inline_ms;
-        stats.full_prep_total_inner_ms += metrics.total_inner_ms;
     });
 }
 

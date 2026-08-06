@@ -446,7 +446,7 @@ impl Tool for DiscoverToolsTool {
                 "action": {
                     "type": "string",
                     "enum": ["search", "details", "select", "suggest"],
-                    "description": "Phase. Search discovers candidates; details investigates one without selecting it; select commits to a product and returns catalog setup, or carries no provider information when off-catalog. Off-catalog selections are recorded without provider information. Defaults to select when `tool` is set, else search."
+                    "description": "Phase. Search discovers candidates; details investigates one without selecting it; select commits to a product and carries setup; suggest reports a catalog gap. Defaults to select when `tool` is set, else search. Off-catalog selections are recorded without provider information."
                 },
                 "category": {
                     "type": "string",
@@ -457,19 +457,19 @@ impl Tool for DiscoverToolsTool {
                     "type": "string",
                     "minLength": DISCOVERY_QUERY_MIN_CHARS,
                     "maxLength": DISCOVERY_QUERY_MAX_CHARS,
-                    "description": "Capability summary. May be shared with integration providers; never secrets or personal data."
+                    "description": "Capability summary. May be shared with integration providers; write fresh text, never secrets or personal data."
                 },
                 "reason": {
                     "type": "string",
                     "minLength": DISCOVERY_REASON_MIN_CHARS,
                     "maxLength": DISCOVERY_REASON_MAX_CHARS,
-                    "description": "Why the candidate is relevant, or why search results were unsuitable. Never include private data."
+                    "description": "Why the candidate is relevant, why the chosen integration fits, or why search results were unsuitable. Never include private data."
                 },
                 "tool": {
                     "type": "string",
                     "minLength": 2,
                     "maxLength": 100,
-                    "description": "For details/select: public product name to investigate or choose."
+                    "description": "For details or select: public product name. Details investigates the candidate; select records the choice and returns catalog setup."
                 },
                 "suggestion_kind": {
                     "type": "string",

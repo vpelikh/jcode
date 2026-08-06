@@ -8,7 +8,7 @@ use crate::tui::backend::{RemoteConnection, RemoteDisconnectReason};
 use anyhow::Result;
 use crossterm::event::EventStream;
 use futures::StreamExt;
-use crate::tui::terminal_writer::AppTerminal;
+use ratatui::DefaultTerminal;
 use std::time::{Duration, Instant};
 use tokio::time::MissedTickBehavior;
 
@@ -207,7 +207,7 @@ pub(in crate::tui::app) fn should_use_same_session_fast_path(
 
 async fn wait_for_reload_handoff_before_reconnect(
     app: &mut App,
-    terminal: &mut AppTerminal,
+    terminal: &mut DefaultTerminal,
     event_stream: &mut EventStream,
     state: &mut RemoteRunState,
 ) -> Result<Option<ConnectOutcome>> {
@@ -304,7 +304,7 @@ async fn wait_for_reload_handoff_before_reconnect(
 
 async fn recover_reloading_server(
     app: &mut App,
-    terminal: &mut AppTerminal,
+    terminal: &mut DefaultTerminal,
     state: &mut RemoteRunState,
     detail: &str,
 ) -> Result<bool> {
@@ -353,7 +353,7 @@ async fn recover_reloading_server(
 
 pub(in crate::tui::app) async fn connect_with_retry(
     app: &mut App,
-    terminal: &mut AppTerminal,
+    terminal: &mut DefaultTerminal,
     event_stream: &mut EventStream,
     state: &mut RemoteRunState,
     session_to_resume: Option<&str>,

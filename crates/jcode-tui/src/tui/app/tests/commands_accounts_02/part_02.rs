@@ -3,14 +3,6 @@ fn test_improve_mode_persists_in_session_file() {
     with_temp_jcode_home(|| {
         let mut session = crate::session::Session::create(None, None);
         session.improve_mode = Some(crate::session::SessionImproveMode::ImprovePlan);
-        // Add a message so save() does not early-return (persist guard).
-        session.add_message(
-            crate::message::Role::User,
-            vec![crate::message::ContentBlock::Text {
-                text: "placeholder".to_string(),
-                cache_control: None,
-            }],
-        );
         let session_id = session.id.clone();
         session.save().expect("save session");
 

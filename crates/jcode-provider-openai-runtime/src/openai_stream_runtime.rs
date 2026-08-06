@@ -121,49 +121,13 @@ pub(super) async fn stream_response(
     let connect_start = std::time::Instant::now();
     let idle_timeout = effective_https_idle_timeout(&request);
 
-    // Surface the upload size right away so a long "sending context" phase is
-    // explainable (large payload draining on a slow uplink).
-    let payload = serde_json::to_vec(&request).unwrap_or_default();
-    let payload_bytes = payload.len() as u64;
-    if payload_bytes > 0 {
-        emit_status_detail(
-            &tx,
-            format!(
-                "sending {}",
-                jcode_provider_core::transport::readable_bytes(payload_bytes)
-            ),
-        )
-        .await;
-    }
-
-    let upload_tx = tx.clone();
-    let response =
-        jcode_provider_core::transport::send_body_with_upload_progress(
-            builder,
-            payload,
-            idle_timeout,
-            move |sent| {
-                let detail = jcode_provider_core::transport::upload_progress_label(
-                    sent,
-                    payload_bytes,
-                );
-                if !detail.is_empty() {
-                    let _ = upload_tx.try_send(Ok(StreamEvent::StatusDetail {
-                        detail,
-                    }));
-                }
-            },
-            |msg: &str| {
-                let tx = tx.clone();
-                let msg = msg.to_string();
-                async move {
-                    emit_status_detail(&tx, msg).await;
-                }
-            },
-        )
-        .await
-        .context("Failed to send request to OpenAI API")
-        .map_err(OpenAIStreamFailure::Other)?;
+    let response = jcode_provider_core::transport::send_with_initial_response_timeout(
+        builder.json(&request),
+        idle_timeout,
+    )
+    .await
+    .context("Failed to send request to OpenAI API")
+    .map_err(OpenAIStreamFailure::Other)?;
 
     let connect_ms = connect_start.elapsed().as_millis();
     jcode_base::logging::info(&format!(
@@ -259,43 +223,11 @@ pub(super) async fn stream_response(
             }
         }
 
-        // A 422 from an OpenAI-compatible endpoint with a token-limit body is a
-        // transient exhaustion (the request was well-formed, but the completion
-        // token cap would be exceeded), not a permanent rejection. Retrying
-        // after a short wait usually succeeds once the provider's quota frees
-        // up. Gated by `is_token_limit_error` so unrelated 422s
-        // (malformed requests, tool-schema rejections, etc.) are NOT retried.
-        //
-        // The message is routed through the rate-limit renderer so a wait hint
-        // (from a Retry-After header or parsed out of the body) is surfaced to
-        // the user, and so it carries the "rate limit" marker the outer retry
-        // classifier needs to retry even when no wait time could be parsed.
-        let token_limit_422 = status == StatusCode::UNPROCESSABLE_ENTITY
-            && jcode_provider_core::token_limit::is_token_limit_error(&body);
-        let token_limit_wait = if token_limit_422 {
-            jcode_provider_core::token_limit::extract_wait_time(&body)
-        } else {
-            None
-        };
-
-        let msg = if status == StatusCode::TOO_MANY_REQUESTS || token_limit_422 {
-            // Prefer an explicit Retry-After header; fall back to the wait
-            // parsed from the token-limit body for display.
-            let display_hint = retry_after.map(|hint| hint.remaining()).or(token_limit_wait);
-            format_rate_limit_error(&body, display_hint)
+        // For rate limits, format structured payloads into a readable message.
+        let msg = if status == StatusCode::TOO_MANY_REQUESTS {
+            format_rate_limit_error(&body, retry_after.map(|hint| hint.remaining()))
         } else {
             format!("OpenAI API error {}: {}", status, body)
-        };
-
-        // Carry a retry hint to the outer retry loop. When the wait came out of
-        // the body (no header), synthesize a RetryAfter from it so the loop
-        // honours the provider's suggested wait instead of plain backoff.
-        let retry_after = match (retry_after, token_limit_wait) {
-            (Some(_), _) => retry_after,
-            (None, Some(hint)) => Some(
-                jcode_provider_core::retry_after::RetryAfter::from_duration(hint),
-            ),
-            (None, None) => None,
         };
         return Err(OpenAIStreamFailure::Other(
             jcode_provider_core::retry_after::error_with_retry_after(msg, retry_after),
@@ -1712,25 +1644,6 @@ mod stream_runtime_tests {
         assert!(is_retryable_error("429 too many requests"));
         assert!(is_retryable_error("rate limit exceeded"));
         assert!(is_retryable_error("rate_limit_exceeded"));
-    }
-
-    #[test]
-    fn token_limit_422_message_is_retryable() {
-        // A 422 token-limit exhaustion is transient, not a permanent rejection.
-        // The message is rendered through the rate-limit path, which carries
-        // the "rate limit" marker the classifier needs.
-        // The production retry loop lowercases the error before classification.
-        let rendered = format_rate_limit_error(
-            "Token limit exceeded: used 60323, limit 60000. Retry in 18 min.",
-            Some(Duration::from_secs(18 * 60)),
-        );
-        assert!(is_retryable_error(&rendered.to_lowercase()));
-
-        let rendered_ru = format_rate_limit_error(
-            "Превышен лимит completion-токенов: использовано 60323, лимит 60000. Повторите попытку через 18 мин.",
-            None,
-        );
-        assert!(is_retryable_error(&rendered_ru.to_lowercase()));
     }
 
     #[test]

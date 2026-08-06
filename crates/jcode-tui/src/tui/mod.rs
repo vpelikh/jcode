@@ -31,9 +31,6 @@ pub mod backend;
 pub(crate) mod color_support;
 mod core;
 pub(crate) mod fuzzy;
-// The TUI render path writes through a dedicated writer thread (see
-// `terminal_writer`) so a wedged pty can never freeze the single render loop.
-pub mod terminal_writer;
 // Terminal image display + metadata helpers now live in the dependency-free
 // `jcode-terminal-image` crate (shared with the `read` tool). Re-exported here
 // so existing `crate::tui::image` / `crate::tui::image_metadata` paths keep working.

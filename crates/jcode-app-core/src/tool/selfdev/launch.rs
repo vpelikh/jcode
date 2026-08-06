@@ -28,7 +28,6 @@ pub fn enter_selfdev_session(
                 child.memory_injections = parent.memory_injections.clone();
                 child.replay_events = parent.replay_events.clone();
                 inherited_context = true;
-                child.rebuild_event_map();
                 child
             }
             Err(err) => {

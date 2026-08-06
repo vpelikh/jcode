@@ -1102,7 +1102,7 @@ mod tests {
             "Do not ask the user",
         ] {
             assert!(
-                crate::todo::PRE_CONCISE_TODO_INTENT_UNDERSTANDING_CONTINUATION_MESSAGE
+                crate::todo::TODO_INTENT_UNDERSTANDING_CONTINUATION_MESSAGE
                     .contains(required_concept),
                 "intent gate message omitted {required_concept}"
             );
@@ -1129,7 +1129,7 @@ mod tests {
             "non-testable requirements",
         ] {
             assert!(
-                crate::todo::PRE_BUDGET_TODO_CLOSED_FEEDBACK_LOOP_CONTINUATION_MESSAGE
+                crate::todo::TODO_CLOSED_FEEDBACK_LOOP_CONTINUATION_MESSAGE
                     .contains(required_concept),
                 "feedback gate message omitted {required_concept}"
             );

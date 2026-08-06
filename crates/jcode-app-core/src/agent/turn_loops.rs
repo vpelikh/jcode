@@ -1,6 +1,5 @@
 use super::*;
 use crate::{terminal_eprintln as eprintln, terminal_print as print, terminal_println as println};
-use crate::tool::ToolOutput;
 
 impl Agent {
     /// Run turns until no more tool calls
@@ -914,11 +913,6 @@ impl Agent {
 
             // Execute tools and add results
             let mut tool_results_dirty = false;
-            // Pass 1: validate, commit SDK-served results, and build contexts for
-            // locally executed calls. SDK results and validation errors are
-            // committed inline (in original order); local calls are collected and
-            // dispatched by their concurrency class below.
-            let mut local_calls: Vec<(ToolCall, ToolContext)> = Vec::new();
             for tc in tool_calls {
                 let message_id = assistant_message_id
                     .clone()
@@ -955,18 +949,17 @@ impl Agent {
                 let is_native_tool = JCODE_NATIVE_TOOLS.contains(&tc.name.as_str());
 
                 // Check if SDK already executed this tool
-                let use_sdk = match sdk_tool_results.remove(&tc.id) {
+                if let Some((sdk_content, sdk_is_error)) = sdk_tool_results.remove(&tc.id) {
                     // For native tools, ignore SDK errors and execute locally
-                    Some((_sdk_content, sdk_is_error)) if is_native_tool && sdk_is_error => {
+                    if is_native_tool && sdk_is_error {
                         if trace {
                             eprintln!(
                                 "[trace] sdk_error_for_native_tool name={} id={}, executing locally",
                                 tc.name, tc.id
                             );
                         }
-                        false
-                    }
-                    Some((sdk_content, sdk_is_error)) => {
+                        // Fall through to local execution below
+                    } else {
                         if trace {
                             eprintln!(
                                 "[trace] using_sdk_result name={} id={} is_error={}",
@@ -1000,21 +993,17 @@ impl Agent {
                         self.add_message(
                             Role::User,
                             vec![ContentBlock::ToolResult {
-                                tool_use_id: tc.id.clone(),
+                                tool_use_id: tc.id,
                                 content: sdk_content,
                                 is_error: if sdk_is_error { Some(true) } else { None },
                             }],
                         );
                         tool_results_dirty = true;
-                        true
+                        continue;
                     }
-                    None => false,
-                };
-                if use_sdk {
-                    continue;
                 }
 
-                // SDK didn't execute this tool; run it locally.
+                // SDK didn't execute this tool, run it locally
                 if print_output {
                     print!("\n  → ");
                     io::stdout().flush()?;
@@ -1029,30 +1018,110 @@ impl Agent {
                     graceful_shutdown_signal: Some(self.graceful_shutdown.clone()),
                     execution_mode: ToolExecutionMode::AgentTurn,
                 };
-                local_calls.push((tc, ctx));
-            }
 
-            // Pass 2: dispatch. Concurrency-safe calls run as a parallel batch,
-            // but a batch is flushed (and committed in original order) the moment
-            // an unsafe call appears, so tool-result blocks always land in the
-            // model's tool-call order. Unsafe calls run strictly sequentially
-            // inline. This preserves the original "commit every call in call
-            // order" contract while still parallelizing adjacent read-only calls.
-            let mut safe_calls: Vec<(ToolCall, ToolContext)> = Vec::new();
-            for (tc, ctx) in local_calls {
-                if self.registry.is_concurrency_safe(&tc.name).await {
-                    safe_calls.push((tc, ctx));
-                } else {
-                    self.flush_concurrency_safe(std::mem::take(&mut safe_calls), assistant_message_id.as_deref()).await;
-                    tool_results_dirty = true;
-                    self.execute_tool_locally(tc, ctx, print_output, trace, assistant_message_id.as_deref())
-                        .await;
-                    tool_results_dirty = true;
+                if trace {
+                    eprintln!("[trace] tool_exec_start name={} id={}", tc.name, tc.id);
                 }
-            }
-            if !safe_calls.is_empty() {
-                self.flush_concurrency_safe(std::mem::take(&mut safe_calls), assistant_message_id.as_deref()).await;
-                tool_results_dirty = true;
+                Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
+                    session_id: self.session.id.clone(),
+                    message_id: message_id.clone(),
+                    tool_call_id: tc.id.clone(),
+                    tool_name: tc.name.clone(),
+                    status: ToolStatus::Running,
+                    intent: tc.intent.clone(),
+                    title: None,
+                }));
+
+                logging::info(&format!("Tool starting: {}", tc.name));
+                let tool_start = Instant::now();
+
+                // Publish status for TUI to show during Task execution
+                Bus::global().publish(BusEvent::SubagentStatus(SubagentStatus {
+                    session_id: self.session.id.clone(),
+                    status: format!("running {}", tc.name),
+                    model: Some(self.provider.model()),
+                }));
+
+                let result = self.registry.execute(&tc.name, tc.input.clone(), ctx).await;
+                crate::telemetry::record_tool_call();
+                self.unlock_tools_if_needed(&tc.name);
+                let tool_elapsed = tool_start.elapsed();
+                logging::info(&format!(
+                    "Tool finished: {} in {:.2}s",
+                    tc.name,
+                    tool_elapsed.as_secs_f64()
+                ));
+
+                match result {
+                    Ok(output) => {
+                        let output = cap_tool_output_for_history(&tc.name, output);
+                        Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
+                            session_id: self.session.id.clone(),
+                            message_id: message_id.clone(),
+                            tool_call_id: tc.id.clone(),
+                            tool_name: tc.name.clone(),
+                            status: ToolStatus::Completed,
+                            intent: tc.intent.clone(),
+                            title: output.title.clone(),
+                        }));
+
+                        if trace {
+                            eprintln!(
+                                "[trace] tool_exec_done name={} id={}\n{}",
+                                tc.name, tc.id, output.output
+                            );
+                        }
+                        if print_output {
+                            let preview = if output.output.len() > 200 {
+                                format!("{}...", crate::util::truncate_str(&output.output, 200))
+                            } else {
+                                output.output.clone()
+                            };
+                            println!("{}", preview.lines().next().unwrap_or("(done)"));
+                        }
+
+                        let blocks = tool_output_to_content_blocks(tc.id, output);
+                        self.add_message_with_duration(
+                            Role::User,
+                            blocks,
+                            Some(tool_elapsed.as_millis() as u64),
+                        );
+                        tool_results_dirty = true;
+                    }
+                    Err(e) => {
+                        crate::telemetry::record_tool_failure();
+                        Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
+                            session_id: self.session.id.clone(),
+                            message_id: message_id.clone(),
+                            tool_call_id: tc.id.clone(),
+                            tool_name: tc.name.clone(),
+                            status: ToolStatus::Error,
+                            intent: tc.intent.clone(),
+                            title: None,
+                        }));
+
+                        let error_msg = format!("Error: {}", e);
+                        if trace {
+                            eprintln!(
+                                "[trace] tool_exec_error name={} id={} {}",
+                                tc.name, tc.id, error_msg
+                            );
+                        }
+                        if print_output {
+                            println!("{}", error_msg);
+                        }
+                        self.add_message_with_duration(
+                            Role::User,
+                            vec![ContentBlock::ToolResult {
+                                tool_use_id: tc.id,
+                                content: error_msg,
+                                is_error: Some(true),
+                            }],
+                            Some(tool_elapsed.as_millis() as u64),
+                        );
+                        tool_results_dirty = true;
+                    }
+                }
             }
 
             if tool_results_dirty {
@@ -1083,203 +1152,6 @@ impl Agent {
         }
 
         Ok(final_text)
-    }
-
-    /// Run a batch of concurrency-safe calls together, then commit each result
-    /// in the original call order. Used by the mixed-order dispatch in `run_turn`
-    /// so read-only calls parallelize but still land in the model's tool-call
-    /// order relative to any sequential calls around them.
-    async fn flush_concurrency_safe(
-        &mut self,
-        safe_calls: Vec<(ToolCall, ToolContext)>,
-        assistant_message_id: Option<&str>,
-    ) {
-        if safe_calls.is_empty() {
-            return;
-        }
-        let message_id = assistant_message_id
-            .map(str::to_string)
-            .unwrap_or_else(|| self.session.id.clone());
-        for (tc, _ctx) in &safe_calls {
-            Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
-                session_id: self.session.id.clone(),
-                message_id: message_id.clone(),
-                tool_call_id: tc.id.clone(),
-                tool_name: tc.name.clone(),
-                status: ToolStatus::Running,
-                intent: tc.intent.clone(),
-                title: None,
-            }));
-        }
-
-        let registry = self.registry.clone();
-        let executed: Vec<(ToolCall, ToolContext, Result<ToolOutput>, std::time::Duration)> =
-            futures::future::join_all(safe_calls.into_iter().map(|(tc, ctx)| {
-                let registry = registry.clone();
-                let name = tc.name.clone();
-                let input = tc.input.clone();
-                let start = std::time::Instant::now();
-                async move {
-                    let result = registry.execute(&name, input, ctx.clone()).await;
-                    (tc, ctx, result, start.elapsed())
-                }
-            }))
-            .await;
-
-        for (tc, ctx, result, elapsed) in executed {
-            // Mirror the per-call bookkeeping the sequential path performs: every
-            // executed call is counted in telemetry and may release tools (e.g. an
-            // `mcp` reconnect). Skipping these in the parallel path would under-
-            // count tool usage and starve the lock released by `mcp`.
-            crate::telemetry::record_tool_call();
-            self.unlock_tools_if_needed(&tc.name);
-            self.commit_tool_result(tc, ctx, result, false, false, assistant_message_id, elapsed);
-        }
-    }
-
-    /// Run one local tool call to completion and append its result, in order.
-    ///
-    /// Used for tools that are not safe to run concurrently (writes,
-    /// subprocesses, anything mutating shared state). Each call runs strictly
-    /// sequentially so ordering and side effects stay deterministic.
-    async fn execute_tool_locally(
-        &mut self,
-        tc: ToolCall,
-        ctx: ToolContext,
-        print_output: bool,
-        trace: bool,
-        assistant_message_id: Option<&str>,
-    ) {
-        let message_id = assistant_message_id
-            .map(str::to_string)
-            .unwrap_or_else(|| self.session.id.clone());
-
-        if trace {
-            eprintln!("[trace] tool_exec_start name={} id={}", tc.name, tc.id);
-        }
-        Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
-            session_id: self.session.id.clone(),
-            message_id: message_id.clone(),
-            tool_call_id: tc.id.clone(),
-            tool_name: tc.name.clone(),
-            status: ToolStatus::Running,
-            intent: tc.intent.clone(),
-            title: None,
-        }));
-
-        logging::info(&format!("Tool starting: {}", tc.name));
-        let tool_start = Instant::now();
-
-        // Publish status for TUI to show during Task execution
-        Bus::global().publish(BusEvent::SubagentStatus(SubagentStatus {
-            session_id: self.session.id.clone(),
-            status: format!("running {}", tc.name),
-            model: Some(self.provider.model()),
-        }));
-
-        let result = self.registry.execute(&tc.name, tc.input.clone(), ctx.clone()).await;
-        crate::telemetry::record_tool_call();
-        self.unlock_tools_if_needed(&tc.name);
-        let tool_elapsed = tool_start.elapsed();
-        logging::info(&format!(
-            "Tool finished: {} in {:.2}s",
-            tc.name,
-            tool_elapsed.as_secs_f64()
-        ));
-
-        self.commit_tool_result(tc, ctx, result, print_output, trace, assistant_message_id, tool_elapsed);
-    }
-
-    /// Append a tool call's result: publish the done/error events, print the
-    /// preview, and add the tool-result blocks to the session. Shared by the
-    /// sequential and parallel paths so both produce identical history and UI
-    /// output. For the parallel path (`print_output == false`) the per-call
-    /// Running event, telemetry, and tool unlock are handled by the caller
-    /// (`flush_concurrency_safe`) so they run once per call rather than once per
-    /// batch.
-    fn commit_tool_result(
-        &mut self,
-        tc: ToolCall,
-        _ctx: ToolContext,
-        result: Result<ToolOutput>,
-        print_output: bool,
-        trace: bool,
-        assistant_message_id: Option<&str>,
-        elapsed: std::time::Duration,
-    ) {
-        let message_id = assistant_message_id
-            .map(str::to_string)
-            .unwrap_or_else(|| self.session.id.clone());
-        let tool_elapsed = elapsed;
-
-        match result {
-            Ok(output) => {
-                let output = cap_tool_output_for_history(&tc.name, output);
-                Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
-                    session_id: self.session.id.clone(),
-                    message_id: message_id.clone(),
-                    tool_call_id: tc.id.clone(),
-                    tool_name: tc.name.clone(),
-                    status: ToolStatus::Completed,
-                    intent: tc.intent.clone(),
-                    title: output.title.clone(),
-                }));
-
-                if trace {
-                    eprintln!(
-                        "[trace] tool_exec_done name={} id={}\n{}",
-                        tc.name, tc.id, output.output
-                    );
-                }
-                if print_output {
-                    let preview = if output.output.len() > 200 {
-                        format!("{}...", crate::util::truncate_str(&output.output, 200))
-                    } else {
-                        output.output.clone()
-                    };
-                    println!("{}", preview.lines().next().unwrap_or("(done)"));
-                }
-
-                let blocks = tool_output_to_content_blocks(tc.id, output);
-                self.add_message_with_duration(
-                    Role::User,
-                    blocks,
-                    Some(tool_elapsed.as_millis() as u64),
-                );
-            }
-            Err(e) => {
-                crate::telemetry::record_tool_failure();
-                Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
-                    session_id: self.session.id.clone(),
-                    message_id: message_id.clone(),
-                    tool_call_id: tc.id.clone(),
-                    tool_name: tc.name.clone(),
-                    status: ToolStatus::Error,
-                    intent: tc.intent.clone(),
-                    title: None,
-                }));
-
-                let error_msg = format!("Error: {}", e);
-                if trace {
-                    eprintln!(
-                        "[trace] tool_exec_error name={} id={} {}",
-                        tc.name, tc.id, error_msg
-                    );
-                }
-                if print_output {
-                    println!("{}", error_msg);
-                }
-                self.add_message_with_duration(
-                    Role::User,
-                    vec![ContentBlock::ToolResult {
-                        tool_use_id: tc.id,
-                        content: error_msg,
-                        is_error: Some(true),
-                    }],
-                    Some(tool_elapsed.as_millis() as u64),
-                );
-            }
-        }
     }
 
     pub(super) fn messages_end_with_tool_result(messages: &[Message]) -> bool {

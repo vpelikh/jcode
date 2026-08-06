@@ -5,192 +5,6 @@ use super::*;
 /// helps; hopping to the strongest Anthropic route often does.
 const GUARDRAIL_REROUTE_MODEL: &str = "claude-opus-4-8";
 
-/// Extract a provider-suggested retry wait from a token-limit / rate-limit
-/// error message.
-///
-/// The OpenAI-compatible runtimes surface a parsed wait in two possible forms
-/// into the error text:
-/// - a compact "Retry after 6m" / "Retry after 45s" suffix (from the rate-limit
-///   renderer), or
-/// - the raw provider body (e.g. "Повторите попытку через 6 мин."), which the
-///   shared token-limit parser understands.
-///
-/// Returns the wait, capped to a sane bound so an oversized/malformed hint can
-/// never stall a turn indefinitely. Returns `None` when no wait is present,
-/// letting the caller fall back to its normal error handling.
-pub(super) fn token_limit_retry_wait(error: &str) -> Option<std::time::Duration> {
-    use std::time::Duration;
-
-    // 1. Compact rate-limit form: "Retry after 6m", "Retry after 45s",
-    //    "Retry after 1h 30m".
-    for prefix in ["retry after ", "retry in "] {
-        let lower = error.to_ascii_lowercase();
-        let mut search_from = 0;
-        while let Some(idx) = lower[search_from..].find(prefix) {
-            let idx = search_from + idx;
-            let rest = &lower[idx + prefix.len()..];
-            if let Some(duration) = parse_compact_duration(rest) {
-                return Some(duration);
-            }
-            search_from = idx + prefix.len();
-        }
-    }
-
-    // 2. Raw provider body form handled by the shared token-limit parser
-    //    (e.g. "Повторите попытку через 6 мин.", "через 45 сек").
-    jcode_provider_core::token_limit::extract_wait_time(error).map(|dur| {
-        // Cap at 15 minutes so a hostile/malformed hint never stalls a turn.
-        dur.min(Duration::from_secs(15 * 60))
-    })
-}
-
-/// Maximum number of automatic hourly retries for a rate-limit (HTTP 429) error
-/// that carries no concrete reset time. A free-tier window normally reopens
-/// within an hour, so 24 hourly attempts (~1 day) gives it ample room to clear;
-/// beyond that the error is treated as non-transient and the caller falls back
-/// to a manual retry offer instead of holding the turn forever.
-const RATE_LIMIT_HOURLY_MAX_ATTEMPTS: u8 = 24;
-
-/// Outcome of asking [`rate_limit_retry_wait`] how to handle a rate-limit
-/// (HTTP 429) error on a pending remote turn.
-#[derive(Debug, PartialEq)]
-pub(super) enum RateLimitRetry {
-    /// Reschedule the turn after `wait`. The caller is responsible for the
-    /// actual reschedule (`schedule_pending_remote_retry_in`).
-    Wait(std::time::Duration),
-    /// The hourly retry budget is spent: a rate limit that never cleared (a
-    /// permanently capped key, or a misclassified error) must stop consuming
-    /// the turn's retry budget and fall through to a manual retry offer.
-    Exhausted,
-    /// The error is not a recognized rate limit; leave it to the caller's
-    /// normal error handling (and do *not* log anything).
-    NotRateLimit,
-}
-
-/// Decide how to handle a provider rate-limit (HTTP 429) error, defaulting to a
-/// one-hour cadence when the provider gives no concrete reset time, and
-/// returning [`RateLimitRetry::Exhausted`] once the retry budget is spent.
-///
-/// Free-tier limits (e.g. opencode.ai `FreeUsageLimitError`) return
-/// `status: 429` with a body like "Rate limit exceeded. Please try again
-/// later." and no `Retry-After` header. Burning the turn's retry budget on
-/// sub-second backoffs just hammers the endpoint and gives up quickly; instead
-/// retry on an hourly cadence so a reopened usage window is picked up
-/// automatically. `attempts` is the number of hourly retries already performed
-/// for this pending message (typically `rate_limit_pending_message.retry_attempts`,
-/// which `schedule_pending_remote_retry_in` increments on every reschedule).
-///
-/// The budget gate runs *first*, so even an explicit `Retry-After` or a
-/// body-carried wait is suppressed once the cap is hit. That is intentional:
-/// a provider that perpetually answers `429 Retry-After: 30` would otherwise
-/// retry forever and defeat the cap. When the budget is spent the turn must
-/// terminate, so the last valid hint is deliberately sacrificed.
-pub(super) fn rate_limit_retry_wait(
-    error: &str,
-    retry_after_secs: Option<u64>,
-    attempts: u8,
-) -> RateLimitRetry {
-    use std::time::Duration;
-
-    const HOURLY_DEFAULT: Duration = Duration::from_secs(3_600);
-    const MAX_HINT: Duration = Duration::from_secs(86_400);
-
-    // A rate limit with no reset window may never clear (a permanently capped
-    // key, or a misclassified error). Stop auto-retrying once we have given it
-    // a full day of hourly attempts; the caller surfaces a manual offer instead
-    // of holding the turn forever. Gate runs before any wait source below is
-    // honored, so a perpetual 429 can never outrun the cap.
-    if attempts >= RATE_LIMIT_HOURLY_MAX_ATTEMPTS {
-        return RateLimitRetry::Exhausted;
-    }
-
-    // 1. An explicit server Retry-After hint wins (capped so a hostile/oversized
-    //    value can never stall the turn indefinitely).
-    if let Some(secs) = retry_after_secs {
-        if secs > 0 {
-            return RateLimitRetry::Wait(Duration::from_secs(secs).min(MAX_HINT));
-        }
-    }
-
-    // 2. A wait already embedded in the body (token-limit "retry after 6m",
-    //    "Повторите попытку через 8 мин.", etc.).
-    if let Some(wait) = token_limit_retry_wait(error) {
-        return RateLimitRetry::Wait(wait.min(MAX_HINT));
-    }
-
-    // 3. A plain 429 / rate-limit with no concrete wait: retry hourly.
-    let lower = error.to_ascii_lowercase();
-    let is_rate_limit = contains_status_429(&lower)
-        || lower.contains("too many requests")
-        || lower.contains("rate limit")
-        || lower.contains("rate_limit")
-        || lower.contains("ratelimit");
-    if is_rate_limit {
-        return RateLimitRetry::Wait(HOURLY_DEFAULT);
-    }
-
-    RateLimitRetry::NotRateLimit
-}
-
-/// True when `text` contains an HTTP 429 status code as a standalone token
-/// (e.g. "status: 429" or "429 too many requests"), not embedded in a longer
-/// digit run like "model-4290".
-fn contains_status_429(text: &str) -> bool {
-    let mut from = 0;
-    while let Some(idx) = text[from..].find("429") {
-        let idx = from + idx;
-        let preceded_by_digit = idx > 0 && text.as_bytes()[idx - 1].is_ascii_digit();
-        let followed_by_digit = text
-            .as_bytes()
-            .get(idx + 3)
-            .map_or(false, |b| b.is_ascii_digit());
-        if !preceded_by_digit && !followed_by_digit {
-            return true;
-        }
-        // Otherwise this "429" is part of a longer number; skip past it.
-        from = idx + 3;
-    }
-    false
-}
-
-/// Parse a compact duration like "6m", "45s", "1h 30m", "90m" (as emitted by
-/// the OpenAI rate-limit renderer). Returns `None` for anything unrecognized.
-fn parse_compact_duration(s: &str) -> Option<std::time::Duration> {
-    use std::time::Duration;
-
-    let mut total = Duration::ZERO;
-    let mut rest = s;
-    loop {
-        rest = rest.trim_start();
-        // Split off a leading `<number><unit>` token.
-        let digits_end = rest
-            .char_indices()
-            .find(|(_, c)| !c.is_ascii_digit())
-            .map(|(i, _)| i)
-            .unwrap_or(rest.len());
-        if digits_end == 0 {
-            break;
-        }
-        let number: u64 = rest[..digits_end].parse().ok()?;
-        let after_digits = rest[digits_end..].trim_start();
-        let unit = after_digits.chars().next()?;
-        let unit_len = unit.len_utf8();
-        match unit {
-            'd' => total += Duration::from_secs(number.saturating_mul(86_400)),
-            'h' => total += Duration::from_secs(number.saturating_mul(3_600)),
-            'm' => total += Duration::from_secs(number.saturating_mul(60)),
-            's' => total += Duration::from_secs(number),
-            _ => return None,
-        }
-        rest = after_digits[unit_len..].trim_start();
-    }
-    if total.is_zero() {
-        None
-    } else {
-        Some(total)
-    }
-}
-
 impl App {
     fn format_failover_count(value: usize) -> String {
         match value {
@@ -972,30 +786,22 @@ impl App {
         }
 
         if is_request_payload_too_large_error(&error) {
-            // 413 is a request body-size rejection driven by inline images and/or
-            // accumulated large tool outputs. Strip oversized images now; if there
-            // are none, truncate large tool results so a manual resubmit (or
-            // auto-poke retry) goes through, and keep auto-poke alive.
+            // 413 is a request body-size rejection driven by inline images.
+            // Strip oversized images now so a manual resubmit (or auto-poke
+            // retry) goes through, and keep auto-poke alive.
             let stripped = self
                 .session
-                .strip_oversized_images(crate::compaction::PAYLOAD_IMAGE_EMERGENCY_CHAR_BUDGET);
-            let truncated = if stripped == 0 {
-                self.session.emergency_truncate_tool_results(
-                    crate::compaction::PAYLOAD_TOOL_RESULT_CHAR_BUDGET,
-                )
-            } else {
-                0
-            };
-            if stripped > 0 || truncated > 0 {
+                .strip_oversized_images(crate::compaction::PAYLOAD_IMAGE_CHAR_BUDGET);
+            if stripped > 0 {
                 self.messages.clear();
                 self.reseed_compaction_from_provider_messages();
                 self.push_display_message(DisplayMessage::error(format!(
-                    "Error: {} Dropped {} oversized image(s) and truncated {} tool result(s); you can retry.",
-                    error, stripped, truncated
+                    "Error: {} Dropped {} oversized image(s); you can retry.",
+                    error, stripped
                 )));
             } else {
                 self.push_display_message(DisplayMessage::error(format!(
-                    "Error: {} Request body was too large but no inline images or tool results could be dropped. Run /fix to try manual recovery.",
+                    "Error: {} Request body was too large but no inline images could be dropped. Run /fix to try manual recovery.",
                     error
                 )));
                 super::commands::stop_auto_poke_for_non_retryable_error(self, &error);
@@ -1106,7 +912,7 @@ impl App {
     /// request and the retry would 413 again.
     pub(super) async fn try_recover_payload_too_large_and_retry(
         &mut self,
-        terminal: &mut AppTerminal,
+        terminal: &mut DefaultTerminal,
         event_stream: &mut EventStream,
     ) -> bool {
         if self.is_remote {
@@ -1115,15 +921,8 @@ impl App {
 
         let stripped = self
             .session
-            .strip_oversized_images(crate::compaction::PAYLOAD_IMAGE_EMERGENCY_CHAR_BUDGET);
-        let truncated = if stripped == 0 {
-            self.session.emergency_truncate_tool_results(
-                crate::compaction::PAYLOAD_TOOL_RESULT_CHAR_BUDGET,
-            )
-        } else {
-            0
-        };
-        if stripped == 0 && truncated == 0 {
+            .strip_oversized_images(crate::compaction::PAYLOAD_IMAGE_CHAR_BUDGET);
+        if stripped == 0 {
             return false;
         }
 
@@ -1134,8 +933,8 @@ impl App {
         self.reseed_compaction_from_provider_messages();
 
         self.push_display_message(DisplayMessage::system(format!(
-            "⚡ Request was too large; dropped {} oversized image(s), truncated {} tool result(s), and retrying...",
-            stripped, truncated
+            "⚡ Request was too large; dropped {} oversized image(s) and retrying...",
+            stripped
         )));
 
         self.reset_state_for_compaction_retry();
@@ -1172,7 +971,7 @@ impl App {
     /// any turn error. Shared by every compaction auto-retry path.
     async fn run_compaction_retry_turn(
         &mut self,
-        terminal: &mut AppTerminal,
+        terminal: &mut DefaultTerminal,
         event_stream: &mut EventStream,
     ) -> bool {
         let retry_result = self
@@ -1195,7 +994,7 @@ impl App {
     /// Returns true if the retry succeeded.
     pub(super) async fn try_auto_compact_and_retry(
         &mut self,
-        terminal: &mut AppTerminal,
+        terminal: &mut DefaultTerminal,
         event_stream: &mut EventStream,
     ) -> bool {
         if self.is_remote || !self.provider.supports_compaction() {
@@ -2141,171 +1940,4 @@ pub(super) fn unavailable_model_route_message(
     }
 
     lines.join("\n")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-
-    #[test]
-    fn waits_are_extracted_from_compact_rate_limit_forms() {
-        assert_eq!(
-            token_limit_retry_wait("Rate limited (retry after 6m): ..."),
-            Some(Duration::from_secs(6 * 60))
-        );
-        assert_eq!(
-            token_limit_retry_wait("Rate limited (retry after 45s): ..."),
-            Some(Duration::from_secs(45))
-        );
-        assert_eq!(
-            token_limit_retry_wait("Rate limited (retry after 1h 30m): ..."),
-            Some(Duration::from_secs(90 * 60))
-        );
-    }
-
-    #[test]
-    fn waits_are_extracted_from_raw_provider_bodies() {
-        // The verbatim OpenAI-compatible token-limit body reported by a user.
-        assert_eq!(
-            token_limit_retry_wait(
-                "OpenAI-compatible chat request failed\n  status: 422 Unprocessable Entity\n  response: {\"error\":\"Превышен лимит completion-токенов: использовано 60520, лимит 60000. Повторите попытку через 8 мин.\"}"
-            ),
-            Some(Duration::from_secs(8 * 60))
-        );
-        assert_eq!(
-            token_limit_retry_wait("Лимит превышен, через 45 сек"),
-            Some(Duration::from_secs(45))
-        );
-    }
-
-    #[test]
-    fn oversized_waits_are_capped() {
-        assert_eq!(
-            token_limit_retry_wait("Повторите попытку через 120 мин"),
-            Some(Duration::from_secs(15 * 60))
-        );
-    }
-
-    #[test]
-    fn no_wait_means_none() {
-        assert_eq!(token_limit_retry_wait("unknown error"), None);
-        assert_eq!(token_limit_retry_wait("OpenAI API error 500"), None);
-        assert_eq!(token_limit_retry_wait(""), None);
-    }
-
-    #[test]
-    fn rate_limit_429_without_reset_retries_hourly() {
-        // opencode.ai FreeUsageLimitError: status 429, body "Rate limit
-        // exceeded", no Retry-After header. Should schedule a one-hour retry
-        // rather than give up after sub-second backoffs.
-        let err = "OpenAI-compatible chat request failed\n  endpoint: https://opencode.ai/zen/v1/chat/completions\n  model: hy3-free\n  auth: OPENCODE_API_KEY\n  status: 429 Too Many Requests\n  response: {\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"}}";
-        assert_eq!(
-            rate_limit_retry_wait(err, None, 0),
-            RateLimitRetry::Wait(Duration::from_secs(60 * 60))
-        );
-    }
-
-    #[test]
-    fn rate_limit_plain_too_many_requests_retries_hourly() {
-        assert_eq!(
-            rate_limit_retry_wait("429 Too Many Requests: retry later", None, 0),
-            RateLimitRetry::Wait(Duration::from_secs(60 * 60))
-        );
-    }
-
-    #[test]
-    fn rate_limit_explicit_retry_after_header_is_honored() {
-        // An explicit server hint wins over the hourly default.
-        let err = "status: 429 too many requests\n  response: {}";
-        assert_eq!(
-            rate_limit_retry_wait(err, Some(30), 0),
-            RateLimitRetry::Wait(Duration::from_secs(30))
-        );
-    }
-
-    #[test]
-    fn rate_limit_body_wait_is_preferred_over_hourly_default() {
-        // A body-carried wait (e.g. "retry in 6 minutes") is used verbatim.
-        let err = "OpenAI-compatible chat request failed\n  status: 429 Too Many Requests\n  response: {\"error\":\"Rate limit exceeded. Retry after 6m\"}";
-        assert_eq!(
-            rate_limit_retry_wait(err, None, 0),
-            RateLimitRetry::Wait(Duration::from_secs(6 * 60))
-        );
-    }
-
-    #[test]
-    fn non_rate_limit_errors_yield_none() {
-        assert_eq!(rate_limit_retry_wait("500 internal server error", None, 0), RateLimitRetry::NotRateLimit);
-        assert_eq!(rate_limit_retry_wait("connection reset", None, 0), RateLimitRetry::NotRateLimit);
-        assert_eq!(rate_limit_retry_wait("unknown error", None, 0), RateLimitRetry::NotRateLimit);
-    }
-
-    #[test]
-    fn embedded_429_digits_do_not_false_positive() {
-        // A model name or error string containing the digit run "429" (e.g.
-        // "model-4290") must NOT be treated as a 429 rate limit.
-        assert_eq!(
-            rate_limit_retry_wait("model hy3-4290 is unavailable", None, 0),
-            RateLimitRetry::NotRateLimit
-        );
-        assert_eq!(
-            rate_limit_retry_wait("status: 4290 request limit reached", None, 0),
-            RateLimitRetry::NotRateLimit
-        );
-        // But a real "status: 429" still matches.
-        assert_eq!(
-            rate_limit_retry_wait("status: 429 too many requests", None, 0),
-            RateLimitRetry::Wait(Duration::from_secs(60 * 60))
-        );
-    }
-
-    #[test]
-    fn hourly_retry_stops_after_attempt_budget_is_spent() {
-        // Once the hourly retry budget is exhausted, stop auto-retrying so a
-        // permanently capped key falls back to a manual offer instead of
-        // holding the turn forever.
-        let err = "status: 429 Too Many Requests";
-        assert_eq!(
-            rate_limit_retry_wait(err, None, RATE_LIMIT_HOURLY_MAX_ATTEMPTS - 1),
-            RateLimitRetry::Wait(Duration::from_secs(60 * 60))
-        );
-        assert_eq!(
-            rate_limit_retry_wait(err, None, RATE_LIMIT_HOURLY_MAX_ATTEMPTS),
-            RateLimitRetry::Exhausted
-        );
-    }
-
-    #[test]
-    fn hourly_retry_waits_until_budget_is_exhausted() {
-        // Mirror the live reschedule loop: schedule_pending_remote_retry_in
-        // increments retry_attempts on every hourly reschedule, so a never-clearing
-        // 429 must keep retrying for exactly RATE_LIMIT_HOURLY_MAX_ATTEMPTS hourly
-        // tries and then stop (fall through to a manual offer).
-        let err = "status: 429 Too Many Requests";
-        let mut attempts = 0u8;
-        let mut schedules = 0u8;
-        while let RateLimitRetry::Wait(_) = rate_limit_retry_wait(err, None, attempts) {
-            attempts = attempts.saturating_add(1);
-            schedules += 1;
-        }
-        assert_eq!(schedules, RATE_LIMIT_HOURLY_MAX_ATTEMPTS);
-        assert_eq!(attempts, RATE_LIMIT_HOURLY_MAX_ATTEMPTS);
-    }
-
-    #[test]
-    fn parse_compact_duration_handles_tokens() {
-        assert_eq!(parse_compact_duration("6m"), Some(Duration::from_secs(360)));
-        assert_eq!(parse_compact_duration("45s"), Some(Duration::from_secs(45)));
-        assert_eq!(
-            parse_compact_duration("1h 30m"),
-            Some(Duration::from_secs(90 * 60))
-        );
-        assert_eq!(
-            parse_compact_duration("2d"),
-            Some(Duration::from_secs(2 * 86_400))
-        );
-        assert_eq!(parse_compact_duration("garbage"), None);
-        assert_eq!(parse_compact_duration(""), None);
-    }
 }

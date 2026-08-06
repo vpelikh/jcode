@@ -89,9 +89,7 @@ jcode-productivity-core = { path = "../jcode-productivity-core" }
 jcode-tui-workspace = { path = "../jcode-tui-workspace" }
 
 [features]
-# jemalloc is a default allocator feature (matches the root crate): it forwards
-# down to jcode-base, giving a page-returning allocator that bounds RSS.
-default = ["pdf", "embeddings", "bedrock", "jemalloc"]
+default = ["pdf", "embeddings", "bedrock"]
 # Exposes bench-only debug helpers (e.g. debug_copy_selection_text_for_bench)
 # consumed by the dev `tui_bench` binary in the root crate.
 dev-bins = []

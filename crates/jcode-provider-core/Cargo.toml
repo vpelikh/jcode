@@ -10,9 +10,7 @@ path = "src/lib.rs"
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
-bytes = "1"
 futures = "0.3"
-http-body = "1"
 httpdate = "1"
 jcode-logging = { path = "../jcode-logging" }
 jcode-schema-dialect = { path = "../jcode-schema-dialect" }
@@ -22,7 +20,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rand = "0.9.3"
 sha2 = "0.10"
-tokio = { version = "1", features = ["sync", "time", "macros"] }
+tokio = { version = "1", features = ["sync", "time"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["sync", "macros", "rt"] }

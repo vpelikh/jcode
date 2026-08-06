@@ -28,7 +28,7 @@ mod tips;
 mod todos_render;
 #[path = "info_widget_usage.rs"]
 mod usage_render;
-use super::info_widget_overview::{InfoPageKind, compute_page_layout};
+use super::info_widget_overview::{InfoPageKind, MAX_TODO_LINES, compute_page_layout};
 use super::workspace_map::VisibleWorkspaceRow;
 use crate::ambient::AmbientStatus;
 pub use crate::memory_types::{
@@ -57,13 +57,11 @@ pub(crate) use memory_utils::is_traceworthy_memory_event;
 use memory_utils::{memory_active_summary, memory_last_trace_summary, memory_state_detail};
 use model::{render_model_info, render_model_widget};
 use swarm_background::{render_background_compact, render_background_widget, render_swarm_widget};
-use text::{truncate_smart, truncate_with_ellipsis, wrap_text_width};
+use text::{truncate_smart, truncate_with_ellipsis};
 pub(crate) use tips::occasional_status_tip;
 use tips::{render_tips_widget, tips_widget_height};
 pub(crate) use todos_render::swarm_plan_todos;
 use todos_render::{render_todos_compact, render_todos_expanded, render_todos_widget};
-pub(crate) use todos_render::todos_widget_line_count;
-pub(crate) use todos_render::todos_compact_line_count;
 #[cfg(test)]
 use usage_render::render_usage_pill;
 use usage_render::{render_context_usage_line, render_usage_compact, render_usage_widget};
@@ -1115,14 +1113,9 @@ pub(crate) fn calculate_widget_height(
             if data.todos.is_empty() {
                 return 0;
             }
-            // Size the widget to the full rendered list: every todo is shown with
-            // its content wrapped to the available width (no ellipsis, no "+N more"
-            // footer), so the widget grows vertically to fit all of them.
-            let lines = render_todos_widget(data, Rect::new(0, 0, inner_width as u16, u16::MAX));
-            if lines.is_empty() {
-                return 0;
-            }
-            lines.len() as u16
+            // Header (with inline pip meter) + up to 5 items
+            let items = data.todos.len().min(5) as u16;
+            1 + items + if data.todos.len() > 5 { 1 } else { 0 }
         }
         WidgetKind::ContextUsage => {
             if data

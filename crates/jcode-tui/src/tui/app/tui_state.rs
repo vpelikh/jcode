@@ -1629,9 +1629,7 @@ impl crate::tui::TuiState for App {
             } else {
                 false
             },
-
-            git_info: gather_git_info(self.session.working_dir.as_deref().map(std::path::Path::new)),
-
+            git_info: gather_git_info(),
         }
     }
 
@@ -1918,8 +1916,7 @@ impl crate::tui::TuiState for App {
     }
 
     fn git_branch(&self) -> Option<String> {
-        let work_dir = self.working_dir().map(std::path::PathBuf::from);
-        gather_git_info(work_dir.as_deref()).map(|info| info.branch)
+        gather_git_info().map(|info| info.branch)
     }
 
     fn now_millis(&self) -> u64 {

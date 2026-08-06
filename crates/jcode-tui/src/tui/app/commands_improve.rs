@@ -599,8 +599,6 @@ fn todo_confidence_suffix(todo: &crate::todo::TodoItem) -> String {
 }
 
 pub(super) fn handle_improve_command_local(app: &mut App, command: ImproveCommand) {
-    // Mutual exclusion: starting improve/refactor clears any active review loop.
-    super::commands::clear_review_loop_on_improve(app);
     match command {
         ImproveCommand::Resume => {
             let session_id = active_session_id(app);

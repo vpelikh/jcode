@@ -19,7 +19,7 @@ fn report_reload_interaction_gap() {
     ));
 }
 use crate::tui::TuiState;
-use crossterm::cursor::{RestorePosition, SavePosition, Show};
+use crossterm::cursor::{RestorePosition, SavePosition};
 use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use ratatui::{buffer::Buffer, layout::Rect, style::Style};
 use std::io::Write;
@@ -343,15 +343,6 @@ impl StatusSpinnerRenderer {
     }
 
     pub(super) fn idle_animation_only_available(&self, app: &App) -> bool {
-        // If the terminal writer dropped output (wedged pty), ratatui's model no
-        // longer matches the screen. The cheap animation-only path clones
-        // `last_frame` and would paint a stale screen, so it must stand down and
-        // let the full frame heal the divergence. This also lets `draw_full_core`
-        // consume the resync flag.
-        if crate::tui::terminal_writer::resync_pending() {
-            crate::tui::ui::note_idle_animation_fast_path_blocked("resync_pending");
-            return false;
-        }
         let blocked = idle_animation_fast_path_blocked_reason(&IdleAnimationFastPathInputs {
             has_previous_frame: self.last_frame.is_some(),
             animation_active: crate::tui::idle_donut_active(app),
@@ -394,7 +385,7 @@ impl StatusSpinnerRenderer {
     pub(super) fn draw_idle_animation_only(
         &mut self,
         app: &App,
-        terminal: &mut AppTerminal,
+        terminal: &mut DefaultTerminal,
     ) -> Result<bool> {
         let Some(previous_frame) = self.last_frame.as_ref() else {
             return Ok(false);
@@ -469,115 +460,20 @@ impl StatusSpinnerRenderer {
         Ok(true)
     }
 
-    /// Render a full frame into the live terminal.
-    ///
-    /// This is the only production entry point into a full repaint. It dispatches to
-    /// the backend-generic [`Self::draw_full_with`], which owns the synchronized-
-    /// update window and the cursor error-recovery. Every call site routes through
-    /// here; [`Self::draw_full_core`] is the backend-generic body kept separate so
-    /// tests can drive the real production path against a captured backend.
     pub(super) fn draw_full(
         &mut self,
         app: &mut App,
-        terminal: &mut AppTerminal,
+        terminal: &mut DefaultTerminal,
     ) -> Result<()> {
-        self.draw_full_with(app, terminal)
-    }
-
-    /// The synchronized-update wrapper shared by every full-frame repaint.
-    ///
-    /// Splitting this out generically (rather than inlining it in
-    /// [`Self::draw_full`], which is pinned to `AppTerminal = CrosstermBackend<TerminalWriter>`)
-    /// lets a test drive the exact wrapper — the `BeginSynchronizedUpdate` /
-    /// `EndSynchronizedUpdate` window and the error-path cursor re-show — against a
-    /// captured `CrosstermBackend<Vec<u8>>`, instead of leaving it untestable on
-    /// real stdout.
-    ///
-    /// On a failed draw `draw_full_core` has already hidden the cursor but the
-    /// composer never reached its re-show (the errored `terminal.draw` aborts before
-    /// `apply_buffer_with_cursor` restores the caret). Re-show it so a fatal frame
-    /// error cannot leave the terminal with the cursor hidden after teardown.
-    pub(super) fn draw_full_with<B>(
-        &mut self,
-        app: &mut App,
-        terminal: &mut ratatui::Terminal<B>,
-    ) -> Result<()>
-    where
-        B: ratatui::backend::Backend + Write,
-        B::Error: std::error::Error + Send + Sync + 'static,
-    {
-        // Wrap the whole frame in a synchronized update so the terminal applies
-        // every cell change atomically. Without this, ratatui's crossterm backend
-        // streams cells one-by-one and eagerly-repainting terminals (and slow/remote
-        // or multiplexed sessions) show visible flicker. See issue #282.
-        let sync = crossterm::execute!(terminal.backend_mut(), BeginSynchronizedUpdate).is_ok();
-        // Always close the sync window, even if the draw fails; otherwise the
-        // terminal is left in synchronized-update mode and later output glitches.
-        let result = self.draw_full_core(app, terminal);
-        if sync {
-            let _ = crossterm::execute!(terminal.backend_mut(), EndSynchronizedUpdate);
-        }
-        // On a failed draw the cursor was hidden but the composer's re-show never ran
-        // (see the note above); re-show it so a fatal frame error cannot leave the
-        // terminal with the caret hidden after teardown.
-        if result.is_err() {
-            let _ = crossterm::execute!(terminal.backend_mut(), Show);
-        }
-        result
-    }
-
-    /// The backend-generic body of a full-frame repaint. Split out from
-    /// [`Self::draw_full_with`] (which in turn is dispatched from [`Self::draw_full`])
-    /// so the actual production path (including the cursor-hide for the diff flush)
-    /// can be exercised directly against any `ratatui::backend::Backend` in tests,
-    /// instead of being approximated by a stand-in harness.
-    ///
-    /// This is the exact code path the scroll-triggered `SoftRepaint` runs
-    /// (request_full_repaint → invalidate_previous_terminal_buffer → here), and the
-    /// place the cursor is hidden so its visible caret does not sweep across the
-    /// re-emitted cells. Testing it directly keeps the regression guard on the real
-    /// production code rather than a copy of its steps.
-    pub(super) fn draw_full_core<B>(
-        &mut self,
-        app: &mut App,
-        terminal: &mut ratatui::Terminal<B>,
-    ) -> Result<()>
-    where
-        B: ratatui::backend::Backend,
-        B::Error: std::error::Error + Send + Sync + 'static,
-    {
         // Painting a frame is progress, including during long streaming turns.
         crate::logging::watchdog::beat("tui.draw");
-
-        // A full frame (and any SoftRepaint the scroll path triggers) clears/invalidates and
-        // then writes the diff through the backend's `MoveTo(x, y)` for every changed cell.
-        // While the cursor is visible, eager terminals (especially ones without synchronized-
-        // update support) let the visible block cursor sweep across the re-emitted cells, which
-        // reads as "cursor jumps to random places" during scroll. Hide it for EVERY full frame,
-        // not only the sentinel-invalidated repaints: streaming and plain-keystroke frames also
-        // come through here with `FullFrameInvalidation::None` (turn.rs and the input loop don't
-        // set the repaint flags), yet still `MoveTo` the cells that shift as content grows —
-        // including the composer row the caret sits in — so gating the hide on
-        // `invalidation != None` would let the caret sweep on those paths again. `terminal.draw`
-        // then either restores the caret (the normal composer path, where `draw_input` sets a
-        // cursor position) or leaves it hidden (overlay branches such as the changelog/help/
-        // pickers, where ratatui also hides when no position is set), so the cursor ends exactly
-        // where it belongs in every case. The hide/show is atomic within the synchronized-update
-        // frame (or a sub-frame burst on non-sync terminals), so it is invisible in steady state.
-        // The hide is best-effort: skipping it must not abort the frame (the soft-repaint buffer
-        // invalidation has already happened), so the error is deliberately ignored.
-        let _ = terminal.backend_mut().hide_cursor();
-
-        // If the writer dropped output while the pty was wedged, ratatui's
-        // internal previous buffer no longer matches the real terminal. Force a
-        // full re-emit (soft repaint) so the screen and ratatui's model are
-        // realigned once the pty can drain again.
-        let resync_requested = crate::tui::terminal_writer::take_resync_requested();
-        let invalidation = full_frame_invalidation(
-            app.force_full_redraw,
-            app.force_full_repaint || resync_requested,
-        );
+        let invalidation = full_frame_invalidation(app.force_full_redraw, app.force_full_repaint);
         let force_full_redraw = invalidation != FullFrameInvalidation::None;
+        // Wrap the whole frame (optional clear + diff flush) in a synchronized update so the
+        // terminal applies every cell change atomically. Without this, ratatui's crossterm
+        // backend streams cells one-by-one and eagerly-repainting terminals (and slow/remote or
+        // multiplexed sessions) show visible flicker. See issue #282.
+        let sync = crossterm::execute!(terminal.backend_mut(), BeginSynchronizedUpdate).is_ok();
         match invalidation {
             FullFrameInvalidation::HardClear => {
                 terminal.clear()?;
@@ -615,6 +511,9 @@ impl StatusSpinnerRenderer {
         let completed_buffer = completed.buffer.clone();
         // `completed` borrows the terminal; it is unused past this point, so the
         // borrow ends here (NLL) before we touch the backend again below.
+        if sync {
+            let _ = crossterm::execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+        }
         crate::tui::ui::record_draw_call_attribution(crate::tui::ui::DrawCallAttribution {
             timestamp_ms: crate::tui::ui::wall_clock_ms(),
             total_ms: total_elapsed.as_secs_f64() * 1000.0,
@@ -650,7 +549,7 @@ impl StatusSpinnerRenderer {
     pub(super) fn draw_status_spinner_only(
         &mut self,
         app: &App,
-        terminal: &mut AppTerminal,
+        terminal: &mut DefaultTerminal,
     ) -> Result<bool> {
         let status_symbol = status_spinner_only_symbol(app);
         if status_symbol.is_none() {
@@ -733,7 +632,7 @@ fn render_status_spinner_into_buffer_mut(buffer: &mut Buffer, area: Rect, symbol
 impl App {
     /// Run the TUI application
     /// Returns Some(session_id) if hot-reload was requested
-    pub async fn run(mut self, mut terminal: AppTerminal) -> Result<RunResult> {
+    pub async fn run(mut self, mut terminal: DefaultTerminal) -> Result<RunResult> {
         super::terminal_liveness::capture_initial_tty();
         let mut event_stream = EventStream::new();
         let mut redraw_period = crate::tui::redraw_interval(&self);
@@ -866,7 +765,7 @@ impl App {
     /// Run the TUI in remote mode, connecting to a server
     pub async fn run_remote(
         mut self,
-        mut terminal: AppTerminal,
+        mut terminal: DefaultTerminal,
         remote_working_dir: Option<String>,
     ) -> Result<RunResult> {
         super::terminal_liveness::capture_initial_tty();
@@ -1101,7 +1000,7 @@ impl App {
     /// Run the TUI in replay mode, playing back a timeline of events.
     pub async fn run_replay(
         self,
-        terminal: AppTerminal,
+        terminal: DefaultTerminal,
         timeline: Vec<crate::replay::TimelineEvent>,
         speed: f64,
     ) -> Result<RunResult> {
@@ -1110,7 +1009,7 @@ impl App {
 
     /// Run an interactive swarm replay, rendering multiple sessions in tiled panes.
     pub async fn run_swarm_replay(
-        terminal: AppTerminal,
+        terminal: DefaultTerminal,
         panes: Vec<crate::replay::PaneReplayInput>,
         speed: f64,
         centered_override: Option<bool>,

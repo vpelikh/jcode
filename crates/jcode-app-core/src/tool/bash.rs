@@ -68,7 +68,6 @@ export -f cargo
     ))
 }
 
-
 /// Build a clear timeout message. The `timeout` param is in milliseconds, which
 /// agents frequently mistake for seconds (e.g. passing 1000 thinking it means
 /// 1000s when it is 1s). Spell out the seconds equivalent and, for suspiciously
@@ -703,71 +702,20 @@ fn build_detached_shell_wrapper(command: &str) -> StdCommand {
     cmd
 }
 
-fn format_command_output(
-    mut output: String,
-    exit_code: Option<i32>,
-    cwd: Option<&std::path::Path>,
-    duration_ms: Option<u64>,
-) -> String {
+fn format_command_output(mut output: String, exit_code: Option<i32>) -> String {
     if output.len() > MAX_OUTPUT_LEN {
         output = truncate_str(&output, MAX_OUTPUT_LEN).to_string();
         output.push_str("\n... (output truncated)");
     }
 
-    // Record the working directory the command ran in, mirroring the exit-code
-    // footer, so display surfaces can show it without the tool arguments
-    // carrying it. Emitted whenever the command produced any content.
-    if let Some(cwd) = cwd {
-        let cwd = cwd.to_string_lossy();
-        if !cwd.trim().is_empty()
-            && !output.trim().is_empty()
-            && !output.contains("\nWorking directory:")
-        {
-            output.push_str(&format!("\n\nWorking directory: {}", cwd));
-        }
-    }
-
-    // Record the wall-clock execution time so display surfaces show the cost of
-    // the command without relying on the provider-facing [tool timing] header,
-    // which is feature-gated and not part of the stored transcript. Skipped for
-    // a clean no-op so the "completed successfully" placeholder stays intact.
-    if let Some(duration_ms) = duration_ms
-        && !output.trim().is_empty()
-    {
-        output.push_str(&format!("\n\nExecution time: {}", format_elapsed_ms(duration_ms)));
-    }
-
-    // Always record the exit code (including 0) so the outcome is visible on
-    // the tool row and in the transcript regardless of whether the command
-    // produced output or failed.
-    if let Some(code) = exit_code {
+    if let Some(code) = exit_code.filter(|code| *code != 0) {
         output.push_str(&format!("\n\nExit code: {}", code));
     }
 
-    // A truly clean no-op (no output, no cwd, no timing) collapses to the
-    // explicit success sentinel instead of a bare "Exit code: 0" line.
-    if output.trim() == "Exit code: 0" {
+    if output.trim().is_empty() {
         "Command completed successfully (no output)".to_string()
     } else {
         output
-    }
-}
-
-fn format_elapsed_ms(duration_ms: u64) -> String {
-    match duration_ms {
-        0..=999 => format!("{}ms", duration_ms),
-        1_000..=9_999 => format!("{:.1}s", duration_ms as f64 / 1000.0),
-        10_000..=59_999 => format!("{}s", duration_ms / 1000),
-        _ => {
-            let total_seconds = duration_ms / 1000;
-            let minutes = total_seconds / 60;
-            let seconds = total_seconds % 60;
-            if seconds == 0 {
-                format!("{}m", minutes)
-            } else {
-                format!("{}m {}s", minutes, seconds)
-            }
-        }
     }
 }
 
@@ -780,54 +728,9 @@ mod utf8_truncation_tests {
     #[test]
     fn format_command_output_truncates_on_utf8_boundary() {
         let input = format!("{}é", "a".repeat(29_999));
-        let output = format_command_output(input, None, None, None);
+        let output = format_command_output(input, None);
         assert!(output.ends_with("\n... (output truncated)"));
         assert!(output.starts_with(&"a".repeat(29_999)));
-    }
-
-    #[test]
-    fn format_command_output_records_working_directory_exit_and_time() {
-        let cwd = std::path::Path::new("/home/user/project");
-        let out =
-            format_command_output("On branch main".to_string(), Some(0), Some(cwd), Some(120));
-        assert!(out.contains("Working directory: /home/user/project"), "{out}");
-        assert!(out.contains("Exit code: 0"), "{out}");
-        assert!(out.contains("Execution time: 120ms"), "{out}");
-
-        let out = format_command_output("boom".to_string(), Some(2), Some(cwd), Some(1500));
-        assert!(out.contains("Exit code: 2"), "{out}");
-        assert!(out.contains("Working directory: /home/user/project"), "{out}");
-        assert!(out.contains("Execution time: 1.5s"), "{out}");
-    }
-
-    #[test]
-    fn format_command_output_collapses_clean_noops_but_emits_metadata_on_output() {
-        let cwd = std::path::Path::new("/home/user/project");
-        // A clean no-op with no output and no metadata collapses to the success
-        // sentinel (which the display layer treats as exit 0).
-        let out = format_command_output(String::new(), Some(0), None, None);
-        assert_eq!(out, "Command completed successfully (no output)");
-        // A clean no-op with a cwd/timing still collapses because those footers
-        // are gated on real output.
-        let out = format_command_output(String::new(), Some(0), Some(cwd), Some(5));
-        assert_eq!(out, "Command completed successfully (no output)");
-    }
-
-    #[test]
-    fn format_command_output_skips_cwd_when_absent_or_empty() {
-        assert!(
-            !format_command_output("hi".to_string(), None, None, None)
-                .contains("Working directory:")
-        );
-        assert!(
-            !format_command_output(
-                "hi".to_string(),
-                None,
-                Some(std::path::Path::new("   ")),
-                None
-            )
-            .contains("Working directory:")
-        );
     }
 
     #[cfg(windows)]
@@ -1046,8 +949,6 @@ impl BashTool {
         let stdin_tx = ctx.stdin_request_tx.clone();
         let tool_call_id = ctx.tool_call_id.clone();
         let title_for_work = title.clone();
-        let cwd_for_work = ctx.working_dir.clone();
-        let work_started = std::time::Instant::now();
         // Track progress parsed from output so a timeout promotion starts the
         // background task at the real percentage instead of 0%.
         let promoted_progress = std::sync::Arc::new(PromotedCommandProgress::default());
@@ -1151,12 +1052,7 @@ impl BashTool {
                     }
                     output.push_str(&stderr);
                 }
-                let output = format_command_output(
-                    output,
-                    status.code(),
-                    cwd_for_work.as_deref(),
-                    Some(work_started.elapsed().as_millis() as u64),
-                );
+                let output = format_command_output(output, status.code());
                 Ok(ToolOutput::new(output).with_title(title_for_work))
             });
 
@@ -1267,13 +1163,7 @@ impl BashTool {
                 let _ = tokio::fs::remove_file(&info.output_file).await;
                 let _ = tokio::fs::remove_file(&info.status_file).await;
                 return Ok(
-                    ToolOutput::new(format_command_output(
-                        output,
-                        status.code(),
-                        ctx.working_dir.as_deref(),
-                        Some(started.elapsed().as_millis() as u64),
-                    ))
-                    .with_title(
+                    ToolOutput::new(format_command_output(output, status.code())).with_title(
                         params
                             .intent
                             .clone()

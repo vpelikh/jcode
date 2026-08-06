@@ -686,17 +686,6 @@ impl App {
             let before = crate::process_memory::snapshot();
             crate::process_memory::release_retained_heap("client_debug_allocator_purge");
             let after = crate::process_memory::snapshot();
-            // On macOS `ps`-style RSS over-accounts reserved-but-unwritten
-            // malloc arenas, so the honest number for reclaimed memory is
-            // `phys_footprint` when the OS reports it (see the memory-footprint
-            // investigation). Fall back to RSS everywhere else.
-            let resident_bytes = |s: &crate::process_memory::ProcessMemorySnapshot| {
-                s.os.as_ref()
-                    .and_then(|os| os.phys_footprint_bytes)
-                    .unwrap_or(s.rss_bytes.unwrap_or(0))
-            };
-            let resident_recovered_bytes =
-                resident_bytes(&before).saturating_sub(resident_bytes(&after));
             let rss_recovered_bytes = before
                 .rss_bytes
                 .unwrap_or(0)
@@ -704,7 +693,6 @@ impl App {
             serde_json::to_string_pretty(&serde_json::json!({
                 "before": before,
                 "after": after,
-                "resident_recovered_bytes": resident_recovered_bytes,
                 "rss_recovered_bytes": rss_recovered_bytes,
             }))
             .unwrap_or_else(|_| "{}".to_string())

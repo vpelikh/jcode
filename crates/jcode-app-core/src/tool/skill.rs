@@ -55,7 +55,7 @@ impl Tool for SkillTool {
     }
 
     fn description(&self) -> &str {
-        "Manage skills. Use action=list to see available skills and their full descriptions, action=load to activate a skill (loads its instructions into the conversation), action=read to view a skill's contents, and action=reload/reload_all to refresh skills from disk. Load a skill proactively when the task matches its described capability."
+        "Manage skills."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -421,10 +421,6 @@ mod tests {
     fn test_tool_description() {
         let tool = create_test_tool();
         assert!(tool.description().contains("skill"));
-        // The description should tell the model it can self-load skills
-        // proactively (issue: ccc skill never used).
-        assert!(tool.description().contains("action=load"));
-        assert!(tool.description().contains("Load a skill proactively"));
     }
 
     #[test]

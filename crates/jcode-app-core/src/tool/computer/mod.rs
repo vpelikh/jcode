@@ -203,7 +203,11 @@ impl Tool for ComputerTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "description": "Action to run (screenshot, click, type, press, set_value, find_element, discover...)."
+                    "description": "Common: screenshot, ocr, ui (see); click, type, key (visible input); \
+                        press, set_value (BACKGROUND AX action on an `element` handle); find_element; \
+                        run_applescript; setup, check_permissions; discover (load full action set). \
+                        Many more actions (move, drag, scroll, window/app management, clipboard, \
+                        select_menu, notify, ...) take the same fields; call discover for their params."
                 },
                 "category": {
                     "type": "string",
@@ -220,7 +224,7 @@ impl Tool for ComputerTool {
                 "value": { "type": "string", "description": "Value to match (find_element) or set (set_value)." },
                 "element": {
                     "type": "object",
-                    "description": "Element handle from find_element/ui: {app, path:[child indices]}.",
+                    "description": "Element handle from find_element/ui: {app, path:[child indices]}. Used by press/set_value/get_value/perform_action.",
                     "properties": {
                         "app": { "type": "string" },
                         "path": { "type": "array", "items": { "type": "integer" } }

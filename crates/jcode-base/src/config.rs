@@ -88,7 +88,6 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_HOME",
     "JCODE_HOOK_PRE_TOOL",
     "JCODE_HOOK_PRE_TOOL_TIMEOUT_MS",
-    "JCODE_WAKE_MODE",
     "JCODE_HOOK_POST_TOOL",
     "JCODE_HOOK_SESSION_END",
     "JCODE_HOOK_SESSION_START",
@@ -175,10 +174,6 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_TELEGRAM_BOT_TOKEN",
     "JCODE_TELEGRAM_CHAT_ID",
     "JCODE_TELEGRAM_REPLY_ENABLED",
-    "JCODE_TELEGRAM_API_BASE",
-    "JCODE_TELEGRAM_PROXY",
-    "JCODE_TELEGRAM_API_IP",
-    "JCODE_TELEGRAM_ALLOWED_USER_ID",
     "JCODE_TOOL_CALL_DETAILS",
     "JCODE_TOOL_PROFILE",
     "JCODE_TOOLS",
@@ -656,44 +651,6 @@ pub struct ToolConfig {
         alias = "mcp_tools_auto_threshold_tokens"
     )]
     pub mcp_tools_token_threshold: usize,
-    /// When enabled, a `read` of a file range that was already read earlier in
-    /// this session (still in the active, un-compacted context) and whose file
-    /// has not changed since then returns a compact pointer to the earlier
-    /// result instead of re-emitting the full text, avoiding re-sending
-    /// expensive raw content. It deliberately changes the tool result from
-    /// content to a pointer, but only ever for unchanged re-reads (the file
-    /// mtime must predate the prior read), so fresh content is always returned
-    /// when the file changed. Default: on.
-    #[serde(alias = "read_dedup")]
-    pub read_dedup: bool,
-    /// Enforce the "use `compass_query` before `agentgrep`" guidance at the
-    /// code level. When on, a full-text `agentgrep` grep search is redirected to
-    /// `compass_query` (instead of executing grep) as long as `compass_query` is
-    /// actually available: it is registered, not disabled by the session tool
-    /// policy, and the session has a working directory to search. Filename and
-    /// file-inspection modes (find/outline/trace) are left to run normally
-    /// because compass does not replace them. The model can still force raw grep
-    /// by passing `allow_raw_fallback` (a documented agentgrep input field).
-    /// Default: on, matching the built-in preferred-tools guidance that tells
-    /// agents to try semantic search first and only fall back to grep when no
-    /// index covers the task.
-    #[serde(default = "default_true")]
-    pub prefer_compass_query: bool,
-    /// Kick off a background Compass knowledge-graph build when a session binds
-    /// to a working directory whose index is missing, so the agent's first
-    /// `compass_query` finds a warm index instead of blocking the turn while a
-    /// (potentially multi-minute) cold build runs inline. The build runs off the
-    /// query path on a background thread under the per-project build lock, and
-    /// is deduplicated per commit (worktrees on different SHAs build
-    /// independently). It is skipped when the session cannot use `compass_query`
-    /// (e.g. tools.disabled), and a failed build backs off for ~5 minutes before
-    /// retrying. Default: on.
-    #[serde(default = "default_true")]
-    pub prewarm_compass_index: bool,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 impl Default for ToolConfig {
@@ -705,9 +662,6 @@ impl Default for ToolConfig {
             disable_base_tools: false,
             mcp_tools: McpToolsMode::Auto,
             mcp_tools_token_threshold: 8_000,
-            read_dedup: true,
-            prefer_compass_query: true,
-            prewarm_compass_index: true,
         }
     }
 }

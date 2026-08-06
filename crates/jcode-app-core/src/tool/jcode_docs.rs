@@ -50,7 +50,7 @@ impl Tool for JcodeDocsTool {
     }
 
     fn description(&self) -> &str {
-        "Search bundled Jcode docs. Use first for tool/config/behavior questions."
+        "Search bundled, version-matched Jcode documentation. Use this first for questions about Jcode features, configuration, architecture, tools, or behavior."
     }
 
     fn parameters_schema(&self) -> Value {

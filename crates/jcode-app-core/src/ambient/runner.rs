@@ -437,7 +437,6 @@ impl AmbientRunnerHandle {
                 child.memory_injections = parent.memory_injections.clone();
                 child.replay_events = parent.replay_events.clone();
                 child.working_dir = item.working_dir.clone().or(parent.working_dir.clone());
-                child.rebuild_event_map();
                 child
             }
             Err(err) => {
@@ -454,7 +453,6 @@ impl AmbientRunnerHandle {
                     ),
                 );
                 child.working_dir = item.working_dir.clone();
-                child.rebuild_event_map();
                 child
             }
         };
@@ -552,14 +550,10 @@ impl AmbientRunnerHandle {
 
         let ambient_enabled = config().ambient.enabled;
 
-        // Spawn reply pollers for all configured message channels (Telegram,
-        // Discord, etc.). These run regardless of whether ambient mode is
-        // enabled so Telegram/Discord remote control (slash commands + plain
-        // prompts) works even when the ambient cycle is off. Without ambient the
-        // reply loop handles commands and reports that plain prompts need a
-        // target session; with ambient it also forwards plain text into the
-        // active ambient cycle.
-        {
+        // Spawn reply pollers only when ambient mode is enabled; scheduled
+        // session-targeted scheduled tasks should still work without the ambient-only reply
+        // infrastructure.
+        if ambient_enabled {
             let safety_config = config().safety.clone();
             if safety_config.email_reply_enabled
                 && safety_config.email_imap_host.is_some()
@@ -572,9 +566,10 @@ impl AmbientRunnerHandle {
                 logging::info("Ambient runner: IMAP reply poller spawned");
             }
 
+            // Spawn reply pollers for all configured message channels
+            // (Telegram, Discord, etc.)
             let channel_registry = crate::channel::ChannelRegistry::from_config(&safety_config);
-            let runner_handle = if ambient_enabled { Some(self.clone()) } else { None };
-            channel_registry.spawn_reply_loops(runner_handle.as_ref());
+            channel_registry.spawn_reply_loops(&self);
         }
 
         let amb_config = &config().ambient;

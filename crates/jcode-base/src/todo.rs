@@ -178,14 +178,8 @@ pub const TODO_INTENT_UNDERSTANDING_CONTINUATION_MESSAGE: &str = "[auto] Underst
 const PRE_COMPACT_TODO_INTENT_UNDERSTANDING_CONTINUATION_MESSAGE: &str = "Understand the user's intent better. Try to avoid asking the user. Make sure the todo is up to date.";
 
 /// Previous verbose wording, retained so persisted sessions still classify it
-/// as a hidden quality-gate message after the concise rewrite. The detailed
-/// intent-understanding calibration rubric (requirement inventory, outcomes and
-/// deliverables, integration paths, and "Do not ask the user") lives in this
-/// retained form and is what `TODO_INTENT_UNDERSTANDING_CONTINUATION_MESSAGE`
-/// collapses into the short nudge. Exposed for tool-schema tests that assert
-/// the calibration concepts are not lost from the design.
-pub const PRE_CONCISE_TODO_INTENT_UNDERSTANDING_CONTINUATION_MESSAGE: &str =
-    "Your understanding of the user's intent is not high enough. Re-read the request and think harder about what the user actually wants and left implicit, using the conversation and codebase as evidence. Form a requirement inventory covering outcomes, deliverables, constraints, prohibited actions, integration paths, edge cases, and necessary follow-through, and check the plan represents every material item. Do not ask the user; resolve the ambiguity yourself, then update the plan's user intention and understands_user_intent.";
+/// as a hidden quality-gate message after the concise rewrite.
+const PRE_CONCISE_TODO_INTENT_UNDERSTANDING_CONTINUATION_MESSAGE: &str = "Your understanding of the user's intent is not high enough. Re-read the request and think harder about what the user actually wants and left implicit, using the conversation and codebase as evidence. Form a requirement inventory covering outcomes, deliverables, constraints, prohibited actions, integration paths, edge cases, and necessary follow-through, and check the plan represents every material item. Do not ask the user; resolve the ambiguity yourself, then update the plan's user intention and understands_user_intent.";
 const PRE_TODO_REMINDER_INTENT_UNDERSTANDING_CONTINUATION_MESSAGE: &str =
     "Understand the user's intent better. Try to avoid asking the user.";
 
@@ -194,11 +188,7 @@ const PRE_TODO_REMINDER_INTENT_UNDERSTANDING_CONTINUATION_MESSAGE: &str =
 pub const TODO_CLOSED_FEEDBACK_LOOP_CONTINUATION_MESSAGE: &str = "[auto] Your feedback loop isn't good enough. Think about what feedback loops you need. Make sure the todo is up to date.";
 const PRE_COMPACT_TODO_CLOSED_FEEDBACK_LOOP_CONTINUATION_MESSAGE: &str = "Improve the goal's feedback loop. Name a concrete check for each requirement and what result will show it passed. Update the todo, then continue the work.";
 const PRE_TODO_REMINDER_CLOSED_FEEDBACK_LOOP_CONTINUATION_MESSAGE: &str = "Improve the goal's feedback loop. Name a concrete check for each requirement and what result will show it passed. Update the goal, then continue the work.";
-/// Retained verbose closed-feedback-loop wording. The short `[auto]` nudge
-/// (`TODO_CLOSED_FEEDBACK_LOOP_CONTINUATION_MESSAGE`) collapses this rubric;
-/// exposed for tool-schema tests that assert the calibration concepts are not
-/// lost (e.g. per-requirement observations and "run tests ... count only").
-pub const PRE_BUDGET_TODO_CLOSED_FEEDBACK_LOOP_CONTINUATION_MESSAGE: &str = "Your feedback loop is not closed. First, improve the goal's objective and name the observation that reports back on each requirement, so progress can be measured across iterations. Generic phrases such as run tests, verify, or review count only for requirements those named checks demonstrably enforce; add separate explicit checks for non-testable requirements. Then call the todo tool again with the revised goal before continuing the task. The goal is to create a strong feedback loop you can iterate against.";
+const PRE_BUDGET_TODO_CLOSED_FEEDBACK_LOOP_CONTINUATION_MESSAGE: &str = "Your feedback loop is not closed. First, improve the goal's objective and name the observation that reports back on each requirement, so progress can be measured across iterations. Generic phrases such as run tests, verify, or review count only for requirements those named checks demonstrably enforce; add separate explicit checks for non-testable requirements. Then call the todo tool again with the revised goal before continuing the task. The goal is to create a strong feedback loop you can iterate against.";
 
 /// Pre-rename ("hill-climbability") version of the closed-feedback-loop
 /// continuation. Kept only so persisted transcripts still classify it as a
@@ -306,7 +296,7 @@ pub fn build_todo_ownership_continuation_message(todos: &[TodoItem], goals: &[To
 const LEGACY_TODO_OWNERSHIP_CONTINUATION_MESSAGE: &str = "[automated todo completion gate - not a user message] Your end-to-end ownership is not high enough to finish this goal.";
 
 /// Model-facing continuation for private completion-confidence checks.
-pub const TODO_COMPLETION_CONTINUATION_MESSAGE: &str = "[auto] Do more validation on the work below; it still needs a validation pass before you mark it done. Keep the todo up to date; do not reply or wait for the user.";
+pub const TODO_COMPLETION_CONTINUATION_MESSAGE: &str = "[auto] Do more validation on the work below. Keep the todo up to date; do not reply or wait for the user.";
 const PRE_COMPACT_TODO_COMPLETION_CONTINUATION_MESSAGE: &str = "[automated follow-up - not a user message] Do more validation on the work below. Keep the todo up to date; do not reply or wait for the user.";
 
 /// Model-facing continuation identifying the items whose confidence jumped and

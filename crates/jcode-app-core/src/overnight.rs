@@ -186,7 +186,6 @@ fn create_coordinator_session(parent: &Session, mission: &Option<String>) -> Res
     child.testing_build = parent.testing_build.clone();
     child.working_dir = parent.working_dir.clone();
     child.provider_session_id = None;
-    child.rebuild_event_map();
     Ok(child)
 }
 

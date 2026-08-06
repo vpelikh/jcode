@@ -230,15 +230,6 @@ pub struct SkillInfo {
     pub description: String,
 }
 
-/// Default preferred-tools guidance injected when no project/global
-/// `preferred-tools.md` is present. This ensures code-search tool ordering is
-/// always enforced even in a clean environment.
-const DEFAULT_PREFERRED_TOOLS: &str = "# Default Preferred Tools\n\n\
-    For any codebase discovery, search, or indexing task, use `compass_query` first.\n\
-    Only fall back to `agentgrep` when `compass_query` is unavailable. Code search is\n\
-    never optional between grep and a search skill: when a search skill is present,\n\
-    use it.";
-
 const SKILL_DESC_MAX_CHARS: usize = 120;
 
 fn clip_skill_description(description: &str) -> String {
@@ -260,7 +251,7 @@ fn build_available_skills_section(available_skills: &[SkillInfo]) -> Option<Stri
         return None;
     }
 
-    let mut section = "# Available Skills\n\nYou have the following skills available. The user can invoke one with `/skillname`; you can also load one yourself with the `skill_manage` tool (action=load) when its described capability is relevant to the task. Do not wait for the user to invoke a skill you can use to do the job better; load it proactively.\n".to_string();
+    let mut section = "# Available Skills\n\nYou have access to the following skills that the user can invoke with `/skillname`:\n".to_string();
     for skill in available_skills {
         section.push_str(&format!(
             "\n- `/{} ` - {}",
@@ -269,7 +260,7 @@ fn build_available_skills_section(available_skills: &[SkillInfo]) -> Option<Stri
         ));
     }
     section.push_str(
-        "\n\nWhen a user asks about available skills or capabilities, mention these skills and offer to activate them.",
+        "\n\nWhen a user asks about available skills or capabilities, mention these skills.",
     );
     Some(section)
 }
@@ -1026,26 +1017,18 @@ fn load_prompt_overlay_files_from_dir(working_dir: Option<&Path>) -> (Option<Str
     }
 }
 
-/// Load preferred-tool guidance from ~/.jcode/ and ./.jcode/, falling back to
-/// the built-in default so code-search tool guidance is always present.
+/// Load optional preferred-tool guidance from ~/.jcode/ and ./.jcode/
 fn load_preferred_tools_files_from_dir(working_dir: Option<&Path>) -> (Option<String>, usize) {
     let mut contents = vec![];
     let mut total_chars = 0usize;
 
     let load_file = |path: &Path, label: &str| -> Option<(String, usize)> {
-        // Only treat an existing, non-blank file as guidance. A whitespace-only
-        // or empty `preferred-tools.md` should fall through to the built-in
-        // default rather than silently disabling it (mirrors
-        // `load_base_system_prompt`).
         if path.exists() {
-            let content = std::fs::read_to_string(path).ok()?;
-            if !content.trim().is_empty() {
+            std::fs::read_to_string(path).ok().map(|content| {
                 let raw_size = content.len();
                 let formatted = format!("# {}\n\n{}", label, content.trim());
-                Some((formatted, raw_size))
-            } else {
-                None
-            }
+                (formatted, raw_size)
+            })
         } else {
             None
         }
@@ -1072,10 +1055,7 @@ fn load_preferred_tools_files_from_dir(working_dir: Option<&Path>) -> (Option<St
     }
 
     if contents.is_empty() {
-        (
-            Some(DEFAULT_PREFERRED_TOOLS.to_string()),
-            DEFAULT_PREFERRED_TOOLS.len(),
-        )
+        (None, 0)
     } else {
         (Some(contents.join("\n\n")), total_chars)
     }

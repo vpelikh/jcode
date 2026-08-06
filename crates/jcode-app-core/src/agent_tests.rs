@@ -915,17 +915,6 @@ async fn restore_session_resets_runtime_interrupt_and_queue_state() {
         None,
         None,
     );
-    // A real conversation line so the session persists on disk and always
-    // overwrites any stale (possibly Crashed) leftover with the same fixed id;
-    // otherwise the intentional save() skip for untouched sessions leaves stale
-    // state behind when this test runs after others in the same process.
-    restored_session.add_message(
-        crate::message::Role::User,
-        vec![crate::message::ContentBlock::Text {
-            text: "resume".to_string(),
-            cache_control: None,
-        }],
-    );
     restored_session.save().expect("save restored session");
 
     seed_transient_session_state(&mut agent);

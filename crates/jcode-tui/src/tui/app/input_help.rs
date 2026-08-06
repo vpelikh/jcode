@@ -97,9 +97,6 @@ impl App {
             "review" => {
                 "/review\nLaunch a one-shot headed review session immediately.\n\nThe reviewer will DM this session when done. If OpenAI ChatGPT OAuth is available, it prefers gpt-5.5."
             }
-            "review-loop" => {
-                "/review-loop\nRun a post-completion per-lens review loop on this session.\n\nA loop mode review spawns an independent read-only reviewer per lens (correctness, edges/errors, security, performance, build/leftovers, requirement traceability), reports findings back as fix turns, and re-reviews each lens until it is clean or a stall cap is hit, ending with a final confirmation pass.\n\n/review-loop (or /review-loop start|run)\nStart (or restart) the per-lens review loop on this session.\n\n/review-loop stop\nStop the active review loop.\n\n/review-loop status\nShow the current review loop status or the final digest if the loop has finished.\n\nTo run the loop automatically after completion, enable autoreview loop_mode in config."
-            }
             "judge" => {
                 "/judge\nLaunch a one-shot headed judge session immediately.\n\nThe judge will DM this session when done. If OpenAI ChatGPT OAuth is available, it prefers gpt-5.5."
             }
@@ -193,7 +190,7 @@ impl App {
                 "/show-agentgrep-output\nShow whether full agentgrep search output renders inline in the transcript.\n\n/show-agentgrep-output on\nRender the full agentgrep search results inline beneath each agentgrep call instead of just the one-line summary.\n\n/show-agentgrep-output off\nShow only the compact one-line agentgrep summary."
             }
             "tool-call-details" => {
-                "/tool-call-details\nShow whether the technical detail (command, path, args) renders next to the model-provided intent on tool rows.\n\n/tool-call-details on\nOn bash rows, render a verbose block with the full executed command (wrapped), the working directory, the execution time, and the exit code; on other tool rows show the technical detail after the intent, e.g. `bash · Run tests · $ cargo test`.\n\n/tool-call-details off\nShow only the intent on tool rows that have one. Rows without an intent still show the technical detail, and error summaries always render."
+                "/tool-call-details\nShow whether the dimmed technical detail (command, path, args) renders next to the model-provided intent on tool rows.\n\n/tool-call-details on\nShow the technical detail after the intent, e.g. `bash · Run tests · $ cargo test`.\n\n/tool-call-details off\nShow only the intent on tool rows that have one. Rows without an intent still show the technical detail, and error summaries always render."
             }
             "auth" | "login" => {
                 "/auth\nShow authentication status for all providers.\n\n/login\nInteractive provider selection - pick a provider to log into.\n\n/login <provider>\nStart login flow directly for any provider shown by /login or the /login completions.\n\nUse /login jcode for pay-as-you-go hosted models through the Jcode router. Set a monthly spending limit in the browser; no API key is pasted into the terminal."

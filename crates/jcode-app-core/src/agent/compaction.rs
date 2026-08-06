@@ -185,39 +185,21 @@ impl Agent {
     /// Best-effort recovery after a provider HTTP 413 "request too large" error.
     ///
     /// This failure is caused by the serialized request body (dominated by inline
-    /// base64 images and/or accumulated large tool outputs) exceeding the
-    /// provider's size cap, which is independent of the token context window. We
-    /// strip oversized images from the persisted transcript first, oldest-first,
-    /// down to a conservative byte budget; if the oversized payload is instead
-    /// driven by large tool-result text (the common case for a coding session
-    /// with big file/cat/read outputs), we truncate those tool results as a
-    /// fallback. Either way we then reset the provider session/cache so the
-    /// caller can retry the same turn immediately.
+    /// base64 images) exceeding the provider's size cap, which is independent of
+    /// the token context window. We strip oversized images from the persisted
+    /// transcript, oldest-first, down to a conservative byte budget and reset the
+    /// provider session/cache so the caller can retry the same turn immediately.
     fn try_recover_after_payload_too_large(&mut self, error: &str) -> bool {
         if !crate::compaction::is_request_payload_too_large_error(error) {
             return false;
         }
 
-        // Phase 1: drop oversized inline images (the classic 413 driver). Use
-        // the tighter emergency budget: once a request has been rejected as too
-        // large, prioritize getting a retry through over preserving screenshots.
         let stripped = self
             .session
-            .strip_oversized_images(crate::compaction::PAYLOAD_IMAGE_EMERGENCY_CHAR_BUDGET);
-
-        // Phase 2: if images couldn't get us under budget (e.g. the oversized
-        // payload is accumulated tool-result text, not images), truncate large
-        // tool results so the next request body fits.
-        let truncated = if stripped == 0 {
-            self.session
-                .emergency_truncate_tool_results(crate::compaction::PAYLOAD_TOOL_RESULT_CHAR_BUDGET)
-        } else {
-            0
-        };
-
-        if stripped == 0 && truncated == 0 {
+            .strip_oversized_images(crate::compaction::PAYLOAD_IMAGE_CHAR_BUDGET);
+        if stripped == 0 {
             logging::warn(
-                "Request-too-large recovery skipped: no oversized inline images or tool results to strip",
+                "Request-too-large recovery skipped: no oversized inline images to strip",
             );
             return false;
         }
@@ -243,8 +225,8 @@ impl Agent {
         self.session.provider_session_id = None;
 
         logging::warn(&format!(
-            "Request body exceeded provider size limit; stripped {} oversized inline image(s), truncated {} tool result(s), retrying",
-            stripped, truncated
+            "Request body exceeded provider size limit; stripped {} oversized inline image(s) and retrying",
+            stripped
         ));
         crate::runtime_memory_log::emit_event(
             crate::runtime_memory_log::RuntimeMemoryLogEvent::new(
@@ -252,7 +234,7 @@ impl Agent {
                 "request_payload_too_large",
             )
             .with_session_id(self.session.id.clone())
-            .with_detail(format!("images_stripped={stripped},tool_results_truncated={truncated}"))
+            .with_detail(format!("images_stripped={stripped}"))
             .force_attribution(),
         );
 

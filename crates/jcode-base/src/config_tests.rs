@@ -1,7 +1,7 @@
 use super::{
-    AmbientConfig, AutoReviewConfig, Config, DiffDisplayMode, DisplayConfig, HookCommands,
-    LatexRenderingMode, McpToolsMode, ProviderConfig, SessionPickerResumeAction, SwarmSpawnMode,
-    ToolConfig, config_env_fingerprint, populate_context_limits_from_config_ref,
+    AmbientConfig, Config, DiffDisplayMode, DisplayConfig, HookCommands, LatexRenderingMode,
+    McpToolsMode, ProviderConfig, SessionPickerResumeAction, SwarmSpawnMode, ToolConfig,
+    config_env_fingerprint, populate_context_limits_from_config_ref,
 };
 use std::ffi::OsString;
 use std::path::Path;
@@ -436,24 +436,6 @@ fn tool_config_defaults_to_full_toolset() {
     assert!(selection.disabled_tools.is_empty());
     assert_eq!(config.mcp_tools, McpToolsMode::Auto);
     assert_eq!(config.mcp_tools_token_threshold, 8_000);
-    // The compass_query-first enforcement is on by default, matching the
-    // built-in preferred-tools guidance that tells agents to try semantic
-    // search first. An operator can turn it off via [tools] below.
-    assert!(config.prefer_compass_query);
-}
-
-#[test]
-fn tool_config_prefer_compass_query_round_trips_through_toml() {
-    // Explicitly off.
-    let off: Config = toml::from_str("[tools]\nprefer_compass_query = false\n").unwrap();
-    assert!(!off.tools.prefer_compass_query);
-    // Explicitly on.
-    let on: Config = toml::from_str("[tools]\nprefer_compass_query = true\n").unwrap();
-    assert!(on.tools.prefer_compass_query);
-    // Absent key falls back to the default (on) for backward compatibility
-    // with config files written before the flag existed.
-    let absent: Config = toml::from_str("[tools]\nread_dedup = true\n").unwrap();
-    assert!(absent.tools.prefer_compass_query);
 }
 
 #[test]
@@ -679,24 +661,6 @@ fn test_generated_default_config_has_expected_user_defaults() {
     let parsed: Config =
         toml::from_str(&content).expect("generated default config should parse as Config");
     assert_eq!(parsed.agents.swarm_spawn_mode, SwarmSpawnMode::Inline);
-    // The compass_query-first enforcement knob ships documented and defaults on.
-    assert!(
-        content.contains("prefer_compass_query"),
-        "generated default config should document prefer_compass_query"
-    );
-    assert!(
-        parsed.tools.prefer_compass_query,
-        "generated default config keeps compass_query-first enforcement on"
-    );
-    // The pre-warm knob ships documented and defaults on.
-    assert!(
-        content.contains("prewarm_compass_index"),
-        "generated default config should document prewarm_compass_index"
-    );
-    assert!(
-        parsed.tools.prewarm_compass_index,
-        "generated default config keeps Compass pre-warm on"
-    );
     assert!(
         parsed.display.show_thinking,
         "freshly created user config should request model reasoning"
@@ -1453,70 +1417,4 @@ fn config_reload_generation_increments_on_cache_invalidation() {
         after > before,
         "invalidate_config_cache must bump the reload generation ({before} -> {after})"
     );
-}
-
-#[test]
-fn test_autoreview_loop_mode_and_stall_defaults() {
-    // Phase 1b: review-loop config scaffolding on AutoReviewConfig.
-    let cfg = Config::default();
-    assert!(cfg.autoreview.loop_mode, "loop_mode must default to true");
-    assert_eq!(
-        cfg.autoreview.max_stalled_turns, 3,
-        "max_stalled_turns must default to 3"
-    );
-}
-
-#[test]
-fn test_autoreview_enabled_and_loop_default_on_for_empty_config() {
-    // A brand-new user with no [autoreview] section (or an empty config) must
-    // get the default-on behavior: review runs as part of the flow. This is the
-    // public Config parse boundary for new installs.
-    let cfg: Config = toml::from_str("")
-        .expect("empty config must deserialize");
-    assert!(
-        cfg.autoreview.enabled,
-        "empty config: autoreview must default to enabled"
-    );
-    assert!(
-        cfg.autoreview.loop_mode,
-        "empty config: review loop must default on"
-    );
-
-    // An other-sections-only config (no [autoreview] table) behaves the same.
-    let cfg2: Config = toml::from_str("[features]\nmermaid = false\n")
-        .expect("config without autoreview section must deserialize");
-    assert!(cfg2.autoreview.enabled);
-    assert!(cfg2.autoreview.loop_mode);
-}
-
-#[test]
-fn test_autoreview_loop_mode_and_stall_deserialize() {
-    let cfg: Config = toml::from_str(
-        r#"
-        [autoreview]
-        enabled = true
-        loop_mode = true
-        max_stalled_turns = 0
-        "#,
-    )
-    .expect("config should deserialize with review-loop fields");
-
-    assert!(cfg.autoreview.enabled);
-    assert!(cfg.autoreview.loop_mode);
-    assert_eq!(cfg.autoreview.max_stalled_turns, 0);
-}
-
-#[test]
-fn test_autoreview_loop_mode_stall_tolerates_missing_fields() {
-    // Existing sessions/configs without the new fields must load tolerantly.
-    let cfg: Config = toml::from_str(
-        r#"
-        [autoreview]
-        enabled = false
-        "#,
-    )
-    .expect("config without loop fields must still deserialize");
-
-    assert!(cfg.autoreview.loop_mode);
-    assert_eq!(cfg.autoreview.max_stalled_turns, 3);
 }

@@ -713,8 +713,8 @@ fn onboarding_import_happy_path_images() {
         // dirty counts of the repo the generator runs in. Pin it to a clean
         // fixture branch. (The version label is compile-time build meta, which
         // is deterministic for a given checkout and expected to advance.)
-        crate::tui::app::helpers::seed_git_info_cache_for_tests(
-            Some(crate::tui::info_widget::GitInfo {
+        crate::tui::app::helpers::seed_git_info_cache_for_tests(Some(
+            crate::tui::info_widget::GitInfo {
                 branch: "main".to_string(),
                 modified: 0,
                 staged: 0,
@@ -722,9 +722,8 @@ fn onboarding_import_happy_path_images() {
                 ahead: 0,
                 behind: 0,
                 dirty_files: Vec::new(),
-            }),
-            None,
-        );
+            },
+        ));
         let mut app = create_test_app();
         // The header shows a randomly drawn session mascot ("client: Goat 🐐"),
         // which would make the artifact differ run to run. Pin it.

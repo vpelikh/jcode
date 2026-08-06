@@ -379,8 +379,8 @@ fn swarm_plan_todos_preserve_blockers_and_assignee_and_flow_to_renderer() {
 #[test]
 fn swarm_plan_running_items_render_before_completed_in_large_plans() {
     // 120-item deep plan: 100 completed, 1 running near the end, rest queued.
-    // The widget renders the FULL list (no "+N more" footer), so the running item
-    // is always visible and nothing is hidden behind a line budget.
+    // The running item must be visible in the small line budget instead of
+    // hiding behind the "+N more" footer.
     let mut items: Vec<crate::plan::PlanItem> = (0..100)
         .map(|i| plan_item(&format!("done-{i}"), "completed"))
         .collect();
@@ -396,16 +396,9 @@ fn swarm_plan_running_items_render_before_completed_in_large_plans() {
     let text = lines_text(&render_todos_widget(&data, Rect::new(0, 0, 60, 8)));
     assert!(
         text.contains("task hot-task"),
-        "running plan item must render: {text}"
+        "running plan item should be visible in the budgeted list: {text}"
     );
-    // Every todo renders; there is no "+N more" summary footer anymore.
-    assert!(
-        !text.contains("+more") && !text.contains("+ done"),
-        "no +N footer expected when the full list renders: {text}"
-    );
-    for i in 0..19 {
-        assert!(text.contains(&format!("queued-{i}")), "queued-{i} must render: {text}");
-    }
+    assert!(text.contains("+"), "footer summarizes the rest: {text}");
 }
 
 #[test]
@@ -485,14 +478,9 @@ fn flat_todo_list_shows_feedback_loop_assessments_on_header_in_all_widget_sizes(
         lines_text_concat(&render_todos_expanded(&data, Rect::new(0, 0, 70, 14))),
         lines_text_concat(&render_todos_compact(&data, Rect::new(0, 0, 70, 3))),
     ] {
-        // The feedback-loop assessments are preserved in the header. On a wide
-        // widget they sit on the header line; when the header wraps they may
-        // split across rows, so assert each assessment label appears rather than
-        // relying on contiguity.
-        assert!(text.contains("loop"), "loop marker missing: {text}");
         assert!(
-            text.contains("representative") && text.contains("main_paths"),
-            "loop assessment labels missing: {text}"
+            text.contains("loop strong/representative/main_paths"),
+            "loop suffix missing: {text}"
         );
     }
 }
@@ -564,46 +552,6 @@ fn loop_suffix_renders_safely_at_tiny_sizes() {
         let _ = render_todos_expanded(&data, rect);
         let _ = render_todos_compact(&data, rect);
     }
-}
-
-#[test]
-fn todo_long_content_wraps_instead_of_truncating() {
-    // A todo whose body is far wider than the widget wraps across multiple lines
-    // and keeps the FULL text (no ellipsis), even in a narrow widget.
-    let long_body = "Implement a deeply nested transformation pipeline that also \
-handles streaming partial results and rendering them to the debug side panel";
-    let body_no_spaces = long_body.replace(' ', "");
-    let data = InfoWidgetData {
-        todos: vec![todo_item("a", &long_body, "in_progress", None)],
-        ..Default::default()
-    };
-    let text = lines_text(&render_todos_widget(&data, Rect::new(0, 0, 30, 20)));
-    assert!(!text.contains("..."), "no ellipsis truncation: {text}");
-    // Wrapping splits the body onto multiple rows (each prefixed by the status
-    // glyph), so assert that every word of the body appears rather than relying
-    // on character contiguity across lines.
-    for word in long_body.split_whitespace() {
-        assert!(text.contains(word), "word '{word}' lost in wrap: {text}");
-    }
-
-    // An over-wide single word (no spaces) hard-breaks so nothing is lost.
-    let word_data = InfoWidgetData {
-        todos: vec![todo_item("b", &body_no_spaces, "pending", None)],
-        ..Default::default()
-    };
-    let word_text = lines_text(&render_todos_widget(&word_data, Rect::new(0, 0, 20, 20)));
-    // Hard-break legitimately splits the over-wide word across rows, and each
-    // row is prefixed by the status glyph, so the full word is a *subsequence*
-    // (chars in order) of the compacted output, not a contiguous substring.
-    // Strip glyph/UI noise, then verify body_no_spaces recurs in order.
-    let word_compact: String = word_text
-        .chars()
-        .filter(|c| !c.is_whitespace() && !matches!(c, '▶' | '○' | '✓' | '✗' | '⊳' | '·' | '?' | '!'))
-        .collect();
-    assert!(
-        is_subsequence(&word_compact, &body_no_spaces),
-        "over-wide word must be fully preserved in order (hard-broken): {word_text}"
-    );
 }
 
 #[test]
@@ -710,14 +658,6 @@ fn lines_text(lines: &[ratatui::text::Line<'_>]) -> String {
         .map(|span| span.content.as_ref())
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// True if `needle`'s characters appear as an in-order subsequence of `hay`.
-/// Used to verify a hard-broken over-wide word is fully preserved even though
-/// continuation-row glyphs interleave between its chunks.
-fn is_subsequence(hay: &str, needle: &str) -> bool {
-    let mut it = hay.chars();
-    needle.chars().all(|c| it.any(|h| h == c))
 }
 
 #[test]
@@ -1872,343 +1812,4 @@ fn compact_page_height_matches_for_cost_based_usage() {
 
     let lines = super::render_page(InfoPageKind::CompactOnly, &data, inner);
     assert_eq!(lines.len() as u16, layout.pages[0].height);
-}
-
-/// The CompactOnly overview page must reserve exactly as many rows as it
-/// renders even when todos are present and their compact summary wraps at the
-/// overview's narrow width. This pins the width-aware compact_todos_height
-/// against the actual rendered page. A tall todo list cannot fit a TodosExpanded
-/// page in a short overview, so the compact page is the only one selected.
-#[test]
-fn compact_page_height_matches_with_wrapped_todos_summary() {
-    use super::InfoPageKind;
-
-    let data = InfoWidgetData {
-        model: Some("claude-test".to_string()),
-        todos: (0..20)
-            .map(|i| todo_item(&format!("t{i}"), "task", "pending", None))
-            .collect(),
-        todo_goals: vec![crate::todo::TodoGoal {
-            group: None,
-            closed_feedback_loop: Some(crate::todo::FeedbackLoopState::from_legacy_score(85)),
-            feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
-            feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::MainPaths),
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
-
-    // Narrow width forces the compact summary (with confidence + loop suffix)
-    // to wrap across several rows; a tall list fails the TodosExpanded fit, so
-    // the CompactOnly page is selected.
-    let inner_height = 8;
-    for inner_w in 22u16..=40 {
-        let inner = Rect::new(0, 0, inner_w, inner_height);
-        let layout = super::compute_page_layout(&data, inner.width as usize, inner.height);
-        assert!(
-            layout
-                .pages
-                .iter()
-                .any(|p| p.kind == InfoPageKind::CompactOnly),
-            "compact page expected at width {inner_w}"
-        );
-        if let Some(page) = layout
-            .pages
-            .iter()
-            .find(|p| p.kind == InfoPageKind::CompactOnly)
-        {
-            let lines = super::render_page(InfoPageKind::CompactOnly, &data, inner);
-            assert_eq!(
-                lines.len() as u16,
-                page.height,
-                "compact page height must equal rendered rows at width {inner_w}"
-            );
-        }
-    }
-}
-
-/// The TodosExpanded overview page must reserve exactly as many rows as it
-/// renders. `expanded_todos_height` is now derived from the actual wrapped line
-/// count (no fixed 12-line cap), so with no other sections the whole list must
-/// fit and a height mismatch would clip the last todo or waste rows.
-#[test]
-fn todos_expanded_page_height_matches_wrapped_rendered_lines() {
-    use super::InfoPageKind;
-    let mk = |id: &str, body: &str, status: &str| todo_item(id, body, status, None);
-
-    for (title, todos, inner_w) in [
-        (
-            "short single-line todos still match",
-            vec![
-                mk("a", "one task", "in_progress"),
-                mk("b", "second task", "pending"),
-            ],
-            40,
-        ),
-        (
-            "many todos match 1:1 (no cap, no +N footer)",
-            (0..20)
-                .map(|i| mk(&format!("t{i}"), &format!("task number {i}"), "pending"))
-                .collect(),
-            40,
-        ),
-        (
-            "long bodies wrap so rendered lines exceed todo count",
-            vec![mk(
-                "w",
-                "a deeply nested transformation pipeline that also handles streaming partial results and rendering them into the debug side panel with several extra words",
-                "in_progress",
-            )],
-            24,
-        ),
-    ] {
-        let data = InfoWidgetData {
-            todos,
-            ..Default::default()
-        };
-        // Tall enough inner area so height is not clipped by the viewport.
-        let inner = Rect::new(0, 0, inner_w, 60);
-        let layout = super::compute_page_layout(&data, inner.width as usize, inner.height);
-
-        // The TodosExpanded candidate must be present and must be what the
-        // multi-page layout selected (single expanded page).
-        assert_eq!(layout.pages.len(), 1, "{title}: page set mismatch");
-        assert_eq!(
-            layout.pages[0].kind,
-            InfoPageKind::TodosExpanded,
-            "{title}"
-        );
-
-        let lines = super::render_page(InfoPageKind::TodosExpanded, &data, inner);
-        assert_eq!(
-            lines.len() as u16,
-            layout.pages[0].height,
-            "{title}: page height must equal rendered line count \
-             (wrapped rows included, no cap, no +N footer)"
-        );
-    }
-}
-
-/// `calculate_widget_height(WidgetKind::Todos)` must match the number of lines
-/// `render_todos_widget` actually produces (header + every wrapped todo row),
-/// for a handful of list sizes and widths. This is the margin-placement height
-/// the earlier fixed "up to 5 + footer" formula ignored; it is now render-based.
-#[test]
-fn todos_widget_height_equals_rendered_line_count() {
-    let mk = |id: &str, body: &str, status: &str| todo_item(id, body, status, None);
-
-    let cases: Vec<(Vec<crate::todo::TodoItem>, u16)> = vec![
-        (vec![mk("a", "one", "in_progress")], 40),
-        ((0..8).map(|i| mk(&format!("t{i}"), &format!("chore {i}"), "pending")).collect(), 40),
-        ((0..20).map(|i| mk(&format!("t{i}"), &format!("chore {i}"), "pending")).collect(), 40),
-        (
-            vec![mk(
-                "w",
-                "a very long single word that must hard wrap 汉字汉字汉字汉字 across the narrow band",
-                "in_progress",
-            )],
-            20,
-        ),
-    ];
-
-    for (todos, width) in cases {
-        let data = InfoWidgetData {
-            todos,
-            ..Default::default()
-        };
-        let rendered = render_todos_widget(&data, Rect::new(0, 0, width, 100)).len() as u16;
-        // Pass a generous max_height so the estimate is not clipped.
-        let estimated =
-            calculate_widget_height(WidgetKind::Todos, &data, width + 2, 100);
-        // calculate_widget_height is border-inclusive (content + 2 border rows),
-        // the same convention the layout uses to seat `block.inner(rect)`; the
-        // placed inner area then holds exactly `rendered` content rows.
-        assert_eq!(estimated, rendered + 2, "todos at width {width}");
-        // Independent check: todos_widget_line_count returns the content-only
-        // line count (no border), so it must equal the rendered rows directly.
-        assert_eq!(
-            super::todos_widget_line_count(&data, width) as u16,
-            rendered,
-            "line_count at width {width}"
-        );
-    }
-}
-
-/// Every rendered row of the widgets must fit within the widget's inner width:
-/// the header row(s) (now wrapped, and optional confidence/loop suffixes clipped
-/// when a suffix alone is wider than the box), todo rows, wrapped continuation
-/// rows, and wrapped group-header rows. This is the guarantee this feature adds
-/// - everything displays fully, wrapped to its box, never clipped. We sum the
-/// display width of each row's spans (wide CJK glyphs count 2) and require it
-/// <= inner.width.
-#[test]
-fn todo_widget_lines_never_exceed_inner_width() {
-    use unicode_width::UnicodeWidthStr;
-    let mk = |id: &str, body: &str, status: &str, group: Option<&str>| {
-        todo_item(id, body, status, group)
-    };
-
-    let data = InfoWidgetData {
-        todos: vec![
-            mk(
-                "a",
-                "a normal sized todo body that should fit comfortably on one or two lines",
-                "in_progress",
-                None,
-            ),
-            mk(
-                "b",
-                "another todo with a fairly long sentence body used to exercise wrapping behavior across the narrow widget",
-                "pending",
-                None,
-            ),
-            mk(
-                "c",
-                "short",
-                "completed",
-                Some("a long group name 汉字 that will wrap across multiple rows"),
-            ),
-        ],
-        ..Default::default()
-    };
-
-    // A range of widget widths, including narrow ones that force heavy wrapping
-    // and hard-breaks of over-wide words.
-    for inner_w in 22u16..=30 {
-        let inner = Rect::new(0, 0, inner_w, 100);
-        for lines in [
-            render_todos_widget(&data, inner),
-            render_todos_expanded(&data, inner),
-            render_todos_compact(&data, inner),
-        ] {
-            for (idx, line) in lines.iter().enumerate() {
-                let w = line
-                    .spans
-                    .iter()
-                    .map(|s| s.content.width())
-                    .sum::<usize>();
-                assert!(
-                    w <= inner_w as usize,
-                    "row {idx} (width {w}) exceeds inner width {inner_w}:\n{}",
-                    lines_text(&lines)
-                );
-            }
-        }
-    }
-}
-
-/// The compact todos surface must never overflow and its rendered row count must
-/// match `todos_compact_line_count` (which the overview page-layout uses to
-/// reserve height). With a confidence + feedback-loop-carrying summary this
-/// exercises the wrapped-summary path at narrow widths.
-#[test]
-fn compact_todos_rows_fit_and_height_matches() {
-    use unicode_width::UnicodeWidthStr;
-    let data = InfoWidgetData {
-        todos: vec![
-            todo_item("a", "one", "in_progress", None),
-            todo_item("b", "two", "completed", None),
-        ],
-        todo_goals: vec![crate::todo::TodoGoal {
-            group: None,
-            closed_feedback_loop: Some(crate::todo::FeedbackLoopState::from_legacy_score(85)),
-            feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
-            feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::MainPaths),
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
-    for inner_w in 10u16..=40 {
-        let inner = Rect::new(0, 0, inner_w, 100);
-        let lines = render_todos_compact(&data, inner);
-        for (idx, line) in lines.iter().enumerate() {
-            let w = line.spans.iter().map(|s| s.content.width()).sum::<usize>();
-            assert!(
-                w <= inner_w as usize,
-                "compact row {idx} (width {w}) exceeds inner width {inner_w}:\n{}",
-                lines_text(&lines)
-            );
-        }
-        assert_eq!(
-            super::todos_compact_line_count(&data, inner_w) as u16,
-            lines.len() as u16,
-            "compact line_count must match rendered rows at width {inner_w}"
-        );
-    }
-}
-
-/// Every rendered row of all todo widget variants must fit within the widget's
-/// inner width across narrow widths and a spread of item/group/goal shapes.
-///
-/// This guards the wrapping introduced for long items (full text, no ellipsis),
-/// which had two overflow regressions at narrow widths:
-///   * the per-item confidence trailer (` · plausible`) was appended
-///     unconditionally even when the fixed glyph/priority prefix already filled
-///     the box, so the first item happened to overflow;
-///   * the continuation rows printed the content wrapped to the narrower
-///     first-line prefix, so wrapped chunks overflowed the wider continuation
-///     prefix.
-/// The fix wraps content to the continuation prefix and appends the confidence
-/// and blocked trailers only when they fit in the leftover columns, so no row
-/// can exceed `inner.width`.
-#[test]
-fn todo_widget_rows_never_overflow_narrow_widths() {
-    use unicode_width::UnicodeWidthStr;
-    let mk = |content: &str, status: &str, group: Option<&str>| todo_item("x", content, status, group);
-    let mut failures = Vec::new();
-    for width in 12u16..=40 {
-        for content in [
-            "a",
-            "ab cd ef",
-            "abcdefghijklmnopqrstuvwxyz",
-            "a very long single word that must hard wrap 汉字汉字 漢字 again",
-            "ショートワードが長すぎる場合に分割される必要があります",
-            "emoji 🚀 sailing wide 🏄 and more text",
-            "混在mixed combining 文字 and ascii text",
-        ] {
-            for group in [None, Some("g"), Some("a very long group 汉字 name")] {
-                for status in ["in_progress", "pending", "completed", "cancelled"] {
-                    let data = InfoWidgetData {
-                        todos: vec![mk(content, status, group)],
-                        todo_goals: vec![crate::todo::TodoGoal {
-                            group: group.map(|s| s.to_string()),
-                            closed_feedback_loop: Some(
-                                crate::todo::FeedbackLoopState::from_legacy_score(85),
-                            ),
-                            feedback_loop_relevance: Some(
-                                crate::todo::FeedbackLoopRelevance::Representative,
-                            ),
-                            feedback_loop_coverage: Some(
-                                crate::todo::FeedbackLoopCoverage::MainPaths,
-                            ),
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    };
-                    let inner = Rect::new(0, 0, width, 100);
-                    for (kind, lines) in [
-                        ("widget", render_todos_widget(&data, inner)),
-                        ("expanded", render_todos_expanded(&data, inner)),
-                        ("compact", render_todos_compact(&data, inner)),
-                    ] {
-                        for (idx, line) in lines.iter().enumerate() {
-                            let w = line.spans.iter().map(|s| s.content.width()).sum::<usize>();
-                            if w > width as usize {
-                                failures.push(format!(
-                                    "[{kind}] width {width} group {group:?} status {status} content '{content}' row {idx} (w {w}):\n{}",
-                                    lines_text(&lines)
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "{} rows overflow their widget:\n{}",
-        failures.len(),
-        failures.join("\n====\n")
-    );
 }

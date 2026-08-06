@@ -39,26 +39,6 @@ pub const EMERGENCY_IMAGE_MAX_CHARS: usize = 1024;
 /// under the hard provider cap so a single retry reliably fits.
 pub const PAYLOAD_IMAGE_CHAR_BUDGET: usize = 12 * 1024 * 1024;
 
-/// Total-base64 budget applied when reactively recovering from a *specific*
-/// provider HTTP 413 "request too large" error.
-///
-/// `PAYLOAD_IMAGE_CHAR_BUDGET` (12 MiB) is chosen to stay under Anthropic's
-/// ~32 MB body cap while preserving as much visual context as possible. But many
-/// OpenAI-compatible gateways and coding proxies reject bodies far below that
-/// (often 4-16 MB), so a 413 that is driven by stacked screenshots can survive a
-/// strip-to-12-MiB retry and fail again. Once a request has actually been
-/// rejected as too large, we prioritize getting a retry through over preserving
-/// screenshots, so the reactive path strips images down to this tighter cap.
-pub const PAYLOAD_IMAGE_EMERGENCY_CHAR_BUDGET: usize = 4 * 1024 * 1024;
-
-/// Approximate maximum total tool-result body (in characters) we aim to keep
-/// the transcript under when recovering from a "request too large" / HTTP 413
-/// payload error that is driven by accumulated large tool outputs (file/cat/read
-/// results) rather than inline images. More generous than the image budget
-/// because tool-result text is what carries the working context of a coding
-/// session, so we keep as much of it as the hard provider cap allows.
-pub const PAYLOAD_TOOL_RESULT_CHAR_BUDGET: usize = 8 * 1024 * 1024;
-
 /// Approximate chars per token for estimation
 pub const CHARS_PER_TOKEN: usize = 4;
 
@@ -578,67 +558,6 @@ pub fn emergency_truncate_tool_results(messages: &mut [Message], max_chars: usiz
     truncated
 }
 
-/// Shorten oversized tool-result text in `contents`, oldest-first, until the
-/// total remaining tool-result payload fits within `target_total_chars`.
-///
-/// This is the byte-size counterpart to
-/// [`strip_large_images_in_contents`] for the HTTP 413 "request too large"
-/// failure mode that is driven by accumulated large tool outputs (file/cat/read
-/// results) rather than inline images. Unlike image stripping (which drops whole
-/// image blocks), each oversized tool result is shortened to keep its head and
-/// tail so the model retains the beginning and end of the content. Returns the
-/// number of tool results that were truncated.
-pub fn emergency_truncate_tool_results_in_contents(
-    contents: &mut [&mut Vec<ContentBlock>],
-    target_total_chars: usize,
-) -> usize {
-    // Collect (content_index, block_index, content_len) for every tool result,
-    // in transcript order (oldest first).
-    let mut results: Vec<(usize, usize, usize)> = Vec::new();
-    let mut total: usize = 0;
-    for (ci, content) in contents.iter().enumerate() {
-        for (bi, block) in content.iter().enumerate() {
-            if let ContentBlock::ToolResult { content, .. } = block {
-                results.push((ci, bi, content.len()));
-                total = total.saturating_add(content.len());
-            }
-        }
-    }
-
-    if total <= target_total_chars {
-        return 0;
-    }
-
-    // Shorten the largest tool results first to get the most size reduction per
-    // block, while still trying to preserve head/tail of the newly large ones.
-    // Sort by payload length descending (largest first).
-    results.sort_by(|a, b| b.2.cmp(&a.2));
-
-    // Per-tool-result cap so no single result can dominate the budget: keep the
-    // head and tail but bound each block. The target budget is split across the
-    // results we intend to keep, scaled so the total stays under the target.
-    let keep = results.len().max(1);
-    let per_result_cap = (target_total_chars / keep).max(256).min(target_total_chars);
-
-    let mut truncated = 0;
-    for (ci, bi, _orig_len) in results {
-        if total <= target_total_chars {
-            break;
-        }
-        let block = &mut contents[ci][bi];
-        if let ContentBlock::ToolResult { content, .. } = block {
-            if content.len() > per_result_cap {
-                let shortened = emergency_truncated_tool_result(content, per_result_cap);
-                total = total.saturating_sub(content.len()).saturating_add(shortened.len());
-                *content = shortened;
-                truncated += 1;
-            }
-        }
-    }
-
-    truncated
-}
-
 pub fn emergency_truncate_large_payloads(
     messages: &mut [Message],
     max_tool_result_chars: usize,
@@ -1071,80 +990,6 @@ mod tests {
         }
     }
 
-    fn tool_result_msg(content_len: usize) -> Message {
-        Message {
-            role: Role::User,
-            content: vec![ContentBlock::ToolResult {
-                tool_use_id: "call_x".to_string(),
-                content: "r".repeat(content_len),
-                is_error: None,
-            }],
-            timestamp: None,
-            tool_duration_ms: None,
-        }
-    }
-
-    #[test]
-    fn truncate_tool_results_in_contents_shortens_largest_first() {
-        // Three tool results (1k, 10k, 5k). Budget 9000 requires shortening the
-        // biggest first; the result total must end under budget.
-        let mut messages = vec![
-            tool_result_msg(1000),
-            tool_result_msg(10000),
-            tool_result_msg(5000),
-        ];
-        let mut contents: Vec<&mut Vec<ContentBlock>> = messages
-            .iter_mut()
-            .map(|m| &mut m.content)
-            .collect();
-
-        let truncated = emergency_truncate_tool_results_in_contents(&mut contents, 9000);
-        assert!(truncated > 0);
-
-        // The total remaining tool-result payload must fit the budget.
-        let mut total: usize = 0;
-        for msg in &messages {
-            for block in &msg.content {
-                if let ContentBlock::ToolResult { content, .. } = block {
-                    total += content.len();
-                }
-            }
-        }
-        assert!(total <= 9000, "total tool results {} exceeded budget", total);
-    }
-
-    #[test]
-    fn truncate_tool_results_in_contents_noop_when_under_budget() {
-        let mut messages = vec![tool_result_msg(1000), tool_result_msg(2000)];
-        let mut contents: Vec<&mut Vec<ContentBlock>> = messages
-            .iter_mut()
-            .map(|m| &mut m.content)
-            .collect();
-
-        let truncated = emergency_truncate_tool_results_in_contents(&mut contents, 5000);
-        assert_eq!(truncated, 0);
-        assert!(matches!(messages[0].content[0], ContentBlock::ToolResult { .. }));
-    }
-
-    #[test]
-    fn truncate_tool_results_in_contents_handles_single_huge_result() {
-        // A single result far over budget still gets shortened so the request
-        // ships (better than re-sending a rejected oversized body).
-        let mut messages = vec![tool_result_msg(100_000)];
-        let mut contents: Vec<&mut Vec<ContentBlock>> = messages
-            .iter_mut()
-            .map(|m| &mut m.content)
-            .collect();
-
-        let truncated = emergency_truncate_tool_results_in_contents(&mut contents, 2000);
-        assert_eq!(truncated, 1);
-        if let ContentBlock::ToolResult { content, .. } = &messages[0].content[0] {
-            assert!(content.len() <= 2000, "content stayed {} chars", content.len());
-        } else {
-            panic!("expected a tool result");
-        }
-    }
-
     #[test]
     fn strip_large_images_drops_oldest_until_under_budget() {
         // Four 1000-char images = 4000 total; budget 2500 should drop the two
@@ -1187,18 +1032,5 @@ mod tests {
         let stripped = emergency_strip_large_images(&mut messages, 2000);
         assert_eq!(stripped, 1);
         assert!(matches!(messages[0].content[0], ContentBlock::Text { .. }));
-    }
-
-    #[test]
-    fn emergency_image_budget_is_tighter_than_regular_budget() {
-        // The reactive 413 path must strip harder than the pre-emptive budget so
-        // a request that was actually rejected as too large reliably fits on the
-        // retry (gateway caps are often well below Anthropic's ~32 MB body cap).
-        assert!(
-            PAYLOAD_IMAGE_EMERGENCY_CHAR_BUDGET < PAYLOAD_IMAGE_CHAR_BUDGET,
-            "emergency budget {} must be tighter than regular budget {}",
-            PAYLOAD_IMAGE_EMERGENCY_CHAR_BUDGET,
-            PAYLOAD_IMAGE_CHAR_BUDGET
-        );
     }
 }

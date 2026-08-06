@@ -161,14 +161,6 @@ async fn test_selfdev_session_and_registry() {
     let mut session = session::Session::create(None, Some("Test E2E".to_string()));
     session.set_canary("test-build");
     let session_id = session.id.clone();
-    // Add a message so save() does not early-return (persist guard).
-    session.add_message(
-        crate::message::Role::User,
-        vec![crate::message::ContentBlock::Text {
-            text: "placeholder".to_string(),
-            cache_control: None,
-        }],
-    );
     session.save().expect("Failed to save session");
 
     let loaded = session::Session::load(&session_id).expect("Failed to load session");

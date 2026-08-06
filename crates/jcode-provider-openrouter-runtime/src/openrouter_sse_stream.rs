@@ -19,18 +19,6 @@ fn local_endpoint_troubleshooting_hint(api_base: &str, model: &str) -> &'static 
     "Hint: check network connectivity, DNS/TLS, that the base URL includes the API version (usually /v1), and that the model exists on the provider."
 }
 
-/// A troubleshooting hint for a provider that rejected the request because its
-/// serialized body was too large (HTTP 413). The generic network hint is
-/// misleading here: a 413 payload rejection is a *request-body size* failure,
-/// not a connectivity fault, so we point the user at shrinking the transcript
-/// (dropping images or large tool outputs) instead.
-fn payload_too_large_hint() -> &'static str {
-    "Hint: the provider rejected the request because the serialized body exceeded \
-its size limit (not a network error). Reduce the payload: keep recent turns, drop \
-or re-run image-heavy tools, shorten large tool outputs, or start a fresh \
-conversation with /new and /compact."
-}
-
 // ============================================================================
 // SSE Stream Parser
 // ============================================================================
@@ -58,8 +46,12 @@ pub(super) async fn run_stream_with_retries(
 
     for attempt in 0..max_retries {
         if attempt > 0 {
-            let delay =
-                retry_delay_after_failure(attempt, next_retry_delay.take(), retry_backoff_cap);
+            let delay = jcode_provider_core::retry_after::retry_delay(
+                attempt,
+                RETRY_BASE_DELAY_MS,
+                next_retry_delay.take(),
+            )
+            .min(retry_backoff_cap);
             tokio::time::sleep(delay).await;
             jcode_base::logging::info(&format!(
                 "Retrying API request using {} (attempt {}/{})",
@@ -159,28 +151,6 @@ pub(super) async fn run_stream_with_retries(
     }
 }
 
-/// Choose the delay before the next retry attempt.
-///
-/// An explicit server-suggested wait (e.g. a token-limit 422 telling us to
-/// retry in N minutes) must be honored rather than truncated by the generic
-/// backoff cap. Truncating it hammers an endpoint that is still over its
-/// completion-token quota and exhausts the retry budget before the provider
-/// recovers. The backoff cap only applies to the exponential-backoff fallback,
-/// which is used when no server hint was recovered.
-fn retry_delay_after_failure(
-    attempt: u32,
-    server_hint: Option<std::time::Duration>,
-    backoff_cap: std::time::Duration,
-) -> std::time::Duration {
-    match server_hint {
-        Some(hint) => hint,
-        None => {
-            jcode_provider_core::attempt_tracker::retry_backoff_delay(attempt, RETRY_BASE_DELAY_MS)
-                .min(backoff_cap)
-        }
-    }
-}
-
 #[expect(
     clippy::too_many_arguments,
     reason = "stream helpers thread transport, auth, request, event channel, and pin state explicitly"
@@ -223,57 +193,21 @@ async fn stream_response(
             .header("X-Title", "jcode");
     }
 
-    let payload = serde_json::to_vec(&request).unwrap_or_default();
-    let payload_bytes = payload.len() as u64;
-    if payload_bytes > 0 {
-        let _ = tx
-            .send(Ok(StreamEvent::StatusDetail {
-                detail: format!(
-                    "sending {}",
-                    jcode_provider_core::transport::readable_bytes(payload_bytes)
-                ),
-            }))
-            .await;
-    }
-
-    let upload_tx = tx.clone();
-    let response =
-        jcode_provider_core::transport::send_body_with_upload_progress(
-            req,
-            payload,
-            stream_idle_timeout,
-            move |sent| {
-                let detail = jcode_provider_core::transport::upload_progress_label(
-                    sent,
-                    payload_bytes,
-                );
-                if !detail.is_empty() {
-                    let _ = upload_tx.try_send(Ok(StreamEvent::StatusDetail {
-                        detail,
-                    }));
-                }
-            },
-            |msg: &str| {
-                let tx = tx.clone();
-                let msg = msg.to_string();
-                async move {
-                    let _ = tx
-                        .send(Ok(StreamEvent::StatusDetail { detail: msg }))
-                        .await;
-                }
-            },
+    let response = jcode_provider_core::transport::send_with_initial_response_timeout(
+        req.json(&request),
+        stream_idle_timeout,
+    )
+    .await
+    .with_context(|| {
+        let hint = local_endpoint_troubleshooting_hint(&api_base, &model);
+        format!(
+            "Failed to send OpenAI-compatible chat request\n  endpoint: {}\n  model: {}\n  auth: {}\n{}",
+            url,
+            model,
+            auth.label(),
+            hint
         )
-        .await
-        .with_context(|| {
-            let hint = local_endpoint_troubleshooting_hint(&api_base, &model);
-            format!(
-                "Failed to send OpenAI-compatible chat request\n  endpoint: {}\n  model: {}\n  auth: {}\n{}",
-                url,
-                model,
-                auth.label(),
-                hint
-            )
-        })?;
+    })?;
 
     let connect_ms = connect_start.elapsed().as_millis();
     jcode_base::logging::info(&format!(
@@ -286,34 +220,7 @@ async fn stream_response(
         let status = response.status();
         let retry_after = jcode_provider_core::retry_after::retry_after(response.headers());
         let body = jcode_base::util::http_error_body(response, "HTTP error").await;
-        let hint = if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
-            payload_too_large_hint()
-        } else {
-            local_endpoint_troubleshooting_hint(&api_base, &model)
-        };
-
-        // A 422 from an OpenAI-compatible endpoint with a token-limit body is a
-        // transient exhaustion, not a permanent rejection: the request was
-        // well-formed but the completion token cap would be exceeded, and a
-        // short wait usually clears it. Treat it like a rate limit so the retry
-        // loop reconnects after (preferably) the provider-suggested wait.
-        // Gated by `is_token_limit_error` so unrelated 422s (malformed
-        // requests, tool-schema rejections, etc.) are NOT retried.
-        let token_limit_422 = status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
-            && jcode_provider_core::token_limit::is_token_limit_error(&body);
-
-        // Carry a retry hint to the retry loop: prefer an explicit Retry-After
-        // header; otherwise synthesize one from the wait parsed out of the
-        // token-limit body so the loop honours it instead of plain backoff.
-        let retry_hint = if token_limit_422 {
-            retry_after.or_else(|| {
-                jcode_provider_core::token_limit::extract_wait_time(&body)
-                    .map(jcode_provider_core::retry_after::RetryAfter::from_duration)
-            })
-        } else {
-            retry_after
-        };
-
+        let hint = local_endpoint_troubleshooting_hint(&api_base, &model);
         return Err(jcode_provider_core::retry_after::error_with_retry_after(
             format!(
                 "OpenAI-compatible chat request failed\n  endpoint: {}\n  model: {}\n  auth: {}\n  status: {}\n  response: {}\n{}",
@@ -324,7 +231,7 @@ async fn stream_response(
                 body,
                 hint
             ),
-            retry_hint,
+            retry_after,
         ));
     }
 
@@ -395,16 +302,6 @@ fn parsed_http_status(error_str: &str) -> Option<u16> {
 }
 
 fn is_retryable_error(error_str: &str) -> bool {
-    // A 422 that is a token-limit exhaustion is transient and should be
-    // retried (issue: OpenAI-compatible providers return 422 when the
-    // completion-token cap would be exceeded; the request is well-formed).
-    // Detect it from the body markers before the hard 4xx exclusion below.
-    if parsed_http_status(error_str) == Some(422)
-        && jcode_provider_core::token_limit::is_token_limit_error(error_str)
-    {
-        return true;
-    }
-
     // Explicit non-retryable HTTP statuses take precedence over the loose
     // substring heuristics below. These are deterministic client-side failures
     // (auth, billing, malformed request) where retrying is futile and just
@@ -449,20 +346,6 @@ mod tests {
     }
 
     #[test]
-    fn payload_too_large_hint_is_about_request_size_not_network() {
-        // A 413 is a request-body-size rejection; the hint must not blame
-        // DNS/TLS or network connectivity, and should point at shrinking the
-        // transcript (images / tool outputs).
-        let hint = payload_too_large_hint();
-        assert!(hint.contains("serialized body exceeded"));
-        assert!(hint.contains("not a network error"));
-        assert!(hint.contains("tool outputs"));
-        assert!(!hint.contains("DNS/TLS"));
-        assert!(!hint.contains("network connectivity"));
-        assert!(!hint.to_lowercase().contains("dns"));
-    }
-
-    #[test]
     fn parsed_http_status_extracts_code() {
         assert_eq!(
             parsed_http_status("status: 402 payment required"),
@@ -472,31 +355,6 @@ mod tests {
         assert_eq!(parsed_http_status("no status here"), None);
         // Embedded numbers elsewhere must not be misread as a status.
         assert_eq!(parsed_http_status("you requested 65536 tokens"), None);
-    }
-
-    #[test]
-    fn retry_delay_honors_server_hint_over_backoff_cap() {
-        use std::time::Duration;
-        let cap = Duration::from_secs(30);
-
-        // A server-suggested wait (e.g. a token-limit 422 "retry in N min")
-        // must be honored even when it exceeds the generic backoff cap. The
-        // pre-fix code truncated every delay at `cap`, hammering an endpoint
-        // still over its completion-token quota.
-        let hint = Duration::from_secs(6 * 60);
-        assert_eq!(retry_delay_after_failure(1, Some(hint), cap), hint);
-        assert_eq!(retry_delay_after_failure(8, Some(hint), cap), hint);
-
-        // Shorter server hints pass through unchanged.
-        let short = Duration::from_secs(5);
-        assert_eq!(retry_delay_after_failure(3, Some(short), cap), short);
-
-        // Without a hint, the capped exponential backoff is used.
-        let backed_off = retry_delay_after_failure(4, None, cap);
-        assert!(
-            backed_off <= cap,
-            "backoff fallback must stay within the cap"
-        );
     }
 
     #[test]
@@ -536,30 +394,6 @@ mod tests {
     fn http_429_is_retryable_without_rate_limit_words_in_body() {
         assert!(is_retryable_error(
             "chat request failed\n  status: 429 unknown\n  response: {}"
-        ));
-    }
-
-    #[test]
-    fn token_limit_422_is_retryable() {
-        // OpenAI-compatible endpoints return 422 when the completion-token cap
-        // would be exceeded; the request is well-formed and a wait clears it.
-        assert!(is_retryable_error(
-            "openai-compatible chat request failed\n  endpoint: https://your-provider/chat/completions\n  model: DeepSeek-V4-Flash\n  auth: OPENAI_COMPAT_API_KEY\n  status: 422 Unprocessable Entity\n  response: {\"error\":\"Превышен лимит completion-токенов: использовано 60323, лимит 60000. Повторите попытку через 18 мин.\"}"
-        ));
-        assert!(is_retryable_error(
-            "openai-compatible chat request failed\n  status: 422 unprocessable entity\n  response: {\"error\": \"Token limit exceeded: used 5000, limit 4096\"}"
-        ));
-    }
-
-    #[test]
-    fn unrelated_422_remains_non_retryable() {
-        // A 422 that is NOT a token-limit error (malformed request, unsupported
-        // model, tool-schema rejection) must stay non-retryable.
-        assert!(!is_retryable_error(
-            "chat request failed\n  status: 422 unprocessable entity\n  response: {\"error\": \"invalid request payload\"}"
-        ));
-        assert!(!is_retryable_error(
-            "chat request failed\n  status: 422 unprocessable entity\n  response: {\"error\": \"model is not supported\"}"
         ));
     }
 }

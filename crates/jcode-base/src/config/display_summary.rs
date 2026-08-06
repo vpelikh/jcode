@@ -347,36 +347,12 @@ impl Config {
                 "disabled"
             },
             if self.safety.telegram_enabled {
-                let mut displayed = self
-                    .safety
+                self.safety
                     .telegram_chat_id
                     .as_deref()
                     .unwrap_or("enabled (no chat_id)")
-                    .to_string();
-                let mut connectivity = Vec::new();
-                if self.safety.telegram_api_base.as_deref().is_some_and(|b| !b.trim().is_empty()) {
-                    connectivity.push("custom api_base");
-                }
-                if self.safety.telegram_proxy.as_deref().is_some_and(|p| !p.trim().is_empty()) {
-                    connectivity.push("proxy");
-                }
-                if self.safety.telegram_api_ip.as_deref().is_some_and(|i| !i.trim().is_empty()) {
-                    connectivity.push("pinned ip");
-                }
-                if self
-                    .safety
-                    .telegram_allowed_user_id
-                    .as_deref()
-                    .is_some_and(|u| !u.trim().is_empty())
-                {
-                    connectivity.push("user-whitelisted");
-                }
-                if !connectivity.is_empty() {
-                    displayed.push_str(&format!(" ({})", connectivity.join(", ")));
-                }
-                displayed
             } else {
-                "disabled".to_string()
+                "disabled"
             },
             if self.safety.telegram_reply_enabled {
                 "enabled"

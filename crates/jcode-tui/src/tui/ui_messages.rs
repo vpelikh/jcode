@@ -79,40 +79,6 @@ fn render_single_line_system_notice(
     Some(lines)
 }
 
-/// Wrap `text` across one or more physical rows at `indent + width`, emitting
-/// `Line`s that each carry a leading `indent` span plus the chunk. Long rows
-/// wrap onto continuation lines (with the same indent) instead of being
-/// truncated with an ellipsis, so full command text and bash output stay
-/// readable regardless of how wide the underlying content is.
-fn push_wrapped_indented(
-    lines: &mut Vec<Line<'static>>,
-    indent: &str,
-    text: &str,
-    style: Style,
-    available_width: usize,
-) {
-    let indent_width = UnicodeWidthStr::width(indent);
-    let content_width = available_width.saturating_sub(indent_width);
-    if content_width == 0 {
-        lines.push(Line::from(vec![
-            Span::raw(indent.to_string()),
-            Span::styled(text.to_string(), style),
-        ]));
-        return;
-    }
-    // Empty text must not produce a dangling indent-only row (`split_by_display_width`
-    // yields a single `String::new()` chunk for empty input).
-    if text.is_empty() {
-        return;
-    }
-    for chunk in split_by_display_width(text, content_width) {
-        lines.push(Line::from(vec![
-            Span::raw(indent.to_string()),
-            Span::styled(chunk, style),
-        ]));
-    }
-}
-
 pub(crate) fn render_assistant_message(
     msg: &DisplayMessage,
     width: u16,
@@ -1489,50 +1455,18 @@ fn push_todo_plan_details(
             crate::todo::IntentUnderstanding::Clear
             | crate::todo::IntentUnderstanding::Complete => todo_score_color(),
         };
-        let state_span = Span::styled(state.as_str().to_string(), Style::default().fg(state_color));
+        let mut spans = vec![
+            Span::styled("Intent ", Style::default().fg(todo_label_color())),
+            Span::styled(state.as_str().to_string(), Style::default().fg(state_color)),
+            Span::styled(": ", Style::default().fg(todo_label_color())),
+        ];
         if let Some(intention) = intention {
-            if compact_details {
-                let mut spans = vec![
-                    Span::styled("Intent ", Style::default().fg(todo_label_color())),
-                    state_span.clone(),
-                    Span::styled(": ", Style::default().fg(todo_label_color())),
-                    Span::styled(intention.to_string(), Style::default().fg(todo_meta_color())),
-                ];
-                lines.push(todo_card_line(spans, base_indent, inner_width));
-            } else {
-                // Wide transcript: wrap the objective rather than ellipsizing it,
-                // matching the no-intent-state detail path. Reserve the
-                // "Intent <state>: " + indent prefix width so the first chunk
-                // fits the card width (continuation chunks use a narrower
-                // indent, so they always fit too).
-                let prefix_width = 7 + state.as_str().width() + 2;
-                let available = inner_width.saturating_sub(prefix_width).max(1);
-                for (index, chunk) in wrap_todo_detail(intention, available).into_iter().enumerate() {
-                    let mut spans = vec![
-                        Span::styled(
-                            if index == 0 {
-                                "Intent ".to_string()
-                            } else {
-                                " ".repeat(7)
-                            },
-                            Style::default().fg(todo_label_color()),
-                        ),
-                    ];
-                    if index == 0 {
-                        spans.push(state_span.clone());
-                        spans.push(Span::styled(": ", Style::default().fg(todo_label_color())));
-                    }
-                    spans.push(Span::styled(chunk, Style::default().fg(todo_meta_color())));
-                    lines.push(todo_card_line(spans, base_indent, inner_width));
-                }
-            }
-        } else {
-            let spans = vec![
-                Span::styled("Intent ", Style::default().fg(todo_label_color())),
-                state_span,
-            ];
-            lines.push(todo_card_line(spans, base_indent, inner_width));
+            spans.push(Span::styled(
+                intention.to_string(),
+                Style::default().fg(todo_meta_color()),
+            ));
         }
+        lines.push(todo_card_line(spans, base_indent, inner_width));
     } else if let Some(intention) = intention {
         push_todo_detail(
             lines,
@@ -2496,10 +2430,6 @@ fn split_resume_hint(detail: &str) -> (&str, Option<&str>) {
     } else {
         (detail.trim(), None)
     }
-}
-
-fn truncate_inline(input: &str, width: usize) -> String {
-    truncate_connection_line(input, width)
 }
 
 fn truncate_connection_line(input: &str, width: usize) -> String {
@@ -3969,8 +3899,6 @@ pub(crate) fn render_tool_message(
         return lines;
     };
 
-    let is_bash = tools_ui::canonical_tool_name(&tc.name) == "bash";
-
     if tools_ui::is_memory_store_tool(tc) && !msg.content.starts_with("Error:") {
         let content = tc
             .input
@@ -4092,67 +4020,6 @@ pub(crate) fn render_tool_message(
     let row_width = block_width.saturating_sub(1);
     let display_name = tools_ui::resolve_display_tool_name(&tc.name).to_string();
     let base_prefix = format!("  {} {} ", icon, display_name);
-    // Show a compact `[exit N]` badge on bash rows so the outcome is visible at
-    // a glance without needing to expand verbose details. A confirmed success
-    // (exit 0) renders dimly; any non-zero exit renders in the error color and
-    // is always shown.
-    let bash_exit = if is_bash {
-        tools_ui::parse_bash_exit_code(&msg.content).map(|code| (code, code != 0))
-    } else {
-        None
-    };
-    let bash_exit_span = bash_exit.as_ref().map(|(code, is_nonzero)| {
-        let color = if *is_nonzero {
-            rgb(220, 100, 100)
-        } else {
-            dim_color()
-        };
-        Span::styled(format!(" [exit {}]", code), Style::default().fg(color))
-    });
-    let bash_exit_width = bash_exit_span
-        .as_ref()
-        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-        .unwrap_or(0);
-    // Inline working directory and execution time on the bash tool row, so the
-    // outcome is visible at a glance (matching the issue's requested format:
-    // `✓ bash [exit 0] · /path · git status · N tok · 120ms`).
-    let (bash_cwd_span, bash_duration_span) = if is_bash {
-        let cwd =
-            tools_ui::parse_bash_working_dir(&msg.content).map(|s| (s, true)).or_else(|| {
-                tc.input
-                    .get("cwd")
-                    .or_else(|| tc.input.get("working_dir"))
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(|s| (s.to_string(), false))
-            });
-        let cwd_span = cwd.map(|(dir, _)| {
-            Span::styled(
-                format!(" · {}", truncate_inline(dir.as_str(), 24)),
-                Style::default().fg(dim_color()),
-            )
-        });
-        let dur = tools_ui::parse_bash_execution_time(&msg.content)
-            .or_else(|| tools_ui::parse_bash_timing_duration(&msg.content));
-        let dur_span = dur.map(|d| {
-            Span::styled(
-                format!(" · {}", d),
-                Style::default().fg(dim_color()),
-            )
-        });
-        (cwd_span, dur_span)
-    } else {
-        (None, None)
-    };
-    let bash_inline_width = bash_cwd_span
-        .as_ref()
-        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
-        .unwrap_or(0)
-        + bash_duration_span
-            .as_ref()
-            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
-            .unwrap_or(0);
     let token_suffix_width =
         UnicodeWidthStr::width(format!(" · {}", token_badge.label.as_str()).as_str());
     let edit_suffix_width = if is_edit_tool && has_diff_changes {
@@ -4163,9 +4030,7 @@ pub(crate) fn render_tool_message(
     let reserved_summary_width = row_width
         .saturating_sub(UnicodeWidthStr::width(base_prefix.as_str()))
         .saturating_sub(token_suffix_width)
-        .saturating_sub(edit_suffix_width)
-        .saturating_sub(bash_exit_width)
-        .saturating_sub(bash_inline_width);
+        .saturating_sub(edit_suffix_width);
 
     let intent = tc
         .intent
@@ -4213,10 +4078,6 @@ pub(crate) fn render_tool_message(
         Span::styled(format!("  {} ", icon), Style::default().fg(icon_color)),
         Span::styled(display_name, Style::default().fg(tool_color())),
     ];
-    // Runtime detail toggles hoisted here so both the row summary and the bash
-    // verbose block agree on whether bash's full wrapped command is shown.
-    let show_tool_detail = tools_ui::show_tool_call_details() || is_error || is_partial_batch;
-    let bash_verbose_block = is_bash && show_tool_detail;
     if let Some(intent) = intent {
         tool_line.push(Span::styled(" · ", Style::default().fg(dim_color())));
         tool_line.push(Span::styled(
@@ -4224,30 +4085,17 @@ pub(crate) fn render_tool_message(
             Style::default().fg(tool_color()),
         ));
         // Error summaries always render so failures stay diagnosable even
-        // when technical details are hidden. For bash with the verbose block
-        // on (tool_call_details), `summary` is a lossy "… $ <command>" snippet
-        // (truncate_command_display's 28-char intent cap) that duplicates the
-        // full wrapped command rendered below, so suppress it (but keep real
-        // error/partial-batch diagnostics).
-        let suppress_bash_cmd_summary =
-            is_bash && show_tool_detail && !is_error && !is_partial_batch && summary != intent;
-        if show_tool_detail && !suppress_bash_cmd_summary && !summary.is_empty() && summary != intent {
+        // when technical details are hidden.
+        let show_detail = tools_ui::show_tool_call_details() || is_error || is_partial_batch;
+        if show_detail && !summary.is_empty() && summary != intent {
             tool_line.push(Span::styled(" · ", Style::default().fg(dim_color())));
             tool_line.push(Span::styled(summary, Style::default().fg(dim_color())));
         }
     } else if !summary.is_empty() {
-        // For bash, the non-intent summary is the command text itself. When the
-        // bash verbose block is on, the full command already renders on the
-        // wrapped line below, so a one-line "… $ <command>" summary on the row
-        // would be both redundant and (on a narrow terminal) trimmed to a lossy
-        // "…". Skip it and let the verbose block own the command display.
-        let skip_command_summary = is_bash && show_tool_detail;
-        if !skip_command_summary {
-            tool_line.push(Span::styled(
-                format!(" {}", summary),
-                Style::default().fg(dim_color()),
-            ));
-        }
+        tool_line.push(Span::styled(
+            format!(" {}", summary),
+            Style::default().fg(dim_color()),
+        ));
     }
     if is_edit_tool && has_diff_changes {
         tool_line.push(Span::styled(" (", Style::default().fg(dim_color())));
@@ -4261,15 +4109,6 @@ pub(crate) fn render_tool_message(
             Style::default().fg(diff_del_color()),
         ));
         tool_line.push(Span::styled(")", Style::default().fg(dim_color())));
-    }
-    if let Some(exit_span) = bash_exit_span {
-        tool_line.push(exit_span);
-    }
-    if let Some(cwd_span) = bash_cwd_span {
-        tool_line.push(cwd_span);
-    }
-    if let Some(dur_span) = bash_duration_span {
-        tool_line.push(dur_span);
     }
     let token_suffix = Line::from(vec![
         Span::styled(" · ", Style::default().fg(dim_color())),
@@ -4302,31 +4141,11 @@ pub(crate) fn render_tool_message(
         }
     }
 
-    // Bash verbose block: when tool_call_details is on, render the full executed
-    // command (wrapped beneath the row so it is never elided) in addition to the
-    // working directory, execution time, and exit code which already render
-    // inline. Command *output* remains governed solely by show_bash_output.
-    if bash_verbose_block {
-        if let Some(command) = tc.input.get("command").and_then(|v| v.as_str()).filter(|c| !c.trim().is_empty()) {
-            // Wrap a long command across continuation lines rather than trimming
-            // it with an ellipsis, so the full command stays legible.
-            push_wrapped_indented(
-                &mut lines,
-                "    ",
-                &format!("$ {}", command.trim()),
-                Style::default().fg(dim_color()),
-                row_width,
-            );
-        }
-    }
-
     // Fallback command preview on a second line only when the row has no
     // intent. With an intent present, the command summary is inline-only: it
     // shows on the tool row when it fits and is dropped otherwise, never
-    // spilling onto a second line. Skipped when the bash verbose block already
-    // rendered the command.
+    // spilling onto a second line.
     if tools_ui::canonical_tool_name(&tc.name) == "bash"
-        && !bash_verbose_block
         && intent.is_none()
         && !rendered_tool_line_text.contains('$')
         && let Some(command) = tc.input.get("command").and_then(|v| v.as_str())
@@ -4355,51 +4174,22 @@ pub(crate) fn render_tool_message(
         }
     }
 
-    // The command's full output, rendered untrimmed underneath the tool row when
-    // `display.show_bash_output` is enabled. This is the single owner of bash
-    // output; `tool_call_details` handles the command metadata alone. The
-    // `[tool timing: ...]` header and the
-    // Working directory / Execution time / Exit code footers are harness
-    // metadata, not command output, so they are stripped before surfacing the
-    // real command result.
     if tools_ui::canonical_tool_name(&tc.name) == "bash"
         && tools_ui::show_bash_output()
         && msg.content.trim() != "Command completed successfully (no output)"
     {
-        let detail_content = strip_tool_result_timestamp_header(&msg.content);
-        let output_lines = detail_content.lines().filter(|line| {
-            let t = line.trim();
-            !t.is_empty()
-                && !t.starts_with("Working directory:")
-                && !t.starts_with("Execution time:")
-                && !t.starts_with("Exit code:")
-                && !t.starts_with("--- Command finished with exit code:")
-        });
-        let output_lines: Vec<&str> = output_lines.collect();
-        if !output_lines.is_empty() {
-            let output_label = Line::from(vec![
-                Span::raw("    "),
-                Span::styled(
-                    "Output:",
-                    Style::default().fg(dim_color()).add_modifier(ratatui::style::Modifier::BOLD),
-                ),
+        const MAX_COLLAPSED_OUTPUT_LINES: usize = 3;
+        let output_lines = msg.content.lines().filter(|line| !line.trim().is_empty());
+        let total = output_lines.clone().count();
+        for output in output_lines.skip(total.saturating_sub(MAX_COLLAPSED_OUTPUT_LINES)) {
+            let output_line = Line::from(vec![
+                Span::raw("      "),
+                Span::styled(output.to_string(), Style::default().fg(dim_color())),
             ]);
             lines.push(super::truncate_line_with_ellipsis_to_width(
-                &output_label,
+                &output_line,
                 row_width,
             ));
-        }
-        for output in output_lines {
-            // Wrap a long output line across continuation lines (aligned under
-            // the same indent) rather than trimming it with an ellipsis, so the
-            // full command result stays readable.
-            push_wrapped_indented(
-                &mut lines,
-                "      ",
-                output,
-                Style::default().fg(dim_color()),
-                row_width,
-            );
         }
     }
 
