@@ -2392,6 +2392,58 @@ fn bash_row_has_no_trimmed_command_summary_when_details_are_on() {
     crate::tui::ui::tools_ui::tests_show_bash_output_override::set(false);
 }
 
+#[test]
+fn exact_long_command_renders_full_across_wrapped_lines() {
+    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(true);
+    crate::tui::ui::tools_ui::tests_show_bash_output_override::set(true);
+
+    // A real-world multiline command that previously got its tail trimmed by the
+    // one-line summary path. It must survive in full, wrapped across the pane.
+    let command = "export PATH=\"$HOME/.cargo/bin:$PATH\"; cd /Users/vasilypelikh/IdeaProjects/vpelikh/github/jcode && cargo test -p jcode-tui --lib bash_row_has_no_trimmed_command_summary_when_details_are_on";
+
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "test result: ok\n\nWorking directory: /Users/vasilypelikh/IdeaProjects/vpelikh/github/jcode\n\nExecution time: 1ms\n\nExit code: 0".to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_bash_exact".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({ "command": command }),
+            intent: None,
+            thought_signature: None,
+        }),
+    };
+
+    let rendered = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // The rendered text must contain every non-whitespace token of the command
+    // (wrapping splits lines, so compare with whitespace removed).
+    let compact = without_whitespace(&rendered);
+    let expected = without_whitespace(command);
+    assert!(
+        compact.contains(&expected),
+        "full command must be present across wrapped lines:\n{rendered}"
+    );
+    // The commit command lines themselves must be ellipsis-free. Note: the tool
+    // row may still show an ellipsis on a *metadata* suffix (e.g. the working
+    // directory), so scope the check to exact command lines starting with "$".
+    for line in rendered.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("$ ") && trimmed.contains("…") {
+            panic!("command line was ellipsis-trimmed: {line:?}\n{rendered}");
+        }
+    }
+
+    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(false);
+    crate::tui::ui::tools_ui::tests_show_bash_output_override::set(false);
+}
+
 fn gmail_draft_message(content: &str, input: serde_json::Value) -> DisplayMessage {
     DisplayMessage {
         role: "tool".to_string(),
