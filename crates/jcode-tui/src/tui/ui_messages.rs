@@ -79,6 +79,35 @@ fn render_single_line_system_notice(
     Some(lines)
 }
 
+/// Wrap `text` across one or more physical rows at `indent + width`, emitting
+/// `Line`s that each carry a leading `indent` span plus the chunk. Long rows
+/// wrap onto continuation lines (with the same indent) instead of being
+/// truncated with an ellipsis, so full command text and bash output stay
+/// readable regardless of how wide the underlying content is.
+fn push_wrapped_indented(
+    lines: &mut Vec<Line<'static>>,
+    indent: &str,
+    text: &str,
+    style: Style,
+    available_width: usize,
+) {
+    let indent_width = UnicodeWidthStr::width(indent);
+    let content_width = available_width.saturating_sub(indent_width);
+    if content_width == 0 {
+        lines.push(Line::from(vec![
+            Span::raw(indent.to_string()),
+            Span::styled(text.to_string(), style),
+        ]));
+        return;
+    }
+    for chunk in split_by_display_width(text, content_width) {
+        lines.push(Line::from(vec![
+            Span::raw(indent.to_string()),
+            Span::styled(chunk, style),
+        ]));
+    }
+}
+
 pub(crate) fn render_assistant_message(
     msg: &DisplayMessage,
     width: u16,
@@ -4229,17 +4258,15 @@ pub(crate) fn render_tool_message(
     // trimmed preview, and turning on details never silently drags in output.
     if show_bash_details {
         if let Some(command) = tc.input.get("command").and_then(|v| v.as_str()).filter(|c| !c.trim().is_empty()) {
-            let command_line = Line::from(vec![
-                Span::raw("    "),
-                Span::styled(
-                    format!("$ {}", command.trim()),
-                    Style::default().fg(dim_color()),
-                ),
-            ]);
-            lines.push(super::truncate_line_with_ellipsis_to_width(
-                &command_line,
+            // Wrap a long command across continuation lines rather than trimming
+            // it with an ellipsis, so the full command stays legible.
+            push_wrapped_indented(
+                &mut lines,
+                "    ",
+                &format!("$ {}", command.trim()),
+                Style::default().fg(dim_color()),
                 row_width,
-            ));
+            );
         }
     }
 
@@ -4313,14 +4340,16 @@ pub(crate) fn render_tool_message(
             ));
         }
         for output in output_lines {
-            let output_line = Line::from(vec![
-                Span::raw("      "),
-                Span::styled(output.to_string(), Style::default().fg(dim_color())),
-            ]);
-            lines.push(super::truncate_line_with_ellipsis_to_width(
-                &output_line,
+            // Wrap a long output line across continuation lines (aligned under
+            // the same indent) rather than trimming it with an ellipsis, so the
+            // full command result stays readable.
+            push_wrapped_indented(
+                &mut lines,
+                "      ",
+                output,
+                Style::default().fg(dim_color()),
                 row_width,
-            ));
+            );
         }
     }
 
