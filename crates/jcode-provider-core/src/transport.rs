@@ -58,7 +58,14 @@ where
         let _ = done_tx.send(result);
     });
     let mut done = done_rx.fuse();
-    let mut ticker = tokio::time::interval(heartbeat_secs);
+    // The first tick must land after one full heartbeat period, not immediately.
+    // `tokio::time::interval` fires its first tick as soon as it is polled, which
+    // would emit a misleading "awaiting response headers (0s)" when the request
+    // has barely started. Anchoring the first tick at `now + heartbeat_secs`
+    // means the first progress word reports a real elapsed time (~heartbeat),
+    // and subsequent words advance by the same period.
+    let started_tick = std::time::Instant::now() + heartbeat_secs;
+    let mut ticker = tokio::time::interval_at(started_tick.into(), heartbeat_secs);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
