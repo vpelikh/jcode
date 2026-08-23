@@ -2223,7 +2223,7 @@ fn render_tool_message_shows_bash_details_block_when_enabled() {
     crate::tui::ui::tools_ui::tests_show_bash_details_override::set(true);
     let msg = DisplayMessage {
         role: "tool".to_string(),
-        content: "[tool timing: start=2026-01-01T00:00:00.000Z finish=2026-01-01T00:00:00.120Z duration=120ms] On branch main\nUntracked files\n\nExit code: 0".to_string(),
+        content: "[tool timing: start=2026-01-01T00:00:00.000Z finish=2026-01-01T00:00:00.120Z duration=120ms] On branch main\nUntracked files\n\nWorking directory: /home/user/project\n\nExit code: 0".to_string(),
         tool_calls: Vec::new(),
         duration_secs: None,
         title: None,
@@ -2232,7 +2232,6 @@ fn render_tool_message_shows_bash_details_block_when_enabled() {
             name: "bash".to_string(),
             input: serde_json::json!({
                 "command": "git status",
-                "working_dir": "/home/user/project",
             }),
             intent: Some("Check git status".to_string()),
             thought_signature: None,
@@ -2255,7 +2254,7 @@ fn render_tool_message_shows_bash_details_block_when_enabled() {
     );
     assert!(
         rendered.contains("cwd /home/user/project"),
-        "verbose details should show the working directory: {rendered}"
+        "verbose details should show the working directory from the content footer: {rendered}"
     );
     assert!(
         rendered.contains("On branch main"),

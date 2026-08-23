@@ -702,7 +702,11 @@ fn build_detached_shell_wrapper(command: &str) -> StdCommand {
     cmd
 }
 
-fn format_command_output(mut output: String, exit_code: Option<i32>) -> String {
+fn format_command_output(
+    mut output: String,
+    exit_code: Option<i32>,
+    cwd: Option<&std::path::Path>,
+) -> String {
     if output.len() > MAX_OUTPUT_LEN {
         output = truncate_str(&output, MAX_OUTPUT_LEN).to_string();
         output.push_str("\n... (output truncated)");
@@ -710,6 +714,21 @@ fn format_command_output(mut output: String, exit_code: Option<i32>) -> String {
 
     if let Some(code) = exit_code.filter(|code| *code != 0) {
         output.push_str(&format!("\n\nExit code: {}", code));
+    }
+
+    // Record the working directory the command ran in. It is emitted as a
+    // trailing footer (mirroring the `Exit code` footer) so display surfaces
+    // can show it without the tool arguments carrying it, and the model sees
+    // context consistent with where the command actually executed. Skipped for
+    // a clean no-op so the "completed successfully" placeholder stays intact.
+    if let Some(cwd) = cwd {
+        let cwd = cwd.to_string_lossy();
+        if !cwd.trim().is_empty()
+            && !output.trim().is_empty()
+            && !output.contains("\nWorking directory:")
+        {
+            output.push_str(&format!("\n\nWorking directory: {}", cwd));
+        }
     }
 
     if output.trim().is_empty() {
@@ -728,9 +747,41 @@ mod utf8_truncation_tests {
     #[test]
     fn format_command_output_truncates_on_utf8_boundary() {
         let input = format!("{}é", "a".repeat(29_999));
-        let output = format_command_output(input, None);
+        let output = format_command_output(input, None, None);
         assert!(output.ends_with("\n... (output truncated)"));
         assert!(output.starts_with(&"a".repeat(29_999)));
+    }
+
+    #[test]
+    fn format_command_output_records_working_directory_and_exit_code() {
+        let cwd = std::path::Path::new("/home/user/project");
+        let out = format_command_output("On branch main".to_string(), Some(0), Some(cwd));
+        assert!(out.contains("Working directory: /home/user/project"), "{out}");
+        // exit 0 carries no separate exit footer; only the cwd footer is added.
+        assert!(!out.contains("Exit code: 0"), "{out}");
+
+        let out = format_command_output("boom".to_string(), Some(2), Some(cwd));
+        assert!(out.contains("Exit code: 2"), "{out}");
+        assert!(out.contains("Working directory: /home/user/project"), "{out}");
+
+        // A clean no-op omits both footers so the placeholder stays intact.
+        let out = format_command_output(String::new(), Some(0), Some(cwd));
+        assert_eq!(
+            out,
+            "Command completed successfully (no output)".to_string()
+        );
+    }
+
+    #[test]
+    fn format_command_output_skips_cwd_when_absent_or_empty() {
+        assert!(
+            !format_command_output("hi".to_string(), None, None)
+                .contains("Working directory:")
+        );
+        assert!(
+            !format_command_output("hi".to_string(), None, Some(std::path::Path::new("   ")))
+                .contains("Working directory:")
+        );
     }
 
     #[cfg(windows)]
@@ -949,6 +1000,7 @@ impl BashTool {
         let stdin_tx = ctx.stdin_request_tx.clone();
         let tool_call_id = ctx.tool_call_id.clone();
         let title_for_work = title.clone();
+        let cwd_for_work = ctx.working_dir.clone();
         // Track progress parsed from output so a timeout promotion starts the
         // background task at the real percentage instead of 0%.
         let promoted_progress = std::sync::Arc::new(PromotedCommandProgress::default());
@@ -1052,7 +1104,11 @@ impl BashTool {
                     }
                     output.push_str(&stderr);
                 }
-                let output = format_command_output(output, status.code());
+                let output = format_command_output(
+                    output,
+                    status.code(),
+                    cwd_for_work.as_deref(),
+                );
                 Ok(ToolOutput::new(output).with_title(title_for_work))
             });
 
@@ -1163,7 +1219,12 @@ impl BashTool {
                 let _ = tokio::fs::remove_file(&info.output_file).await;
                 let _ = tokio::fs::remove_file(&info.status_file).await;
                 return Ok(
-                    ToolOutput::new(format_command_output(output, status.code())).with_title(
+                    ToolOutput::new(format_command_output(
+                        output,
+                        status.code(),
+                        ctx.working_dir.as_deref(),
+                    ))
+                    .with_title(
                         params
                             .intent
                             .clone()
