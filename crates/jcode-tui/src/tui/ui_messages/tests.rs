@@ -1998,8 +1998,68 @@ fn render_tool_message_shows_intent_and_technical_preview_on_one_line() {
     let lines = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off);
     let rendered = extract_line_text(&lines[0]);
 
-    assert!(rendered.contains("bash · Verify compact progress card · $ cargo test"));
-    assert_eq!(lines.len(), 1, "Bash output is hidden by default");
+    // With tool_call_details on, bash renders the full wrapped command in a
+    // verbose block below the row instead of a lossy on-row snippet; the row
+    // shows only the intent.
+    assert!(
+        !rendered.contains("· $ cargo test"),
+        "row should not carry a command snippet after the intent: {rendered}"
+    );
+    assert!(rendered.contains("bash · Verify compact progress card"));
+    let joined: String = lines.iter().map(extract_line_text).collect::<Vec<_>>().join("\n");
+    assert!(
+        joined.contains("$ cargo test -p jcode render_background_task --lib"),
+        "full command must render in the verbose block:\n{joined}"
+    );
+    crate::tui::ui::tools_ui::tests_tool_call_details_override::set(false);
+}
+
+/// The reported bug: a bash command with an intent, tool_call_details on. The
+/// row previously carried a lossy "… $ <command>" snippet (truncate_command_display's
+/// 28-char intent cap) even though the full wrapped command rendered below. Now the
+/// row shows only the intent and the full command wraps in the verbose block.
+#[test]
+fn tool_call_details_bash_renders_full_wrapped_command_without_lossy_row_snippet() {
+    crate::tui::ui::tools_ui::tests_tool_call_details_override::set(true);
+    let command =
+        "export PATH=\"$HOME/.cargo/bin:$PATH\"; cd /Users/vasilypelikh/IdeaProjects/vpelikh/github/jcode && echo \"=== ui_messages ===\" && cargo test -p jcode-tui --lib 'tui::ui::messages::tests::'";
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "Working directory: /Users/vasilypelikh/IdeaProjects/vpelikh/github/jcode\nExecution time: 1ms".to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_user_scenario".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({ "command": command }),
+            intent: Some("Run the tests".to_string()),
+            thought_signature: None,
+        }),
+    };
+
+    let rendered = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>();
+
+    // Row must not carry a lossy command snippet alongside the intent.
+    let row_text: String = rendered
+        .first()
+        .map(|l| l.clone())
+        .unwrap_or_default();
+    assert!(
+        !row_text.contains("· $ "),
+        "row must not show a lossy command snippet: {row_text}"
+    );
+    // Full command must be present (wrapped in the verbose block).
+    let strip = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+    let joined = strip(&rendered.join("\n"));
+    assert!(
+        joined.contains(&strip(command)),
+        "full command must render wrapped:\n{rendered:?}"
+    );
+
     crate::tui::ui::tools_ui::tests_tool_call_details_override::set(false);
 }
 
@@ -2232,8 +2292,8 @@ fn render_tool_message_shows_bash_exit_code_badge_on_success() {
 }
 
 #[test]
-fn render_tool_message_shows_bash_details_block_when_enabled() {
-    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(true);
+fn render_tool_message_shows_command_block_when_tool_call_details_enabled() {
+    crate::tui::ui::tools_ui::tests_tool_call_details_override::set(true);
     let msg = DisplayMessage {
         role: "tool".to_string(),
         content: "On branch main\nUntracked files\n\nWorking directory: /home/user/project\n\nExecution time: 120ms\n\nExit code: 0".to_string(),
@@ -2275,19 +2335,20 @@ fn render_tool_message_shows_bash_details_block_when_enabled() {
         rendered.contains("$ git status"),
         "verbose details should show the full command: {rendered}"
     );
-    // show_bash_details owns metadata only: it must NOT render the command
+    // tool_call_details' bash verbose block shows the command only when enabled;
+    // with the override off it must NOT render the command
     // output or an "Output:" label, which belong solely to show_bash_output.
     assert!(
         !rendered.contains("On branch main"),
-        "show_bash_details must not render bash output: {rendered}"
+        "tool_call_details must not render bash output: {rendered}"
     );
     assert!(
         !rendered.contains("Untracked files"),
-        "show_bash_details must not render bash output: {rendered}"
+        "tool_call_details must not render bash output: {rendered}"
     );
     assert!(
         !rendered.contains("Output:"),
-        "show_bash_details must not label command output: {rendered}"
+        "tool_call_details must not label command output: {rendered}"
     );
     assert!(
         !rendered.contains("Working directory:"),
@@ -2297,12 +2358,12 @@ fn render_tool_message_shows_bash_details_block_when_enabled() {
         !rendered.contains("Execution time:"),
         "execution-time footer should be filtered out: {rendered}"
     );
-    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(false);
+    crate::tui::ui::tools_ui::tests_tool_call_details_override::set(false);
 }
 
 #[test]
 fn long_bash_command_and_output_wrap_instead_of_truncating() {
-    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(true);
+    crate::tui::ui::tools_ui::tests_tool_call_details_override::set(true);
     crate::tui::ui::tools_ui::tests_show_bash_output_override::set(true);
 
     // A command and output line far wider than the 40-col pane.
@@ -2341,13 +2402,13 @@ fn long_bash_command_and_output_wrap_instead_of_truncating() {
         "long output line must wrap and stay complete: {rendered}"
     );
 
-    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(false);
+    crate::tui::ui::tools_ui::tests_tool_call_details_override::set(false);
     crate::tui::ui::tools_ui::tests_show_bash_output_override::set(false);
 }
 
 #[test]
 fn bash_row_has_no_trimmed_command_summary_when_details_are_on() {
-    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(true);
+    crate::tui::ui::tools_ui::tests_tool_call_details_override::set(true);
     crate::tui::ui::tools_ui::tests_show_bash_output_override::set(true);
 
     // A command that is short enough to fit, with no intent, so the former
@@ -2388,13 +2449,13 @@ fn bash_row_has_no_trimmed_command_summary_when_details_are_on() {
         "full command should render in the details block: {rendered}"
     );
 
-    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(false);
+    crate::tui::ui::tools_ui::tests_tool_call_details_override::set(false);
     crate::tui::ui::tools_ui::tests_show_bash_output_override::set(false);
 }
 
 #[test]
 fn exact_long_command_renders_full_across_wrapped_lines() {
-    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(true);
+    crate::tui::ui::tools_ui::tests_tool_call_details_override::set(true);
     crate::tui::ui::tools_ui::tests_show_bash_output_override::set(true);
 
     // A real-world multiline command that previously got its tail trimmed by the
@@ -2440,7 +2501,7 @@ fn exact_long_command_renders_full_across_wrapped_lines() {
         }
     }
 
-    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(false);
+    crate::tui::ui::tools_ui::tests_tool_call_details_override::set(false);
     crate::tui::ui::tools_ui::tests_show_bash_output_override::set(false);
 }
 
@@ -3710,9 +3771,10 @@ fn push_wrapped_indented_respects_wide_unicode_glyph_width() {
 
 #[test]
 fn bash_row_shows_command_summary_when_details_off() {
-    // With show_bash_details OFF, the row carries a "$ ..." command summary
+    // With the bash verbose block OFF (tool_call_details off), the row carries a
+    // "$ ..." command summary
     // (the fallback path), not suppressed like when details are on.
-    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(false);
+    crate::tui::ui::tools_ui::tests_tool_call_details_override::set(false);
     crate::tui::ui::tools_ui::tests_show_bash_output_override::set(false);
 
     let command = "git status";
@@ -3743,15 +3805,15 @@ fn bash_row_shows_command_summary_when_details_off() {
         "row should show the command summary when details are off:\n{rendered}"
     );
 
-    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(false);
+    crate::tui::ui::tools_ui::tests_tool_call_details_override::set(false);
     crate::tui::ui::tools_ui::tests_show_bash_output_override::set(false);
 }
 
 #[test]
 fn bash_output_renders_independently_when_details_off() {
-    // show_bash_output owns output; it must render even when show_bash_details
+    // show_bash_output owns output; it must render even when tool_call_details
     // is off (they are independent flags).
-    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(false);
+    crate::tui::ui::tools_ui::tests_tool_call_details_override::set(false);
     crate::tui::ui::tools_ui::tests_show_bash_output_override::set(true);
 
     let msg = DisplayMessage {
@@ -3777,9 +3839,9 @@ fn bash_output_renders_independently_when_details_off() {
 
     assert!(
         rendered.contains("line one") && rendered.contains("line two"),
-        "output must render with show_bash_output regardless of show_bash_details:\n{rendered}"
+        "output must render with show_bash_output regardless of tool_call_details:\n{rendered}"
     );
 
-    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(false);
+    crate::tui::ui::tools_ui::tests_tool_call_details_override::set(false);
     crate::tui::ui::tools_ui::tests_show_bash_output_override::set(false);
 }
