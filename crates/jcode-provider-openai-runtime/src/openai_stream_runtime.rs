@@ -121,9 +121,33 @@ pub(super) async fn stream_response(
     let connect_start = std::time::Instant::now();
     let idle_timeout = effective_https_idle_timeout(&request);
 
-    let response = jcode_provider_core::transport::send_with_initial_response_timeout(
+    // Surface the upload size right away so a long "sending context" phase is
+    // explainable (large payload draining on a slow uplink).
+    let payload_bytes = serde_json::to_vec(&request)
+        .map(|bytes| bytes.len() as u64)
+        .unwrap_or(0);
+    if payload_bytes > 0 {
+        emit_status_detail(
+            &tx,
+            format!(
+                "sending {}",
+                jcode_provider_core::transport::readable_bytes(payload_bytes)
+            ),
+        )
+        .await;
+    }
+
+    let response = jcode_provider_core::transport::send_with_initial_response_timeout_with_progress(
         builder.json(&request),
         idle_timeout,
+        std::time::Duration::from_secs(5),
+        |msg: &str| {
+            let tx = tx.clone();
+            let msg = msg.to_string();
+            async move {
+                emit_status_detail(&tx, msg).await;
+            }
+        },
     )
     .await
     .context("Failed to send request to OpenAI API")
