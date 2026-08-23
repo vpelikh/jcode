@@ -2345,6 +2345,53 @@ fn long_bash_command_and_output_wrap_instead_of_truncating() {
     crate::tui::ui::tools_ui::tests_show_bash_output_override::set(false);
 }
 
+#[test]
+fn bash_row_has_no_trimmed_command_summary_when_details_are_on() {
+    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(true);
+    crate::tui::ui::tools_ui::tests_show_bash_output_override::set(true);
+
+    // A command that is short enough to fit, with no intent, so the former
+    // behavior would have put a "$ git diff --stat -" summary on the row.
+    let command = "git diff --stat -";
+
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "working tree clean\n\nWorking directory: /Users/vasilypelikh/IdeaProjects/vpelikh/github/jcode\n\nExecution time: 1ms\n\nExit code: 0".to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_bash_row".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({ "command": command }),
+            intent: None,
+            thought_signature: None,
+        }),
+    };
+
+    // Narrow width so the old row-summary path would trim "$ <command>" to
+    // "$ …".
+    let rendered = render_tool_message(&msg, 40, crate::config::DiffDisplayMode::Off)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // The row must not show a lossy trimmed "$ …" summary command.
+    assert!(
+        !rendered.lines().any(|l| l.contains("$ …")),
+        "row must not show a trimmed command summary when details are on: {rendered}"
+    );
+    // The full command must be present (in the details block, wrapped).
+    assert!(
+        rendered.contains(&format!("$ {command}")),
+        "full command should render in the details block: {rendered}"
+    );
+
+    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(false);
+    crate::tui::ui::tools_ui::tests_show_bash_output_override::set(false);
+}
+
 fn gmail_draft_message(content: &str, input: serde_json::Value) -> DisplayMessage {
     DisplayMessage {
         role: "tool".to_string(),
