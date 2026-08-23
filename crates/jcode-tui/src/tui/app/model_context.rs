@@ -978,7 +978,7 @@ impl App {
             // auto-poke retry) goes through, and keep auto-poke alive.
             let stripped = self
                 .session
-                .strip_oversized_images(crate::compaction::PAYLOAD_IMAGE_CHAR_BUDGET);
+                .strip_oversized_images(crate::compaction::PAYLOAD_IMAGE_EMERGENCY_CHAR_BUDGET);
             let truncated = if stripped == 0 {
                 self.session.emergency_truncate_tool_results(
                     crate::compaction::PAYLOAD_TOOL_RESULT_CHAR_BUDGET,
@@ -1115,7 +1115,7 @@ impl App {
 
         let stripped = self
             .session
-            .strip_oversized_images(crate::compaction::PAYLOAD_IMAGE_CHAR_BUDGET);
+            .strip_oversized_images(crate::compaction::PAYLOAD_IMAGE_EMERGENCY_CHAR_BUDGET);
         let truncated = if stripped == 0 {
             self.session.emergency_truncate_tool_results(
                 crate::compaction::PAYLOAD_TOOL_RESULT_CHAR_BUDGET,

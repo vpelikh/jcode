@@ -198,10 +198,12 @@ impl Agent {
             return false;
         }
 
-        // Phase 1: drop oversized inline images (the classic 413 driver).
+        // Phase 1: drop oversized inline images (the classic 413 driver). Use
+        // the tighter emergency budget: once a request has been rejected as too
+        // large, prioritize getting a retry through over preserving screenshots.
         let stripped = self
             .session
-            .strip_oversized_images(crate::compaction::PAYLOAD_IMAGE_CHAR_BUDGET);
+            .strip_oversized_images(crate::compaction::PAYLOAD_IMAGE_EMERGENCY_CHAR_BUDGET);
 
         // Phase 2: if images couldn't get us under budget (e.g. the oversized
         // payload is accumulated tool-result text, not images), truncate large
