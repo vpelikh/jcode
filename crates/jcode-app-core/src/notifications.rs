@@ -490,21 +490,23 @@ pub fn send_macos_turn_notification(
             }
         };
 
-        match std::process::Command::new("/usr/bin/open")
-            .arg("-gj")
-            .arg(&app_path)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            Ok(child) => {
-                reap_notification_child(child);
-                true
-            }
+        // Launch the broker executable directly rather than via `/usr/bin/open
+        // -gj`. LaunchServices resolves the bundle's `jcode-notification-broker`
+        // symlink back to the real `.../jcode` binary name, which breaks the
+        // argv[0]-based multicall dispatch: `is_invocation()` sees the canonical
+        // name and the process exits as a normal CLI without ever posting to
+        // Notification Center. Spawning the symlink by name preserves it, so the
+        // broker enters its run loop and drains the inbox.
+        if macos_notification_broker_is_running() {
+            // A broker is already resident and will pick up the queued payload.
+            return true;
+        }
+        match spawn_macos_notification_broker(&executable) {
+            Ok(()) => true,
             Err(error) => {
-                // The caller will send a fallback, so remove this payload rather
-                // than deliver a duplicate after a later successful launch.
+                // Could not launch the broker; remove this payload so the caller
+                // can fall back to a generic desktop notification without
+                // delivering a duplicate later.
                 let _ = std::fs::remove_file(queued_path);
                 logging::warn(&format!(
                     "failed to launch macOS notification broker: {error}"
@@ -513,6 +515,47 @@ pub fn send_macos_turn_notification(
             }
         }
     }
+}
+
+/// Whether a `jcode-notification-broker` process is already alive. Used to avoid
+/// stacking a second broker (each owns an NSApplication run loop, so duplicates
+/// would race to drain the inbox).
+#[cfg(target_os = "macos")]
+fn macos_notification_broker_is_running() -> bool {
+    use std::process::Command;
+
+    let ps = match Command::new("/bin/ps")
+        .args(["-axo", "comm="])
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return false,
+    };
+    let haystack = String::from_utf8_lossy(&ps.stdout);
+    haystack.lines().any(|line| {
+        let name = line.rsplit('/').next().unwrap_or(line.trim());
+        name.trim() == MACOS_NOTIFICATION_BROKER_EXECUTABLE
+    })
+}
+
+/// Spawn the broker executable detached. Returns true when the child was
+/// launched (it should stay resident draining the inbox at 0.25s).
+#[cfg(target_os = "macos")]
+fn spawn_macos_notification_broker(executable: &std::path::Path) -> std::io::Result<()> {
+    use std::process::Command;
+    use std::os::unix::process::CommandExt as _;
+
+    let mut command = Command::new(executable);
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // Detach into a new process group/session so it survives the caller exiting
+    // and keeps its own run-loop (mirrors the persistent intent of the
+    // LSUIElement bundle without depending on LaunchServices).
+    #[cfg(unix)]
+    command.process_group(0);
+    command.spawn().map(|_| ())
 }
 
 #[cfg(target_os = "macos")]
