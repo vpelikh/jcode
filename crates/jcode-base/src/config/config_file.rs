@@ -278,18 +278,6 @@ impl Config {
         Ok(())
     }
 
-    /// Update the persisted verbose-bash-details preference.
-    pub fn set_show_bash_details(show: bool) -> anyhow::Result<()> {
-        let mut cfg = Self::load();
-        cfg.display.show_bash_details = show;
-        cfg.save()?;
-        crate::logging::info(&format!(
-            "Saved display.show_bash_details to config: {}",
-            show
-        ));
-        Ok(())
-    }
-
     /// Persist the baked global launch-hotkey mapping.
     ///
     /// Auto-import calls this once with the per-repo chord -> directory layout it

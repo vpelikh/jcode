@@ -196,20 +196,15 @@ prompt_entry_animation = true
 
 # Render the full, untrimmed bash command output beneath the tool summary
 # (default: true). When false, no bash output is shown at all. This flag is
-# the sole owner of bash output; show_bash_details handles metadata (command,
-# working directory, execution time, exit code) only.
+# the sole owner of bash command output.
 # show_bash_output = true
 
-# Enrich bash tool rows into a verbose details block showing the working
-# directory (when known), execution time, the full executed command, and the
-# exit code (default: true). This flag controls bash *metadata*; it never
-# renders the command output, which is governed solely by show_bash_output.
-# show_bash_details = true
-
-# Show the dimmed technical detail (command, file path, args) next to the
-# model-provided intent on tool rows (default: false). When false, tool rows
-# with an intent show just the intent; rows without an intent still show the
-# technical detail.
+# Show the technical detail on tool rows (default: false). When on, bash tool
+# rows render a verbose block with the full executed command (wrapped), the
+# working directory (when known), the execution time, and the exit code; other
+# tool rows show their technical detail (command, file path, args) next to the
+# intent. When off, rows with an intent show just the intent; rows without an
+# intent still show the technical detail.
 # tool_call_details = false
 
 # Occasionally surface a "learn this keybinding" nudge (in a distinct color)

@@ -4181,6 +4181,10 @@ pub(crate) fn render_tool_message(
         Span::styled(format!("  {} ", icon), Style::default().fg(icon_color)),
         Span::styled(display_name, Style::default().fg(tool_color())),
     ];
+    // Runtime detail toggles hoisted here so both the row summary and the bash
+    // verbose block agree on whether bash's full wrapped command is shown.
+    let show_tool_detail = tools_ui::show_tool_call_details() || is_error || is_partial_batch;
+    let bash_verbose_block = is_bash && show_tool_detail;
     if let Some(intent) = intent {
         tool_line.push(Span::styled(" · ", Style::default().fg(dim_color())));
         tool_line.push(Span::styled(
@@ -4188,19 +4192,24 @@ pub(crate) fn render_tool_message(
             Style::default().fg(tool_color()),
         ));
         // Error summaries always render so failures stay diagnosable even
-        // when technical details are hidden.
-        let show_detail = tools_ui::show_tool_call_details() || is_error || is_partial_batch;
-        if show_detail && !summary.is_empty() && summary != intent {
+        // when technical details are hidden. For bash with the verbose block
+        // on (tool_call_details), `summary` is a lossy "… $ <command>" snippet
+        // (truncate_command_display's 28-char intent cap) that duplicates the
+        // full wrapped command rendered below, so suppress it (but keep real
+        // error/partial-batch diagnostics).
+        let suppress_bash_cmd_summary =
+            is_bash && show_tool_detail && !is_error && !is_partial_batch && summary != intent;
+        if show_tool_detail && !suppress_bash_cmd_summary && !summary.is_empty() && summary != intent {
             tool_line.push(Span::styled(" · ", Style::default().fg(dim_color())));
             tool_line.push(Span::styled(summary, Style::default().fg(dim_color())));
         }
     } else if !summary.is_empty() {
         // For bash, the non-intent summary is the command text itself. When the
-        // verbose details block is on, the full command already renders on the
+        // bash verbose block is on, the full command already renders on the
         // wrapped line below, so a one-line "… $ <command>" summary on the row
         // would be both redundant and (on a narrow terminal) trimmed to a lossy
-        // "…". Skip it and let the details block own the command display.
-        let skip_command_summary = is_bash && tools_ui::show_bash_details();
+        // "…". Skip it and let the verbose block own the command display.
+        let skip_command_summary = is_bash && show_tool_detail;
         if !skip_command_summary {
             tool_line.push(Span::styled(
                 format!(" {}", summary),
@@ -4261,15 +4270,11 @@ pub(crate) fn render_tool_message(
         }
     }
 
-    let show_bash_details = is_bash && tools_ui::show_bash_details();
-
-    // Verbose bash details block (opt-in via `display.show_bash_details`):
-    // renders the full executed command in addition to the working directory,
-    // execution time, and exit code. This block owns bash *metadata* only;
-    // the command's actual output belongs solely to `display.show_bash_output`.
-    // Keeping them separate means turning on output never surprises you with a
-    // trimmed preview, and turning on details never silently drags in output.
-    if show_bash_details {
+    // Bash verbose block: when tool_call_details is on, render the full executed
+    // command (wrapped beneath the row so it is never elided) in addition to the
+    // working directory, execution time, and exit code which already render
+    // inline. Command *output* remains governed solely by show_bash_output.
+    if bash_verbose_block {
         if let Some(command) = tc.input.get("command").and_then(|v| v.as_str()).filter(|c| !c.trim().is_empty()) {
             // Wrap a long command across continuation lines rather than trimming
             // it with an ellipsis, so the full command stays legible.
@@ -4286,10 +4291,10 @@ pub(crate) fn render_tool_message(
     // Fallback command preview on a second line only when the row has no
     // intent. With an intent present, the command summary is inline-only: it
     // shows on the tool row when it fits and is dropped otherwise, never
-    // spilling onto a second line. Skipped when the verbose details block
-    // already rendered the command.
+    // spilling onto a second line. Skipped when the bash verbose block already
+    // rendered the command.
     if tools_ui::canonical_tool_name(&tc.name) == "bash"
-        && !show_bash_details
+        && !bash_verbose_block
         && intent.is_none()
         && !rendered_tool_line_text.contains('$')
         && let Some(command) = tc.input.get("command").and_then(|v| v.as_str())
@@ -4320,8 +4325,8 @@ pub(crate) fn render_tool_message(
 
     // The command's full output, rendered untrimmed underneath the tool row when
     // `display.show_bash_output` is enabled. This is the single owner of bash
-    // output; `show_bash_details` handles metadata (command/cwd/time/exit) only
-    // and never previews output. The `[tool timing: ...]` header and the
+    // output; `tool_call_details` handles the command metadata alone. The
+    // `[tool timing: ...]` header and the
     // Working directory / Execution time / Exit code footers are harness
     // metadata, not command output, so they are stripped before surfacing the
     // real command result.
