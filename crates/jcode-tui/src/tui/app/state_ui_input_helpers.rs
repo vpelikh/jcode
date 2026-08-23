@@ -110,6 +110,10 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
         "Show/toggle full agentgrep search output inline in chat",
     ),
     RegisteredCommand::public(
+        "/bash-details",
+        "Show/toggle verbose bash details (command, cwd, time, output) on tool rows",
+    ),
+    RegisteredCommand::public(
         "/tool-call-details",
         "Show/toggle dimmed technical details on tool rows with an intent",
     ),
@@ -1054,6 +1058,26 @@ impl App {
                     (
                         "/tool-call-details off".into(),
                         "Show only the intent on tool rows that have one",
+                    ),
+                ],
+            );
+        }
+
+        if prefix.starts_with("/bash-details ") {
+            return self.rank_suggestions(
+                input,
+                vec![
+                    (
+                        "/bash-details status".into(),
+                        "Show whether verbose bash details render on tool rows",
+                    ),
+                    (
+                        "/bash-details on".into(),
+                        "Show command, cwd, time, and output beneath bash rows",
+                    ),
+                    (
+                        "/bash-details off".into(),
+                        "Keep the compact bash row with only the [exit N] badge",
                     ),
                 ],
             );

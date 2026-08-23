@@ -2154,6 +2154,120 @@ fn render_tool_message_shows_bash_output_when_enabled() {
     crate::tui::ui::tools_ui::tests_show_bash_output_override::set(false);
 }
 
+#[test]
+fn render_tool_message_shows_bash_exit_code_badge_on_failed_run() {
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "boom\n\nExit code: 2".to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_bash_exit_failed".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({"command": "false"}),
+            intent: Some("Run failing command".to_string()),
+            thought_signature: None,
+        }),
+    };
+
+    let lines = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off);
+    let rendered = lines
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        rendered.contains("[exit 2]"),
+        "failed bash run should show exit badge: {rendered}"
+    );
+    assert!(
+        rendered.contains('✗'),
+        "failed bash run should use the error icon: {rendered}"
+    );
+}
+
+#[test]
+fn render_tool_message_shows_bash_exit_code_badge_on_success() {
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "clean\n\nExit code: 0".to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_bash_exit_ok".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({"command": "git status"}),
+            intent: Some("Check git status".to_string()),
+            thought_signature: None,
+        }),
+    };
+
+    let lines = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off);
+    let rendered = lines
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        rendered.contains("[exit 0]"),
+        "successful bash run should show exit badge: {rendered}"
+    );
+}
+
+#[test]
+fn render_tool_message_shows_bash_details_block_when_enabled() {
+    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(true);
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "[tool timing: start=2026-01-01T00:00:00.000Z finish=2026-01-01T00:00:00.120Z duration=120ms] On branch main\nUntracked files\n\nExit code: 0".to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_bash_details".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({
+                "command": "git status",
+                "working_dir": "/home/user/project",
+            }),
+            intent: Some("Check git status".to_string()),
+            thought_signature: None,
+        }),
+    };
+
+    let rendered = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        rendered.contains("$ git status"),
+        "verbose details should show the full command: {rendered}"
+    );
+    assert!(
+        rendered.contains("took 120ms"),
+        "verbose details should show the execution time: {rendered}"
+    );
+    assert!(
+        rendered.contains("cwd /home/user/project"),
+        "verbose details should show the working directory: {rendered}"
+    );
+    assert!(
+        rendered.contains("On branch main"),
+        "verbose details should show the full output: {rendered}"
+    );
+    assert!(
+        rendered.contains("[exit 0]"),
+        "verbose details still show the exit badge: {rendered}"
+    );
+    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(false);
+}
+
 fn gmail_draft_message(content: &str, input: serde_json::Value) -> DisplayMessage {
     DisplayMessage {
         role: "tool".to_string(),
