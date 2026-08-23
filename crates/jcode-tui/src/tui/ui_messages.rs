@@ -4190,7 +4190,9 @@ pub(crate) fn render_tool_message(
         }
 
         let mut meta_parts: Vec<Span<'static>> = Vec::new();
-        if let Some(duration) = tools_ui::parse_bash_timing_duration(&msg.content) {
+        let duration = tools_ui::parse_bash_execution_time(&msg.content)
+            .or_else(|| tools_ui::parse_bash_timing_duration(&msg.content));
+        if let Some(duration) = duration {
             meta_parts.push(Span::styled(
                 format!("took {}", duration),
                 Style::default().fg(dim_color()),
