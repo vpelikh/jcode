@@ -39,6 +39,18 @@ pub const EMERGENCY_IMAGE_MAX_CHARS: usize = 1024;
 /// under the hard provider cap so a single retry reliably fits.
 pub const PAYLOAD_IMAGE_CHAR_BUDGET: usize = 12 * 1024 * 1024;
 
+/// Total-base64 budget applied when reactively recovering from a *specific*
+/// provider HTTP 413 "request too large" error.
+///
+/// `PAYLOAD_IMAGE_CHAR_BUDGET` (12 MiB) is chosen to stay under Anthropic's
+/// ~32 MB body cap while preserving as much visual context as possible. But many
+/// OpenAI-compatible gateways and coding proxies reject bodies far below that
+/// (often 4-16 MB), so a 413 that is driven by stacked screenshots can survive a
+/// strip-to-12-MiB retry and fail again. Once a request has actually been
+/// rejected as too large, we prioritize getting a retry through over preserving
+/// screenshots, so the reactive path strips images down to this tighter cap.
+pub const PAYLOAD_IMAGE_EMERGENCY_CHAR_BUDGET: usize = 4 * 1024 * 1024;
+
 /// Approximate maximum total tool-result body (in characters) we aim to keep
 /// the transcript under when recovering from a "request too large" / HTTP 413
 /// payload error that is driven by accumulated large tool outputs (file/cat/read
@@ -1175,5 +1187,18 @@ mod tests {
         let stripped = emergency_strip_large_images(&mut messages, 2000);
         assert_eq!(stripped, 1);
         assert!(matches!(messages[0].content[0], ContentBlock::Text { .. }));
+    }
+
+    #[test]
+    fn emergency_image_budget_is_tighter_than_regular_budget() {
+        // The reactive 413 path must strip harder than the pre-emptive budget so
+        // a request that was actually rejected as too large reliably fits on the
+        // retry (gateway caps are often well below Anthropic's ~32 MB body cap).
+        assert!(
+            PAYLOAD_IMAGE_EMERGENCY_CHAR_BUDGET < PAYLOAD_IMAGE_CHAR_BUDGET,
+            "emergency budget {} must be tighter than regular budget {}",
+            PAYLOAD_IMAGE_EMERGENCY_CHAR_BUDGET,
+            PAYLOAD_IMAGE_CHAR_BUDGET
+        );
     }
 }
