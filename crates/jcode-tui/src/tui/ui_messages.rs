@@ -4190,10 +4190,18 @@ pub(crate) fn render_tool_message(
             tool_line.push(Span::styled(summary, Style::default().fg(dim_color())));
         }
     } else if !summary.is_empty() {
-        tool_line.push(Span::styled(
-            format!(" {}", summary),
-            Style::default().fg(dim_color()),
-        ));
+        // For bash, the non-intent summary is the command text itself. When the
+        // verbose details block is on, the full command already renders on the
+        // wrapped line below, so a one-line "… $ <command>" summary on the row
+        // would be both redundant and (on a narrow terminal) trimmed to a lossy
+        // "…". Skip it and let the details block own the command display.
+        let skip_command_summary = is_bash && tools_ui::show_bash_details();
+        if !skip_command_summary {
+            tool_line.push(Span::styled(
+                format!(" {}", summary),
+                Style::default().fg(dim_color()),
+            ));
+        }
     }
     if is_edit_tool && has_diff_changes {
         tool_line.push(Span::styled(" (", Style::default().fg(dim_color())));
