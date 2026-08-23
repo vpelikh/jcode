@@ -712,15 +712,9 @@ fn format_command_output(
         output.push_str("\n... (output truncated)");
     }
 
-    if let Some(code) = exit_code.filter(|code| *code != 0) {
-        output.push_str(&format!("\n\nExit code: {}", code));
-    }
-
-    // Record the working directory the command ran in. It is emitted as a
-    // trailing footer (mirroring the `Exit code` footer) so display surfaces
-    // can show it without the tool arguments carrying it, and the model sees
-    // context consistent with where the command actually executed. Skipped for
-    // a clean no-op so the "completed successfully" placeholder stays intact.
+    // Record the working directory the command ran in, mirroring the exit-code
+    // footer, so display surfaces can show it without the tool arguments
+    // carrying it. Emitted whenever the command produced any content.
     if let Some(cwd) = cwd {
         let cwd = cwd.to_string_lossy();
         if !cwd.trim().is_empty()
@@ -731,7 +725,16 @@ fn format_command_output(
         }
     }
 
-    if output.trim().is_empty() {
+    // Always record the exit code (including 0) so the outcome is visible on
+    // the tool row and in the transcript regardless of whether the command
+    // produced output or failed.
+    if let Some(code) = exit_code {
+        output.push_str(&format!("\n\nExit code: {}", code));
+    }
+
+    // A truly clean no-op (no output, no cwd) collapses to the explicit
+    // success sentinel instead of a bare "Exit code: 0" line.
+    if output.trim() == "Exit code: 0" {
         "Command completed successfully (no output)".to_string()
     } else {
         output
@@ -757,14 +760,23 @@ mod utf8_truncation_tests {
         let cwd = std::path::Path::new("/home/user/project");
         let out = format_command_output("On branch main".to_string(), Some(0), Some(cwd));
         assert!(out.contains("Working directory: /home/user/project"), "{out}");
-        // exit 0 carries no separate exit footer; only the cwd footer is added.
-        assert!(!out.contains("Exit code: 0"), "{out}");
+        assert!(out.contains("Exit code: 0"), "{out}");
 
         let out = format_command_output("boom".to_string(), Some(2), Some(cwd));
         assert!(out.contains("Exit code: 2"), "{out}");
         assert!(out.contains("Working directory: /home/user/project"), "{out}");
 
-        // A clean no-op omits both footers so the placeholder stays intact.
+        // A clean no-op with no cwd collapses to the success sentinel (which
+        // the display layer treats as exit 0).
+        let out = format_command_output(String::new(), Some(0), None);
+        assert_eq!(
+            out,
+            "Command completed successfully (no output)".to_string()
+        );
+        // A clean no-op still collapses to the sentinel even when a cwd exists,
+        // because the cwd footer is gated on there being real output to attach
+        // it to. A non-empty-output run is when cwd is surfaced (checked above
+        // with "On branch main").
         let out = format_command_output(String::new(), Some(0), Some(cwd));
         assert_eq!(
             out,

@@ -170,13 +170,16 @@ pub fn concise_tool_error_summary(content: &str) -> Option<String> {
 
 /// Parse the numeric exit code embedded in a bash tool result, if present.
 ///
-/// The bash tool appends one of two trailing lines when the command finishes:
-/// `Exit code: N` (foreground runs) or `--- Command finished with exit code: N ---`
-/// (detached/background runs). A successful run with no output surfaces the
-/// placeholder `Command completed successfully (no output)` and carries no exit
-/// marker, so callers should treat `None` as "exit unknown / no output" and
-/// `Some(0)` as a confirmed success.
+/// The bash tool appends `Exit code: N` (foreground/reload runs) or
+/// `--- Command finished with exit code: N ---` (detached/background runs) as a
+/// trailing footer. A successful run with no output surfaces the explicit
+/// sentinel `Command completed successfully (no output)`, which is treated as
+/// exit code 0. `None` is returned only when the outcome is genuinely unknown.
 pub fn parse_bash_exit_code(content: &str) -> Option<i32> {
+    let trimmed = content.trim();
+    if trimmed == "Command completed successfully (no output)" {
+        return Some(0);
+    }
     for raw_line in content.lines().rev() {
         let line = raw_line.trim();
         if let Some(rest) = line.strip_prefix("Exit code:") {
@@ -343,7 +346,8 @@ mod tests {
         );
         assert_eq!(
             parse_bash_exit_code("Command completed successfully (no output)"),
-            None
+            Some(0),
+            "the success sentinel must be treated as exit code 0 so the badge shows"
         );
         assert_eq!(parse_bash_exit_code("no marker here"), None);
     }
