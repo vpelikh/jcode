@@ -2300,6 +2300,51 @@ fn render_tool_message_shows_bash_details_block_when_enabled() {
     crate::tui::ui::tools_ui::tests_show_bash_details_override::set(false);
 }
 
+#[test]
+fn long_bash_command_and_output_wrap_instead_of_truncating() {
+    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(true);
+    crate::tui::ui::tools_ui::tests_show_bash_output_override::set(true);
+
+    // A command and output line far wider than the 40-col pane.
+    let long_command = "find . -type f -name '*.png' -not -path './node_modules/*' -exec sh -c 'cp \"$1\" /tmp/backup/${1//\\//_}' _ {} \\;";
+    let long_output = "module.exports = { build: { target: 'esnext', rollupOptions: { external: ['node:fs', 'node:path'] } }, plugins: [react(), tailwind(), { name: 'wrangler', apply: 'build' }] };";
+
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: format!("{long_output}\n\nWorking directory: /repo\n\nExecution time: 3ms\n\nExit code: 0"),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_bash_long".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({ "command": long_command }),
+            intent: Some("Run heavy command".to_string()),
+            thought_signature: None,
+        }),
+    };
+
+    let rendered = render_tool_message(&msg, 40, crate::config::DiffDisplayMode::Off)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let compact = without_whitespace(&rendered);
+
+    // The full command must survive (wrapped across rows), never elided.
+    assert!(
+        compact.contains(&without_whitespace(long_command)),
+        "long command must wrap and stay complete: {rendered}"
+    );
+    assert!(
+        compact.contains(&without_whitespace(long_output)),
+        "long output line must wrap and stay complete: {rendered}"
+    );
+
+    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(false);
+    crate::tui::ui::tools_ui::tests_show_bash_output_override::set(false);
+}
+
 fn gmail_draft_message(content: &str, input: serde_json::Value) -> DisplayMessage {
     DisplayMessage {
         role: "tool".to_string(),
