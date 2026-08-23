@@ -168,6 +168,88 @@ pub fn concise_tool_error_summary(content: &str) -> Option<String> {
     None
 }
 
+/// Parse the numeric exit code embedded in a bash tool result, if present.
+///
+/// The bash tool appends one of two trailing lines when the command finishes:
+/// `Exit code: N` (foreground runs) or `--- Command finished with exit code: N ---`
+/// (detached/background runs). A successful run with no output surfaces the
+/// placeholder `Command completed successfully (no output)` and carries no exit
+/// marker, so callers should treat `None` as "exit unknown / no output" and
+/// `Some(0)` as a confirmed success.
+pub fn parse_bash_exit_code(content: &str) -> Option<i32> {
+    for raw_line in content.lines().rev() {
+        let line = raw_line.trim();
+        if let Some(rest) = line.strip_prefix("Exit code:") {
+            return rest
+                .trim()
+                .parse::<i32>()
+                .ok()
+                .filter(|_| !line.is_empty());
+        }
+        if let Some(rest) = line.strip_prefix("--- Command finished with exit code:") {
+            let code = rest.trim().trim_end_matches('-').trim();
+            if !code.is_empty() {
+                return code.parse::<i32>().ok();
+            }
+        }
+    }
+    None
+}
+
+/// Parse the execution time from the `[tool timing: ...]` header prepended to a
+/// tool result's text content (see `jcode_message_types::Message::with_timestamps`).
+/// Returns the humanized duration (e.g. `120ms`, `1.5s`, `2m`) when available.
+pub fn parse_bash_timing_duration(content: &str) -> Option<String> {
+    let trimmed = content.trim_start();
+    // Search anywhere in the leading header so a trimmed/mirrored transcript
+    // still finds it even if the header is not the very first token.
+    let searchable = &trimmed[..trimmed.len().min(160)];
+    let after_open = searchable.strip_prefix('[')?;
+    let header_end = after_open.find(']')?;
+    let header = &after_open[..header_end];
+    let header = header.strip_prefix("tool timing:")?;
+    let duration = header
+        .split_whitespace()
+        .find(|part| part.starts_with("duration="))?;
+    let value = duration.strip_prefix("duration=")?;
+    parse_duration_value(value)
+}
+
+fn parse_duration_value(value: &str) -> Option<String> {
+    let value = value.trim().trim_end_matches(']').trim();
+    let lowercase = value.to_ascii_lowercase();
+    if let Some(ms) = lowercase.strip_suffix("ms") {
+        let ms: u64 = ms.parse().ok()?;
+        return Some(humanize_duration_ms(ms));
+    }
+    if let Some(secs) = lowercase.strip_suffix('s') {
+        let secs: f64 = secs.parse().ok()?;
+        return Some(humanize_duration_ms((secs * 1000.0).round() as u64));
+    }
+    if let Ok(ms) = value.parse::<u64>() {
+        return Some(humanize_duration_ms(ms));
+    }
+    None
+}
+
+fn humanize_duration_ms(duration_ms: u64) -> String {
+    match duration_ms {
+        0..=999 => format!("{}ms", duration_ms),
+        1_000..=9_999 => format!("{:.1}s", duration_ms as f64 / 1000.0),
+        10_000..=59_999 => format!("{}s", duration_ms / 1000),
+        _ => {
+            let total_seconds = duration_ms / 1000;
+            let minutes = total_seconds / 60;
+            let seconds = total_seconds % 60;
+            if seconds == 0 {
+                format!("{}m", minutes)
+            } else {
+                format!("{}m {}s", minutes, seconds)
+            }
+        }
+    }
+}
+
 pub fn tool_output_looks_failed(content: &str) -> bool {
     let trimmed = content.trim();
     if trimmed.is_empty() {
@@ -232,5 +314,48 @@ mod tests {
         ));
         assert!(!tool_output_looks_failed("Exit code: 0"));
         assert!(!tool_output_looks_failed("completed successfully"));
+    }
+
+    #[test]
+    fn parses_bash_exit_code_from_foreground_and_detached_markers() {
+        assert_eq!(parse_bash_exit_code("out\n\nExit code: 0"), Some(0));
+        assert_eq!(parse_bash_exit_code("boom\n\nExit code: 2"), Some(2));
+        assert_eq!(
+            parse_bash_exit_code("done\n\n--- Command finished with exit code: 3 ---"),
+            Some(3)
+        );
+        assert_eq!(
+            parse_bash_exit_code("Command completed successfully (no output)"),
+            None
+        );
+        assert_eq!(parse_bash_exit_code("no marker here"), None);
+    }
+
+    #[test]
+    fn parses_bash_timing_duration() {
+        assert_eq!(
+            parse_bash_timing_duration(
+                "[tool timing: start=2026-01-01T00:00:00.000Z finish=2026-01-01T00:00:00.120Z duration=120ms] git status"
+            )
+            .as_deref(),
+            Some("120ms")
+        );
+        assert_eq!(
+            parse_bash_timing_duration("[tool timing: duration=1500ms] echo").as_deref(),
+            Some("1.5s")
+        );
+        assert_eq!(
+            parse_bash_timing_duration("[tool timing: duration=90s] echo").as_deref(),
+            Some("1m 30s")
+        );
+        assert_eq!(parse_bash_timing_duration("no timing header"), None);
+    }
+
+    #[test]
+    fn humanizes_duration_units() {
+        assert_eq!(humanize_duration_ms(500), "500ms");
+        assert_eq!(humanize_duration_ms(2_000), "2.0s");
+        assert_eq!(humanize_duration_ms(90_000), "1m 30s");
+        assert_eq!(humanize_duration_ms(120_000), "2m");
     }
 }

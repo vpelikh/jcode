@@ -8,6 +8,7 @@ pub(super) use jcode_tui_tool_display::concise_tool_error_summary;
 pub(crate) use jcode_tui_tool_display::{
     canonical_tool_name, is_edit_tool_name, resolve_display_tool_name, tool_output_looks_failed,
 };
+pub(super) use jcode_tui_tool_display::{parse_bash_exit_code, parse_bash_timing_duration};
 
 /// Whether the dimmed technical detail (command, path, args) should render
 /// alongside a model-provided intent on tool rows. Rows without an intent
@@ -47,6 +48,35 @@ pub(crate) fn show_bash_output() -> bool {
 #[cfg(test)]
 pub(crate) fn show_bash_output() -> bool {
     tests_show_bash_output_override::get()
+}
+
+/// Whether bash tool rows should render the verbose details block (full
+/// command, working directory, execution time, and output).
+#[cfg(not(test))]
+pub(crate) fn show_bash_details() -> bool {
+    crate::config::config().display.show_bash_details
+}
+
+#[cfg(test)]
+pub(crate) fn show_bash_details() -> bool {
+    tests_show_bash_details_override::get()
+}
+
+#[cfg(test)]
+pub(crate) mod tests_show_bash_details_override {
+    use std::cell::Cell;
+
+    thread_local! {
+        static SHOW_DETAILS: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn get() -> bool {
+        SHOW_DETAILS.with(Cell::get)
+    }
+
+    pub(crate) fn set(value: bool) {
+        SHOW_DETAILS.with(|cell| cell.set(value));
+    }
 }
 
 #[cfg(test)]
