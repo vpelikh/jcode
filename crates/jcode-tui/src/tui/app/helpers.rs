@@ -214,8 +214,15 @@ pub(super) fn ctrl_bracket_fallback_to_esc(code: &mut KeyCode, modifiers: &mut K
     if !modifiers.contains(KeyModifiers::CONTROL) {
         return;
     }
-    if *code == KeyCode::Esc {
-        *code = KeyCode::Char('[');
+    match code {
+        KeyCode::Esc => {
+            *code = KeyCode::Char('[');
+        }
+        KeyCode::Char('5') => {
+            // Legacy tty mapping for Ctrl+]
+            *code = KeyCode::Char(']');
+        }
+        _ => {}
     }
 }
 
@@ -1064,15 +1071,6 @@ pub(super) fn encode_rgba_as_png(width: usize, height: usize, rgba: &[u8]) -> Op
     Some(buf)
 }
 
-#[cfg(test)]
-pub(super) fn gather_git_info() -> Option<GitInfo> {
-    GIT_INFO_CACHE
-        .lock()
-        .ok()
-        .and_then(|guard| guard.as_ref().and_then(|(_, cached, _)| cached.clone()))
-}
-
-#[cfg(not(test))]
 pub(super) fn gather_git_info() -> Option<GitInfo> {
     use std::time::Instant;
 
@@ -1313,7 +1311,6 @@ pub(crate) fn format_countdown_until(target: chrono::DateTime<chrono::Utc>) -> S
     }
 }
 
-#[cfg(not(test))]
 fn gather_git_info_inner() -> Option<GitInfo> {
     use std::process::Command;
 
