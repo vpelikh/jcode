@@ -3613,3 +3613,97 @@ fn render_empty_todo_tool_result_collapses_to_compact_line() {
     assert!(!plain.contains("No tasks yet"), "{plain}");
     assert!(plain.contains("no tasks"), "{plain}");
 }
+
+#[test]
+fn push_wrapped_indented_wraps_on_narrow_available_width() {
+    let mut lines = Vec::new();
+    super::push_wrapped_indented(
+        &mut lines,
+        "  ",
+        "abcdefghij",
+        ratatui::style::Style::default(),
+        6, // indent=2 -> content_width=4
+    );
+    let texts: Vec<String> = lines.iter().map(extract_line_text).collect();
+    assert!(!texts.is_empty(), "must emit at least one row");
+    // Every physical row (indent + content) must be <= the available width.
+    for t in &texts {
+        assert!(
+            t.width() <= 6,
+            "row wider than available width: {t:?} (width {})",
+            t.width()
+        );
+    }
+    // Strip the leading indent from each row and concat: full text must survive.
+    let joined: String = texts
+        .iter()
+        .map(|t| t.trim_start_matches("  "))
+        .collect();
+    assert_eq!(&joined, "abcdefghij", "all text must be preserved, got: {texts:?}");
+}
+
+#[test]
+fn push_wrapped_indented_empty_text_emits_no_dangling_indent_only_row() {
+    let mut lines = Vec::new();
+    super::push_wrapped_indented(
+        &mut lines,
+        "      ",
+        "",
+        ratatui::style::Style::default(),
+        40,
+    );
+    // Empty text should not render a dangling indent-only row.
+    assert!(
+        lines.is_empty(),
+        "empty text must emit no rows, got {lines:?}"
+    );
+}
+
+#[test]
+fn push_wrapped_indented_extreme_narrow_falls_back_to_single_row() {
+    let mut lines = Vec::new();
+    // available_width (0) <= indent_width (2): the content_width==0 guard path.
+    super::push_wrapped_indented(
+        &mut lines,
+        "  ",
+        "abc",
+        ratatui::style::Style::default(),
+        0,
+    );
+    // Degenerate width: must still emit the full text on a single row (never lose it).
+    let texts: Vec<String> = lines.iter().map(extract_line_text).collect();
+    assert!(!texts.is_empty(), "must emit at least one row");
+    assert!(
+        texts.concat().contains("abc"),
+        "full text must survive even at zero width: {texts:?}"
+    );
+}
+
+#[test]
+fn push_wrapped_indented_respects_wide_unicode_glyph_width() {
+    let mut lines = Vec::new();
+    // CJK chars are width 2; a full-width string must wrap so no physical row
+    // exceeds `available_width`.
+    let text = "日本語テキスト日本語テキスト日本語"; // 14 CJK chars * 2 = 28 cols
+    super::push_wrapped_indented(
+        &mut lines,
+        "  ",
+        text,
+        ratatui::style::Style::default(),
+        10, // indent=2 -> content_width=8, so rows must be <= 8 content cols
+    );
+    let texts: Vec<String> = lines.iter().map(extract_line_text).collect();
+    assert!(!texts.is_empty(), "must emit rows");
+    for t in &texts {
+        assert!(
+            t.width() <= 10,
+            "row exceeded width with wide glyphs: {t:?} (width {})",
+            t.width()
+        );
+    }
+    let joined: String = texts
+        .iter()
+        .map(|t| t.trim_start_matches("  "))
+        .collect();
+    assert_eq!(&joined, text, "wide-char text must be fully preserved: {texts:?}");
+}

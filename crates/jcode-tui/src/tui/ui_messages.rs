@@ -100,6 +100,11 @@ fn push_wrapped_indented(
         ]));
         return;
     }
+    // Empty text must not produce a dangling indent-only row (`split_by_display_width`
+    // yields a single `String::new()` chunk for empty input).
+    if text.is_empty() {
+        return;
+    }
     for chunk in split_by_display_width(text, content_width) {
         lines.push(Line::from(vec![
             Span::raw(indent.to_string()),
