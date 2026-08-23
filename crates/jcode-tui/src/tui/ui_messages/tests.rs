@@ -3707,3 +3707,79 @@ fn push_wrapped_indented_respects_wide_unicode_glyph_width() {
         .collect();
     assert_eq!(&joined, text, "wide-char text must be fully preserved: {texts:?}");
 }
+
+#[test]
+fn bash_row_shows_command_summary_when_details_off() {
+    // With show_bash_details OFF, the row carries a "$ ..." command summary
+    // (the fallback path), not suppressed like when details are on.
+    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(false);
+    crate::tui::ui::tools_ui::tests_show_bash_output_override::set(false);
+
+    let command = "git status";
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "On branch main\n\nWorking directory: /repo\n\nExecution time: 1ms\n\nExit code: 0".to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_bash_nodetails".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({ "command": command }),
+            intent: None,
+            thought_signature: None,
+        }),
+    };
+
+    let rendered = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Row must show the command summary when details are off (no suppression).
+    assert!(
+        rendered.contains("$ git status"),
+        "row should show the command summary when details are off:\n{rendered}"
+    );
+
+    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(false);
+    crate::tui::ui::tools_ui::tests_show_bash_output_override::set(false);
+}
+
+#[test]
+fn bash_output_renders_independently_when_details_off() {
+    // show_bash_output owns output; it must render even when show_bash_details
+    // is off (they are independent flags).
+    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(false);
+    crate::tui::ui::tools_ui::tests_show_bash_output_override::set(true);
+
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "line one\nline two\n\nWorking directory: /repo\n\nExecution time: 1ms\n\nExit code: 0".to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_bash_outonly".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({ "command": "printf x" }),
+            intent: Some("Print".to_string()),
+            thought_signature: None,
+        }),
+    };
+
+    let rendered = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        rendered.contains("line one") && rendered.contains("line two"),
+        "output must render with show_bash_output regardless of show_bash_details:\n{rendered}"
+    );
+
+    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(false);
+    crate::tui::ui::tools_ui::tests_show_bash_output_override::set(false);
+}
