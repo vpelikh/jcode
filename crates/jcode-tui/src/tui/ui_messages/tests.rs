@@ -2223,7 +2223,7 @@ fn render_tool_message_shows_bash_details_block_when_enabled() {
     crate::tui::ui::tools_ui::tests_show_bash_details_override::set(true);
     let msg = DisplayMessage {
         role: "tool".to_string(),
-        content: "[tool timing: start=2026-01-01T00:00:00.000Z finish=2026-01-01T00:00:00.120Z duration=120ms] On branch main\nUntracked files\n\nWorking directory: /home/user/project\n\nExit code: 0".to_string(),
+        content: "On branch main\nUntracked files\n\nWorking directory: /home/user/project\n\nExecution time: 120ms\n\nExit code: 0".to_string(),
         tool_calls: Vec::new(),
         duration_secs: None,
         title: None,
