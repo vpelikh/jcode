@@ -84,13 +84,13 @@ pub struct DisplayConfig {
     /// no bash output is shown at all.
     #[serde(default = "default_true")]
     pub show_bash_output: bool,
-    /// Show the technical detail on tool rows (default: false). When on, bash
+    /// Show the technical detail on tool rows (default: true). When on, bash
     /// tool rows render a verbose block with the full executed command (wrapped),
     /// the working directory (when known), the execution time, and the exit code;
     /// other tool rows show their technical detail (command, path, args) after
     /// the intent. When off, rows with an intent show only the intent; rows
     /// without an intent always fall back to the technical detail.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub tool_call_details: bool,
     /// Native terminal scrollbar configuration for scrollable panes
     pub native_scrollbars: NativeScrollbarConfig,
@@ -160,7 +160,7 @@ impl Default for DisplayConfig {
             copy_badge_alt_label: String::new(),
             show_agentgrep_output: false,
             show_bash_output: true,
-            tool_call_details: false,
+            tool_call_details: true,
             native_scrollbars: NativeScrollbarConfig::default(),
             keybinding_hints: true,
             theme: String::new(),
@@ -248,21 +248,21 @@ mod tests {
     }
 
     #[test]
-    fn bash_output_defaults_on_and_tool_call_details_defaults_off() {
+    fn bash_output_and_tool_call_details_default_on() {
         let default = DisplayConfig::default();
         assert!(
             default.show_bash_output,
             "bash output should default on (full untrimmed render)"
         );
         assert!(
-            !default.tool_call_details,
-            "tool_call_details should default off"
+            default.tool_call_details,
+            "tool_call_details should default on (bash full command block)"
         );
 
         // Omitting the fields keeps the defaults.
         let missing: DisplayConfig = serde_json::from_str("{}").expect("display config");
         assert!(missing.show_bash_output);
-        assert!(!missing.tool_call_details);
+        assert!(missing.tool_call_details);
 
         // Explicit on/off round-trips for both.
         let out_on: DisplayConfig =

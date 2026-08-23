@@ -2063,11 +2063,11 @@ fn tool_call_details_bash_renders_full_wrapped_command_without_lossy_row_snippet
     crate::tui::ui::tools_ui::tests_tool_call_details_override::set(false);
 }
 
-/// Default (tool_call_details off): a row with an intent renders only the
+/// When tool_call_details is off, a row with an intent renders only the
 /// intent; the dimmed technical preview is dropped and no fallback command
 /// line is added.
 #[test]
-fn render_tool_message_hides_technical_preview_by_default() {
+fn render_tool_message_hides_technical_preview_when_tool_details_off() {
     let msg = DisplayMessage {
         role: "tool".to_string(),
         content: "ok".to_string(),
