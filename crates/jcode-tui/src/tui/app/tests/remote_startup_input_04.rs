@@ -16,6 +16,36 @@ fn test_handle_server_event_updates_status_detail() {
 }
 
 #[test]
+fn test_new_connection_phase_clears_stale_status_detail() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    // A heartbeat detail from a previous attempt is lingering.
+    app.status_detail = Some("awaiting response headers (123s)".to_string());
+
+    // Entering a fresh connection attempt must clear the stale detail so it
+    // does not linger next to the new phase label.
+    app.handle_server_event(
+        crate::protocol::ServerEvent::ConnectionPhase {
+            phase: "sending request".to_string(),
+        },
+        &mut remote,
+    );
+
+    assert!(
+        app.status_detail.is_none(),
+        "stale status_detail should be cleared on a new connection attempt, got {:?}",
+        app.status_detail
+    );
+    assert!(
+        matches!(app.status, ProcessingStatus::Connecting(_)),
+        "expected connecting status after SendingRequest phase"
+    );
+}
+
+#[test]
 fn test_handle_server_event_transcript_replace_updates_input() {
     let mut app = create_test_app();
     let rt = tokio::runtime::Runtime::new().unwrap();
