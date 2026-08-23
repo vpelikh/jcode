@@ -4222,9 +4222,11 @@ pub(crate) fn render_tool_message(
     let show_bash_details = is_bash && tools_ui::show_bash_details();
 
     // Verbose bash details block (opt-in via `display.show_bash_details`):
-    // renders the full executed command, the working directory (when known),
-    // execution time, and the command's output so the agent's actions are easy
-    // to review and debug.
+    // renders the full executed command in addition to the working directory,
+    // execution time, and exit code. This block owns bash *metadata* only;
+    // the command's actual output belongs solely to `display.show_bash_output`.
+    // Keeping them separate means turning on output never surprises you with a
+    // trimmed preview, and turning on details never silently drags in output.
     if show_bash_details {
         if let Some(command) = tc.input.get("command").and_then(|v| v.as_str()).filter(|c| !c.trim().is_empty()) {
             let command_line = Line::from(vec![
@@ -4238,64 +4240,6 @@ pub(crate) fn render_tool_message(
                 &command_line,
                 row_width,
             ));
-        }
-
-        // Working directory and execution time render inline on the tool row
-        // itself (see the bash_inline spans above), so the details block only
-        // adds the full command and the command's output.
-
-        // Full output (first several non-empty lines), distinct from the
-        // `show_bash_output` tail preview. The `[tool timing: ...]` header is
-        // harness metadata, not command output, and the Working directory /
-        // Execution time / Exit code footers are metadata too, so they are
-        // stripped before we surface the real command result.
-        let detail_content = strip_tool_result_timestamp_header(&msg.content);
-        if detail_content.trim() != "Command completed successfully (no output)"
-            && detail_content.trim()
-                != "Tool output missing (session interrupted before tool execution completed)"
-        {
-            const MAX_DETAIL_OUTPUT_LINES: usize = 8;
-            let output_lines = detail_content.lines().filter(|line| {
-                let t = line.trim();
-                !t.is_empty()
-                    && !t.starts_with("Working directory:")
-                    && !t.starts_with("Execution time:")
-                    && !t.starts_with("Exit code:")
-                    && !t.starts_with("--- Command finished with exit code:")
-            });
-            let total = output_lines.clone().count();
-            if total > 0 {
-                let output_label = Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled("Output:", Style::default().fg(dim_color()).add_modifier(
-                        ratatui::style::Modifier::BOLD,
-                    )),
-                ]);
-                lines.push(super::truncate_line_with_ellipsis_to_width(
-                    &output_label,
-                    row_width,
-                ));
-            }
-            for output in output_lines.take(MAX_DETAIL_OUTPUT_LINES) {
-                let output_line = Line::from(vec![
-                    Span::raw("      "),
-                    Span::styled(output.to_string(), Style::default().fg(dim_color())),
-                ]);
-                lines.push(super::truncate_line_with_ellipsis_to_width(
-                    &output_line,
-                    row_width,
-                ));
-            }
-            if total > MAX_DETAIL_OUTPUT_LINES {
-                let elided = Line::from(vec![
-                    Span::raw("      "),
-                    Span::styled(
-                        format!("… {} more line(s) (show_bash_output on shows the tail)", total - MAX_DETAIL_OUTPUT_LINES),
-                        Style::default().fg(dim_color()),
-                    ),
-                ]);
-                lines.push(super::truncate_line_with_ellipsis_to_width(&elided, row_width));
-            }
         }
     }
 
@@ -4334,24 +4278,41 @@ pub(crate) fn render_tool_message(
         }
     }
 
+    // The command's full output, rendered untrimmed underneath the tool row when
+    // `display.show_bash_output` is enabled. This is the single owner of bash
+    // output; `show_bash_details` handles metadata (command/cwd/time/exit) only
+    // and never previews output. The `[tool timing: ...]` header and the
+    // Working directory / Execution time / Exit code footers are harness
+    // metadata, not command output, so they are stripped before surfacing the
+    // real command result.
     if tools_ui::canonical_tool_name(&tc.name) == "bash"
         && tools_ui::show_bash_output()
         && msg.content.trim() != "Command completed successfully (no output)"
     {
-        const MAX_COLLAPSED_OUTPUT_LINES: usize = 3;
-        let output_lines = msg
-            .content
-            .lines()
-            .filter(|line| {
-                let t = line.trim();
-                !t.is_empty()
-                    && !t.starts_with("Working directory:")
-                    && !t.starts_with("Execution time:")
-                    && !t.starts_with("Exit code:")
-                    && !t.starts_with("--- Command finished with exit code:")
-            });
-        let total = output_lines.clone().count();
-        for output in output_lines.skip(total.saturating_sub(MAX_COLLAPSED_OUTPUT_LINES)) {
+        let detail_content = strip_tool_result_timestamp_header(&msg.content);
+        let output_lines = detail_content.lines().filter(|line| {
+            let t = line.trim();
+            !t.is_empty()
+                && !t.starts_with("Working directory:")
+                && !t.starts_with("Execution time:")
+                && !t.starts_with("Exit code:")
+                && !t.starts_with("--- Command finished with exit code:")
+        });
+        let output_lines: Vec<&str> = output_lines.collect();
+        if !output_lines.is_empty() {
+            let output_label = Line::from(vec![
+                Span::raw("    "),
+                Span::styled(
+                    "Output:",
+                    Style::default().fg(dim_color()).add_modifier(ratatui::style::Modifier::BOLD),
+                ),
+            ]);
+            lines.push(super::truncate_line_with_ellipsis_to_width(
+                &output_label,
+                row_width,
+            ));
+        }
+        for output in output_lines {
             let output_line = Line::from(vec![
                 Span::raw("      "),
                 Span::styled(output.to_string(), Style::default().fg(dim_color())),

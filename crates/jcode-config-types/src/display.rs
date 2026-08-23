@@ -79,14 +79,16 @@ pub struct DisplayConfig {
     /// just the one-line summary (default: false)
     #[serde(default)]
     pub show_agentgrep_output: bool,
-    /// Show up to the last three non-empty bash output lines beneath the tool
-    /// summary (default: false).
-    #[serde(default)]
+    /// Render the full, untrimmed bash command output beneath the tool summary
+    /// (default: true). This flag is the sole owner of bash output; when false,
+    /// no bash output is shown at all.
+    #[serde(default = "default_true")]
     pub show_bash_output: bool,
     /// Enrich bash tool rows into a verbose details block showing the working
     /// directory (when known), execution time, the full executed command, and
-    /// the command output (default: true). Independent of `show_bash_output`,
-    /// which only shows the last few output lines.
+    /// the exit code (default: true). This flag controls bash metadata only;
+    /// it never renders the command output, which is governed solely by
+    /// `show_bash_output`.
     #[serde(default = "default_true")]
     pub show_bash_details: bool,
     /// Show the dimmed technical detail (command, path, args) after the
@@ -162,7 +164,7 @@ impl Default for DisplayConfig {
             compact_notifications: false,
             copy_badge_alt_label: String::new(),
             show_agentgrep_output: false,
-            show_bash_output: false,
+            show_bash_output: true,
             show_bash_details: true,
             tool_call_details: false,
             native_scrollbars: NativeScrollbarConfig::default(),
@@ -255,10 +257,15 @@ mod tests {
     fn bash_details_defaults_on_and_parses_explicit_value() {
         let default = DisplayConfig::default();
         assert!(default.show_bash_details, "verbose bash details should default on");
+        assert!(
+            default.show_bash_output,
+            "bash output should default on (full untrimmed render)"
+        );
 
         // Omitting the field keeps the default (on).
         let missing: DisplayConfig = serde_json::from_str("{}").expect("display config");
         assert!(missing.show_bash_details);
+        assert!(missing.show_bash_output);
 
         // Explicit on/off round-trips.
         let on: DisplayConfig =
@@ -267,6 +274,13 @@ mod tests {
         let off: DisplayConfig =
             serde_json::from_str(r#"{"show_bash_details":false}"#).expect("display config");
         assert!(!off.show_bash_details);
+
+        let out_on: DisplayConfig =
+            serde_json::from_str(r#"{"show_bash_output":true}"#).expect("display config");
+        assert!(out_on.show_bash_output);
+        let out_off: DisplayConfig =
+            serde_json::from_str(r#"{"show_bash_output":false}"#).expect("display config");
+        assert!(!out_off.show_bash_output);
     }
 
     #[test]
