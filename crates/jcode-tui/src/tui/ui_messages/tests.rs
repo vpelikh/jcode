@@ -2147,10 +2147,23 @@ fn render_tool_message_shows_bash_output_when_enabled() {
         .map(extract_line_text)
         .collect::<Vec<_>>();
 
-    assert_eq!(rendered.len(), 4);
-    assert!(!rendered.iter().any(|line| line.trim() == "one"));
-    assert!(rendered.iter().any(|line| line.trim() == "two"));
-    assert!(rendered.iter().any(|line| line.trim() == "four"));
+    // show_bash_output renders the full, untrimmed output: every line appears.
+    assert!(
+        rendered.iter().any(|line| line.trim() == "one"),
+        "first output line should be shown: {rendered:?}"
+    );
+    assert!(
+        rendered.iter().any(|line| line.trim() == "two"),
+        "second output line should be shown: {rendered:?}"
+    );
+    assert!(
+        rendered.iter().any(|line| line.trim() == "three"),
+        "third output line should be shown: {rendered:?}"
+    );
+    assert!(
+        rendered.iter().any(|line| line.trim() == "four"),
+        "last output line should be shown: {rendered:?}"
+    );
     crate::tui::ui::tools_ui::tests_show_bash_output_override::set(false);
 }
 
@@ -2262,21 +2275,27 @@ fn render_tool_message_shows_bash_details_block_when_enabled() {
         rendered.contains("$ git status"),
         "verbose details should show the full command: {rendered}"
     );
+    // show_bash_details owns metadata only: it must NOT render the command
+    // output or an "Output:" label, which belong solely to show_bash_output.
     assert!(
-        rendered.contains("Output:"),
-        "verbose details should label the command result: {rendered}"
+        !rendered.contains("On branch main"),
+        "show_bash_details must not render bash output: {rendered}"
     );
     assert!(
-        rendered.contains("On branch main"),
-        "verbose details should show the real command output (not the metadata footers): {rendered}"
+        !rendered.contains("Untracked files"),
+        "show_bash_details must not render bash output: {rendered}"
+    );
+    assert!(
+        !rendered.contains("Output:"),
+        "show_bash_details must not label command output: {rendered}"
     );
     assert!(
         !rendered.contains("Working directory:"),
-        "metadata footers should be filtered out of the output block: {rendered}"
+        "metadata footers should be filtered out: {rendered}"
     );
     assert!(
         !rendered.contains("Execution time:"),
-        "execution-time footer should be filtered out of the output block: {rendered}"
+        "execution-time footer should be filtered out: {rendered}"
     );
     crate::tui::ui::tools_ui::tests_show_bash_details_override::set(false);
 }
