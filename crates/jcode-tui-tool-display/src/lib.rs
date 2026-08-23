@@ -216,6 +216,23 @@ pub fn parse_bash_working_dir(content: &str) -> Option<String> {
     None
 }
 
+/// Parse the execution time from the bash tool's `Execution time: <dur>`
+/// footer (e.g. `Execution time: 120ms`, `1.5s`, `2m`), if present. This footer
+/// is part of the stored transcript content, so the duration shows reliably on
+/// resume/replay (unlike the feature-gated `[tool timing]` header).
+pub fn parse_bash_execution_time(content: &str) -> Option<String> {
+    for raw_line in content.lines().rev() {
+        let line = raw_line.trim();
+        if let Some(rest) = line.strip_prefix("Execution time:") {
+            let value = rest.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Parse the execution time from the `[tool timing: ...]` header prepended to a
 /// tool result's text content (see `jcode_message_types::Message::with_timestamps`).
 /// Returns the humanized duration (e.g. `120ms`, `1.5s`, `2m`) when available.
@@ -370,6 +387,19 @@ mod tests {
             Some("1m 30s")
         );
         assert_eq!(parse_bash_timing_duration("no timing header"), None);
+    }
+
+    #[test]
+    fn parses_bash_execution_time_footer() {
+        assert_eq!(
+            parse_bash_execution_time("out\n\nExecution time: 120ms").as_deref(),
+            Some("120ms")
+        );
+        assert_eq!(
+            parse_bash_execution_time("out\n\nExecution time: 1.5s").as_deref(),
+            Some("1.5s")
+        );
+        assert_eq!(parse_bash_execution_time("plain output"), None);
     }
 
     #[test]
