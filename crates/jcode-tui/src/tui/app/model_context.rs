@@ -5,6 +5,83 @@ use super::*;
 /// helps; hopping to the strongest Anthropic route often does.
 const GUARDRAIL_REROUTE_MODEL: &str = "claude-opus-4-8";
 
+/// Extract a provider-suggested retry wait from a token-limit / rate-limit
+/// error message.
+///
+/// The OpenAI-compatible runtimes surface a parsed wait in two possible forms
+/// into the error text:
+/// - a compact "Retry after 6m" / "Retry after 45s" suffix (from the rate-limit
+///   renderer), or
+/// - the raw provider body (e.g. "Повторите попытку через 6 мин."), which the
+///   shared token-limit parser understands.
+///
+/// Returns the wait, capped to a sane bound so an oversized/malformed hint can
+/// never stall a turn indefinitely. Returns `None` when no wait is present,
+/// letting the caller fall back to its normal error handling.
+pub(super) fn token_limit_retry_wait(error: &str) -> Option<std::time::Duration> {
+    use std::time::Duration;
+
+    // 1. Compact rate-limit form: "Retry after 6m", "Retry after 45s",
+    //    "Retry after 1h 30m".
+    for prefix in ["retry after ", "retry in "] {
+        let lower = error.to_ascii_lowercase();
+        let mut search_from = 0;
+        while let Some(idx) = lower[search_from..].find(prefix) {
+            let idx = search_from + idx;
+            let rest = &lower[idx + prefix.len()..];
+            if let Some(duration) = parse_compact_duration(rest) {
+                return Some(duration);
+            }
+            search_from = idx + prefix.len();
+        }
+    }
+
+    // 2. Raw provider body form handled by the shared token-limit parser
+    //    (e.g. "Повторите попытку через 6 мин.", "через 45 сек").
+    jcode_provider_core::token_limit::extract_wait_time(error).map(|dur| {
+        // Cap at 15 minutes so a hostile/malformed hint never stalls a turn.
+        dur.min(Duration::from_secs(15 * 60))
+    })
+}
+
+/// Parse a compact duration like "6m", "45s", "1h 30m", "90m" (as emitted by
+/// the OpenAI rate-limit renderer). Returns `None` for anything unrecognized.
+fn parse_compact_duration(s: &str) -> Option<std::time::Duration> {
+    use std::time::Duration;
+
+    let mut total = Duration::ZERO;
+    let mut rest = s;
+    loop {
+        rest = rest.trim_start();
+        // Split off a leading `<number><unit>` token.
+        let digits_end = rest
+            .char_indices()
+            .find(|(_, c)| !c.is_ascii_digit())
+            .map(|(i, _)| i)
+            .unwrap_or(rest.len());
+        if digits_end == 0 {
+            break;
+        }
+        let number: u64 = rest[..digits_end].parse().ok()?;
+        let after_digits = rest[digits_end..].trim_start();
+        let unit = after_digits.chars().next()?;
+        let unit_len = unit.len_utf8();
+        match unit {
+            'd' => total += Duration::from_secs(number.saturating_mul(86_400)),
+            'h' => total += Duration::from_secs(number.saturating_mul(3_600)),
+            'm' => total += Duration::from_secs(number.saturating_mul(60)),
+            's' => total += Duration::from_secs(number),
+            _ => return None,
+        }
+        rest = after_digits[unit_len..].trim_start();
+    }
+    if total.is_zero() {
+        None
+    } else {
+        Some(total)
+    }
+}
+
 impl App {
     fn format_failover_count(value: usize) -> String {
         match value {
@@ -1940,4 +2017,72 @@ pub(super) fn unavailable_model_route_message(
     }
 
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn waits_are_extracted_from_compact_rate_limit_forms() {
+        assert_eq!(
+            token_limit_retry_wait("Rate limited (retry after 6m): ..."),
+            Some(Duration::from_secs(6 * 60))
+        );
+        assert_eq!(
+            token_limit_retry_wait("Rate limited (retry after 45s): ..."),
+            Some(Duration::from_secs(45))
+        );
+        assert_eq!(
+            token_limit_retry_wait("Rate limited (retry after 1h 30m): ..."),
+            Some(Duration::from_secs(90 * 60))
+        );
+    }
+
+    #[test]
+    fn waits_are_extracted_from_raw_provider_bodies() {
+        // The verbatim OpenAI-compatible token-limit body reported by a user.
+        assert_eq!(
+            token_limit_retry_wait(
+                "OpenAI-compatible chat request failed\n  status: 422 Unprocessable Entity\n  response: {\"error\":\"Превышен лимит completion-токенов: использовано 60520, лимит 60000. Повторите попытку через 8 мин.\"}"
+            ),
+            Some(Duration::from_secs(8 * 60))
+        );
+        assert_eq!(
+            token_limit_retry_wait("Лимит превышен, через 45 сек"),
+            Some(Duration::from_secs(45))
+        );
+    }
+
+    #[test]
+    fn oversized_waits_are_capped() {
+        assert_eq!(
+            token_limit_retry_wait("Повторите попытку через 120 мин"),
+            Some(Duration::from_secs(15 * 60))
+        );
+    }
+
+    #[test]
+    fn no_wait_means_none() {
+        assert_eq!(token_limit_retry_wait("unknown error"), None);
+        assert_eq!(token_limit_retry_wait("OpenAI API error 500"), None);
+        assert_eq!(token_limit_retry_wait(""), None);
+    }
+
+    #[test]
+    fn parse_compact_duration_handles_tokens() {
+        assert_eq!(parse_compact_duration("6m"), Some(Duration::from_secs(360)));
+        assert_eq!(parse_compact_duration("45s"), Some(Duration::from_secs(45)));
+        assert_eq!(
+            parse_compact_duration("1h 30m"),
+            Some(Duration::from_secs(90 * 60))
+        );
+        assert_eq!(
+            parse_compact_duration("2d"),
+            Some(Duration::from_secs(2 * 86_400))
+        );
+        assert_eq!(parse_compact_duration("garbage"), None);
+        assert_eq!(parse_compact_duration(""), None);
+    }
 }
