@@ -1310,6 +1310,16 @@ pub(in crate::tui::app) fn handle_server_event(
             }
             remote.clear_pending();
             remote.reset_call_output_tokens_seen();
+            // A provider token-limit / quota-cap 422 tells us to retry in N
+            // minutes. Instead of offering a fallback or re-sending context
+            // immediately (which just burns credits against an endpoint still
+            // over its completion-token cap), schedule a single wait-and-retry
+            // honoring the upstream wait, and surface a clear message.
+            if let Some(wait) = app_mod::model_context::token_limit_retry_wait(&message) {
+                if app.schedule_pending_remote_retry_in(wait, "Token limit reached") {
+                    return false;
+                }
+            }
             // Connectivity failures (DNS, connection reset, no route, transient
             // TLS, timeouts) are always transient: the request never reached the
             // provider. Hold the turn and resume when the network recovers,

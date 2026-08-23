@@ -147,6 +147,63 @@ fn test_remote_error_with_retryable_pending_schedules_retry() {
 }
 
 #[test]
+fn test_remote_token_limit_error_schedules_wait_retry_not_fallback() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    app.rate_limit_pending_message = Some(PendingRemoteMessage {
+        content: "retry me".to_string(),
+        images: vec![],
+        is_system: true,
+        system_reminder: None,
+        auto_retry: true,
+        retry_attempts: 0,
+        retry_at: None,
+    });
+    app.is_processing = true;
+    app.status = ProcessingStatus::Streaming;
+
+    // A provider token-limit 422 telling us to retry in 6 minutes.
+    let message = "OpenAI-compatible chat request failed\n  status: 422 Unprocessable Entity\n  response: {\"error\":\"Превышен лимит completion-токенов: использовано 60520, лимит 60000. Повторите попытку через 6 мин.\"}";
+    app.handle_server_event(
+        crate::protocol::ServerEvent::Error {
+            id: 12,
+            message: message.to_string(),
+            retry_after_secs: None,
+        },
+        &mut remote,
+    );
+
+    // The pending turn stays, rescheduled to retry after the provider wait.
+    let pending = app
+        .rate_limit_pending_message
+        .as_ref()
+        .expect("token-limit turn should remain pending for wait-fore-retry");
+    assert!(
+        pending.retry_at.is_some(),
+        "token-limit error should schedule a retry-at time"
+    );
+    assert!(app.rate_limit_reset.is_some());
+
+    // A clear wait notice is shown (no "Connection lost" immediate resend).
+    let wait_notice = app
+        .display_messages()
+        .iter()
+        .find(|message| message.content.starts_with("⏳ Token limit reached"))
+        .expect("token-limit error should surface a retry-wait message");
+    assert!(wait_notice.content.contains("6 minutes"));
+    assert!(wait_notice.content.contains("retrying automatically"));
+
+    // No fallback offer is armed and no immediate context resend path ran.
+    assert!(
+        app.pending_fallback_offer.is_none(),
+        "token-limit wait retry must not arm a fallback offer"
+    );
+}
+
+#[test]
 fn test_remote_non_retryable_error_gets_short_auto_poke_retry() {
     let mut app = create_test_app();
     let rt = tokio::runtime::Runtime::new().unwrap();
