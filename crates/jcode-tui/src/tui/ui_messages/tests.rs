@@ -2158,7 +2158,7 @@ fn render_tool_message_shows_bash_output_when_enabled() {
 fn render_tool_message_shows_bash_exit_code_badge_on_failed_run() {
     let msg = DisplayMessage {
         role: "tool".to_string(),
-        content: "boom\n\nExit code: 2".to_string(),
+        content: "boom\n\nWorking directory: /tmp/proj\n\nExecution time: 5ms\n\nExit code: 2".to_string(),
         tool_calls: Vec::new(),
         duration_secs: None,
         title: None,
@@ -2184,7 +2184,7 @@ fn render_tool_message_shows_bash_exit_code_badge_on_failed_run() {
     );
     assert!(
         rendered.contains('✗'),
-        "failed bash run should use the error icon: {rendered}"
+        "failed bash run should use the error icon even with cwd/time footers preceding the exit code: {rendered}"
     );
 }
 
