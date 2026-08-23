@@ -4196,13 +4196,15 @@ pub(crate) fn render_tool_message(
                 Style::default().fg(dim_color()),
             ));
         }
-        let cwd = tc
-            .input
-            .get("cwd")
-            .or_else(|| tc.input.get("working_dir"))
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
+        let cwd = tools_ui::parse_bash_working_dir(&msg.content).or_else(|| {
+            tc.input
+                .get("cwd")
+                .or_else(|| tc.input.get("working_dir"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+        });
         if let Some(cwd) = cwd {
             meta_parts.push(Span::styled(
                 format!("cwd {}", cwd),

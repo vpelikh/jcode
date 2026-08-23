@@ -8,7 +8,9 @@ pub(super) use jcode_tui_tool_display::concise_tool_error_summary;
 pub(crate) use jcode_tui_tool_display::{
     canonical_tool_name, is_edit_tool_name, resolve_display_tool_name, tool_output_looks_failed,
 };
-pub(super) use jcode_tui_tool_display::{parse_bash_exit_code, parse_bash_timing_duration};
+pub(super) use jcode_tui_tool_display::{
+    parse_bash_exit_code, parse_bash_timing_duration, parse_bash_working_dir,
+};
 
 /// Whether the dimmed technical detail (command, path, args) should render
 /// alongside a model-provided intent on tool rows. Rows without an intent
