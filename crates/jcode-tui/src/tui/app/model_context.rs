@@ -972,22 +972,30 @@ impl App {
         }
 
         if is_request_payload_too_large_error(&error) {
-            // 413 is a request body-size rejection driven by inline images.
-            // Strip oversized images now so a manual resubmit (or auto-poke
-            // retry) goes through, and keep auto-poke alive.
+            // 413 is a request body-size rejection driven by inline images and/or
+            // accumulated large tool outputs. Strip oversized images now; if there
+            // are none, truncate large tool results so a manual resubmit (or
+            // auto-poke retry) goes through, and keep auto-poke alive.
             let stripped = self
                 .session
                 .strip_oversized_images(crate::compaction::PAYLOAD_IMAGE_CHAR_BUDGET);
-            if stripped > 0 {
+            let truncated = if stripped == 0 {
+                self.session.emergency_truncate_tool_results(
+                    crate::compaction::PAYLOAD_TOOL_RESULT_CHAR_BUDGET,
+                )
+            } else {
+                0
+            };
+            if stripped > 0 || truncated > 0 {
                 self.messages.clear();
                 self.reseed_compaction_from_provider_messages();
                 self.push_display_message(DisplayMessage::error(format!(
-                    "Error: {} Dropped {} oversized image(s); you can retry.",
-                    error, stripped
+                    "Error: {} Dropped {} oversized image(s) and truncated {} tool result(s); you can retry.",
+                    error, stripped, truncated
                 )));
             } else {
                 self.push_display_message(DisplayMessage::error(format!(
-                    "Error: {} Request body was too large but no inline images could be dropped. Run /fix to try manual recovery.",
+                    "Error: {} Request body was too large but no inline images or tool results could be dropped. Run /fix to try manual recovery.",
                     error
                 )));
                 super::commands::stop_auto_poke_for_non_retryable_error(self, &error);
@@ -1108,7 +1116,14 @@ impl App {
         let stripped = self
             .session
             .strip_oversized_images(crate::compaction::PAYLOAD_IMAGE_CHAR_BUDGET);
-        if stripped == 0 {
+        let truncated = if stripped == 0 {
+            self.session.emergency_truncate_tool_results(
+                crate::compaction::PAYLOAD_TOOL_RESULT_CHAR_BUDGET,
+            )
+        } else {
+            0
+        };
+        if stripped == 0 && truncated == 0 {
             return false;
         }
 
@@ -1119,8 +1134,8 @@ impl App {
         self.reseed_compaction_from_provider_messages();
 
         self.push_display_message(DisplayMessage::system(format!(
-            "⚡ Request was too large; dropped {} oversized image(s) and retrying...",
-            stripped
+            "⚡ Request was too large; dropped {} oversized image(s), truncated {} tool result(s), and retrying...",
+            stripped, truncated
         )));
 
         self.reset_state_for_compaction_retry();

@@ -1311,6 +1311,32 @@ request in this new forked session, using the inherited conversation only as con
         stripped
     }
 
+    /// Shorten oversized tool-result text in the stored transcript, oldest-first,
+    /// until the total remaining tool-result payload fits within
+    /// `target_total_chars`. Used to recover from provider HTTP 413
+    /// "request too large" errors that are driven by accumulated large tool
+    /// outputs (e.g. file/cat/read results) rather than inline images.
+    ///
+    /// Unlike image stripping (which drops whole image blocks), this keeps the
+    /// head and tail of each oversized tool result so the model retains the
+    /// beginning and end of the content. Mutates and persists the authoritative
+    /// transcript and invalidates the provider-message cache. Returns the number
+    /// of tool results that were truncated.
+    pub fn emergency_truncate_tool_results(&mut self, target_total_chars: usize) -> usize {
+        let mut contents: Vec<&mut Vec<ContentBlock>> =
+            self.messages.iter_mut().map(|m| &mut m.content).collect();
+        let truncated =
+            jcode_compaction_core::emergency_truncate_tool_results_in_contents(
+                &mut contents,
+                target_total_chars,
+            );
+        if truncated > 0 {
+            self.mark_memory_profile_dirty();
+            self.mark_messages_full_dirty();
+        }
+        truncated
+    }
+
     pub fn visible_conversation_message_count(&self) -> usize {
         self.messages
             .iter()
