@@ -2244,25 +2244,39 @@ fn render_tool_message_shows_bash_details_block_when_enabled() {
         .collect::<Vec<_>>()
         .join("\n");
 
+    // The first line carries the exit badge plus the working directory and
+    // execution time inline, matching the issue's requested single-row format.
+    assert!(
+        rendered.contains("[exit 0]"),
+        "verbose details still show the exit badge on the row: {rendered}"
+    );
+    assert!(
+        rendered.contains("/home/user/project"),
+        "working directory should render inline on the tool row: {rendered}"
+    );
+    assert!(
+        rendered.contains("120ms"),
+        "execution time should render inline on the tool row: {rendered}"
+    );
     assert!(
         rendered.contains("$ git status"),
         "verbose details should show the full command: {rendered}"
     );
     assert!(
-        rendered.contains("took 120ms"),
-        "verbose details should show the execution time: {rendered}"
-    );
-    assert!(
-        rendered.contains("cwd /home/user/project"),
-        "verbose details should show the working directory from the content footer: {rendered}"
+        rendered.contains("Output:"),
+        "verbose details should label the command result: {rendered}"
     );
     assert!(
         rendered.contains("On branch main"),
-        "verbose details should show the full output: {rendered}"
+        "verbose details should show the real command output (not the metadata footers): {rendered}"
     );
     assert!(
-        rendered.contains("[exit 0]"),
-        "verbose details still show the exit badge: {rendered}"
+        !rendered.contains("Working directory:"),
+        "metadata footers should be filtered out of the output block: {rendered}"
+    );
+    assert!(
+        !rendered.contains("Execution time:"),
+        "execution-time footer should be filtered out of the output block: {rendered}"
     );
     crate::tui::ui::tools_ui::tests_show_bash_details_override::set(false);
 }
