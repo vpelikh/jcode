@@ -27,6 +27,75 @@ pub async fn send_with_initial_response_timeout(
     }
 }
 
+/// [`send_with_initial_response_timeout`] that additionally invokes a progress
+/// callback while the request is in flight (connect + upload + header wait).
+///
+/// The plain variant is an opaque `request.send()` that can appear to hang for a
+/// long time: on a slow uplink the body upload drains for a while, and then the
+/// server can sit without sending response headers for minutes (reasoning models
+/// especially). The TUI footer shows nothing but a frozen "sending context"
+/// phase with no way to tell an alive-but-slow send from a dead connection.
+///
+/// This polls the bounded send and, until it resolves, periodically calls the
+/// async `on_progress` with a human-readable "still awaiting response, Ns
+/// elapsed" message. Providers wire that into a `StatusDetail` stream event so
+/// the footer visibly ticks and proves the phase is alive.
+pub async fn send_with_initial_response_timeout_with_progress<Fut>(
+    request: reqwest::RequestBuilder,
+    timeout: Duration,
+    heartbeat_secs: Duration,
+    mut on_progress: impl FnMut(&str) -> Fut + Send,
+) -> Result<reqwest::Response>
+where
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    use futures::FutureExt;
+
+    let started = std::time::Instant::now();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let send_task = tokio::spawn(async move {
+        let result = tokio::time::timeout(timeout, request.send()).await;
+        let _ = done_tx.send(result);
+    });
+    let mut done = done_rx.fuse();
+    let mut ticker = tokio::time::interval(heartbeat_secs);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            result = &mut done => {
+                let _ = send_task.await;
+                return match result {
+                    Ok(Ok(response)) => Ok(response?),
+                    Ok(Err(_)) => anyhow::bail!(
+                        "Initial response timeout: no response headers received within {timeout:?}"
+                    ),
+                    Err(_) => anyhow::bail!(
+                        "Request sender dropped unexpectedly while waiting for response headers"
+                    ),
+                };
+            }
+            _ = ticker.tick() => {
+                let elapsed = started.elapsed().as_secs();
+                on_progress(&format!("awaiting response headers ({elapsed}s)")).await;
+            }
+        }
+    }
+}
+
+/// Format a byte count compactly (e.g. `1.2 KB`, `3.4 MB`).
+pub fn readable_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    if bytes >= MB as u64 {
+        format!("{:.1} MB", bytes as f64 / MB)
+    } else if bytes >= KB as u64 {
+        format!("{:.1} KB", bytes as f64 / KB)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
 /// Whether an error message describes a transient transport-level fault
 /// (connection reset, DNS hiccup, TLS teardown, HTTP/2 stream error, ...)
 /// that is likely to succeed on retry with a fresh connection.
@@ -89,8 +158,11 @@ pub fn is_transient_transport_error(error_str: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_transient_transport_error, send_with_initial_response_timeout};
-    use std::io::Read;
+    use super::{
+        is_transient_transport_error, send_with_initial_response_timeout,
+        send_with_initial_response_timeout_with_progress,
+    };
+    use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::thread;
@@ -200,5 +272,88 @@ mod tests {
         ));
         // Also test the identifier in isolation (case-insensitive)
         assert!(is_transient_transport_error("stream_read_error"));
+    }
+
+    #[test]
+    fn readable_bytes_formats_compact_units() {
+        assert_eq!(super::readable_bytes(512), "512 B");
+        assert_eq!(super::readable_bytes(2048), "2.0 KB");
+        assert_eq!(super::readable_bytes(3 * 1024 * 1024), "3.0 MB");
+    }
+
+    #[tokio::test]
+    async fn progress_heartbeat_fires_before_slow_request_resolves() {
+        use std::sync::{Arc, Mutex};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow server");
+        let address = listener.local_addr().expect("read slow server address");
+        let (request_seen_tx, request_seen_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set read timeout");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).expect("read request");
+            request_seen_tx.send(()).expect("report request received");
+            // Hold the connection open without sending headers so the heartbeat
+            // has a chance to fire, then respond and let the client resolve.
+            release_rx.recv_timeout(Duration::from_secs(2)).ok();
+            let body = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
+            let _ = stream.write_all(body.as_bytes()).expect("write response");
+        });
+
+        let beacons = Arc::new(Mutex::new(Vec::new()));
+        let beacons_clone = Arc::clone(&beacons);
+        let request = reqwest::Client::new()
+            .post(format!("http://{address}/chat/completions"))
+            .body("{}");
+
+        let send_task = tokio::spawn(send_with_initial_response_timeout_with_progress(
+            request,
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+            move |msg: &str| {
+                beacons_clone
+                    .lock()
+                    .unwrap()
+                    .push(msg.to_string());
+                async move {}
+            },
+        ));
+
+        // Wait until at least one heartbeat message has been emitted before
+        // releasing the server, to prove the callback fires while in flight.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if !beacons.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "heartbeat did not fire before request resolved"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        request_seen_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("server should receive request");
+        let _ = release_tx.send(());
+        send_task.await.expect("send task to complete").expect("response ok");
+        server.join().expect("server thread to exit");
+
+        let beacons = beacons.lock().unwrap();
+        assert!(
+            !beacons.is_empty(),
+            "expected at least one heartbeat message"
+        );
+        assert!(
+            beacons[0].contains("awaiting response headers"),
+            "unexpected heartbeat: {:?}",
+            beacons[0]
+        );
     }
 }

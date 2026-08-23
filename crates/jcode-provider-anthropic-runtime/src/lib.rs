@@ -2068,9 +2068,35 @@ async fn stream_response(
         req = req.header("anthropic-beta", beta_header);
     }
 
-    let response = jcode_provider_core::transport::send_with_initial_response_timeout(
+    // Surface the upload size right away so a long "sending context" phase is
+    // explainable (large payload draining on a slow uplink).
+    let payload_bytes = serde_json::to_vec(&request)
+        .map(|bytes| bytes.len() as u64)
+        .unwrap_or(0);
+    if payload_bytes > 0 {
+        let _ = tx
+            .send(Ok(StreamEvent::StatusDetail {
+                detail: format!(
+                    "sending {}",
+                    jcode_provider_core::transport::readable_bytes(payload_bytes)
+                ),
+            }))
+            .await;
+    }
+
+    let response = jcode_provider_core::transport::send_with_initial_response_timeout_with_progress(
         req.json(&request),
         stream_idle_timeout,
+        std::time::Duration::from_secs(5),
+        |msg: &str| {
+            let tx = tx.clone();
+            let msg = msg.to_string();
+            async move {
+                let _ = tx
+                    .send(Ok(StreamEvent::StatusDetail { detail: msg }))
+                    .await;
+            }
+        },
     )
     .await
     .context("Failed to send request to Anthropic API")?;
