@@ -196,6 +196,23 @@ pub fn parse_bash_exit_code(content: &str) -> Option<i32> {
     None
 }
 
+/// Parse the working directory recorded in a bash tool result's trailing
+/// `Working directory: <path>` footer, if present. The bash tool appends this
+/// footer (mirroring the `Exit code:` footer) so display surfaces can show
+/// where the command actually ran without relying on the tool arguments.
+pub fn parse_bash_working_dir(content: &str) -> Option<String> {
+    for raw_line in content.lines().rev() {
+        let line = raw_line.trim();
+        if let Some(rest) = line.strip_prefix("Working directory:") {
+            let dir = rest.trim();
+            if !dir.is_empty() {
+                return Some(dir.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Parse the execution time from the `[tool timing: ...]` header prepended to a
 /// tool result's text content (see `jcode_message_types::Message::with_timestamps`).
 /// Returns the humanized duration (e.g. `120ms`, `1.5s`, `2m`) when available.
@@ -349,6 +366,22 @@ mod tests {
             Some("1m 30s")
         );
         assert_eq!(parse_bash_timing_duration("no timing header"), None);
+    }
+
+    #[test]
+    fn parses_bash_working_directory_footer() {
+        assert_eq!(
+            parse_bash_working_dir(
+                "On branch main\n\nWorking directory: /home/user/project"
+            )
+            .as_deref(),
+            Some("/home/user/project")
+        );
+        assert_eq!(
+            parse_bash_working_dir("clean\n\nExit code: 0").as_deref(),
+            None
+        );
+        assert_eq!(parse_bash_working_dir("plain output"), None);
     }
 
     #[test]
