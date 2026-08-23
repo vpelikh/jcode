@@ -2931,51 +2931,6 @@ fn handle_show_agentgrep_output_command(app: &mut App, trimmed: &str) -> bool {
     true
 }
 
-fn handle_show_bash_details_command(app: &mut App, trimmed: &str) -> bool {
-    if trimmed != "/bash-details" && !trimmed.starts_with("/bash-details ") {
-        return false;
-    }
-
-    let rest = trimmed
-        .strip_prefix("/bash-details")
-        .unwrap_or_default()
-        .trim();
-
-    if rest.is_empty() || matches!(rest, "show" | "status") {
-        let current = crate::config::config().display.show_bash_details;
-        app.push_display_message(DisplayMessage::system(format!(
-            "Bash details are currently {}.\n\nWhen on, bash tool rows render a verbose block with the full executed command, the working directory (when known), the execution time, and the command's output. The compact [exit N] badge shows regardless of this setting.\n\nUse /bash-details on or /bash-details off to change it.",
-            if current { "on" } else { "off" }
-        )));
-        return true;
-    }
-
-    let Some(enabled) = parse_on_off_value(rest) else {
-        app.push_display_message(DisplayMessage::error(
-            "Usage: /bash-details (show), /bash-details on, or /bash-details off".to_string(),
-        ));
-        return true;
-    };
-
-    app.set_status_notice(format!(
-        "Bash details: {}",
-        if enabled { "on" } else { "off" }
-    ));
-    match crate::config::Config::set_show_bash_details(enabled) {
-        Ok(()) => app.push_display_message(DisplayMessage::system(format!(
-            "Saved bash details: {}. Applied to this session immediately.",
-            if enabled { "on" } else { "off" }
-        ))),
-        Err(error) => app.push_display_message(DisplayMessage::error(format!(
-            "Applied bash details {} for this session, but failed to save it as the default: {}",
-            if enabled { "on" } else { "off" },
-            error
-        ))),
-    }
-
-    true
-}
-
 fn parse_agents_target(raw: &str) -> Option<crate::tui::AgentModelTarget> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "swarm" | "agent" | "agents" | "subagent" | "subagents" => {
@@ -3346,10 +3301,6 @@ pub(super) fn handle_config_command(app: &mut App, trimmed: &str) -> bool {
     }
 
     if handle_show_agentgrep_output_command(app, trimmed) {
-        return true;
-    }
-
-    if handle_show_bash_details_command(app, trimmed) {
         return true;
     }
 
