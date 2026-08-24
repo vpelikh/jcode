@@ -1414,6 +1414,12 @@ pub struct SafetyConfig {
     /// Optional proxy for Telegram Bot API traffic (e.g. `socks5://127.0.0.1:1080`
     /// or `http://user:pass@host:3128`). Env override: `JCODE_TELEGRAM_PROXY`.
     pub telegram_proxy: Option<String>,
+    /// Optional alternate Telegram data-center IP to connect to instead of the
+    /// DNS-resolved one (e.g. `149.154.167.220`). Pins the `api.telegram.org`
+    /// hostname to this IP while keeping its real name for TLS/SNI, so no
+    /// proxy is needed even when the default DC IP is blocked. Env override:
+    /// `JCODE_TELEGRAM_API_IP`.
+    pub telegram_api_ip: Option<String>,
     /// Enable Discord notifications (default: false)
     pub discord_enabled: bool,
     /// Discord bot token
@@ -1465,6 +1471,7 @@ impl Default for SafetyConfig {
             telegram_reply_enabled: false,
             telegram_api_base: None,
             telegram_proxy: None,
+            telegram_api_ip: None,
             discord_enabled: false,
             discord_bot_token: None,
             discord_channel_id: None,
