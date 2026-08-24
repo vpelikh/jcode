@@ -3,6 +3,55 @@ use serde::Deserialize;
 
 const API_BASE: &str = "https://api.telegram.org/bot";
 
+/// Resolve the effective Telegram Bot API base (with a trailing `/bot`).
+///
+/// Honors an override (e.g. a reverse proxy mirror or an alternate data-center
+/// IP that bypasses a blocked regional Telegram endpoint). If the override has
+/// no `/bot` path segment it is appended for you.
+pub fn api_base(override_base: Option<&str>) -> String {
+    match override_base {
+        Some(raw) if !raw.trim().is_empty() => {
+            let trimmed = raw.trim().trim_end_matches('/');
+            if trimmed.ends_with("/bot") {
+                format!("{}/", trimmed)
+            } else {
+                format!("{}/bot/", trimmed)
+            }
+        }
+        _ => API_BASE.to_string(),
+    }
+}
+
+/// Build a HTTP client for Telegram Bot API calls.
+///
+/// When `proxy_url` is set, a dedicated client is built that routes through the
+/// proxy (SOCKS5/HTTP), useful when Telegram's default endpoint is blocked on
+/// the current network. Otherwise the caller supplies their own client.
+pub fn build_client(proxy_url: Option<&str>) -> anyhow::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .tcp_keepalive(Some(std::time::Duration::from_secs(30)));
+    if let Some(proxy) = proxy_url
+        && let Some(proxy) = non_empty(proxy)
+    {
+        let reqwest_proxy = reqwest::Proxy::all(proxy)
+            .map_err(|e| anyhow::anyhow!("invalid telegram proxy `{proxy}`: {e}"))?;
+        builder = builder.proxy(reqwest_proxy);
+    }
+    builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build telegram client: {e}"))
+}
+
+fn non_empty(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct TelegramResponse<T> {
     ok: bool,
@@ -36,7 +85,19 @@ pub async fn send_message(
     chat_id: &str,
     text: &str,
 ) -> anyhow::Result<()> {
-    let url = format!("{}{}/sendMessage", API_BASE, bot_token);
+    send_message_with_base(client, bot_token, chat_id, text, None).await
+}
+
+/// [`send_message`] with an explicit Bot API base override (e.g. reverse-proxy
+/// mirror or alternate data-center IP). Pass `None` to use the default.
+pub async fn send_message_with_base(
+    client: &reqwest::Client,
+    bot_token: &str,
+    chat_id: &str,
+    text: &str,
+    base_override: Option<&str>,
+) -> anyhow::Result<()> {
+    let url = format!("{}{}/sendMessage", api_base(base_override), bot_token);
     let resp = client
         .post(&url)
         .json(&serde_json::json!({
@@ -69,7 +130,18 @@ pub async fn get_updates(
     offset: Option<i64>,
     timeout_secs: u64,
 ) -> anyhow::Result<Vec<Update>> {
-    let url = format!("{}{}/getUpdates", API_BASE, bot_token);
+    get_updates_with_base(client, bot_token, offset, timeout_secs, None).await
+}
+
+/// [`get_updates`] with an explicit Bot API base override.
+pub async fn get_updates_with_base(
+    client: &reqwest::Client,
+    bot_token: &str,
+    offset: Option<i64>,
+    timeout_secs: u64,
+    base_override: Option<&str>,
+) -> anyhow::Result<Vec<Update>> {
+    let url = format!("{}{}/getUpdates", api_base(base_override), bot_token);
     let mut params = serde_json::json!({
         "timeout": timeout_secs,
         "allowed_updates": ["message"],
@@ -123,5 +195,45 @@ mod tests {
         let resp: TelegramResponse<Vec<Update>> = serde_json::from_str(json).unwrap();
         assert!(resp.ok);
         assert!(resp.result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_api_base_default() {
+        assert_eq!(api_base(None), "https://api.telegram.org/bot");
+        assert_eq!(api_base(Some("")), "https://api.telegram.org/bot");
+        assert_eq!(api_base(Some("   ")), "https://api.telegram.org/bot");
+    }
+
+    #[test]
+    fn test_api_base_override_normalization() {
+        // Alternate data-center IP (the user's working DC).
+        assert_eq!(
+            api_base(Some("https://api.telegram.org/")),
+            "https://api.telegram.org/bot/"
+        );
+        // Raw host without scheme is treated as-is by pushing the wrapper.
+        assert_eq!(api_base(Some("149.154.167.220")), "149.154.167.220/bot/");
+        // Already has /bot path.
+        assert_eq!(
+            api_base(Some("https://mirror.example.com/bot")),
+            "https://mirror.example.com/bot/"
+        );
+        // Trailing slash handled.
+        assert_eq!(
+            api_base(Some("https://mirror.example.com/bot/")),
+            "https://mirror.example.com/bot/"
+        );
+    }
+
+    #[test]
+    fn test_build_client_rejects_bad_proxy() {
+        // reqwest rejects an all-symbols "url" (url::ParseError at build time).
+        assert!(build_client(Some("::::")).is_err());
+    }
+
+    #[test]
+    fn test_build_client_ok_without_proxy() {
+        assert!(build_client(None).is_ok());
+        assert!(build_client(Some("")).is_ok());
     }
 }

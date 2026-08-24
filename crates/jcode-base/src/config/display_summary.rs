@@ -347,12 +347,25 @@ impl Config {
                 "disabled"
             },
             if self.safety.telegram_enabled {
-                self.safety
+                let mut displayed = self
+                    .safety
                     .telegram_chat_id
                     .as_deref()
                     .unwrap_or("enabled (no chat_id)")
+                    .to_string();
+                let mut connectivity = Vec::new();
+                if self.safety.telegram_api_base.as_deref().is_some_and(|b| !b.trim().is_empty()) {
+                    connectivity.push("custom api_base");
+                }
+                if self.safety.telegram_proxy.as_deref().is_some_and(|p| !p.trim().is_empty()) {
+                    connectivity.push("proxy");
+                }
+                if !connectivity.is_empty() {
+                    displayed.push_str(&format!(" ({})", connectivity.join(", ")));
+                }
+                displayed
             } else {
-                "disabled"
+                "disabled".to_string()
             },
             if self.safety.telegram_reply_enabled {
                 "enabled"

@@ -1407,6 +1407,13 @@ pub struct SafetyConfig {
     pub telegram_chat_id: Option<String>,
     /// Enable Telegram reply → agent directive feature (default: false)
     pub telegram_reply_enabled: bool,
+    /// Telegram Bot API base URL with a trailing `/bot`, e.g. a reverse proxy
+    /// mirror or an alternate data-center IP. Defaults to the official
+    /// `https://api.telegram.org/bot`. Env override: `JCODE_TELEGRAM_API_BASE`.
+    pub telegram_api_base: Option<String>,
+    /// Optional proxy for Telegram Bot API traffic (e.g. `socks5://127.0.0.1:1080`
+    /// or `http://user:pass@host:3128`). Env override: `JCODE_TELEGRAM_PROXY`.
+    pub telegram_proxy: Option<String>,
     /// Enable Discord notifications (default: false)
     pub discord_enabled: bool,
     /// Discord bot token
@@ -1456,6 +1463,8 @@ impl Default for SafetyConfig {
             telegram_bot_token: None,
             telegram_chat_id: None,
             telegram_reply_enabled: false,
+            telegram_api_base: None,
+            telegram_proxy: None,
             discord_enabled: false,
             discord_bot_token: None,
             discord_channel_id: None,
