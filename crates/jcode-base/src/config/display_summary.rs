@@ -363,6 +363,14 @@ impl Config {
                 if self.safety.telegram_api_ip.as_deref().is_some_and(|i| !i.trim().is_empty()) {
                     connectivity.push("pinned ip");
                 }
+                if self
+                    .safety
+                    .telegram_allowed_user_id
+                    .as_deref()
+                    .is_some_and(|u| !u.trim().is_empty())
+                {
+                    connectivity.push("user-whitelisted");
+                }
                 if !connectivity.is_empty() {
                     displayed.push_str(&format!(" ({})", connectivity.join(", ")));
                 }
