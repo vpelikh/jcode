@@ -1464,6 +1464,7 @@ impl Server {
         // Give the decoupled Telegram/Discord control loops access to the live
         // session registry so `/resume`/`/use` can message a running session.
         crate::server::telegram_control::register_live_sessions(Arc::clone(&self.sessions));
+        crate::server::telegram_control::register_provider(Arc::clone(&self.provider));
 
         // Spawn the Jade cloud relay listener independently of ambient mode. The
         // worker is strictly opt-in and requires an explicit API base, token,
