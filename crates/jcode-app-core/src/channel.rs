@@ -222,7 +222,10 @@ impl TelegramChannel {
         let (cmd, rest) = split_command(trimmed);
         match cmd.as_str() {
             "/help" | "/start" | "help" | "start" => HELP_TEXT.to_string(),
-            "/list" | "/sessions" => self.list_sessions_reply(),
+            "/list" | "/sessions" => {
+                self.send_session_picker().await;
+                String::new()
+            }
             "/status" => self.status_reply(runner).await,
             "/use" => self.use_session_reply(&rest).await,
             "/history" => self.history_reply(&rest),
@@ -247,40 +250,109 @@ impl TelegramChannel {
         }
     }
 
-    /// `/list` / `/sessions`: enumerate recent sessions with numbered entries
-    /// so the user can pick one with `/use <n>`.
-    fn list_sessions_reply(&self) -> String {
+    /// Send an inline-keyboard session picker to the chat. Each button's
+    /// `callback_data` is the session id, so tapping it selects that session.
+    async fn send_session_picker(&self) {
         let entries = crate::recent_session_index::recent(12);
         let sessions = match entries {
             Ok(list) => list,
             Err(e) => {
-                logging::warn(&format!("telegram /list failed to open session index: {e}"));
-                return "⚠️ Could not read the session index.".to_string();
+                logging::warn(&format!("telegram session picker index error: {e}"));
+                return;
             }
         };
         if sessions.is_empty() {
-            return "No sessions found yet.".to_string();
+            let _ = self.send("No sessions found yet.");
+            return;
         }
+        use crate::telegram::{InlineKeyboardButton, InlineKeyboardRow};
         let active = crate::server::telegram_control::active_session_for(&self.chat_id);
-        let mut lines = Vec::with_capacity(sessions.len() + 2);
-        lines.push("📚 Sessions (choose with `/use <n>`):".to_string());
-        for (i, s) in sessions.iter().enumerate() {
+        let mut rows: Vec<InlineKeyboardRow> = Vec::new();
+        for s in sessions.iter() {
             let title = s
                 .display_title()
                 .unwrap_or("<untitled>")
                 .chars()
-                .take(40)
+                .take(30)
                 .collect::<String>();
             let short: String = s.session_id.chars().take(8).collect();
-            let marker = if active.as_deref() == Some(s.session_id.as_str()) {
+            let prefix = if active.as_deref() == Some(s.session_id.as_str()) {
                 "✅ "
             } else {
                 ""
             };
-            lines.push(format!("{}{}. {} ({})", marker, i + 1, title, short));
+            rows.push(vec![InlineKeyboardButton {
+                text: format!("{}{} ({})", prefix, title, short),
+                callback_data: s.session_id.clone(),
+            }]);
         }
-        lines.push("\nTip: `/use 3` to select, `/history` to view, plain text to send.".to_string());
-        lines.join("\n")
+        let _ = crate::telegram::send_message_with_keyboard(
+            &self.client,
+            &self.token,
+            &self.chat_id,
+            "📚 Select a session:",
+            &rows,
+            self.api_base.as_deref(),
+        )
+        .await;
+    }
+
+    /// Handle an inline-keyboard tap (`callback_query`). `callback_data` is a
+    /// session id; selecting it sets the active session for this chat.
+    async fn handle_callback_query(&self, cb: crate::telegram::CallbackQuery) {
+        let Some(chat_id) = cb
+            .message
+            .as_ref()
+            .and_then(|m| m.chat.as_ref())
+            .map(|c| c.id.to_string())
+        else {
+            return;
+        };
+        if chat_id != self.chat_id {
+            return;
+        }
+        if !self.is_allowed_sender(cb.from.as_ref()) {
+            logging::warn("ignoring callback_query from disallowed sender");
+            let _ = crate::telegram::answer_callback_query(
+                &self.client,
+                &self.token,
+                &cb.id,
+                "Not allowed",
+                self.api_base.as_deref(),
+            )
+            .await;
+            return;
+        }
+        let Some(data) = cb.data.as_deref() else {
+            let _ = crate::telegram::answer_callback_query(
+                &self.client,
+                &self.token,
+                &cb.id,
+                "",
+                self.api_base.as_deref(),
+            )
+            .await;
+            return;
+        };
+
+        let session_id = data.trim().to_string();
+        crate::server::telegram_control::set_active_session(&self.chat_id, &session_id);
+        let ack = format!("Selected session `{}`", short_id(&session_id));
+        crate::logging::info(&format!("telegram callback selected session={session_id}"));
+        let _ = crate::telegram::answer_callback_query(
+            &self.client,
+            &self.token,
+            &cb.id,
+            &ack,
+            self.api_base.as_deref(),
+        )
+        .await;
+        let _ = self
+            .send(&format!(
+                "✅ Selected `{}`. Send a message to talk to it, or `/history` to view.",
+                short_id(&session_id)
+            ))
+            .await;
     }
 
     /// `/use <n-or-id>`: select the active session for this chat.
@@ -509,6 +581,11 @@ impl MessageChannel for TelegramChannel {
                     for update in updates {
                         offset = Some(update.update_id + 1);
 
+                        if let Some(cb) = update.callback_query {
+                            let _ = self.handle_callback_query(cb).await;
+                            continue;
+                        }
+
                         let msg = match update.message {
                             Some(m) => m,
                             None => continue,
@@ -566,7 +643,9 @@ impl MessageChannel for TelegramChannel {
                             }
                         } else if trimmed.starts_with('/') {
                             let reply = self.handle_command(trimmed, runner.as_ref()).await;
-                            let _ = self.send(&reply).await;
+                            if !reply.is_empty() {
+                                let _ = self.send(&reply).await;
+                            }
                         } else if let Some(active_id) =
                             crate::server::telegram_control::active_session_for(&self.chat_id)
                         {

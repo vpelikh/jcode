@@ -80,6 +80,21 @@ struct TelegramResponse<T> {
 pub struct Update {
     pub update_id: i64,
     pub message: Option<TelegramMessage>,
+    pub callback_query: Option<CallbackQuery>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CallbackQuery {
+    pub id: String,
+    pub from: Option<TelegramFrom>,
+    pub data: Option<String>,
+    pub message: Option<CallbackMessage>,
+}
+
+/// The message a callback query is attached to (only chat id is used here).
+#[derive(Debug, Deserialize)]
+pub struct CallbackMessage {
+    pub chat: Option<Chat>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,6 +161,93 @@ pub async fn send_message_with_base(
     Ok(())
 }
 
+/// A single inline keyboard button with `callback_data`.
+#[derive(Debug, Clone)]
+pub struct InlineKeyboardButton {
+    pub text: String,
+    pub callback_data: String,
+}
+
+/// A row of inline keyboard buttons.
+pub type InlineKeyboardRow = Vec<InlineKeyboardButton>;
+
+/// Send a message with an optional inline keyboard (`callback_data` buttons).
+pub async fn send_message_with_keyboard(
+    client: &reqwest::Client,
+    bot_token: &str,
+    chat_id: &str,
+    text: &str,
+    keyboard: &[InlineKeyboardRow],
+    base_override: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut body = serde_json::json!({
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": true,
+    });
+    if !keyboard.is_empty() {
+        let rows: Vec<serde_json::Value> = keyboard.iter().map(|row| json_row(row)).collect();
+        body["reply_markup"] = serde_json::json!({ "inline_keyboard": rows });
+    }
+    post_telegram(client, bot_token, "sendMessage", body, base_override).await
+}
+
+/// Confirm receipt of a callback query so Telegram stops showing the loading
+/// spinner on the tapped button.
+pub async fn answer_callback_query(
+    client: &reqwest::Client,
+    bot_token: &str,
+    callback_query_id: &str,
+    text: &str,
+    base_override: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut body = serde_json::json!({ "callback_query_id": callback_query_id });
+    if text.is_empty() {
+        body["text"] = serde_json::json!("");
+    } else {
+        body["text"] = serde_json::json!(text);
+    }
+    post_telegram(client, bot_token, "answerCallbackQuery", body, base_override).await
+}
+
+/// POST a JSON body to a Bot API method and return whether it succeeded,
+/// logging on failure but not erroring (agnostic callers decide).
+async fn post_telegram(
+    client: &reqwest::Client,
+    bot_token: &str,
+    method: &str,
+    body: serde_json::Value,
+    base_override: Option<&str>,
+) -> anyhow::Result<()> {
+    let url = format!("{}{}/{}", api_base(base_override), bot_token, method);
+    let resp = client.post(&url).json(&body).send().await?;
+    let status = resp.status();
+    let parsed: TelegramResponse<serde_json::Value> = resp.json().await?;
+    if !parsed.ok {
+        anyhow::bail!(
+            "Telegram API error ({}): {}",
+            status,
+            parsed.description.unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+/// Convert one keyboard row into a JSON array of button objects.
+fn json_row(row: &[InlineKeyboardButton]) -> serde_json::Value {
+    let buttons: Vec<serde_json::Value> = row
+        .iter()
+        .map(|b| {
+            serde_json::json!({
+                "text": b.text,
+                "callback_data": b.callback_data,
+            })
+        })
+        .collect();
+    serde_json::Value::Array(buttons)
+}
+
 pub async fn get_updates(
     client: &reqwest::Client,
     bot_token: &str,
@@ -166,7 +268,7 @@ pub async fn get_updates_with_base(
     let url = format!("{}{}/getUpdates", api_base(base_override), bot_token);
     let mut params = serde_json::json!({
         "timeout": timeout_secs,
-        "allowed_updates": ["message"],
+        "allowed_updates": ["message", "callback_query"],
     });
 
     if let Some(off) = offset {
@@ -217,6 +319,26 @@ mod tests {
         let resp: TelegramResponse<Vec<Update>> = serde_json::from_str(json).unwrap();
         assert!(resp.ok);
         assert!(resp.result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_parse_callback_query() {
+        let json = r#"{
+            "update_id": 42,
+            "callback_query": {
+                "id": "cb-1",
+                "from": {"id": 6191763506},
+                "data": "sess-abc",
+                "message": {"chat": {"id": 6191763506}}
+            }
+        }"#;
+        let update: Update = serde_json::from_str(json).unwrap();
+        let cb = update.callback_query.expect("callback_query present");
+        assert_eq!(cb.id, "cb-1");
+        assert_eq!(cb.data.as_deref(), Some("sess-abc"));
+        assert_eq!(cb.from.map(|f| f.id), Some(6191763506));
+        let chat_id = cb.message.and_then(|m| m.chat).map(|c| c.id);
+        assert_eq!(chat_id, Some(6191763506));
     }
 
     #[test]
