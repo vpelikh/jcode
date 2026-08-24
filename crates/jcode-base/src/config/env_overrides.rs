@@ -642,6 +642,9 @@ impl Config {
         if let Ok(v) = std::env::var("JCODE_TELEGRAM_PROXY") {
             self.safety.telegram_proxy = Some(v);
         }
+        if let Ok(v) = std::env::var("JCODE_TELEGRAM_API_IP") {
+            self.safety.telegram_api_ip = Some(v);
+        }
         if let Ok(v) = std::env::var("JCODE_DISCORD_BOT_TOKEN") {
             self.safety.discord_bot_token = Some(v);
             self.safety.discord_enabled = true;

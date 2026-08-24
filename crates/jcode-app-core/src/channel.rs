@@ -42,6 +42,7 @@ impl ChannelRegistry {
                 config.telegram_reply_enabled,
                 config.telegram_api_base.clone(),
                 config.telegram_proxy.clone(),
+                config.telegram_api_ip.clone(),
             )));
         }
 
@@ -167,20 +168,22 @@ pub struct TelegramChannel {
 
 impl TelegramChannel {
     pub fn new(token: String, chat_id: String, reply_enabled: bool) -> Self {
-        // Default connectivity: no proxy, default API base.
-        Self::with_connectivity(token, chat_id, reply_enabled, None, None)
+        // Default connectivity: default API base, no proxy, no IP pin.
+        Self::with_connectivity(token, chat_id, reply_enabled, None, None, None)
     }
 
-    /// Construct a Telegram channel with optional API-base and proxy overrides
-    /// (from `[safety] telegram_api_base` / `telegram_proxy`, or their env vars).
+    /// Construct a Telegram channel with optional API-base, proxy, and
+    /// alternate-IP overrides (from `[safety] telegram_api_base` /
+    /// `telegram_proxy` / `telegram_api_ip`, or their env vars).
     pub fn with_connectivity(
         token: String,
         chat_id: String,
         reply_enabled: bool,
         api_base: Option<String>,
         proxy: Option<String>,
+        api_ip: Option<String>,
     ) -> Self {
-        let client = match crate::telegram::build_client(proxy.as_deref()) {
+        let client = match crate::telegram::build_client(proxy.as_deref(), api_ip.as_deref()) {
             Ok(client) => client,
             Err(e) => {
                 crate::logging::error(&format!(
