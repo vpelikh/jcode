@@ -3845,3 +3845,76 @@ fn bash_output_renders_independently_when_details_off() {
     crate::tui::ui::tools_ui::tests_tool_call_details_override::set(false);
     crate::tui::ui::tools_ui::tests_show_bash_output_override::set(false);
 }
+
+/// Regression: a long bash command and its long output, with both
+/// tool_call_details and show_bash_output on, must render fully wrapped — never
+/// hard-trimmed at the row summary width. Reproduces the user's real session:
+/// a 500-char command and matching 500-char output with the cwd set.
+#[test]
+fn bash_long_command_and_output_render_fully_wrapped_untrimmed() {
+    crate::tui::ui::tools_ui::tests_tool_call_details_override::set(true);
+    crate::tui::ui::tools_ui::tests_show_bash_output_override::set(true);
+
+    let command = format!(
+        "echo \"this is a long command test with many arguments, let me count characters carefully {}\"",
+        "0123456789 ".repeat(29)
+    );
+    let output = format!(
+        "this is a long command test with many arguments, let me count characters carefully {}",
+        "0123456789 ".repeat(29)
+    );
+    let content = format!(
+        "{output}\nWorking directory: /Users/vasilypelikh/IdeaProjects/vpelikh/github/jcode\nExecution time: 112ms\nExit code: 0\n--- Command finished with exit code: 0 ---"
+    );
+
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content,
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_long_bash".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({ "command": command, "cwd": "/Users/vasilypelikh/IdeaProjects/vpelikh/github/jcode" }),
+            intent: Some("Test whether long bash command text gets trimmed".to_string()),
+            thought_signature: None,
+        }),
+    };
+
+    let rendered = render_tool_message(&msg, 80, crate::config::DiffDisplayMode::Off)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Compare ignoring whitespace, since wrapping/re-indent reflows spaces.
+    let strip = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+    let rendered_stripped = strip(&rendered);
+
+    // The full command must be present (wrapped in the verbose block), including
+    // its final bytes, with no hard truncation.
+    assert!(
+        rendered_stripped.contains(&strip(&command)),
+        "full bash command must render wrapped, not trimmed:\n{rendered}"
+    );
+    // The full output must be present (wrapped under show_bash_output), including
+    // its final bytes.
+    assert!(
+        rendered_stripped.contains(&strip(&output)),
+        "full bash output must render wrapped, not trimmed:\n{rendered}"
+    );
+    // Neither the wrapped command block nor the wrapped output block may
+    // introduce a lossy ellipsis where the full text belongs. (Only the first,
+    // compact tool row legitimately ellipsizes trailing metadata to keep the
+    // token badge; it is covered by the row-truncation tests.)
+    for line in rendered.lines().skip(1) {
+        assert!(
+            !line.contains('…'),
+            "no ellipsis should be introduced into the wrapped command or output:\n{rendered}"
+        );
+    }
+
+    crate::tui::ui::tools_ui::tests_tool_call_details_override::set(false);
+    crate::tui::ui::tools_ui::tests_show_bash_output_override::set(false);
+}
