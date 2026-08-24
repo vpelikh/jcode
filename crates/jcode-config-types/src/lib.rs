@@ -1420,6 +1420,11 @@ pub struct SafetyConfig {
     /// proxy is needed even when the default DC IP is blocked. Env override:
     /// `JCODE_TELEGRAM_API_IP`.
     pub telegram_api_ip: Option<String>,
+    /// Optional Telegram user ID whitelist (numeric). When set, only a message
+    /// whose sender id matches is acted upon (permission replies, commands, and
+    /// ambient prompts). Keeps a publicly-known bot from being driven by anyone.
+    /// Env override: `JCODE_TELEGRAM_ALLOWED_USER_ID`.
+    pub telegram_allowed_user_id: Option<String>,
     /// Enable Discord notifications (default: false)
     pub discord_enabled: bool,
     /// Discord bot token
@@ -1472,6 +1477,7 @@ impl Default for SafetyConfig {
             telegram_api_base: None,
             telegram_proxy: None,
             telegram_api_ip: None,
+            telegram_allowed_user_id: None,
             discord_enabled: false,
             discord_bot_token: None,
             discord_channel_id: None,

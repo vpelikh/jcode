@@ -687,6 +687,9 @@ desktop_notifications = true
 # telegram_api_ip = ""    # Optional alternate Telegram DC IP (e.g. 149.154.167.220) to pin
 #                         # api.telegram.org to while keeping its name for TLS. No proxy needed.
 #                         # Env override: JCODE_TELEGRAM_API_IP
+# telegram_allowed_user_id = ""  # Optional numeric user-ID whitelist for the bot.
+#                                # When set, only that Telegram user can drive/command it.
+#                                # Env override: JCODE_TELEGRAM_ALLOWED_USER_ID
 
 # Discord notifications via Bot API (https://discord.com/developers)
 # discord_enabled = false
