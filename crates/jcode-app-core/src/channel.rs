@@ -14,7 +14,10 @@ pub trait MessageChannel: Send + Sync {
 
     async fn send(&self, text: &str) -> anyhow::Result<()>;
 
-    async fn reply_loop(&self, runner: AmbientRunnerHandle);
+    /// Poll the channel for inbound messages and react. `runner` is the ambient
+    /// runner when ambient mode is available; pass `None` when the loop runs
+    /// standalone (e.g. Telegram remote control with ambient disabled).
+    async fn reply_loop(&self, runner: Option<AmbientRunnerHandle>);
 }
 
 #[derive(Clone)]
@@ -43,6 +46,7 @@ impl ChannelRegistry {
                 config.telegram_api_base.clone(),
                 config.telegram_proxy.clone(),
                 config.telegram_api_ip.clone(),
+                config.telegram_allowed_user_id.clone(),
             )));
         }
 
@@ -122,10 +126,10 @@ impl ChannelRegistry {
         }
     }
 
-    pub fn spawn_reply_loops(&self, runner: &AmbientRunnerHandle) {
+    pub fn spawn_reply_loops(&self, runner: Option<&AmbientRunnerHandle>) {
         for ch in self.channels.iter().filter(|c| c.is_reply_enabled()) {
             let ch = Arc::clone(ch);
-            let runner = runner.clone();
+            let runner = runner.cloned();
             tokio::spawn(async move {
                 logging::info(&format!("{} reply loop spawned", ch.name()));
                 ch.reply_loop(runner).await;
@@ -163,18 +167,21 @@ pub struct TelegramChannel {
     chat_id: String,
     reply_enabled: bool,
     api_base: Option<String>,
+    allowed_user_id: Option<String>,
     client: reqwest::Client,
 }
 
 impl TelegramChannel {
     pub fn new(token: String, chat_id: String, reply_enabled: bool) -> Self {
-        // Default connectivity: default API base, no proxy, no IP pin.
-        Self::with_connectivity(token, chat_id, reply_enabled, None, None, None)
+        // Default connectivity: default API base, no proxy, no IP pin, no user whitelist.
+        Self::with_connectivity(token, chat_id, reply_enabled, None, None, None, None)
     }
 
-    /// Construct a Telegram channel with optional API-base, proxy, and
-    /// alternate-IP overrides (from `[safety] telegram_api_base` /
-    /// `telegram_proxy` / `telegram_api_ip`, or their env vars).
+    /// Construct a Telegram channel with optional API-base, proxy, alternate-IP,
+    /// and sender-whitelist overrides (from `[safety] telegram_api_base` /
+    /// `telegram_proxy` / `telegram_api_ip` / `telegram_allowed_user_id`, or
+    /// their env vars).
+    #[allow(clippy::too_many_arguments)]
     pub fn with_connectivity(
         token: String,
         chat_id: String,
@@ -182,6 +189,7 @@ impl TelegramChannel {
         api_base: Option<String>,
         proxy: Option<String>,
         api_ip: Option<String>,
+        allowed_user_id: Option<String>,
     ) -> Self {
         let client = match crate::telegram::build_client(proxy.as_deref(), api_ip.as_deref()) {
             Ok(client) => client,
@@ -198,10 +206,115 @@ impl TelegramChannel {
             chat_id,
             reply_enabled,
             api_base,
+            allowed_user_id,
             client,
         }
     }
+
+    /// Handle a slash command received over Telegram, returning the reply text.
+    /// Read-only commands: `/help`, `/status`, `/list`. Write commands
+    /// (create/resume/abort) are reserved for a later phase.
+    async fn handle_command(
+        &self,
+        trimmed: &str,
+        runner: Option<&AmbientRunnerHandle>,
+    ) -> String {
+        let (cmd, _rest) = split_command(trimmed);
+        match cmd.as_str() {
+            "/help" | "/start" | "help" | "start" => HELP_TEXT.to_string(),
+            "/list" => self.list_sessions_reply(),
+            "/status" => self.status_reply(runner).await,
+            _ => format!(
+                "Unknown command `{}`. Use `/help` for available commands.",
+                cmd
+            ),
+        }
+    }
+
+    /// `/list`: enumerate recent sessions from the durable metadata index.
+    fn list_sessions_reply(&self) -> String {
+        let entries = crate::recent_session_index::recent(12);
+        let sessions = match entries {
+            Ok(list) => list,
+            Err(e) => {
+                logging::warn(&format!("telegram /list failed to open session index: {e}"));
+                return "⚠️ Could not read the session index.".to_string();
+            }
+        };
+        if sessions.is_empty() {
+            return "No sessions found yet.".to_string();
+        }
+        let mut lines = Vec::with_capacity(sessions.len() + 1);
+        lines.push("📚 Recent sessions:".to_string());
+        for (i, s) in sessions.iter().enumerate() {
+            let title = s
+                .display_title()
+                .unwrap_or("<untitled>")
+                .chars()
+                .take(50)
+                .collect::<String>();
+            let short_id: String = s.session_id.chars().take(8).collect();
+            lines.push(format!("{}. {} ({})", i + 1, title, short_id));
+        }
+        lines.push("\nUse `/list` again later; write commands are coming soon.".to_string());
+        lines.join("\n")
+    }
+
+    /// `/status`: report ambient mode availability and remote-control readiness.
+    async fn status_reply(&self, runner: Option<&AmbientRunnerHandle>) -> String {
+        let ambient = if let Some(r) = runner {
+            let running = r.is_running().await;
+            if running { "running" } else { "initialized" }
+        } else {
+            "disabled"
+        };
+        format!(
+            "🤖 jcode remote control\n*Ambient mode:* {}\n*Commands:* /help /list /status",
+            ambient
+        )
+    }
+
+    /// Enforce the sender whitelist. When no whitelist is configured, any
+    /// sender in the configured chat is accepted for backwards compatibility.
+    fn is_allowed_sender(&self, from: Option<&crate::telegram::TelegramFrom>) -> bool {
+        match &self.allowed_user_id {
+            Some(allow) => {
+                let allow = allow.trim();
+                if allow.is_empty() {
+                    return true;
+                }
+                from.map(|f| f.id.to_string() == allow).unwrap_or(false)
+            }
+            None => true,
+        }
+    }
 }
+
+/// Split a Telegram command line into (command, rest-of-args), matching bot
+/// commands like `/status`, `/list 5`, or a bare `/start`. A trailing
+/// `@botname` on the command word is stripped.
+fn split_command(line: &str) -> (String, String) {
+    let line = line.trim();
+    let (word, rest) = match line.find(char::is_whitespace) {
+        Some(idx) => (&line[..idx], line[idx..].trim()),
+        None => (line, ""),
+    };
+    let cmd = word.split('@').next().unwrap_or(word).to_string();
+    (cmd, rest.to_string())
+}
+
+const HELP_TEXT: &str = "\
+🤖 *jcode Telegram remote control*
+
+Commands:
+/status — show connection & ambient status
+/list — list recent sessions
+/help — this help
+
+Send a plain message to talk to the ambient session (when ambient mode is on).";
+
+// ---------------------------------------------------------------------------
+// Discord channel
 
 #[async_trait]
 impl MessageChannel for TelegramChannel {
@@ -232,7 +345,7 @@ impl MessageChannel for TelegramChannel {
         .await
     }
 
-    async fn reply_loop(&self, runner: AmbientRunnerHandle) {
+    async fn reply_loop(&self, runner: Option<AmbientRunnerHandle>) {
         let mut offset: Option<i64> = None;
 
         loop {
@@ -264,6 +377,14 @@ impl MessageChannel for TelegramChannel {
                             continue;
                         }
 
+                        if !self.is_allowed_sender(msg.from.as_ref()) {
+                            logging::warn(&format!(
+                                "ignoring telegram message from disallowed sender from={:?}",
+                                msg.from.as_ref().map(|f| f.id)
+                            ));
+                            continue;
+                        }
+
                         let text = match msg.text {
                             Some(t) => t,
                             None => continue,
@@ -274,7 +395,8 @@ impl MessageChannel for TelegramChannel {
                             continue;
                         }
 
-                        if let Some(req_id) = crate::notifications::extract_permission_id(trimmed) {
+                        if let Some(req_id) = crate::notifications::extract_permission_id(trimmed)
+                        {
                             let (approved, message) =
                                 crate::notifications::parse_permission_reply(trimmed);
                             if let Err(e) = crate::safety::record_permission_via_file(
@@ -301,7 +423,10 @@ impl MessageChannel for TelegramChannel {
                                     ))
                                     .await;
                             }
-                        } else {
+                        } else if trimmed.starts_with('/') {
+                            let reply = self.handle_command(trimmed, runner.as_ref()).await;
+                            let _ = self.send(&reply).await;
+                        } else if let Some(ref runner) = runner {
                             let injected = runner.inject_message(trimmed, "telegram").await;
                             logging::info(&format!(
                                 "telegram reply injected into session injected={}",
@@ -313,6 +438,12 @@ impl MessageChannel for TelegramChannel {
                                 format!("📋 Message queued, waking agent: _{}_", trimmed)
                             };
                             let _ = self.send(&ack).await;
+                        } else {
+                            let _ = self
+                                .send(&format!(
+                                    "ℹ️ No ambient mode is enabled, so plain messages have no target session. Use `/help` for available commands."
+                                ))
+                                .await;
                         }
                     }
                 }
@@ -439,7 +570,7 @@ impl MessageChannel for DiscordChannel {
         Ok(())
     }
 
-    async fn reply_loop(&self, runner: AmbientRunnerHandle) {
+    async fn reply_loop(&self, runner: Option<AmbientRunnerHandle>) {
         let mut last_seen_id: Option<String> = None;
 
         // Get the latest message ID on startup so we don't replay old messages
@@ -510,7 +641,7 @@ impl MessageChannel for DiscordChannel {
                                     ))
                                     .await;
                             }
-                        } else {
+                        } else if let Some(ref runner) = runner {
                             let injected = runner.inject_message(trimmed, "discord").await;
                             logging::info(&format!(
                                 "discord reply injected into session injected={}",
@@ -709,7 +840,7 @@ impl MessageChannel for JadeRelayChannel {
         self.post_response(text, 0).await
     }
 
-    async fn reply_loop(&self, runner: AmbientRunnerHandle) {
+    async fn reply_loop(&self, runner: Option<AmbientRunnerHandle>) {
         let host = std::env::var("HOSTNAME")
             .or_else(|_| std::env::var("COMPUTERNAME"))
             .unwrap_or_else(|_| "laptop".to_string());
@@ -771,7 +902,11 @@ impl MessageChannel for JadeRelayChannel {
                             }
                             continue;
                         }
-                        let injected = runner.inject_message(trimmed, "jade_relay").await;
+                        let injected = if let Some(ref runner) = runner {
+                            runner.inject_message(trimmed, "jade_relay").await
+                        } else {
+                            false
+                        };
                         logging::info(&format!(
                             "jade relay prompt injected seq={} injected={}",
                             ev.seq, injected
@@ -798,6 +933,49 @@ impl MessageChannel for JadeRelayChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_split_command_basic() {
+        let (cmd, rest) = split_command("/list");
+        assert_eq!(cmd, "/list");
+        assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn test_split_command_with_args() {
+        let (cmd, rest) = split_command("/list  10");
+        assert_eq!(cmd, "/list");
+        assert_eq!(rest, "10");
+    }
+
+    #[test]
+    fn test_split_command_strips_bot_mention() {
+        let (cmd, _) = split_command("/status@vasily_pelikh_openclaw_bot");
+        assert_eq!(cmd, "/status");
+    }
+
+    #[test]
+    fn test_is_allowed_sender_unrestricted() {
+        let ch = TelegramChannel::new("t".into(), "c".into(), true);
+        assert!(ch.is_allowed_sender(None));
+        assert!(ch.is_allowed_sender(Some(&crate::telegram::TelegramFrom { id: 999 })));
+    }
+
+    #[test]
+    fn test_is_allowed_sender_whitelist() {
+        let ch = TelegramChannel::with_connectivity(
+            "t".into(),
+            "c".into(),
+            true,
+            None,
+            None,
+            None,
+            Some("42".into()),
+        );
+        assert!(!ch.is_allowed_sender(None));
+        assert!(!ch.is_allowed_sender(Some(&crate::telegram::TelegramFrom { id: 7 })));
+        assert!(ch.is_allowed_sender(Some(&crate::telegram::TelegramFrom { id: 42 })));
+    }
 
     #[test]
     fn test_discord_message_parse() {

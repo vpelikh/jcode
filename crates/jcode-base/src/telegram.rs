@@ -86,8 +86,14 @@ pub struct Update {
 pub struct TelegramMessage {
     pub text: Option<String>,
     pub chat: Chat,
+    pub from: Option<TelegramFrom>,
     #[serde(rename = "date")]
     pub _date: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TelegramFrom {
+    pub id: i64,
 }
 
 #[derive(Debug, Deserialize)]
