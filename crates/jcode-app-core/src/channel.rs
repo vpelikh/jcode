@@ -219,11 +219,27 @@ impl TelegramChannel {
         trimmed: &str,
         runner: Option<&AmbientRunnerHandle>,
     ) -> String {
-        let (cmd, _rest) = split_command(trimmed);
+        let (cmd, rest) = split_command(trimmed);
         match cmd.as_str() {
             "/help" | "/start" | "help" | "start" => HELP_TEXT.to_string(),
-            "/list" => self.list_sessions_reply(),
+            "/list" | "/sessions" => self.list_sessions_reply(),
             "/status" => self.status_reply(runner).await,
+            "/use" => self.use_session_reply(&rest).await,
+            "/history" => self.history_reply(&rest),
+            "/clear" | "/stop" => {
+                let cleared =
+                    crate::server::telegram_control::active_session_for(&self.chat_id).is_some();
+                crate::server::telegram_control::clear_active_session(&self.chat_id);
+                if cleared {
+                    "✓ Cleared the active session. Use `/use <id>` to select another.".to_string()
+                } else {
+                    "No active session to clear.".to_string()
+                }
+            }
+            "/resume" => {
+                let prompt = rest.trim();
+                self.resume_reply(prompt).await
+            }
             _ => format!(
                 "Unknown command `{}`. Use `/help` for available commands.",
                 cmd
@@ -231,7 +247,8 @@ impl TelegramChannel {
         }
     }
 
-    /// `/list`: enumerate recent sessions from the durable metadata index.
+    /// `/list` / `/sessions`: enumerate recent sessions with numbered entries
+    /// so the user can pick one with `/use <n>`.
     fn list_sessions_reply(&self) -> String {
         let entries = crate::recent_session_index::recent(12);
         let sessions = match entries {
@@ -244,33 +261,149 @@ impl TelegramChannel {
         if sessions.is_empty() {
             return "No sessions found yet.".to_string();
         }
-        let mut lines = Vec::with_capacity(sessions.len() + 1);
-        lines.push("📚 Recent sessions:".to_string());
+        let active = crate::server::telegram_control::active_session_for(&self.chat_id);
+        let mut lines = Vec::with_capacity(sessions.len() + 2);
+        lines.push("📚 Sessions (choose with `/use <n>`):".to_string());
         for (i, s) in sessions.iter().enumerate() {
             let title = s
                 .display_title()
                 .unwrap_or("<untitled>")
                 .chars()
-                .take(50)
+                .take(40)
                 .collect::<String>();
-            let short_id: String = s.session_id.chars().take(8).collect();
-            lines.push(format!("{}. {} ({})", i + 1, title, short_id));
+            let short: String = s.session_id.chars().take(8).collect();
+            let marker = if active.as_deref() == Some(s.session_id.as_str()) {
+                "✅ "
+            } else {
+                ""
+            };
+            lines.push(format!("{}{}. {} ({})", marker, i + 1, title, short));
         }
-        lines.push("\nUse `/list` again later; write commands are coming soon.".to_string());
+        lines.push("\nTip: `/use 3` to select, `/history` to view, plain text to send.".to_string());
         lines.join("\n")
+    }
+
+    /// `/use <n-or-id>`: select the active session for this chat.
+    async fn use_session_reply(&self, arg: &str) -> String {
+        let arg = arg.trim();
+        if arg.is_empty() {
+            return "Usage: `/use <n-or-id>`. Run `/list` to see numbered sessions.".to_string();
+        }
+        let session_id = if let Ok(n) = arg.parse::<usize>() {
+            match crate::recent_session_index::recent(200) {
+                Ok(list) if n >= 1 && n <= list.len() => list[n - 1].session_id.clone(),
+                Ok(_) => return format!("`{n}` is out of range for `/list`.").to_string(),
+                Err(e) => return format!("⚠️ Could not read the session index: {e}").to_string(),
+            }
+        } else {
+            match self.resolve_session_id(arg).await {
+                Ok(id) => id,
+                Err(e) => return e,
+            }
+        };
+        crate::server::telegram_control::set_active_session(&self.chat_id, &session_id);
+        format!(
+            "✅ Selected session `{}`. Use `/history` to view it.",
+            short_id(&session_id)
+        )
+    }
+
+    /// `/history [n]`: show recent messages of the active session.
+    fn history_reply(&self, arg: &str) -> String {
+        let Some(session_id) = crate::server::telegram_control::active_session_for(&self.chat_id)
+        else {
+            return "No active session. Use `/use <n>` after `/list`.".to_string();
+        };
+        let limit = arg
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=50).contains(n))
+            .unwrap_or(10);
+        match crate::server::telegram_control::render_session_history(&session_id, limit) {
+            Ok(text) if text != "(no visible messages)" => format!("📜 [{}]\n{}", short_id(&session_id), text),
+            Ok(text) => format!("[{}] {}", short_id(&session_id), text),
+            Err(e) => format!(
+                "⚠️ Could not read history for `{}`: {}",
+                short_id(&session_id),
+                e
+            ),
+        }
+    }
+
+    /// `/resume <session-id> <prompt>`: send a prompt to a live session
+    /// headlessly and return the assistant's reply (prefix id allowed).
+    async fn resume_reply(&self, args: &str) -> String {
+        let args = args.trim();
+        if args.is_empty() {
+            return "Usage: `/resume <session-id> <prompt>`. Run `/list` first.".to_string();
+        }
+        let (ref_token, prompt) = match args.find(char::is_whitespace) {
+            Some(idx) => (args[..idx].trim(), args[idx..].trim()),
+            None => (args, "Continue"),
+        };
+        let prompt = if prompt.is_empty() { "Continue" } else { prompt };
+        let session_id = match self.resolve_session_id(ref_token).await {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+        crate::server::telegram_control::set_active_session(&self.chat_id, &session_id);
+        crate::logging::info(&format!(
+            "telegram /resume session={} chars={}",
+            session_id,
+            prompt.chars().count()
+        ));
+        match crate::server::telegram_control::resume_session_for_control(&session_id, prompt).await
+        {
+            Ok(reply) => format!("💬 [{}] {}", short_id(&session_id), reply),
+            Err(e) => format!("⚠️ Could not resume `{}`: {}", short_id(&session_id), e),
+        }
+    }
+
+    /// Resolve a user-supplied session reference (full id or unique prefix)
+    /// against the live session registry.
+    async fn resolve_session_id(&self, reference: &str) -> Result<String, String> {
+        let Some(sessions) = crate::server::telegram_control::live_session_ids().await else {
+            return Err("Telegram control is not wired to a server runtime.".to_string());
+        };
+        let reference = reference.trim();
+        if let Some(id) = sessions.iter().find(|id| id.as_str() == reference) {
+            return Ok(id.clone());
+        }
+        let matches: Vec<&String> = sessions
+            .iter()
+            .filter(|id| id.starts_with(reference))
+            .collect();
+        match matches.len() {
+            0 => Err(format!(
+                "No live session matches `{}`. Use `/list`, then `/use <n>`, or pick a live session id.",
+                reference
+            )),
+            1 => Ok(matches[0].clone()),
+            _ => Err(format!(
+                "`{}` matches {} live sessions; use a longer prefix.",
+                reference,
+                matches.len()
+            )),
+        }
     }
 
     /// `/status`: report ambient mode availability and remote-control readiness.
     async fn status_reply(&self, runner: Option<&AmbientRunnerHandle>) -> String {
+        let active = crate::server::telegram_control::active_session_for(&self.chat_id);
         let ambient = if let Some(r) = runner {
             let running = r.is_running().await;
             if running { "running" } else { "initialized" }
         } else {
             "disabled"
         };
+        let active_line = match active {
+            Some(id) => format!("*Active session:* `{}` (use `/history`)", short_id(&id)),
+            None => "*Active session:* none (use `/use`)".to_string(),
+        };
         format!(
-            "🤖 jcode remote control\n*Ambient mode:* {}\n*Commands:* /help /list /status",
-            ambient
+            "🤖 jcode session control\n*Ambient mode:* {}\n{}\n*Commands:* /list /use /history /clear /help",
+            ambient, active_line
         )
     }
 
@@ -303,15 +436,23 @@ fn split_command(line: &str) -> (String, String) {
     (cmd, rest.to_string())
 }
 
+/// First 8 characters of a session id, for compact display.
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
 const HELP_TEXT: &str = "\
-🤖 *jcode Telegram remote control*
+🤖 *jcode Telegram session control*
 
 Commands:
-/status — show connection & ambient status
-/list — list recent sessions
+/list — list sessions
+/use <n or id> — select a session to talk to
+/history [n] — show recent messages of the selected session
+/clear — stop talking to the selected session
+/status — show ambient & control status
 /help — this help
 
-Send a plain message to talk to the ambient session (when ambient mode is on).";
+After `/use`, send any plain message to talk to that session.";
 
 // ---------------------------------------------------------------------------
 // Discord channel
@@ -426,6 +567,29 @@ impl MessageChannel for TelegramChannel {
                         } else if trimmed.starts_with('/') {
                             let reply = self.handle_command(trimmed, runner.as_ref()).await;
                             let _ = self.send(&reply).await;
+                        } else if let Some(active_id) =
+                            crate::server::telegram_control::active_session_for(&self.chat_id)
+                        {
+                            match crate::server::telegram_control::resume_session_for_control(
+                                &active_id, trimmed,
+                            )
+                            .await
+                            {
+                                Ok(reply) => {
+                                    let _ = self
+                                        .send(&format!("💬 [{}] {}", short_id(&active_id), reply))
+                                        .await;
+                                }
+                                Err(e) => {
+                                    let _ = self
+                                        .send(&format!(
+                                            "⚠️ Could not reach session `{}`: {}",
+                                            short_id(&active_id),
+                                            e
+                                        ))
+                                        .await;
+                                }
+                            }
                         } else if let Some(ref runner) = runner {
                             let injected = runner.inject_message(trimmed, "telegram").await;
                             logging::info(&format!(
@@ -441,7 +605,7 @@ impl MessageChannel for TelegramChannel {
                         } else {
                             let _ = self
                                 .send(&format!(
-                                    "ℹ️ No ambient mode is enabled, so plain messages have no target session. Use `/help` for available commands."
+                                    "ℹ️ Select a session first: use `/list` then `/use <n>`, or run `/help`."
                                 ))
                                 .await;
                         }
