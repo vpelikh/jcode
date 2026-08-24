@@ -15,6 +15,12 @@ const MAX_INLINE_DIFF_LINES: usize = 12;
 const MAX_DISCOVERY_DETAIL_LINES: usize = 2;
 const MAX_DISCOVERY_SETUP_LINES: usize = 3;
 
+/// Designed max wrap width for bash verbose lines (the command and its output).
+/// Both are wrapped at min(row_width, this) so a long command wraps identically
+/// to a long output line instead of one over-wide line that the terminal
+/// soft-wraps or clips at the draw edge.
+const BASH_WRAP_WIDTH: usize = 100;
+
 fn prefer_width_stable_system_glyphs() -> bool {
     std::env::var("TERM_PROGRAM")
         .ok()
@@ -4277,13 +4283,14 @@ pub(crate) fn render_tool_message(
     if bash_verbose_block {
         if let Some(command) = tc.input.get("command").and_then(|v| v.as_str()).filter(|c| !c.trim().is_empty()) {
             // Wrap a long command across continuation lines rather than trimming
-            // it with an ellipsis, so the full command stays legible.
+            // it with an ellipsis, at the same designed budget as the output
+            // below, so the full command stays legible and wraps like the output.
             push_wrapped_indented(
                 &mut lines,
                 "    ",
                 &format!("$ {}", command.trim()),
                 Style::default().fg(dim_color()),
-                row_width,
+                row_width.min(BASH_WRAP_WIDTH),
             );
         }
     }
@@ -4359,14 +4366,15 @@ pub(crate) fn render_tool_message(
         }
         for output in output_lines {
             // Wrap a long output line across continuation lines (aligned under
-            // the same indent) rather than trimming it with an ellipsis, so the
-            // full command result stays readable.
+            // the same indent) rather than trimming it with an ellipsis, at the
+            // same designed budget as the command above, so the full command
+            // result stays readable and wraps consistently.
             push_wrapped_indented(
                 &mut lines,
                 "      ",
                 output,
                 Style::default().fg(dim_color()),
-                row_width,
+                row_width.min(BASH_WRAP_WIDTH),
             );
         }
     }
