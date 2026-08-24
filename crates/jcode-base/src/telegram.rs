@@ -91,10 +91,13 @@ pub struct CallbackQuery {
     pub message: Option<CallbackMessage>,
 }
 
-/// The message a callback query is attached to (only chat id is used here).
+/// The message a callback query is attached to (chat id + message id are used
+/// here to reply-to or edit the tapped message).
 #[derive(Debug, Deserialize)]
 pub struct CallbackMessage {
     pub chat: Option<Chat>,
+    #[serde(default)]
+    pub message_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +105,7 @@ pub struct TelegramMessage {
     pub text: Option<String>,
     pub chat: Chat,
     pub from: Option<TelegramFrom>,
+    pub message_id: i64,
     #[serde(rename = "date")]
     pub _date: i64,
 }
@@ -122,29 +126,34 @@ pub async fn send_message(
     chat_id: &str,
     text: &str,
 ) -> anyhow::Result<()> {
-    send_message_with_base(client, bot_token, chat_id, text, None).await
+    send_message_with_base(client, bot_token, chat_id, text, None, None).await
 }
 
 /// [`send_message`] with an explicit Bot API base override (e.g. reverse-proxy
 /// mirror or alternate data-center IP). Pass `None` to use the default.
+///
+/// `reply_to_message_id`, when `Some`, makes Telegram render the message as a
+/// reply to the given message in the chat (used to thread a bot answer under
+/// the user message that triggered it).
 pub async fn send_message_with_base(
     client: &reqwest::Client,
     bot_token: &str,
     chat_id: &str,
     text: &str,
     base_override: Option<&str>,
+    reply_to_message_id: Option<i64>,
 ) -> anyhow::Result<()> {
     let url = format!("{}{}/sendMessage", api_base(base_override), bot_token);
-    let resp = client
-        .post(&url)
-        .json(&serde_json::json!({
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "Markdown",
-            "disable_web_page_preview": true,
-        }))
-        .send()
-        .await?;
+    let mut body = serde_json::json!({
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": true,
+    });
+    if let Some(reply_to) = reply_to_message_id {
+        body["reply_to_message_id"] = serde_json::json!(reply_to);
+    }
+    let resp = client.post(&url).json(&body).send().await?;
 
     let status = resp.status();
     let body: TelegramResponse<serde_json::Value> = resp.json().await?;
@@ -159,6 +168,79 @@ pub async fn send_message_with_base(
 
     logging::info("Telegram notification sent");
     Ok(())
+}
+
+/// Broadcast a chat action such as `typing` to show the user a live indicator
+/// while the bot is processing a long request. Errors are swallowed so the
+/// caller's flow is not disrupted by a transient indicator failure.
+pub async fn send_chat_action(
+    client: &reqwest::Client,
+    bot_token: &str,
+    chat_id: &str,
+    action: &str,
+    base_override: Option<&str>,
+) -> Result<(), ()> {
+    let url = format!("{}{}/sendChatAction", api_base(base_override), bot_token);
+    let body = serde_json::json!({
+        "chat_id": chat_id,
+        "action": action,
+    });
+    match client.post(&url).json(&body).send().await {
+        Ok(_) => Ok(()),
+        Err(_) => Err(()),
+    }
+}
+
+/// Register the bot's slash command list in the Telegram client so users can
+/// discover commands via the `/` menu. Non-fatal: failures are swallowed.
+pub async fn set_my_commands(
+    client: &reqwest::Client,
+    bot_token: &str,
+    base_override: Option<&str>,
+) {
+    let body = serde_json::json!({
+        "commands": [
+            { "command": "list", "description": "List recent sessions" },
+            { "command": "use", "description": "Select a session to talk to (id or #)" },
+            { "command": "history", "description": "Show recent messages of the active session" },
+            { "command": "resume", "description": "Ask a session (id + prompt)" },
+            { "command": "clear", "description": "Stop talking to the active session" },
+            { "command": "status", "description": "Show control & ambient status" },
+            { "command": "help", "description": "Show help" },
+        ]
+    });
+    if let Err(e) = post_telegram(client, bot_token, "setMyCommands", body, base_override).await {
+        logging::warn(&format!("failed to register telegram commands: {e}"));
+    }
+}
+
+/// Clear the inline keyboard from a message. Used to collapse a session picker
+/// after a selection so the buttons do not linger. Non-fatal.
+pub async fn edit_message_reply_markup(
+    client: &reqwest::Client,
+    bot_token: &str,
+    chat_id: i64,
+    message_id: i64,
+    base_override: Option<&str>,
+) {
+    let body = serde_json::json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "reply_markup": { "inline_keyboard": [] },
+    });
+    if let Err(e) = post_telegram(
+        client,
+        bot_token,
+        "editMessageReplyMarkup",
+        body,
+        base_override,
+    )
+    .await
+    {
+        logging::warn(&format!(
+            "failed to clear telegram inline keyboard chat={chat_id} msg={message_id}: {e}"
+        ));
+    }
 }
 
 /// A single inline keyboard button with `callback_data`.
@@ -305,6 +387,7 @@ mod tests {
             "message": {
                 "text": "hello",
                 "chat": {"id": 456},
+                "message_id": 1,
                 "date": 1700000000
             }
         }"#;
@@ -329,7 +412,7 @@ mod tests {
                 "id": "cb-1",
                 "from": {"id": 6191763506},
                 "data": "sess-abc",
-                "message": {"chat": {"id": 6191763506}}
+                "message": {"chat": {"id": 6191763506}, "message_id": 987}
             }
         }"#;
         let update: Update = serde_json::from_str(json).unwrap();
@@ -337,8 +420,27 @@ mod tests {
         assert_eq!(cb.id, "cb-1");
         assert_eq!(cb.data.as_deref(), Some("sess-abc"));
         assert_eq!(cb.from.map(|f| f.id), Some(6191763506));
-        let chat_id = cb.message.and_then(|m| m.chat).map(|c| c.id);
+        let cb_msg = cb.message.as_ref().expect("message present");
+        let chat_id = cb_msg.chat.as_ref().map(|c| c.id);
         assert_eq!(chat_id, Some(6191763506));
+        assert_eq!(cb_msg.message_id, Some(987));
+    }
+
+    #[test]
+    fn test_parse_message_message_id() {
+        let json = r#"{
+            "update_id": 123,
+            "message": {
+                "text": "hello",
+                "chat": {"id": 456},
+                "message_id": 555,
+                "date": 1700000000
+            }
+        }"#;
+        let update: Update = serde_json::from_str(json).unwrap();
+        let msg = update.message.unwrap();
+        assert_eq!(msg.text.as_deref(), Some("hello"));
+        assert_eq!(msg.message_id, 555);
     }
 
     #[test]
