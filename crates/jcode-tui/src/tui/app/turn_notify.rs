@@ -81,6 +81,27 @@ impl App {
                 sound,
             );
         }
+
+        // Fan the same event out to every configured notification backend
+        // (desktop, Telegram/Discord channels, ntfy, email). This makes the
+        // Telegram control chat a notification center for all sessions: the
+        // local OS banner fires as before, and remote channels mirror it.
+        {
+            let session_id = self.active_client_session_id().unwrap_or("unknown");
+            let dispatcher = crate::notifications::NotificationDispatcher::new();
+            let mut body = String::new();
+            if let Some(subtitle) = notification.subtitle.as_deref() {
+                body.push_str(subtitle);
+                body.push('\n');
+            }
+            body.push_str(&notification.body);
+            dispatcher.dispatch(
+                &notification.title,
+                &body,
+                crate::notifications::Priority::Default,
+                Some(session_id),
+            );
+        }
     }
 
     fn runtime_mode_allows_turn_notifications(&self) -> bool {
