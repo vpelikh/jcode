@@ -425,7 +425,11 @@ impl TelegramChannel {
             session_id,
             prompt.chars().count()
         ));
-        match crate::server::telegram_control::resume_session_for_control(&session_id, prompt).await
+        match crate::server::telegram_control::resume_session_for_control_or_spawn(
+            &session_id,
+            prompt,
+        )
+        .await
         {
             Ok(reply) => format!("💬 [{}] {}", short_id(&session_id), reply),
             Err(e) => format!("⚠️ Could not resume `{}`: {}", short_id(&session_id), e),
@@ -649,8 +653,9 @@ impl MessageChannel for TelegramChannel {
                         } else if let Some(active_id) =
                             crate::server::telegram_control::active_session_for(&self.chat_id)
                         {
-                            match crate::server::telegram_control::resume_session_for_control(
-                                &active_id, trimmed,
+                            match crate::server::telegram_control::resume_session_for_control_or_spawn(
+                                &active_id,
+                                trimmed,
                             )
                             .await
                             {

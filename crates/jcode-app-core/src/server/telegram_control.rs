@@ -8,6 +8,7 @@
 
 use crate::agent::Agent;
 use crate::protocol::ServerEvent;
+use crate::provider::Provider;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -19,11 +20,18 @@ use tokio::sync::RwLock;
 pub type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
 
 static LIVE_SESSIONS: OnceLock<SessionAgents> = OnceLock::new();
+static PROVIDER: OnceLock<Arc<dyn Provider>> = OnceLock::new();
 
 /// Register the server's live-session registry. Safe to call once at startup;
 /// a second call is ignored.
 pub fn register_live_sessions(sessions: SessionAgents) {
     let _ = LIVE_SESSIONS.set(sessions);
+}
+
+/// Register the server's provider so closed sessions can be resumed headlessly
+/// (a provider is required to build a new `Agent`).
+pub fn register_provider(provider: Arc<dyn Provider>) {
+    let _ = PROVIDER.set(provider);
 }
 
 /// Send `text` to the live session `session_id` and return the assistant's
@@ -41,25 +49,60 @@ pub async fn resume_session_for_control(session_id: &str, text: &str) -> anyhow:
         anyhow::bail!("session '{session_id}' is not live in this Jcode server");
     };
 
-    let start_message_index = {
-        let guard = agent.lock().await;
-        guard.message_count()
+    run_turn_and_read_reply(agent, text).await
+}
+
+/// Send `text` to the session `session_id`, auto-resuming it headlessly if it
+/// is not currently live. Returns the assistant's reply, or an error if the
+/// session cannot be loaded or the server lacks a registered provider.
+pub async fn resume_session_for_control_or_spawn(
+    session_id: &str,
+    text: &str,
+) -> anyhow::Result<String> {
+    let sessions = match LIVE_SESSIONS.get() {
+        Some(s) => s,
+        None => anyhow::bail!("Telegram control is not wired to a server runtime"),
     };
 
-    // No live client to receive the event stream; discard it. The channel is
-    // unbounded so it cannot block the turn, just accumulates garbage.
-    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<ServerEvent>();
+    // If it's already live, just run the turn.
+    let live = {
+        let guard = sessions.read().await;
+        guard.get(session_id).cloned()
+    };
+    if let Some(agent) = live {
+        return run_turn_and_read_reply(agent, text).await;
+    }
 
-    run_turn_and_read_reply(agent, text, start_message_index, event_tx).await
+    // Not live — auto-resume the persisted session headlessly.
+    let provider = PROVIDER
+        .get()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("no provider registered for session auto-resume"))?;
+    let session = crate::session::Session::load(session_id)?;
+    let provider = provider.fork();
+    let registry = crate::tool::Registry::new(provider.clone()).await;
+    let agent = Agent::new_with_session(Arc::clone(&provider), registry, session, None);
+    let agent = Arc::new(Mutex::new(agent));
+    {
+        let mut guard = sessions.write().await;
+        guard.insert(session_id.to_string(), Arc::clone(&agent));
+    }
+    crate::logging::info(&format!(
+        "telegram auto-resumed session {session_id} headlessly"
+    ));
+    run_turn_and_read_reply(agent, text).await
 }
 
 /// Actually run the turn on a locked agent and read back the assistant reply.
 async fn run_turn_and_read_reply(
     agent: Arc<Mutex<Agent>>,
     text: &str,
-    start_message_index: usize,
-    event_tx: tokio::sync::mpsc::UnboundedSender<ServerEvent>,
 ) -> anyhow::Result<String> {
+    let start_message_index = {
+        let guard = agent.lock().await;
+        guard.message_count()
+    };
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<ServerEvent>();
     let mut guard = agent.lock().await;
     guard
         .run_once_streaming_mpsc(text, Vec::new(), None, event_tx)
