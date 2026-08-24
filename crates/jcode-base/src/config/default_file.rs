@@ -673,6 +673,11 @@ desktop_notifications = true
 # telegram_bot_token = ""  # From @BotFather (prefer JCODE_TELEGRAM_BOT_TOKEN env var)
 # telegram_chat_id = ""    # Your user/chat ID
 # telegram_reply_enabled = false  # Reply to bot messages to send directives
+# telegram_api_base = ""  # Optional Bot API override (default https://api.telegram.org/bot);
+#                         # e.g. a reverse-proxy mirror or alternate data-center IP.
+#                         # Env override: JCODE_TELEGRAM_API_BASE
+# telegram_proxy = ""     # Optional proxy for Telegram traffic, e.g. socks5://127.0.0.1:1080
+#                         # or http://user:pass@host:3128. Env override: JCODE_TELEGRAM_PROXY
 
 # Discord notifications via Bot API (https://discord.com/developers)
 # discord_enabled = false

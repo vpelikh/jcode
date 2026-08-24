@@ -36,10 +36,12 @@ impl ChannelRegistry {
                 "registering telegram notification channel reply_enabled={}",
                 config.telegram_reply_enabled
             ));
-            channels.push(Arc::new(TelegramChannel::new(
+            channels.push(Arc::new(TelegramChannel::with_connectivity(
                 token,
                 chat_id,
                 config.telegram_reply_enabled,
+                config.telegram_api_base.clone(),
+                config.telegram_proxy.clone(),
             )));
         }
 
@@ -159,16 +161,41 @@ pub struct TelegramChannel {
     token: String,
     chat_id: String,
     reply_enabled: bool,
+    api_base: Option<String>,
     client: reqwest::Client,
 }
 
 impl TelegramChannel {
     pub fn new(token: String, chat_id: String, reply_enabled: bool) -> Self {
+        // Default connectivity: no proxy, default API base.
+        Self::with_connectivity(token, chat_id, reply_enabled, None, None)
+    }
+
+    /// Construct a Telegram channel with optional API-base and proxy overrides
+    /// (from `[safety] telegram_api_base` / `telegram_proxy`, or their env vars).
+    pub fn with_connectivity(
+        token: String,
+        chat_id: String,
+        reply_enabled: bool,
+        api_base: Option<String>,
+        proxy: Option<String>,
+    ) -> Self {
+        let client = match crate::telegram::build_client(proxy.as_deref()) {
+            Ok(client) => client,
+            Err(e) => {
+                crate::logging::error(&format!(
+                    "failed to build telegram client, falling back to shared client: {}",
+                    e
+                ));
+                crate::provider::shared_http_client()
+            }
+        };
         Self {
             token,
             chat_id,
             reply_enabled,
-            client: crate::provider::shared_http_client(),
+            api_base,
+            client,
         }
     }
 }
@@ -192,14 +219,29 @@ impl MessageChannel for TelegramChannel {
             "sending telegram notification bytes={}",
             text.len()
         ));
-        crate::telegram::send_message(&self.client, &self.token, &self.chat_id, text).await
+        crate::telegram::send_message_with_base(
+            &self.client,
+            &self.token,
+            &self.chat_id,
+            text,
+            self.api_base.as_deref(),
+        )
+        .await
     }
 
     async fn reply_loop(&self, runner: AmbientRunnerHandle) {
         let mut offset: Option<i64> = None;
 
         loop {
-            match crate::telegram::get_updates(&self.client, &self.token, offset, 30).await {
+            match crate::telegram::get_updates_with_base(
+                &self.client,
+                &self.token,
+                offset,
+                30,
+                self.api_base.as_deref(),
+            )
+            .await
+            {
                 Ok(updates) => {
                     if !updates.is_empty() {
                         logging::debug(&format!(
