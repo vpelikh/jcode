@@ -678,6 +678,9 @@ desktop_notifications = true
 #                         # Env override: JCODE_TELEGRAM_API_BASE
 # telegram_proxy = ""     # Optional proxy for Telegram traffic, e.g. socks5://127.0.0.1:1080
 #                         # or http://user:pass@host:3128. Env override: JCODE_TELEGRAM_PROXY
+# telegram_api_ip = ""    # Optional alternate Telegram DC IP (e.g. 149.154.167.220) to pin
+#                         # api.telegram.org to while keeping its name for TLS. No proxy needed.
+#                         # Env override: JCODE_TELEGRAM_API_IP
 
 # Discord notifications via Bot API (https://discord.com/developers)
 # discord_enabled = false

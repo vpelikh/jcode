@@ -25,9 +25,11 @@ pub fn api_base(override_base: Option<&str>) -> String {
 /// Build a HTTP client for Telegram Bot API calls.
 ///
 /// When `proxy_url` is set, a dedicated client is built that routes through the
-/// proxy (SOCKS5/HTTP), useful when Telegram's default endpoint is blocked on
-/// the current network. Otherwise the caller supplies their own client.
-pub fn build_client(proxy_url: Option<&str>) -> anyhow::Result<reqwest::Client> {
+/// proxy (SOCKS5/HTTP). When `api_ip` is set, the `api.telegram.org` hostname is
+/// pinned to that IP via reqwest's resolver (keeping the real hostname for
+/// TLS/SNI verification), so a blocked default DC IP can be bypassed without a
+/// proxy. Either override (or neither) may be provided.
+pub fn build_client(proxy_url: Option<&str>, api_ip: Option<&str>) -> anyhow::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(15))
         .tcp_keepalive(Some(std::time::Duration::from_secs(30)));
@@ -38,9 +40,23 @@ pub fn build_client(proxy_url: Option<&str>) -> anyhow::Result<reqwest::Client> 
             .map_err(|e| anyhow::anyhow!("invalid telegram proxy `{proxy}`: {e}"))?;
         builder = builder.proxy(reqwest_proxy);
     }
+    if let Some(ip) = api_ip
+        && let Some(ip) = non_empty(ip)
+    {
+        let addr = parse_telegram_ip(ip)?;
+        builder = builder.resolve("api.telegram.org", addr);
+    }
     builder
         .build()
         .map_err(|e| anyhow::anyhow!("failed to build telegram client: {e}"))
+}
+
+/// Parse an IPv4/IPv6 alternate Telegram IP into a `SocketAddr` on port 443.
+fn parse_telegram_ip(ip: &str) -> anyhow::Result<std::net::SocketAddr> {
+    let ip: std::net::IpAddr = ip
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid telegram api_ip `{ip}`: expected an IP address"))?;
+    Ok(std::net::SocketAddr::new(ip, 443))
 }
 
 fn non_empty(value: &str) -> Option<&str> {
@@ -228,12 +244,26 @@ mod tests {
     #[test]
     fn test_build_client_rejects_bad_proxy() {
         // reqwest rejects an all-symbols "url" (url::ParseError at build time).
-        assert!(build_client(Some("::::")).is_err());
+        assert!(build_client(Some("::::"), None).is_err());
     }
 
     #[test]
-    fn test_build_client_ok_without_proxy() {
-        assert!(build_client(None).is_ok());
-        assert!(build_client(Some("")).is_ok());
+    fn test_build_client_ok_without_overrides() {
+        assert!(build_client(None, None).is_ok());
+        assert!(build_client(Some(""), None).is_ok());
+        assert!(build_client(None, Some("")).is_ok());
+    }
+
+    #[test]
+    fn test_api_ip_rejects_non_ip() {
+        assert!(build_client(None, Some("not-an-ip")).is_err());
+        assert!(build_client(None, Some("api.telegram.org")).is_err());
+        assert!(build_client(None, Some("::::")).is_err());
+    }
+
+    #[test]
+    fn test_api_ip_accepts_ipv4_and_ipv6() {
+        assert!(build_client(None, Some("149.154.167.220")).is_ok());
+        assert!(build_client(None, Some("2001:67c:4e8::1")).is_ok());
     }
 }

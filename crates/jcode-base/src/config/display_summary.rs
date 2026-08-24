@@ -360,6 +360,9 @@ impl Config {
                 if self.safety.telegram_proxy.as_deref().is_some_and(|p| !p.trim().is_empty()) {
                     connectivity.push("proxy");
                 }
+                if self.safety.telegram_api_ip.as_deref().is_some_and(|i| !i.trim().is_empty()) {
+                    connectivity.push("pinned ip");
+                }
                 if !connectivity.is_empty() {
                     displayed.push_str(&format!(" ({})", connectivity.join(", ")));
                 }
