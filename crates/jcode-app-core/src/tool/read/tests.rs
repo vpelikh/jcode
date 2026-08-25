@@ -677,3 +677,80 @@ fn decide_dedup_returns_none_for_no_prior() {
     let result = decide_dedup(&path, &requested, now, &[]);
     assert!(result.is_none(), "no prior read must not dedup");
 }
+
+/// Build a StoredMessage containing a `read` ToolUse for `name`/`file`/range,
+/// with a given timestamp.
+fn read_message(
+    id: &str,
+    file: &str,
+    start_line: usize,
+    end_line: usize,
+    ts: chrono::DateTime<chrono::Utc>,
+) -> crate::session::StoredMessage {
+    use crate::message::Role;
+    crate::session::StoredMessage {
+        id: id.to_string(),
+        role: Role::User,
+        content: vec![ContentBlock::ToolUse {
+            id: format!("call-{id}"),
+            name: "read".to_string(),
+            input: json!({
+                "file_path": file,
+                "start_line": start_line,
+                "end_line": end_line,
+            }),
+            thought_signature: None,
+        }],
+        display_role: None,
+        timestamp: Some(ts),
+        tool_duration_ms: None,
+        token_usage: None,
+    }
+}
+
+#[test]
+fn collect_prior_read_candidates_skips_compacted_and_non_read_messages() {
+    use crate::message::Role;
+    let now = chrono::Utc::now();
+    let messages = vec![
+        read_message("m0", "a.rs", 1, 10, now),
+        // A bash tool call must not be collected.
+        crate::session::StoredMessage {
+            id: "m1".to_string(),
+            role: Role::User,
+            content: vec![ContentBlock::ToolUse {
+                id: "call-bash".to_string(),
+                name: "bash".to_string(),
+                input: json!({ "command": "ls" }),
+                thought_signature: None,
+            }],
+            display_role: None,
+            timestamp: Some(now),
+            tool_duration_ms: None,
+            token_usage: None,
+        },
+        read_message("m2", "b.rs", 5, 20, now),
+    ];
+
+    // cutoff=2 means messages 0,1 are compacted away; only m2 survives.
+    let candidates = collect_prior_read_candidates(&messages, 2);
+    assert_eq!(candidates.len(), 1, "only the un-compacted read should survive");
+    assert_eq!(candidates[0].0, "b.rs");
+    assert_eq!(candidates[0].1, (5, 20));
+}
+
+#[test]
+fn collect_prior_read_candidates_keeps_uncompacted_reads_with_ranges() {
+    use crate::message::Role;
+    let now = chrono::Utc::now();
+    let messages = vec![
+        read_message("m0", "a.rs", 1, 10, now),
+        read_message("m1", "a.rs", 20, 30, now),
+    ];
+    let candidates = collect_prior_read_candidates(&messages, 0);
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates[0].0, "a.rs");
+    assert_eq!(candidates[0].1, (1, 10));
+    assert_eq!(candidates[1].0, "a.rs");
+    assert_eq!(candidates[1].1, (20, 30));
+}
