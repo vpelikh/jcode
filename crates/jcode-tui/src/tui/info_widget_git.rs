@@ -141,3 +141,61 @@ pub(super) fn render_git_compact(info: &GitInfo, width: u16) -> Vec<Line<'static
 
     vec![Line::from(parts)]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git_info(branch: &str) -> GitInfo {
+        GitInfo {
+            branch: branch.to_string(),
+            modified: 0,
+            staged: 0,
+            untracked: 0,
+            ahead: 0,
+            behind: 0,
+            dirty_files: Vec::new(),
+        }
+    }
+
+    /// `render_git_compact` must surface the working-directory branch in the
+    /// rendered line. This is the widget-level proof that the scoped branch
+    /// (e.g. a worktree's `feat/panel`, not the daemon CWD's `master`) actually
+    /// appears in the drawn output.
+    #[test]
+    fn compact_render_contains_worktree_branch() {
+        let info = git_info("feat/panel");
+        let lines = render_git_compact(&info, 40);
+        let rendered: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            rendered.contains("feat/panel"),
+            "rendered git widget must contain the worktree branch, got: {rendered:?}"
+        );
+    }
+
+    /// Rendering the full widget (not just compact) also surfaces the branch.
+    #[test]
+    fn widget_render_contains_branch_when_interesting() {
+        let mut info = git_info("feat/panel");
+        info.modified = 2; // is_interesting() requires some stat
+        let data = InfoWidgetData {
+            git_info: Some(info),
+            ..Default::default()
+        };
+        let lines = render_git_widget(&data, Rect::new(0, 0, 40, 5));
+        assert!(!lines.is_empty(), "widget must render when repo is dirty");
+        let rendered: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            rendered.contains("feat/panel"),
+            "rendered widget must contain the worktree branch, got: {rendered:?}"
+        );
+    }
+}
