@@ -564,3 +564,53 @@ fn backdated_now_never_panics_and_prefers_past_instants() {
     let zero = super::backdated_now(Duration::ZERO);
     assert!(zero <= Instant::now());
 }
+
+/// `gather_git_info` must resolve the branch/dirty state of the *working
+/// directory it is given*, so a session attached to a git worktree reports its
+/// own branch instead of the daemon process's CWD. Two separate repos (stand-ins
+/// for two worktrees) must stay independent: querying repo A must never report
+/// repo B's branch, and the cache keys must differ per directory.
+#[test]
+fn gather_git_info_scopes_to_work_dir_and_caches_per_dir() {
+    use std::process::Command;
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = Command::new("git").args(args).current_dir(dir).output().unwrap();
+        assert!(out.status.success(), "git {args:?} failed in {dir:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    let dir_a = std::env::temp_dir().join(format!("jcode-git-a-{}", std::process::id()));
+    let dir_b = std::env::temp_dir().join(format!("jcode-git-b-{}", std::process::id()));
+    for (dir, branch) in [(&dir_a, "maint"), (&dir_b, "main")] {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-b", branch]);
+        std::fs::write(dir.join("file.txt"), "hi\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-m", "init", "--no-gpg-sign"]);
+    }
+    // Advance repo B onto a different branch so stale/shared state would surface
+    // the wrong value for A.
+    git(&dir_b, &["checkout", "-b", "feature-x"]);
+
+    // Directly resolve each repo's state: proves the git commands are scoped to
+    // the given working dir, not the daemon's CWD.
+    let info_a = super::gather_git_info_inner(Some(&dir_a));
+    let info_b = super::gather_git_info_inner(Some(&dir_b));
+    assert_eq!(info_a.as_ref().map(|i| i.branch.as_str()), Some("maint"));
+    assert_eq!(info_b.as_ref().map(|i| i.branch.as_str()), Some("feature-x"));
+
+    // Caching: the two directories must map to distinct keys so reading one
+    // never returns the other's branch.
+    let key_a = super::git_info_cache_key(Some(&dir_a));
+    let key_b = super::git_info_cache_key(Some(&dir_b));
+    assert_ne!(key_a, key_b, "worktrees must get separate cache entries");
+    // A canonicalized equivalent path must share repo A's key.
+    let dir_a_canon =
+        std::fs::canonicalize(&dir_a).unwrap_or_else(|_| dir_a.clone());
+    assert_eq!(super::git_info_cache_key(Some(&dir_a_canon)), key_a);
+
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
