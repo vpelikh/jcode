@@ -437,7 +437,11 @@ impl TelegramChannel {
         {
             Ok((id, reply)) => {
                 crate::server::telegram_control::set_active_session(&self.chat_id, &id);
-                format!("💬 [{}] {}", short_id(&id), reply)
+                format!(
+                    "💬 [{}]\n{}",
+                    short_id(&id),
+                    crate::telegram::escape_markdown(&reply)
+                )
             }
             Err(e) => format!("⚠️ Could not create a session: {e}"),
         }
@@ -494,7 +498,11 @@ impl TelegramChannel {
         )
         .await
         {
-            Ok(reply) => format!("💬 [{}] {}", short_id(&session_id), reply),
+            Ok(reply) => format!(
+                "💬 [{}]\n{}",
+                short_id(&session_id),
+                crate::telegram::escape_markdown(&reply)
+            ),
             Err(e) => format!("⚠️ Could not resume `{}`: {}", short_id(&session_id), e),
         }
     }
@@ -709,7 +717,11 @@ impl TelegramChannel {
                 Ok(reply) => {
                     let _ = self
                         .send_reply(
-                            &format!("💬 [{}] {}", short_id(&active_id), reply),
+                            &format!(
+                                "💬 [{}]\n{}",
+                                short_id(&active_id),
+                                crate::telegram::escape_markdown(&reply)
+                            ),
                             reply_to,
                         )
                         .await;
