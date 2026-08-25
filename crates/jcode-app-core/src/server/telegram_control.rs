@@ -93,6 +93,42 @@ pub async fn resume_session_for_control_or_spawn(
     run_turn_and_read_reply(agent, text).await
 }
 
+/// Create a brand-new session, run the first turn with `text` (if non-empty),
+/// register it as the live session, and return its id plus the assistant reply.
+///
+/// Used by the Telegram `/new` command so a user can start a fresh session from
+/// the chat rather than only talking to existing ones.
+pub async fn create_session_for_control(
+    text: Option<&str>,
+) -> anyhow::Result<(String, String)> {
+    let sessions = LIVE_SESSIONS
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("Telegram control is not wired to a server runtime"))?;
+    let provider = PROVIDER
+        .get()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("no provider registered for session creation"))?;
+    let provider = provider.fork();
+    let registry = crate::tool::Registry::new(provider.clone()).await;
+    let agent = Agent::new_with_initial_working_dir(Arc::clone(&provider), registry, None);
+    let session_id = agent.session_id().to_string();
+    let agent = Arc::new(Mutex::new(agent));
+    {
+        let mut guard = sessions.write().await;
+        guard.insert(session_id.clone(), Arc::clone(&agent));
+    }
+    crate::logging::info(&format!(
+        "telegram created new session {session_id}"
+    ));
+    let reply = match text {
+        Some(text) if !text.trim().is_empty() => {
+            run_turn_and_read_reply(agent, text.trim()).await?
+        }
+        _ => "New session created.".to_string(),
+    };
+    Ok((session_id, reply))
+}
+
 /// Actually run the turn on a locked agent and read back the assistant reply.
 async fn run_turn_and_read_reply(
     agent: Arc<Mutex<Agent>>,
@@ -128,6 +164,13 @@ fn state_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(crate::storage::jcode_dir()?.join("telegram-control-state.json"))
 }
 
+/// Guards all read-modify-write cycles of the control-state file so concurrent
+/// chats never clobber each other's selection.
+fn state_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    &LOCK
+}
+
 fn load_state() -> std::collections::HashMap<String, String> {
     let Ok(path) = state_path() else {
         return std::collections::HashMap::new();
@@ -146,18 +189,26 @@ fn save_state(state: &std::collections::HashMap<String, String>) {
         return;
     };
     let _ = std::fs::create_dir_all(parent);
-    if let Ok(raw) = serde_json::to_string_pretty(state) {
-        let _ = std::fs::write(&path, raw);
+    let Ok(raw) = serde_json::to_string_pretty(state) else {
+        return;
+    };
+    // Atomic write: write to a temp file in the same directory then rename, so
+    // a crash mid-write can never leave a truncated/corrupt state file.
+    let tmp = parent.join("telegram-control-state.json.tmp");
+    if std::fs::write(&tmp, raw).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
     }
 }
 
 /// The session id currently selected for `chat_id`, if any.
 pub fn active_session_for(chat_id: &str) -> Option<String> {
+    let _guard = state_lock().lock().unwrap_or_else(|e| e.into_inner());
     load_state().get(chat_id).cloned()
 }
 
 /// Select the active session for `chat_id`.
 pub fn set_active_session(chat_id: &str, session_id: &str) {
+    let _guard = state_lock().lock().unwrap_or_else(|e| e.into_inner());
     let mut state = load_state();
     state.insert(chat_id.to_string(), session_id.to_string());
     save_state(&state);
@@ -165,6 +216,7 @@ pub fn set_active_session(chat_id: &str, session_id: &str) {
 
 /// Clear the selected session for `chat_id`.
 pub fn clear_active_session(chat_id: &str) {
+    let _guard = state_lock().lock().unwrap_or_else(|e| e.into_inner());
     let mut state = load_state();
     state.remove(chat_id);
     save_state(&state);
