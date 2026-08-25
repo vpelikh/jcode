@@ -102,7 +102,9 @@ impl App {
                 | "run_shell"
         );
         if mutates_repo {
-            super::helpers::invalidate_git_info_cache();
+            super::helpers::invalidate_git_info_cache(
+                self.session.working_dir.as_deref().map(std::path::Path::new),
+            );
         }
 
         // The todo tool rewrites the per-session todo list.
