@@ -961,8 +961,8 @@ pub(in crate::tui::app) fn handle_server_event(
                 if !matches!(app.status, ProcessingStatus::Connecting(_)) {
                     app.connection_phase_started = Some(Instant::now());
                 }
-                // A stale transport detail from a previous attempt (e.g. an
-                // "awaiting response headers (Ns)" heartbeat) must not survive
+                // A stale transport detail from a previous attempt (e.g. a
+                // "waiting for <endpoint>" heartbeat) must not survive
                 // into the new attempt. The fresh attempt re-emits its own
                 // detail, so drop the old one here to avoid showing an
                 // out-of-date elapsed counter next to the new phase label.

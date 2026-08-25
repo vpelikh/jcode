@@ -23,7 +23,7 @@ fn test_new_connection_phase_clears_stale_status_detail() {
     let mut remote = crate::tui::backend::RemoteConnection::dummy();
 
     // A heartbeat detail from a previous attempt is lingering.
-    app.status_detail = Some("awaiting response headers (123s)".to_string());
+    app.status_detail = Some("waiting for https://api.example.com (123s; times out at 180s)".to_string());
 
     // Entering a fresh connection attempt must clear the stale detail so it
     // does not linger next to the new phase label.
