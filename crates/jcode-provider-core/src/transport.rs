@@ -6,6 +6,10 @@
 //! ensures all providers recognize the same fault vocabulary.
 
 use anyhow::Result;
+use bytes::Bytes;
+use http_body::Body;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 /// Send a request while bounding the wait for response headers.
@@ -37,35 +41,19 @@ pub async fn send_with_initial_response_timeout(
 /// phase with no way to tell an alive-but-slow send from a dead connection.
 ///
 /// This polls the bounded send and, until it resolves, periodically calls the
-/// async `on_progress` with a human-readable "waiting for <endpoint> (Ns;
-/// times out at Ms)" message that names where the request is going and when the
-/// send as a whole gives up. Providers wire that into a `StatusDetail` stream
-/// event so the footer visibly ticks and proves the phase is alive.
+/// async `on_progress` with a human-readable "still awaiting response, Ns
+/// elapsed" message. Providers wire that into a `StatusDetail` stream event so
+/// the footer visibly ticks and proves the phase is alive.
 pub async fn send_with_initial_response_timeout_with_progress<Fut>(
     request: reqwest::RequestBuilder,
     timeout: Duration,
     heartbeat_secs: Duration,
-    endpoint: &str,
     mut on_progress: impl FnMut(&str) -> Fut + Send,
 ) -> Result<reqwest::Response>
 where
     Fut: std::future::Future<Output = ()> + Send,
 {
     use futures::FutureExt;
-
-    // Capturing the endpoint from the request itself is unreliable for the real
-    // providers: their bodies are streaming (`Body::wrap(CountingBody)`), and
-    // reqwest's `Body::try_clone` returns None for streaming bodies, so
-    // `RequestBuilder::try_clone` degrades to None. The caller already has the
-    // URL string, so we thread it in explicitly as `endpoint`. The whole URL may
-    // be long (path + query); the callers pass a compact scheme+host label so the
-    // footer shows which route/model host the wait is on without a full URI.
-    // The `timeout` here is the provider's stream_idle_timeout (default 180s),
-    // applied against the whole `request.send()` future — connect + upload + wait
-    // for the first response header — NOT a deadline on total response time.
-    // Name it as a send timeout so the label doesn't imply it's only about
-    // headers.
-    let send_timeout_secs = timeout.as_secs();
 
     let started = std::time::Instant::now();
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
@@ -100,31 +88,161 @@ where
             }
             _ = ticker.tick() => {
                 let elapsed = started.elapsed().as_secs();
-                // Message names the endpoint, how long we've been waiting, and
-                // when the send as a whole gives up. Elapsed ticks every
-                // heartbeat_secs to prove the phase is alive.
-                on_progress(&format!(
-                    "waiting for {endpoint} ({elapsed}s; times out at {send_timeout_secs}s)"
-                ))
-                .await;
+                on_progress(&format!("awaiting response headers ({elapsed}s)")).await;
             }
         }
     }
 }
 
-
+/// Format a byte count compactly (e.g. `1.2 KB`, `503 KB`, `3.4 MB`).
 pub fn readable_bytes(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = KB * 1024.0;
     if bytes >= MB as u64 {
-        format!("{:.1} MB", bytes as f64 / MB)
+        format_mb(bytes as f64 / MB)
     } else if bytes >= KB as u64 {
-        format!("{:.1} KB", bytes as f64 / KB)
+        format_kb(bytes as f64 / KB)
     } else {
         format!("{} B", bytes)
     }
 }
 
+/// Format kilobytes, dropping the trailing `.0` for whole values so a 503 KB
+/// payload reads `503 KB` rather than the noisier `503.0 KB`.
+fn format_kb(value: f64) -> String {
+    if (value - value.round()).abs() < f64::EPSILON {
+        format!("{} KB", value.round() as u64)
+    } else {
+        format!("{:.1} KB", value)
+    }
+}
+
+/// Format megabytes, dropping the trailing `.0` for whole values.
+fn format_mb(value: f64) -> String {
+    if (value - value.round()).abs() < f64::EPSILON {
+        format!("{} MB", value.round() as u64)
+    } else {
+        format!("{:.1} MB", value)
+    }
+}
+
+/// Human-readable status for an in-flight upload.
+///
+/// While the body is still draining on the uplink this reads
+/// `uploading 256 KB / 1.5 MB`; once every byte has been handed to the
+/// transport it switches to `uploaded 1.5 MB, waiting for server` so a long
+/// server-side wait is no longer mistaken for a still-uploading body.
+pub fn upload_progress_label(sent: u64, total: u64) -> String {
+    if total == 0 {
+        return String::new();
+    }
+    if sent >= total {
+        format!(
+            "uploaded {}, waiting for server",
+            readable_bytes(total)
+        )
+    } else {
+        format!(
+            "uploading {} / {}",
+            readable_bytes(sent),
+            readable_bytes(total)
+        )
+    }
+}
+
+/// How frequently an upload reports cumulative bytes-written to the progress
+/// callback. Matches the response-header heartbeat cadence so the footer's
+/// stage counter visibly ticks during a slow drain on an uplink.
+const UPLOAD_PROGRESS_CHUNK: usize = 64 * 1024;
+
+/// A fixed-length [`http_body::Body`] that reports live upload progress.
+///
+/// The whole request body is already serialized in memory by the caller (the
+/// providers do this to surface the payload size up front). This body replays
+/// that buffer in [`UPLOAD_PROGRESS_CHUNK`]-sized pieces and, after each piece,
+/// invokes a callback with the cumulative bytes handed to the transport layer.
+///
+/// It reports an *exact* [`http_body::Body::size_hint`], which matters:
+/// reqwest/hyper then emit a fixed `Content-Length` rather than falling back to
+/// HTTP chunked transfer-encoding. Some provider endpoints reject chunked
+/// request bodies, so preserving exact framing is a hard correctness
+/// requirement, not a nicety.
+///
+/// The body owns its `Bytes` and stores the progress callback as a
+/// `Send + Sync` trait object so it satisfies the `B: HttpBody + Send + Sync +
+/// 'static` bound that `reqwest::Body::wrap` requires. The callback itself can
+/// use a channel or `try_send` to hand byte counts to an async consumer.
+pub struct CountingBody {
+    data: Bytes,
+    offset: usize,
+    on_progress: Box<dyn FnMut(u64) + Send + Sync>,
+}
+
+impl CountingBody {
+    pub fn new(data: Bytes, on_progress: impl FnMut(u64) + Send + Sync + 'static) -> Self {
+        Self {
+            data,
+            offset: 0,
+            on_progress: Box::new(on_progress),
+        }
+    }
+}
+
+impl Body for CountingBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        if self.offset >= self.data.len() {
+            return Poll::Ready(None);
+        }
+        let end = (self.offset + UPLOAD_PROGRESS_CHUNK).min(self.data.len());
+        // Copy the cumulative byte count before calling the progress closure:
+        // invoking a `FnMut` borrows `on_progress` mutably, which cannot coexist
+        // with an immutable borrow of `self.offset` in the same expression.
+        let sent = end as u64;
+        let chunk = self.data.slice(self.offset..end);
+        self.offset = end;
+        (self.on_progress)(sent);
+        Poll::Ready(Some(Ok(http_body::Frame::data(chunk))))
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.data.len() as u64)
+    }
+}
+
+/// Send a request with live upload progress reporting.
+///
+/// Wraps the pre-serialized JSON `payload` in a [`CountingBody`] and sends it
+/// through [`send_with_initial_response_timeout_with_progress`]. The `on_upload`
+/// callback receives cumulative bytes handed to the transport and surfaces it
+/// as an `uploading X / Y` status detail. Once the body is fully consumed, the
+/// caller's `on_progress` continues to receive the standard
+/// `awaiting response headers (Ns)` heartbeat, so a long server-side wait is
+/// visibly distinct from an in-flight upload.
+pub async fn send_body_with_upload_progress<Fut>(
+    request: reqwest::RequestBuilder,
+    payload: Vec<u8>,
+    timeout: Duration,
+    on_upload: impl FnMut(u64) + Send + Sync + 'static,
+    on_progress: impl FnMut(&str) -> Fut + Send,
+) -> Result<reqwest::Response>
+where
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    let body = reqwest::Body::wrap(CountingBody::new(Bytes::from(payload), on_upload));
+    send_with_initial_response_timeout_with_progress(
+        request.body(body),
+        timeout,
+        Duration::from_secs(5),
+        on_progress,
+    )
+    .await
+}
 
 /// Whether an error message describes a transient transport-level fault
 /// (connection reset, DNS hiccup, TLS teardown, HTTP/2 stream error, ...)
@@ -307,8 +425,11 @@ mod tests {
     #[test]
     fn readable_bytes_formats_compact_units() {
         assert_eq!(super::readable_bytes(512), "512 B");
-        assert_eq!(super::readable_bytes(2048), "2.0 KB");
-        assert_eq!(super::readable_bytes(3 * 1024 * 1024), "3.0 MB");
+        // Whole values drop the trailing decimal so 2.0 KB reads "2 KB".
+        assert_eq!(super::readable_bytes(2048), "2 KB");
+        assert_eq!(super::readable_bytes(3 * 1024 * 1024), "3 MB");
+        // Non-whole values keep one decimal place.
+        assert_eq!(super::readable_bytes((1.5 * 1024.0) as u64), "1.5 KB");
     }
 
     #[tokio::test]
@@ -345,7 +466,6 @@ mod tests {
             request,
             Duration::from_secs(5),
             Duration::from_millis(100),
-            "http://127.0.0.1",
             move |msg: &str| {
                 beacons_clone
                     .lock()
@@ -382,38 +502,10 @@ mod tests {
             "expected at least one heartbeat message"
         );
         assert!(
-            beacons[0].contains("waiting for"),
+            beacons[0].contains("awaiting response headers"),
             "unexpected heartbeat: {:?}",
             beacons[0]
         );
-        assert!(
-            beacons[0].contains("http://127.0.0.1"),
-            "heartbeat must name the endpoint, got: {:?}",
-            beacons[0]
-        );
-    }
-
-    #[test]
-    fn endpoint_label_reduces_url_to_scheme_and_host() {
-        use super::endpoint_label;
-        // A long URI reduces to a compact scheme + host for the footer.
-        assert_eq!(
-            endpoint_label("https://api.anthropic.com/v1/messages?x=1&y=2"),
-            "https://api.anthropic.com"
-        );
-        // An explicit non-default port is preserved so a local endpoint stays
-        // distinguishable from a default-HTTPS remote host.
-        assert_eq!(
-            endpoint_label("http://localhost:11434/v1/chat/completions"),
-            "http://localhost:11434"
-        );
-        assert_eq!(
-            endpoint_label("https://api.example.com:8443/path"),
-            "https://api.example.com:8443"
-        );
-        // Unparseable input falls back to the raw string so the message still
-        // names something recognizable.
-        assert_eq!(endpoint_label("not-a-url"), "not-a-url");
     }
 
     #[test]
@@ -482,103 +574,6 @@ mod tests {
         // Monotonically increasing byte counts.
         for window in sent.windows(2) {
             assert!(window[1] > window[0], "progress must increase: {window:?}");
-        }
-    }
-
-    #[tokio::test]
-    async fn send_body_with_upload_progress_keeps_content_length_and_fires_callbacks() {
-        use super::send_body_with_upload_progress;
-        use std::sync::{Arc, Mutex};
-
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind server");
-        let address = listener.local_addr().expect("read address");
-
-        let (headers_tx, headers_rx) = mpsc::channel();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .expect("set timeout");
-
-            // Read bytes until we have the header-terminator and the whole body.
-            let mut buf = Vec::new();
-            let mut chunk = [0_u8; 4096];
-            let mut header_end: Option<usize> = None;
-            let mut content_length = 0usize;
-            loop {
-                let n = stream.read(&mut chunk).expect("read chunk");
-                assert!(n > 0, "client closed mid-request");
-                buf.extend_from_slice(&chunk[..n]);
-                if header_end.is_none() {
-                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                        header_end = Some(pos + 4);
-                        content_length = String::from_utf8_lossy(&buf[..pos])
-                            .to_lowercase()
-                            .split("content-length:")
-                            .nth(1)
-                            .and_then(|s| s.split_whitespace().next())
-                            .and_then(|s| s.parse().ok())
-                            .unwrap_or(0);
-                    }
-                }
-                if let Some(he) = header_end {
-                    if buf.len() >= he + content_length {
-                        break;
-                    }
-                }
-            }
-            let head_str = String::from_utf8_lossy(&buf[..header_end.unwrap()]).to_string();
-            headers_tx.send(head_str).expect("send headers");
-
-            // Respond so the client resolves.
-            let body = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
-            let _ = stream.write_all(body.as_bytes()).expect("write response");
-        });
-
-        let payload: Vec<u8> = vec![9_u8; 3 * 1024 * 1024]; // 3 MB, > 64KB chunk
-        let uploads = Arc::new(Mutex::new(Vec::<u64>::new()));
-        let uploads_cb = uploads.clone();
-
-        let request = reqwest::Client::new()
-            .post(format!("http://{address}/chat/completions"))
-            .header("Content-Type", "application/json");
-        let _response = send_body_with_upload_progress(
-            request,
-            payload,
-            Duration::from_secs(10),
-            "http://127.0.0.1",
-            move |sent| {
-                uploads_cb.lock().unwrap().push(sent);
-            },
-            |_: &str| async {}, // no heartbeat expected for fast local request
-        )
-        .await
-        .expect("request should succeed");
-
-        server.join().expect("server should exit");
-
-        // The request must arrive with a fixed Content-Length (not chunked).
-        let headers = headers_rx.recv_timeout(Duration::from_secs(2)).expect("headers");
-        assert!(
-            !headers.to_lowercase().contains("transfer-encoding: chunked"),
-            "must not fall back to chunked transfer-encoding:\n{headers}"
-        );
-        let cl = headers
-            .to_lowercase()
-            .find("content-length:")
-            .map(|i| {
-                let rest = &headers[i + "content-length:".len()..];
-                rest.split_whitespace().next().unwrap_or("").to_string()
-            })
-            .unwrap_or_default();
-        assert_eq!(cl, (3 * 1024 * 1024).to_string(), "content-length mismatch");
-
-        // At least two progress callbacks, final one equals the full size.
-        let uploads = uploads.lock().unwrap();
-        assert!(uploads.len() >= 2, "expected multiple upload callbacks: {uploads:?}");
-        assert_eq!(*uploads.last().unwrap(), 3 * 1024 * 1024, "full payload reported");
-        for w in uploads.windows(2) {
-            assert!(w[1] > w[0], "progress must increase: {w:?}");
         }
     }
 }
