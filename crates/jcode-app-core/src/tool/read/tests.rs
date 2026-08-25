@@ -302,6 +302,112 @@ async fn read_tool_supports_start_line_with_limit() {
 }
 
 #[tokio::test]
+async fn read_tool_caps_rendered_output_budget() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("big.txt");
+    // ~60k lines of moderate width will exceed the rendered char budget at
+    // line numbers + content, so output must be capped while the continuation
+    // hint stays exact.
+    let line = "x".repeat(60);
+    let content: String = std::iter::repeat_with(|| format!("{line}\n"))
+        .take(60_000)
+        .collect();
+    std::fs::write(&path, &content).expect("write big file");
+
+    let tool = ReadTool::new();
+    let output = tool
+        .execute(
+            json!({ "file_path": "big.txt" }),
+            make_ctx(temp.path().to_path_buf()),
+        )
+        .await
+        .expect("read should succeed");
+
+    // Never exceeds the hard rendered budget even for a large default read.
+    assert!(
+        output.output.len() <= MAX_READ_OUTPUT_CHARS + MAX_LINE_LEN + 500,
+        "rendered output ({}) exceeded budget {}",
+        output.output.len(),
+        MAX_READ_OUTPUT_CHARS
+    );
+    // The beginning of the file is present.
+    assert!(output.output.contains("1\t"), "missing first line: {:?}", output.output);
+    // A continuation hint tells the model where to resume.
+    assert!(
+        output.output.contains("more lines (use offset="),
+        "missing continuation hint: {:?}",
+        output.output
+    );
+}
+
+#[tokio::test]
+async fn read_tool_budget_continuation_hint_points_at_unrendered_region() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("wide.txt");
+    // Wide lines near MAX_LINE_LEN quickly blow the rendered budget, so a
+    // default read stops early; the continuation offset must be the line after
+    // the last rendered line, not the full requested range.
+    let content: String = std::iter::repeat_with(|| format!("{}\n", "y".repeat(1800)))
+        .take(2_000)
+        .collect();
+    std::fs::write(&path, &content).expect("write wide file");
+
+    let tool = ReadTool::new();
+    let output = tool
+        .execute(
+            json!({ "file_path": "wide.txt", "start_line": 1, "end_line": 2000 }),
+            make_ctx(temp.path().to_path_buf()),
+        )
+        .await
+        .expect("read should succeed");
+
+    assert!(
+        output.output.len() <= MAX_READ_OUTPUT_CHARS + MAX_LINE_LEN + 500,
+        "rendered output ({}) exceeded budget {}",
+        output.output.len(),
+        MAX_READ_OUTPUT_CHARS
+    );
+    // The continuation hint must not skip the unrendered portion: it must point
+    // after the last rendered line (a specific start_line), not at 2000.
+    assert!(
+        output.output.contains("more lines (use start_line="),
+        "missing continuation hint: {:?}",
+        output.output
+    );
+    assert!(
+        !output.output.contains("more lines (use start_line=2000"),
+        "hint should point at the unrendered region, not the full range: {:?}",
+        output.output
+    );
+}
+
+#[tokio::test]
+async fn read_tool_small_bounded_read_is_unaffected_by_budget() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("small.txt");
+    std::fs::write(&path, "one\ntwo\nthree\nfour\nfive\n").expect("write file");
+
+    let tool = ReadTool::new();
+    let output = tool
+        .execute(
+            json!({ "file_path": "small.txt", "start_line": 1, "end_line": 3 }),
+            make_ctx(temp.path().to_path_buf()),
+        )
+        .await
+        .expect("read should succeed");
+
+    // A small, explicitly bounded read is unchanged and contains no budget
+    // truncation hint beyond the normal range continuation (none needed).
+    assert!(
+        output.output.len() < MAX_READ_OUTPUT_CHARS,
+        "small read should stay small: {:?}",
+        output.output
+    );
+    assert!(output.output.contains("1\tone"), "output={:?}", output.output);
+    assert!(output.output.contains("3\tthree"), "output={:?}", output.output);
+}
+
+#[tokio::test]
 async fn read_tool_prefers_end_line_over_limit() {
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("sample.txt");
