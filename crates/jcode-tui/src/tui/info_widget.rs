@@ -63,6 +63,7 @@ use tips::{render_tips_widget, tips_widget_height};
 pub(crate) use todos_render::swarm_plan_todos;
 use todos_render::{render_todos_compact, render_todos_expanded, render_todos_widget};
 pub(crate) use todos_render::todos_widget_line_count;
+pub(crate) use todos_render::todos_compact_line_count;
 #[cfg(test)]
 use usage_render::render_usage_pill;
 use usage_render::{render_context_usage_line, render_usage_compact, render_usage_widget};
