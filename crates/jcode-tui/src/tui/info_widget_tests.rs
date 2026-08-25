@@ -2026,6 +2026,7 @@ fn todo_widget_lines_never_exceed_inner_width() {
         for lines in [
             render_todos_widget(&data, inner),
             render_todos_expanded(&data, inner),
+            render_todos_compact(&data, inner),
         ] {
             for (idx, line) in lines.iter().enumerate() {
                 let w = line
@@ -2040,5 +2041,45 @@ fn todo_widget_lines_never_exceed_inner_width() {
                 );
             }
         }
+    }
+}
+
+/// The compact todos surface must never overflow and its rendered row count must
+/// match `todos_compact_line_count` (which the overview page-layout uses to
+/// reserve height). With a confidence + feedback-loop-carrying summary this
+/// exercises the wrapped-summary path at narrow widths.
+#[test]
+fn compact_todos_rows_fit_and_height_matches() {
+    use unicode_width::UnicodeWidthStr;
+    let data = InfoWidgetData {
+        todos: vec![
+            todo_item("a", "one", "in_progress", None),
+            todo_item("b", "two", "completed", None),
+        ],
+        todo_goals: vec![crate::todo::TodoGoal {
+            group: None,
+            closed_feedback_loop: Some(crate::todo::FeedbackLoopState::from_legacy_score(85)),
+            feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
+            feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::MainPaths),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    for inner_w in 10u16..=40 {
+        let inner = Rect::new(0, 0, inner_w, 100);
+        let lines = render_todos_compact(&data, inner);
+        for (idx, line) in lines.iter().enumerate() {
+            let w = line.spans.iter().map(|s| s.content.width()).sum::<usize>();
+            assert!(
+                w <= inner_w as usize,
+                "compact row {idx} (width {w}) exceeds inner width {inner_w}:\n{}",
+                lines_text(&lines)
+            );
+        }
+        assert_eq!(
+            super::todos_compact_line_count(&data, inner_w) as u16,
+            lines.len() as u16,
+            "compact line_count must match rendered rows at width {inner_w}"
+        );
     }
 }
