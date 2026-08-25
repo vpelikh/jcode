@@ -177,6 +177,40 @@ mod tests {
         );
     }
 
+    /// Rendering a long worktree branch into a narrow widget must never panic
+    /// and must still surface a visible, non-empty slice of the branch (the
+    /// truncation keeps the widget from blanking out on deep branch names).
+    /// The branch line starts with the branch's own characters (e.g. `fea...`),
+    /// so a prefix of the worktree branch remains visible.
+    #[test]
+    fn compact_render_handles_long_branch_narrow_width() {
+        let info = git_info("feature/some-very-long-worktree-branch-name");
+        let lines = render_git_compact(&info, 10);
+        let rendered: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            rendered.contains('f') && rendered.contains("fea"),
+            "long branch must still render a visible prefix of the branch, got: {rendered:?}"
+        );
+    }
+
+    /// When there is no git info, the full widget must render nothing (empty
+    /// output) rather than panic or emit a stray branch line.
+    #[test]
+    fn widget_render_empty_when_no_git_info() {
+        let data = InfoWidgetData {
+            git_info: None,
+            ..Default::default()
+        };
+        assert!(
+            render_git_widget(&data, Rect::new(0, 0, 40, 5)).is_empty(),
+            "widget must render nothing when git_info is None"
+        );
+    }
+
     /// Rendering the full widget (not just compact) also surfaces the branch.
     #[test]
     fn widget_render_contains_branch_when_interesting() {
