@@ -1975,3 +1975,66 @@ fn todos_widget_height_equals_rendered_line_count() {
         );
     }
 }
+
+/// Every rendered TODO row of the widget must fit within the widget's inner
+/// width: todo rows, wrapped continuation rows (which repeat the glyph
+/// indented), and wrapped group-header rows. This is the guarantee this feature
+/// adds - each todo item displays fully, wrapped to its box, never clipped. We
+/// sum the display width of each row's spans (wide CJK glyphs count 2) and
+/// require it <= inner.width. (Line 0 is the widget header line; its
+/// confidence/loop suffixes are a pre-existing, separately-managed concern.)
+#[test]
+fn todo_widget_lines_never_exceed_inner_width() {
+    use unicode_width::UnicodeWidthStr;
+    let mk = |id: &str, body: &str, status: &str, group: Option<&str>| {
+        todo_item(id, body, status, group)
+    };
+
+    let data = InfoWidgetData {
+        todos: vec![
+            mk(
+                "a",
+                "a normal sized todo body that should fit comfortably on one or two lines",
+                "in_progress",
+                None,
+            ),
+            mk(
+                "b",
+                "another todo with a fairly long sentence body used to exercise wrapping behavior across the narrow widget",
+                "pending",
+                None,
+            ),
+            mk(
+                "c",
+                "short",
+                "completed",
+                Some("a long group name 汉字 that will wrap across multiple rows"),
+            ),
+        ],
+        ..Default::default()
+    };
+
+    // A range of widget widths, including narrow ones that force heavy wrapping
+    // and hard-breaks of over-wide words.
+    for inner_w in 22u16..=30 {
+        let inner = Rect::new(0, 0, inner_w, 100);
+        for lines in [
+            render_todos_widget(&data, inner),
+            render_todos_expanded(&data, inner),
+        ] {
+            let rows = &lines[1..]; // skip the decorative header (line 0)
+            for (idx, line) in rows.iter().enumerate() {
+                let w = line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.width())
+                    .sum::<usize>();
+                assert!(
+                    w <= inner_w as usize,
+                    "row {idx} (width {w}) exceeds inner width {inner_w}:\n{}",
+                    lines_text(&lines)
+                );
+            }
+        }
+    }
+}

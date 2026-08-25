@@ -309,6 +309,29 @@ fn push_aggregate_confidence_suffix(
     ));
 }
 
+/// Append the aggregate-confidence suffix only when it fits within `available`
+/// remaining columns. The suffix is informational and is dropped (never
+/// clipped) when the group header is too narrow, so it cannot overflow the box.
+fn push_aggregate_confidence_suffix_if_fits(
+    spans: &mut Vec<Span<'static>>,
+    score: Option<crate::todo::ConfidenceState>,
+    available: u16,
+) {
+    if aggregate_confidence_suffix_width(score) == 0
+        || aggregate_confidence_suffix_width(score) > available
+    {
+        return;
+    }
+    push_aggregate_confidence_suffix(spans, score);
+}
+
+/// Total display width of a row's spans, used to decide how much room remains
+/// for optional suffixes before the line can overflow `inner.width`.
+fn spans_width(spans: &[Span<'static>]) -> u16 {
+    use unicode_width::UnicodeWidthStr;
+    spans.iter().map(|s| s.content.width() as u16).sum()
+}
+
 /// Normalize a todo's group label, treating empty/whitespace as ungrouped.
 fn todo_group_key(todo: &crate::todo::TodoItem) -> Option<String> {
     todo.group
@@ -393,9 +416,18 @@ fn push_group_header(
             vec![Span::styled(name_line.clone(), name_style)]
         };
         if i == 0 {
-            push_aggregate_confidence_suffix(&mut spans, confidence);
+            // The name is already sized to reserve room, but when the widget is
+            // very narrow the reserved confidence/loop suffixes alone can exceed
+            // inner.width (the name clamps to a minimum). Guard each optional
+            // suffix so the group header never overflows its box; the suffix is
+            // informational and is dropped rather than clipped.
+            let avail = inner.width.saturating_sub(spans_width(&spans));
+            push_aggregate_confidence_suffix_if_fits(&mut spans, confidence, avail);
             if let Some(goal) = goal {
-                push_goal_loop_suffix(&mut spans, goal);
+                let avail = inner.width.saturating_sub(spans_width(&spans));
+                if goal_loop_suffix_width(goal) <= avail {
+                    push_goal_loop_suffix(&mut spans, goal);
+                }
             }
         }
         lines.push(Line::from(spans));
