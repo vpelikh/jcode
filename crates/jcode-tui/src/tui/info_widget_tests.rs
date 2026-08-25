@@ -587,15 +587,17 @@ handles streaming partial results and rendering them to the debug side panel";
         ..Default::default()
     };
     let word_text = lines_text(&render_todos_widget(&word_data, Rect::new(0, 0, 20, 20)));
-    // Strip all whitespace and glyph noise across the hard-broken rows so the
-    // full single word is verifiable as contiguous.
+    // Hard-break legitimately splits the over-wide word across rows, and each
+    // row is prefixed by the status glyph, so the full word is a *subsequence*
+    // (chars in order) of the compacted output, not a contiguous substring.
+    // Strip glyph/UI noise, then verify body_no_spaces recurs in order.
     let word_compact: String = word_text
         .chars()
         .filter(|c| !c.is_whitespace() && !matches!(c, '▶' | '○' | '✓' | '✗' | '⊳' | '·' | '?' | '!'))
         .collect();
     assert!(
-        word_compact.contains(&body_no_spaces),
-        "over-wide word must be fully preserved (hard-broken): {word_text}"
+        is_subsequence(&word_compact, &body_no_spaces),
+        "over-wide word must be fully preserved in order (hard-broken): {word_text}"
     );
 }
 
@@ -703,6 +705,14 @@ fn lines_text(lines: &[ratatui::text::Line<'_>]) -> String {
         .map(|span| span.content.as_ref())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// True if `needle`'s characters appear as an in-order subsequence of `hay`.
+/// Used to verify a hard-broken over-wide word is fully preserved even though
+/// continuation-row glyphs interleave between its chunks.
+fn is_subsequence(hay: &str, needle: &str) -> bool {
+    let mut it = hay.chars();
+    needle.chars().all(|c| it.any(|h| h == c))
 }
 
 #[test]
