@@ -37,19 +37,35 @@ pub async fn send_with_initial_response_timeout(
 /// phase with no way to tell an alive-but-slow send from a dead connection.
 ///
 /// This polls the bounded send and, until it resolves, periodically calls the
-/// async `on_progress` with a human-readable "still awaiting response, Ns
-/// elapsed" message. Providers wire that into a `StatusDetail` stream event so
-/// the footer visibly ticks and proves the phase is alive.
+/// async `on_progress` with a human-readable "waiting for <endpoint> (Ns;
+/// times out at Ms)" message that names where the request is going and when the
+/// send as a whole gives up. Providers wire that into a `StatusDetail` stream
+/// event so the footer visibly ticks and proves the phase is alive.
 pub async fn send_with_initial_response_timeout_with_progress<Fut>(
     request: reqwest::RequestBuilder,
     timeout: Duration,
     heartbeat_secs: Duration,
+    endpoint: &str,
     mut on_progress: impl FnMut(&str) -> Fut + Send,
 ) -> Result<reqwest::Response>
 where
     Fut: std::future::Future<Output = ()> + Send,
 {
     use futures::FutureExt;
+
+    // Capturing the endpoint from the request itself is unreliable for the real
+    // providers: their bodies are streaming (`Body::wrap(CountingBody)`), and
+    // reqwest's `Body::try_clone` returns None for streaming bodies, so
+    // `RequestBuilder::try_clone` degrades to None. The caller already has the
+    // URL string, so we thread it in explicitly as `endpoint`. The whole URL may
+    // be long (path + query); the callers pass a compact scheme+host label so the
+    // footer shows which route/model host the wait is on without a full URI.
+    // The `timeout` here is the provider's stream_idle_timeout (default 180s),
+    // applied against the whole `request.send()` future — connect + upload + wait
+    // for the first response header — NOT a deadline on total response time.
+    // Name it as a send timeout so the label doesn't imply it's only about
+    // headers.
+    let send_timeout_secs = timeout.as_secs();
 
     let started = std::time::Instant::now();
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
@@ -84,13 +100,19 @@ where
             }
             _ = ticker.tick() => {
                 let elapsed = started.elapsed().as_secs();
-                on_progress(&format!("awaiting response headers ({elapsed}s)")).await;
+                // Message names the endpoint, how long we've been waiting, and
+                // when the send as a whole gives up. Elapsed ticks every
+                // heartbeat_secs to prove the phase is alive.
+                on_progress(&format!(
+                    "waiting for {endpoint} ({elapsed}s; times out at {send_timeout_secs}s)"
+                ))
+                .await;
             }
         }
     }
 }
 
-/// Format a byte count compactly (e.g. `1.2 KB`, `3.4 MB`).
+
 pub fn readable_bytes(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = KB * 1024.0;
@@ -102,6 +124,7 @@ pub fn readable_bytes(bytes: u64) -> String {
         format!("{} B", bytes)
     }
 }
+
 
 /// Whether an error message describes a transient transport-level fault
 /// (connection reset, DNS hiccup, TLS teardown, HTTP/2 stream error, ...)
@@ -322,6 +345,7 @@ mod tests {
             request,
             Duration::from_secs(5),
             Duration::from_millis(100),
+            "http://127.0.0.1",
             move |msg: &str| {
                 beacons_clone
                     .lock()
@@ -358,10 +382,38 @@ mod tests {
             "expected at least one heartbeat message"
         );
         assert!(
-            beacons[0].contains("awaiting response headers"),
+            beacons[0].contains("waiting for"),
             "unexpected heartbeat: {:?}",
             beacons[0]
         );
+        assert!(
+            beacons[0].contains("http://127.0.0.1"),
+            "heartbeat must name the endpoint, got: {:?}",
+            beacons[0]
+        );
+    }
+
+    #[test]
+    fn endpoint_label_reduces_url_to_scheme_and_host() {
+        use super::endpoint_label;
+        // A long URI reduces to a compact scheme + host for the footer.
+        assert_eq!(
+            endpoint_label("https://api.anthropic.com/v1/messages?x=1&y=2"),
+            "https://api.anthropic.com"
+        );
+        // An explicit non-default port is preserved so a local endpoint stays
+        // distinguishable from a default-HTTPS remote host.
+        assert_eq!(
+            endpoint_label("http://localhost:11434/v1/chat/completions"),
+            "http://localhost:11434"
+        );
+        assert_eq!(
+            endpoint_label("https://api.example.com:8443/path"),
+            "https://api.example.com:8443"
+        );
+        // Unparseable input falls back to the raw string so the message still
+        // names something recognizable.
+        assert_eq!(endpoint_label("not-a-url"), "not-a-url");
     }
 
     #[test]
@@ -494,6 +546,7 @@ mod tests {
             request,
             payload,
             Duration::from_secs(10),
+            "http://127.0.0.1",
             move |sent| {
                 uploads_cb.lock().unwrap().push(sent);
             },
