@@ -1868,3 +1868,110 @@ fn compact_page_height_matches_for_cost_based_usage() {
     let lines = super::render_page(InfoPageKind::CompactOnly, &data, inner);
     assert_eq!(lines.len() as u16, layout.pages[0].height);
 }
+
+/// The TodosExpanded overview page must reserve exactly as many rows as it
+/// renders. `expanded_todos_height` is now derived from the actual wrapped line
+/// count (no fixed 12-line cap), so with no other sections the whole list must
+/// fit and a height mismatch would clip the last todo or waste rows.
+#[test]
+fn todos_expanded_page_height_matches_wrapped_rendered_lines() {
+    use super::InfoPageKind;
+    let mk = |id: &str, body: &str, status: &str| todo_item(id, body, status, None);
+
+    for (title, todos, inner_w) in [
+        (
+            "short single-line todos still match",
+            vec![
+                mk("a", "one task", "in_progress"),
+                mk("b", "second task", "pending"),
+            ],
+            40,
+        ),
+        (
+            "many todos match 1:1 (no cap, no +N footer)",
+            (0..20)
+                .map(|i| mk(&format!("t{i}"), &format!("task number {i}"), "pending"))
+                .collect(),
+            40,
+        ),
+        (
+            "long bodies wrap so rendered lines exceed todo count",
+            vec![mk(
+                "w",
+                "a deeply nested transformation pipeline that also handles streaming partial results and rendering them into the debug side panel with several extra words",
+                "in_progress",
+            )],
+            24,
+        ),
+    ] {
+        let data = InfoWidgetData {
+            todos,
+            ..Default::default()
+        };
+        // Tall enough inner area so height is not clipped by the viewport.
+        let inner = Rect::new(0, 0, inner_w, 60);
+        let layout = super::compute_page_layout(&data, inner.width as usize, inner.height);
+
+        // The TodosExpanded candidate must be present and must be what the
+        // multi-page layout selected (single expanded page).
+        assert_eq!(layout.pages.len(), 1, "{title}: page set mismatch");
+        assert_eq!(
+            layout.pages[0].kind,
+            InfoPageKind::TodosExpanded,
+            "{title}"
+        );
+
+        let lines = super::render_page(InfoPageKind::TodosExpanded, &data, inner);
+        assert_eq!(
+            lines.len() as u16,
+            layout.pages[0].height,
+            "{title}: page height must equal rendered line count \
+             (wrapped rows included, no cap, no +N footer)"
+        );
+    }
+}
+
+/// `calculate_widget_height(WidgetKind::Todos)` must match the number of lines
+/// `render_todos_widget` actually produces (header + every wrapped todo row),
+/// for a handful of list sizes and widths. This is the margin-placement height
+/// the earlier fixed "up to 5 + footer" formula ignored; it is now render-based.
+#[test]
+fn todos_widget_height_equals_rendered_line_count() {
+    let mk = |id: &str, body: &str, status: &str| todo_item(id, body, status, None);
+
+    let cases: Vec<(Vec<crate::todo::TodoItem>, u16)> = vec![
+        (vec![mk("a", "one", "in_progress")], 40),
+        ((0..8).map(|i| mk(&format!("t{i}"), &format!("chore {i}"), "pending")).collect(), 40),
+        ((0..20).map(|i| mk(&format!("t{i}"), &format!("chore {i}"), "pending")).collect(), 40),
+        (
+            vec![mk(
+                "w",
+                "a very long single word that must hard wrap 汉字汉字汉字汉字 across the narrow band",
+                "in_progress",
+            )],
+            20,
+        ),
+    ];
+
+    for (todos, width) in cases {
+        let data = InfoWidgetData {
+            todos,
+            ..Default::default()
+        };
+        let rendered = render_todos_widget(&data, Rect::new(0, 0, width, 100)).len() as u16;
+        // Pass a generous max_height so the estimate is not clipped.
+        let estimated =
+            calculate_widget_height(WidgetKind::Todos, &data, width + 2, 100);
+        // calculate_widget_height is border-inclusive (content + 2 border rows),
+        // the same convention the layout uses to seat `block.inner(rect)`; the
+        // placed inner area then holds exactly `rendered` content rows.
+        assert_eq!(estimated, rendered + 2, "todos at width {width}");
+        // Independent check: todos_widget_line_count returns the content-only
+        // line count (no border), so it must equal the rendered rows directly.
+        assert_eq!(
+            super::todos_widget_line_count(&data, width) as u16,
+            rendered,
+            "line_count at width {width}"
+        );
+    }
+}
