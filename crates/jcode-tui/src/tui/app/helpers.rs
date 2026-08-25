@@ -255,10 +255,9 @@ pub(super) fn ctrl_bracket_fallback_to_esc(code: &mut KeyCode, modifiers: &mut K
         KeyCode::Esc => {
             *code = KeyCode::Char('[');
         }
-        KeyCode::Char('5') => {
-            // Legacy tty mapping for Ctrl+]
-            *code = KeyCode::Char(']');
-        }
+        // NOTE: Ctrl+1..9 are now prompt recency-rank jumps (see
+        // ctrl_prompt_rank), so Ctrl+5 is no longer a legacy tty alias for
+        // Ctrl+]; it must reach the recency handler untouched on macOS.
         _ => {}
     }
 }
