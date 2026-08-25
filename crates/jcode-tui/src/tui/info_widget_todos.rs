@@ -332,6 +332,32 @@ fn spans_width(spans: &[Span<'static>]) -> u16 {
     spans.iter().map(|s| s.content.width() as u16).sum()
 }
 
+/// Push a header, wrapping its spans into however many rows are needed so every
+/// row fits `inner.width` (no line is dropped or clipped). Header spans are
+/// short, indivisible units (label, counter, pips, confidence, loop suffix), so
+/// we greedily pack whole spans and break only between them. This lets the
+/// confidence + feedback-loop suffixes stay visible even on narrow widgets
+/// without overflowing the box.
+fn push_header_wrapped(lines: &mut Vec<Line<'static>>, header: Vec<Span<'static>>, inner: Rect) {
+    if header.is_empty() {
+        return;
+    }
+    let max = inner.width.max(1) as usize;
+    let mut row: Vec<Span<'static>> = Vec::new();
+    let mut row_w = 0usize;
+    use unicode_width::UnicodeWidthStr;
+    for span in header {
+        let w = span.content.width();
+        if row_w > 0 && row_w + w > max {
+            lines.push(Line::from(std::mem::take(&mut row)));
+            row_w = 0;
+        }
+        row_w += w;
+        row.push(span);
+    }
+    lines.push(Line::from(row));
+}
+
 /// Normalize a todo's group label, treating empty/whitespace as ungrouped.
 fn todo_group_key(todo: &crate::todo::TodoItem) -> Option<String> {
     todo.group
@@ -599,21 +625,30 @@ pub(super) fn render_todos_widget(data: &InfoWidgetData, inner: Rect) -> Vec<Lin
     ];
     let pip_budget = (inner.width.saturating_sub(12) / 2).clamp(0, 10) as usize;
     push_todo_pips(&mut header, data, pip_budget);
-    push_aggregate_confidence_suffix(&mut header, aggregate_todo_confidence(&data.todos));
+    // The header wraps to multiple rows (push_header_wrapped below), so the
+    // aggregate-confidence and feedback-loop suffixes each get their own row
+    // when wide. Clip them only when a suffix alone is wider than the box.
+    push_aggregate_confidence_suffix_if_fits(
+        &mut header,
+        aggregate_todo_confidence(&data.todos),
+        inner.width,
+    );
 
     // Grouped layout when any todo declares a group; otherwise the flat list.
     if let Some(groups) = grouped_todos(&data.todos) {
-        lines.push(Line::from(header));
+        push_header_wrapped(&mut lines, header, inner);
         lines.extend(render_grouped_todo_lines(&groups, &data.todo_goals, inner, false));
         return lines;
     }
 
     // Flat list: the whole list is one implicit goal, so its feedback-loop score
     // (if recorded) lives on the header line.
-    if let Some(goal) = goal_for_group(&data.todo_goals, None) {
+    if let Some(goal) = goal_for_group(&data.todo_goals, None)
+        .filter(|goal| goal_loop_suffix_width(goal) <= inner.width)
+    {
         push_goal_loop_suffix(&mut header, goal);
     }
-    lines.push(Line::from(header));
+    push_header_wrapped(&mut lines, header, inner);
 
     // Sort todos: in_progress first, then pending, then completed
     let mut sorted_todos: Vec<&crate::todo::TodoItem> = data.todos.iter().collect();
@@ -661,21 +696,27 @@ pub(super) fn render_todos_expanded(data: &InfoWidgetData, inner: Rect) -> Vec<L
     ];
     let pip_budget = (inner.width.saturating_sub(12) / 2).clamp(0, 14) as usize;
     push_todo_pips(&mut header, data, pip_budget);
-    push_aggregate_confidence_suffix(&mut header, aggregate_todo_confidence(&data.todos));
+    push_aggregate_confidence_suffix_if_fits(
+        &mut header,
+        aggregate_todo_confidence(&data.todos),
+        inner.width,
+    );
 
     // Grouped layout when any todo declares a group; otherwise the flat list.
     if let Some(groups) = grouped_todos(&data.todos) {
-        lines.push(Line::from(header));
+        push_header_wrapped(&mut lines, header, inner);
         lines.extend(render_grouped_todo_lines(&groups, &data.todo_goals, inner, true));
         return lines;
     }
 
     // Flat list: the whole list is one implicit goal, so its feedback-loop score
     // (if recorded) lives on the header line.
-    if let Some(goal) = goal_for_group(&data.todo_goals, None) {
+    if let Some(goal) = goal_for_group(&data.todo_goals, None)
+        .filter(|goal| goal_loop_suffix_width(goal) <= inner.width)
+    {
         push_goal_loop_suffix(&mut header, goal);
     }
-    lines.push(Line::from(header));
+    push_header_wrapped(&mut lines, header, inner);
 
     // Sort todos: in_progress first, then pending, then completed
     let mut sorted_todos: Vec<&crate::todo::TodoItem> = data.todos.iter().collect();
