@@ -408,6 +408,35 @@ async fn read_tool_small_bounded_read_is_unaffected_by_budget() {
 }
 
 #[tokio::test]
+async fn read_tool_complete_read_within_budget_emits_no_continuation_hint() {
+    // A read that exactly covers the whole file and fits under the rendered
+    // budget must NOT append a "more lines" continuation hint. This locks the
+    // boundary between a fully-served range and a budget-truncated one: the
+    // budget path computes `end` from the last rendered line, and only adds a
+    // hint when that still precedes the file end.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("complete.txt");
+    std::fs::write(&path, "one\ntwo\nthree\nfour\nfive\n").expect("write file");
+
+    let tool = ReadTool::new();
+    let output = tool
+        .execute(
+            json!({ "file_path": "complete.txt", "start_line": 1, "end_line": 5 }),
+            make_ctx(temp.path().to_path_buf()),
+        )
+        .await
+        .expect("read should succeed");
+
+    // The whole file was served (lines 1..=5), so no continuation hint anywhere.
+    assert!(
+        !output.output.contains("more lines"),
+        "a complete read must not emit a continuation hint: {:?}",
+        output.output
+    );
+    assert!(output.output.contains("5\tfive"), "output={:?}", output.output);
+}
+
+#[tokio::test]
 async fn read_tool_prefers_end_line_over_limit() {
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("sample.txt");
