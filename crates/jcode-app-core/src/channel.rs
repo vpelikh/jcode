@@ -516,12 +516,12 @@ impl TelegramChannel {
         match matches.len() {
             0 => Err(format!(
                 "No live session matches `{}`. Use `/list`, then `/use <n>`, or pick a live session id.",
-                reference
+                crate::telegram::escape_markdown(reference)
             )),
             1 => Ok(matches[0].clone()),
             _ => Err(format!(
                 "`{}` matches {} live sessions; use a longer prefix.",
-                reference,
+                crate::telegram::escape_markdown(reference),
                 matches.len()
             )),
         }
@@ -650,8 +650,16 @@ impl TelegramChannel {
         if let Some(req_id) = crate::notifications::extract_permission_id(trimmed) {
             let (approved, message) =
                 crate::notifications::parse_permission_reply(trimmed);
+            // Record the approving sender's id in the decision audit trail so
+            // it is clear *who* decided (not just via which channel). The
+            // sender is already gated by `is_allowed_sender` above; embedding
+            // the id makes the decision attributable and auditable.
+            let via = match msg.from.as_ref() {
+                Some(from) => format!("telegram_reply:{}", from.id),
+                None => "telegram_reply".to_string(),
+            };
             if let Err(e) =
-                crate::safety::record_permission_via_file(&req_id, approved, "telegram_reply", message)
+                crate::safety::record_permission_via_file(&req_id, approved, &via, message)
             {
                 logging::error(&format!(
                     "Failed to record permission from Telegram for {}: {}",
@@ -730,9 +738,15 @@ impl TelegramChannel {
                 injected
             ));
             let ack = if injected {
-                format!("💬 Message sent to active session: _{}_", trimmed)
+                format!(
+                    "💬 Message sent to active session: \n_{}_",
+                    crate::telegram::escape_markdown(trimmed)
+                )
             } else {
-                format!("📋 Message queued, waking agent: _{}_", trimmed)
+                format!(
+                    "📋 Message queued, waking agent: \n_{}_",
+                    crate::telegram::escape_markdown(trimmed)
+                )
             };
             let _ = self.send_reply(&ack, reply_to).await;
         } else {
