@@ -361,29 +361,45 @@ fn dedup_already_read(
         .map(|state| state.covers_up_to_turn)
         .unwrap_or(0);
 
+    // Collect prior reads that are still in the active context.
+    let mut prior_candidates = Vec::new();
     for (message_index, msg) in session.messages.iter().enumerate() {
         if message_index < compaction_cutoff {
-            // Compacted away; the content is no longer verbatim in context.
             continue;
         }
-        // Use the ToolUse message's timestamp as the "read happened at" anchor:
-        // it precedes the tool result, so `file_unchanged_since` comparing the
-        // file mtime against it is conservative (never treats content read and
-        // then edited as current).
-        let Some(ts) = msg.timestamp else { continue };
         for block in &msg.content {
             if let ContentBlock::ToolUse { name, input, .. } = block
                 && name == "read"
             {
                 let prior = range_from_tool_input(input);
-                let Some(prior_file) = prior.file_path.as_deref() else { continue };
-                if paths_equivalent(prior_file, path)
-                    && file_unchanged_since(current_mtime, &ts)
-                    && coverage_covers(prior.as_range(), range)
-                {
-                    return Some(dedup_pointer_message(path, prior.as_range(), &ts));
-                }
+                let Some(prior_file) = prior.file_path else { continue };
+                let Some(ts) = msg.timestamp else { continue };
+                prior_candidates.push((prior_file, prior.range, ts));
             }
+        }
+    }
+
+    decide_dedup(path, range, current_mtime, &prior_candidates)
+}
+
+/// Core dedup decision, separated from session IO so it is unit-testable.
+///
+/// `prior_candidates` are `(path_str, prior 1-based inclusive range, read_at)`.
+/// Returns the pointer message when a prior read of the same file, still in
+/// active context, unchanged since it was read, fully covers the requested
+/// range.
+fn decide_dedup(
+    path: &Path,
+    range: &NormalizedReadRange,
+    current_mtime: std::time::SystemTime,
+    prior_candidates: &[(String, (usize, usize), chrono::DateTime<chrono::Utc>)],
+) -> Option<String> {
+    for (prior_file, prior_range, ts) in prior_candidates {
+        if paths_equivalent(prior_file, path)
+            && file_unchanged_since(current_mtime, ts)
+            && coverage_covers(*prior_range, range)
+        {
+            return Some(dedup_pointer_message(path, *prior_range, ts));
         }
     }
     None
