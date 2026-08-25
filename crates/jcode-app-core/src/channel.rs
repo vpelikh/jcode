@@ -437,11 +437,7 @@ impl TelegramChannel {
         {
             Ok((id, reply)) => {
                 crate::server::telegram_control::set_active_session(&self.chat_id, &id);
-                format!(
-                    "💬 [{}]\n{}",
-                    short_id(&id),
-                    crate::telegram::escape_markdown(&reply)
-                )
+                agent_reply_message(&id, &reply)
             }
             Err(e) => format!("⚠️ Could not create a session: {e}"),
         }
@@ -498,11 +494,7 @@ impl TelegramChannel {
         )
         .await
         {
-            Ok(reply) => format!(
-                "💬 [{}]\n{}",
-                short_id(&session_id),
-                crate::telegram::escape_markdown(&reply)
-            ),
+            Ok(reply) => agent_reply_message(&session_id, &reply),
             Err(e) => format!("⚠️ Could not resume `{}`: {}", short_id(&session_id), e),
         }
     }
@@ -716,14 +708,7 @@ impl TelegramChannel {
             {
                 Ok(reply) => {
                     let _ = self
-                        .send_reply(
-                            &format!(
-                                "💬 [{}]\n{}",
-                                short_id(&active_id),
-                                crate::telegram::escape_markdown(&reply)
-                            ),
-                            reply_to,
-                        )
+                        .send_reply(&agent_reply_message(&active_id, &reply), reply_to)
                         .await;
                 }
                 Err(e) => {
@@ -751,12 +736,12 @@ impl TelegramChannel {
             ));
             let ack = if injected {
                 format!(
-                    "💬 Message sent to active session: \n_{}_",
+                    "💬 Message sent to active session: _{}_",
                     crate::telegram::escape_markdown(trimmed)
                 )
             } else {
                 format!(
-                    "📋 Message queued, waking agent: \n_{}_",
+                    "📋 Message queued, waking agent: _{}_",
                     crate::telegram::escape_markdown(trimmed)
                 )
             };
@@ -789,6 +774,18 @@ fn split_command(line: &str) -> (String, String) {
 /// First 8 characters of a session id, for compact display.
 fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
+}
+
+/// Format an agent reply for a session-reply message, escaping the reply text
+/// so it cannot break Telegram's legacy `Markdown` parse mode. The reply
+/// follows the short session id on the same line; the id itself is a short
+/// hash and needs no escaping.
+fn agent_reply_message(session_id: &str, reply: &str) -> String {
+    format!(
+        "💬 [{}] {}",
+        short_id(session_id),
+        crate::telegram::escape_markdown(reply)
+    )
 }
 
 const HELP_TEXT: &str = "\
