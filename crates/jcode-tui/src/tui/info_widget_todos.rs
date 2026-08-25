@@ -730,7 +730,7 @@ pub(super) fn render_todos_expanded(data: &InfoWidgetData, inner: Rect) -> Vec<L
     lines
 }
 
-pub(super) fn render_todos_compact(data: &InfoWidgetData, _inner: Rect) -> Vec<Line<'static>> {
+pub(super) fn render_todos_compact(data: &InfoWidgetData, inner: Rect) -> Vec<Line<'static>> {
     if data.todos.is_empty() {
         return Vec::new();
     }
@@ -761,16 +761,28 @@ pub(super) fn render_todos_compact(data: &InfoWidgetData, _inner: Rect) -> Vec<L
             Style::default().fg(rgb(140, 140, 150)),
         ),
     ];
-    push_aggregate_confidence_suffix(&mut summary, aggregate_todo_confidence(&data.todos));
-    if let Some(goal) = goal_for_group(&data.todo_goals, None) {
+    push_aggregate_confidence_suffix_if_fits(
+        &mut summary,
+        aggregate_todo_confidence(&data.todos),
+        inner.width,
+    );
+    if let Some(goal) = goal_for_group(&data.todo_goals, None)
+        .filter(|goal| goal_loop_suffix_width(goal) <= inner.width)
+    {
         push_goal_loop_suffix(&mut summary, goal);
     }
 
-    vec![
-        Line::from(vec![Span::styled(
-            todos_widget_label(data),
-            Style::default().fg(rgb(180, 180, 190)).bold(),
-        )]),
-        Line::from(summary),
-    ]
+    let mut lines = vec![Line::from(vec![Span::styled(
+        todos_widget_label(data),
+        Style::default().fg(rgb(180, 180, 190)).bold(),
+    )])];
+    push_header_wrapped(&mut lines, summary, inner);
+    lines
+}
+
+/// Number of rows the compact todos surface renders at `width` (the label row
+/// plus the wrapped summary rows). Used by the overview page-layout height math
+/// so the compact section's reserved height matches its rendered rows exactly.
+pub(crate) fn todos_compact_line_count(data: &InfoWidgetData, width: u16) -> usize {
+    render_todos_compact(data, Rect::new(0, 0, width, u16::MAX)).len()
 }

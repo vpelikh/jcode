@@ -1,3 +1,4 @@
+use super::info_widget::todos_compact_line_count;
 use super::info_widget::todos_widget_line_count;
 use super::info_widget::{AuthMethod, InfoWidgetData, UsageProvider, is_traceworthy_memory_event};
 
@@ -25,7 +26,7 @@ pub(crate) fn compute_page_layout(
     inner_width: usize,
     inner_height: u16,
 ) -> PageLayout {
-    let compact_height = compact_overview_height(data);
+    let compact_height = compact_overview_height(data, inner_width);
     if compact_height == 0 {
         return PageLayout {
             pages: Vec::new(),
@@ -35,7 +36,7 @@ pub(crate) fn compute_page_layout(
     }
 
     let mut candidates: Vec<InfoPage> = Vec::new();
-    let todos_compact = compact_todos_height(data);
+    let todos_compact = compact_todos_height(data, inner_width);
 
     let todos_expanded = expanded_todos_height(data, inner_width);
     if todos_expanded > 0 {
@@ -111,8 +112,13 @@ fn compact_context_height(data: &InfoWidgetData) -> u16 {
     0
 }
 
-fn compact_todos_height(data: &InfoWidgetData) -> u16 {
-    if data.todos.is_empty() { 0 } else { 2 }
+fn compact_todos_height(data: &InfoWidgetData, inner_width: usize) -> u16 {
+    if data.todos.is_empty() {
+        0
+    } else {
+        // label row + wrapped summary rows, matching render_todos_compact.
+        u16::try_from(todos_compact_line_count(data, inner_width as u16)).unwrap_or(u16::MAX)
+    }
 }
 
 fn compact_memory_height(data: &InfoWidgetData) -> u16 {
@@ -197,10 +203,10 @@ fn compact_git_height(data: &InfoWidgetData) -> u16 {
     0
 }
 
-fn compact_overview_height(data: &InfoWidgetData) -> u16 {
+fn compact_overview_height(data: &InfoWidgetData, inner_width: usize) -> u16 {
     compact_model_height(data)
         + compact_context_height(data)
-        + compact_todos_height(data)
+        + compact_todos_height(data, inner_width)
         + compact_memory_height(data)
         + compact_background_height(data)
         + compact_usage_height(data)
