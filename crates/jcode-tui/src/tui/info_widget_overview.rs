@@ -1,6 +1,5 @@
+use super::info_widget::todos_widget_line_count;
 use super::info_widget::{AuthMethod, InfoWidgetData, UsageProvider, is_traceworthy_memory_event};
-
-pub(crate) const MAX_TODO_LINES: usize = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InfoPageKind {
@@ -23,7 +22,7 @@ pub(crate) struct PageLayout {
 
 pub(crate) fn compute_page_layout(
     data: &InfoWidgetData,
-    _inner_width: usize,
+    inner_width: usize,
     inner_height: u16,
 ) -> PageLayout {
     let compact_height = compact_overview_height(data);
@@ -38,7 +37,7 @@ pub(crate) fn compute_page_layout(
     let mut candidates: Vec<InfoPage> = Vec::new();
     let todos_compact = compact_todos_height(data);
 
-    let todos_expanded = expanded_todos_height(data);
+    let todos_expanded = expanded_todos_height(data, inner_width);
     if todos_expanded > 0 {
         candidates.push(InfoPage {
             kind: InfoPageKind::TodosExpanded,
@@ -209,18 +208,11 @@ fn compact_overview_height(data: &InfoWidgetData) -> u16 {
         + compact_git_height(data)
 }
 
-fn expanded_todos_height(data: &InfoWidgetData) -> u16 {
+fn expanded_todos_height(data: &InfoWidgetData, inner_width: usize) -> u16 {
     if data.todos.is_empty() {
         return 0;
     }
-
-    let available_lines = MAX_TODO_LINES.saturating_sub(1);
-    let todo_lines = data.todos.len().min(available_lines);
-    let mut height = 1 + u16::try_from(todo_lines).unwrap_or(u16::MAX);
-    if data.todos.len() > available_lines {
-        height += 1;
-    }
-    height
+    u16::try_from(todos_widget_line_count(data, inner_width as u16)).unwrap_or(u16::MAX)
 }
 
 fn expanded_memory_height(data: &InfoWidgetData) -> u16 {
