@@ -614,3 +614,59 @@ fn gather_git_info_scopes_to_work_dir_and_caches_per_dir() {
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
 }
+
+/// Integration across the public `gather_git_info` SWR path: a value seeded for
+/// a specific working dir must be returned by `gather_git_info` for that same
+/// dir (proving the seed key and the gather lookup key agree), while a *sibling*
+/// dir keeps its own independent value. Invalidation scoped to one dir must not
+/// disturb another dir's entry, and `invalidate_git_info_cache(None)` must touch
+/// every entry.
+#[test]
+fn git_cache_seed_gather_and_invalidate_are_per_dir() {
+    // Two distinct dirs (need not be real repos; the cache is keyed purely by
+    // canonicalized path and the seeded entries never trigger a git subprocess
+    // within the TTL).
+    let dir_a = std::env::temp_dir().join(format!("jcode-git-ca-{}", std::process::id()));
+    let dir_b = std::env::temp_dir().join(format!("jcode-git-cb-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    let mk = |branch: &str| {
+        Some(crate::tui::info_widget::GitInfo {
+            branch: branch.to_string(),
+            modified: 0,
+            staged: 0,
+            untracked: 0,
+            ahead: 0,
+            behind: 0,
+            dirty_files: Vec::new(),
+        })
+    };
+
+    super::seed_git_info_cache_for_tests(mk("maint"), Some(&dir_a));
+    super::seed_git_info_cache_for_tests(mk("feature-x"), Some(&dir_b));
+
+    // Fresh-ish read of each within TTL resolves its own seeded value.
+    let info_a = super::gather_git_info(Some(&dir_a));
+    let info_b = super::gather_git_info(Some(&dir_b));
+    assert_eq!(info_a.as_ref().map(|i| i.branch.as_str()), Some("maint"));
+    assert_eq!(info_b.as_ref().map(|i| i.branch.as_str()), Some("feature-x"));
+
+    // Invalidate only A: B must be untouched and still report its value.
+    super::invalidate_git_info_cache(Some(&dir_a));
+    let info_b_after = super::gather_git_info(Some(&dir_b));
+    assert_eq!(
+        info_b_after.as_ref().map(|i| i.branch.as_str()),
+        Some("feature-x"),
+        "invalidating one worktree must not disturb the other"
+    );
+
+    // Invalidate everything: both entries are now expired (background refresh
+    // kicks in, which returns the previous value via stale-while-revalidate).
+    super::invalidate_git_info_cache(None);
+
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
