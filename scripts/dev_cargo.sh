@@ -2,6 +2,13 @@
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# Remember where the caller invoked cargo so the build runs in that directory.
+# The wrapper must NOT force everything into the main repo: when called from a
+# git worktree (e.g. /private/tmp/jcode-*), `cargo` must resolve that worktree's
+# Cargo.toml, not the primary checkout. Internal helpers below keep using
+# $repo_root explicitly, so we only need to restore the caller's cwd right
+# before the actual `cargo` invocation.
+caller_cwd="$(pwd)"
 cd "$repo_root"
 
 # `selfdev test` installs a shell-level `cargo` shim so raw `cargo test/check`
@@ -1116,6 +1123,7 @@ if [[ "${JCODE_REMOTE_CARGO:-0}" == "1" ]]; then
   if remote_cargo_preflight; then
     log "using remote cargo via scripts/remote_build.sh"
     rust_action_log_execution="remote"
+    cd "$caller_cwd"
     "$repo_root/scripts/remote_build.sh" "${cargo_argv[@]}"
     exit $?
   fi
@@ -1132,4 +1140,7 @@ acquire_cargo_gate
 # have drained. Measuring before the wait would preserve an unnecessarily low
 # one-job decision even after memory becomes available.
 select_build_jobs
+# Restore the caller's working directory so `cargo` resolves the worktree the
+# user actually invoked it from, not the primary checkout the script cd'd into.
+cd "$caller_cwd"
 run_local_cargo
