@@ -1874,6 +1874,59 @@ fn compact_page_height_matches_for_cost_based_usage() {
     assert_eq!(lines.len() as u16, layout.pages[0].height);
 }
 
+/// The CompactOnly overview page must reserve exactly as many rows as it
+/// renders even when todos are present and their compact summary wraps at the
+/// overview's narrow width. This pins the width-aware compact_todos_height
+/// against the actual rendered page. A tall todo list cannot fit a TodosExpanded
+/// page in a short overview, so the compact page is the only one selected.
+#[test]
+fn compact_page_height_matches_with_wrapped_todos_summary() {
+    use super::InfoPageKind;
+
+    let data = InfoWidgetData {
+        model: Some("claude-test".to_string()),
+        todos: (0..20)
+            .map(|i| todo_item(&format!("t{i}"), "task", "pending", None))
+            .collect(),
+        todo_goals: vec![crate::todo::TodoGoal {
+            group: None,
+            closed_feedback_loop: Some(crate::todo::FeedbackLoopState::from_legacy_score(85)),
+            feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
+            feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::MainPaths),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    // Narrow width forces the compact summary (with confidence + loop suffix)
+    // to wrap across several rows; a tall list fails the TodosExpanded fit, so
+    // the CompactOnly page is selected.
+    let inner_height = 8;
+    for inner_w in 22u16..=40 {
+        let inner = Rect::new(0, 0, inner_w, inner_height);
+        let layout = super::compute_page_layout(&data, inner.width as usize, inner.height);
+        assert!(
+            layout
+                .pages
+                .iter()
+                .any(|p| p.kind == InfoPageKind::CompactOnly),
+            "compact page expected at width {inner_w}"
+        );
+        if let Some(page) = layout
+            .pages
+            .iter()
+            .find(|p| p.kind == InfoPageKind::CompactOnly)
+        {
+            let lines = super::render_page(InfoPageKind::CompactOnly, &data, inner);
+            assert_eq!(
+                lines.len() as u16,
+                page.height,
+                "compact page height must equal rendered rows at width {inner_w}"
+            );
+        }
+    }
+}
+
 /// The TodosExpanded overview page must reserve exactly as many rows as it
 /// renders. `expanded_todos_height` is now derived from the actual wrapped line
 /// count (no fixed 12-line cap), so with no other sections the whole list must
