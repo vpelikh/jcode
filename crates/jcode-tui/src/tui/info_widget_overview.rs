@@ -301,4 +301,68 @@ mod tests {
                 .any(|page| page.kind == InfoPageKind::MemoryExpanded)
         );
     }
+
+    fn mk_todo(i: usize) -> TodoItem {
+        TodoItem {
+            content: format!("task {i}"),
+            status: "pending".to_string(),
+            priority: "medium".to_string(),
+            id: format!("t{i}"),
+            group: None,
+            blocked_by: Vec::new(),
+            assigned_to: None,
+            confidence: None,
+            completion_confidence: None,
+            confidence_history: Vec::new(),
+        }
+    }
+
+    /// `expanded_todos_height` is now render-based (unbounded): a tall todo list
+    /// must still produce a TodosExpanded page when the overview height allows,
+    /// and must degrade to CompactOnly (not an oversized page) when it would
+    /// exceed the overview height. This pins the interaction introduced by the
+    /// render-based height.
+    #[test]
+    fn compute_page_layout_scales_todos_page_with_rendered_height() {
+        // 7 todos -> a TodosExpanded page that fits in a 30-row overview.
+        let data = InfoWidgetData {
+            todos: (0..7).map(mk_todo).collect(),
+            ..Default::default()
+        };
+        let tall = compute_page_layout(&data, 40, 30);
+        assert!(
+            tall
+                .pages
+                .iter()
+                .any(|p| p.kind == InfoPageKind::TodosExpanded),
+            "moderate todo list should offer an expanded page: {:?}",
+            tall.pages
+        );
+        let expanded = tall
+            .pages
+            .iter()
+            .find(|p| p.kind == InfoPageKind::TodosExpanded)
+            .unwrap();
+        // header + 7 wrapped rows (rendered height, border-exclusive here).
+        assert!(expanded.height >= 1 + 7, "height {0}", expanded.height);
+
+        // A huge list that cannot fit the overview height must degrade to the
+        // compact summary page, not produce an oversized/truncated page.
+        let big = InfoWidgetData {
+            todos: (0..200).map(mk_todo).collect(),
+            ..Default::default()
+        };
+        let cramped = compute_page_layout(&big, 40, 8);
+        assert!(
+            !cramped.pages.iter().any(|p| p.kind == InfoPageKind::TodosExpanded),
+            "oversized todo list must not offer an expanded page that can't fit"
+        );
+        assert!(
+            cramped
+                .pages
+                .iter()
+                .any(|p| p.kind == InfoPageKind::CompactOnly),
+            "oversized list falls back to compact"
+        );
+    }
 }
