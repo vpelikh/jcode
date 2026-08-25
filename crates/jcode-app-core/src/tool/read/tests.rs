@@ -448,3 +448,96 @@ async fn read_tool_prefers_end_line_over_limit() {
         output.output
     );
 }
+
+#[test]
+fn normalize_read_range_from_tool_input_handles_all_styles() {
+    // start_line + end_line
+    let json = json!({ "file_path": "f.rs", "start_line": 10, "end_line": 20 });
+    let range = normalize_read_range_from_tool_input(&json);
+    assert_eq!(range, (10, 20));
+
+    // start_line + limit
+    let json = json!({ "file_path": "f.rs", "start_line": 5, "limit": 10 });
+    let range = normalize_read_range_from_tool_input(&json);
+    assert_eq!(range, (5, 14));
+
+    // offset + limit (originally public read parameters)
+    let json = json!({ "file_path": "f.rs", "offset": 9, "limit": 20 });
+    let range = normalize_read_range_from_tool_input(&json);
+    assert_eq!(range, (10, 29));
+
+    // only file_path (default full read): 1-based [1, 5000]
+    let json = json!({ "file_path": "f.rs" });
+    let range = normalize_read_range_from_tool_input(&json);
+    assert_eq!(range, (1, DEFAULT_LIMIT));
+}
+
+#[test]
+fn coverage_covers_requires_prior_range_to_fully_contain_request() {
+    let requested = NormalizedReadRange {
+        offset: 4, // line 5
+        limit: 10, // lines 5..=14
+        style: ReadRangeStyle::StartEnd,
+    };
+
+    // Prior covers lines 1..=20 -> fully contains 5..=14.
+    assert!(coverage_covers((1, 20), &requested));
+    // Prior ends before the request -> not covered.
+    assert!(!coverage_covers((1, 10), &requested));
+    // Prior starts after the request -> not covered.
+    assert!(!coverage_covers((6, 20), &requested));
+    // Exact match -> covered.
+    assert!(coverage_covers((5, 14), &requested));
+}
+
+#[test]
+fn coverage_covers_against_range_request_uses_1based_inclusive() {
+    // Prior read lines [2,4]; request NormalizedReadRange offset=1 limit=3 => lines [2,4].
+    let requested = NormalizedReadRange {
+        offset: 1,
+        limit: 3,
+        style: ReadRangeStyle::StartEnd,
+    };
+    assert!(coverage_covers((2, 4), &requested));
+    assert!(!coverage_covers((2, 3), &requested));
+}
+
+#[test]
+fn file_unchanged_since_returns_true_for_older_mtime() {
+    let now = std::time::SystemTime::now();
+    let since = chrono::DateTime::<chrono::Utc>::from(now + std::time::Duration::from_secs(10));
+    // File mtime (now) is strictly older than the read time (now + 10s) =>
+    // file predates the read => unchanged since => safe to dedup.
+    assert!(file_unchanged_since(now, &since));
+}
+
+#[test]
+fn file_unchanged_since_returns_false_for_newer_or_equal_mtime() {
+    let now = std::time::SystemTime::now();
+    // File mtime equal to read time => ambiguous, do not dedup.
+    let at = chrono::DateTime::<chrono::Utc>::from(now);
+    assert!(!file_unchanged_since(now, &at));
+    // File mtime strictly newer than read time => changed after read => no dedup.
+    let earlier =
+        chrono::DateTime::<chrono::Utc>::from(now - std::time::Duration::from_secs(10));
+    assert!(!file_unchanged_since(now, &earlier));
+}
+
+#[test]
+fn paths_equivalent_canonicalizes_relative_and_absolute() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("target.txt");
+    std::fs::write(&path, "x").expect("write");
+
+    assert!(paths_equivalent(path.to_str().unwrap(), &path));
+    // Same file via a `./`-prefixed relative path under the same parent.
+    let rel = path
+        .parent()
+        .unwrap()
+        .join(format!("./{}", path.file_name().unwrap().to_string_lossy()));
+    assert!(paths_equivalent(rel.to_str().unwrap(), &path));
+    // A different file is not equivalent.
+    let other = temp.path().join("other.txt");
+    std::fs::write(&other, "y").expect("write");
+    assert!(!paths_equivalent(other.to_str().unwrap(), &path));
+}

@@ -656,6 +656,14 @@ pub struct ToolConfig {
         alias = "mcp_tools_auto_threshold_tokens"
     )]
     pub mcp_tools_token_threshold: usize,
+    /// When enabled, a `read` of a file range that was already read earlier in
+    /// this session (still in the active, un-compacted context) and whose file
+    /// has not changed since then returns a compact pointer to the earlier
+    /// result instead of re-emitting the full text, avoiding re-sending
+    /// expensive raw content. It deliberately changes the tool result from
+    /// content to a pointer, so it is opt-in. Default: off.
+    #[serde(alias = "read_dedup")]
+    pub read_dedup: bool,
 }
 
 impl Default for ToolConfig {
@@ -667,6 +675,7 @@ impl Default for ToolConfig {
             disable_base_tools: false,
             mcp_tools: McpToolsMode::Auto,
             mcp_tools_token_threshold: 8_000,
+            read_dedup: false,
         }
     }
 }
