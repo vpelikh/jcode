@@ -1120,49 +1120,44 @@ pub(super) fn encode_rgba_as_png(width: usize, height: usize, rgba: &[u8]) -> Op
 /// refresh. Each working directory keeps an independent entry, so separate
 /// worktrees never share the wrong branch.
 pub(super) fn gather_git_info(work_dir: Option<&Path>) -> Option<GitInfo> {
-    use std::time::Instant;
-
     const TTL: Duration = Duration::from_secs(5);
 
     let key = git_info_cache_key(work_dir);
     if let Ok(mut cache) = GIT_INFO_CACHE.lock() {
         match cache.get_mut(&key) {
             Some((ts, cached, refreshing)) => {
-                if ts.elapsed() < TTL {
-                    return cached.clone();
-                }
-                if *refreshing {
+                if ts.elapsed() < TTL || *refreshing {
                     return cached.clone();
                 }
                 let stale = cached.clone();
                 *refreshing = true;
-                let key = key.clone();
-                let work_dir = work_dir.map(std::path::PathBuf::from);
-                std::thread::spawn(move || {
-                    let result = gather_git_info_inner(work_dir.as_deref());
-                    if let Ok(mut cache) = GIT_INFO_CACHE.lock() {
-                        cache.insert(key, (Instant::now(), result, false));
-                    }
-                });
+                spawn_git_refresh(key, work_dir);
                 return stale;
             }
             None => {
-                let key_for_thread = key.clone();
-                let work_dir = work_dir.map(std::path::PathBuf::from);
                 cache.insert(
                     key.clone(),
                     (backdated_now(TTL + Duration::from_secs(1)), None, true),
                 );
-                std::thread::spawn(move || {
-                    let result = gather_git_info_inner(work_dir.as_deref());
-                    if let Ok(mut cache) = GIT_INFO_CACHE.lock() {
-                        cache.insert(key_for_thread, (Instant::now(), result, false));
-                    }
-                });
+                spawn_git_refresh(key, work_dir);
             }
         }
     }
     None
+}
+
+/// Run `gather_git_info_inner` off the render path for `key` and store the
+/// result back into the per-directory cache. Shared by the cold-cache and
+/// stale-entry refresh branches of `gather_git_info`.
+fn spawn_git_refresh(key: String, work_dir: Option<&Path>) {
+    let key_for_thread = key;
+    let work_dir = work_dir.map(std::path::PathBuf::from);
+    std::thread::spawn(move || {
+        let result = gather_git_info_inner(work_dir.as_deref());
+        if let Ok(mut cache) = GIT_INFO_CACHE.lock() {
+            cache.insert(key_for_thread, (std::time::Instant::now(), result, false));
+        }
+    });
 }
 
 /// Fetch a session's todos plus its goal-level assessments through the same
