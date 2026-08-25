@@ -379,8 +379,8 @@ fn swarm_plan_todos_preserve_blockers_and_assignee_and_flow_to_renderer() {
 #[test]
 fn swarm_plan_running_items_render_before_completed_in_large_plans() {
     // 120-item deep plan: 100 completed, 1 running near the end, rest queued.
-    // The running item must be visible in the small line budget instead of
-    // hiding behind the "+N more" footer.
+    // The widget renders the FULL list (no "+N more" footer), so the running item
+    // is always visible and nothing is hidden behind a line budget.
     let mut items: Vec<crate::plan::PlanItem> = (0..100)
         .map(|i| plan_item(&format!("done-{i}"), "completed"))
         .collect();
@@ -396,9 +396,16 @@ fn swarm_plan_running_items_render_before_completed_in_large_plans() {
     let text = lines_text(&render_todos_widget(&data, Rect::new(0, 0, 60, 8)));
     assert!(
         text.contains("task hot-task"),
-        "running plan item should be visible in the budgeted list: {text}"
+        "running plan item must render: {text}"
     );
-    assert!(text.contains("+"), "footer summarizes the rest: {text}");
+    // Every todo renders; there is no "+N more" summary footer anymore.
+    assert!(
+        !text.contains("+more") && !text.contains("+ done"),
+        "no +N footer expected when the full list renders: {text}"
+    );
+    for i in 0..19 {
+        assert!(text.contains(&format!("queued-{i}")), "queued-{i} must render: {text}");
+    }
 }
 
 #[test]
@@ -552,6 +559,44 @@ fn loop_suffix_renders_safely_at_tiny_sizes() {
         let _ = render_todos_expanded(&data, rect);
         let _ = render_todos_compact(&data, rect);
     }
+}
+
+#[test]
+fn todo_long_content_wraps_instead_of_truncating() {
+    // A todo whose body is far wider than the widget wraps across multiple lines
+    // and keeps the FULL text (no ellipsis), even in a narrow widget.
+    let long_body = "Implement a deeply nested transformation pipeline that also \
+handles streaming partial results and rendering them to the debug side panel";
+    let body_no_spaces = long_body.replace(' ', "");
+    let data = InfoWidgetData {
+        todos: vec![todo_item("a", &long_body, "in_progress", None)],
+        ..Default::default()
+    };
+    let text = lines_text(&render_todos_widget(&data, Rect::new(0, 0, 30, 20)));
+    assert!(!text.contains("..."), "no ellipsis truncation: {text}");
+    // Wrapping splits the body onto multiple rows (each prefixed by the status
+    // glyph), so assert that every word of the body appears rather than relying
+    // on character contiguity across lines.
+    for word in long_body.split_whitespace() {
+        assert!(text.contains(word), "word '{word}' lost in wrap: {text}");
+    }
+
+    // An over-wide single word (no spaces) hard-breaks so nothing is lost.
+    let word_data = InfoWidgetData {
+        todos: vec![todo_item("b", &body_no_spaces, "pending", None)],
+        ..Default::default()
+    };
+    let word_text = lines_text(&render_todos_widget(&word_data, Rect::new(0, 0, 20, 20)));
+    // Strip all whitespace and glyph noise across the hard-broken rows so the
+    // full single word is verifiable as contiguous.
+    let word_compact: String = word_text
+        .chars()
+        .filter(|c| !c.is_whitespace() && !matches!(c, '▶' | '○' | '✓' | '✗' | '⊳' | '·' | '?' | '!'))
+        .collect();
+    assert!(
+        word_compact.contains(&body_no_spaces),
+        "over-wide word must be fully preserved (hard-broken): {word_text}"
+    );
 }
 
 #[test]
