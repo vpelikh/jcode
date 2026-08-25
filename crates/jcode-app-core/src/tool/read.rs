@@ -12,6 +12,21 @@ use std::path::Path;
 const DEFAULT_LIMIT: usize = 5000;
 const MAX_LINE_LEN: usize = 2000;
 
+/// Hard cap on rendered characters for a single `read` call.
+///
+/// The default `limit` is 5000 lines, so an unbounded read of a large file can
+/// emit tens of thousands of normal-width lines. That is a real token cost, and
+/// past the downstream context guard's ~50k-token single-output ceiling the
+/// whole result is *withheld* rather than returned, so the model loses the
+/// content entirely and often re-issues a narrower call.
+///
+/// Capping the rendered output here (well under that ceiling) keeps the useful
+/// *beginning* of the file and always appends an explicit continuation hint, so
+/// a default full-file read degrades to a bounded, useful prefix rather than a
+/// refusal. Explicitly bounded calls (small `limit`/`end_line`) are unaffected
+/// because they almost always land under the cap.
+const MAX_READ_OUTPUT_CHARS: usize = 120_000;
+
 pub struct ReadTool;
 
 impl ReadTool {
@@ -44,16 +59,6 @@ struct NormalizedReadRange {
     offset: usize,
     limit: usize,
     style: ReadRangeStyle,
-}
-
-impl NormalizedReadRange {
-    fn next_offset(self) -> usize {
-        self.offset + self.limit
-    }
-
-    fn next_start_line(self) -> usize {
-        self.next_offset() + 1
-    }
 }
 
 fn normalize_read_range(params: &ReadInput) -> Result<NormalizedReadRange> {
@@ -190,10 +195,15 @@ impl Tool for ReadTool {
         // Read file
         let content = tokio::fs::read_to_string(&path).await?;
 
-        // Single-pass: count lines while building output
+        // Single-pass: count lines while building output, bounded by the limit
+        // and the max rendered character cap. We still count every line up to the
+        // requested range so `total_lines` and the continuation hint stay exact.
         let mut output = String::with_capacity(range.limit.min(2000) * 80);
         let mut total_lines = 0usize;
         let mut truncated_line_count = 0usize;
+        let mut budget_exhausted = false;
+        let mut rendered_chars = 0usize;
+        let mut last_rendered_line = range.offset;
         let end_exclusive = range.offset + range.limit;
         {
             use std::fmt::Write;
@@ -206,22 +216,34 @@ impl Tool for ReadTool {
                     // Still need to count remaining lines
                     continue;
                 }
+                if rendered_chars >= MAX_READ_OUTPUT_CHARS {
+                    // Stop rendering, but keep counting remaining lines so the
+                    // continuation hint below is exact. Once the budget is
+                    // exhausted it stays exhausted for the rest of the range.
+                    budget_exhausted = true;
+                    continue;
+                }
                 let line_num = i + 1;
+                last_rendered_line = i;
                 if line.len() > MAX_LINE_LEN {
                     truncated_line_count += 1;
-                    let _ = writeln!(
-                        output,
-                        "{:>5}\t{}...",
-                        line_num,
-                        crate::util::truncate_str(line, MAX_LINE_LEN)
-                    );
+                    let window = crate::util::truncate_str(line.trim_end(), MAX_LINE_LEN);
+                    let _ = writeln!(output, "{:>5}\t{}...", line_num, window);
+                    // `{:>5}` pads the number to width 5, then tab + content +
+                    // the "..." suffix + newline.
+                    rendered_chars += 5 + 1 + window.chars().count() + 3 + 1;
                 } else {
                     let _ = writeln!(output, "{:>5}\t{}", line_num, line);
+                    rendered_chars += 5 + 1 + line.chars().count() + 1;
                 }
             }
         }
 
-        let end = end_exclusive.min(total_lines);
+        let end = if budget_exhausted {
+            last_rendered_line + 1
+        } else {
+            end_exclusive.min(total_lines)
+        };
 
         // Publish file touch event for swarm coordination
         Bus::global().publish(BusEvent::FileTouch(FileTouch {
@@ -254,8 +276,12 @@ impl Tool for ReadTool {
         // Add metadata
         if end < total_lines {
             let continuation_hint = match range.style {
-                ReadRangeStyle::OffsetLimit => format!("offset={}", range.next_offset()),
-                ReadRangeStyle::StartEnd => format!("start_line={}", range.next_start_line()),
+                // The next line after the last *rendered* line. When the output
+                // budget is exhausted this is earlier than offset+limit, so it
+                // tells the model exactly where to resume rather than skipping
+                // the unrendered portion of the requested range.
+                ReadRangeStyle::OffsetLimit => format!("offset={}", end),
+                ReadRangeStyle::StartEnd => format!("start_line={}", end + 1),
             };
             output.push_str(&format!(
                 "\n... {} more lines (use {} to continue)\n",
