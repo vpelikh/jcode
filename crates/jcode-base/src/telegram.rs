@@ -1,7 +1,25 @@
 use crate::logging;
+use reqwest::StatusCode;
 use serde::Deserialize;
 
 const API_BASE: &str = "https://api.telegram.org/bot";
+
+/// Telegram hard limit on a single message text length in characters.
+/// Messages longer than this are rejected with `400 text is too long`.
+pub const MAX_MESSAGE_CHARS: usize = 4096;
+
+/// Maximum times a transient (HTTP 429) send is retried with backoff.
+const SEND_RETRIES: u32 = 4;
+
+/// Upper bound on a single backoff sleep so a pathological stream of rate
+/// limits can never stall a reply loop for long.
+const MAX_RETRY_DELAY_SECS: u64 = 30;
+
+/// Pause between consecutive chunks of a multi-message send. Firing several
+/// `sendMessage` calls back-to-back can crowd Telegram's per-second flood
+/// window; a short inter-chunk delay keeps long sends under the limit without
+/// noticeably slowing them. Only applies between chunks, not to single sends.
+const INTER_CHUNK_DELAY_MS: u64 = 200;
 
 /// Resolve the effective Telegram Bot API base (with a trailing `/bot`).
 ///
@@ -68,6 +86,38 @@ fn non_empty(value: &str) -> Option<&str> {
     }
 }
 
+/// Split `text` into chunks no longer than Telegram's per-message limit.
+///
+/// Used by senders to deliver arbitrarily-long content (e.g. session history)
+/// as a sequence of messages instead of having Telegram reject it. Chunks are
+/// split on newlines when possible; a single over-long "word" is hard-split.
+pub fn chunk_message(text: &str, max: usize) -> Vec<String> {
+    let max = max.clamp(1, MAX_MESSAGE_CHARS);
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for line in text.split_inclusive('\n') {
+        let mut line = line.to_string();
+        // A single logical line can still exceed the cap (e.g. a long code
+        // line). Hard-split it so no chunk overflows.
+        while line.chars().count() > max {
+            if !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+            }
+            let take: String = line.chars().take(max).collect();
+            line = line.chars().skip(max).collect();
+            chunks.push(take);
+        }
+        if current.chars().count() + line.chars().count() > max && !current.is_empty() {
+            chunks.push(std::mem::take(&mut current));
+        }
+        current.push_str(&line);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
 #[derive(Debug, Deserialize)]
 struct TelegramResponse<T> {
     ok: bool,
@@ -103,11 +153,27 @@ pub struct CallbackMessage {
 #[derive(Debug, Deserialize)]
 pub struct TelegramMessage {
     pub text: Option<String>,
+    /// Caption of a media message (photo/document/video). Used as a textual
+    /// fallback when `text` is absent, so attached files with a caption are not
+    /// silently dropped.
+    #[serde(default)]
+    pub caption: Option<String>,
     pub chat: Chat,
     pub from: Option<TelegramFrom>,
     pub message_id: i64,
     #[serde(rename = "date")]
     pub _date: i64,
+}
+
+impl TelegramMessage {
+    /// The effective inbound text: `text` if present, else a media `caption`.
+    pub fn inbound_text(&self) -> Option<&str> {
+        self.text
+            .as_deref()
+            .or(self.caption.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,6 +201,11 @@ pub async fn send_message(
 /// `reply_to_message_id`, when `Some`, makes Telegram render the message as a
 /// reply to the given message in the chat (used to thread a bot answer under
 /// the user message that triggered it).
+///
+/// Long `text` is split into multiple messages at Telegram's 4096-character
+/// limit so content is never rejected; transient rate limits are retried and,
+/// if Telegram cannot parse the Markdown, the message is resent in plain text
+/// rather than being dropped.
 pub async fn send_message_with_base(
     client: &reqwest::Client,
     bot_token: &str,
@@ -144,30 +215,111 @@ pub async fn send_message_with_base(
     reply_to_message_id: Option<i64>,
 ) -> anyhow::Result<()> {
     let url = format!("{}{}/sendMessage", api_base(base_override), bot_token);
-    let mut body = serde_json::json!({
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": true,
-    });
-    if let Some(reply_to) = reply_to_message_id {
-        body["reply_to_message_id"] = serde_json::json!(reply_to);
+    if text.trim().is_empty() {
+        return Ok(());
     }
-    let resp = client.post(&url).json(&body).send().await?;
+    let chunks = chunk_message(text, MAX_MESSAGE_CHARS);
+    let mut reply_to = reply_to_message_id;
+    for (i, chunk) in chunks.iter().enumerate() {
+        let mut body = serde_json::json!({
+            "chat_id": chat_id,
+            "text": chunk,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": true,
+        });
+        if let Some(rt) = reply_to {
+            body["reply_to_message_id"] = serde_json::json!(rt);
+        }
+        send_message_once(client, &url, body, true).await?;
+        // Only the first message in a multi-chunk sequence threads under the
+        // triggering message; the rest simply follow in the chat.
+        reply_to = None;
+        // Pace consecutive chunks so a long send stays under Telegram's
+        // per-second flood-control window instead of triggering a 429.
+        if i + 1 < chunks.len() {
+            tokio::time::sleep(std::time::Duration::from_millis(INTER_CHUNK_DELAY_MS)).await;
+        }
+    }
+    logging::info(&format!(
+        "Telegram notification sent ({} message{})",
+        chunks.len(),
+        if chunks.len() == 1 { "" } else { "s" }
+    ));
+    Ok(())
+}
 
-    let status = resp.status();
-    let body: TelegramResponse<serde_json::Value> = resp.json().await?;
+/// Send one Telegram message, handling transient HTTP 429 rate limits (with
+/// backoff) and, when `allow_plain_fallback` is set, resending without
+/// `parse_mode` if Telegram rejects the Markdown (so dynamic agent output is
+/// still delivered rather than silently lost).
+async fn send_message_once(
+    client: &reqwest::Client,
+    url: &str,
+    body: serde_json::Value,
+    allow_plain_fallback: bool,
+) -> anyhow::Result<()> {
+    let mut body = body;
+    let mut attempts: u32 = 0;
+    loop {
+        attempts += 1;
+        let resp = match client.post(url).json(&body).send().await {
+            Ok(resp) => resp,
+            Err(e) => return Err(anyhow::anyhow!("Telegram request failed: {e}")),
+        };
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+        let status = resp.status();
 
-    if !body.ok {
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            if attempts > SEND_RETRIES {
+                return Err(anyhow::anyhow!("Telegram rate limited too many times"));
+            }
+            let backoff = retry_after
+                .unwrap_or_else(|| 2u64.pow(attempts.saturating_sub(1)))
+                .max(1)
+                .min(MAX_RETRY_DELAY_SECS);
+            logging::warn(&format!(
+                "Telegram rate limited, waiting {backoff}s (attempt {attempts})"
+            ));
+            tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+            continue;
+        }
+
+        let parsed: TelegramResponse<serde_json::Value> = resp.json().await?;
+        if parsed.ok {
+            return Ok(());
+        }
+        let description = parsed.description.clone().unwrap_or_default();
+        if allow_plain_fallback
+            && is_markdown_parse_error(&description)
+            && !body.get("parse_mode").map(|v| v.is_null()).unwrap_or(true)
+        {
+            logging::warn(&format!(
+                "Telegram rejected Markdown, resending as plain text: {description}"
+            ));
+            if let Some(obj) = body.as_object_mut() {
+                obj.remove("parse_mode");
+            }
+            continue;
+        }
         anyhow::bail!(
             "Telegram API error ({}): {}",
             status,
-            body.description.unwrap_or_default()
+            description
         );
     }
+}
 
-    logging::info("Telegram notification sent");
-    Ok(())
+/// Whether a Bot API error description indicates a Markdown parse failure
+/// (which can be retried without `parse_mode`).
+fn is_markdown_parse_error(description: &str) -> bool {
+    let d = description.to_lowercase();
+    d.contains("can't parse entities")
+        || d.contains("cannot parse entities")
+        || (d.contains("parse:") && d.contains("entity"))
 }
 
 /// Broadcast a chat action such as `typing` to show the user a live indicator
@@ -201,6 +353,7 @@ pub async fn set_my_commands(
     let body = serde_json::json!({
         "commands": [
             { "command": "list", "description": "List recent sessions" },
+            { "command": "new", "description": "Start a new session (optionally with a prompt)" },
             { "command": "use", "description": "Select a session to talk to (id or #)" },
             { "command": "history", "description": "Show recent messages of the active session" },
             { "command": "resume", "description": "Ask a session (id + prompt)" },
@@ -262,17 +415,30 @@ pub async fn send_message_with_keyboard(
     keyboard: &[InlineKeyboardRow],
     base_override: Option<&str>,
 ) -> anyhow::Result<()> {
-    let mut body = serde_json::json!({
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": true,
-    });
-    if !keyboard.is_empty() {
-        let rows: Vec<serde_json::Value> = keyboard.iter().map(|row| json_row(row)).collect();
-        body["reply_markup"] = serde_json::json!({ "inline_keyboard": rows });
+    let url = format!("{}{}/sendMessage", api_base(base_override), bot_token);
+    if text.trim().is_empty() {
+        return Ok(());
     }
-    post_telegram(client, bot_token, "sendMessage", body, base_override).await
+    let chunks = chunk_message(text, MAX_MESSAGE_CHARS);
+    for (i, chunk) in chunks.iter().enumerate() {
+        let mut body = serde_json::json!({
+            "chat_id": chat_id,
+            "text": chunk,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": true,
+        });
+        // Keyboard is attached to the first chunk only; the rest are plain
+        // follow-up messages so the buttons don't repeat.
+        if i == 0 && !keyboard.is_empty() {
+            let rows: Vec<serde_json::Value> = keyboard.iter().map(|row| json_row(row)).collect();
+            body["reply_markup"] = serde_json::json!({ "inline_keyboard": rows });
+        }
+        send_message_once(client, &url, body, true).await?;
+        if i + 1 < chunks.len() {
+            tokio::time::sleep(std::time::Duration::from_millis(INTER_CHUNK_DELAY_MS)).await;
+        }
+    }
+    Ok(())
 }
 
 /// Confirm receipt of a callback query so Telegram stops showing the loading
@@ -314,6 +480,40 @@ async fn post_telegram(
         );
     }
     Ok(())
+}
+
+/// The `getMe` result: the bot's own identity as reported by Telegram.
+#[derive(Debug, Deserialize)]
+pub struct BotIdentity {
+    pub id: i64,
+    #[serde(default)]
+    pub first_name: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+}
+
+/// Call `getMe` to verify the bot token is valid (startup auth check). Returns
+/// the bot identity on success, or an error describing the failure so setup
+/// mistakes surface early instead of as repeated polling errors.
+pub async fn verify_bot_auth(
+    client: &reqwest::Client,
+    bot_token: &str,
+    base_override: Option<&str>,
+) -> anyhow::Result<BotIdentity> {
+    let url = format!("{}{}/getMe", api_base(base_override), bot_token);
+    let resp = client.post(&url).send().await?;
+    let status = resp.status();
+    let parsed: TelegramResponse<BotIdentity> = resp.json().await?;
+    if !parsed.ok {
+        anyhow::bail!(
+            "Telegram auth failed ({}): {}",
+            status,
+            parsed.description.unwrap_or_default()
+        );
+    }
+    parsed
+        .result
+        .ok_or_else(|| anyhow::anyhow!("Telegram getMe returned no bot identity"))
 }
 
 /// Convert one keyboard row into a JSON array of button objects.
@@ -444,6 +644,56 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_message_caption_fallback() {
+        // A media message (photo/document) has a caption but no `text`.
+        let json = r#"{
+            "update_id": 200,
+            "message": {
+                "caption": "  analyze this image  ",
+                "chat": {"id": 456},
+                "message_id": 7,
+                "date": 1700000000
+            }
+        }"#;
+        let update: Update = serde_json::from_str(json).unwrap();
+        let msg = update.message.unwrap();
+        assert!(msg.text.is_none());
+        assert_eq!(msg.inbound_text(), Some("analyze this image"));
+    }
+
+    #[test]
+    fn test_inbound_text_prefers_text_and_trims() {
+        let json = r#"{
+            "update_id": 201,
+            "message": {
+                "text": "  hi  ",
+                "caption": "ignored caption",
+                "chat": {"id": 456},
+                "message_id": 8,
+                "date": 1700000000
+            }
+        }"#;
+        let update: Update = serde_json::from_str(json).unwrap();
+        let msg = update.message.unwrap();
+        assert_eq!(msg.inbound_text(), Some("hi"));
+    }
+
+    #[test]
+    fn test_inbound_text_none_when_no_text_or_caption() {
+        let json = r#"{
+            "update_id": 202,
+            "message": {
+                "chat": {"id": 456},
+                "message_id": 9,
+                "date": 1700000000
+            }
+        }"#;
+        let update: Update = serde_json::from_str(json).unwrap();
+        let msg = update.message.unwrap();
+        assert!(msg.inbound_text().is_none());
+    }
+
+    #[test]
     fn test_api_base_default() {
         assert_eq!(api_base(None), "https://api.telegram.org/bot");
         assert_eq!(api_base(Some("")), "https://api.telegram.org/bot");
@@ -495,5 +745,42 @@ mod tests {
     fn test_api_ip_accepts_ipv4_and_ipv6() {
         assert!(build_client(None, Some("149.154.167.220")).is_ok());
         assert!(build_client(None, Some("2001:67c:4e8::1")).is_ok());
+    }
+
+    #[test]
+    fn test_chunk_message_splits_long_text() {
+        let short = "hello world";
+        let chunks = chunk_message(short, MAX_MESSAGE_CHARS);
+        assert_eq!(chunks, vec![short.to_string()]);
+
+        // Build a text that must span multiple chunks.
+        let long = "line one\n".repeat(3000);
+        let chunks = chunk_message(&long, MAX_MESSAGE_CHARS);
+        assert!(chunks.len() > 1, "expected multiple chunks, got {}", chunks.len());
+        for c in &chunks {
+            assert!(c.chars().count() <= MAX_MESSAGE_CHARS);
+        }
+        let joined: String = chunks.concat();
+        assert_eq!(joined, long);
+    }
+
+    #[test]
+    fn test_chunk_message_hard_splits_oversized_single_line() {
+        let line = "x".repeat(10_000);
+        let chunks = chunk_message(&line, 100);
+        assert_eq!(chunks.len(), 100);
+        for c in &chunks {
+            assert_eq!(c.chars().count(), 100);
+        }
+        assert_eq!(chunks.concat(), line);
+    }
+
+    #[test]
+    fn test_is_markdown_parse_error_detects_common_messages() {
+        assert!(is_markdown_parse_error("can't parse entities"));
+        assert!(is_markdown_parse_error("Bad Request: can't parse entities"));
+        assert!(is_markdown_parse_error("cannot parse entities"));
+        assert!(is_markdown_parse_error("parse: unexpected ... entity"));
+        assert!(!is_markdown_parse_error("message text is empty"));
     }
 }
