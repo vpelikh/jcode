@@ -304,8 +304,16 @@ fn remote_ownership_gate_reads_the_remote_goal_assessment() {
         )
         .expect("save remote goal assessment");
 
-        assert!(!app.schedule_auto_poke_followup_if_needed());
-        assert!(app.queued_messages.is_empty());
+        // The remote session's goal assessment clears the ownership gate, so
+        // no ownership continuation is queued. Post-1bd235b5f the clean
+        // completion path still returns true because it requests the concise
+        // final-response turn ("All todos done"), not a poke.
+        assert!(app.schedule_auto_poke_followup_if_needed());
+        assert_eq!(
+            app.queued_messages,
+            vec![crate::todo::TODO_FINAL_RESPONSE_CONTINUATION_MESSAGE.to_string()],
+            "a passing remote goal yields the final-response turn, not a poke"
+        );
     });
 }
 
@@ -668,7 +676,13 @@ fn completed_cycle_rearms_auto_poke_only_when_default_on() {
             }],
         )
         .expect("save passing goal");
-        assert!(!app.schedule_auto_poke_followup_if_needed());
+        // Post-1bd235b5f a clean completion returns true because it requests
+        // the concise final-response turn; it is not a poke or a gate retry.
+        assert!(app.schedule_auto_poke_followup_if_needed());
+        assert_eq!(
+            app.queued_messages,
+            vec![crate::todo::TODO_FINAL_RESPONSE_CONTINUATION_MESSAGE.to_string()]
+        );
         assert!(
             app.auto_poke_incomplete_todos,
             "default-on auto-poke should cover the next batch of work too"
@@ -694,7 +708,10 @@ fn completed_cycle_rearms_auto_poke_only_when_default_on() {
         )
         .expect("save passing goal");
         app.auto_poke_incomplete_todos = true; // pretend a stale arm survived
-        assert!(!app.schedule_auto_poke_followup_if_needed());
+        // Even though a stale arm lets the call proceed and it returns true to
+        // request the final-response turn, the disarmed default must win: the
+        // default-on re-arm never re-arms because auto_poke_default_on is false.
+        assert!(app.schedule_auto_poke_followup_if_needed());
         assert!(
             !app.auto_poke_incomplete_todos,
             "/poke off must not be undone by the default-on re-arm"

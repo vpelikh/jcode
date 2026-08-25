@@ -1671,7 +1671,8 @@ fn recent_project_review_falls_back_cleanly_when_no_repo_is_known() {
     assert!(app.queued_messages.is_empty());
     assert!(matches!(app.onboarding_phase(), Some(OnboardingPhase::Suggestions)));
     assert!(app.status_notice.as_ref().is_some_and(|(notice, _)| {
-        notice.contains("No recent Git repository found")
+        // Matches the current fallback copy (e90512dd6 rewrote the notice).
+        notice.contains("No active Git repository found")
     }));
 }
 
