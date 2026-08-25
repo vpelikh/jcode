@@ -670,3 +670,69 @@ fn git_cache_seed_gather_and_invalidate_are_per_dir() {
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
 }
+
+/// Faithful reproduction of the reported bug using a *real* linked worktree:
+/// one repo with `master` checked out at the main path and a feature branch
+/// checked out at a linked worktree. Before the fix, `gather_git_info` ran git
+/// against the daemon's CWD (the main checkout) and always reported `master` no
+/// matter which worktree the session was in. After the fix, the worktree dir
+/// scopes git correctly, and each worktree reports its own branch.
+#[test]
+fn gather_git_info_resolves_real_worktree_branch() {
+    use std::process::Command;
+
+    fn git_ok(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = Command::new("git").args(args).current_dir(dir).output().unwrap();
+        assert!(out.status.success(), "git {args:?} failed in {dir:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    let main = std::env::temp_dir().join(format!("jcode-wt-main-{}", std::process::id()));
+    let linked = std::env::temp_dir().join(format!("jcode-wt-link-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&main);
+    let _ = std::fs::remove_dir_all(&linked);
+    std::fs::create_dir_all(&main).unwrap();
+
+    git_ok(&main, &["init", "-b", "master"]);
+    std::fs::write(main.join("README.md"), "# repo\n").unwrap();
+    git_ok(&main, &["add", "."]);
+    git_ok(&main, &["commit", "-m", "init", "--no-gpg-sign"]);
+    // Create the feature branch, return main to master, then link a worktree
+    // dedicated to the feature branch - the exact scenario from the bug report.
+    git_ok(&main, &["checkout", "-b", "feat/panel"]);
+    git_ok(&main, &["checkout", "master"]);
+    git_ok(
+        &main,
+        &["worktree", "add", linked.to_str().unwrap(), "feat/panel"],
+    );
+
+    // The linked worktree is now on feat/panel while the main path is on master,
+    // so a CWD-blind query (pre-fix behavior) would always report master.
+
+    assert_eq!(
+        git_ok(&linked, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "feat/panel"
+    );
+    assert_eq!(
+        git_ok(&main, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "master"
+    );
+
+    // Scoping to the linked worktree dir must yield feat/panel, not master.
+    let linked_info = super::gather_git_info_inner(Some(&linked));
+    assert_eq!(
+        linked_info.as_ref().map(|i| i.branch.as_str()),
+        Some("feat/panel"),
+        "worktree session must report its own branch, not master"
+    );
+    // Scoping to the main checkout yields master.
+    let main_info = super::gather_git_info_inner(Some(&main));
+    assert_eq!(main_info.as_ref().map(|i| i.branch.as_str()), Some("master"));
+
+    let _ = git_ok(
+        &main,
+        &["worktree", "remove", "--force", linked.to_str().unwrap()],
+    );
+    let _ = std::fs::remove_dir_all(&linked);
+    let _ = std::fs::remove_dir_all(&main);
+}
