@@ -338,6 +338,12 @@ disable_base_tools = false
 # Env overrides: JCODE_MCP_TOOLS, JCODE_MCP_TOOLS_TOKEN_THRESHOLD.
 mcp_tools = "auto"
 mcp_tools_token_threshold = 8000
+# Avoid re-sending a file range to the model when it was already read earlier
+# in this session, the file has not changed since, and the earlier result is
+# still in the active (un-compacted) context. When all hold, `read` returns a
+# compact pointer to the earlier result instead of the full text. Opt-in
+# because it changes the tool result from content to a pointer.
+read_dedup = false
 
 [acp]
 # Agent Client Protocol adapter compatibility profile: standard, extended, or full.

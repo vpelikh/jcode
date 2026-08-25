@@ -2,6 +2,9 @@
 
 use super::{Tool, ToolContext, ToolOutput};
 use crate::bus::{Bus, BusEvent, FileOp, FileTouch};
+use crate::config;
+use crate::message::ContentBlock;
+use crate::session::Session;
 use anyhow::Result;
 use async_trait::async_trait;
 use jcode_terminal_image::{ImageDisplayParams, ImageProtocol, display_image};
@@ -192,6 +195,32 @@ impl Tool for ReadTool {
             )));
         }
 
+        // Dedup: if enabled, and this exact file range was already read earlier
+        // in this session (still in active context, file unchanged), return a
+        // compact pointer instead of re-reading the file.
+        if config::config().tools.read_dedup
+            && let Some(pointer) = dedup_already_read(&ctx, &path, &range)
+        {
+            Bus::global().publish(BusEvent::FileTouch(FileTouch {
+                session_id: ctx.session_id.clone(),
+                path: path.to_path_buf(),
+                op: FileOp::Read,
+                intent: None,
+                summary: Some(format!(
+                    "read dedup: lines {}-{} of {} already in context",
+                    range.offset + 1,
+                    range.offset + range.limit,
+                    Path::new(&params.file_path).display()
+                )),
+                detail: None,
+            }));
+            crate::logging::info(&format!(
+                "[tool:read] dedup for {} in session {} (range={}..{})",
+                params.file_path, ctx.session_id, range.offset + 1, range.offset + range.limit
+            ));
+            return Ok(ToolOutput::new(pointer));
+        }
+
         // Read file
         let content = tokio::fs::read_to_string(&path).await?;
 
@@ -300,6 +329,172 @@ impl Tool for ReadTool {
 
 #[cfg(test)]
 mod tests;
+
+/// Try to deduplicate this read against an earlier read in the same session.
+///
+/// Returns `Some(pointer)` when the exact requested range was already read
+/// earlier in this session, that earlier result is still part of the *active*
+/// (un-compacted) context, and the file has not changed since that read. The
+/// returned pointer tells the model the content is already in context rather
+/// than re-emitting the full text. Repeated reads of unchanged file ranges are
+/// collapsed to a pointer. Fully conservative gating means we never serve stale or
+/// already-summarized content.
+///
+/// Returns `None` (meaning "read normally") when dedup does not apply.
+fn dedup_already_read(
+    ctx: &ToolContext,
+    path: &Path,
+    range: &NormalizedReadRange,
+) -> Option<String> {
+    // File freshness anchor: the file must not be newer than the prior read.
+    let metadata = std::fs::metadata(path).ok()?;
+    let current_mtime = metadata.modified().ok()?;
+
+    // Load the session (cheap disk read; only reached when read_dedup is on).
+    let session = Session::load(&ctx.session_id).ok()?;
+
+    // Compaction cutoff: messages before this index were summarized away, so a
+    // prior read there is no longer verbatim in context.
+    let compaction_cutoff = session
+        .compaction
+        .as_ref()
+        .map(|state| state.covers_up_to_turn)
+        .unwrap_or(0);
+
+    for (message_index, msg) in session.messages.iter().enumerate() {
+        if message_index < compaction_cutoff {
+            // Compacted away; the content is no longer verbatim in context.
+            continue;
+        }
+        // Use the ToolUse message's timestamp as the "read happened at" anchor:
+        // it precedes the tool result, so `file_unchanged_since` comparing the
+        // file mtime against it is conservative (never treats content read and
+        // then edited as current).
+        let Some(ts) = msg.timestamp else { continue };
+        for block in &msg.content {
+            if let ContentBlock::ToolUse { name, input, .. } = block
+                && name == "read"
+            {
+                let prior = range_from_tool_input(input);
+                let Some(prior_file) = prior.file_path.as_deref() else { continue };
+                if paths_equivalent(prior_file, path)
+                    && file_unchanged_since(current_mtime, &ts)
+                    && coverage_covers(prior.as_range(), range)
+                {
+                    return Some(dedup_pointer_message(path, prior.as_range(), &ts));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// A prior read's file path and normalized line range, parsed from a read tool
+/// input object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RangeRequest {
+    file_path: Option<String>,
+    range: (usize, usize), // (start_line, end_line), 1-based inclusive
+}
+
+impl RangeRequest {
+    fn as_range(&self) -> (usize, usize) {
+        self.range
+    }
+}
+
+fn range_from_tool_input(input: &Value) -> RangeRequest {
+    let file_path = input
+        .get("file_path")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let range = normalize_read_range_from_tool_input(input);
+    RangeRequest { file_path, range }
+}
+
+/// Normalize a read tool input's `start_line`/`end_line`/`offset`/`limit` into
+/// a 1-based inclusive `(start_line, end_line)` range. Mirrors
+/// [`normalize_read_range`] but for already-serialized tool inputs.
+fn normalize_read_range_from_tool_input(input: &Value) -> (usize, usize) {
+    let start_line = input
+        .get("start_line")
+        .and_then(|value| value.as_u64())
+        .map(|value| value as usize);
+    let end_line = input
+        .get("end_line")
+        .and_then(|value| value.as_u64())
+        .map(|value| value as usize);
+    let offset = input
+        .get("offset")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as usize;
+    let limit = input
+        .get("limit")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(DEFAULT_LIMIT as u64) as usize;
+
+    match (start_line, end_line) {
+        (Some(start), Some(end)) => (start.max(1), end.max(start.max(1))),
+        (Some(start), None) => (start.max(1), start + limit.saturating_sub(1)),
+        (None, Some(end)) => (1, end),
+        (None, None) => (offset + 1, offset + limit),
+    }
+}
+
+/// Whether a requested range is fully covered by a prior range, both as
+/// 1-based inclusive `(start_line, end_line)`.
+fn coverage_covers(prior: (usize, usize), requested: &NormalizedReadRange) -> bool {
+    // NormalizedReadRange is 0-based `offset` + `limit`; convert to 1-based
+    // inclusive end for comparison.
+    let requested_start = requested.offset + 1;
+    let requested_end = requested.offset + requested.limit;
+    prior.0 <= requested_start && prior.1 >= requested_end
+}
+
+/// Whether two paths resolve to the same file (by canonicalized absolute path).
+fn paths_equivalent(a: &str, b: &Path) -> bool {
+    let a_path = Path::new(a);
+    let canon_a = std::fs::canonicalize(a_path).unwrap_or_else(|_| a_path.to_path_buf());
+    let canon_b = std::fs::canonicalize(b).unwrap_or_else(|_| b.to_path_buf());
+    canon_a == canon_b
+}
+
+/// Whether the file was not modified after the prior-read time `since`.
+///
+/// We pass the file's *current* mtime and compare it to the prior read's
+/// recorded time. The prior read time is the message timestamp, which is set
+/// when the read happened. If the file's mtime is strictly earlier than that
+/// read time, the file was not edited after the read (editing bumps mtime to a
+/// newer value), so dedup is safe. If mtime is at or after the read time, the
+/// file may have changed since, so we do not dedup.
+fn file_unchanged_since(
+    current_mtime: std::time::SystemTime,
+    since: &chrono::DateTime<chrono::Utc>,
+) -> bool {
+    // `Err` means current_mtime < since (strictly before the read) => the file
+    // was not modified after the read => unchanged => safe to dedup.
+    current_mtime
+        .duration_since(std::time::SystemTime::from(*since))
+        .is_err()
+}
+
+/// Build the compact pointer message returned instead of re-reading.
+fn dedup_pointer_message(
+    path: &Path,
+    prior: (usize, usize),
+    read_at: &chrono::DateTime<chrono::Utc>,
+) -> String {
+    format!(
+        "Already in context: {} (lines {}-{}), read in this session at {}.\n\
+         The file has not changed since, so this range is already available in the earlier \
+         tool result and is not re-sent. If you need a fresh copy (e.g. after an edit), \
+         read a specific line range that forces a new read, or change the file.",
+        path.display(),
+        prior.0,
+        prior.1,
+        read_at
+    )
+}
 
 fn is_binary_file(path: &Path) -> bool {
     // Check by extension first (no I/O needed)
