@@ -541,3 +541,139 @@ fn paths_equivalent_canonicalizes_relative_and_absolute() {
     std::fs::write(&other, "y").expect("write");
     assert!(!paths_equivalent(other.to_str().unwrap(), &path));
 }
+
+/// Build a candidate prior-read tuple for `decide_dedup` where the file
+/// (mtime = now) was read `secs_ahead` seconds *after* `now`, so the file
+/// predates the read and the freshness gate does not block dedup, isolating the
+/// other decision dimensions.
+fn candidate_ahead(path: &str, range: (usize, usize), secs_ahead: i64) -> (String, (usize, usize), chrono::DateTime<chrono::Utc>) {
+    let now = std::time::SystemTime::now();
+    let read_at = chrono::DateTime::<chrono::Utc>::from(
+        now + std::time::Duration::from_secs(secs_ahead.max(0) as u64),
+    );
+    (path.to_string(), range, read_at)
+}
+
+#[test]
+fn decide_dedup_returns_pointer_when_unchanged_and_covered() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("f.rs");
+    std::fs::write(&path, "x").expect("write");
+    let now = std::time::SystemTime::now();
+    let requested = NormalizedReadRange {
+        offset: 4,
+        limit: 10,
+        style: ReadRangeStyle::StartEnd,
+    };
+
+    // File mtime = now was read 100s *later* (read_at in the future relative to
+    // the mtime), so the file predates the read => unchanged since => dedup
+    // applies.
+    let read_at = chrono::DateTime::<chrono::Utc>::from(
+        now + std::time::Duration::from_secs(100),
+    );
+    let result = decide_dedup(
+        &path,
+        &requested,
+        now,
+        &[(path.to_str().unwrap().to_string(), (1, 20), read_at)],
+    );
+    assert!(result.is_some(), "expected dedup, got None");
+    let msg = result.unwrap();
+    assert!(msg.contains("Already in context"), "{msg}");
+    assert!(msg.contains("lines 1-20"), "{msg}");
+}
+
+#[test]
+fn decide_dedup_skips_different_file() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("f.rs");
+    let other = temp.path().join("g.rs");
+    std::fs::write(&path, "x").expect("write");
+    std::fs::write(&other, "y").expect("write");
+    let now = std::time::SystemTime::now();
+    let requested = NormalizedReadRange {
+        offset: 0,
+        limit: 5,
+        style: ReadRangeStyle::StartEnd,
+    };
+    let result = decide_dedup(
+        &path,
+        &requested,
+        now,
+        &[candidate_ahead(other.to_str().unwrap(), (1, 20), 100)],
+    );
+    assert!(result.is_none(), "different file must not dedup");
+}
+
+/// Build a candidate prior-read tuple for `decide_dedup` where the read
+/// happened `secs_ago` seconds before the file mtime (mtime after read => the
+/// file is *newer* than the read => the freshness gate blocks dedup).
+fn candidate_before(path: &str, range: (usize, usize), secs_ago: i64) -> (String, (usize, usize), chrono::DateTime<chrono::Utc>) {
+    let now = std::time::SystemTime::now();
+    let read_at = chrono::DateTime::<chrono::Utc>::from(
+        now - std::time::Duration::from_secs(secs_ago.max(0) as u64),
+    );
+    (path.to_string(), range, read_at)
+}
+
+#[test]
+fn decide_dedup_skips_changed_file() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("f.rs");
+    std::fs::write(&path, "x").expect("write");
+    let now = std::time::SystemTime::now();
+    let requested = NormalizedReadRange {
+        offset: 0,
+        limit: 5,
+        style: ReadRangeStyle::StartEnd,
+    };
+    // The file was read 100s ago, but its mtime is now (newer than the read):
+    // the file changed after it was read, so dedup must not apply even though
+    // the same file and a covering range were requested.
+    let result = decide_dedup(
+        &path,
+        &requested,
+        now,
+        &[candidate_before(path.to_str().unwrap(), (1, 20), 100)],
+    );
+    assert!(result.is_none(), "changed file must not dedup");
+}
+
+#[test]
+fn decide_dedup_skips_uncovered_range() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("f.rs");
+    std::fs::write(&path, "x").expect("write");
+    let now = std::time::SystemTime::now();
+    // Request lines 10..=14.
+    let requested = NormalizedReadRange {
+        offset: 9,
+        limit: 5,
+        style: ReadRangeStyle::StartEnd,
+    };
+    // Prior only read lines 1..=10 -> does not cover 10..=14 fully.
+    // Prior read 100s after mtime (unchanged); only the partial coverage blocks.
+    let result = decide_dedup(
+        &path,
+        &requested,
+        now,
+        &[candidate_ahead(path.to_str().unwrap(), (1, 10), 100)],
+    );
+    assert!(result.is_none(), "partial coverage must not dedup");
+}
+
+#[test]
+fn decide_dedup_returns_none_for_no_prior() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("f.rs");
+    std::fs::write(&path, "x").expect("write");
+    let now = std::time::SystemTime::now();
+    let requested = NormalizedReadRange {
+        offset: 0,
+        limit: 5,
+        style: ReadRangeStyle::StartEnd,
+    };
+    let result = decide_dedup(&path, &requested, now, &[]);
+    assert!(result.is_none(), "no prior read must not dedup");
+}
