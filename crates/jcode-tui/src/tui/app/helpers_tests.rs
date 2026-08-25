@@ -663,9 +663,32 @@ fn git_cache_seed_gather_and_invalidate_are_per_dir() {
         "invalidating one worktree must not disturb the other"
     );
 
-    // Invalidate everything: both entries are now expired (background refresh
-    // kicks in, which returns the previous value via stale-while-revalidate).
+    // Invalidate everything: both entries are backdated past the TTL and left
+    // not-refreshing, so the next read treats them as expired (SWR returns the
+    // last value and kicks a background refresh) instead of dropping them. Check
+    // the cache internals directly - the public read is racy against the
+    // background refresh, but the invalidation's blast radius is not.
     super::invalidate_git_info_cache(None);
+    {
+        let keys = {
+            let guard = super::GIT_INFO_CACHE.lock().unwrap();
+            guard.keys().cloned().collect::<Vec<_>>()
+        };
+        assert_eq!(keys.len(), 2, "global invalidation must not drop entries");
+        let guard = super::GIT_INFO_CACHE.lock().unwrap();
+        for (ts, cached, refreshing) in guard.values() {
+            assert!(cached.is_some(), "SWR keeps the last value on invalidation");
+            assert!(
+                !refreshing,
+                "invalidation clears the refreshing flag so a refresh may run"
+            );
+            // Backdated 3600s, or at minimum older than the 5s TTL.
+            let backdate = std::time::Duration::from_secs(3600);
+            let now = std::time::Instant::now();
+            let expired = matches!(now.checked_sub(backdate), Some(cutoff) if *ts <= cutoff);
+            assert!(expired, "entry must be backdated past the TTL");
+        }
+    }
 
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
@@ -708,7 +731,6 @@ fn gather_git_info_resolves_real_worktree_branch() {
 
     // The linked worktree is now on feat/panel while the main path is on master,
     // so a CWD-blind query (pre-fix behavior) would always report master.
-
     assert_eq!(
         git_ok(&linked, &["rev-parse", "--abbrev-ref", "HEAD"]),
         "feat/panel"
