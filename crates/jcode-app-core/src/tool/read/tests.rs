@@ -754,3 +754,176 @@ fn collect_prior_read_candidates_keeps_uncompacted_reads_with_ranges() {
     assert_eq!(candidates[1].0, "a.rs");
     assert_eq!(candidates[1].1, (20, 30));
 }
+
+/// End-to-end acceptance: with `[tools] read_dedup = true`, re-reading a file
+/// range that a prior `read` in the same session (unchanged since) already put
+/// in active context returns a compact pointer instead of the full text.
+///
+/// Exercises the real integration boundary: a persisted on-disk session (via an
+/// isolated `JCODE_HOME`), the global config cache (via `Config::invalidate_cache`),
+/// and `ReadTool::execute` itself.
+#[tokio::test]
+async fn read_tool_dedup_returns_pointer_for_unchanged_reread() {
+    // Isolate config + session storage so the test never touches the user's
+    // real ~/.jcode directory (the same pattern config_color_tests uses).
+    let _guard = crate::storage::lock_test_env();
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let home = tempfile::TempDir::new().expect("tempdir");
+    crate::env::set_var("JCODE_HOME", home.path());
+    crate::config::Config::invalidate_cache();
+
+    // A session whose first message is a `read` of lines 1..=10 of target.txt.
+    let session_id = "e2e-dedup-session";
+    let mut session =
+        crate::session::Session::create_with_id(session_id.to_string(), None, None);
+    let file = home.path().join("target.txt");
+    std::fs::write(&file, "one\ntwo\nthree\n").expect("write target");
+    let now = chrono::Utc::now();
+    session.messages = vec![crate::session::StoredMessage {
+        id: "m0".to_string(),
+        role: crate::message::Role::User,
+        content: vec![ContentBlock::ToolUse {
+            id: "call-read".to_string(),
+            name: "read".to_string(),
+            input: json!({
+                "file_path": file.to_str().unwrap(),
+                "start_line": 1,
+                "end_line": 10,
+            }),
+            thought_signature: None,
+        }],
+        display_role: None,
+        timestamp: Some(now),
+        tool_duration_ms: None,
+        token_usage: None,
+    }];
+    session.save().expect("persist session");
+
+    // Enable read_dedup through a real config file read by the global cache.
+    let config_path = crate::config::Config::path().expect("config path");
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent).expect("create config dir");
+    }
+    std::fs::write(&config_path, "[tools]\nread_dedup = true\n")
+        .expect("write config with read_dedup");
+    crate::config::Config::invalidate_cache();
+
+    // Read the same file/range through ReadTool::execute.
+    let tool = ReadTool::new();
+    let ctx = make_ctx(home.path().to_path_buf());
+    // make_ctx fixes session_id to "test-session"; align the persisted session.
+    let ctx = ToolContext {
+        session_id: session_id.to_string(),
+        ..ctx
+    };
+    let output = tool
+        .execute(
+            json!({ "file_path": "target.txt", "start_line": 1, "end_line": 3 }),
+            ctx,
+        )
+        .await
+        .expect("read should succeed");
+
+    // The prior read covered lines 1..=10 (enclosing the request 1..=3) and the
+    // file is unchanged (mtime predates the read), so execute returns the
+    // pointer rather than the file content.
+    assert!(
+        output.output.contains("Already in context"),
+        "expected dedup pointer, got: {:?}",
+        output.output
+    );
+
+    crate::config::Config::invalidate_cache();
+    if let Some(prev) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}
+
+/// End-to-end negative: even with `read_dedup = true`, a second read of a range
+/// whose file was *modified after* the prior read must return the fresh content,
+/// never a stale pointer. This exercises the freshness guard through the real
+/// `ReadTool::execute` path.
+#[tokio::test]
+async fn read_tool_dedup_returns_fresh_content_when_file_changed() {
+    let _guard = crate::storage::lock_test_env();
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let home = tempfile::TempDir::new().expect("tempdir");
+    crate::env::set_var("JCODE_HOME", home.path());
+    crate::config::Config::invalidate_cache();
+
+    let session_id = "e2e-dedup-changed";
+    let mut session =
+        crate::session::Session::create_with_id(session_id.to_string(), None, None);
+    let file = home.path().join("target.txt");
+    std::fs::write(&file, "one\ntwo\nthree\n").expect("write target");
+
+    // Model "file read, then edited": the prior read's timestamp is *before* we
+    // then touch the file, so after editing the file mtime is newer than the read.
+    let read_time = chrono::Utc::now();
+    session.messages = vec![crate::session::StoredMessage {
+        id: "m0".to_string(),
+        role: crate::message::Role::User,
+        content: vec![ContentBlock::ToolUse {
+            id: "call-read".to_string(),
+            name: "read".to_string(),
+            input: json!({
+                "file_path": file.to_str().unwrap(),
+                "start_line": 1,
+                "end_line": 10,
+            }),
+            thought_signature: None,
+        }],
+        display_role: None,
+        timestamp: Some(read_time),
+        tool_duration_ms: None,
+        token_usage: None,
+    }];
+    session.save().expect("persist session");
+
+    let config_path = crate::config::Config::path().expect("config path");
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent).expect("create config dir");
+    }
+    std::fs::write(&config_path, "[tools]\nread_dedup = true\n")
+        .expect("write config with read_dedup");
+    crate::config::Config::invalidate_cache();
+
+    // Now modify the file after the prior read: its mtime becomes newer than
+    // read_time, so dedup must NOT apply.
+    std::fs::write(&file, "one\nTWO\nthree\n").expect("rewrite target after read");
+
+    let tool = ReadTool::new();
+    let ctx = ToolContext {
+        session_id: session_id.to_string(),
+        ..make_ctx(home.path().to_path_buf())
+    };
+    let output = tool
+        .execute(
+            json!({ "file_path": "target.txt", "start_line": 1, "end_line": 3 }),
+            ctx,
+        )
+        .await
+        .expect("read should succeed");
+
+    // The file changed after the prior read, so the fresh (updated) content must
+    // be returned, not a dedup pointer.
+    assert!(
+        !output.output.contains("Already in context"),
+        "changed file must return content, not a pointer: {:?}",
+        output.output
+    );
+    assert!(
+        output.output.contains("TWO"),
+        "expected the updated file content, got: {:?}",
+        output.output
+    );
+
+    crate::config::Config::invalidate_cache();
+    if let Some(prev) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}
