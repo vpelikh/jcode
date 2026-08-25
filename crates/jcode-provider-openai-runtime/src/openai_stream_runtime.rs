@@ -123,9 +123,8 @@ pub(super) async fn stream_response(
 
     // Surface the upload size right away so a long "sending context" phase is
     // explainable (large payload draining on a slow uplink).
-    let payload_bytes = serde_json::to_vec(&request)
-        .map(|bytes| bytes.len() as u64)
-        .unwrap_or(0);
+    let payload = serde_json::to_vec(&request).unwrap_or_default();
+    let payload_bytes = payload.len() as u64;
     if payload_bytes > 0 {
         emit_status_detail(
             &tx,
@@ -137,21 +136,35 @@ pub(super) async fn stream_response(
         .await;
     }
 
-    let response = jcode_provider_core::transport::send_with_initial_response_timeout_with_progress(
-        builder.json(&request),
-        idle_timeout,
-        std::time::Duration::from_secs(5),
-        |msg: &str| {
-            let tx = tx.clone();
-            let msg = msg.to_string();
-            async move {
-                emit_status_detail(&tx, msg).await;
-            }
-        },
-    )
-    .await
-    .context("Failed to send request to OpenAI API")
-    .map_err(OpenAIStreamFailure::Other)?;
+    let upload_tx = tx.clone();
+    let response =
+        jcode_provider_core::transport::send_body_with_upload_progress(
+            builder,
+            payload,
+            idle_timeout,
+            &jcode_provider_core::transport::endpoint_label(&url),
+            move |sent| {
+                let detail = jcode_provider_core::transport::upload_progress_label(
+                    sent,
+                    payload_bytes,
+                );
+                if !detail.is_empty() {
+                    let _ = upload_tx.try_send(Ok(StreamEvent::StatusDetail {
+                        detail,
+                    }));
+                }
+            },
+            |msg: &str| {
+                let tx = tx.clone();
+                let msg = msg.to_string();
+                async move {
+                    emit_status_detail(&tx, msg).await;
+                }
+            },
+        )
+        .await
+        .context("Failed to send request to OpenAI API")
+        .map_err(OpenAIStreamFailure::Other)?;
 
     let connect_ms = connect_start.elapsed().as_millis();
     jcode_base::logging::info(&format!(
