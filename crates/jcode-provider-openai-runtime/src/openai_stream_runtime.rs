@@ -142,7 +142,6 @@ pub(super) async fn stream_response(
             builder,
             payload,
             idle_timeout,
-            &jcode_provider_core::transport::endpoint_label(&url),
             move |sent| {
                 let detail = jcode_provider_core::transport::upload_progress_label(
                     sent,
