@@ -95,19 +95,44 @@ fn non_empty(value: &str) -> Option<&str> {
 /// cannot (a) break parse_mode and trigger a "can't parse entities" resend, or
 /// (b) leak unintended bold/italic/code formatting into the visible output.
 ///
+/// A literal `\` is only special when it precedes one of the escapable
+/// characters (it introduces an escape). So a backslash is doubled *only* when
+/// followed by `_`, `*`, `` ` ``, `[`, `]`, or another `\`; a backslash before
+/// any other character is left as-is so content like a Windows path
+/// (`C:\Users\foo`) or a regex (`\d+`) renders without doubling.
+///
 /// The surrounding static markup is *not* escaped here; callers compose the
 /// trusted delimiters (`*bold*`, `` `code` ``) and escape only the interpolated
 /// value: `format!("💬 _{}_", escape_markdown(user_input))`.
 pub fn escape_markdown(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
         match ch {
-            '_' | '*' | '`' | '[' | ']' | '\\' => {
+            '_' | '*' | '`' | '[' | ']' => {
                 out.push('\\');
                 out.push(ch);
             }
+            '\\' => {
+                // A backslash needs escaping only when it precedes an escapable
+                // char (i.e. when Telegram would otherwise treat it as an escape
+                // marker). Otherwise it is a literal backslash already.
+                let next_escapable = chars
+                    .get(i + 1)
+                    .map(|n| matches!(n, '_' | '*' | '`' | '[' | ']' | '\\'))
+                    .unwrap_or(false);
+                if next_escapable {
+                    out.push('\\');
+                    out.push('\\');
+                } else {
+                    out.push('\\');
+                }
+            }
             _ => out.push(ch),
         }
+        i += 1;
     }
     out
 }
@@ -846,9 +871,21 @@ mod tests {
         assert_eq!(escape_markdown("a*b"), "a\\*b");
         assert_eq!(escape_markdown("`code`"), "\\`code\\`");
         assert_eq!(escape_markdown("[x]"), "\\[x\\]");
-        assert_eq!(escape_markdown("back\\slash"), "back\\\\slash");
-        // Backslash is escaped first, so it also protects the char after it.
+        // A backslash before an escapable char is doubled so it renders literally.
         assert_eq!(escape_markdown("_a_"), "\\_a\\_");
+        // Two consecutive backslashes: the first precedes a `\` (doubled), the
+        // second precedes `b` (kept single), so the value ends with three `\`.
+        assert_eq!(escape_markdown(r"a\\b"), r"a\\\b");
+    }
+
+    #[test]
+    fn test_escape_markdown_does_not_double_unrelated_backslashes() {
+        // A backslash before a non-escapable char is already literal, so it is
+        // NOT doubled: Windows paths and regexes render without `\\`.
+        assert_eq!(escape_markdown(r"C:\Users\foo"), r"C:\Users\foo");
+        assert_eq!(escape_markdown(r"\d+\.\d+"), r"\d+\.\d+");
+        // Trailing backslash has no following char; stays single.
+        assert_eq!(escape_markdown(r"path\"), r"path\");
     }
 
     #[test]
