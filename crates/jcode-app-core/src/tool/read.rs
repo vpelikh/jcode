@@ -361,10 +361,25 @@ fn dedup_already_read(
         .map(|state| state.covers_up_to_turn)
         .unwrap_or(0);
 
-    // Collect prior reads that are still in the active context.
+    let prior_candidates =
+        collect_prior_read_candidates(&session.messages, compaction_cutoff);
+
+    decide_dedup(path, range, current_mtime, &prior_candidates)
+}
+
+/// Collect prior `read` tool calls from session messages that are still in the
+/// active (un-compacted) context, as `(file_path, prior_range, read_at)` triples.
+///
+/// Separated from the rest of dedup so the session-scrape -> candidate
+/// conversion is unit-testable without a persisted on-disk session.
+fn collect_prior_read_candidates(
+    messages: &[crate::session::StoredMessage],
+    compaction_cutoff: usize,
+) -> Vec<(String, (usize, usize), chrono::DateTime<chrono::Utc>)> {
     let mut prior_candidates = Vec::new();
-    for (message_index, msg) in session.messages.iter().enumerate() {
+    for (message_index, msg) in messages.iter().enumerate() {
         if message_index < compaction_cutoff {
+            // Compacted away; the content is no longer verbatim in context.
             continue;
         }
         for block in &msg.content {
@@ -378,8 +393,7 @@ fn dedup_already_read(
             }
         }
     }
-
-    decide_dedup(path, range, current_mtime, &prior_candidates)
+    prior_candidates
 }
 
 /// Core dedup decision, separated from session IO so it is unit-testable.
