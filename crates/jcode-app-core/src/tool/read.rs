@@ -532,9 +532,10 @@ fn dedup_pointer_message(
 ) -> String {
     format!(
         "Already in context: {} (lines {}-{}), read in this session at {}.\n\
-         The file has not changed since, so this range is already available in the earlier \
-         tool result and is not re-sent. If you need a fresh copy (e.g. after an edit), \
-         read a specific line range that forces a new read, or change the file.",
+         The file has not changed since that read, so re-reading would return the exact same \
+         bytes; they are already available in the earlier tool result and are not re-sent here. \
+         If you expected different content, the file must have been edited (in that case this \
+         pointer would not have been returned).",
         path.display(),
         prior.0,
         prior.1,
