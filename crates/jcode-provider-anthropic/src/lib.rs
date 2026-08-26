@@ -509,7 +509,7 @@ pub fn format_tools(tools: &[ToolDefinition], is_oauth: bool, cache_ttl_1h: bool
                 &["skill_manage"],
                 ApiTool {
                     name: "Skill".to_string(),
-                    description: "Execute a skill within the main conversation".to_string(),
+                    description: "Execute a skill within the main conversation. Load a skill (e.g. {\"skill\":\"<name>\"}) to use its instructions when the task matches its described capability.".to_string(),
                     input_schema: json!({"type":"object","properties":{"skill":{"type":"string"},"args":{"type":"string"}},"required":["skill"],"additionalProperties":false}),
                     cache_control: None,
                 },
@@ -1136,6 +1136,22 @@ mod cache_prefix_invariant_tests {
         assert_eq!(names.iter().filter(|n| **n == "Agent").count(), 1);
         assert_eq!(names.iter().filter(|n| **n == "Bash").count(), 1);
         assert_eq!(names.iter().filter(|n| **n == "Read").count(), 1);
+    }
+
+    #[test]
+    fn oauth_skill_tool_description_tells_the_model_it_can_load_skills() {
+        // In OAuth mode the curated `Skill` tool replaces the local
+        // skill_manage description, so its own text must still tell the model
+        // it can self-load a skill (issue: ccc skill never used).
+        let registry = vec![tool_def("skill_manage")];
+        let formatted = format_tools(&registry, true, false);
+
+        let skill = formatted
+            .iter()
+            .find(|t| t.name == "Skill")
+            .expect("curated Skill tool");
+        assert!(skill.description.contains("skill"));
+        assert!(skill.description.contains("Load a skill"));
     }
 
     #[test]

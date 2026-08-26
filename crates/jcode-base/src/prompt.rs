@@ -251,7 +251,7 @@ fn build_available_skills_section(available_skills: &[SkillInfo]) -> Option<Stri
         return None;
     }
 
-    let mut section = "# Available Skills\n\nYou have access to the following skills that the user can invoke with `/skillname`:\n".to_string();
+    let mut section = "# Available Skills\n\nYou have the following skills available. The user can invoke one with `/skillname`; you can also load one yourself with the `skill_manage` tool (action=load) when its described capability is relevant to the task. Do not wait for the user to invoke a skill you can use to do the job better; load it proactively.\n".to_string();
     for skill in available_skills {
         section.push_str(&format!(
             "\n- `/{} ` - {}",
@@ -260,7 +260,7 @@ fn build_available_skills_section(available_skills: &[SkillInfo]) -> Option<Stri
         ));
     }
     section.push_str(
-        "\n\nWhen a user asks about available skills or capabilities, mention these skills.",
+        "\n\nWhen a user asks about available skills or capabilities, mention these skills and offer to activate them.",
     );
     Some(section)
 }
