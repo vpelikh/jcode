@@ -2622,3 +2622,85 @@ fn test_credential_failure_breaker_resets_on_turn_success() {
         "a successful turn must reset the credential-failure streak"
     );
 }
+
+/// A reload recovery continuation is sent with `auto_retry == true`. If the
+/// server rejects it with "Already processing a message" (the previous turn is
+/// still finishing server-side, e.g. a reload/reconnect raced the dispatch),
+/// the continuation must be requeued and re-adopted with the running-turn state
+/// instead of being pushed through the generic retry path. Otherwise the busy
+/// rejection burns retry budget against a still-running turn and eventually
+/// exhausts it, dropping the continuation that is the only thing that resumes
+/// an interrupted headed session after reload (regression for the
+/// "Auto-retry limit reached after 3 attempts" failure after a reload).
+#[test]
+fn test_remote_busy_rejection_requeues_auto_retry_recovery_continuation() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    // Shape: an in-flight reload recovery continuation. System message with an
+    // empty send content and a system reminder, auto_retry=true (the reload
+    // recovery directive), zero attempts consumed.
+    app.rate_limit_pending_message = Some(PendingRemoteMessage {
+        content: String::new(),
+        images: vec![],
+        is_system: true,
+        system_reminder: Some(
+            "Reload succeeded (v1 \u{2192} v2). Continue immediately from where you left off."
+                .to_string(),
+        ),
+        auto_retry: true,
+        retry_attempts: 0,
+        retry_at: None,
+    });
+    app.is_processing = true;
+    app.status = ProcessingStatus::Sending;
+    app.current_message_id = Some(20);
+
+    let needs_redraw = app.handle_server_event(
+        crate::protocol::ServerEvent::Error {
+            id: 20,
+            message: "Already processing a message".to_string(),
+            retry_after_secs: None,
+        },
+        &mut remote,
+    );
+
+    // The continuation must be recovered into the hidden system-message queue,
+    // not burned through the retry budget.
+    assert!(
+        needs_redraw,
+        "busy rejection should request a redraw for the re-adopted state"
+    );
+    assert!(app.rate_limit_pending_message.is_none());
+    assert!(
+        app.rate_limit_reset.is_none(),
+        "busy rejection must not arm a rate-limit retry"
+    );
+    assert_eq!(
+        app.hidden_queued_system_messages.len(),
+        1,
+        "reload continuation should be requeued for redispatch after the busy turn"
+    );
+    assert!(
+        app.hidden_queued_system_messages[0].contains("Continue immediately"),
+        "the recovery reminder should be preserved"
+    );
+    assert!(app.queued_messages().is_empty());
+    assert!(app.is_processing, "server busy state should be re-adopted");
+    assert!(matches!(app.status, ProcessingStatus::Thinking(_)));
+    assert!(app.current_message_id.is_none());
+    assert_eq!(
+        app.status_notice(),
+        Some("Server still busy; follow-up stays queued".to_string())
+    );
+
+    // And critically: no "Auto-retry limit reached" error should be produced.
+    assert!(
+        !app.display_messages()
+            .iter()
+            .any(|m| m.role == "error" && m.content.contains("Auto-retry limit reached")),
+        "a busy rejection must not exhaust the retry budget"
+    );
+}
