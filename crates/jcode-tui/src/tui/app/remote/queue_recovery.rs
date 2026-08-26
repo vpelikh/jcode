@@ -119,21 +119,26 @@ impl App {
 ///
 /// A queued follow-up that was already taken from `queued_messages` and handed
 /// to `begin_remote_send` lives only in `rate_limit_pending_message` while it
-/// is in flight. That pending shape (`is_system` with `auto_retry == false`)
-/// has no retry path: the tick resend requires a rate-limit reset timestamp
-/// and the disconnect resend requires `auto_retry`. If the connection dies
-/// before the turn completes (typically a server reload handoff racing the
-/// dispatch), clearing the pending message silently drops the user's queued
-/// message (issue #391). Instead, put it back at the front of the queue so it
-/// is re-sent once the turn is proven idle after reconnect, which is the
-/// queue's contract.
+/// is in flight. If the connection dies before the turn completes (typically a
+/// server reload handoff racing the dispatch), clearing the pending message
+/// silently drops the user's queued message (issue #391). Instead, put it back
+/// at the front of the queue so it is re-sent once the turn is proven idle
+/// after reconnect, which is the queue's contract.
+///
+/// The pending shape is a queued continuation when `is_system` and carries
+/// either an empty-send system reminder (a reload recovery directive) or
+/// non-empty content. Both `auto_retry` states are recoverable. A reload
+/// recovery continuation arrives with `auto_retry == true`; on a server-busy
+/// rejection its generic retry path boots it through the tick resend and burns
+/// the retry budget against a still-running turn. Recovering it here instead
+/// holds it briefly and re-sends it once after the real turn finishes, which is
+/// the only thing that resumes an interrupted headed session after reload.
 pub(super) fn recover_undelivered_queued_continuation(app: &mut App, reason: &str) -> bool {
     let is_recoverable = app
         .rate_limit_pending_message
         .as_ref()
         .is_some_and(|pending| {
             pending.is_system
-                && !pending.auto_retry
                 && (!pending.content.trim().is_empty() || pending.system_reminder.is_some())
         });
     if !is_recoverable {
