@@ -256,7 +256,7 @@ impl Tool for ReadTool {
                 last_rendered_line = i;
                 if line.len() > MAX_LINE_LEN {
                     truncated_line_count += 1;
-                    let window = crate::util::truncate_str(line.trim_end(), MAX_LINE_LEN);
+                    let window = crate::util::truncate_str(line, MAX_LINE_LEN);
                     let _ = writeln!(output, "{:>5}\t{}...", line_num, window);
                     // `{:>5}` pads the number to width 5, then tab + content +
                     // the "..." suffix + newline.
