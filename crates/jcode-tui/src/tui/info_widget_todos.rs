@@ -509,22 +509,26 @@ fn push_todo_item_line(
         rgb(160, 160, 170)
     };
 
-    // Fixed prefix consumed by the status glyph, optional priority marker, the
-    // per-item confidence suffix, and the blocked suffix.
-    let prefix_width = indent
-        + 2 // glyph + following space
-        + priority_marker.0.len()
-        + todo_confidence_suffix_width(todo) as usize;
-
+    // Fixed prefix consumed by the status glyph and optional priority marker.
+    // The per-item confidence and blocked suffixes are *optional* trailers:
+    // they must never crowd the content into a clipped column.
+    //
+    // Continuation rows indent under the content start and repeat a dim glyph,
+    // so their leading prefix is `indent + 4 + priority` (2 for the item glyph,
+    // 2 for the repeated continuation glyph). To guarantee NO row overflows we
+    // wrap the content to that widest prefix; the first row shows `wrapped[0]`,
+    // which leaves the widest-prefix-to-first-prefix gap plus any leftover for
+    // the optional confidence/blocked trailers.
+    let cont_prefix = indent + 4 + priority_marker.0.len();
     let content_width = inner
         .width
-        .saturating_sub(prefix_width as u16)
-        .saturating_sub(suffix.len() as u16)
+        .saturating_sub(cont_prefix as u16)
         .max(1) as usize;
 
     let wrapped = wrap_text_width(&todo.content, content_width);
 
-    // First line carries the status glyph + priority marker + content + suffix.
+    // First line carries the status glyph + priority marker + content, then the
+    // optional confidence + blocked trailers only if they fit.
     let mut first_spans = Vec::new();
     if indent > 0 {
         first_spans.push(Span::raw(" ".repeat(indent)));
@@ -543,8 +547,20 @@ fn push_todo_item_line(
         wrapped[0].clone(),
         Style::default().fg(text_color),
     ));
-    push_todo_confidence_suffix(&mut first_spans, todo);
-    if !suffix.is_empty() {
+    // The confidence and blocked suffixes are appended only when they fit in the
+    // remaining columns after the content, never when they would overflow the
+    // box or crowd the content into a clipped column.
+    let suffix_start = spans_width(&first_spans) as usize;
+    let remaining = inner.width.saturating_sub(suffix_start as u16) as usize;
+    let confidence_w = todo_confidence_suffix_width(todo) as usize;
+    if confidence_w > 0 && confidence_w <= remaining {
+        push_todo_confidence_suffix(&mut first_spans, todo);
+    }
+    if !suffix.is_empty()
+        && suffix.len() <= inner
+            .width
+            .saturating_sub(spans_width(&first_spans) as u16) as usize
+    {
         first_spans.push(Span::styled(
             suffix.to_string(),
             Style::default().fg(rgb(100, 100, 110)),
