@@ -770,7 +770,6 @@ fn collect_prior_read_candidates_skips_compacted_and_non_read_messages() {
 
 #[test]
 fn collect_prior_read_candidates_keeps_uncompacted_reads_with_ranges() {
-    use crate::message::Role;
     let now = chrono::Utc::now();
     let messages = vec![
         read_message("m0", "a.rs", 1, 10, now),
