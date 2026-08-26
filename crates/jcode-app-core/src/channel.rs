@@ -283,12 +283,12 @@ impl TelegramChannel {
         let active = crate::server::telegram_control::active_session_for(&self.chat_id);
         let mut rows: Vec<InlineKeyboardRow> = Vec::new();
         for s in sessions.iter() {
-            let title = s
+            let title: String = s
                 .display_title()
-                .unwrap_or("<untitled>")
+                .unwrap_or_else(|| s.session_id.as_str())
                 .chars()
                 .take(30)
-                .collect::<String>();
+                .collect();
             let short: String = s.session_id.chars().take(8).collect();
             let prefix = if active.as_deref() == Some(s.session_id.as_str()) {
                 "✅ "
