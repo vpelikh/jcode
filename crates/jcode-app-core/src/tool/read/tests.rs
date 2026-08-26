@@ -502,6 +502,32 @@ fn normalize_read_range_from_tool_input_handles_all_styles() {
 }
 
 #[test]
+fn normalize_read_range_from_tool_input_saturates_on_overflow() {
+    // A stored read tool input can carry a huge or near-usize::MAX limit/start.
+    // Range normalization must saturate rather than panic on the addition so a
+    // malformed prior read can never crash the dedup path.
+    let max = usize::MAX as u64;
+
+    // start_line + huge limit
+    let json = json!({ "file_path": "f.rs", "start_line": max, "limit": max });
+    let range = normalize_read_range_from_tool_input(&json);
+    assert_eq!(range.0, max as usize);
+    assert_eq!(range.1, usize::MAX, "must saturate, not overflow");
+
+    // offset + huge limit
+    let json = json!({ "file_path": "f.rs", "offset": max, "limit": max });
+    let range = normalize_read_range_from_tool_input(&json);
+    assert_eq!(range.0, max as usize, "offset+1 saturates at usize::MAX");
+    assert_eq!(range.1, usize::MAX, "must saturate, not overflow");
+
+    // start_line + huge limit: subtraction is also protected
+    let json = json!({ "file_path": "f.rs", "start_line": 1, "limit": max });
+    let range = normalize_read_range_from_tool_input(&json);
+    assert_eq!(range.0, 1);
+    assert_eq!(range.1, usize::MAX, "start + (limit-1) must saturate");
+}
+
+#[test]
 fn coverage_covers_requires_prior_range_to_fully_contain_request() {
     let requested = NormalizedReadRange {
         offset: 4, // line 5

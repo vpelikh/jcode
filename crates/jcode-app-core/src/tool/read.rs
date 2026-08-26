@@ -475,9 +475,9 @@ fn normalize_read_range_from_tool_input(input: &Value) -> (usize, usize) {
 
     match (start_line, end_line) {
         (Some(start), Some(end)) => (start.max(1), end.max(start.max(1))),
-        (Some(start), None) => (start.max(1), start + limit.saturating_sub(1)),
+        (Some(start), None) => (start.max(1), start.saturating_add(limit.saturating_sub(1))),
         (None, Some(end)) => (1, end),
-        (None, None) => (offset + 1, offset + limit),
+        (None, None) => (offset.saturating_add(1), offset.saturating_add(limit)),
     }
 }
 
