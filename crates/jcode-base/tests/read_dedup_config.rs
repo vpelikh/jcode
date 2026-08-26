@@ -26,3 +26,18 @@ fn read_dedup_false_override_round_trips() {
         .expect("standalone [tools] read_dedup=false must parse");
     assert!(!parsed.tools.read_dedup, "read_dedup=false must be honored");
 }
+
+#[test]
+fn read_dedup_defaults_to_on_when_absent_from_existing_config() {
+    use jcode_base::config::Config;
+    // Existing users' configs lack the read_dedup key. A `[tools]` section with
+    // only unrelated keys must resolve the missing flag to the struct default
+    // (on), honoring the "default on" behavior for anyone who hasn't opted out.
+    let existing = "[tools]\nread_dedup = true\nprofile = \"full\"\n";
+    let parsed = toml::from_str::<Config>(existing)
+        .expect("config without read_dedup key must parse");
+    assert!(
+        parsed.tools.read_dedup,
+        "read_dedup must default to on when absent from an existing config"
+    );
+}
