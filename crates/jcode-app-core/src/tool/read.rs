@@ -443,12 +443,6 @@ struct RangeRequest {
     range: (usize, usize), // (start_line, end_line), 1-based inclusive
 }
 
-impl RangeRequest {
-    fn as_range(&self) -> (usize, usize) {
-        self.range
-    }
-}
-
 fn range_from_tool_input(input: &Value) -> RangeRequest {
     let file_path = input
         .get("file_path")
