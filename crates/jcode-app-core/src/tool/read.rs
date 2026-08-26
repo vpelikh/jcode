@@ -30,6 +30,17 @@ const MAX_LINE_LEN: usize = 2000;
 /// because they almost always land under the cap.
 const MAX_READ_OUTPUT_CHARS: usize = 120_000;
 
+/// Minimum requested line count before we bother attempting read dedup.
+///
+/// `dedup_already_read` loads the persisted session from disk to find prior
+/// reads of the same range, which is a real per-call IO cost (and now that
+/// `read_dedup` is on by default, it runs on every `read`). For small reads the
+/// pointer-vs-content saving is negligible, so gating them here skips the
+/// session load entirely and keeps the common "read a few lines" case free of
+/// that overhead. Only reads requesting at least this many lines pay for the
+/// dedup lookup.
+const READ_DEDUP_MIN_LINES: usize = 50;
+
 pub struct ReadTool;
 
 impl ReadTool {
@@ -198,7 +209,12 @@ impl Tool for ReadTool {
         // Dedup: if enabled, and this exact file range was already read earlier
         // in this session (still in active context, file unchanged), return a
         // compact pointer instead of re-reading the file.
+        //
+        // Only bother for reads of a meaningful size: attempting it loads the
+        // persisted session from disk, so tiny reads (under READ_DEDUP_MIN_LINES)
+        // skip that overhead entirely since the saving would be negligible.
         if config::config().tools.read_dedup
+            && range.limit >= READ_DEDUP_MIN_LINES
             && let Some(pointer) = dedup_already_read(&ctx, &path, &range)
         {
             Bus::global().publish(BusEvent::FileTouch(FileTouch {

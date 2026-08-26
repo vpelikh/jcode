@@ -801,12 +801,14 @@ async fn read_tool_dedup_returns_pointer_for_unchanged_reread() {
     crate::env::set_var("JCODE_HOME", home.path());
     crate::config::Config::invalidate_cache();
 
-    // A session whose first message is a `read` of lines 1..=10 of target.txt.
+    // A session whose first message is a `read` of lines 1..=200 of target.txt.
     let session_id = "e2e-dedup-session";
     let mut session =
         crate::session::Session::create_with_id(session_id.to_string(), None, None);
     let file = home.path().join("target.txt");
-    std::fs::write(&file, "one\ntwo\nthree\n").expect("write target");
+    // Enough lines that the dedup lookup (gated on READ_DEDUP_MIN_LINES) runs.
+    std::fs::write(&file, (1..=200).map(|n| format!("line {n}\n")).collect::<String>())
+        .expect("write target");
     let now = chrono::Utc::now();
     session.messages = vec![crate::session::StoredMessage {
         id: "m0".to_string(),
@@ -817,7 +819,7 @@ async fn read_tool_dedup_returns_pointer_for_unchanged_reread() {
             input: json!({
                 "file_path": file.to_str().unwrap(),
                 "start_line": 1,
-                "end_line": 10,
+                "end_line": 200,
             }),
             thought_signature: None,
         }],
@@ -847,13 +849,13 @@ async fn read_tool_dedup_returns_pointer_for_unchanged_reread() {
     };
     let output = tool
         .execute(
-            json!({ "file_path": "target.txt", "start_line": 1, "end_line": 3 }),
+            json!({ "file_path": "target.txt", "start_line": 1, "end_line": 60 }),
             ctx,
         )
         .await
         .expect("read should succeed");
 
-    // The prior read covered lines 1..=10 (enclosing the request 1..=3) and the
+    // The prior read covered lines 1..=200 (enclosing the request 1..=60) and the
     // file is unchanged (mtime predates the read), so execute returns the
     // pointer rather than the file content.
     assert!(
@@ -886,7 +888,8 @@ async fn read_tool_dedup_returns_fresh_content_when_file_changed() {
     let mut session =
         crate::session::Session::create_with_id(session_id.to_string(), None, None);
     let file = home.path().join("target.txt");
-    std::fs::write(&file, "one\ntwo\nthree\n").expect("write target");
+    std::fs::write(&file, (1..=200).map(|n| format!("line {n}\n")).collect::<String>())
+        .expect("write target");
 
     // Model "file read, then edited": the prior read's timestamp is *before* we
     // then touch the file, so after editing the file mtime is newer than the read.
@@ -900,7 +903,7 @@ async fn read_tool_dedup_returns_fresh_content_when_file_changed() {
             input: json!({
                 "file_path": file.to_str().unwrap(),
                 "start_line": 1,
-                "end_line": 10,
+                "end_line": 200,
             }),
             thought_signature: None,
         }],
@@ -921,7 +924,8 @@ async fn read_tool_dedup_returns_fresh_content_when_file_changed() {
 
     // Now modify the file after the prior read: its mtime becomes newer than
     // read_time, so dedup must NOT apply.
-    std::fs::write(&file, "one\nTWO\nthree\n").expect("rewrite target after read");
+    std::fs::write(&file, (1..=200).map(|n| format!("LINE {n}\n")).collect::<String>())
+        .expect("rewrite target after read");
 
     let tool = ReadTool::new();
     let ctx = ToolContext {
@@ -930,7 +934,7 @@ async fn read_tool_dedup_returns_fresh_content_when_file_changed() {
     };
     let output = tool
         .execute(
-            json!({ "file_path": "target.txt", "start_line": 1, "end_line": 3 }),
+            json!({ "file_path": "target.txt", "start_line": 1, "end_line": 60 }),
             ctx,
         )
         .await
@@ -944,8 +948,88 @@ async fn read_tool_dedup_returns_fresh_content_when_file_changed() {
         output.output
     );
     assert!(
-        output.output.contains("TWO"),
+        output.output.contains("LINE"),
         "expected the updated file content, got: {:?}",
+        output.output
+    );
+
+    crate::config::Config::invalidate_cache();
+    if let Some(prev) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}
+
+/// End-to-end: small reads (under READ_DEDUP_MIN_LINES) skip the dedup lookup
+/// entirely, even when the same unchanged range was previously read and
+/// `read_dedup` is on. This is the gate that avoids the per-read session load
+/// for the common "read a few lines" case.
+#[tokio::test]
+async fn read_tool_dedup_skips_lookup_for_small_reads() {
+    let _guard = crate::storage::lock_test_env();
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let home = tempfile::TempDir::new().expect("tempdir");
+    crate::env::set_var("JCODE_HOME", home.path());
+    crate::config::Config::invalidate_cache();
+
+    let session_id = "e2e-dedup-small";
+    let mut session =
+        crate::session::Session::create_with_id(session_id.to_string(), None, None);
+    let file = home.path().join("target.txt");
+    std::fs::write(&file, "one\ntwo\nthree\nfour\nfive\n").expect("write target");
+    let now = chrono::Utc::now();
+    session.messages = vec![crate::session::StoredMessage {
+        id: "m0".to_string(),
+        role: crate::message::Role::User,
+        content: vec![ContentBlock::ToolUse {
+            id: "call-read".to_string(),
+            name: "read".to_string(),
+            input: json!({
+                "file_path": file.to_str().unwrap(),
+                "start_line": 1,
+                "end_line": 5,
+            }),
+            thought_signature: None,
+        }],
+        display_role: None,
+        timestamp: Some(now),
+        tool_duration_ms: None,
+        token_usage: None,
+    }];
+    session.save().expect("persist session");
+
+    let config_path = crate::config::Config::path().expect("config path");
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent).expect("create config dir");
+    }
+    std::fs::write(&config_path, "[tools]\nread_dedup = true\n")
+        .expect("write config with read_dedup");
+    crate::config::Config::invalidate_cache();
+
+    // A re-read of the same unchanged range, but only 5 lines (well under
+    // READ_DEDUP_MIN_LINES): dedup must be skipped, so the content is returned.
+    let tool = ReadTool::new();
+    let ctx = ToolContext {
+        session_id: session_id.to_string(),
+        ..make_ctx(home.path().to_path_buf())
+    };
+    let output = tool
+        .execute(
+            json!({ "file_path": "target.txt", "start_line": 1, "end_line": 5 }),
+            ctx,
+        )
+        .await
+        .expect("read should succeed");
+
+    assert!(
+        !output.output.contains("Already in context"),
+        "small re-read must not dedup (skips the lookup): {:?}",
+        output.output
+    );
+    assert!(
+        output.output.contains("1\tone"),
+        "expected the file content, got: {:?}",
         output.output
     );
 
