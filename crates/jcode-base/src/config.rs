@@ -660,7 +660,9 @@ pub struct ToolConfig {
     /// has not changed since then returns a compact pointer to the earlier
     /// result instead of re-emitting the full text, avoiding re-sending
     /// expensive raw content. It deliberately changes the tool result from
-    /// content to a pointer, so it is opt-in. Default: off.
+    /// content to a pointer, but only ever for unchanged re-reads (the file
+    /// mtime must predate the prior read), so fresh content is always returned
+    /// when the file changed. Default: on.
     #[serde(alias = "read_dedup")]
     pub read_dedup: bool,
 }
@@ -674,7 +676,7 @@ impl Default for ToolConfig {
             disable_base_tools: false,
             mcp_tools: McpToolsMode::Auto,
             mcp_tools_token_threshold: 8_000,
-            read_dedup: false,
+            read_dedup: true,
         }
     }
 }
