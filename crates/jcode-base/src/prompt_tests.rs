@@ -95,6 +95,29 @@ fn skill_description_clipping_is_utf8_safe() {
 }
 
 #[test]
+fn skills_section_tells_the_agent_to_proactively_load_relevant_skills() {
+    let skills = vec![SkillInfo {
+        name: "example".to_string(),
+        description: "Use for code search tasks.".to_string(),
+    }];
+    let section = build_available_skills_section(&skills).expect("skills section");
+
+    // The agent should be told it can and should use skills itself, not only
+    // wait for the user to invoke them (issue: ccc skill never used). The model
+    // self-serves via skill_manage, never by emitting a /slash command.
+    assert!(section.contains("/example"));
+    assert!(section.contains("load one yourself with the `skill_manage` tool (action=load)"));
+    assert!(section.contains("load it proactively"));
+    assert!(section.contains("The user can invoke one with `/skillname`"));
+    assert!(!section.contains("invoke a skill yourself"));
+}
+
+#[test]
+fn skills_section_is_omitted_when_no_skills_available() {
+    assert!(build_available_skills_section(&[]).is_none());
+}
+
+#[test]
 fn full_and_split_prompt_builders_use_the_same_one_line_skill_descriptions() {
     let skills = vec![SkillInfo {
         name: "example".to_string(),
