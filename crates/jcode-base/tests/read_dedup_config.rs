@@ -12,18 +12,17 @@ fn default_config_template_parses_with_read_dedup() {
     let template = Config::default_config_file_contents();
     let config =
         toml::from_str::<Config>(&template).expect("the shipped config template must parse");
-    // Default is off (opt-in, since it changes the tool result from content to
-    // a pointer).
-    assert!(!config.tools.read_dedup, "read_dedup must default to false");
+    // Default is on (the shipped template carries true).
+    assert!(config.tools.read_dedup, "read_dedup must default to true");
 }
 
 #[test]
-fn read_dedup_true_override_round_trips() {
+fn read_dedup_false_override_round_trips() {
     use jcode_base::config::Config;
-    // A standalone `[tools]` section overriding read_dedup to true must parse
-    // and be honored through the public Config.
-    let standalone = "[tools]\nread_dedup = true\n";
+    // A standalone `[tools]` section overriding read_dedup to false (turning the
+    // default-on feature off) must parse and be honored through the public Config.
+    let standalone = "[tools]\nread_dedup = false\n";
     let parsed = toml::from_str::<Config>(standalone)
-        .expect("standalone [tools] read_dedup=true must parse");
-    assert!(parsed.tools.read_dedup, "read_dedup=true must be honored");
+        .expect("standalone [tools] read_dedup=false must parse");
+    assert!(!parsed.tools.read_dedup, "read_dedup=false must be honored");
 }
