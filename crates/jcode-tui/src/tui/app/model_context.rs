@@ -61,7 +61,8 @@ const RATE_LIMIT_HOURLY_MAX_ATTEMPTS: u8 = 24;
 /// sub-second backoffs just hammers the endpoint and gives up quickly; instead
 /// retry on an hourly cadence so a reopened usage window is picked up
 /// automatically. `attempts` is the number of hourly retries already performed
-/// for this pending message (typically `rate_limit_pending_message.retry_attempts`).
+/// for this pending message (typically `rate_limit_pending_message.retry_attempts`,
+/// which `schedule_pending_remote_retry_in` increments on every reschedule).
 pub(super) fn rate_limit_retry_wait(
     error: &str,
     retry_after_secs: Option<u64>,
@@ -2234,6 +2235,23 @@ mod tests {
             rate_limit_retry_wait(err, None, RATE_LIMIT_HOURLY_MAX_ATTEMPTS),
             None
         );
+    }
+
+    #[test]
+    fn hourly_retry_waits_until_budget_is_exhausted() {
+        // Mirror the live reschedule loop: schedule_pending_remote_retry_in
+        // increments retry_attempts on every hourly reschedule, so a never-clearing
+        // 429 must keep retrying for exactly RATE_LIMIT_HOURLY_MAX_ATTEMPTS hourly
+        // tries and then stop (fall through to a manual offer).
+        let err = "status: 429 Too Many Requests";
+        let mut attempts = 0u8;
+        let mut schedules = 0u8;
+        while rate_limit_retry_wait(err, None, attempts).is_some() {
+            attempts = attempts.saturating_add(1);
+            schedules += 1;
+        }
+        assert_eq!(schedules, RATE_LIMIT_HOURLY_MAX_ATTEMPTS);
+        assert_eq!(attempts, RATE_LIMIT_HOURLY_MAX_ATTEMPTS);
     }
 
     #[test]
