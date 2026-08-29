@@ -51,9 +51,25 @@ pub(super) fn token_limit_retry_wait(error: &str) -> Option<std::time::Duration>
 /// to a manual retry offer instead of holding the turn forever.
 const RATE_LIMIT_HOURLY_MAX_ATTEMPTS: u8 = 24;
 
-/// Extract a provider-suggested retry wait for a rate-limit (HTTP 429) error,
-/// defaulting to a one-hour cadence when the provider gives no concrete reset
-/// time, and returning `None` once the retry budget is exhausted.
+/// Outcome of asking [`rate_limit_retry_wait`] how to handle a rate-limit
+/// (HTTP 429) error on a pending remote turn.
+#[derive(Debug, PartialEq)]
+pub(super) enum RateLimitRetry {
+    /// Reschedule the turn after `wait`. The caller is responsible for the
+    /// actual reschedule (`schedule_pending_remote_retry_in`).
+    Wait(std::time::Duration),
+    /// The hourly retry budget is spent: a rate limit that never cleared (a
+    /// permanently capped key, or a misclassified error) must stop consuming
+    /// the turn's retry budget and fall through to a manual retry offer.
+    Exhausted,
+    /// The error is not a recognized rate limit; leave it to the caller's
+    /// normal error handling (and do *not* log anything).
+    NotRateLimit,
+}
+
+/// Decide how to handle a provider rate-limit (HTTP 429) error, defaulting to a
+/// one-hour cadence when the provider gives no concrete reset time, and
+/// returning [`RateLimitRetry::Exhausted`] once the retry budget is spent.
 ///
 /// Free-tier limits (e.g. opencode.ai `FreeUsageLimitError`) return
 /// `status: 429` with a body like "Rate limit exceeded. Please try again
@@ -63,11 +79,17 @@ const RATE_LIMIT_HOURLY_MAX_ATTEMPTS: u8 = 24;
 /// automatically. `attempts` is the number of hourly retries already performed
 /// for this pending message (typically `rate_limit_pending_message.retry_attempts`,
 /// which `schedule_pending_remote_retry_in` increments on every reschedule).
+///
+/// The budget gate runs *first*, so even an explicit `Retry-After` or a
+/// body-carried wait is suppressed once the cap is hit. That is intentional:
+/// a provider that perpetually answers `429 Retry-After: 30` would otherwise
+/// retry forever and defeat the cap. When the budget is spent the turn must
+/// terminate, so the last valid hint is deliberately sacrificed.
 pub(super) fn rate_limit_retry_wait(
     error: &str,
     retry_after_secs: Option<u64>,
     attempts: u8,
-) -> Option<std::time::Duration> {
+) -> RateLimitRetry {
     use std::time::Duration;
 
     const HOURLY_DEFAULT: Duration = Duration::from_secs(3_600);
@@ -75,23 +97,25 @@ pub(super) fn rate_limit_retry_wait(
 
     // A rate limit with no reset window may never clear (a permanently capped
     // key, or a misclassified error). Stop auto-retrying once we have given it
-    // a full day of hourly attempts, and let the caller surface a manual offer.
+    // a full day of hourly attempts; the caller surfaces a manual offer instead
+    // of holding the turn forever. Gate runs before any wait source below is
+    // honored, so a perpetual 429 can never outrun the cap.
     if attempts >= RATE_LIMIT_HOURLY_MAX_ATTEMPTS {
-        return None;
+        return RateLimitRetry::Exhausted;
     }
 
     // 1. An explicit server Retry-After hint wins (capped so a hostile/oversized
     //    value can never stall the turn indefinitely).
     if let Some(secs) = retry_after_secs {
         if secs > 0 {
-            return Some(Duration::from_secs(secs).min(MAX_HINT));
+            return RateLimitRetry::Wait(Duration::from_secs(secs).min(MAX_HINT));
         }
     }
 
     // 2. A wait already embedded in the body (token-limit "retry after 6m",
     //    "Повторите попытку через 8 мин.", etc.).
     if let Some(wait) = token_limit_retry_wait(error) {
-        return Some(wait.min(MAX_HINT));
+        return RateLimitRetry::Wait(wait.min(MAX_HINT));
     }
 
     // 3. A plain 429 / rate-limit with no concrete wait: retry hourly.
@@ -102,10 +126,10 @@ pub(super) fn rate_limit_retry_wait(
         || lower.contains("rate_limit")
         || lower.contains("ratelimit");
     if is_rate_limit {
-        return Some(HOURLY_DEFAULT);
+        return RateLimitRetry::Wait(HOURLY_DEFAULT);
     }
 
-    None
+    RateLimitRetry::NotRateLimit
 }
 
 /// True when `text` contains an HTTP 429 status code as a standalone token
@@ -2163,7 +2187,7 @@ mod tests {
         let err = "OpenAI-compatible chat request failed\n  endpoint: https://opencode.ai/zen/v1/chat/completions\n  model: hy3-free\n  auth: OPENCODE_API_KEY\n  status: 429 Too Many Requests\n  response: {\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"}}";
         assert_eq!(
             rate_limit_retry_wait(err, None, 0),
-            Some(Duration::from_secs(60 * 60))
+            RateLimitRetry::Wait(Duration::from_secs(60 * 60))
         );
     }
 
@@ -2171,7 +2195,7 @@ mod tests {
     fn rate_limit_plain_too_many_requests_retries_hourly() {
         assert_eq!(
             rate_limit_retry_wait("429 Too Many Requests: retry later", None, 0),
-            Some(Duration::from_secs(60 * 60))
+            RateLimitRetry::Wait(Duration::from_secs(60 * 60))
         );
     }
 
@@ -2181,7 +2205,7 @@ mod tests {
         let err = "status: 429 too many requests\n  response: {}";
         assert_eq!(
             rate_limit_retry_wait(err, Some(30), 0),
-            Some(Duration::from_secs(30))
+            RateLimitRetry::Wait(Duration::from_secs(30))
         );
     }
 
@@ -2191,15 +2215,15 @@ mod tests {
         let err = "OpenAI-compatible chat request failed\n  status: 429 Too Many Requests\n  response: {\"error\":\"Rate limit exceeded. Retry after 6m\"}";
         assert_eq!(
             rate_limit_retry_wait(err, None, 0),
-            Some(Duration::from_secs(6 * 60))
+            RateLimitRetry::Wait(Duration::from_secs(6 * 60))
         );
     }
 
     #[test]
     fn non_rate_limit_errors_yield_none() {
-        assert_eq!(rate_limit_retry_wait("500 internal server error", None, 0), None);
-        assert_eq!(rate_limit_retry_wait("connection reset", None, 0), None);
-        assert_eq!(rate_limit_retry_wait("unknown error", None, 0), None);
+        assert_eq!(rate_limit_retry_wait("500 internal server error", None, 0), RateLimitRetry::NotRateLimit);
+        assert_eq!(rate_limit_retry_wait("connection reset", None, 0), RateLimitRetry::NotRateLimit);
+        assert_eq!(rate_limit_retry_wait("unknown error", None, 0), RateLimitRetry::NotRateLimit);
     }
 
     #[test]
@@ -2208,16 +2232,16 @@ mod tests {
         // "model-4290") must NOT be treated as a 429 rate limit.
         assert_eq!(
             rate_limit_retry_wait("model hy3-4290 is unavailable", None, 0),
-            None
+            RateLimitRetry::NotRateLimit
         );
         assert_eq!(
             rate_limit_retry_wait("status: 4290 request limit reached", None, 0),
-            None
+            RateLimitRetry::NotRateLimit
         );
         // But a real "status: 429" still matches.
         assert_eq!(
             rate_limit_retry_wait("status: 429 too many requests", None, 0),
-            Some(Duration::from_secs(60 * 60))
+            RateLimitRetry::Wait(Duration::from_secs(60 * 60))
         );
     }
 
@@ -2229,11 +2253,11 @@ mod tests {
         let err = "status: 429 Too Many Requests";
         assert_eq!(
             rate_limit_retry_wait(err, None, RATE_LIMIT_HOURLY_MAX_ATTEMPTS - 1),
-            Some(Duration::from_secs(60 * 60))
+            RateLimitRetry::Wait(Duration::from_secs(60 * 60))
         );
         assert_eq!(
             rate_limit_retry_wait(err, None, RATE_LIMIT_HOURLY_MAX_ATTEMPTS),
-            None
+            RateLimitRetry::Exhausted
         );
     }
 
@@ -2246,7 +2270,7 @@ mod tests {
         let err = "status: 429 Too Many Requests";
         let mut attempts = 0u8;
         let mut schedules = 0u8;
-        while rate_limit_retry_wait(err, None, attempts).is_some() {
+        while let RateLimitRetry::Wait(_) = rate_limit_retry_wait(err, None, attempts) {
             attempts = attempts.saturating_add(1);
             schedules += 1;
         }
