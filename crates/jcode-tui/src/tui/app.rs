@@ -136,6 +136,13 @@ struct PendingRemoteMessage {
     is_system: bool,
     system_reminder: Option<String>,
     auto_retry: bool,
+    /// Count of reschedules performed for this pending message. Shared across the
+    /// 422 token-limit path, the 429 hourly-rate-limit path, and the generic
+    /// auto-retry path because all three funnel through `schedule_pending_remote_retry_in`,
+    /// which increments it on every reschedule. The 429 hourly budget (`RATE_LIMIT_HOURLY_MAX_ATTEMPTS`)
+    /// therefore measures total pending reschedules, not 429-specific ones; this
+    /// is intentional (any non-clearing error that keeps rescheduling should
+    /// terminate), not a per-class counter.
     retry_attempts: u8,
     retry_at: Option<Instant>,
 }
