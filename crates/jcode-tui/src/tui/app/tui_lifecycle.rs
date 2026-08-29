@@ -295,6 +295,7 @@ impl App {
             return false;
         };
         let retry_at = Instant::now() + wait;
+        pending.retry_attempts = pending.retry_attempts.saturating_add(1);
         pending.retry_at = Some(retry_at);
         self.rate_limit_reset = Some(retry_at);
         self.status = ProcessingStatus::Idle;
