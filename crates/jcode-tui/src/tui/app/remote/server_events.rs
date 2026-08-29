@@ -1320,6 +1320,27 @@ pub(in crate::tui::app) fn handle_server_event(
                     return false;
                 }
             }
+            // A 429 rate-limit with no concrete reset time (e.g. a free-tier
+            // "Rate limit exceeded" body and no `Retry-After` header) must not be
+            // given up after a few sub-second backoffs. Honor any explicit server
+            // wait; otherwise retry on an hourly cadence so a reopened usage
+            // window is picked up automatically instead of hammering the endpoint
+            // (issue: opencode.ai FreeUsageLimitError surfaces `status: 429`
+            // without a reset time, which previously exhausted the auto-retry
+            // budget in ~12s and then stopped). Once the hourly retry budget is
+            // spent the error is treated as non-transient and a manual offer is
+            // surfaced, so a permanently capped key can never hold the turn forever.
+            if let Some(pending) = app.rate_limit_pending_message.as_ref() {
+                if let Some(wait) = app_mod::model_context::rate_limit_retry_wait(
+                    &message,
+                    retry_after_secs,
+                    pending.retry_attempts,
+                ) {
+                    if app.schedule_pending_remote_retry_in(wait, "Rate limited") {
+                        return false;
+                    }
+                }
+            }
             // Connectivity failures (DNS, connection reset, no route, transient
             // TLS, timeouts) are always transient: the request never reached the
             // provider. Hold the turn and resume when the network recovers,
