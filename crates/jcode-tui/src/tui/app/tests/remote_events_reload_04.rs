@@ -203,6 +203,135 @@ fn test_remote_token_limit_error_schedules_wait_retry_not_fallback() {
     );
 }
 
+/// A free-tier 429 with no `Retry-After` and no body reset time (opencode.ai
+/// `FreeUsageLimitError`) must flow through `handle_server_event` into the
+/// hourly 429 path: the pending turn stays, a ~1h retry-at is scheduled, the
+/// attempt counter is bumped, and a clear wait notice is shown (no fallback
+/// offer, no immediate resend). This is the real acceptance path that
+/// previously exhausted the auto-retry budget in ~12s and then stopped.
+#[test]
+fn test_remote_429_without_reset_schedules_hourly_retry_through_handler() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    app.rate_limit_pending_message = Some(PendingRemoteMessage {
+        content: "retry me".to_string(),
+        images: vec![],
+        is_system: true,
+        system_reminder: None,
+        auto_retry: true,
+        retry_attempts: 0,
+        retry_at: None,
+    });
+    app.is_processing = true;
+    app.status = ProcessingStatus::Streaming;
+
+    let message = "OpenAI-compatible chat request failed\n  endpoint: https://opencode.ai/zen/v1/chat/completions\n  model: hy3-free\n  auth: OPENCODE_API_KEY\n  status: 429 Too Many Requests\n  response: {\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"}}";
+    app.handle_server_event(
+        crate::protocol::ServerEvent::Error {
+            id: 12,
+            message: message.to_string(),
+            retry_after_secs: None,
+        },
+        &mut remote,
+    );
+
+    // The pending turn stays pending for the hourly auto-retry.
+    let pending = app
+        .rate_limit_pending_message
+        .as_ref()
+        .expect("429 turn should remain pending for hourly retry");
+    assert!(pending.retry_at.is_some(), "429 should schedule a retry-at time");
+    assert_eq!(
+        pending.retry_attempts, 1,
+        "the hourly reschedule must increment the attempt counter"
+    );
+    assert!(app.rate_limit_reset.is_some());
+
+    // The retry-at must be ~1 hour out, not a sub-second backoff.
+    let retry_at = pending.retry_at.expect("retry_at set above");
+    let wait = retry_at.saturating_duration_since(std::time::Instant::now());
+    assert!(
+        wait >= std::time::Duration::from_secs(3_540) && wait <= std::time::Duration::from_secs(3_660),
+        "429 without reset should retry in ~1h, got {wait:?}"
+    );
+
+    // A clear wait notice is shown without arming a fallback offer.
+    let wait_notice = app
+        .display_messages()
+        .iter()
+        .find(|m| m.content.starts_with("⏳ Rate limited"))
+        .expect("429 should surface a retry-wait message");
+    assert!(wait_notice.content.contains("60 minutes"));
+    assert!(wait_notice.content.contains("retrying automatically"));
+    assert!(
+        app.pending_fallback_offer.is_none(),
+        "429 hourly retry must not arm a fallback offer"
+    );
+}
+
+/// Once the hourly 429 budget is exhausted, `handle_server_event` must stop
+/// auto-retrying: the 429 block returns `Exhausted`, the handler falls through
+/// to the generic error tail (which finds `retry_attempts >= AUTO_RETRY_MAX_ATTEMPTS`),
+/// clears the pending turn, and arms a manual fallback offer. Note this path is
+/// only reached when there is no `Retry-After` header and no body reset hint
+/// (otherwise the earlier `reset_duration` branch handles the 429 and returns
+/// first), which is exactly the free-tier "no reset time" case this fix targets.
+#[test]
+fn test_remote_429_hourly_budget_exhaustion_stops_auto_retry() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    app.rate_limit_pending_message = Some(PendingRemoteMessage {
+        content: "retry me".to_string(),
+        images: vec![],
+        is_system: true,
+        system_reminder: None,
+        auto_retry: true,
+        retry_attempts: 24, // RATE_LIMIT_HOURLY_MAX_ATTEMPTS
+        retry_at: Some(std::time::Instant::now()),
+    });
+    app.is_processing = true;
+    app.status = ProcessingStatus::Streaming;
+
+    // Free-tier body with no `Retry-After` and no "retry"/"reset" keyword, so
+    // it reaches the 429 hourly block (not the generic reset_duration path).
+    let message = "status: 429 Too Many Requests\n  response: {\"error\":\"Rate limit exceeded. Please try again later.\"}";
+    app.handle_server_event(
+        crate::protocol::ServerEvent::Error {
+            id: 13,
+            message: message.to_string(),
+            retry_after_secs: None,
+        },
+        &mut remote,
+    );
+
+    assert!(
+        app.rate_limit_pending_message.is_none(),
+        "exhausted 429 budget must clear the pending turn (no further auto-retry)"
+    );
+    assert!(
+        app.rate_limit_reset.is_none(),
+        "exhausted 429 budget must not arm a new rate_limit_reset"
+    );
+    // The generic tail must surface the manual-retry requirement (route-
+    // independent) rather than silently rescheduling. When the test app has no
+    // alternate model route, no provider-fallback offer is armed, so we assert
+    // the explicit "Auto-retry limit reached" notice pushed by the tail.
+    let surfaced_manual_retry = app
+        .display_messages
+        .iter()
+        .any(|m| m.content.contains("Auto-retry limit reached"));
+    assert!(
+        surfaced_manual_retry,
+        "exhausted 429 budget must surface a manual-retry notice rather than reschedule"
+    );
+}
+
 #[test]
 fn test_remote_non_retryable_error_gets_short_auto_poke_retry() {
     let mut app = create_test_app();
