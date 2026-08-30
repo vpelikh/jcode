@@ -49,8 +49,9 @@ pub use crash::{
     find_session_by_name_or_id, recover_crashed_sessions, recover_crashed_sessions_by_ids,
 };
 pub use jcode_session_types::{
-    EnvSnapshot, GitState, SessionImproveMode, SessionStatus, StoredCompactionState,
-    StoredDisplayRole, StoredMemoryInjection, StoredMessage, StoredTokenUsage,
+    EnvSnapshot, GitState, ReviewLoopState, SessionImproveMode, SessionStatus,
+    StoredCompactionState, StoredDisplayRole, StoredMemoryInjection, StoredMessage,
+    StoredTokenUsage,
 };
 use journal::{PersistVectorMode, SessionJournalMeta, SessionPersistState};
 pub use maintenance::prune_old_session_backups;
@@ -140,6 +141,10 @@ pub struct Session {
     /// Last requested `/improve` mode for this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub improve_mode: Option<SessionImproveMode>,
+    /// Active review loop (post-completion review rounds), if any. Persisted so
+    /// a resumed loop reloads its lens progress and accumulated findings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_loop: Option<ReviewLoopState>,
     /// Whether automatic end-of-turn review is enabled for this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autoreview_enabled: Option<bool>,
@@ -506,6 +511,7 @@ impl Session {
             reasoning_effort: self.reasoning_effort.clone(),
             subagent_model: self.subagent_model.clone(),
             improve_mode: self.improve_mode,
+            review_loop: self.review_loop.clone(),
             autoreview_enabled: self.autoreview_enabled,
             autojudge_enabled: self.autojudge_enabled,
             is_canary: self.is_canary,
@@ -747,6 +753,7 @@ impl Session {
             reasoning_effort: None,
             subagent_model: None,
             improve_mode: None,
+            review_loop: None,
             autoreview_enabled: None,
             autojudge_enabled: None,
             is_canary: false,
@@ -801,6 +808,7 @@ impl Session {
             reasoning_effort: None,
             subagent_model: None,
             improve_mode: None,
+            review_loop: None,
             autoreview_enabled: None,
             autojudge_enabled: None,
             is_canary: false,

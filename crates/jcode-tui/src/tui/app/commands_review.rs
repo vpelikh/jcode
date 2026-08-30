@@ -1,9 +1,73 @@
 use super::commands::{REVIEW_PREFERRED_MODEL, active_session_id, active_working_dir};
+use super::review_loop;
 use super::{App, DisplayMessage};
 use crate::id;
 use crate::message::{ContentBlock, Role, ToolCall};
 use crate::session::{Session, StoredMessage};
 use std::time::Instant;
+
+/// A coarse signature of the working tree's tracked/untracked changes, used to
+/// detect whether a review-loop fix turn actually touched files. Returns `None`
+/// when the session is not in a git repo. We deliberately do not shell out to a
+/// full diff — `status --porcelain` is enough to distinguish "files changed"
+/// from "no change", which is all the stall cap needs.
+fn working_tree_signature(cwd: &std::path::Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines: Vec<&str> = text.lines().collect();
+    lines.sort_unstable();
+    let joined = lines.join("\n");
+    if joined.trim().is_empty() {
+        Some(String::new())
+    } else {
+        Some(joined)
+    }
+}
+
+/// Extract the set of file paths referenced by a `git status --porcelain`
+/// signature, used to record which files a review-loop fix turn actually
+/// touched. Handles the common states (` M`, `A `, `??`, ` D`) and renames
+/// (`R100 old -> new`).
+fn changed_files_from_signature(sig: &str) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut files = BTreeSet::new();
+    for line in sig.lines() {
+        let line = line.trim_start();
+        if line.is_empty() {
+            continue;
+        }
+        // Skip the 2-char status columns, then any rename/copy score digits
+        // (the porcelain form is `R100 old -> new`), then the separating space.
+        let bytes = line.as_bytes();
+        let mut idx = 2.min(bytes.len());
+        while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+            idx += 1;
+        }
+        while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+            idx += 1;
+        }
+        let rest = &line[idx..];
+        if rest.is_empty() {
+            continue;
+        }
+        // Renames look like "old -> new"; keep the destination path.
+        let path = match rest.split_once(" -> ") {
+            Some((_, new)) => new.trim(),
+            None => rest.trim(),
+        };
+        if !path.is_empty() {
+            files.insert(path.to_string());
+        }
+    }
+    files.into_iter().collect()
+}
 
 fn review_session_read_only_guardrails() -> &'static str {
     "Important constraints for this session:\n\
@@ -644,6 +708,7 @@ fn clone_session_for_review(
     child.model = Some(initial_model);
     child.provider_key = provider_key_override.or_else(|| app.session.provider_key.clone());
     child.subagent_model = app.session.subagent_model.clone();
+    child.reasoning_effort = app.session.reasoning_effort.clone();
     child.autoreview_enabled = Some(false);
     child.autojudge_enabled = Some(false);
     child.status = crate::session::SessionStatus::Closed;
@@ -899,6 +964,11 @@ pub(super) fn maybe_trigger_autoreview_local(app: &mut App) {
     if !app.autoreview_enabled || app.is_remote || app.is_replay {
         return;
     }
+    // When loop_mode is enabled, the review loop replaces the one-shot
+    // autoreview entirely. Suppress the one-shot to avoid double review.
+    if crate::config::config().autoreview.loop_mode {
+        return;
+    }
     if let Err(error) = launch_autoreview_window_local(app) {
         app.push_display_message(DisplayMessage::error(format!(
             "Failed to launch autoreview: {}",
@@ -1099,6 +1169,435 @@ pub(super) enum RefactorCommand {
     Resume,
     Status,
     Stop,
+}
+
+// ============================================================================
+// Review-loop harness glue (docs/proposals/review-rounds.md).
+//
+// The actual state machine lives in `review_loop.rs` (pure, unit-tested). This
+// section only translates between that state machine and the App/TUI: spawning
+// the per-lens reviewer child sessions, polling them for a `VERDICT`, and
+// feeding the result back. The auto loop runs for local sessions only.
+// ============================================================================
+
+/// Per-lens reviewer startup message. Independent per-lens reviewers each get a
+/// clean prompt focused on a single lens, with the report contract so the
+/// harness can parse the verdict deterministically.
+fn build_lens_review_startup_message(parent_session_id: &str, lens_name: &str, lens_label: &str, lens_focus: &str) -> String {
+    format!(
+        "You are the `{lens_name}` reviewer for parent session `{parent_session_id}`.\n\
+You are one of several independent reviewers. Your job is ONLY to inspect the recent work through the `{lens_label}` lens.\n\
+\n\
+First read only the conversation history you actually need:\n\
+1. Use `conversation_search` with `stats=true` to learn the history size.\n\
+2. Read the most recent turns with `conversation_search turns` (start with roughly the last 6-12 turns, then widen only if needed).\n\
+3. If requirements are unclear, use `conversation_search query` to find the latest relevant user request or acceptance criteria.\n\
+\n\
+{guard}\
+Inspect the actual repo changes with targeted commands such as `git diff --stat`, `git diff --name-only`, and focused file reads.\n\
+\n\
+LENS FOCUS — only flag issues in this area:\n{lens_focus}\n\
+\n\
+Only flag issues in the changed code (the recent batch). Prefer concrete findings over style comments.\n\
+When done, respond with the machine-readable report contract and nothing else:\n\
+\n\
+VERDICT: CLEAN\n\
+  (if nothing in your lens scope is wrong)\n\
+or\n\
+VERDICT: FINDINGS\n\
+FINDING: <severity>|<file>|<issue text>\n\
+FINDING: <severity>|<file>|<issue text>\n\
+  (one FINDING line per issue; severity is HIGH/MEDIUM/LOW/INFO)\n\
+\n\
+Then stop. Do not ask the user anything. Keep your session concise.",
+        lens_name = lens_name,
+        lens_label = lens_label,
+        lens_focus = lens_focus,
+        guard = review_session_read_only_guardrails(),
+    )
+}
+
+/// True when an auto review loop is active on this session (unfinished).
+pub(super) fn is_review_loop_active(app: &App) -> bool {
+    app.session
+        .review_loop
+        .as_ref()
+        .map(|s| !s.finished)
+        .unwrap_or(false)
+}
+
+/// Enter the review loop after the completion gates pass. Seeded on the session
+/// so it survives reloads; the actual reviewing is driven by turn-end followups.
+pub(super) fn maybe_enter_review_loop(app: &mut App) {
+    if app.is_remote || app.is_replay || !app.autoreview_enabled {
+        return;
+    }
+    if !crate::config::config().autoreview.loop_mode {
+        return;
+    }
+    // The completion gates (ownership / confidence) may still be running a
+    // follow-up continuation this turn. Per the proposal the loop enters only
+    // once the gates have passed; don't seed it on the same turn the gate is
+    // still nudging the model for more work.
+    if app.pending_queued_dispatch {
+        return;
+    }
+    // Mutual exclusion: do not auto-enter a review loop while an improve/refactor
+    // loop is active. (Going the other way, starting improve clears the review
+    // loop via clear_review_loop_on_improve().)
+    if app.improve_mode.is_some() {
+        return;
+    }
+    // Auto-entry seeds the loop only once per session: only when no review-loop
+    // state exists yet. A finished loop must NOT be re-seeded here (that would
+    // restart the whole 6-lens loop after every completed turn). Restart of a
+    // finished loop is a deliberate, manual action via `/review-loop start`,
+    // which calls enter_review_loop() directly and resets the finished flag.
+    if app.session.review_loop.is_some() {
+        return;
+    }
+    let state = app
+        .session
+        .review_loop
+        .get_or_insert_with(crate::session::ReviewLoopState::new);
+    review_loop::enter_review_loop(state);
+    state.active_reviewer_id = None;
+    let _ = app.session.save();
+    app.push_display_message(DisplayMessage::system(
+        "🔁 Review loop started: reviewing the finished work across 6 lenses.".to_string(),
+    ));
+    app.set_status_notice("Review loop: started");
+}
+
+/// Spawn the independent per-lens reviewer for the loop's current lens.
+fn spawn_loop_reviewer(app: &mut App, lens: jcode_session_types::ReviewLens) -> anyhow::Result<String> {
+    let parent_session_id = current_feedback_target_session_id(app);
+    let lens_prompt = build_lens_review_startup_message(
+        &parent_session_id,
+        lens.name(),
+        lens.label(),
+        lens.focus(),
+    );
+    let model_override = current_autoreview_model_override();
+    let initial_model = model_override
+        .clone()
+        .unwrap_or_else(|| current_autoreview_model_summary(app));
+
+    // Reuse a single reviewer session across all lens reviews when one already
+    // exists, otherwise spawn a fresh one and remember its id for reuse. This
+    // gives the post-completion review loop a single, persistent reviewer
+    // window instead of opening a new terminal per lens.
+    let reviewer_session_id = app
+        .session
+        .review_loop
+        .as_ref()
+        .and_then(|s| s.reviewer_session_id.clone());
+
+    let reuse_existing = reviewer_session_id.is_some();
+    let session_id = match reviewer_session_id {
+        Some(reused_id) => reused_id,
+        None => {
+            let (id, _name) =
+                clone_session_for_review(app, "review-loop", initial_model, None)?;
+            // Persist the id so subsequent lens reviews reuse this same window.
+            if let Some(state) = app.session.review_loop.as_mut() {
+                state.reviewer_session_id = Some(id.clone());
+            }
+            id
+        }
+    };
+
+    prepare_review_spawned_session(
+        &session_id,
+        lens_prompt,
+        model_override,
+        None,
+        Some("review-loop".to_string()),
+        None,
+    );
+
+    // Only open a terminal the first time. A reused reviewer session already
+    // has its window open; re-injecting the prompt into the existing session
+    // re-points it at the current lens.
+    if !reuse_existing {
+        let exe = super::launch_client_executable();
+        let cwd = active_working_dir(app)
+            .filter(|path| path.is_dir())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let socket = std::env::var("JCODE_SOCKET").ok();
+        super::spawn_in_new_terminal(&exe, &session_id, &cwd, socket.as_deref())?;
+    }
+
+    Ok(session_id)
+}
+
+/// Poll the in-flight reviewer child session for a `VERDICT`.
+enum PollResult {
+    /// The reviewer session is gone (deleted/unloadable); the loop cannot make
+    /// progress and must finalize rather than poll forever.
+    Gone,
+    /// The reviewer is still running and has not emitted a verdict yet.
+    Pending,
+    /// A verdict was parsed.
+    Report(jcode_session_types::ReviewReport),
+}
+
+fn poll_loop_reviewer(reviewer_id: &str) -> PollResult {
+    let session = match crate::session::Session::load(reviewer_id) {
+        Ok(s) => s,
+        // The reviewer session vanished (deleted or unloadable). Treat as a
+        // terminal condition: do NOT keep polling, or the loop spins forever
+        // waiting on a child that no longer exists.
+        Err(_) => return PollResult::Gone,
+    };
+    // Scan messages most-recent-first for the first parseable verdict. The
+    // reviewer may emit a trailing message (e.g. a tool result) after its
+    // VERDICT text, so only checking `messages.last()` would miss it and poll
+    // forever. Stop at the first block that parses so a single verdict is not
+    // double-counted.
+    for message in session.messages.iter().rev() {
+        let mut text = String::new();
+        for block in &message.content {
+            if let crate::message::ContentBlock::Text { text: t, .. } = block {
+                text.push_str(t);
+            }
+        }
+        if let Ok(report) = jcode_session_types::ReviewReport::parse(&text) {
+            return PollResult::Report(report);
+        }
+    }
+    PollResult::Pending
+}
+
+/// Step the review loop from the turn-end followups hook. Returns true when a
+/// follow-up was scheduled (so the caller can consider the turn extended).
+pub(super) fn step_review_loop(app: &mut App) -> bool {
+    // Take the state out so we can mutate `app` freely while driving the loop.
+    let mut state = match app.session.review_loop.take() {
+        Some(s) if !s.finished => s,
+        _ => return false,
+    };
+
+    let max_stalled = crate::config::config().autoreview.max_stalled_turns;
+
+    // The in-flight reviewer id is persisted on the state (not just in-memory)
+    // so a reloaded session resumes polling the same child session instead of
+    // spawning a duplicate.
+    let result = if state.active_reviewer_id.is_some() {
+        let reviewer_id = state.active_reviewer_id.clone().unwrap();
+        match poll_loop_reviewer(&reviewer_id) {
+            PollResult::Gone => {
+                // The reviewer child session disappeared (deleted/unloadable).
+                // Finalize the loop instead of polling forever: signal the user
+                // and stop. The loop is left "finished" so it does not restart
+                // on the next turn-end.
+                state.active_reviewer_id = None;
+                state.finished = true;
+                state.finish_reason = Some("reviewer_unavailable".to_string());
+                let digest = review_loop::build_and_store_digest(&mut state);
+                app.push_display_message(DisplayMessage::system(format!(
+                    "{digest}\n\n(Review loop stopped: the in-flight reviewer session is gone.)"
+                )));
+                app.session.review_loop = Some(state);
+                let _ = app.session.save();
+                app.set_status_notice("Review loop: reviewer gone");
+                false
+            }
+            PollResult::Pending => {
+                // Reviewer still working: wait, don't stall.
+                app.session.review_loop = Some(state);
+                true
+            }
+            PollResult::Report(report) => {
+                state.active_reviewer_id = None;
+                // Determine whether the fix turn actually changed files: compare
+                // the baseline captured at fix-queue time against the current
+                // working tree. A file-touching fix is productive repair work and
+                // must not count toward the stall cap.
+                if let Some(cwd) = active_working_dir(app) {
+                    // Capture the current signature once and reuse it for both
+                    // the touched-flag comparison and the file list, avoiding a
+                    // second `git status` subprocess.
+                    let now_sig = working_tree_signature(&cwd);
+                    let touched = match (&state.fix_baseline_tree, &now_sig) {
+                        (Some(baseline), Some(now)) => now != baseline,
+                        _ => false,
+                    };
+                    state.last_fix_touched_files = touched;
+                    // Record which files the fix turn actually touched so the
+                    // digest can report real "Files touched" counts. This was
+                    // previously dead code (record_fix_files was never called).
+                    if touched {
+                        if let Some(now_sig) = now_sig {
+                            let files = changed_files_from_signature(&now_sig);
+                            review_loop::record_fix_files(&mut state, files);
+                        }
+                    }
+                }
+                let action = review_loop::apply_verdict(&mut state, &report, max_stalled);
+                match action {
+                    review_loop::ReviewLoopAction::QueueFixTurn(findings) => {
+                        app.session.review_loop = Some(state);
+                        let summary = findings
+                            .iter()
+                            .map(|f| format!("[{}] {}: {}", f.severity, f.path, f.text))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let prompt = format!(
+                            "The reviewer found the following issues. Fix them:\n\n{summary}"
+                        );
+                        // Capture the working-tree signature so the next
+                        // re-check can tell whether the fix actually changed
+                        // files (a productive, file-touching fix must not count
+                        // toward the stall cap even if the open set did not
+                        // shrink).
+                        if let Some(cwd) = active_working_dir(app) {
+                            if let Some(sig) = working_tree_signature(&cwd) {
+                                app.session.review_loop.as_mut().unwrap().fix_baseline_tree =
+                                    Some(sig);
+                            }
+                        }
+                        super::commands_improve::start_synthetic_user_turn(app, prompt);
+                        true
+                    }
+                    review_loop::ReviewLoopAction::Converged
+                    | review_loop::ReviewLoopAction::Stalled => {
+                        let digest = review_loop::build_and_store_digest(&mut state);
+                        app.push_display_message(DisplayMessage::system(digest));
+                        app.session.review_loop = Some(state);
+                        let _ = app.session.save();
+                        app.set_status_notice("Review loop: done");
+                        false
+                    }
+                    review_loop::ReviewLoopAction::SpawnReviewer(lens) => {
+                        if let Ok(id) = spawn_loop_reviewer(app, lens) {
+                            state.active_reviewer_id = Some(id);
+                        }
+                        app.session.review_loop = Some(state);
+                        let _ = app.session.save();
+                        true
+                    }
+                    review_loop::ReviewLoopAction::None => {
+                        app.session.review_loop = Some(state);
+                        false
+                    }
+                }
+            }
+        }
+    } else {
+        let action = review_loop::next_action(&mut state);
+        match action {
+            review_loop::ReviewLoopAction::SpawnReviewer(lens) => {
+                if let Ok(id) = spawn_loop_reviewer(app, lens) {
+                    state.active_reviewer_id = Some(id);
+                }
+                app.session.review_loop = Some(state);
+                let _ = app.session.save();
+                true
+            }
+            review_loop::ReviewLoopAction::Converged
+            | review_loop::ReviewLoopAction::Stalled => {
+                let digest = review_loop::build_and_store_digest(&mut state);
+                app.push_display_message(DisplayMessage::system(digest));
+                app.session.review_loop = Some(state);
+                let _ = app.session.save();
+                false
+            }
+            _ => {
+                app.session.review_loop = Some(state);
+                false
+            }
+        }
+    };
+    result
+}
+
+/// Manual `/review-loop` command (mirrors `/improve`): start a full per-lens
+/// loop for the current session. Enforces mutual exclusion with improve/refactor.
+pub(super) fn handle_review_loop_command_local(app: &mut App, trimmed: &str) -> bool {
+    if !trimmed.starts_with("/review-loop") {
+        return false;
+    }
+    let rest = trimmed.strip_prefix("/review-loop").unwrap_or_default().trim();
+
+    match rest {
+        "" | "start" | "run" => {
+            // Mutual exclusion: starting a review loop clears improve/refactor.
+            app.improve_mode = None;
+            app.session.improve_mode = None;
+            let state = app
+                .session
+                .review_loop
+                .get_or_insert_with(crate::session::ReviewLoopState::new);
+            review_loop::enter_review_loop(state);
+            let _ = app.session.save();
+            app.push_display_message(DisplayMessage::system(
+                "🔁 Review loop started (manual). Reviewing across 6 lenses.".to_string(),
+            ));
+            app.set_status_notice("Review loop: started");
+            true
+        }
+        "stop" => {
+            if let Some(state) = app.session.review_loop.as_mut() {
+                state.finish_with("user_stopped");
+                let _ = app.session.save();
+                app.push_display_message(DisplayMessage::system(
+                    "Review loop stopped.".to_string(),
+                ));
+                app.set_status_notice("Review loop: stopped");
+            } else {
+                app.push_display_message(DisplayMessage::system(
+                    "No active review loop to stop.".to_string(),
+                ));
+            }
+            true
+        }
+        "status" => {
+            let status = match &app.session.review_loop {
+                None => "No review loop for this session.".to_string(),
+                Some(state) if state.finished => {
+                    // The digest was persisted when the loop finished, so a
+                    // reloaded session can still show the outcome. Fall back to
+                    // a one-line summary if it is somehow absent.
+                    match state.record.as_ref().and_then(|r| r.digest.as_deref()) {
+                        Some(digest) => digest.to_string(),
+                        None => format!(
+                            "Review loop finished ({}).",
+                            state.finish_reason.as_deref().unwrap_or("unknown")
+                        ),
+                    }
+                }
+                Some(state) => {
+                    let lens = state
+                        .current_lens
+                        .map(|l| l.label().to_string())
+                        .unwrap_or_else(|| "unset".to_string());
+                    format!(
+                        "Review loop active at lens: {lens} (phase: {:?}, stall turns: {}).",
+                        state.phase, state.stall_turns
+                    )
+                }
+            };
+            app.push_display_message(DisplayMessage::system(status));
+            true
+        }
+        _ => {
+            app.push_display_message(DisplayMessage::error(
+                "Usage: /review-loop [start|stop|status]".to_string(),
+            ));
+            true
+        }
+    }
+}
+
+/// When improve/refactor starts, clear any active review loop (mutual
+/// exclusion: only one loop-mode per session at a time).
+pub(super) fn clear_review_loop_on_improve(app: &mut App) {
+    if app.session.review_loop.as_ref().map(|s| !s.finished).unwrap_or(false) {
+        app.session.review_loop = None;
+        let _ = app.session.save();
+    }
 }
 
 #[cfg(test)]

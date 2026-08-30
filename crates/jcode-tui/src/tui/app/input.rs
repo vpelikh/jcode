@@ -1543,6 +1543,11 @@ impl App {
             self.stop_auto_continuation_after_guardrail();
             return false;
         }
+        // Review loop runs as a post-completion follow-up. If a loop is active it
+        // owns the turn-end continuation; let it drive spawning/fixing/polling.
+        if super::commands::is_review_loop_active(self) {
+            return super::commands::step_review_loop(self);
+        }
         self.schedule_auto_poke_followup_if_needed()
             || self.schedule_overnight_poke_followup_if_needed()
     }
