@@ -1643,7 +1643,6 @@ fn metadata_text(session: &Session) -> String {
 /// Render the review-loop record (if any) into searchable text so a session that
 /// went through the post-completion review rounds surfaces in `session_search`.
 fn review_search_text(session: &Session) -> Option<String> {
-    use jcode_session_types::ReviewLoopState;
     let state = session.review_loop.as_ref()?;
     let record = state.record.as_ref()?;
     let total_rounds = record.rounds.len();
