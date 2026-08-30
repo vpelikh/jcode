@@ -196,6 +196,11 @@ pub struct TelegramChannel {
     process_lock: tokio::sync::Mutex<()>,
     /// Tracks consecutive discovery failures for UX reporting and circuit behavior.
     consecutive_discovery_failures: tokio::sync::Mutex<u32>,
+    /// Tracks bot authentication warnings to avoid spam. User-friendly warning
+    /// messages are shown once per process to help users identify setup issues.
+    /// Wrapped in a Mutex because `reply_loop` runs on `Arc<Self>` and needs
+    /// `&mut` access to flip the `warned` flag across an `.await`.
+    auth_warning_tracker: tokio::sync::Mutex<AuthWarningTracker>,
 }
 
 impl TelegramChannel {
@@ -241,6 +246,7 @@ impl TelegramChannel {
             discovered_once: tokio::sync::Mutex::new(false),
             process_lock: tokio::sync::Mutex::new(()),
             consecutive_discovery_failures: tokio::sync::Mutex::new(0),
+            auth_warning_tracker: tokio::sync::Mutex::new(AuthWarningTracker::default()),
         }
     }
 
@@ -370,7 +376,7 @@ impl TelegramChannel {
         for s in sessions.iter() {
             let title: String = s
                 .display_title()
-                .unwrap_or_else(|| s.session_id.as_str())
+                .unwrap_or(s.session_id.as_str())
                 .chars()
                 .take(30)
                 .collect();
@@ -982,6 +988,38 @@ pub fn format_user_friendly_error(error: &anyhow::Error, context: Option<&str>) 
     msg
 }
 
+/// Enhanced warning system for bot auth failures with persistent warning flag.
+/// Tracks whether we've already warned about auth failure to avoid spam.
+#[derive(Default)]
+pub struct AuthWarningTracker {
+    warned: bool,
+}
+
+impl AuthWarningTracker {
+    pub fn new() -> Self {
+        Self { warned: false }
+    }
+
+    /// Check if we should warn about auth failure and return appropriate message.
+    /// Only warns once per channel to avoid spam.
+    pub fn warn_if_needed(&mut self) -> Option<String> {
+        if self.warned {
+            return None;
+        }
+        self.warned = true;
+        Some(
+            "🔐 *Bot Authentication Required*\n\n\
+             • Your bot token has failed authentication.\n\
+             • Please check [safety] telegram_bot_token in your config\n\
+             • Verify the bot is properly set up with @BotFather\n\
+             • Ensure the bot is still in your chat\n\n\
+             🔧 Use `/help` for setup instructions and troubleshooting."
+                .to_string(),
+        )
+    }
+}
+
+
 /// Format an agent reply for a session-reply message, escaping the reply text
 /// so it cannot break Telegram's legacy `Markdown` parse mode. The reply
 /// follows the short session id on the same line; the id itself is a short
@@ -1097,20 +1135,20 @@ impl MessageChannel for TelegramChannel {
                     "telegram bot token invalid/unreachable (config issue): {e}"
                 ));
                 // Enhanced UX: warn the chat owner once so the misconfiguration is
-                // visible where they will see it, not only in logs.
-                let friendly = format_user_friendly_error(&e, Some("bot startup auth"));
-                let _ = crate::telegram::send_message_with_base(
-                    &client,
-                    &self.token,
-                    &self.chat_id,
-                    &format!(
-                        "⚠️ *Telegram bot failed to authenticate.*\n{}",
-                        friendly
-                    ),
-                    self.api_base.as_deref(),
-                    None,
-                )
-                .await;
+                // visible where they will see it, not only in logs. The warning
+                // tracker ensures the (potentially un-actionable) auth message is
+                // shown at most once per process instead of on every loop start.
+                if let Some(message) = self.auth_warning_tracker.lock().await.warn_if_needed() {
+                    let _ = crate::telegram::send_message_with_base(
+                        &client,
+                        &self.token,
+                        &self.chat_id,
+                        &format!("⚠️ *Telegram bot failed to authenticate.*\n{}", message),
+                        self.api_base.as_deref(),
+                        None,
+                    )
+                    .await;
+                }
             }
         }
 
@@ -1699,6 +1737,21 @@ mod tests {
         assert!(other.contains("Something Went Wrong"));
         assert!(other.contains("some unexpected internal error"));
         assert!(other.contains("bot startup auth"));
+    }
+
+    #[test]
+    fn test_auth_warning_tracker_warns_once() {
+        let mut tracker = AuthWarningTracker::new();
+        // First call returns the friendly warning message.
+        let first = tracker.warn_if_needed();
+        assert!(first.is_some());
+        assert!(first.unwrap().contains("Bot Authentication Required"));
+        // Subsequent calls within the same process return None (no spam).
+        assert!(tracker.warn_if_needed().is_none());
+        assert!(tracker.warn_if_needed().is_none());
+        // A fresh tracker warns again (per-process tracking, not global).
+        let mut fresh = AuthWarningTracker::new();
+        assert!(fresh.warn_if_needed().is_some());
     }
 
     /// A tiny in-memory Telegram Bot API endpoint for exercising the picker
