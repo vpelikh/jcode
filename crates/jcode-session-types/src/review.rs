@@ -329,6 +329,11 @@ pub struct ReviewLoopState {
     /// polling the same reviewer instead of spawning a duplicate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_reviewer_id: Option<String>,
+    /// Session id of the single reviewer session used for the entire review loop.
+    /// When set, all lens reviews reuse this same session instead of spawning new
+    /// ones, creating a truly single-window review experience.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_session_id: Option<String>,
     /// Whether the most recent fix turn actually changed files on disk. A
     /// *productive* (file-changing) re-check never counts against the stall
     /// cap, even if the open-findings set did not shrink: the fix may have been
