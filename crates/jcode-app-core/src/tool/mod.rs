@@ -918,6 +918,18 @@ impl Registry {
         }
     }
 
+    /// Whether a tool is safe to execute concurrently with sibling calls in the
+    /// same agent step. Read-only inspection tools opt in via
+    /// [`Tool::concurrency_safe_marker`]; every other tool (the default) is
+    /// unsafe and the loop runs it strictly sequentially.
+    pub async fn is_concurrency_safe(&self, name: &str) -> bool {
+        let tools = self.tools.read().await;
+        match tools.get(Self::resolve_tool_name(name)) {
+            Some(tool) => tool.concurrency_safe_marker(),
+            None => false,
+        }
+    }
+
     /// Register a tool dynamically (for MCP tools, etc.)
     pub async fn register(&self, name: String, tool: Arc<dyn Tool>) {
         let mut tools = self.tools.write().await;
