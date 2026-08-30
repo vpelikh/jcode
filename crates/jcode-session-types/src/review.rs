@@ -329,6 +329,17 @@ pub struct ReviewLoopState {
     /// polling the same reviewer instead of spawning a duplicate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_reviewer_id: Option<String>,
+    /// Whether the most recent fix turn actually changed files on disk. A
+    /// *productive* (file-changing) re-check never counts against the stall
+    /// cap, even if the open-findings set did not shrink: the fix may have been
+    /// partial or adjacent, and the cap is meant to bound churn, not legitimate
+    /// repair work.
+    #[serde(default)]
+    pub last_fix_touched_files: bool,
+    /// Working-tree signature captured when the last fix turn was queued, used
+    /// to detect whether the fix actually changed files at re-check poll time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_baseline_tree: Option<String>,
 }
 
 impl Default for ReviewLoopState {
@@ -342,6 +353,8 @@ impl Default for ReviewLoopState {
             phase: ReviewLoopPhase::Lenses,
             awaiting_postfix_recheck: false,
             active_reviewer_id: None,
+            last_fix_touched_files: false,
+            fix_baseline_tree: None,
         }
     }
 }
@@ -596,11 +609,13 @@ mod review_tests {
     }
 
     #[test]
-    fn active_reviewer_id_roundtrips() {
+    fn productive_fix_fields_roundtrip() {
         let mut state = ReviewLoopState::default();
-        state.active_reviewer_id = Some("rev-123".to_string());
+        state.last_fix_touched_files = true;
+        state.fix_baseline_tree = Some(" M src/foo.rs".to_string());
         let json = serde_json::to_string(&state).unwrap();
         let back: ReviewLoopState = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.active_reviewer_id, Some("rev-123".to_string()));
+        assert!(back.last_fix_touched_files);
+        assert_eq!(back.fix_baseline_tree.as_deref(), Some(" M src/foo.rs"));
     }
 }
