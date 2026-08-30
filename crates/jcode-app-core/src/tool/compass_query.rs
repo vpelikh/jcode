@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use compass_model::query_contract::{CodeQueryLimits, SearchRequest};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -118,7 +119,7 @@ impl Tool for CompassQueryTool {
             &engine,
             &params.query,
             params.path.as_deref(),
-            params.limit.unwrap_or(20),
+            params.limit.unwrap_or(20).max(1),
             params.intent.as_deref().unwrap_or("search"),
         );
 
@@ -148,12 +149,10 @@ fn execute_query(
     limit: usize,
     intent: &str,
 ) -> Result<String, anyhow::Error> {
-    use compass_model::query_contract::{CodeQueryLimits, SearchRequest};
-
     let request = SearchRequest {
         query: query.to_string(),
         limits: CodeQueryLimits {
-            max_nodes: limit as u32,
+            max_nodes: limit.max(1) as u32,
             ..Default::default()
         },
     };
