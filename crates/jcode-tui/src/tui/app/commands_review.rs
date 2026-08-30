@@ -1182,6 +1182,7 @@ pub(super) fn maybe_enter_review_loop(app: &mut App) {
         .review_loop
         .get_or_insert_with(crate::session::ReviewLoopState::new);
     review_loop::enter_review_loop(state);
+    state.active_reviewer_id = None;
     app.active_review_reviewer_id = None;
     let _ = app.session.save();
     app.push_display_message(DisplayMessage::system(
@@ -1191,7 +1192,7 @@ pub(super) fn maybe_enter_review_loop(app: &mut App) {
 }
 
 /// Spawn the independent per-lens reviewer for the loop's current lens.
-fn spawn_loop_reviewer(app: &mut App, lens: jcode_session_types::ReviewLens) -> anyhow::Result<()> {
+fn spawn_loop_reviewer(app: &mut App, lens: jcode_session_types::ReviewLens) -> anyhow::Result<String> {
     let parent_session_id = current_feedback_target_session_id(app);
     let prompt = build_lens_review_startup_message(
         &parent_session_id,
@@ -1223,15 +1224,14 @@ fn spawn_loop_reviewer(app: &mut App, lens: jcode_session_types::ReviewLens) -> 
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let socket = std::env::var("JCODE_SOCKET").ok();
     let _opened = super::spawn_in_new_terminal(&exe, &session_id, &cwd, socket.as_deref())?;
-    app.active_review_reviewer_id = Some(session_id);
-    Ok(())
+    app.active_review_reviewer_id = Some(session_id.clone());
+    Ok(session_id)
 }
 
 /// Poll the in-flight reviewer child session for a `VERDICT`. Returns the parsed
 /// report, or `None` if the reviewer has not produced a verdict yet.
-fn poll_loop_reviewer_verdict(app: &App) -> Option<jcode_session_types::ReviewReport> {
-    let id = app.active_review_reviewer_id.as_ref()?;
-    let session = crate::session::Session::load(id).ok()?;
+fn poll_loop_reviewer_verdict(reviewer_id: &str) -> Option<jcode_session_types::ReviewReport> {
+    let session = crate::session::Session::load(reviewer_id).ok()?;
     let last = session.messages.last()?;
     let mut text = String::new();
     for block in &last.content {
@@ -1256,9 +1256,14 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
 
     let max_stalled = crate::config::config().autoreview.max_stalled_turns;
 
-    let result = if app.active_review_reviewer_id.is_some() {
-        match poll_loop_reviewer_verdict(app) {
+    // The in-flight reviewer id is persisted on the state (not just in-memory)
+    // so a reloaded session resumes polling the same child session instead of
+    // spawning a duplicate.
+    let result = if state.active_reviewer_id.is_some() {
+        let reviewer_id = state.active_reviewer_id.clone().unwrap();
+        match poll_loop_reviewer_verdict(&reviewer_id) {
             Some(report) => {
+                state.active_reviewer_id = None;
                 app.active_review_reviewer_id = None;
                 let action = review_loop::apply_verdict(&mut state, &report, max_stalled);
                 match action {
@@ -1285,8 +1290,11 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
                         false
                     }
                     review_loop::ReviewLoopAction::SpawnReviewer(lens) => {
+                        if let Ok(id) = spawn_loop_reviewer(app, lens) {
+                            state.active_reviewer_id = Some(id);
+                        }
                         app.session.review_loop = Some(state);
-                        let _ = spawn_loop_reviewer(app, lens).is_ok();
+                        let _ = app.session.save();
                         true
                     }
                     review_loop::ReviewLoopAction::None => {
@@ -1305,8 +1313,11 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
         let action = review_loop::next_action(&mut state);
         match action {
             review_loop::ReviewLoopAction::SpawnReviewer(lens) => {
+                if let Ok(id) = spawn_loop_reviewer(app, lens) {
+                    state.active_reviewer_id = Some(id);
+                }
                 app.session.review_loop = Some(state);
-                let _ = spawn_loop_reviewer(app, lens).is_ok();
+                let _ = app.session.save();
                 true
             }
             review_loop::ReviewLoopAction::Converged
