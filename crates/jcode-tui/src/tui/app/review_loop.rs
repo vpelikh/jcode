@@ -125,6 +125,12 @@ pub fn apply_verdict(
                 if max_stalled_turns != 0 && state.stall_turns >= max_stalled_turns {
                     state.finished = true;
                     state.finish_reason = Some("stall_cap".to_string());
+                    // The still-open findings could not be resolved within the
+                    // cap. Surface them in the digest as can't-fix so the user
+                    // sees exactly what blocked convergence.
+                    for f in &new_open {
+                        state.add_cant_fix(vec![f.clone()]);
+                    }
                     return ReviewLoopAction::Stalled;
                 }
                 // Stalled but under cap: re-spawn the reviewer for another re-check
@@ -389,6 +395,26 @@ mod review_loop_tests {
         apply_verdict(&mut s, &findings("bug"), 0);
         // max_stalled_turns == 0 means never force-stop.
         assert!(!s.finished);
+    }
+
+    #[test]
+    fn stall_cap_surfaces_open_findings_as_cant_fix() {
+        let mut s = clean_state();
+        next_action(&mut s);
+        apply_verdict(&mut s, &findings("hard bug"), 2);
+        // Post-fix re-check re-raises the same finding (no fix) -> stall 1.
+        next_action(&mut s);
+        apply_verdict(&mut s, &findings("hard bug"), 2);
+        // Second stall -> cap hit -> Stalled, and the open finding is surfaced.
+        next_action(&mut s);
+        match apply_verdict(&mut s, &findings("hard bug"), 2) {
+            ReviewLoopAction::Stalled => {}
+            other => panic!("expected Stalled, got {other:?}"),
+        }
+        assert!(s.finished);
+        let rec = s.record.as_ref().unwrap();
+        assert_eq!(rec.cant_fix.len(), 1);
+        assert_eq!(rec.cant_fix[0].text, "hard bug");
     }
 
     #[test]
