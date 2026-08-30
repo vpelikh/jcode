@@ -66,7 +66,7 @@ impl Tool for CompassQueryTool {
                 "intent": {
                     "type": "string",
                     "enum": ["search", "impact", "discovery", "callers", "callees", "traverse"],
-                    "description": "Query intent. search = find by description. impact = change analysis. discovery = architecture overview. callers/callees = navigation. traverse = bounded path."
+                    "description": "Advisory hint for how to present results. All intents currently use Compass's semantic search engine; this value is surfaced in the report and can refine future result ranking. search = find by description, impact = change analysis, discovery = architecture overview, callers/callees = navigation, traverse = bounded path."
                 }
             },
             "required": ["query"]
@@ -139,7 +139,7 @@ impl Tool for CompassQueryTool {
 fn execute_query(
     engine: &compass_query::CodeQueryEngine,
     query: &str,
-    _path_filter: Option<&str>,
+    path_filter: Option<&str>,
     limit: usize,
     intent: &str,
 ) -> Result<String, anyhow::Error> {
@@ -159,7 +159,7 @@ fn execute_query(
     output.push_str(&format!("# Compass query: {}\n\n", query));
     output.push_str(&format!("**Intent:** {}\n", intent));
     output.push_str(&format!("**Limit:** {}\n", limit));
-    if let Some(p) = _path_filter {
+    if let Some(p) = path_filter {
         output.push_str(&format!("**Path filter:** {}\n", p));
     }
     output.push_str(&format!("\n**Found {} result(s)**\n\n", response.results.len()));
