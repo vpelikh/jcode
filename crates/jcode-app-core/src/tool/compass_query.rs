@@ -3,7 +3,6 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::PathBuf;
-use tokio::process::Command as TokioCommand;
 
 use super::{Tool, ToolContext, ToolOutput};
 
@@ -45,8 +44,8 @@ impl Tool for CompassQueryTool {
     fn description(&self) -> &str {
         "Semantic code search and structural analysis backed by Compass's knowledge graph. \
          Use for natural-language code search, finding call sites, impact analysis, dependency \
-         traversal, and architecture discovery. The first query in a project automatically builds \
-         a Compass index if one does not exist yet."
+         traversal, and architecture discovery. Requires a pre-built Compass index for the working \
+         directory; build it out-of-band with `compass extract <dir>` (or equivalent)."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -92,29 +91,27 @@ impl Tool for CompassQueryTool {
             )));
         }
 
-        // Open the Compass query engine. If no index exists yet, build one
-        // automatically (via the Compass CLI) before retrying.
+        // Open the Compass query engine against the project's pre-built index.
+        // Index building is an out-of-band operation (e.g. `compass extract <dir>`);
+        // this tool only consumes an existing Compass knowledge graph in-process
+        // via the compass-query library. No CLI subprocess is spawned.
         let engine = match compass_query::open(&working_dir, None, &cache_dir) {
             Ok(engine) => engine,
-            Err(open_err) => match build_compass_index(&working_dir).await {
-                Ok(()) => compass_query::open(&working_dir, None, &cache_dir).map_err(|e| {
-                    anyhow!("Index built but reopen failed: {e}")
-                })?,
-                Err(build_err) => {
-                    return Ok(ToolOutput::new(format!(
-                        "Compass knowledge graph is not available for this project.\n\n\
-                         Open failed: {}\n\
-                         Auto-build failed: {}\n\n\
-                         To use compass_query, build a Compass index first:\n\
-                         1. Clone Compass: git clone https://github.com/crabbuild/compass\n\
-                         2. Build: cargo build --release --bin compass\n\
-                         3. Index project: compass extract {}\n\
-                         4. Re-run this query once the index exists.\n\n\
-                         In the meantime, use agentgrep for grep/find/trace-style searches.",
-                        open_err, build_err, working_dir.display()
-                    )));
-                }
-            },
+            Err(open_err) => {
+                return Ok(ToolOutput::new(format!(
+                    "Compass knowledge graph is not available for this project.\n\n\
+                     Open failed: {}\n\n\
+                     compass_query is a pure in-process library consumer and does not build \
+                     indexes itself. To use it, provide a pre-built Compass index:\n\
+                     1. Clone Compass: git clone https://github.com/crabbuild/compass\n\
+                     2. Build: cargo build --release --bin compass\n\
+                     3. Index project: compass extract {}\n\
+                     4. Re-run this query once the index exists.\n\n\
+                     In the meantime, use agentgrep for grep/find/trace-style searches.",
+                    open_err,
+                    working_dir.display()
+                )));
+            }
         };
 
         let result = execute_query(
@@ -140,27 +137,6 @@ impl Tool for CompassQueryTool {
             ))),
         }
     }
-}
-
-/// Build a Compass knowledge-graph index for the project, so that subsequent
-/// `compass_query` calls can open it. Uses the Compass CLI `extract` command.
-async fn build_compass_index(working_dir: &PathBuf) -> Result<(), anyhow::Error> {
-    let output = TokioCommand::new("compass")
-        .current_dir(working_dir)
-        .args(["extract", &working_dir.to_string_lossy()])
-        .output()
-        .await
-        .map_err(|e| anyhow!("failed to launch `compass` CLI: {e}. Is Compass installed?"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!(
-            "compass extract exited with {}: {}",
-            output.status.code().unwrap_or(-1),
-            stderr.trim()
-        ));
-    }
-    Ok(())
 }
 
 /// Run a search through the Compass `CodeQueryEngine`. Returns a model-ready
