@@ -671,11 +671,21 @@ impl TelegramChannel {
             "discovering…".to_string()
         };
         let since = self.last_discovery.lock().await.elapsed();
-        let discovery_line = format!(
-            "*Connection:* {} (re-checked {}s ago)",
-            discovery,
-            since.as_secs()
-        );
+        let failures = *self.consecutive_discovery_failures.lock().await;
+        let discovery_line = if failures > 0 {
+            format!(
+                "*Connection:* {} (re-checked {}s ago, {} recent failure(s))",
+                discovery,
+                since.as_secs(),
+                failures
+            )
+        } else {
+            format!(
+                "*Connection:* {} (re-checked {}s ago)",
+                discovery,
+                since.as_secs()
+            )
+        };
         format!(
             "🤖 *jcode Telegram control*\n\
              *Ambient mode:* {}\n\
