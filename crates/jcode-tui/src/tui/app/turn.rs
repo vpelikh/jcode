@@ -1478,6 +1478,7 @@ impl App {
             }
         }
 
+        super::commands::maybe_enter_review_loop(self);
         super::commands::maybe_trigger_autoreview_local(self);
         super::commands::maybe_trigger_autojudge_local(self);
         Ok(())
