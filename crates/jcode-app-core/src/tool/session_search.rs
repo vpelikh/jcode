@@ -1665,6 +1665,16 @@ fn review_search_text(session: &Session) -> Option<String> {
     for f in &record.cant_fix {
         lines.push(format!("review can't-fix: [{}] {}: {}", f.severity, f.path, f.text));
     }
+    // Include the actual finding content so a search for an issue the review
+    // surfaced (e.g. a bug description) matches this session.
+    for round in &record.rounds {
+        for f in &round.findings {
+            lines.push(format!(
+                "review finding: [{}] {}: {}",
+                f.severity, f.path, f.text
+            ));
+        }
+    }
     Some(lines.join("\n"))
 }
 
