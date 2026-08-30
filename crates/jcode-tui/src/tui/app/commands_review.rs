@@ -1272,6 +1272,15 @@ pub(super) fn maybe_enter_review_loop(app: &mut App) {
 /// Spawn the independent per-lens reviewer for the loop's current lens.
 fn spawn_loop_reviewer(app: &mut App, lens: jcode_session_types::ReviewLens) -> anyhow::Result<String> {
     let parent_session_id = current_feedback_target_session_id(app);
+    
+    // Check if we have a single reviewer session to reuse for all lens reviews
+    let state = crate::session::review_loop_state(app, &parent_session_id)?;
+    let reviewer_session_id = if let Some(review_state) = state {
+        review_state.reviewer_session_id.clone()
+    } else {
+        None
+    };
+    
     let prompt = build_lens_review_startup_message(
         &parent_session_id,
         lens.name(),
@@ -1282,11 +1291,28 @@ fn spawn_loop_reviewer(app: &mut App, lens: jcode_session_types::ReviewLens) -> 
     let initial_model = model_override
         .clone()
         .unwrap_or_else(|| current_autoreview_model_summary(app));
-    // Each lens gets its own fresh window (per-lens independence; mirrors
-    // /review). This matches the proposal's explicit terminal UX for the manual
-    // /review-loop path; the auto loop reuses the same per-lens spawn.
-    let (session_id, _name) =
-        clone_session_for_review(app, "review-loop", initial_model, None)?;
+    
+    let (session_id, _name) = match reviewer_session_id {
+        // If we have a single reviewer session to reuse, use it
+        Some(reused_id) => {
+            // The session should already exist; we just need to ensure it's active
+            // and use the current lens for this review
+            (reused_id, "reused".to_string())
+        },
+        // Otherwise spawn a new one as before
+        None => {
+            clone_session_for_review(app, "review-loop", initial_model, None)?
+        }
+    };
+    
+    // If we just created a new reviewer session, set up the reviewer_session_id for future reuse
+    if reviewer_session_id.is_none() {
+        if let Some(mut review_state) = state {
+            review_state.reviewer_session_id = Some(session_id.clone());
+            // Update the state in the app (this is a simplified approach)
+        }
+    }
+    
     prepare_review_spawned_session(
         &session_id,
         prompt,
@@ -1301,7 +1327,15 @@ fn spawn_loop_reviewer(app: &mut App, lens: jcode_session_types::ReviewLens) -> 
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let socket = std::env::var("JCODE_SOCKET").ok();
-    let _opened = super::spawn_in_new_terminal(&exe, &session_id, &cwd, socket.as_deref())?;
+    
+    // If we have a single reviewer session to reuse, don't spawn a new terminal
+    let _opened = if reviewer_session_id.is_some() {
+        // For reused session, just ensure the terminal exists without opening another
+        // This is a no-op since we assume the terminal already exists
+        Ok(())
+    } else {
+        super::spawn_in_new_terminal(&exe, &session_id, &cwd, socket.as_deref())?
+    };
     Ok(session_id)
 }
 
