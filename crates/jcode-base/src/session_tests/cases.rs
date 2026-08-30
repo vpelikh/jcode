@@ -823,6 +823,12 @@ fn test_save_persists_compaction_state() -> Result<()> {
         compacted_count: 8,
     });
 
+    // Add a message so save() does not early-return (persist guard).
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text { text: "placeholder".to_string(), cache_control: None }],
+    );
+
     session.save()?;
 
     let loaded = Session::load("session_compaction_persist_test")?;
@@ -847,6 +853,13 @@ fn test_save_persists_provider_key() -> Result<()> {
     session.provider_key = Some("opencode".to_string());
     session.model = Some("anthropic/claude-sonnet-4".to_string());
 
+    // Add a message so save() does not early-return (persist guard).
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text { text: "placeholder".to_string(), cache_control: None }],
+    );
+
+    // Save once to create the file, then modify and save again to verify persistence.
     session.save()?;
 
     let loaded = Session::load("session_provider_key_persist_test")?;
@@ -871,6 +884,12 @@ fn test_save_persists_reasoning_effort() -> Result<()> {
     );
     session.model = Some("gpt-5.4".to_string());
     session.reasoning_effort = Some("xhigh".to_string());
+
+    // Add a message so save() does not early-return (persist guard).
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text { text: "placeholder".to_string(), cache_control: None }],
+    );
 
     session.save()?;
 
