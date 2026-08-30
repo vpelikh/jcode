@@ -6,6 +6,31 @@ use crate::message::{ContentBlock, Role, ToolCall};
 use crate::session::{Session, StoredMessage};
 use std::time::Instant;
 
+/// A coarse signature of the working tree's tracked/untracked changes, used to
+/// detect whether a review-loop fix turn actually touched files. Returns `None`
+/// when the session is not in a git repo. We deliberately do not shell out to a
+/// full diff — `status --porcelain` is enough to distinguish "files changed"
+/// from "no change", which is all the stall cap needs.
+fn working_tree_signature(cwd: &std::path::Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines: Vec<&str> = text.lines().collect();
+    lines.sort_unstable();
+    let joined = lines.join("\n");
+    if joined.trim().is_empty() {
+        Some(String::new())
+    } else {
+        Some(joined)
+    }
+}
+
 fn review_session_read_only_guardrails() -> &'static str {
     "Important constraints for this session:\n\
 - This session is analysis-only. Do not do the work yourself.\n\
@@ -1270,6 +1295,19 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
             Some(report) => {
                 state.active_reviewer_id = None;
                 app.active_review_reviewer_id = None;
+                // Determine whether the fix turn actually changed files: compare
+                // the baseline captured at fix-queue time against the current
+                // working tree. A file-touching fix is productive repair work and
+                // must not count toward the stall cap.
+                if let Some(cwd) = active_working_dir(app) {
+                    let touched = match &state.fix_baseline_tree {
+                        Some(baseline) => working_tree_signature(&cwd)
+                            .map(|now| now != *baseline)
+                            .unwrap_or(false),
+                        None => false,
+                    };
+                    state.last_fix_touched_files = touched;
+                }
                 let action = review_loop::apply_verdict(&mut state, &report, max_stalled);
                 match action {
                     review_loop::ReviewLoopAction::QueueFixTurn(findings) => {
@@ -1282,6 +1320,17 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
                         let prompt = format!(
                             "The reviewer found the following issues. Fix them:\n\n{summary}"
                         );
+                        // Capture the working-tree signature so the next
+                        // re-check can tell whether the fix actually changed
+                        // files (a productive, file-touching fix must not count
+                        // toward the stall cap even if the open set did not
+                        // shrink).
+                        if let Some(cwd) = active_working_dir(app) {
+                            if let Some(sig) = working_tree_signature(&cwd) {
+                                app.session.review_loop.as_mut().unwrap().fix_baseline_tree =
+                                    Some(sig);
+                            }
+                        }
                         super::commands_improve::start_synthetic_user_turn(app, prompt);
                         true
                     }
