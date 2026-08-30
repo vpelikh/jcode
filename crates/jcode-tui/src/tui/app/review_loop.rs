@@ -59,11 +59,6 @@ pub fn enter_review_loop(state: &mut ReviewLoopState) {
     }
 }
 
-/// True when the session currently has an active, unfinished review loop.
-pub fn is_review_loop_active(state: &ReviewLoopState) -> bool {
-    !state.finished && state.current_lens.is_some()
-}
-
 /// Decide the next harness action when there is no in-flight reviewer for the
 /// current lens. Call this from turn-end followups when `state.active_reviewer_id`
 /// is `None` (the persisted source of truth for the in-flight reviewer).
