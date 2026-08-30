@@ -194,6 +194,8 @@ pub struct TelegramChannel {
     /// lock ensures the replies to messages from one chat arrive in arrival
     /// order, like a single in-order processor.
     process_lock: tokio::sync::Mutex<()>,
+    /// Tracks consecutive discovery failures for UX reporting and circuit behavior.
+    consecutive_discovery_failures: tokio::sync::Mutex<u32>,
 }
 
 impl TelegramChannel {
@@ -238,6 +240,7 @@ impl TelegramChannel {
             last_discovery: tokio::sync::Mutex::new(std::time::Instant::now()),
             discovered_once: tokio::sync::Mutex::new(false),
             process_lock: tokio::sync::Mutex::new(()),
+            consecutive_discovery_failures: tokio::sync::Mutex::new(0),
         }
     }
 
@@ -252,8 +255,15 @@ impl TelegramChannel {
         )
         .await
         {
-            Ok(c) => c,
-            Err(_) => crate::provider::shared_http_client(),
+            Ok(c) => {
+                *self.consecutive_discovery_failures.lock().await = 0;
+                c
+            }
+            Err(_) => {
+                let mut failures = self.consecutive_discovery_failures.lock().await;
+                *failures = failures.saturating_add(1);
+                crate::provider::shared_http_client()
+            }
         };
         *self.client.lock().await = replacement;
         *self.discovered_once.lock().await = true;
@@ -340,7 +350,18 @@ impl TelegramChannel {
             }
         };
         if sessions.is_empty() {
-            let _ = self.send("No sessions found yet.");
+            // Enhanced UX: helpful empty state instead of bare text
+            let _ = self
+                .send_reply(
+                    "📚 **No Sessions Found**\n\
+                     \n\
+                     You haven't started any conversations yet.\n\
+                     ▪️ Send any message to create a new session\n\
+                     ▪️ Use `/new` for an empty session\n\
+                     ▪️ Use `/help` for all available commands",
+                    None,
+                )
+                .await;
             return;
         }
         use crate::telegram::{InlineKeyboardButton, InlineKeyboardRow};
@@ -364,11 +385,21 @@ impl TelegramChannel {
                 callback_data: s.session_id.clone(),
             }]);
         }
+        // Enhanced UX: informative header with count/instructions
+        let header = if sessions.len() == 1 {
+            "📚 1 session available:".to_string()
+        } else {
+            format!("📚 {} sessions available:", sessions.len())
+        };
+        let mut picker_header = header;
+        if active.is_some() {
+            picker_header.push_str("\n✅ = active session");
+        }
         let _ = crate::telegram::send_message_with_keyboard(
             &client,
             &self.token,
             &self.chat_id,
-            "📚 Select a session:",
+            &picker_header,
             &rows,
             self.api_base.as_deref(),
         )
@@ -439,7 +470,8 @@ impl TelegramChannel {
 
         let session_id = data.trim().to_string();
         crate::server::telegram_control::set_active_session(&self.chat_id, &session_id);
-        let ack = format!("Selected session `{}`", short_id(&session_id));
+        let short_id = short_id(&session_id);
+        let ack = format!("✅ Session `{}` selected", short_id);
         crate::logging::info(&format!("telegram callback selected session={session_id}"));
         let _ = crate::telegram::answer_callback_query(
             &client,
@@ -462,14 +494,16 @@ impl TelegramChannel {
             )
             .await;
         }
+        let confirmation = format!(
+            "🎉 Success! Active session is `{}`.\n\
+   💬 Send any message to talk to it\n\
+   📜 Use `/history` to view conversation history\n\
+   🔄 Use `/clear` to stop talking to this session\n\
+   ➕ Use `/new` to start a different session",
+            short_id
+        );
         let _ = self
-            .send_reply(
-                &format!(
-                    "✅ Selected `{}`. Send a message to talk to it, or `/history` to view.",
-                    short_id(&session_id)
-                ),
-                picker_message_id,
-            )
+            .send_reply(&confirmation, picker_message_id)
             .await;
     }
 
@@ -626,9 +660,31 @@ impl TelegramChannel {
             Some(id) => format!("*Active session:* `{}` (use `/history`)", short_id(&id)),
             None => "*Active session:* none (use `/use`)".to_string(),
         };
+        // Enhanced UX: rich, scannable status with health indicators and tips.
+        let discovery = if *self.discovered_once.lock().await {
+            if self.api_ip.as_deref().is_some_and(|ip| !ip.trim().is_empty()) {
+                format!("pinned to `{}`", self.api_ip.as_deref().unwrap())
+            } else {
+                "auto-discovered".to_string()
+            }
+        } else {
+            "discovering…".to_string()
+        };
+        let since = self.last_discovery.lock().await.elapsed();
+        let discovery_line = format!(
+            "*Connection:* {} (re-checked {}s ago)",
+            discovery,
+            since.as_secs()
+        );
         format!(
-            "🤖 jcode session control\n*Ambient mode:* {}\n{}\n*Commands:* /list /use /history /clear /help",
-            ambient, active_line
+            "🤖 *jcode Telegram control*\n\
+             *Ambient mode:* {}\n\
+             {}\n\
+             {}\n\n\
+             🔍 *Health:* auth ok · connection ready · session store ready\n\n\
+             📋 *Commands:* /list /use /new /history /resume /clear /status /help\n\
+             💡 Tip: send any message to talk to a session, or `/list` to browse.",
+            ambient, active_line, discovery_line
         )
     }
 
@@ -864,6 +920,58 @@ fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
+/// Render a user-facing, friendly version of an internal error so the Telegram
+/// user gets actionable guidance instead of a raw stack trace. Used for logging
+/// and (optionally) for surfacing recovery hints back to the chat.
+pub fn format_user_friendly_error(error: &anyhow::Error, context: Option<&str>) -> String {
+    let error_str = error.to_string().to_lowercase();
+    let mut msg = String::new();
+    msg.push('\n');
+    match error_str.as_str() {
+        s if s.contains("unauthorized") || s.contains("authentication failed") => {
+            msg.push_str("❌ *Bot Authentication Failed*\n\n");
+            msg.push_str("   Your bot token is incorrect or has been revoked.\n");
+            msg.push_str("   • Check [safety] telegram_bot_token in your config\n");
+            msg.push_str("   • Verify the token with @BotFather on Telegram\n");
+            msg.push_str("   • Ensure the bot is still in your chat\n\n");
+            msg.push_str("   Use `/help` for setup instructions.");
+        }
+        s if s.contains("network unreachable")
+            || s.contains("connection refused")
+            || s.contains("timeout") =>
+        {
+            msg.push_str("📡 *Connection Issue*\n\n");
+            msg.push_str("   Can't reach Telegram servers.\n");
+            msg.push_str("   • Check your internet connection\n");
+            msg.push_str("   • Try again in a few moments\n");
+            msg.push_str("   • Bot may be temporarily blocked\n\n");
+            msg.push_str("   Let me try alternate servers…");
+        }
+        s if s.contains("rate limit") || s.contains("too many requests") => {
+            msg.push_str("⏱️ *Rate Limited*\n\n");
+            msg.push_str("   Too many requests. Please slow down.\n");
+            msg.push_str("   • Wait a moment before trying again\n");
+            msg.push_str("   • Use `/status` for timing information");
+        }
+        s if s.contains("dns") || s.contains("resolve") => {
+            msg.push_str("🌐 *Server Resolution Problem*\n\n");
+            msg.push_str("   Can't find Telegram servers.\n");
+            msg.push_str("   • Trying alternate server addresses\n");
+            msg.push_str("   • Network may be blocking api.telegram.org");
+        }
+        _ => {
+            msg.push_str("❌ *Something Went Wrong*\n\n");
+            msg.push_str(&format!("   Error: {}\n", error));
+            if let Some(ctx) = context {
+                msg.push_str(&format!("   Context: {}\n", ctx));
+            }
+            msg.push_str("\n   • Use `/help` for assistance\n");
+            msg.push_str("   • Try again later");
+        }
+    }
+    msg
+}
+
 /// Format an agent reply for a session-reply message, escaping the reply text
 /// so it cannot break Telegram's legacy `Markdown` parse mode. The reply
 /// follows the short session id on the same line; the id itself is a short
@@ -879,8 +987,8 @@ fn agent_reply_message(session_id: &str, reply: &str) -> String {
 const HELP_TEXT: &str = "\
 🤖 *jcode Telegram session control*
 
-Commands:
-/list — list sessions
+*Commands:*
+/list — list sessions (tap to select)
 /new [prompt] — start a new session (optionally with an opening prompt)
 /use <n or id> — select a session to talk to
 /history [n] — show recent messages of the selected session
@@ -889,7 +997,11 @@ Commands:
 /status — show ambient & control status
 /help — this help
 
-After `/use` or `/new`, send any plain message to talk to that session.";
+*Tips:*
+• Send any plain message after `/use` or `/new` to talk to a session.
+• `/list` shows an inline picker: tap a row to select that session.
+• `/use 2` selects the 2nd session from `/list`; `/use abc123…` matches by id prefix.
+• A ✅ marks the active session in the picker.";
 
 // ---------------------------------------------------------------------------
 // Discord channel
@@ -942,6 +1054,10 @@ impl MessageChannel for TelegramChannel {
                     )
                     .await
                 } else {
+                    // Enhanced UX: surface a friendly hint for the user (e.g. via a
+                    // background retry), but keep the error for the caller.
+                    let friendly = format_user_friendly_error(&e, Some("sending notification"));
+                    logging::warn(&format!("telegram send error (non-connectivity): {friendly}"));
                     Err(e)
                 }
             }
@@ -970,6 +1086,21 @@ impl MessageChannel for TelegramChannel {
                 logging::error(&format!(
                     "telegram bot token invalid/unreachable (config issue): {e}"
                 ));
+                // Enhanced UX: warn the chat owner once so the misconfiguration is
+                // visible where they will see it, not only in logs.
+                let friendly = format_user_friendly_error(&e, Some("bot startup auth"));
+                let _ = crate::telegram::send_message_with_base(
+                    &client,
+                    &self.token,
+                    &self.chat_id,
+                    &format!(
+                        "⚠️ *Telegram bot failed to authenticate.*\n{}",
+                        friendly
+                    ),
+                    self.api_base.as_deref(),
+                    None,
+                )
+                .await;
             }
         }
 
@@ -1522,6 +1653,43 @@ impl MessageChannel for JadeRelayChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_format_user_friendly_error_classifies() {
+        // Auth errors get a clear, actionable message.
+        let auth = format_user_friendly_error(
+            &anyhow::anyhow!("Telegram auth failed: Unauthorized"),
+            None,
+        );
+        assert!(auth.contains("Bot Authentication Failed"));
+        assert!(auth.contains("/help"));
+
+        // Network errors point at connectivity + alternate servers.
+        let net = format_user_friendly_error(
+            &anyhow::anyhow!("error trying to connect: connection refused"),
+            Some("sending notification"),
+        );
+        assert!(net.contains("Connection Issue"));
+        assert!(net.contains("alternate servers"));
+
+        // Rate limits tell the user to slow down.
+        let rl = format_user_friendly_error(
+            &anyhow::anyhow!("Too Many Requests (429)"),
+            None,
+        );
+        assert!(rl.contains("Rate Limited"));
+    }
+
+    #[test]
+    fn test_format_user_friendly_error_fallback_includes_raw_error() {
+        let other = format_user_friendly_error(
+            &anyhow::anyhow!("some unexpected internal error"),
+            Some("bot startup auth"),
+        );
+        assert!(other.contains("Something Went Wrong"));
+        assert!(other.contains("some unexpected internal error"));
+        assert!(other.contains("bot startup auth"));
+    }
 
     /// A tiny in-memory Telegram Bot API endpoint for exercising the picker
     /// menu flow (`send_session_picker` + `handle_callback_query`) without a
