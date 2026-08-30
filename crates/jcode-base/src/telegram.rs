@@ -90,8 +90,9 @@ fn non_empty(value: &str) -> Option<&str> {
 /// DNS-resolved default is blocked. These come from Telegram's published DC
 /// ranges (149.154.167.x / 149.154.175.x and their IPv6 counterparts). The
 /// hostname is always kept for TLS/SNI, so this only redirects the TCP
-/// connection; it does not bypass certificate verification. We deliberately do
-/// not scan arbitrary ranges: discovery is bounded to this list.
+/// connection; it does not bypass certificate verification. TLS verification
+/// still uses the hostname, so the server certificate is validated as usual.
+/// We deliberately do not scan arbitrary ranges: discovery is bounded to this list.
 pub const TELEGRAM_DC_CANDIDATES: &[&str] = &[
     "149.154.167.220",
     "149.154.167.40",
@@ -151,12 +152,14 @@ pub fn is_connectivity_error(e: &anyhow::Error) -> bool {
 }
 
 /// Build a short-timeout client used only for the discovery probe (`getMe`).
-/// A fast connect timeout keeps an offline candidate from stalling the sweep;
-/// the resulting client (if reachable) is reused for the real long-poll path.
+/// A fast *connect* timeout keeps an unreachable candidate from stalling the
+/// sweep. Crucially this client has NO overall request timeout: `discover_client`
+/// returns it and it is reused for the real long-poll path (`getUpdates` holds
+/// the connection open for ~30s), so capping total request time here would sever
+/// long polling. The probe call itself is bounded separately via `tokio::time::timeout`.
 fn build_probe_client(proxy: Option<&str>, api_ip: Option<&str>) -> anyhow::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(DISCOVERY_PROBE_TIMEOUT_SECS))
-        .timeout(std::time::Duration::from_secs(DISCOVERY_PROBE_TIMEOUT_SECS + 5));
+        .connect_timeout(std::time::Duration::from_secs(DISCOVERY_PROBE_TIMEOUT_SECS));
     if let Some(proxy) = proxy
         && let Some(proxy) = non_empty(proxy)
     {
@@ -208,8 +211,13 @@ pub async fn discover_client(
                 continue;
             }
         };
-        match verify_bot_auth(&client, bot_token, None).await {
-            Ok(_) => {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(DISCOVERY_PROBE_TIMEOUT_SECS + 5),
+            verify_bot_auth(&client, bot_token, None),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {
                 if let Some(ip) = maybe_ip {
                     logging::info(&format!("telegram reachable via pinned IP {ip}"));
                 } else {
@@ -219,14 +227,25 @@ pub async fn discover_client(
                 }
                 return Ok(client);
             }
-            Err(e) => {
+            Ok(Err(e)) => {
+                // Probe returned an application-level error (e.g. 401 Unauthorized).
                 if !is_connectivity_error(&e) {
-                    anyhow::bail!("Telegram auth failed (bad token?): {e}. Stopping IP discovery.");
+                    anyhow::bail!(
+                        "Telegram auth failed (bad token?): {e}. Stopping IP discovery."
+                    );
                 }
                 logging::debug(&format!(
                     "telegram candidate {i} unreachable ({maybe_ip:?}): {e}"
                 ));
                 last_err = Some(e);
+            }
+            Err(elapsed) => {
+                // Overall probe timed out; classify as a connectivity failure and
+                // keep trying other candidates.
+                logging::debug(&format!(
+                    "telegram candidate {i} timed out after {DISCOVERY_PROBE_TIMEOUT_SECS}s"
+                ));
+                last_err = Some(anyhow::anyhow!("probe timed out: {elapsed}"));
             }
         }
     }
