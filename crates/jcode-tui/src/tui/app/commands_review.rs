@@ -1262,7 +1262,6 @@ pub(super) fn maybe_enter_review_loop(app: &mut App) {
         .get_or_insert_with(crate::session::ReviewLoopState::new);
     review_loop::enter_review_loop(state);
     state.active_reviewer_id = None;
-    app.active_review_reviewer_id = None;
     let _ = app.session.save();
     app.push_display_message(DisplayMessage::system(
         "🔁 Review loop started: reviewing the finished work across 6 lenses.".to_string(),
@@ -1303,7 +1302,6 @@ fn spawn_loop_reviewer(app: &mut App, lens: jcode_session_types::ReviewLens) -> 
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let socket = std::env::var("JCODE_SOCKET").ok();
     let _opened = super::spawn_in_new_terminal(&exe, &session_id, &cwd, socket.as_deref())?;
-    app.active_review_reviewer_id = Some(session_id.clone());
     Ok(session_id)
 }
 
@@ -1349,7 +1347,6 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
         match poll_loop_reviewer_verdict(&reviewer_id) {
             Some(report) => {
                 state.active_reviewer_id = None;
-                app.active_review_reviewer_id = None;
                 // Determine whether the fix turn actually changed files: compare
                 // the baseline captured at fix-queue time against the current
                 // working tree. A file-touching fix is productive repair work and
@@ -1402,7 +1399,7 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
                     }
                     review_loop::ReviewLoopAction::Converged
                     | review_loop::ReviewLoopAction::Stalled => {
-                        let digest = review_loop::build_digest(&state);
+                        let digest = review_loop::build_and_store_digest(&mut state);
                         app.push_display_message(DisplayMessage::system(digest));
                         app.session.review_loop = Some(state);
                         let _ = app.session.save();
@@ -1442,7 +1439,7 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
             }
             review_loop::ReviewLoopAction::Converged
             | review_loop::ReviewLoopAction::Stalled => {
-                let digest = review_loop::build_digest(&state);
+                let digest = review_loop::build_and_store_digest(&mut state);
                 app.push_display_message(DisplayMessage::system(digest));
                 app.session.review_loop = Some(state);
                 let _ = app.session.save();
@@ -1475,7 +1472,6 @@ pub(super) fn handle_review_loop_command_local(app: &mut App, trimmed: &str) -> 
                 .review_loop
                 .get_or_insert_with(crate::session::ReviewLoopState::new);
             review_loop::enter_review_loop(state);
-            app.active_review_reviewer_id = None;
             let _ = app.session.save();
             app.push_display_message(DisplayMessage::system(
                 "🔁 Review loop started (manual). Reviewing across 6 lenses.".to_string(),
@@ -1486,7 +1482,6 @@ pub(super) fn handle_review_loop_command_local(app: &mut App, trimmed: &str) -> 
         "stop" => {
             if let Some(state) = app.session.review_loop.as_mut() {
                 state.finish_with("user_stopped");
-                app.active_review_reviewer_id = None;
                 let _ = app.session.save();
                 app.push_display_message(DisplayMessage::system(
                     "Review loop stopped.".to_string(),
@@ -1534,7 +1529,6 @@ pub(super) fn handle_review_loop_command_local(app: &mut App, trimmed: &str) -> 
 pub(super) fn clear_review_loop_on_improve(app: &mut App) {
     if app.session.review_loop.as_ref().map(|s| !s.finished).unwrap_or(false) {
         app.session.review_loop = None;
-        app.active_review_reviewer_id = None;
         let _ = app.session.save();
     }
 }
