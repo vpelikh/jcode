@@ -3,7 +3,6 @@ use async_trait::async_trait;
 use compass_model::query_contract::{CodeQueryLimits, SearchRequest};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::path::PathBuf;
 
 use super::{Tool, ToolContext, ToolOutput};
 
@@ -46,7 +45,15 @@ impl Tool for CompassQueryTool {
         "Semantic code search and structural analysis backed by Compass's knowledge graph. \
          Use for natural-language code search, finding call sites, impact analysis, dependency \
          traversal, and architecture discovery. Requires a pre-built Compass index for the working \
-         directory; build it out-of-band with `compass extract <dir>` (or equivalent)."
+         directory; build it out-of-band (e.g. `compass extract <dir>`)."
+    }
+
+    fn concurrency_safe_marker(&self) -> bool {
+        // Read-only inspection tool: opens a pre-built Compass index and runs
+        // semantic search. It is a pure function of its input plus the index
+        // files, mutates no shared agent/session state, spawns no subprocesses,
+        // and does not depend on sibling tool results.
+        true
     }
 
     fn parameters_schema(&self) -> Value {
@@ -93,17 +100,16 @@ impl Tool for CompassQueryTool {
         }
 
         // Open the Compass query engine against the project's pre-built index.
-        // Index building is an out-of-band operation (e.g. `compass extract <dir>`);
-        // this tool only consumes an existing Compass knowledge graph in-process
-        // via the compass-query library. No CLI subprocess is spawned.
+        // Index building is performed out-of-band; this tool only consumes an
+        // existing Compass knowledge graph in-process via the compass-query library.
         let engine = match compass_query::open(&working_dir, None, &cache_dir) {
             Ok(engine) => engine,
             Err(open_err) => {
                 return Ok(ToolOutput::new(format!(
                     "Compass knowledge graph is not available for this project.\n\n\
                      Open failed: {}\n\n\
-                     compass_query is a pure in-process library consumer and does not build \
-                     indexes itself. To use it, provide a pre-built Compass index:\n\
+                     compass_query consumes a pre-built Compass index in-process and does \
+                     not build indexes itself. Build one out-of-band first:\n\
                      1. Clone Compass: git clone https://github.com/crabbuild/compass\n\
                      2. Build: cargo build --release --bin compass\n\
                      3. Index project: compass extract {}\n\
