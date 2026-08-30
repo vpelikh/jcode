@@ -11,8 +11,8 @@ Phases 1–6 are implemented and unit-tested on branch `jc/review-rounds`.
   pure state machine in `crates/jcode-tui/src/tui/app/review_loop.rs` (with
   `review_loop_tests`).
 - `AutoReviewConfig.loop_mode` / `max_stalled_turns` are in `jcode-config-types`.
-- `Session.review_loop`, `SessionStartupStub`, `SessionJournalMeta`, and the
-  snapshot diff term are wired in `jcode-base`.
+- `Session.review_loop`, `SessionJournalMeta`, and the snapshot diff term are
+  wired in `jcode-base`.
 - Harness glue (per-lens reviewer spawn, child-session polling, `turn.rs` entry
   hook, `input.rs` turn-end followup arm, `/review-loop` command, double-review
   guard, mutual exclusion) is in `crates/jcode-tui/src/tui/app/commands_review.rs`.
