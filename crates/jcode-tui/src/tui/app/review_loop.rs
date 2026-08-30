@@ -127,6 +127,9 @@ pub fn apply_verdict(
                     state.finish_reason = Some("stall_cap".to_string());
                     return ReviewLoopAction::Stalled;
                 }
+                // Stalled but under cap: re-spawn the reviewer for another re-check
+                // (do not queue another fix turn, the fix did not resolve it).
+                return ReviewLoopAction::SpawnReviewer(lens);
             } else {
                 // Productive round (new findings or first pass): reset the cap.
                 state.stall_turns = 0;
@@ -313,6 +316,26 @@ mod review_loop_tests {
         }
         assert!(s.finished);
         assert_eq!(s.finish_reason.as_deref(), Some("converged"));
+    }
+
+    #[test]
+    fn stall_rechecks_without_queueing_another_fix_turn() {
+        // Stalled (same open findings, no net shrink) but under the stall cap
+        // must re-spawn the reviewer for another re-check, NOT queue a second
+        // fix turn (the fix did not resolve the finding).
+        let mut s = clean_state();
+        next_action(&mut s);
+        apply_verdict(&mut s, &findings("bug a"), 3);
+        // Post-fix re-check re-raises the same finding -> stalled (cap=3).
+        next_action(&mut s);
+        match apply_verdict(&mut s, &findings("bug a"), 3) {
+            ReviewLoopAction::SpawnReviewer(ReviewLens::Correctness) => {}
+            other => panic!("expected re-spawn for stalled re-check, got {other:?}"),
+        }
+        // Still awaiting the post-fix re-check (no convergence yet).
+        assert!(s.awaiting_postfix_recheck);
+        assert_eq!(s.stall_turns, 1);
+        assert!(!s.finished);
     }
 
     #[test]

@@ -324,9 +324,6 @@ pub struct ReviewLoopState {
     /// stall counter compares against the previous open-findings set.
     #[serde(default)]
     pub awaiting_postfix_recheck: bool,
-    /// Index into `ReviewLens::ALL` for the final confirmation pass.
-    #[serde(default)]
-    pub confirm_lens_index: usize,
 }
 
 impl Default for ReviewLoopState {
@@ -339,7 +336,6 @@ impl Default for ReviewLoopState {
             record: None,
             phase: ReviewLoopPhase::Lenses,
             awaiting_postfix_recheck: false,
-            confirm_lens_index: 0,
         }
     }
 }
