@@ -646,6 +646,7 @@ fn clone_session_for_review(
     child.model = Some(initial_model);
     child.provider_key = provider_key_override.or_else(|| app.session.provider_key.clone());
     child.subagent_model = app.session.subagent_model.clone();
+    child.reasoning_effort = app.session.reasoning_effort.clone();
     child.autoreview_enabled = Some(false);
     child.autojudge_enabled = Some(false);
     child.status = crate::session::SessionStatus::Closed;
@@ -1165,6 +1166,13 @@ pub(super) fn maybe_enter_review_loop(app: &mut App) {
         return;
     }
     if !crate::config::config().autoreview.loop_mode {
+        return;
+    }
+    // The completion gates (ownership / confidence) may still be running a
+    // follow-up continuation this turn. Per the proposal the loop enters only
+    // once the gates have passed; don't seed it on the same turn the gate is
+    // still nudging the model for more work.
+    if app.pending_queued_dispatch {
         return;
     }
     if is_review_loop_active(app) {
