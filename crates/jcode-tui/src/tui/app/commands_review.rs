@@ -1498,10 +1498,18 @@ pub(super) fn handle_review_loop_command_local(app: &mut App, trimmed: &str) -> 
         "status" => {
             let status = match &app.session.review_loop {
                 None => "No review loop for this session.".to_string(),
-                Some(state) if state.finished => format!(
-                    "Review loop finished ({}).",
-                    state.finish_reason.as_deref().unwrap_or("unknown")
-                ),
+                Some(state) if state.finished => {
+                    // The digest was persisted when the loop finished, so a
+                    // reloaded session can still show the outcome. Fall back to
+                    // a one-line summary if it is somehow absent.
+                    match state.record.as_ref().and_then(|r| r.digest.as_deref()) {
+                        Some(digest) => digest.to_string(),
+                        None => format!(
+                            "Review loop finished ({}).",
+                            state.finish_reason.as_deref().unwrap_or("unknown")
+                        ),
+                    }
+                }
                 Some(state) => {
                     let lens = state
                         .current_lens
