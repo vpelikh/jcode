@@ -100,11 +100,14 @@ jcode-task-types = { path = "../jcode-task-types" }
 jcode-tool-core = { path = "../jcode-tool-core" }
 
 # Code intelligence via Compass (knowledge graph, semantic search, impact analysis).
-# Only compass-query + compass-model are needed; compass-core/compass-graph are
-# pulled in transitively by compass-query and we avoid declaring compass-core
-# directly because it drags compass-history (rand version conflict).
+# compass-query + compass-model are used to open/query an index; compass-core
+# provides the in-process build_graph API used to create the index on first use.
+# NOTE: compass-core pulls in compass-history, which pins time = "=0.3.53"; the
+# workspace root pins time to 0.3.53 so the two co-resolve (aws/azure/ratatui
+# accept ^0.3.4, so this is compatible).
 compass-query = { git = "https://github.com/crabbuild/compass", tag = "compass-v0.3.23" }
 compass-model = { git = "https://github.com/crabbuild/compass", tag = "compass-v0.3.23" }
+compass-core = { git = "https://github.com/crabbuild/compass", tag = "compass-v0.3.23" }
 jcode-tool-types = { path = "../jcode-tool-types" }
 
 # Archive extraction (for auto-update)
