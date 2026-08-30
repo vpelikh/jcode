@@ -527,7 +527,7 @@ fn test_account_switch_shorthand_switches_openai_account_by_label() {
     with_temp_jcode_home(|| {
         let now_ms = chrono::Utc::now().timestamp_millis();
 
-        crate::auth::codex::upsert_account(crate::auth::codex::OpenAiAccount {
+        let label = crate::auth::codex::upsert_account(crate::auth::codex::OpenAiAccount {
             label: "openai2".to_string(),
             access_token: "acc".to_string(),
             refresh_token: "ref".to_string(),
@@ -546,7 +546,7 @@ fn test_account_switch_shorthand_switches_openai_account_by_label() {
 
             assert_eq!(
                 crate::auth::codex::active_account_label().as_deref(),
-                Some("openai-1")
+                Some(label.as_str())
             );
         });
     });

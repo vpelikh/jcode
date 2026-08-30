@@ -296,7 +296,7 @@ pub fn build_todo_ownership_continuation_message(todos: &[TodoItem], goals: &[To
 const LEGACY_TODO_OWNERSHIP_CONTINUATION_MESSAGE: &str = "[automated todo completion gate - not a user message] Your end-to-end ownership is not high enough to finish this goal.";
 
 /// Model-facing continuation for private completion-confidence checks.
-pub const TODO_COMPLETION_CONTINUATION_MESSAGE: &str = "[auto] Do more validation on the work below. Keep the todo up to date; do not reply or wait for the user.";
+pub const TODO_COMPLETION_CONTINUATION_MESSAGE: &str = "[auto] Do more validation on the work below; its completion confidence still needs validation. Keep the todo up to date; do not reply or wait for the user.";
 const PRE_COMPACT_TODO_COMPLETION_CONTINUATION_MESSAGE: &str = "[automated follow-up - not a user message] Do more validation on the work below. Keep the todo up to date; do not reply or wait for the user.";
 
 /// Model-facing continuation identifying the items whose confidence jumped and
