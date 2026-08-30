@@ -801,6 +801,12 @@ fn test_save_persists_compaction_state() -> Result<()> {
         compacted_count: 8,
     });
 
+    // Add a message so save() does not early-return (persist guard).
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text { text: "placeholder".to_string(), cache_control: None }],
+    );
+
     session.save()?;
 
     let loaded = Session::load("session_compaction_persist_test")?;
@@ -825,6 +831,13 @@ fn test_save_persists_provider_key() -> Result<()> {
     session.provider_key = Some("opencode".to_string());
     session.model = Some("anthropic/claude-sonnet-4".to_string());
 
+    // Add a message so save() does not early-return (persist guard).
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text { text: "placeholder".to_string(), cache_control: None }],
+    );
+
+    // Save once to create the file, then modify and save again to verify persistence.
     session.save()?;
 
     let loaded = Session::load("session_provider_key_persist_test")?;
@@ -849,6 +862,12 @@ fn test_save_persists_reasoning_effort() -> Result<()> {
     );
     session.model = Some("gpt-5.4".to_string());
     session.reasoning_effort = Some("xhigh".to_string());
+
+    // Add a message so save() does not early-return (persist guard).
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text { text: "placeholder".to_string(), cache_control: None }],
+    );
 
     session.save()?;
 
@@ -2291,9 +2310,10 @@ fn streaming_guard_creates_visible_macos_sleep_assertion() {
     let temp = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
 
-    let reason = "Jcode streaming model response";
+    // Use a unique reason to avoid collision with any live daemon
+    let reason = format!("Jcode streaming test-{}", std::process::id());
     {
-        let _streaming = StreamingGuard::new("session_power");
+        let _streaming = StreamingGuard::with_reason(&reason, &reason);
 
         let output = std::process::Command::new("pmset")
             .args(["-g", "assertions"])
@@ -2302,7 +2322,7 @@ fn streaming_guard_creates_visible_macos_sleep_assertion() {
         assert!(output.status.success(), "pmset should succeed");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            stdout.contains(reason),
+            stdout.contains(&reason),
             "pmset output should show the streaming assertion; output was:\n{stdout}"
         );
     }
@@ -2313,7 +2333,7 @@ fn streaming_guard_creates_visible_macos_sleep_assertion() {
         .expect("pmset -g assertions should run on macOS");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        !stdout.contains(reason),
+        !stdout.contains(&reason),
         "streaming assertion should be released after guard drop; output was:\n{stdout}"
     );
 }
