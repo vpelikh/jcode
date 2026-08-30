@@ -901,13 +901,35 @@ impl Default for HooksConfig {
 }
 
 /// Automatic end-of-turn code review configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AutoReviewConfig {
     /// Enable autoreview by default for new/resumed sessions (default: false)
     pub enabled: bool,
     /// Optional model override for autoreview reviewer sessions.
     pub model: Option<String>,
+    /// When true, autoreview runs as a post-completion review loop: after the
+    /// completion gates pass, an independent per-lens reviewer inspects the
+    /// batch diff, findings are fixed, and the loop re-reviews until clean or a
+    /// stall cap is hit. Disabled by default; when false, autoreview stays
+    /// one-shot per turn (no loop).
+    pub loop_mode: bool,
+    /// Churn cap for the review loop: max consecutive rounds that report no new
+    /// findings but do not converge before force-stop. Default 3. `0` means
+    /// unlimited (rely on convergence + the finding-fingerprint guard).
+    pub max_stalled_turns: u32,
+}
+
+impl Default for AutoReviewConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: None,
+            loop_mode: false,
+            // Mirror the proposal's documented default churn cap.
+            max_stalled_turns: 3,
+        }
+    }
 }
 
 /// Integration discovery configuration (legacy `[sponsors]` section name).

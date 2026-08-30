@@ -228,14 +228,6 @@ mod tests {
             None,
             Some("Generated title".to_string()),
         );
-        // Add a message so save() does not early-return (persist guard).
-        session.add_message(
-            crate::message::Role::User,
-            vec![crate::message::ContentBlock::Text {
-                text: "placeholder".to_string(),
-                cache_control: None,
-            }],
-        );
         session.save().expect("save session");
         crate::todo::save_todos(
             session_id,
