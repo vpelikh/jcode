@@ -358,6 +358,7 @@ impl Default for ReviewLoopState {
             phase: ReviewLoopPhase::Lenses,
             awaiting_postfix_recheck: false,
             active_reviewer_id: None,
+            reviewer_session_id: None,
             last_fix_touched_files: false,
             fix_baseline_tree: None,
         }
