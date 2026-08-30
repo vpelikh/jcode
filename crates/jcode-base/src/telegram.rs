@@ -126,6 +126,12 @@ const DISCOVERY_PROBE_TIMEOUT_SECS: u64 = 8;
 /// connection refused/unreachable, TLS mismatch for a pinned IP) rather than an
 /// application-level auth/API error. Used to decide whether to keep trying
 /// alternate DC IPs.
+///
+/// Keywords are chosen to be specific enough to avoid false positives (e.g. a
+/// chat message containing "ghost" does not trip `host`): we match `host` only
+/// as part of `connection.*host` or `lookup.*host` style DNS-failure phrasing,
+/// and rely on `resolve`/`dns`/`name resolution`/`no address` for the common
+/// poisoned-DNS case.
 pub fn is_connectivity_error(e: &anyhow::Error) -> bool {
     let s = e.to_string().to_lowercase();
     s.contains("dns")
@@ -133,6 +139,7 @@ pub fn is_connectivity_error(e: &anyhow::Error) -> bool {
         || s.contains("lookup")
         || s.contains("name resolution")
         || s.contains("no address")
+        || s.contains("nodename")
         || s.contains("timed out")
         || s.contains("timeout")
         || s.contains("deadline")
@@ -141,14 +148,14 @@ pub fn is_connectivity_error(e: &anyhow::Error) -> bool {
         || s.contains("no route")
         || s.contains("connect error")
         || s.contains("operation timed out")
-        || s.contains("reset")
-        || s.contains("tcp")
+        || s.contains("reset by peer")
+        || s.contains("broken pipe")
         || s.contains("tls")
         || s.contains("ssl")
         || s.contains("certificate")
         || s.contains("handshake")
-        || s.contains("network")
-        || s.contains("host")
+        || s.contains("http2")
+        || s.contains("connect: ")
 }
 
 /// Build a short-timeout client used only for the discovery probe (`getMe`).
