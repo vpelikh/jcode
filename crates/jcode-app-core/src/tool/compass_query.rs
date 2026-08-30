@@ -2,6 +2,8 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::path::PathBuf;
+use tokio::process::Command as TokioCommand;
 
 use super::{Tool, ToolContext, ToolOutput};
 
@@ -43,8 +45,8 @@ impl Tool for CompassQueryTool {
     fn description(&self) -> &str {
         "Semantic code search and structural analysis backed by Compass's knowledge graph. \
          Use for natural-language code search, finding call sites, impact analysis, dependency \
-         traversal, and architecture discovery. Falls back to a clear error if no Compass index \
-         has been built for the working directory."
+         traversal, and architecture discovery. The first query in a project automatically builds \
+         a Compass index if one does not exist yet."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -90,23 +92,29 @@ impl Tool for CompassQueryTool {
             )));
         }
 
-        // Open the Compass query engine against the project's graph.
+        // Open the Compass query engine. If no index exists yet, build one
+        // automatically (via the Compass CLI) before retrying.
         let engine = match compass_query::open(&working_dir, None, &cache_dir) {
             Ok(engine) => engine,
-            Err(e) => {
-                return Ok(ToolOutput::new(format!(
-                    "Compass knowledge graph is not available for this project.\n\n\
-                     Error: {}\n\n\
-                     To use compass_query, build a Compass index first:\n\
-                     1. Clone Compass: git clone https://github.com/crabbuild/compass\n\
-                     2. Build: cargo build --release --bin compass\n\
-                     3. Index project: ./target/release/compass extract --path {}\n\
-                     4. Re-run this query once the index exists.\n\n\
-                     In the meantime, use agentgrep for grep/find/trace-style searches.",
-                    e,
-                    working_dir.display()
-                )));
-            }
+            Err(open_err) => match build_compass_index(&working_dir).await {
+                Ok(()) => compass_query::open(&working_dir, None, &cache_dir).map_err(|e| {
+                    anyhow!("Index built but reopen failed: {e}")
+                })?,
+                Err(build_err) => {
+                    return Ok(ToolOutput::new(format!(
+                        "Compass knowledge graph is not available for this project.\n\n\
+                         Open failed: {}\n\
+                         Auto-build failed: {}\n\n\
+                         To use compass_query, build a Compass index first:\n\
+                         1. Clone Compass: git clone https://github.com/crabbuild/compass\n\
+                         2. Build: cargo build --release --bin compass\n\
+                         3. Index project: compass extract {}\n\
+                         4. Re-run this query once the index exists.\n\n\
+                         In the meantime, use agentgrep for grep/find/trace-style searches.",
+                        open_err, build_err, working_dir.display()
+                    )));
+                }
+            },
         };
 
         let result = execute_query(
@@ -134,6 +142,27 @@ impl Tool for CompassQueryTool {
     }
 }
 
+/// Build a Compass knowledge-graph index for the project, so that subsequent
+/// `compass_query` calls can open it. Uses the Compass CLI `extract` command.
+async fn build_compass_index(working_dir: &PathBuf) -> Result<(), anyhow::Error> {
+    let output = TokioCommand::new("compass")
+        .current_dir(working_dir)
+        .args(["extract", &working_dir.to_string_lossy()])
+        .output()
+        .await
+        .map_err(|e| anyhow!("failed to launch `compass` CLI: {e}. Is Compass installed?"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "compass extract exited with {}: {}",
+            output.status.code().unwrap_or(-1),
+            stderr.trim()
+        ));
+    }
+    Ok(())
+}
+
 /// Run a search through the Compass `CodeQueryEngine`. Returns a model-ready
 /// formatted report.
 fn execute_query(
@@ -155,6 +184,31 @@ fn execute_query(
 
     let response = engine.search(request).map_err(|e| anyhow!("{}", e))?;
 
+    // Resolve each hit's node + source file, then apply the optional path filter.
+    let mut rows: Vec<(String, Option<String>, f64, Vec<String>)> = Vec::new();
+    for hit in &response.results {
+        let node = response.nodes.iter().find(|n| n.id == hit.node_id);
+        let name = node
+            .map(|n| n.qualified_name.as_str())
+            .unwrap_or(hit.node_id.as_str())
+            .to_string();
+        let file = node
+            .and_then(|n| n.source.as_ref())
+            .map(|s| s.file.clone());
+        // Apply path filter (substring match on the resolved file path).
+        if let (Some(filter), Some(file)) = (path_filter, &file) {
+            if !file.contains(filter) {
+                continue;
+            }
+        }
+        rows.push((
+            name,
+            file,
+            hit.score,
+            hit.matched_fields.clone(),
+        ));
+    }
+
     let mut output = String::new();
     output.push_str(&format!("# Compass query: {}\n\n", query));
     output.push_str(&format!("**Intent:** {}\n", intent));
@@ -162,30 +216,16 @@ fn execute_query(
     if let Some(p) = path_filter {
         output.push_str(&format!("**Path filter:** {}\n", p));
     }
-    output.push_str(&format!("\n**Found {} result(s)**\n\n", response.results.len()));
+    output.push_str(&format!("\n**Found {} result(s)**\n\n", rows.len()));
 
-    for (i, hit) in response.results.iter().enumerate() {
-        // Resolve the matched node by id for a human-readable name.
-        let name = response
-            .nodes
-            .iter()
-            .find(|n| n.id == hit.node_id)
-            .map(|n| n.qualified_name.as_str())
-            .unwrap_or(hit.node_id.as_str());
-        let file = response
-            .nodes
-            .iter()
-            .find(|n| n.id == hit.node_id)
-            .and_then(|n| n.source.as_ref())
-            .map(|s| s.file.as_str());
-
+    for (i, (name, file, score, matched)) in rows.iter().enumerate() {
         output.push_str(&format!("## {}. {}\n\n", i + 1, name));
         if let Some(file) = file {
             output.push_str(&format!("**File:** {}\n", file));
         }
-        output.push_str(&format!("**Score:** {:.3}\n", hit.score));
-        if !hit.matched_fields.is_empty() {
-            output.push_str(&format!("**Matched:** {}\n", hit.matched_fields.join(", ")));
+        output.push_str(&format!("**Score:** {:.3}\n", score));
+        if !matched.is_empty() {
+            output.push_str(&format!("**Matched:** {}\n", matched.join(", ")));
         }
         output.push('\n');
     }
