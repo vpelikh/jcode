@@ -1319,7 +1319,7 @@ fn spawn_loop_reviewer(app: &mut App, lens: jcode_session_types::ReviewLens) -> 
     // Only open a terminal the first time. A reused reviewer session already
     // has its window open; re-injecting the prompt into the existing session
     // re-points it at the current lens.
-    if reviewer_session_id.is_none() {
+    if !reuse_existing {
         let exe = super::launch_client_executable();
         let cwd = active_working_dir(app)
             .filter(|path| path.is_dir())
