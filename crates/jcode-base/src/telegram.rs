@@ -86,6 +86,121 @@ fn non_empty(value: &str) -> Option<&str> {
     }
 }
 
+/// Curated list of known Telegram data-center IPs, tried in order when the
+/// DNS-resolved default is blocked. These come from Telegram's published DC
+/// ranges (149.154.167.x / 149.154.175.x and their IPv6 counterparts). The
+/// hostname is always kept for TLS/SNI, so this only redirects the TCP
+/// connection; it does not bypass certificate verification. We deliberately do
+/// not scan arbitrary ranges: discovery is bounded to this list.
+pub const TELEGRAM_DC_CANDIDATES: &[&str] = &[
+    "149.154.167.220",
+    "149.154.167.40",
+    "149.154.167.50",
+    "149.154.175.50",
+    "149.154.175.100",
+    "149.154.175.53",
+    "2001:67c:4e8::1",
+    "2001:67c:4e8::2",
+    "2001:67c:4e8::3",
+    "2001:67c:4e8::4",
+    "2001:67c:4e8::5",
+    "2001:67c:4e8::6",
+    "2001:67c:4e8::7",
+    "2001:67c:4e8::8",
+    "2001:67c:4e8::9",
+    "2001:67c:4e8::a",
+];
+
+/// Seconds to wait before retrying discovery after a full failure, so a blocked
+/// network does not trigger a fresh (slow) candidate sweep on every poll.
+pub const DISCOVERY_BACKOFF_SECS: u64 = 60;
+
+/// True if the error is a network-level failure (DNS poisoned, IP blocked,
+/// connection refused/unreachable, TLS mismatch for a pinned IP) rather than an
+/// application-level auth/API error. Used to decide whether to keep trying
+/// alternate DC IPs.
+pub fn is_connectivity_error(e: &anyhow::Error) -> bool {
+    let s = e.to_string().to_lowercase();
+    s.contains("dns")
+        || s.contains("resolve")
+        || s.contains("lookup")
+        || s.contains("name resolution")
+        || s.contains("timed out")
+        || s.contains("timeout")
+        || s.contains("connection refused")
+        || s.contains("unreachable")
+        || s.contains("no route")
+        || s.contains("connect error")
+        || s.contains("reset")
+        || s.contains("tcp")
+        || s.contains("tls")
+        || s.contains("ssl")
+        || s.contains("certificate")
+        || s.contains("handshake")
+}
+
+/// Build a working client for the Telegram Bot API, auto-discovering a
+/// reachable data-center IP when the DNS-resolved default is blocked.
+///
+/// Precedence: if `override_ip` (from `[safety] telegram_api_ip`) is set, it is
+/// tried first as an explicit escape hatch. Then the default DNS resolution is
+/// tried, followed by the curated list of known DC IPs (`TELEGRAM_DC_CANDIDATES`).
+/// The first client whose `verify_bot_auth` probe succeeds is returned. A
+/// non-connectivity error (e.g. a bad bot token) stops discovery immediately,
+/// since no IP will help.
+pub async fn discover_client(
+    bot_token: &str,
+    proxy: Option<&str>,
+    override_ip: Option<&str>,
+) -> anyhow::Result<reqwest::Client> {
+    let mut candidates: Vec<Option<String>> = Vec::new();
+    if let Some(ip) = override_ip.filter(|ip| !ip.trim().is_empty()) {
+        candidates.push(Some(ip.trim().to_string()));
+    }
+    candidates.push(None); // default DNS resolution
+    for ip in TELEGRAM_DC_CANDIDATES {
+        candidates.push(Some((*ip).to_string()));
+    }
+
+    let mut last_err: Option<anyhow::Error> = None;
+    for (i, maybe_ip) in candidates.iter().enumerate() {
+        let client = match build_client(proxy, maybe_ip.as_deref()) {
+            Ok(c) => c,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+        match verify_bot_auth(&client, bot_token, None).await {
+            Ok(_) => {
+                if let Some(ip) = maybe_ip {
+                    logging::info(&format!("telegram reachable via pinned IP {ip}"));
+                } else {
+                    logging::info(&format!(
+                        "telegram reachable via default DNS (candidate {i})"
+                    ));
+                }
+                return Ok(client);
+            }
+            Err(e) => {
+                if !is_connectivity_error(&e) {
+                    anyhow::bail!("Telegram auth failed (bad token?): {e}. Stopping IP discovery.");
+                }
+                logging::debug(&format!(
+                    "telegram candidate {i} unreachable ({maybe_ip:?}): {e}"
+                ));
+                last_err = Some(e);
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "Telegram unreachable: tried default DNS and {} DC IPs. Last error: {}",
+        TELEGRAM_DC_CANDIDATES.len(),
+        last_err.map(|e| e.to_string()).unwrap_or_default()
+    )
+}
+
 /// Escape text for Telegram's legacy `Markdown` parse mode so it renders
 /// literally and cannot be misinterpreted as formatting.
 ///
@@ -895,5 +1010,55 @@ mod tests {
         // Ordinary characters and spaces pass through unescaped; only the
         // legacy-Markdown reserved set gets a backslash.
         assert_eq!(escape_markdown("hello world 123"), "hello world 123");
+    }
+
+    #[test]
+    fn test_dc_candidate_list_is_non_empty_and_parses() {
+        assert!(!TELEGRAM_DC_CANDIDATES.is_empty());
+        for ip in TELEGRAM_DC_CANDIDATES {
+            assert!(ip.parse::<std::net::IpAddr>().is_ok(), "bad candidate IP: {ip}");
+        }
+    }
+
+    #[test]
+    fn test_discovery_backoff_is_reasonable() {
+        assert!(DISCOVERY_BACKOFF_SECS >= 30);
+    }
+
+    #[test]
+    fn test_is_connectivity_error_classifies() {
+        // Network-level failures should keep discovery going.
+        assert!(is_connectivity_error(&anyhow::anyhow!(
+            "error trying to connect: tcp connect error: Connection refused"
+        )));
+        assert!(is_connectivity_error(&anyhow::anyhow!(
+            "failed to lookup host: dns resolution failed"
+        )));
+        assert!(is_connectivity_error(&anyhow::anyhow!(
+            "tls handshake error: certificate mismatch"
+        )));
+        // Auth errors should stop discovery.
+        assert!(!is_connectivity_error(&anyhow::anyhow!(
+            "Telegram auth failed: Unauthorized"
+        )));
+    }
+
+    #[test]
+    fn test_discovery_candidate_ordering() {
+        // Simulate the ordering used in discover_client: override first, then
+        // default DNS, then the curated list.
+        let override_ip = Some("10.0.0.1");
+        let mut candidates: Vec<Option<String>> = Vec::new();
+        if let Some(ip) = override_ip.filter(|ip| !ip.trim().is_empty()) {
+            candidates.push(Some(ip.trim().to_string()));
+        }
+        candidates.push(None);
+        for ip in TELEGRAM_DC_CANDIDATES {
+            candidates.push(Some((*ip).to_string()));
+        }
+        // candidates.first() returns Option<&Option<String>>, need Some(&Option...)
+        assert_eq!(candidates.first(), Some(&Some("10.0.0.1".to_string())));
+        assert_eq!(candidates.get(1), Some(&None));
+        assert_eq!(candidates.get(2), Some(&Some("149.154.167.220".to_string())));
     }
 }

@@ -172,7 +172,23 @@ pub struct TelegramChannel {
     reply_enabled: bool,
     api_base: Option<String>,
     allowed_user_id: Option<String>,
-    client: reqwest::Client,
+    /// HTTP client used for Bot API calls. Lazily (re)discovered: on first use a
+    /// reachable data-center IP is auto-selected (see `client()`), so a blocked
+    /// default DC does not require manual `telegram_api_ip` configuration.
+    client: tokio::sync::Mutex<reqwest::Client>,
+    /// Proxy override retained for re-discovery when the cached client goes
+    /// stale (connectivity failure).
+    proxy: Option<String>,
+    /// Explicit IP override (`[safety] telegram_api_ip`) tried first during
+    /// discovery as a last-resort escape hatch. Usually `None`.
+    api_ip: Option<String>,
+    /// When discovery was last attempted (success or failure), used to throttle
+    /// re-discovery after a full failure (see `DISCOVERY_BACKOFF_SECS`).
+    last_discovery: tokio::sync::Mutex<std::time::Instant>,
+    /// Whether discovery has been run at least once. Until then, `client_or_default`
+    /// triggers a discovery sweep so a blocked default DC is worked around at
+    /// first use rather than only after a failed call.
+    discovered_once: tokio::sync::Mutex<bool>,
     /// Serializes inbound message handling for this chat. Because each message
     /// is handled in its own task (so the poll loop stays responsive), this
     /// lock ensures the replies to messages from one chat arrive in arrival
@@ -216,9 +232,56 @@ impl TelegramChannel {
             reply_enabled,
             api_base,
             allowed_user_id,
-            client,
+            client: tokio::sync::Mutex::new(client),
+            proxy,
+            api_ip,
+            last_discovery: tokio::sync::Mutex::new(std::time::Instant::now()),
+            discovered_once: tokio::sync::Mutex::new(false),
             process_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Run (or re-run) the discovery sweep, replacing the cached client with the
+    /// first reachable DC (or the default client if all candidates fail). Marks
+    /// discovery as done and records the attempt time for backoff.
+    async fn run_discovery(&self) {
+        let replacement = match crate::telegram::discover_client(
+            &self.token,
+            self.proxy.as_deref(),
+            self.api_ip.as_deref(),
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(_) => crate::provider::shared_http_client(),
+        };
+        *self.client.lock().await = replacement;
+        *self.discovered_once.lock().await = true;
+        *self.last_discovery.lock().await = std::time::Instant::now();
+    }
+
+    /// Return a usable client, running discovery once at first use (or after the
+    /// cache is invalidated) so a blocked default DC is transparently worked
+    /// around. On a full discovery failure a default (DNS-resolved) client is
+    /// returned so the calling operation still attempts to run.
+    async fn client_or_default(&self) -> reqwest::Client {
+        if !*self.discovered_once.lock().await {
+            self.run_discovery().await;
+        }
+        self.client.lock().await.clone()
+    }
+
+    /// Drop the cached client so the next call re-discovers. Re-sweeps are
+    /// throttled by `DISCOVERY_BACKOFF_SECS` so a persistently blocked network
+    /// does not trigger a slow candidate sweep on every poll/error.
+    async fn invalidate_cache(&self) {
+        {
+            let last = *self.last_discovery.lock().await;
+            if last.elapsed().as_secs() < crate::telegram::DISCOVERY_BACKOFF_SECS {
+                return;
+            }
+        }
+        self.run_discovery().await;
     }
 
     /// Handle a slash command received over Telegram, returning the reply text.
@@ -267,6 +330,7 @@ impl TelegramChannel {
     /// Send an inline-keyboard session picker to the chat. Each button's
     /// `callback_data` is the session id, so tapping it selects that session.
     async fn send_session_picker(&self) {
+        let client = self.client_or_default().await;
         let entries = crate::recent_session_index::recent(12);
         let sessions = match entries {
             Ok(list) => list,
@@ -301,7 +365,7 @@ impl TelegramChannel {
             }]);
         }
         let _ = crate::telegram::send_message_with_keyboard(
-            &self.client,
+            &client,
             &self.token,
             &self.chat_id,
             "📚 Select a session:",
@@ -314,13 +378,14 @@ impl TelegramChannel {
     /// Handle an inline-keyboard tap (`callback_query`). `callback_data` is a
     /// session id; selecting it sets the active session for this chat.
     async fn handle_callback_query(&self, cb: crate::telegram::CallbackQuery) {
+        let client = self.client_or_default().await;
         // A tap on a picker button must always be acknowledged so Telegram
         // clears the button's loading spinner. A callback whose message or
         // chat id is missing is still answered (a no-op toast) so the button
         // never stays stuck in its loading state.
         let Some(msg) = cb.message.as_ref() else {
             let _ = crate::telegram::answer_callback_query(
-                &self.client,
+                &client,
                 &self.token,
                 &cb.id,
                 "",
@@ -331,7 +396,7 @@ impl TelegramChannel {
         };
         let Some(chat_id) = msg.chat.as_ref().map(|c| c.id.to_string()) else {
             let _ = crate::telegram::answer_callback_query(
-                &self.client,
+                &client,
                 &self.token,
                 &cb.id,
                 "",
@@ -351,7 +416,7 @@ impl TelegramChannel {
         if !self.is_allowed_sender(cb.from.as_ref()) {
             logging::warn("ignoring callback_query from disallowed sender");
             let _ = crate::telegram::answer_callback_query(
-                &self.client,
+                &client,
                 &self.token,
                 &cb.id,
                 "Not allowed",
@@ -362,7 +427,7 @@ impl TelegramChannel {
         }
         let Some(data) = cb.data.as_deref() else {
             let _ = crate::telegram::answer_callback_query(
-                &self.client,
+                &client,
                 &self.token,
                 &cb.id,
                 "",
@@ -377,7 +442,7 @@ impl TelegramChannel {
         let ack = format!("Selected session `{}`", short_id(&session_id));
         crate::logging::info(&format!("telegram callback selected session={session_id}"));
         let _ = crate::telegram::answer_callback_query(
-            &self.client,
+            &client,
             &self.token,
             &cb.id,
             &ack,
@@ -389,7 +454,7 @@ impl TelegramChannel {
             && let Ok(chat_id_num) = chat_id.parse::<i64>()
         {
             crate::telegram::edit_message_reply_markup(
-                &self.client,
+                &client,
                 &self.token,
                 chat_id_num,
                 message_id,
@@ -585,8 +650,9 @@ impl TelegramChannel {
     /// Fire a one-shot `typing` chat action so the user sees a live indicator
     /// while the bot is processing. Non-fatal (errors are swallowed).
     async fn show_typing(&self) {
+        let client = self.client_or_default().await;
         let _ = crate::telegram::send_chat_action(
-            &self.client,
+            &client,
             &self.token,
             &self.chat_id,
             "typing",
@@ -598,8 +664,9 @@ impl TelegramChannel {
     /// Send a bot message to the chat, optionally threading it as a reply to the
     /// message `reply_to_message_id` that triggered it.
     async fn send_reply(&self, text: &str, reply_to_message_id: Option<i64>) -> anyhow::Result<()> {
+        let client = self.client_or_default().await;
         crate::telegram::send_message_with_base(
-            &self.client,
+            &client,
             &self.token,
             &self.chat_id,
             text,
@@ -615,7 +682,7 @@ impl TelegramChannel {
     where
         Fut: std::future::Future<Output = T>,
     {
-        let client = self.client.clone();
+        let client = self.client_or_default().await;
         let token = self.token.clone();
         let chat_id = self.chat_id.clone();
         let api_base = self.api_base.clone();
@@ -846,8 +913,9 @@ impl MessageChannel for TelegramChannel {
             "sending telegram notification bytes={}",
             text.len()
         ));
-        crate::telegram::send_message_with_base(
-            &self.client,
+        let client = self.client_or_default().await;
+        match crate::telegram::send_message_with_base(
+            &client,
             &self.token,
             &self.chat_id,
             text,
@@ -855,15 +923,40 @@ impl MessageChannel for TelegramChannel {
             None,
         )
         .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if crate::telegram::is_connectivity_error(&e) {
+                    logging::warn(&format!(
+                        "telegram send failed (connectivity); re-discovering: {e}"
+                    ));
+                    self.invalidate_cache().await;
+                    let client = self.client_or_default().await;
+                    crate::telegram::send_message_with_base(
+                        &client,
+                        &self.token,
+                        &self.chat_id,
+                        text,
+                        self.api_base.as_deref(),
+                        None,
+                    )
+                    .await
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 
     async fn reply_loop(self: Arc<Self>, runner: Option<AmbientRunnerHandle>) {
         let mut offset: Option<i64> = None;
 
         // Fail fast on a bad bot token with a clear message instead of the loop
-        // silently re-polling an auth error forever.
+        // silently re-polling an auth error forever. Discovery resolves a
+        // reachable DC first, so a blocked default endpoint does not block auth.
+        let client = self.client_or_default().await;
         match crate::telegram::verify_bot_auth(
-            &self.client,
+            &client,
             &self.token,
             self.api_base.as_deref(),
         )
@@ -882,11 +975,12 @@ impl MessageChannel for TelegramChannel {
 
         // Register the bot's slash commands with Telegram so they show up in the
         // user's `/` menu. Non-fatal on failure.
-        crate::telegram::set_my_commands(&self.client, &self.token, self.api_base.as_deref()).await;
+        crate::telegram::set_my_commands(&client, &self.token, self.api_base.as_deref()).await;
 
         loop {
+            let client = self.client_or_default().await;
             match crate::telegram::get_updates_with_base(
-                &self.client,
+                &client,
                 &self.token,
                 offset,
                 30,
@@ -939,6 +1033,11 @@ impl MessageChannel for TelegramChannel {
                 }
                 Err(e) => {
                     logging::error(&format!("Telegram poll error: {}", e));
+                    if crate::telegram::is_connectivity_error(&e) {
+                        // The cached DC IP is no longer reachable; re-discover on
+                        // the next iteration (throttled by the backoff window).
+                        self.invalidate_cache().await;
+                    }
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                 }
             }
