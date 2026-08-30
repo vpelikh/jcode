@@ -65,8 +65,8 @@ pub fn is_review_loop_active(state: &ReviewLoopState) -> bool {
 }
 
 /// Decide the next harness action when there is no in-flight reviewer for the
-/// current lens. Call this from turn-end followups when
-/// `app.active_review_reviewer_id` is `None`.
+/// current lens. Call this from turn-end followups when `state.active_reviewer_id`
+/// is `None` (the persisted source of truth for the in-flight reviewer).
 pub fn next_action(state: &mut ReviewLoopState) -> ReviewLoopAction {
     if state.finished {
         return ReviewLoopAction::None;
@@ -252,6 +252,17 @@ fn lens_index(lens: Option<ReviewLens>) -> usize {
         Some(l) => ReviewLens::ALL.iter().position(|x| *x == l).unwrap_or(0),
         None => 0,
     }
+}
+
+/// Build the digest and persist it on the loop's record so a resumed or
+/// reloaded session can show the outcome without re-running the loop. Returns
+/// the digest text for immediate display.
+pub fn build_and_store_digest(state: &mut ReviewLoopState) -> String {
+    let digest = build_digest(state);
+    if let Some(record) = state.record.as_mut() {
+        record.digest = Some(digest.clone());
+    }
+    digest
 }
 
 /// Build the end-of-loop digest summarizing rounds, findings fixed, can't-fix
@@ -532,5 +543,19 @@ mod review_loop_tests {
         assert!(digest.contains("Review/fix rounds"));
         assert!(digest.contains("Can't fix"));
         assert!(digest.contains("a.rs"));
+    }
+
+    #[test]
+    fn build_and_store_digest_persists_on_record() {
+        // The digest must be persisted on the record so a resumed session can
+        // show the outcome without re-running the loop. build_digest() alone
+        // does not write it.
+        let mut s = clean_state();
+        next_action(&mut s);
+        apply_verdict(&mut s, &findings("x"), 3);
+        assert!(s.record.as_ref().unwrap().digest.is_none());
+        let digest = build_and_store_digest(&mut s);
+        assert!(digest.contains("Review rounds complete"));
+        assert_eq!(s.record.as_ref().unwrap().digest.as_deref(), Some(digest.as_str()));
     }
 }

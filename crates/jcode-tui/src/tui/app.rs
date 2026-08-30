@@ -1277,10 +1277,6 @@ pub struct App {
     autojudge_enabled: bool,
     // Last requested `/improve` mode for this session.
     improve_mode: Option<ImproveMode>,
-    // When a review loop is active, the session id of the in-flight per-lens
-    // reviewer child session. `None` means the loop is idle (waiting for a
-    // turn to spawn the next reviewer, or between rounds).
-    active_review_reviewer_id: Option<String>,
     // Suppress duplicate memory injection messages for near-identical prompts.
     last_injected_memory_signature: Option<(String, Instant)>,
     // Swarm feature toggle for this session
