@@ -1099,6 +1099,11 @@ mod tests {
             "error sending request: deadline has elapsed",
             "network is unreachable",
             "no address found for host",
+            "nodename nor servname provided, or not known",
+            "connection reset by peer",
+            "Broken pipe (os error 32)",
+            "http2 error: connection closed",
+            "dial tcp: lookup api.telegram.org: no such host",
         ] {
             assert!(is_connectivity_error(&anyhow::anyhow!(msg)), "expected connectivity: {msg}");
         }
@@ -1110,6 +1115,24 @@ mod tests {
         assert!(!is_connectivity_error(&anyhow::anyhow!(
             "Telegram API error (400): Bad Request: can't parse entities"
         )));
+    }
+
+    #[test]
+    fn test_is_connectivity_error_avoids_false_positives() {
+        // These strings contain substrings that used to match broad keywords
+        // ("host", "network", "tcp"); they must NOT be treated as connectivity
+        // failures, so a benign message body never aborts discovery prematurely.
+        for msg in [
+            "the ghost in the machine replied",
+            "could not parse entities in message to host channel",
+            "unexpected network of friends joined",
+            "a tcp-like protocol is not supported here",
+        ] {
+            assert!(
+                !is_connectivity_error(&anyhow::anyhow!(msg)),
+                "false positive for connectivity: {msg}"
+            );
+        }
     }
 
     #[test]
