@@ -115,6 +115,12 @@ pub const TELEGRAM_DC_CANDIDATES: &[&str] = &[
 /// network does not trigger a fresh (slow) candidate sweep on every poll.
 pub const DISCOVERY_BACKOFF_SECS: u64 = 60;
 
+/// Per-candidate connect timeout during discovery. Kept short so an offline
+/// network does not make the full sweep block for minutes (18 candidates × the
+/// normal 15s is far too long for a single poll). A working candidate is well
+/// within this; the long-poll path reuses the same resolved client afterward.
+const DISCOVERY_PROBE_TIMEOUT_SECS: u64 = 8;
+
 /// True if the error is a network-level failure (DNS poisoned, IP blocked,
 /// connection refused/unreachable, TLS mismatch for a pinned IP) rather than an
 /// application-level auth/API error. Used to decide whether to keep trying
@@ -125,18 +131,48 @@ pub fn is_connectivity_error(e: &anyhow::Error) -> bool {
         || s.contains("resolve")
         || s.contains("lookup")
         || s.contains("name resolution")
+        || s.contains("no address")
         || s.contains("timed out")
         || s.contains("timeout")
+        || s.contains("deadline")
         || s.contains("connection refused")
         || s.contains("unreachable")
         || s.contains("no route")
         || s.contains("connect error")
+        || s.contains("operation timed out")
         || s.contains("reset")
         || s.contains("tcp")
         || s.contains("tls")
         || s.contains("ssl")
         || s.contains("certificate")
         || s.contains("handshake")
+        || s.contains("network")
+        || s.contains("host")
+}
+
+/// Build a short-timeout client used only for the discovery probe (`getMe`).
+/// A fast connect timeout keeps an offline candidate from stalling the sweep;
+/// the resulting client (if reachable) is reused for the real long-poll path.
+fn build_probe_client(proxy: Option<&str>, api_ip: Option<&str>) -> anyhow::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(DISCOVERY_PROBE_TIMEOUT_SECS))
+        .timeout(std::time::Duration::from_secs(DISCOVERY_PROBE_TIMEOUT_SECS + 5));
+    if let Some(proxy) = proxy
+        && let Some(proxy) = non_empty(proxy)
+    {
+        let reqwest_proxy = reqwest::Proxy::all(proxy)
+            .map_err(|e| anyhow::anyhow!("invalid telegram proxy `{proxy}`: {e}"))?;
+        builder = builder.proxy(reqwest_proxy);
+    }
+    if let Some(ip) = api_ip
+        && let Some(ip) = non_empty(ip)
+    {
+        let addr = parse_telegram_ip(ip)?;
+        builder = builder.resolve("api.telegram.org", addr);
+    }
+    builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build telegram probe client: {e}"))
 }
 
 /// Build a working client for the Telegram Bot API, auto-discovering a
@@ -145,8 +181,9 @@ pub fn is_connectivity_error(e: &anyhow::Error) -> bool {
 /// Precedence: if `override_ip` (from `[safety] telegram_api_ip`) is set, it is
 /// tried first as an explicit escape hatch. Then the default DNS resolution is
 /// tried, followed by the curated list of known DC IPs (`TELEGRAM_DC_CANDIDATES`).
-/// The first client whose `verify_bot_auth` probe succeeds is returned. A
-/// non-connectivity error (e.g. a bad bot token) stops discovery immediately,
+/// Each candidate is probed with a short-timeout client; the first whose
+/// `verify_bot_auth` probe succeeds is returned (and reused for the real path).
+/// A non-connectivity error (e.g. a bad bot token) stops discovery immediately,
 /// since no IP will help.
 pub async fn discover_client(
     bot_token: &str,
@@ -164,7 +201,7 @@ pub async fn discover_client(
 
     let mut last_err: Option<anyhow::Error> = None;
     for (i, maybe_ip) in candidates.iter().enumerate() {
-        let client = match build_client(proxy, maybe_ip.as_deref()) {
+        let client = match build_probe_client(proxy, maybe_ip.as_deref()) {
             Ok(c) => c,
             Err(e) => {
                 last_err = Some(e);
@@ -1028,18 +1065,24 @@ mod tests {
     #[test]
     fn test_is_connectivity_error_classifies() {
         // Network-level failures should keep discovery going.
-        assert!(is_connectivity_error(&anyhow::anyhow!(
-            "error trying to connect: tcp connect error: Connection refused"
-        )));
-        assert!(is_connectivity_error(&anyhow::anyhow!(
-            "failed to lookup host: dns resolution failed"
-        )));
-        assert!(is_connectivity_error(&anyhow::anyhow!(
-            "tls handshake error: certificate mismatch"
-        )));
+        for msg in [
+            "error trying to connect: tcp connect error: Connection refused",
+            "failed to lookup host: dns resolution failed",
+            "tls handshake error: certificate mismatch",
+            "operation timed out after 8000ms",
+            "error sending request: deadline has elapsed",
+            "network is unreachable",
+            "no address found for host",
+        ] {
+            assert!(is_connectivity_error(&anyhow::anyhow!(msg)), "expected connectivity: {msg}");
+        }
         // Auth errors should stop discovery.
         assert!(!is_connectivity_error(&anyhow::anyhow!(
             "Telegram auth failed: Unauthorized"
+        )));
+        // A successful result is never an error; guard the negative path too.
+        assert!(!is_connectivity_error(&anyhow::anyhow!(
+            "Telegram API error (400): Bad Request: can't parse entities"
         )));
     }
 
@@ -1060,5 +1103,19 @@ mod tests {
         assert_eq!(candidates.first(), Some(&Some("10.0.0.1".to_string())));
         assert_eq!(candidates.get(1), Some(&None));
         assert_eq!(candidates.get(2), Some(&Some("149.154.167.220".to_string())));
+        // The curated list must be tried before any arbitrary scan: total is
+        // override + default-DNS + every candidate, and never a wider sweep.
+        assert_eq!(candidates.len(), 2 + TELEGRAM_DC_CANDIDATES.len());
+    }
+
+    #[test]
+    fn test_build_probe_client_rejects_non_ip() {
+        // A non-IP override must fail to build so discovery skips it, not crash.
+        assert!(build_probe_client(None, Some("not-an-ip")).is_err());
+        // An empty override builds a default-DNS probe client.
+        assert!(build_probe_client(None, Some("")).is_ok());
+        assert!(build_probe_client(None, None).is_ok());
+        // A valid pinned IP builds a probe client.
+        assert!(build_probe_client(None, Some("149.154.167.220")).is_ok());
     }
 }

@@ -173,8 +173,8 @@ pub struct TelegramChannel {
     api_base: Option<String>,
     allowed_user_id: Option<String>,
     /// HTTP client used for Bot API calls. Lazily (re)discovered: on first use a
-    /// reachable data-center IP is auto-selected (see `client()`), so a blocked
-    /// default DC does not require manual `telegram_api_ip` configuration.
+    /// reachable data-center IP is auto-selected (see `client_or_default`), so a
+    /// blocked default DC does not require manual `telegram_api_ip` configuration.
     client: tokio::sync::Mutex<reqwest::Client>,
     /// Proxy override retained for re-discovery when the cached client goes
     /// stale (connectivity failure).
@@ -272,10 +272,10 @@ impl TelegramChannel {
     }
 
     /// Drop the cached client so the next call re-discovers. Re-sweeps are
-    /// throttled by `DISCOVERY_BACKOFF_SECS` so a persistently blocked network
-    /// does not trigger a slow candidate sweep on every poll/error.
-    async fn invalidate_cache(&self) {
-        {
+    /// throttled by `DISCOVERY_BACKOFF_SECS` (unless `force`) so a persistently
+    /// blocked network does not trigger a slow candidate sweep on every poll.
+    async fn invalidate_cache(&self, force: bool) {
+        if !force {
             let last = *self.last_discovery.lock().await;
             if last.elapsed().as_secs() < crate::telegram::DISCOVERY_BACKOFF_SECS {
                 return;
@@ -930,7 +930,7 @@ impl MessageChannel for TelegramChannel {
                     logging::warn(&format!(
                         "telegram send failed (connectivity); re-discovering: {e}"
                     ));
-                    self.invalidate_cache().await;
+                    self.invalidate_cache(true).await;
                     let client = self.client_or_default().await;
                     crate::telegram::send_message_with_base(
                         &client,
@@ -1036,7 +1036,7 @@ impl MessageChannel for TelegramChannel {
                     if crate::telegram::is_connectivity_error(&e) {
                         // The cached DC IP is no longer reachable; re-discover on
                         // the next iteration (throttled by the backoff window).
-                        self.invalidate_cache().await;
+                        self.invalidate_cache(false).await;
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                 }
