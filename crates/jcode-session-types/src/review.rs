@@ -324,6 +324,11 @@ pub struct ReviewLoopState {
     /// stall counter compares against the previous open-findings set.
     #[serde(default)]
     pub awaiting_postfix_recheck: bool,
+    /// Session id of the in-flight reviewer child session for the current lens,
+    /// if any. Persisted (not just in-memory) so a reloaded session can keep
+    /// polling the same reviewer instead of spawning a duplicate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_reviewer_id: Option<String>,
 }
 
 impl Default for ReviewLoopState {
@@ -336,6 +341,7 @@ impl Default for ReviewLoopState {
             record: None,
             phase: ReviewLoopPhase::Lenses,
             awaiting_postfix_recheck: false,
+            active_reviewer_id: None,
         }
     }
 }
@@ -355,6 +361,18 @@ impl ReviewLoopState {
     pub fn finish_with(&mut self, reason: &str) {
         self.finished = true;
         self.finish_reason = Some(reason.to_string());
+    }
+
+    /// Append findings to the record's can't-fix list (deduped by fingerprint
+    /// key) without advancing the lens. Used to surface still-open findings when
+    /// the loop force-stops on the stall cap.
+    pub fn add_cant_fix(&mut self, findings: Vec<Finding>) {
+        let record = self.record.get_or_insert_with(ReviewRecord::default);
+        for f in findings {
+            if !record.cant_fix.iter().any(|c| c.fingerprint_key() == f.fingerprint_key()) {
+                record.cant_fix.push(f);
+            }
+        }
     }
 }
 
@@ -575,5 +593,14 @@ mod review_tests {
         let json = serde_json::to_string(&ReviewLoopState::default()).unwrap();
         let back: ReviewLoopState = serde_json::from_str(&json).unwrap();
         assert_eq!(back, ReviewLoopState::default());
+    }
+
+    #[test]
+    fn active_reviewer_id_roundtrips() {
+        let mut state = ReviewLoopState::default();
+        state.active_reviewer_id = Some("rev-123".to_string());
+        let json = serde_json::to_string(&state).unwrap();
+        let back: ReviewLoopState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.active_reviewer_id, Some("rev-123".to_string()));
     }
 }
