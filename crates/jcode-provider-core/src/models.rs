@@ -399,6 +399,61 @@ pub fn open_weight_family_context_limit(model: &str) -> Option<usize> {
         return Some(262_144);
     }
 
+    // --- xAI Grok 4.x family: 256K context ---
+    if m.contains("grok-4") {
+        return Some(256_000);
+    }
+
+    // --- ByteDance Seed 2.0 family: 256K context ---
+    if m.contains("seed-2") {
+        return Some(256_000);
+    }
+
+    // --- Step 3.7 family: 256K context ---
+    if m.contains("step-3") {
+        return Some(256_000);
+    }
+
+    // --- Tencent Hunyuan (hy3) family: 256K context ---
+    if m.contains("hy3") {
+        return Some(256_000);
+    }
+
+    // --- Ling 3.0 family: 256K context ---
+    if m.contains("ling-3") {
+        return Some(256_000);
+    }
+
+    // --- Inkling family: 256K context ---
+    if m.contains("inkling") {
+        return Some(256_000);
+    }
+
+    // --- NVIDIA Nemotron 3.x family: 256K context ---
+    if m.contains("nemotron-3") || m.contains("nemotron-3.5") {
+        return Some(256_000);
+    }
+
+    // --- Mistral latest family (large/medium/small-latest): 256K context ---
+    if m.contains("mistral-large") || m.contains("mistral-medium") || m.contains("mistral-small-latest") {
+        return Some(256_000);
+    }
+
+    // --- Cohere Command family: 256K context ---
+    if m.contains("command-a") || m.contains("command-r") {
+        return Some(256_000);
+    }
+
+    // --- Meta Llama 4 family: 256K context (1M variant exists but 256K is the common window) ---
+    if m.contains("llama-4") {
+        return Some(256_000);
+    }
+
+    // --- Google Gemma 4 family: 128K context ---
+    if m.contains("gemma-4") {
+        return Some(131_072);
+    }
+
     // --- OpenAI gpt-oss open weights: 131K context ---
     if m.contains("gpt-oss") {
         return Some(131_072);
