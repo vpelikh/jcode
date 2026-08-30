@@ -1243,7 +1243,18 @@ pub(super) fn maybe_enter_review_loop(app: &mut App) {
     if app.pending_queued_dispatch {
         return;
     }
-    if is_review_loop_active(app) {
+    // Mutual exclusion: do not auto-enter a review loop while an improve/refactor
+    // loop is active. (Going the other way, starting improve clears the review
+    // loop via clear_review_loop_on_improve().)
+    if app.improve_mode.is_some() {
+        return;
+    }
+    // Auto-entry seeds the loop only once per session: only when no review-loop
+    // state exists yet. A finished loop must NOT be re-seeded here (that would
+    // restart the whole 6-lens loop after every completed turn). Restart of a
+    // finished loop is a deliberate, manual action via `/review-loop start`,
+    // which calls enter_review_loop() directly and resets the finished flag.
+    if app.session.review_loop.is_some() {
         return;
     }
     let state = app
