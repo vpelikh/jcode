@@ -1,8 +1,25 @@
 # Review Rounds After Work Is Complete
 
-Status: proposal
+Status: implemented (branch `jc/review-rounds`, worktree `.worktrees/review-rounds`)
 
-## Problem
+## Implementation notes
+
+Phases 1–6 are implemented and unit-tested on branch `jc/review-rounds`.
+
+- Report-contract parser, lens definitions, fingerprint/stall helpers, and persisted
+  state live in `crates/jcode-session-types/src/review.rs` (engine types) and the
+  pure state machine in `crates/jcode-tui/src/tui/app/review_loop.rs` (with
+  `review_loop_tests`).
+- `AutoReviewConfig.loop_mode` / `max_stalled_turns` are in `jcode-config-types`.
+- `Session.review_loop`, `SessionStartupStub`, `SessionJournalMeta`, and the
+  snapshot diff term are wired in `jcode-base`.
+- Harness glue (per-lens reviewer spawn, child-session polling, `turn.rs` entry
+  hook, `input.rs` turn-end followup arm, `/review-loop` command, double-review
+  guard, mutual exclusion) is in `crates/jcode-tui/src/tui/app/commands_review.rs`.
+
+The loop entry is gated behind `loop_mode` and local-session scope, matching the
+proposal. The final confirmation pass re-runs all six lenses against the final code
+state; only an all-CLEAN final pass converges.
 
 Once a session's todos are complete, jcode has nothing between "work done" and
 "final response". The completion gates check *assessments*, not the *result*. We
