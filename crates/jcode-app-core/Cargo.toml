@@ -98,6 +98,13 @@ jcode-session-types = { path = "../jcode-session-types" }
 jcode-setup-hints = { path = "../jcode-setup-hints" }
 jcode-task-types = { path = "../jcode-task-types" }
 jcode-tool-core = { path = "../jcode-tool-core" }
+
+# Code intelligence via Compass (knowledge graph, semantic search, impact analysis).
+# Only compass-query + compass-model are needed; compass-core/compass-graph are
+# pulled in transitively by compass-query and we avoid declaring compass-core
+# directly because it drags compass-history (rand version conflict).
+compass-query = { git = "https://github.com/crabbuild/compass", tag = "compass-v0.3.23" }
+compass-model = { git = "https://github.com/crabbuild/compass", tag = "compass-v0.3.23" }
 jcode-tool-types = { path = "../jcode-tool-types" }
 
 # Archive extraction (for auto-update)
