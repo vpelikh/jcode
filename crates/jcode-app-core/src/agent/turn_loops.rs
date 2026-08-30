@@ -1032,62 +1032,27 @@ impl Agent {
                 local_calls.push((tc, ctx));
             }
 
-            // Pass 2: dispatch. Unsafe tools run strictly sequentially in order;
-            // concurrency-safe tools run together but commit their results in
-            // original order so tool-result blocks stay aligned with the model's
-            // tool_use ids (the TUI and transcript depend on that ordering).
+            // Pass 2: dispatch. Concurrency-safe calls run as a parallel batch,
+            // but a batch is flushed (and committed in original order) the moment
+            // an unsafe call appears, so tool-result blocks always land in the
+            // model's tool-call order. Unsafe calls run strictly sequentially
+            // inline. This preserves the original "commit every call in call
+            // order" contract while still parallelizing adjacent read-only calls.
             let mut safe_calls: Vec<(ToolCall, ToolContext)> = Vec::new();
             for (tc, ctx) in local_calls {
                 if self.registry.is_concurrency_safe(&tc.name).await {
                     safe_calls.push((tc, ctx));
                 } else {
+                    self.flush_concurrency_safe(std::mem::take(&mut safe_calls), assistant_message_id.as_deref()).await;
+                    tool_results_dirty = true;
                     self.execute_tool_locally(tc, ctx, print_output, trace, assistant_message_id.as_deref())
                         .await;
                     tool_results_dirty = true;
                 }
             }
             if !safe_calls.is_empty() {
-                let message_id = assistant_message_id
-                    .clone()
-                    .unwrap_or_else(|| self.session.id.clone());
-                for (tc, _ctx) in &safe_calls {
-                    Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
-                        session_id: self.session.id.clone(),
-                        message_id: message_id.clone(),
-                        tool_call_id: tc.id.clone(),
-                        tool_name: tc.name.clone(),
-                        status: ToolStatus::Running,
-                        intent: tc.intent.clone(),
-                        title: None,
-                    }));
-                }
-
-                let registry = self.registry.clone();
-                let executed: Vec<(ToolCall, ToolContext, Result<ToolOutput>, std::time::Duration)> =
-                    futures::future::join_all(safe_calls.into_iter().map(|(tc, ctx)| {
-                        let registry = registry.clone();
-                        let name = tc.name.clone();
-                        let input = tc.input.clone();
-                        let start = std::time::Instant::now();
-                        async move {
-                            let result = registry.execute(&name, input, ctx.clone()).await;
-                            (tc, ctx, result, start.elapsed())
-                        }
-                    }))
-                    .await;
-
-                for (tc, ctx, result, elapsed) in executed {
-                    self.commit_tool_result(
-                        tc,
-                        ctx,
-                        result,
-                        print_output,
-                        trace,
-                        assistant_message_id.as_deref(),
-                        elapsed,
-                    );
-                    tool_results_dirty = true;
-                }
+                self.flush_concurrency_safe(std::mem::take(&mut safe_calls), assistant_message_id.as_deref()).await;
+                tool_results_dirty = true;
             }
 
             if tool_results_dirty {
@@ -1118,6 +1083,58 @@ impl Agent {
         }
 
         Ok(final_text)
+    }
+
+    /// Run a batch of concurrency-safe calls together, then commit each result
+    /// in the original call order. Used by the mixed-order dispatch in `run_turn`
+    /// so read-only calls parallelize but still land in the model's tool-call
+    /// order relative to any sequential calls around them.
+    async fn flush_concurrency_safe(
+        &mut self,
+        safe_calls: Vec<(ToolCall, ToolContext)>,
+        assistant_message_id: Option<&str>,
+    ) {
+        if safe_calls.is_empty() {
+            return;
+        }
+        let message_id = assistant_message_id
+            .map(str::to_string)
+            .unwrap_or_else(|| self.session.id.clone());
+        for (tc, _ctx) in &safe_calls {
+            Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
+                session_id: self.session.id.clone(),
+                message_id: message_id.clone(),
+                tool_call_id: tc.id.clone(),
+                tool_name: tc.name.clone(),
+                status: ToolStatus::Running,
+                intent: tc.intent.clone(),
+                title: None,
+            }));
+        }
+
+        let registry = self.registry.clone();
+        let executed: Vec<(ToolCall, ToolContext, Result<ToolOutput>, std::time::Duration)> =
+            futures::future::join_all(safe_calls.into_iter().map(|(tc, ctx)| {
+                let registry = registry.clone();
+                let name = tc.name.clone();
+                let input = tc.input.clone();
+                let start = std::time::Instant::now();
+                async move {
+                    let result = registry.execute(&name, input, ctx.clone()).await;
+                    (tc, ctx, result, start.elapsed())
+                }
+            }))
+            .await;
+
+        for (tc, ctx, result, elapsed) in executed {
+            // Mirror the per-call bookkeeping the sequential path performs: every
+            // executed call is counted in telemetry and may release tools (e.g. an
+            // `mcp` reconnect). Skipping these in the parallel path would under-
+            // count tool usage and starve the lock released by `mcp`.
+            crate::telemetry::record_tool_call();
+            self.unlock_tools_if_needed(&tc.name);
+            self.commit_tool_result(tc, ctx, result, false, false, assistant_message_id, elapsed);
+        }
     }
 
     /// Run one local tool call to completion and append its result, in order.
@@ -1176,8 +1193,10 @@ impl Agent {
     /// Append a tool call's result: publish the done/error events, print the
     /// preview, and add the tool-result blocks to the session. Shared by the
     /// sequential and parallel paths so both produce identical history and UI
-    /// output. `elapsed` is `None` for the parallel path, which computes it
-    /// before dispatch; otherwise the value recorded by the caller is reused.
+    /// output. For the parallel path (`print_output == false`) the per-call
+    /// Running event, telemetry, and tool unlock are handled by the caller
+    /// (`flush_concurrency_safe`) so they run once per call rather than once per
+    /// batch.
     fn commit_tool_result(
         &mut self,
         tc: ToolCall,
