@@ -155,6 +155,24 @@ pub trait Tool: Send + Sync {
     /// Execute the tool with the given input.
     async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput>;
 
+    /// Whether calls to this tool may execute concurrently with sibling calls
+    /// in the same agent step.
+    ///
+    /// Returning `true` opts the tool into parallel dispatch: when a model
+    /// requests several independent read-only calls in one step, the loop may
+    /// run the concurrency-safe ones at the same time instead of one at a time.
+    /// The default is `false`, which is always safe: such calls run strictly
+    /// sequentially.
+    ///
+    /// Only opt in a tool whose execution is a pure function of its input and
+    /// the filesystem, and which does not mutate shared agent/session state
+    /// observed by other in-flight calls. Read-only inspection tools such as
+    /// `read`, `ls`, and `agentgrep` qualify; tools that write, run
+    /// subprocesses, or depend on sibling results must stay sequential.
+    fn concurrency_safe_marker(&self) -> bool {
+        false
+    }
+
     /// Convert to API tool definition.
     fn to_definition(&self) -> ToolDefinition {
         ToolDefinition {
@@ -168,6 +186,32 @@ pub trait Tool: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A trivial tool used only to assert the trait's safe-by-default marker.
+    struct MarkerTool;
+    #[async_trait]
+    impl Tool for MarkerTool {
+        fn name(&self) -> &str {
+            "marker"
+        }
+        fn description(&self) -> &str {
+            "marker"
+        }
+        fn parameters_schema(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+        async fn execute(&self, _input: Value, _ctx: ToolContext) -> Result<ToolOutput> {
+            Ok(ToolOutput::new(""))
+        }
+    }
+
+    #[test]
+    fn tool_is_not_concurrency_safe_by_default() {
+        // The whole parallel-dispatch optimization is opt-in. A tool that does
+        // not override the marker must run sequentially, or it could race the
+        // shared session state other in-flight calls observe.
+        assert!(!MarkerTool.concurrency_safe_marker());
+    }
 
     #[test]
     fn ensure_intent_adds_property_and_required() {

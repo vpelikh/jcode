@@ -41,6 +41,12 @@ impl Tool for SidePanelTool {
         "Manage side panel pages."
     }
 
+    fn concurrency_safe_marker(&self) -> bool {
+        // Read-only view/manifest mutations (local page state), no shared
+        // session state observed by other calls in flight.
+        true
+    }
+
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",

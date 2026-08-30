@@ -1639,3 +1639,23 @@ async fn only_the_known_open_world_tools_are_ineligible_for_openai_strict_mode()
          eligibility rule is too aggressive, a missing name means this list is stale"
     );
 }
+
+#[tokio::test]
+async fn read_only_tools_are_concurrency_safe() {
+    // Parallel dispatch only fires for tools that opt in. The read-only
+    // inspection tools must opt in, and a write/subprocess tool must stay
+    // sequential, or independent reads could race shared session state.
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+
+    assert!(registry.is_concurrency_safe("read").await);
+    assert!(registry.is_concurrency_safe("ls").await);
+    assert!(registry.is_concurrency_safe("agentgrep").await);
+    assert!(registry.is_concurrency_safe("side_panel").await);
+
+    // `bash` spawns subprocesses and mutates the working tree; it must never
+    // run concurrently with sibling calls.
+    assert!(!registry.is_concurrency_safe("bash").await);
+    // Unknown tools are conservatively unsafe.
+    assert!(!registry.is_concurrency_safe("does_not_exist").await);
+}
