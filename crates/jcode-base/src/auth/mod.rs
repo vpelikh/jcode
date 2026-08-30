@@ -401,6 +401,14 @@ impl AuthStatus {
             || self.gemini == AuthState::Available
             || self.cursor == AuthState::Available
             || self.grok_build == AuthState::Available
+            || crate::provider_catalog::login_providers()
+                .iter()
+                .any(|provider| match provider.target {
+                    crate::provider_catalog::LoginProviderTarget::OpenAiCompatible(profile) => {
+                        crate::provider_catalog::openai_compatible_profile_is_configured(profile)
+                    }
+                    _ => false,
+                })
     }
 
     /// Emit a structured, non-secret snapshot of which providers currently have

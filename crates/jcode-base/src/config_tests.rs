@@ -1,7 +1,7 @@
 use super::{
-    AmbientConfig, AutoReviewConfig, Config, DiffDisplayMode, DisplayConfig, HookCommands,
-    LatexRenderingMode, McpToolsMode, ProviderConfig, SessionPickerResumeAction, SwarmSpawnMode,
-    ToolConfig, config_env_fingerprint, populate_context_limits_from_config_ref,
+    AmbientConfig, Config, DiffDisplayMode, DisplayConfig, HookCommands, LatexRenderingMode,
+    McpToolsMode, ProviderConfig, SessionPickerResumeAction, SwarmSpawnMode, ToolConfig,
+    config_env_fingerprint, populate_context_limits_from_config_ref,
 };
 use std::ffi::OsString;
 use std::path::Path;
@@ -1462,47 +1462,4 @@ fn config_reload_generation_increments_on_cache_invalidation() {
         after > before,
         "invalidate_config_cache must bump the reload generation ({before} -> {after})"
     );
-}
-
-#[test]
-fn test_autoreview_loop_mode_and_stall_defaults() {
-    // Phase 1b: review-loop config scaffolding on AutoReviewConfig.
-    let cfg = Config::default();
-    assert!(!cfg.autoreview.loop_mode, "loop_mode must default to false");
-    assert_eq!(
-        cfg.autoreview.max_stalled_turns, 3,
-        "max_stalled_turns must default to 3"
-    );
-}
-
-#[test]
-fn test_autoreview_loop_mode_and_stall_deserialize() {
-    let cfg: Config = toml::from_str(
-        r#"
-        [autoreview]
-        enabled = true
-        loop_mode = true
-        max_stalled_turns = 0
-        "#,
-    )
-    .expect("config should deserialize with review-loop fields");
-
-    assert!(cfg.autoreview.enabled);
-    assert!(cfg.autoreview.loop_mode);
-    assert_eq!(cfg.autoreview.max_stalled_turns, 0);
-}
-
-#[test]
-fn test_autoreview_loop_mode_stall_tolerates_missing_fields() {
-    // Existing sessions/configs without the new fields must load tolerantly.
-    let cfg: Config = toml::from_str(
-        r#"
-        [autoreview]
-        enabled = false
-        "#,
-    )
-    .expect("config without loop fields must still deserialize");
-
-    assert!(!cfg.autoreview.loop_mode);
-    assert_eq!(cfg.autoreview.max_stalled_turns, 3);
 }

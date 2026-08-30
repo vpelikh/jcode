@@ -2,8 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    EnvSnapshot, ReviewLoopState, SessionImproveMode, SessionStatus, StoredCompactionState,
-    StoredMemoryInjection, StoredMessage, StoredReplayEvent,
+    EnvSnapshot, SessionImproveMode, SessionStatus, StoredCompactionState, StoredMemoryInjection,
+    StoredMessage, StoredReplayEvent,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -21,8 +21,6 @@ pub(super) struct SessionJournalMeta {
     pub(super) reasoning_effort: Option<String>,
     pub(super) subagent_model: Option<String>,
     pub(super) improve_mode: Option<SessionImproveMode>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) review_loop: Option<ReviewLoopState>,
     pub(super) autoreview_enabled: Option<bool>,
     pub(super) autojudge_enabled: Option<bool>,
     pub(super) is_canary: bool,
@@ -83,7 +81,6 @@ pub(super) fn metadata_requires_snapshot(
         || prev.reasoning_effort != current.reasoning_effort
         || prev.subagent_model != current.subagent_model
         || prev.improve_mode != current.improve_mode
-        || prev.review_loop != current.review_loop
         || prev.autoreview_enabled != current.autoreview_enabled
         || prev.autojudge_enabled != current.autojudge_enabled
         || prev.is_canary != current.is_canary
