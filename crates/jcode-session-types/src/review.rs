@@ -424,15 +424,24 @@ pub struct ReviewRecord {
 }
 
 impl ReviewRecord {
-    /// The currently open findings: every finding reported in a non-clean round,
-    /// minus findings marked can't-fix, minus findings for a lens whose latest
-    /// round was clean. This is the set used to compute the stall fingerprint.
+    /// The currently open findings: the findings from the *latest* non-clean
+    /// round for each lens, minus findings marked can't-fix, minus lenses whose
+    /// latest round was clean. This is the set used to compute the stall
+    /// fingerprint.
+    ///
+    /// We deliberately take the most recent round's findings per lens rather
+    /// than the union of all rounds. A post-fix re-check reflects the
+    /// post-fix state of the code: if a re-check reported `{A, B}` and the
+    /// following re-check (after a fix) reports only `{A}`, the open set must
+    /// shrink to `{A}`. Unioning across rounds would wrongly keep `{A, B}`
+    /// open forever and treat a legitimate partial fix as a stall.
     pub fn open_findings(&self) -> Vec<Finding> {
         use std::collections::HashMap;
-        // Open findings per lens (only non-clean rounds contribute). A clean
-        // round for a lens removes that lens's slot, but can't-fix findings are
-        // tracked separately so a later clean round does not clear them.
-        let mut open_by_lens: HashMap<ReviewLens, Vec<Finding>> = HashMap::new();
+        // The latest non-clean round's findings per lens. Tracks the latest
+        // *non-clean* round index per lens; a later clean round clears it.
+        let mut latest_open_by_lens: HashMap<ReviewLens, Vec<Finding>> = HashMap::new();
+        let mut latest_nonclean_index: HashMap<ReviewLens, usize> = HashMap::new();
+        let mut latest_clean_index: HashMap<ReviewLens, usize> = HashMap::new();
         let mut cant_fix: Vec<Finding> = Vec::new();
         let mut cant_fix_keys: HashSet<(String, String)> = HashSet::new();
 
@@ -444,14 +453,18 @@ impl ReviewRecord {
             }
         }
 
-        for round in &self.rounds {
+        for (i, round) in self.rounds.iter().enumerate() {
             if round.clean {
-                // A clean round for a lens clears that lens's open findings.
-                // Can't-fix findings are tracked separately and always re-added
-                // via `cant_fix`, so they survive the clean round.
-                open_by_lens.remove(&round.lens);
+                // A clean round for a lens clears its open findings if it is the
+                // most recent round for that lens. Can't-fix findings are
+                // tracked separately and survive via `cant_fix`.
+                latest_clean_index.insert(round.lens, i);
+                latest_nonclean_index.remove(&round.lens);
+                latest_open_by_lens.remove(&round.lens);
             } else {
-                let slot = open_by_lens.entry(round.lens).or_default();
+                latest_nonclean_index.insert(round.lens, i);
+                let slot = latest_open_by_lens.entry(round.lens).or_default();
+                slot.clear();
                 for f in &round.findings {
                     let key = f.fingerprint_key();
                     if cant_fix_keys.contains(&key) {
@@ -471,7 +484,19 @@ impl ReviewRecord {
             }
         }
 
-        let mut open: Vec<Finding> = open_by_lens.into_values().flatten().collect();
+        // Drop any lens whose latest round was a clean one (it advanced past
+        // the open findings we just recorded).
+        for lens in latest_clean_index.keys() {
+            if let Some(&ci) = latest_clean_index.get(lens) {
+                if let Some(&ni) = latest_nonclean_index.get(lens) {
+                    if ci > ni {
+                        latest_open_by_lens.remove(lens);
+                    }
+                }
+            }
+        }
+
+        let mut open: Vec<Finding> = latest_open_by_lens.into_values().flatten().collect();
         open.extend(cant_fix);
         open
     }
@@ -599,6 +624,51 @@ mod review_tests {
         // authz is in cant_fix, so it must remain open.
         assert_eq!(record.open_findings().len(), 1);
         assert_eq!(record.open_findings()[0].path, "sec.rs");
+    }
+
+    #[test]
+    fn open_findings_uses_latest_nonclean_round() {
+        // The open_findings set must reflect the *latest* non-clean round per lens,
+        // not the union of all rounds. This is critical for stall detection: a
+        // post-fix re-check must be able to shrink the open set when a fix
+        // resolves some findings.
+        let mut record = ReviewRecord::default();
+
+        // First non-clean round: two findings.
+        record.rounds.push(ReviewRound {
+            lens: ReviewLens::Correctness,
+            findings: vec![
+                Finding::new("HIGH", "a.rs", "bug a"),
+                Finding::new("LOW", "b.rs", "bug b"),
+            ],
+            clean: false,
+            cant_fix: vec![],
+            files_touched: vec![],
+        });
+        // Open set: both findings.
+        assert_eq!(record.open_findings().len(), 2);
+
+        // Second non-clean round: only bug a remains (partial fix).
+        record.rounds.push(ReviewRound {
+            lens: ReviewLens::Correctness,
+            findings: vec![Finding::new("HIGH", "a.rs", "bug a")],
+            clean: false,
+            cant_fix: vec![],
+            files_touched: vec![],
+        });
+        // Open set: only bug a remains (bug b fixed).
+        assert_eq!(record.open_findings().len(), 1);
+        assert_eq!(record.open_findings()[0].text, "bug a");
+
+        // Clean round for the lens clears open findings.
+        record.rounds.push(ReviewRound {
+            lens: ReviewLens::Correctness,
+            findings: vec![],
+            clean: true,
+            cant_fix: vec![],
+            files_touched: vec![],
+        });
+        assert_eq!(record.open_findings().len(), 0);
     }
 
     #[test]

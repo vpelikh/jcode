@@ -31,6 +31,44 @@ fn working_tree_signature(cwd: &std::path::Path) -> Option<String> {
     }
 }
 
+/// Extract the set of file paths referenced by a `git status --porcelain`
+/// signature, used to record which files a review-loop fix turn actually
+/// touched. Handles the common states (` M`, `A `, `??`, ` D`) and renames
+/// (`R100 old -> new`).
+fn changed_files_from_signature(sig: &str) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut files = BTreeSet::new();
+    for line in sig.lines() {
+        let line = line.trim_start();
+        if line.is_empty() {
+            continue;
+        }
+        // Skip the 2-char status columns, then any rename/copy score digits
+        // (the porcelain form is `R100 old -> new`), then the separating space.
+        let bytes = line.as_bytes();
+        let mut idx = 2.min(bytes.len());
+        while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+            idx += 1;
+        }
+        while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+            idx += 1;
+        }
+        let rest = &line[idx..];
+        if rest.is_empty() {
+            continue;
+        }
+        // Renames look like "old -> new"; keep the destination path.
+        let path = match rest.split_once(" -> ") {
+            Some((_, new)) => new.trim(),
+            None => rest.trim(),
+        };
+        if !path.is_empty() {
+            files.insert(path.to_string());
+        }
+    }
+    files.into_iter().collect()
+}
+
 fn review_session_read_only_guardrails() -> &'static str {
     "Important constraints for this session:\n\
 - This session is analysis-only. Do not do the work yourself.\n\
@@ -1308,6 +1346,15 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
                         None => false,
                     };
                     state.last_fix_touched_files = touched;
+                    // Record which files the fix turn actually touched so the
+                    // digest can report real "Files touched" counts. This was
+                    // previously dead code (record_fix_files was never called).
+                    if touched {
+                        if let Some(now_sig) = working_tree_signature(&cwd) {
+                            let files = changed_files_from_signature(&now_sig);
+                            review_loop::record_fix_files(&mut state, files);
+                        }
+                    }
                 }
                 let action = review_loop::apply_verdict(&mut state, &report, max_stalled);
                 match action {
