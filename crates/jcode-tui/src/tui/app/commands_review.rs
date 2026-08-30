@@ -1273,15 +1273,7 @@ pub(super) fn maybe_enter_review_loop(app: &mut App) {
 /// Spawn the independent per-lens reviewer for the loop's current lens.
 fn spawn_loop_reviewer(app: &mut App, lens: jcode_session_types::ReviewLens) -> anyhow::Result<String> {
     let parent_session_id = current_feedback_target_session_id(app);
-    
-    // Check if we have a single reviewer session to reuse for all lens reviews
-    let reviewer_session_id = app
-        .session
-        .review_loop
-        .as_ref()
-        .and_then(|state| state.reviewer_session_id.clone());
-    
-    let prompt = build_lens_review_startup_message(
+    let lens_prompt = build_lens_review_startup_message(
         &parent_session_id,
         lens.name(),
         lens.label(),
@@ -1291,51 +1283,53 @@ fn spawn_loop_reviewer(app: &mut App, lens: jcode_session_types::ReviewLens) -> 
     let initial_model = model_override
         .clone()
         .unwrap_or_else(|| current_autoreview_model_summary(app));
-    
-    let (session_id, _name) = match reviewer_session_id {
-        // If we have a single reviewer session to reuse, use it
-        Some(reused_id) => {
-            // The session should already exist; we just need to ensure it's active
-            // and use the current lens for this review
-            (reused_id, "reused".to_string())
-        },
-        // Otherwise spawn a new one as before
+
+    // Reuse a single reviewer session across all lens reviews when one already
+    // exists, otherwise spawn a fresh one and remember its id for reuse. This
+    // gives the post-completion review loop a single, persistent reviewer
+    // window instead of opening a new terminal per lens.
+    let reviewer_session_id = app
+        .session
+        .review_loop
+        .as_ref()
+        .and_then(|s| s.reviewer_session_id.clone());
+
+    let reuse_existing = reviewer_session_id.is_some();
+    let session_id = match reviewer_session_id {
+        Some(reused_id) => reused_id,
         None => {
-            clone_session_for_review(app, "review-loop", initial_model, None)?
+            let (id, _name) =
+                clone_session_for_review(app, "review-loop", initial_model, None)?;
+            // Persist the id so subsequent lens reviews reuse this same window.
+            if let Some(state) = app.session.review_loop.as_mut() {
+                state.reviewer_session_id = Some(id.clone());
+            }
+            id
         }
     };
-    
-    // If we just created a new reviewer session, set up the reviewer_session_id for future reuse
-    if reviewer_session_id.is_none() {
-        if let Some(mut review_state) = state {
-            review_state.reviewer_session_id = Some(session_id.clone());
-            // Update the state in the app (this is a simplified approach)
-        }
-    }
-    
+
     prepare_review_spawned_session(
         &session_id,
-        prompt,
+        lens_prompt,
         model_override,
         None,
         Some("review-loop".to_string()),
         None,
     );
-    let exe = super::launch_client_executable();
-    let cwd = active_working_dir(app)
-        .filter(|path| path.is_dir())
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let socket = std::env::var("JCODE_SOCKET").ok();
-    
-    // If we have a single reviewer session to reuse, don't spawn a new terminal
-    // For reused session, just ensure the terminal exists without opening another
-    // This is a no-op since we assume the terminal already exists
-    if reviewer_session_id.is_some() {
-        // Skip spawning for reused reviewer session
-    } else {
+
+    // Only open a terminal the first time. A reused reviewer session already
+    // has its window open; re-injecting the prompt into the existing session
+    // re-points it at the current lens.
+    if reviewer_session_id.is_none() {
+        let exe = super::launch_client_executable();
+        let cwd = active_working_dir(app)
+            .filter(|path| path.is_dir())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let socket = std::env::var("JCODE_SOCKET").ok();
         super::spawn_in_new_terminal(&exe, &session_id, &cwd, socket.as_deref())?;
     }
+
     Ok(session_id)
 }
 
