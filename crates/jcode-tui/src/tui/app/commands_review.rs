@@ -1300,17 +1300,23 @@ fn spawn_loop_reviewer(app: &mut App, lens: jcode_session_types::ReviewLens) -> 
 /// report, or `None` if the reviewer has not produced a verdict yet.
 fn poll_loop_reviewer_verdict(reviewer_id: &str) -> Option<jcode_session_types::ReviewReport> {
     let session = crate::session::Session::load(reviewer_id).ok()?;
-    let last = session.messages.last()?;
-    let mut text = String::new();
-    for block in &last.content {
-        if let crate::message::ContentBlock::Text { text: t, .. } = block {
-            text.push_str(t);
+    // Scan messages most-recent-first for the first parseable verdict. The
+    // reviewer may emit a trailing message (e.g. a tool result) after its
+    // VERDICT text, so only checking `messages.last()` would miss it and poll
+    // forever. Stop at the first block that parses so a single verdict is not
+    // double-counted.
+    for message in session.messages.iter().rev() {
+        let mut text = String::new();
+        for block in &message.content {
+            if let crate::message::ContentBlock::Text { text: t, .. } = block {
+                text.push_str(t);
+            }
+        }
+        if let Ok(report) = jcode_session_types::ReviewReport::parse(&text) {
+            return Some(report);
         }
     }
-    match jcode_session_types::ReviewReport::parse(&text) {
-        Ok(report) => Some(report),
-        Err(_) => None,
-    }
+    None
 }
 
 /// Step the review loop from the turn-end followups hook. Returns true when a
@@ -1338,18 +1344,20 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
                 // working tree. A file-touching fix is productive repair work and
                 // must not count toward the stall cap.
                 if let Some(cwd) = active_working_dir(app) {
-                    let touched = match &state.fix_baseline_tree {
-                        Some(baseline) => working_tree_signature(&cwd)
-                            .map(|now| now != *baseline)
-                            .unwrap_or(false),
-                        None => false,
+                    // Capture the current signature once and reuse it for both
+                    // the touched-flag comparison and the file list, avoiding a
+                    // second `git status` subprocess.
+                    let now_sig = working_tree_signature(&cwd);
+                    let touched = match (&state.fix_baseline_tree, &now_sig) {
+                        (Some(baseline), Some(now)) => now != baseline,
+                        _ => false,
                     };
                     state.last_fix_touched_files = touched;
                     // Record which files the fix turn actually touched so the
                     // digest can report real "Files touched" counts. This was
                     // previously dead code (record_fix_files was never called).
                     if touched {
-                        if let Some(now_sig) = working_tree_signature(&cwd) {
+                        if let Some(now_sig) = now_sig {
                             let files = changed_files_from_signature(&now_sig);
                             review_loop::record_fix_files(&mut state, files);
                         }
