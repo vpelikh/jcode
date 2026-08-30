@@ -42,10 +42,14 @@ pub enum ReviewLoopAction {
 }
 
 /// Seed a review loop on a session that has just had its todos complete.
-/// Idempotent: if a loop already exists and is unfinished, this is a no-op.
+///
+/// Idempotent while a loop is in progress: if a loop is already active it is a
+/// no-op. If a *previous* loop has finished (manual `/review-loop start` after
+/// a completed run, or a fresh completion triggering the auto loop again), the
+/// finished state is cleared so a new loop can run from the first lens.
 pub fn enter_review_loop(state: &mut ReviewLoopState) {
     if state.finished {
-        return;
+        *state = ReviewLoopState::new();
     }
     if state.current_lens.is_none() && !state.phase_is_confirmation() {
         state.current_lens = Some(ReviewLens::ALL[0]);
@@ -302,6 +306,25 @@ mod review_loop_tests {
         enter_review_loop(&mut s);
         assert_eq!(s.current_lens, Some(ReviewLens::Correctness));
         assert!(!s.finished);
+    }
+
+    #[test]
+    fn enter_restarts_after_finished() {
+        // A finished loop must be re-seedable: a manual `/review-loop start`
+        // (or a fresh auto entry) after convergence should clear finished and
+        // restart from the first lens, not be a silent no-op.
+        let mut s = clean_state();
+        // Drive to convergence.
+        next_action(&mut s);
+        apply_verdict(&mut s, &ReviewReport::Clean, 3);
+        // Finish it off so it is `finished`.
+        s.finish_with("converged");
+        assert!(s.finished);
+
+        enter_review_loop(&mut s);
+        assert!(!s.finished);
+        assert_eq!(s.current_lens, Some(ReviewLens::Correctness));
+        assert!(s.record.is_some());
     }
 
     #[test]
