@@ -120,7 +120,16 @@ pub fn apply_verdict(
             // Stall is only counted on a post-fix re-run for the same lens (P6):
             // the open set neither shrank nor gained a new finding. A first-pass
             // findings report is always "productive" (the main session will fix).
-            if state.awaiting_postfix_recheck && findings_stalled(&prev_open, &new_open) {
+            // Critically, a re-check whose fix actually changed files on disk is
+            // *productive* repair work and must NEVER count toward the stall cap:
+            // the cap is meant to bound churn (re-raising the same findings with no
+            // progress), not legitimate fixes that happened to be partial or
+            // adjacent. Only a file-touching re-check that still reports the same
+            // open findings is a true stall.
+            let is_stall = state.awaiting_postfix_recheck
+                && !state.last_fix_touched_files
+                && findings_stalled(&prev_open, &new_open);
+            if is_stall {
                 state.stall_turns = state.stall_turns.saturating_add(1);
                 if max_stalled_turns != 0 && state.stall_turns >= max_stalled_turns {
                     state.finished = true;
@@ -137,7 +146,8 @@ pub fn apply_verdict(
                 // (do not queue another fix turn, the fix did not resolve it).
                 return ReviewLoopAction::SpawnReviewer(lens);
             } else {
-                // Productive round (new findings or first pass): reset the cap.
+                // Productive round (first pass, new findings, or a file-changing
+                // fix that did not fully clear the set): reset the cap.
                 state.stall_turns = 0;
             }
 
@@ -254,6 +264,10 @@ pub fn build_digest(state: &ReviewLoopState) -> String {
     out.push_str(&format!("- Review/fix rounds: {}\n", total_rounds));
     out.push_str(&format!("- Findings reported: {}\n", findings_reported));
     out.push_str(&format!("- Files touched: {}\n", record.files_touched.len()));
+    out.push_str(&format!(
+        "- Last fix changed files: {}\n",
+        state.last_fix_touched_files
+    ));
     if !record.cant_fix.is_empty() {
         out.push_str("\n### Can't fix\n");
         for f in &record.cant_fix {
@@ -381,6 +395,55 @@ mod review_loop_tests {
             other => panic!("expected Stalled, got {other:?}"),
         }
         assert!(s.finished);
+        assert_eq!(s.finish_reason.as_deref(), Some("stall_cap"));
+    }
+
+    #[test]
+    fn productive_file_changing_recheck_never_counts_toward_stall_cap() {
+        // A re-check whose fix actually changed files on disk is productive
+        // repair work: even if the open-findings set did not shrink, it must
+        // not increment the stall counter. The loop should queue another fix
+        // turn (try again) rather than force-stopping at the cap.
+        let mut s = clean_state();
+        next_action(&mut s);
+        apply_verdict(&mut s, &findings("bug a"), 2);
+        // Simulate the fix turn having touched files (positive baseline diff).
+        s.last_fix_touched_files = true;
+        // Post-fix re-check re-raises the same finding, but files changed.
+        next_action(&mut s);
+        match apply_verdict(&mut s, &findings("bug a"), 2) {
+            ReviewLoopAction::QueueFixTurn(_) => {}
+            other => panic!("expected another fix turn, got {other:?}"),
+        }
+        // Stall counter must remain at zero for a productive round.
+        assert_eq!(s.stall_turns, 0);
+        assert!(!s.finished);
+        // Even after repeatedly re-raising with file changes, never force-stops.
+        for _ in 0..5 {
+            s.last_fix_touched_files = true;
+            next_action(&mut s);
+            match apply_verdict(&mut s, &findings("bug a"), 2) {
+                ReviewLoopAction::QueueFixTurn(_) => {}
+                other => panic!("expected another fix turn, got {other:?}"),
+            }
+        }
+        assert_eq!(s.stall_turns, 0);
+        assert!(!s.finished);
+    }
+
+    #[test]
+    fn stall_cap_only_counts_when_no_file_change() {
+        // Without a file change (last_fix_touched_files = false), the same
+        // re-raised finding still counts as a stall and force-stops at cap.
+        let mut s = clean_state();
+        s.last_fix_touched_files = false;
+        next_action(&mut s);
+        apply_verdict(&mut s, &findings("bug a"), 1);
+        next_action(&mut s);
+        match apply_verdict(&mut s, &findings("bug a"), 1) {
+            ReviewLoopAction::Stalled => {}
+            other => panic!("expected Stalled, got {other:?}"),
+        }
         assert_eq!(s.finish_reason.as_deref(), Some("stall_cap"));
     }
 
