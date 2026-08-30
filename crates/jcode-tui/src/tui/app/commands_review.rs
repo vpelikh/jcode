@@ -901,6 +901,11 @@ pub(super) fn maybe_trigger_autoreview_local(app: &mut App) {
     if !app.autoreview_enabled || app.is_remote || app.is_replay {
         return;
     }
+    // When loop_mode is enabled, the review loop replaces the one-shot
+    // autoreview entirely. Suppress the one-shot to avoid double review.
+    if crate::config::config().autoreview.loop_mode {
+        return;
+    }
     if let Err(error) = launch_autoreview_window_local(app) {
         app.push_display_message(DisplayMessage::error(format!(
             "Failed to launch autoreview: {}",
