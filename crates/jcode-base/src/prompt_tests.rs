@@ -113,6 +113,33 @@ fn skills_section_tells_the_agent_to_proactively_load_relevant_skills() {
 }
 
 #[test]
+fn skills_section_directs_code_search_to_skills_over_grep() {
+    let skills = vec![SkillInfo {
+        name: "ccc".to_string(),
+        description: "Semantic code search over the codebase.".to_string(),
+    }];
+    let section = build_available_skills_section(&skills).expect("skills section");
+
+    // Requirement from the user: code-search skills (ccc/graphify) must be the
+    // path, with grep/agentgrep reserved as a last resort when no skill applies.
+    assert!(
+        section.contains("semantic code search") && section.contains("skill"),
+        "section should explicitly call out the code-search skill path"
+    );
+    assert!(section.contains("is the path"));
+    assert!(section.contains("only as a last resort"));
+    assert!(section.contains("no installed skill covers the job"));
+    // The code-search-first directive lives in the lead sentence only. The
+    // trailing "mention these skills" sentence must not repeat the grep clause.
+    let trailing = section.rsplit("\n\n").next().unwrap_or("");
+    assert!(
+        !trailing.contains("grep"),
+        "grep/agentgrep directive must not be duplicated in the trailing sentence"
+    );
+    assert!(trailing.contains("offer to activate them"));
+}
+
+#[test]
 fn skills_section_is_omitted_when_no_skills_available() {
     assert!(build_available_skills_section(&[]).is_none());
 }

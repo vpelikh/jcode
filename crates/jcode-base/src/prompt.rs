@@ -260,7 +260,7 @@ fn build_available_skills_section(available_skills: &[SkillInfo]) -> Option<Stri
         return None;
     }
 
-    let mut section = "# Available Skills\n\nYou have the following skills available. The user can invoke one with `/skillname`; you can also load one yourself with the `skill_manage` tool (action=load) when its described capability is relevant to the task. Do not wait for the user to invoke a skill you can use to do the job better; load it proactively.\n".to_string();
+    let mut section = "# Available Skills\n\nYou have the following skills available. The user can invoke one with `/skillname`; you can also load one yourself with the `skill_manage` tool (action=load) when its described capability is relevant to the task. Do not wait for the user to invoke a skill you can use to do the job better; load it proactively. For semantic code search or codebase indexing, a matching skill (for example the `ccc` semantic-search skill, or a `graphify`-style relationship skill) is the path; use `grep`/`agentgrep` only as a last resort when no installed skill covers the job.\n".to_string();
     for skill in available_skills {
         section.push_str(&format!(
             "\n- `/{} ` - {}",
