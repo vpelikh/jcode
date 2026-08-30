@@ -1305,10 +1305,25 @@ fn spawn_loop_reviewer(app: &mut App, lens: jcode_session_types::ReviewLens) -> 
     Ok(session_id)
 }
 
-/// Poll the in-flight reviewer child session for a `VERDICT`. Returns the parsed
-/// report, or `None` if the reviewer has not produced a verdict yet.
-fn poll_loop_reviewer_verdict(reviewer_id: &str) -> Option<jcode_session_types::ReviewReport> {
-    let session = crate::session::Session::load(reviewer_id).ok()?;
+/// Poll the in-flight reviewer child session for a `VERDICT`.
+enum PollResult {
+    /// The reviewer session is gone (deleted/unloadable); the loop cannot make
+    /// progress and must finalize rather than poll forever.
+    Gone,
+    /// The reviewer is still running and has not emitted a verdict yet.
+    Pending,
+    /// A verdict was parsed.
+    Report(jcode_session_types::ReviewReport),
+}
+
+fn poll_loop_reviewer(reviewer_id: &str) -> PollResult {
+    let session = match crate::session::Session::load(reviewer_id) {
+        Ok(s) => s,
+        // The reviewer session vanished (deleted or unloadable). Treat as a
+        // terminal condition: do NOT keep polling, or the loop spins forever
+        // waiting on a child that no longer exists.
+        Err(_) => return PollResult::Gone,
+    };
     // Scan messages most-recent-first for the first parseable verdict. The
     // reviewer may emit a trailing message (e.g. a tool result) after its
     // VERDICT text, so only checking `messages.last()` would miss it and poll
@@ -1322,10 +1337,10 @@ fn poll_loop_reviewer_verdict(reviewer_id: &str) -> Option<jcode_session_types::
             }
         }
         if let Ok(report) = jcode_session_types::ReviewReport::parse(&text) {
-            return Some(report);
+            return PollResult::Report(report);
         }
     }
-    None
+    PollResult::Pending
 }
 
 /// Step the review loop from the turn-end followups hook. Returns true when a
@@ -1344,8 +1359,30 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
     // spawning a duplicate.
     let result = if state.active_reviewer_id.is_some() {
         let reviewer_id = state.active_reviewer_id.clone().unwrap();
-        match poll_loop_reviewer_verdict(&reviewer_id) {
-            Some(report) => {
+        match poll_loop_reviewer(&reviewer_id) {
+            PollResult::Gone => {
+                // The reviewer child session disappeared (deleted/unloadable).
+                // Finalize the loop instead of polling forever: signal the user
+                // and stop. The loop is left "finished" so it does not restart
+                // on the next turn-end.
+                state.active_reviewer_id = None;
+                state.finished = true;
+                state.finish_reason = Some("reviewer_unavailable".to_string());
+                let digest = review_loop::build_and_store_digest(&mut state);
+                app.push_display_message(DisplayMessage::system(format!(
+                    "{digest}\n\n(Review loop stopped: the in-flight reviewer session is gone.)"
+                )));
+                app.session.review_loop = Some(state);
+                let _ = app.session.save();
+                app.set_status_notice("Review loop: reviewer gone");
+                false
+            }
+            PollResult::Pending => {
+                // Reviewer still working: wait, don't stall.
+                app.session.review_loop = Some(state);
+                true
+            }
+            PollResult::Report(report) => {
                 state.active_reviewer_id = None;
                 // Determine whether the fix turn actually changed files: compare
                 // the baseline captured at fix-queue time against the current
@@ -1419,11 +1456,6 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
                         false
                     }
                 }
-            }
-            None => {
-                // Reviewer still working: wait, don't stall.
-                app.session.review_loop = Some(state);
-                true
             }
         }
     } else {
