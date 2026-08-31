@@ -158,6 +158,22 @@ pub fn is_connectivity_error(e: &anyhow::Error) -> bool {
         || s.contains("connect: ")
 }
 
+/// Whether an error indicates a transient API-level failure that warrants
+/// retry. This includes both connectivity errors (DNS failures, timeouts, TLS
+/// issues) and Telegram's 429 flood-control responses. Permanent errors
+/// (invalid token, malformed request, unauthorized) should not be retried.
+pub fn is_transient_api_error(e: &anyhow::Error) -> bool {
+    // Network-layer failures are transient by nature.
+    if is_connectivity_error(e) {
+        return true;
+    }
+    // Telegram returns 429 with "flood control" during rapid polling. We can
+    // detect this from the error string since `post_telegram` wraps status
+    // codes as `"Telegram API error (429): ..."`.
+    let s = e.to_string();
+    s.contains("(429)") || s.contains("flood control")
+}
+
 /// Build a short-timeout client used only for the discovery probe (`getMe`).
 /// A fast *connect* timeout keeps an unreachable candidate from stalling the
 /// sweep. Crucially this client has NO overall request timeout: `discover_client`
@@ -737,10 +753,11 @@ pub async fn set_my_commands(
                 break;
             }
             Err(e) => {
-                // Only retry transient errors (connectivity issues, rate limits).
-                // Permanent failures like invalid token or bad request should
-                // surface immediately instead of being hidden behind retries.
-                if !is_connectivity_error(&e) {
+                // Only retry transient errors (connectivity issues, rate
+                // limits). Permanent failures like invalid token or bad
+                // request should surface immediately instead of being hidden
+                // behind retries.
+                if !is_transient_api_error(&e) {
                     logging::warn(&format!(
                         "setMyCommands failed with non-transient error ({e}), not retrying"
                     ));
@@ -1307,6 +1324,36 @@ mod tests {
                 "false positive for connectivity: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn test_is_transient_api_error_classifies() {
+        // Connectivity errors should be transient.
+        assert!(is_transient_api_error(&anyhow::anyhow!(
+            "error trying to connect: tcp connect error: Connection refused"
+        )));
+        assert!(is_transient_api_error(&anyhow::anyhow!(
+            "failed to lookup host: dns resolution failed"
+        )));
+
+        // Telegram 429 flood control should be transient (retryable).
+        assert!(is_transient_api_error(&anyhow::anyhow!(
+            "Telegram API error (429): Bad Request: flood control"
+        )));
+        assert!(is_transient_api_error(&anyhow::anyhow!(
+            "Telegram API error (429): Too Many Requests"
+        )));
+
+        // Permanent errors should NOT be transient.
+        assert!(!is_transient_api_error(&anyhow::anyhow!(
+            "Telegram auth failed: Unauthorized"
+        )));
+        assert!(!is_transient_api_error(&anyhow::anyhow!(
+            "Telegram API error (400): Bad Request: chat not found"
+        )));
+        assert!(!is_transient_api_error(&anyhow::anyhow!(
+            "Telegram API error (403): Forbidden"
+        )));
     }
 
     #[test]
