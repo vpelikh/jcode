@@ -377,6 +377,7 @@ pub(super) fn create_transfer_session_from_parent(
     child.testing_build = parent.testing_build.clone();
     child.status = crate::session::SessionStatus::Closed;
     child.provider_session_id = None;
+    child.rebuild_event_map();
     child.save()?;
     crate::todo::save_todos(&child.id, &todos)?;
     Ok((child.id.clone(), child.display_name().to_string()))
