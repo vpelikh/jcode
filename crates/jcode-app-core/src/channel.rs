@@ -1,6 +1,9 @@
 use crate::ambient_runner::AmbientRunnerHandle;
 use crate::config::SafetyConfig;
 use crate::logging;
+use crate::telegram::escape_markdown_v2;
+use crate::telegram::InlineKeyboardButton;
+use crate::telegram::InlineKeyboardRow;
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -301,8 +304,8 @@ impl TelegramChannel {
     }
 
     /// Handle a slash command received over Telegram, returning the reply text.
-    /// Read-only commands: `/help`, `/status`, `/list`. Write commands
-    /// (create/resume/abort) are reserved for a later phase.
+    /// Read-only commands: `/help`, `/status`, `/list`, `/whoami`. Write commands
+    /// (create/resume/abort/free) act on the live session registry.
     async fn handle_command(
         &self,
         trimmed: &str,
@@ -322,6 +325,19 @@ impl TelegramChannel {
                 self.new_session_reply(prompt).await
             }
             "/history" => self.history_reply(&rest),
+            "/find" | "/search" => {
+                let q = rest.trim();
+                self.find_session_reply(q).await
+            }
+            "/whoami" => self.whoami_reply(),
+            "/live" | "/ls" => {
+                self.send_live_sessions_picker().await;
+                String::new()
+            }
+            "/free" => {
+                let arg = rest.trim();
+                self.free_session_reply(arg).await
+            }
             "/clear" | "/stop" => {
                 let cleared =
                     crate::server::telegram_control::active_session_for(&self.chat_id).is_some();
@@ -332,6 +348,7 @@ impl TelegramChannel {
                     "No active session to clear.".to_string()
                 }
             }
+            "/abort" | "/cancel" => self.abort_reply().await,
             "/resume" => {
                 let prompt = rest.trim();
                 self.resume_reply(prompt).await
@@ -474,6 +491,39 @@ impl TelegramChannel {
             return;
         };
 
+        // A tap on a `/free` picker button carries a `__free__<session_id>`
+        // payload: drop that live session instead of selecting it.
+        if let Some(id) = data.strip_prefix("__free__") {
+            let id = id.trim().to_string();
+            let removed = crate::server::telegram_control::free_session_for_control(&id).await;
+            let ack = if removed {
+                format!("🗑️ Freed `{}`", short_id(&id))
+            } else {
+                format!("⚠️ `{}` already gone", short_id(&id))
+            };
+            let _ = crate::telegram::answer_callback_query(
+                &client,
+                &self.token,
+                &cb.id,
+                &ack,
+                self.api_base.as_deref(),
+            )
+            .await;
+            if let Some(message_id) = picker_message_id
+                && let Ok(chat_id_num) = chat_id.parse::<i64>()
+            {
+                crate::telegram::edit_message_reply_markup(
+                    &client,
+                    &self.token,
+                    chat_id_num,
+                    message_id,
+                    self.api_base.as_deref(),
+                )
+                .await;
+            }
+            return;
+        }
+
         let session_id = data.trim().to_string();
         crate::server::telegram_control::set_active_session(&self.chat_id, &session_id);
         let short_id = short_id(&session_id);
@@ -592,6 +642,196 @@ impl TelegramChannel {
         }
     }
 
+    /// `/find <query>`: search recent sessions by title/working-dir/id and send
+    /// a tap-to-select inline picker of the matches.
+    async fn find_session_reply(&self, query: &str) -> String {
+        let query = query.trim();
+        if query.is_empty() {
+            return "Usage: `/find <text>`. Searches session titles and ids.".to_string();
+        }
+        let entries = match crate::recent_session_index::search(query, 24) {
+            Ok(list) => list,
+            Err(e) => {
+                logging::warn(&format!("telegram /find index error: {e}"));
+                return format!("⚠️ Could not search sessions: {e}");
+            }
+        };
+        if entries.is_empty() {
+            return format!("🔍 No sessions match `{}`.", escape_markdown_v2(query));
+        }
+        let active = crate::server::telegram_control::active_session_for(&self.chat_id);
+        let mut rows: Vec<InlineKeyboardRow> = Vec::new();
+        for s in entries.iter().take(24) {
+            let title: String = s
+                .display_title()
+                .unwrap_or(s.session_id.as_str())
+                .chars()
+                .take(30)
+                .collect();
+            let short: String = s.session_id.chars().take(8).collect();
+            let prefix = if active.as_deref() == Some(s.session_id.as_str()) {
+                "✅ "
+            } else {
+                ""
+            };
+            rows.push(vec![InlineKeyboardButton {
+                text: format!("{}{} ({})", prefix, title, short),
+                callback_data: s.session_id.clone(),
+            }]);
+        }
+        let client = self.client_or_default().await;
+        let header = format!("🔍 {} match(es) for `{}`:", rows.len(), escape_markdown_v2(query));
+        let _ = crate::telegram::send_message_with_keyboard(
+            &client,
+            &self.token,
+            &self.chat_id,
+            &header,
+            &rows,
+            self.api_base.as_deref(),
+        )
+        .await;
+        String::new()
+    }
+
+    /// `/whoami`: report this chat's id and the sender's user id so the user can
+    /// paste them into `[safety] telegram_chat_id` / `telegram_allowed_user_id`.
+    fn whoami_reply(&self) -> String {
+        let mut msg = String::from("👤 *You are:*\n");
+        msg.push_str(&format!(
+            "• chat\\_id: `{}`\n",
+            escape_markdown_v2(&self.chat_id)
+        ));
+        if let Some(uid) = self.allowed_user_id.as_ref() {
+            msg.push_str(&format!(
+                "• configured allowed\\_user\\_id: `{}`\n",
+                escape_markdown_v2(uid)
+            ));
+        } else {
+            msg.push_str("• allowed\\_user\\_id: _(not set — any sender in this chat is accepted)_\n");
+        }
+        msg.push_str("\n📋 Copy these into your config:\n");
+        msg.push_str(&format!(
+            "```\n[safety]\ntelegram_chat_id = \"{}\"\n```",
+            escape_markdown_v2(&self.chat_id)
+        ));
+        msg
+    }
+
+    /// `/free <id-or-prefix>`: drop a live (headless) session from the in-memory
+    /// registry so it no longer consumes resources. Use `/live` to list ids.
+    async fn free_session_reply(&self, arg: &str) -> String {
+        let arg = arg.trim();
+        if arg.is_empty() {
+            return "Usage: `/free <session-id-or-prefix>`. List live sessions with `/live`.".to_string();
+        }
+        let Some(sessions) = crate::server::telegram_control::live_sessions_snapshot().await else {
+            return "Telegram control is not wired to a server runtime.".to_string();
+        };
+        let matches: Vec<String> = if let Some(exact) = sessions.iter().find(|id| id.as_str() == arg)
+        {
+            vec![exact.clone()]
+        } else {
+            sessions
+                .iter()
+                .filter(|id| id.starts_with(arg))
+                .cloned()
+                .collect()
+        };
+        match matches.len() {
+            0 => format!("No live session matches `{}`.", escape_markdown_v2(arg)),
+            1 => {
+                let id = &matches[0];
+                let removed = crate::server::telegram_control::free_session_for_control(id).await;
+                if removed {
+                    // Also clear it if it was the active session for this chat.
+                    if crate::server::telegram_control::active_session_for(&self.chat_id).as_deref()
+                        == Some(id.as_str())
+                    {
+                        crate::server::telegram_control::clear_active_session(&self.chat_id);
+                    }
+                    format!("🗑️ Freed live session `{}`.", short_id(id))
+                } else {
+                    format!("⚠️ Could not free `{}` (already gone?).", short_id(id))
+                }
+            }
+            _ => format!(
+                "`{}` matches {} live sessions; use a longer prefix.",
+                escape_markdown_v2(arg),
+                matches.len()
+            ),
+        }
+    }
+
+    /// `/abort` (alias `/cancel`): request a graceful stop of the active
+    /// session's in-flight turn. The agent stops at the next safe point and the
+    /// partial response already produced is delivered.
+    async fn abort_reply(&self) -> String {
+        let Some(session_id) =
+            crate::server::telegram_control::active_session_for(&self.chat_id)
+        else {
+            return "No active session to abort. Use `/use <n>` first.".to_string();
+        };
+        let signaled =
+            crate::server::telegram_control::request_graceful_shutdown_for_control(&session_id).await;
+        if signaled {
+            format!(
+                "🛑 Abort requested for `{}`. The agent will stop at the next safe point.",
+                short_id(&session_id)
+            )
+        } else {
+            format!(
+                "⚠️ `{}` is not a live session (it was resumed headlessly or has ended).",
+                short_id(&session_id)
+            )
+        }
+    }
+
+    /// `/live` (alias `/ls`): list the sessions currently held in the in-memory
+    /// live registry (including Telegram-spawned headless ones) as a picker so
+    /// the user can `/free` or `/use` them.
+    async fn send_live_sessions_picker(&self) {
+        let client = self.client_or_default().await;
+        let Some(sessions) = crate::server::telegram_control::live_sessions_snapshot().await else {
+            let _ = self
+                .send_reply("⚠️ Telegram control is not wired to a server runtime.", None)
+                .await;
+            return;
+        };
+        if sessions.is_empty() {
+            let _ = self
+                .send_reply(
+                    "🟢 No live sessions. Start one with `/new` or `/use <n>`.",
+                    None,
+                )
+                .await;
+            return;
+        }
+        let active = crate::server::telegram_control::active_session_for(&self.chat_id);
+        let mut rows: Vec<InlineKeyboardRow> = Vec::new();
+        for id in sessions.iter() {
+            let short: String = id.chars().take(8).collect();
+            let prefix = if active.as_deref() == Some(id.as_str()) {
+                "✅ "
+            } else {
+                ""
+            };
+            rows.push(vec![InlineKeyboardButton {
+                text: format!("{}🗑️ {} (free)", prefix, short),
+                callback_data: format!("__free__{}", id),
+            }]);
+        }
+        let header = format!("🟢 {} live session(s):", sessions.len());
+        let _ = crate::telegram::send_message_with_keyboard(
+            &client,
+            &self.token,
+            &self.chat_id,
+            &header,
+            &rows,
+            self.api_base.as_deref(),
+        )
+        .await;
+    }
+
     /// `/resume <session-id> <prompt>`: send a prompt to a live session
     /// headlessly and return the assistant's reply (prefix id allowed).
     async fn resume_reply(&self, args: &str) -> String {
@@ -614,15 +854,9 @@ impl TelegramChannel {
             session_id,
             prompt.chars().count()
         ));
-        match crate::server::telegram_control::resume_session_for_control_or_spawn(
-            &session_id,
-            prompt,
-        )
-        .await
-        {
-            Ok(reply) => agent_reply_message(&session_id, &reply),
-            Err(e) => format!("⚠️ Could not resume `{}`: {}", short_id(&session_id), e),
-        }
+        // Stream progress into a single placeholder message the user can watch.
+        self.stream_reply_to_session(None, &session_id, prompt).await;
+        String::new()
     }
 
     /// Resolve a user-supplied session reference (full id or unique prefix)
@@ -642,12 +876,12 @@ impl TelegramChannel {
         match matches.len() {
             0 => Err(format!(
                 "No live session matches `{}`. Use `/list`, then `/use <n>`, or pick a live session id.",
-                crate::telegram::escape_markdown(reference)
+                crate::telegram::escape_markdown_v2(reference)
             )),
             1 => Ok(matches[0].clone()),
             _ => Err(format!(
                 "`{}` matches {} live sessions; use a longer prefix.",
-                crate::telegram::escape_markdown(reference),
+                crate::telegram::escape_markdown_v2(reference),
                 matches.len()
             )),
         }
@@ -692,16 +926,45 @@ impl TelegramChannel {
                 since.as_secs()
             )
         };
+        // Honest health: actually probe auth (getMe) and the session store
+        // rather than printing a static "all green". Cheap and worth it because
+        // a silently-dead bot is the #1 Telegram support complaint.
+        let (auth_ok, auth_detail) = self.live_auth_status().await;
+        let store_ok = crate::recent_session_index::recent(1).map(|r| !r.is_empty()).unwrap_or(false);
+        let live_count = crate::server::telegram_control::live_session_count()
+            .await
+            .unwrap_or(0);
+        let health_line = format!(
+            "🔍 *Health:* auth {} · session store {} · {} live session(s)",
+            if auth_ok { "ok" } else { "FAIL" },
+            if store_ok { "ready" } else { "unavailable" },
+            live_count
+        );
+        let auth_hint = if !auth_ok {
+            format!("\n⚠️ *Auth:* {}", escape_markdown_v2(&auth_detail))
+        } else {
+            String::new()
+        };
         format!(
             "🤖 *jcode Telegram control*\n\
              *Ambient mode:* {}\n\
              {}\n\
              {}\n\n\
-             🔍 *Health:* auth ok · connection ready · session store ready\n\n\
-             📋 *Commands:* /list /use /new /history /resume /clear /status /help\n\
+             {}{}\n\n\
+             📋 *Commands:* /list /find /use /new /history /resume /live /free /abort /clear /whoami /status /help\n\
              💡 Tip: send any message to talk to a session, or `/list` to browse.",
-            ambient, active_line, discovery_line
+            ambient, active_line, discovery_line, health_line, auth_hint
         )
+    }
+
+    /// Probe bot auth live (calls `getMe`) so `/status` reports reality rather
+    /// than a cached assumption. Returns (ok, detail).
+    async fn live_auth_status(&self) -> (bool, String) {
+        let client = self.client_or_default().await;
+        match crate::telegram::verify_bot_auth(&client, &self.token, self.api_base.as_deref()).await {
+            Ok(id) => (true, id.username.unwrap_or_else(|| "ok".to_string())),
+            Err(e) => (false, e.to_string()),
+        }
     }
 
     /// Enforce the sender whitelist. When no whitelist is configured, any
@@ -856,34 +1119,7 @@ impl TelegramChannel {
         if let Some(active_id) =
             crate::server::telegram_control::active_session_for(&self.chat_id)
         {
-            match self
-                .with_typing(async {
-                    crate::server::telegram_control::resume_session_for_control_or_spawn(
-                        &active_id,
-                        trimmed,
-                    )
-                    .await
-                })
-                .await
-            {
-                Ok(reply) => {
-                    let _ = self
-                        .send_reply(&agent_reply_message(&active_id, &reply), reply_to)
-                        .await;
-                }
-                Err(e) => {
-                    let _ = self
-                        .send_reply(
-                            &format!(
-                                "⚠️ Could not reach session `{}`: {}",
-                                short_id(&active_id),
-                                e
-                            ),
-                            reply_to,
-                        )
-                        .await;
-                }
-            }
+            self.stream_reply_to_session(reply_to, &active_id, trimmed).await;
             return Ok(());
         }
 
@@ -897,12 +1133,12 @@ impl TelegramChannel {
             let ack = if injected {
                 format!(
                     "💬 Message sent to active session: _{}_",
-                    crate::telegram::escape_markdown(trimmed)
+                    crate::telegram::escape_markdown_v2(trimmed)
                 )
             } else {
                 format!(
                     "📋 Message queued, waking agent: _{}_",
-                    crate::telegram::escape_markdown(trimmed)
+                    crate::telegram::escape_markdown_v2(trimmed)
                 )
             };
             let _ = self.send_reply(&ack, reply_to).await;
@@ -1021,15 +1257,119 @@ impl AuthWarningTracker {
 
 
 /// Format an agent reply for a session-reply message, escaping the reply text
-/// so it cannot break Telegram's legacy `Markdown` parse mode. The reply
+/// so it cannot break Telegram's MarkdownV2 `parse_mode`. The reply
 /// follows the short session id on the same line; the id itself is a short
 /// hash and needs no escaping.
 fn agent_reply_message(session_id: &str, reply: &str) -> String {
     format!(
-        "💬 [{}] {}",
+        "💬 \\[{}] {}",
         short_id(session_id),
-        crate::telegram::escape_markdown(reply)
+        escape_markdown_v2(reply)
     )
+}
+
+impl TelegramChannel {
+    /// Run a prompt against `session_id` and stream partial assistant text into a
+/// single Telegram message (so the user sees live progress), then leave the
+/// final reply in place. Sends a placeholder first, then edits it as tokens
+/// arrive. If the turn fails, reports the error.
+async fn stream_reply_to_session(
+    &self,
+    reply_to: Option<i64>,
+    session_id: &str,
+    text: &str,
+) {
+    // Post one placeholder message that we will edit with streamed progress.
+    // `send_message_raw` returns the created message id (or None if the text
+    // needed chunking), which we then target with `edit_message_text`. The
+    // placeholder is sent with `parse_mode=MarkdownV2`, so the `[` `]` around
+    // the session id must be escaped (otherwise Telegram rejects the message
+    // and the whole turn is skipped).
+    let placeholder = format!("💭 \\[{}] _thinking…_", short_id(session_id));
+    let client = self.client_or_default().await;
+    let sent_id = match crate::telegram::send_message_raw(
+        &client,
+        &self.token,
+        &self.chat_id,
+        &placeholder,
+        self.api_base.as_deref(),
+        reply_to,
+    )
+    .await
+    {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            // Placeholder needed chunking; fall back to non-streaming.
+            self.fallback_reply(session_id, reply_to, text).await;
+            return;
+        }
+        Err(e) => {
+            let _ = self
+                .send_reply(
+                    &format!("⚠️ Could not start reply for `{}`: {}", short_id(session_id), e),
+                    reply_to,
+                )
+                .await;
+            return;
+        }
+    };
+    use crate::server::telegram_control::resume_session_for_control_or_spawn_streaming as stream_turn;
+    let token = self.token.clone();
+    let api_base = self.api_base.clone();
+    let chat_id = self.chat_id.clone();
+    let sid = short_id(session_id).to_string();
+    let on_progress = |partial: String| {
+        let client = client.clone();
+        let token = token.clone();
+        let api_base = api_base.clone();
+        let chat_id = chat_id.clone();
+        let sid = sid.clone();
+        async move {
+            let body = format!("💬 \\[{}] {}", sid, escape_markdown_v2(&partial));
+            crate::telegram::edit_message_text(
+                &client,
+                &token,
+                chat_id.parse::<i64>().unwrap_or(0),
+                sent_id,
+                &body,
+                api_base.as_deref(),
+            )
+            .await;
+        }
+    };
+    if let Err(e) = stream_turn(session_id, text, on_progress).await {
+        let _ = crate::telegram::edit_message_text(
+            &client,
+            &self.token,
+            self.chat_id.parse::<i64>().unwrap_or(0),
+            sent_id,
+            &format!(
+                "⚠️ Could not reach session `{}`: {}",
+                short_id(session_id),
+                escape_markdown_v2(&e.to_string())
+            ),
+            self.api_base.as_deref(),
+        )
+        .await;
+    }
+}
+
+/// Non-streaming fallback used when we cannot obtain a message id to edit.
+async fn fallback_reply(&self, session_id: &str, reply_to: Option<i64>, text: &str) {
+    match crate::server::telegram_control::resume_session_for_control_or_spawn(session_id, text).await {
+        Ok(reply) => {
+            let _ = self.send_reply(&agent_reply_message(session_id, &reply), reply_to).await;
+        }
+        Err(e) => {
+            let _ = self
+                .send_reply(
+                    &format!("⚠️ Could not reach session `{}`: {}", short_id(session_id), e),
+                    reply_to,
+                )
+                .await;
+        }
+    }
+}
 }
 
 const HELP_TEXT: &str = "\
@@ -1037,18 +1377,23 @@ const HELP_TEXT: &str = "\
 
 *Commands:*
 /list — list sessions (tap to select)
-/new [prompt] — start a new session (optionally with an opening prompt)
-/use <n or id> — select a session to talk to
-/history [n] — show recent messages of the selected session
-/resume <id> <prompt> — ask a session directly
+/find (text) — search sessions by title or id
+/new (prompt) — start a new session (optional opening prompt)
+/use (n or id) — select a session to talk to
+/history (n) — show recent messages of the selected session
+/resume (id) (prompt) — ask a session directly
+/live — list live sessions (tap 🗑️ to free one)
+/free (id) — drop a live headless session
+/abort — stop the active session's running turn
+/whoami — show this chat's id for config
 /clear — stop talking to the selected session
 /status — show ambient & control status
 /help — this help
 
 *Tips:*
-• Send any plain message after `/use` or `/new` to talk to a session.
-• `/list` shows an inline picker: tap a row to select that session.
-• `/use 2` selects the 2nd session from `/list`; `/use abc123…` matches by id prefix.
+• Send any plain message after /use or /new to talk to a session.
+• /list shows an inline picker: tap a row to select that session.
+• /use 2 selects the 2nd session; /use abc123… matches by id prefix.
 • A ✅ marks the active session in the picker.";
 
 // ---------------------------------------------------------------------------
