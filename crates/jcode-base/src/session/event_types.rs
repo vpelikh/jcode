@@ -280,10 +280,10 @@ impl SessionEventMap {
         // Validate operation based on event type
         match &event.op {
             SessionEventOp::AppendMessage { message, .. } => {
-                validate_message(message, &event.event_id)?;
+                Self::validate_message(message, &event.event_id)?;
             }
             SessionEventOp::InsertMessage { message, .. } => {
-                validate_message(message, &event.event_id)?;
+                Self::validate_message(message, &event.event_id)?;
             }
             SessionEventOp::SetCompaction { compaction } => {
                 self.validate_compaction(compaction)?;
