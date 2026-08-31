@@ -292,7 +292,7 @@ impl SessionEventMap {
                 self.validate_memory_injection(memory_injection)?;
             }
             SessionEventOp::ReplayEvent { replay_event } => {
-                self.validate_replay_event(replay_event)?;
+Self::validate_replay_event(replay_event)?;
             }
             _ => {} // Other operations don't need additional validation
         }
@@ -353,13 +353,13 @@ impl SessionEventMap {
     }
     
     /// Validate replay event
-    fn validate_replay_event(&self, replay_event: &StoredReplayEvent) -> Result<(), SessionEventError> {
+    fn validate_replay_event(replay_event: &StoredReplayEvent) -> Result<(), SessionEventError> {
         if replay_event.timestamp > chrono::Utc::now() {
             return Err(SessionEventError::InvalidTimestamp {
                 timestamp: replay_event.timestamp
             });
         }
-        
+
         Ok(())
     }
 }
