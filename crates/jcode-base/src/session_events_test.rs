@@ -432,3 +432,58 @@ fn test_event_map_hydrated_on_disk_round_trip() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_replace_after_truncate_replays_deterministically() {
+    use crate::session::event_types::SessionEventMap;
+
+    let mut map = SessionEventMap::default();
+    let mk = |id: &str| StoredMessage {
+        id: id.to_string(),
+        role: Role::User,
+        content: vec![text_block(id)],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    };
+
+    // 1) append three messages
+    for id in ["a", "b", "c"] {
+        map.append_event(SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: format!("rehydrate_{}", id),
+            op: SessionEventOp::AppendMessage { message_id: id.to_string(), message: mk(id) },
+            parent_id: None,
+            version: 1,
+        });
+    }
+    // 2) truncate to first two (partial replace [0..2])
+    map.append_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "truncate".to_string(),
+        op: SessionEventOp::ReplaceMessages {
+            start_index: 0,
+            end_index: 2,
+            messages: vec![mk("a"), mk("b")],
+        },
+        parent_id: None,
+        version: 1,
+    });
+    // 3) full replacement (end_index::MAX semantics)
+    map.append_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "replace_all".to_string(),
+        op: SessionEventOp::ReplaceMessages {
+            start_index: 0,
+            end_index: usize::MAX,
+            messages: vec![mk("x"), mk("y"), mk("z")],
+        },
+        parent_id: None,
+        version: 1,
+    });
+
+    let derived = map.derive_messages();
+    let ids: Vec<&str> = derived.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, vec!["x", "y", "z"], "full replacement must drop earlier tail, not splice");
+}

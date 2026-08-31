@@ -1321,13 +1321,20 @@ request in this new forked session, using the inherited conversation only as con
     }
 
     pub fn replace_messages(&mut self, messages: Vec<StoredMessage>) {
-        // Append to event log (replace all)
+        // Append to event log (replace all).
+        //
+        // `end_index` uses usize::MAX rather than the current length so that
+        // replay is deterministic: a full replacement must cover the entire
+        // derived transcript regardless of where it sits in the event stream
+        // (e.g. after a prior truncate shortened the tail). `derive_messages`
+        // caps `end_index` at the live length, so usize::MAX always means
+        // "to the end".
         let event = SessionEvent {
             timestamp: chrono::Utc::now(),
             event_id: "replace_all".to_string(),
             op: SessionEventOp::ReplaceMessages {
                 start_index: 0,
-                end_index: self.messages.len(),
+                end_index: usize::MAX,
                 messages: messages.clone(),
             },
             parent_id: None,
