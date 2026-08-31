@@ -221,6 +221,11 @@ fn agents_md_distinct_project_and_global_files_are_both_loaded() {
 
 #[test]
 fn captured_agents_md_keeps_split_prompt_stable_after_file_write() {
+    let _guard = crate::storage::lock_test_env();
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let temp = tempfile::TempDir::new().unwrap();
+    crate::env::set_var("JCODE_HOME", temp.path());
+
     let project_dir = tempfile::TempDir::new().unwrap();
     let agents_md = project_dir.path().join("AGENTS.md");
     std::fs::write(&agents_md, "original session instructions").unwrap();
@@ -269,6 +274,12 @@ fn captured_agents_md_keeps_split_prompt_stable_after_file_write() {
             .contains("instructions written during the session")
     );
     assert_ne!(before.static_part, next_session.static_part);
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
 }
 
 #[test]
