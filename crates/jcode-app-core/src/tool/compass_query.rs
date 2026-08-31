@@ -120,22 +120,33 @@ impl Tool for CompassQueryTool {
         let engine = match compass_query::open(&graph_path, None, &cache_dir) {
             Ok(engine) => engine,
             Err(open_err) => {
-                // Cold cache. Serialize the whole probe+build+reopen under the
-                // project lock so parallel calls (this tool is concurrency-safe,
-                // so the harness may dispatch siblings at the same time) cannot
-                // race on graph.json. The engine is returned straight out of the
-                // lock, so no open happens against a half-written index.
+                // Cold cache. The in-process index build can take seconds for a
+                // large project, so it must not run on the async executor. Offload
+                // the whole probe+build+reopen to a blocking thread; the flock is
+                // process-wide so it still serializes concurrent builds correctly.
                 let result: anyhow::Result<compass_query::CodeQueryEngine> =
-                    with_build_lock(&cache_dir, || {
-                        // Another call may have finished the build while we
-                        // waited for the lock; reuse it instead of rebuilding.
-                        if let Ok(engine) = compass_query::open(&graph_path, None, &cache_dir) {
-                            return Ok(engine);
+                    tokio::task::spawn_blocking({
+                        let graph_path = graph_path.clone();
+                        let cache_dir = cache_dir.clone();
+                        let working_dir = working_dir.clone();
+                        move || {
+                            with_build_lock(&cache_dir, || {
+                                // Another call may have finished the build while we
+                                // waited for the lock; reuse it instead of rebuilding.
+                                if let Ok(engine) =
+                                    compass_query::open(&graph_path, None, &cache_dir)
+                                {
+                                    return Ok(engine);
+                                }
+                                build_compass_index(&working_dir, &cache_dir)?;
+                                compass_query::open(&graph_path, None, &cache_dir).map_err(|e| {
+                                    anyhow!("Index was built but could not be opened: {}", e)
+                                })
+                            })
                         }
-                        build_compass_index(&working_dir, &cache_dir)?;
-                        compass_query::open(&graph_path, None, &cache_dir)
-                            .map_err(|e| anyhow!("Index was built but could not be opened: {}", e))
-                    });
+                    })
+                    .await
+                    .expect("compass index build task panicked");
                 match result {
                     Ok(engine) => engine,
                     Err(build_err) => {
@@ -244,9 +255,12 @@ where
 /// This runs once per project: the output is cached under `output_dir` and the
 /// caller re-opens it via `compass_query::open`, so subsequent queries skip the
 /// (relatively expensive) build entirely.
-fn build_compass_index(root: &PathBuf, output_dir: &PathBuf) -> Result<(), anyhow::Error> {
+fn build_compass_index(
+    root: &std::path::Path,
+    output_dir: &std::path::Path,
+) -> Result<(), anyhow::Error> {
     let mut options = BuildOptions::new(root);
-    options.output_root = Some(output_dir.clone());
+    options.output_root = Some(output_dir.to_path_buf());
     options.purpose = BuildPurpose::Extract;
     options.scan_filesystem = true;
     options.graph_storage = compass_core::GraphStorage::Json;
@@ -421,7 +435,6 @@ mod tests {
                 let failures = failures.clone();
                 let success = success.clone();
                 let root = root.clone();
-                let cache = cache.clone();
                 s.spawn(move || {
                     // Each thread runs its own current-thread runtime so the
                     // blocking builds overlap on real cores, like parallel dispatch.
