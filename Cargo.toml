@@ -157,8 +157,8 @@ dirs = "5"               # home directory
 anyhow = "1"
 libc = "0.2"             # Unix system calls (flock)
 chrono = { version = "0.4", features = ["serde"] }
-# Pinned to 0.3.53 to satisfy compass-core (via compass-history), which
-# requires time = "=0.3.53". aws/azure/ratatui accept ^0.3.4 so this is compatible.
+# Pinned to 0.3.53: compass-core (via compass-history) requires exactly this
+# version. aws/azure/ratatui accept ^0.3.4, so 0.3.53 is compatible for them.
 time = "=0.3.53"
 
 # Embeddings (local inference) - behind feature flag (163 crates, slow to compile)
