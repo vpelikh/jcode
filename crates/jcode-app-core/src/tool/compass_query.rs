@@ -335,12 +335,11 @@ fn index_is_stale(
 ) -> bool {
     // Check for branch/commit change first. If the current git SHA differs from
     // the one the index was built against, it's definitely stale.
-    if let Some(sha) = current_sha {
-        if let Some(cached_sha) = index_git_sha(cache_dir) {
-            if sha != cached_sha {
-                return true; // Branch/commit changed, index is stale
-            }
-        }
+    if let Some(sha) = current_sha
+        && let Some(cached_sha) = index_git_sha(cache_dir).as_deref()
+        && sha != cached_sha
+    {
+        return true; // Branch/commit changed, index is stale
     }
 
     // Short-circuit if we recently scanned and confirmed freshness.
@@ -368,10 +367,10 @@ fn index_is_stale(
             if ft.is_dir() {
                 // Skip caches/VCS so unrelated churn (e.g. .git, target) does not
                 // force constant rebuilds.
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if matches!(name, ".git" | "target" | "node_modules" | ".jcode") {
-                        continue;
-                    }
+                if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                    && matches!(name, ".git" | "target" | "node_modules" | ".jcode")
+                {
+                    continue;
                 }
                 stack.push(path);
             } else if ft.is_file() {
@@ -382,12 +381,11 @@ fn index_is_stale(
                 if !is_source {
                     continue;
                 }
-                if let Ok(meta) = std::fs::metadata(&path) {
-                    if let Ok(m) = meta.modified() {
-                        if m > index_mtime {
-                            return true;
-                        }
-                    }
+                if let Ok(meta) = std::fs::metadata(&path)
+                    && let Ok(m) = meta.modified()
+                    && m > index_mtime
+                {
+                    return true;
                 }
             }
         }
@@ -533,10 +531,10 @@ fn execute_query(
             .to_string();
         let file = node.and_then(|n| n.source.as_ref()).map(|s| s.file.clone());
         // Apply path filter (substring match on the resolved file path).
-        if let (Some(filter), Some(file)) = (path_filter, &file) {
-            if !file.contains(filter) {
-                continue;
-            }
+        if let (Some(filter), Some(file)) = (path_filter, &file)
+            && !file.contains(filter)
+        {
+            continue;
         }
         rows.push((name, file, hit.score, hit.matched_fields.clone()));
     }
