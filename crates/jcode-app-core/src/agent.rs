@@ -33,9 +33,12 @@ use crate::message::{
 };
 use crate::protocol::{HistoryMessage, ServerEvent};
 use crate::provider::{NativeToolResult, Provider, ProviderRuntimeState};
-use crate::session::{GitState, Session, SessionStatus, StoredDisplayRole, StoredMessage};
+use crate::session::{
+    GitState, Session, SessionStatus, StoredDisplayRole, StoredMessage,
+    event_types::{SessionEvent, SessionEventOp},
+};
 use crate::skill::SkillRegistry;
-use crate::tool::{Registry, ToolContext, ToolExecutionMode};
+use chrono::{DateTime, Utc};
 use anyhow::Result;
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
@@ -468,8 +471,8 @@ impl Agent {
 
     fn seed_compaction_from_session(&mut self) {
         logging::info(&format!(
-            "seed_compaction_from_session: session has {} messages",
-            self.session.messages.len()
+            "seed_compaction_from_session: session has {} messages via event log",
+            self.session.event_map.derive_messages().len()
         ));
         let compaction = self.registry.compaction();
         let mut manager = match compaction.try_write() {
@@ -484,10 +487,11 @@ impl Agent {
         manager.reset();
         let budget = self.provider.context_window();
         manager.set_budget(budget);
-        if let Some(state) = self.session.compaction.as_ref() {
-            manager.restore_persisted_stored_state_with(state, &self.session.messages);
+        let current_compaction = self.session.event_map.current_compaction();
+        if let Some(state) = current_compaction {
+            manager.restore_persisted_stored_state_with(&state, &self.session.event_map.derive_messages());
         } else {
-            manager.seed_restored_stored_messages_with(&self.session.messages);
+            manager.seed_restored_stored_messages_with(&self.session.event_map.derive_messages());
         }
         let sanitized_state = if manager.discard_oversized_openai_native_compaction() {
             Some(manager.persisted_state())
@@ -495,12 +499,19 @@ impl Agent {
             None
         };
         logging::info(&format!(
-            "seed_compaction_from_session: seeded compaction with {} messages",
-            self.session.messages.len()
+            "seed_compaction_from_session: seeded compaction with {} messages via event log",
+            self.session.event_map.derive_messages().len()
         ));
         drop(manager);
         if let Some(state) = sanitized_state {
             self.session.compaction = state;
+            self.session.event_map.append_event(SessionEvent {
+                timestamp: chrono::Utc::now(),
+                event_id: format!("compaction_{}", self.session.messages.len()),
+                op: SessionEventOp::SetCompaction { compaction: state.clone() },
+                parent_id: None,
+                version: 1,
+            });
             self.persist_session_best_effort("sanitized oversized OpenAI native compaction");
         }
     }
@@ -801,7 +812,9 @@ impl Agent {
     }
 
     fn repair_missing_tool_outputs(&mut self) -> usize {
-        if self.tool_output_scan_index > self.session.messages.len() {
+        let messages = self.session.event_map.derive_messages();
+        
+        if self.tool_output_scan_index > messages.len() {
             self.reset_tool_output_tracking();
         }
 
@@ -809,7 +822,7 @@ impl Agent {
         let mut new_result_ids = Vec::new();
         let mut assistant_tool_uses: Vec<(usize, Vec<String>)> = Vec::new();
 
-        for (index, msg) in self.session.messages.iter().enumerate().skip(scan_start) {
+        for (index, msg) in messages.iter().enumerate().skip(scan_start) {
             match msg.role {
                 Role::User => {
                     for block in &msg.content {
@@ -861,8 +874,6 @@ impl Agent {
             }
         }
 
-        self.tool_output_scan_index = self.session.messages.len();
-
         let mut repaired = 0usize;
         let mut inserted = 0usize;
         for (index, missing_for_message) in missing_repairs {
@@ -881,15 +892,14 @@ impl Agent {
                     tool_duration_ms: None,
                     token_usage: None,
                 };
-                self.session
-                    .insert_message(index + 1 + inserted + offset, stored_message);
+                self.session.insert_message(index + 1 + inserted + offset, stored_message);
                 self.tool_result_ids.insert(id.clone());
                 repaired += 1;
             }
             inserted += missing_for_message.len();
         }
 
-        self.tool_output_scan_index = self.session.messages.len();
+        self.tool_output_scan_index = self.session.event_map.derive_messages().len();
 
         if repaired > 0 {
             self.persist_session_best_effort("missing tool-output repair");

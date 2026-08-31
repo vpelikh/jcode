@@ -1279,7 +1279,7 @@ request in this new forked session, using the inherited conversation only as con
 
     pub fn append_stored_message(&mut self, message: StoredMessage) {
         // Append to event log
-        let message_id = self.messages.len().to_string();
+        let message_id = message.id.clone();
         let event = SessionEvent {
             timestamp: chrono::Utc::now(),
             event_id: message_id.clone(),
