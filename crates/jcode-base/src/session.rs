@@ -1765,7 +1765,7 @@ request in this new forked session, using the inherited conversation only as con
         let now = chrono::Utc::now();
 
         for (i, message) in self.messages.iter().enumerate() {
-            map.append_event(SessionEvent {
+            map.push_event(SessionEvent {
                 timestamp: message.timestamp.unwrap_or(now),
                 event_id: format!("rehydrate_{}", i),
                 op: SessionEventOp::AppendMessage {
@@ -1778,7 +1778,7 @@ request in this new forked session, using the inherited conversation only as con
         }
 
         for (j, injection) in self.memory_injections.iter().enumerate() {
-            map.append_event(SessionEvent {
+            map.push_event(SessionEvent {
                 timestamp: injection.timestamp,
                 event_id: format!("rehydrate_mem_{}", j),
                 op: SessionEventOp::MemoryInjection {
@@ -1790,7 +1790,7 @@ request in this new forked session, using the inherited conversation only as con
         }
 
         for (k, replay) in self.replay_events.iter().enumerate() {
-            map.append_event(SessionEvent {
+            map.push_event(SessionEvent {
                 timestamp: replay.timestamp,
                 event_id: format!("rehydrate_replay_{}", k),
                 op: SessionEventOp::ReplayEvent {
@@ -1802,7 +1802,7 @@ request in this new forked session, using the inherited conversation only as con
         }
 
         if let Some(compaction) = &self.compaction {
-            map.append_event(SessionEvent {
+            map.push_event(SessionEvent {
                 timestamp: now,
                 event_id: "rehydrate_compaction".to_string(),
                 op: SessionEventOp::SetCompaction {

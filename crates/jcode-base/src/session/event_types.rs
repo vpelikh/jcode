@@ -140,6 +140,22 @@ impl SessionEventMap {
         }
         self.events.push(event);
     }
+
+    /// Append without validation — used for rehydration from trusted legacy vectors.
+    pub(crate) fn push_event(&mut self, event: SessionEvent) {
+        // Update caches before moving `event` into `self.events`, so we only
+        // clone when the cache actually needs to retain the value.
+        match &event.op {
+            SessionEventOp::SetCompaction { .. } => {
+                self.compaction_event_index = Some(event.clone());
+            }
+            SessionEventOp::ClearAll => {
+                self.compaction_event_index = None;
+            }
+            _ => {}
+        }
+        self.events.push(event);
+    }
     
     /// Derive current messages from events
     pub fn derive_messages(&self) -> Vec<StoredMessage> {
@@ -151,7 +167,7 @@ impl SessionEventMap {
                     messages.push(message.clone());
                 }
                 SessionEventOp::InsertMessage { index, message, .. } => {
-                    if *index <= messages.len() {
+                    if *index < messages.len() {
                         messages.insert(*index, message.clone());
                     }
                 }
@@ -185,7 +201,27 @@ impl SessionEventMap {
                     None
                 }
             }
-            None => None,
+            None => {
+                // Fallback: cache may be empty after deserialization (serde(skip)).
+                // Scan events in reverse to find the most recent SetCompaction.
+                // If a ClearAll appears after that SetCompaction, the compaction
+                // is considered cleared and we return None.
+                let mut found_compaction = None;
+                for event in self.events.iter().rev() {
+                    match &event.op {
+                        SessionEventOp::SetCompaction { compaction } => {
+                            found_compaction = Some(compaction.clone());
+                            break;
+                        }
+                        SessionEventOp::ClearAll => {
+                            // ClearAll after the latest SetCompaction clears it
+                            return None;
+                        }
+                        _ => {}
+                    }
+                }
+                found_compaction
+            }
         }
     }
     
