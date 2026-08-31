@@ -1436,7 +1436,7 @@ impl ConfirmationTracker {
                 + std::time::Duration::from_secs(CONFIRM_TIMEOUT_SECS),
         });
         format!(
-            "⚠️ *Confirm `{action} session `{sid}`*\n\n\
+            "⚠️ *Confirm `{action}` session `{sid}`*\n\n\
              This cannot be undone.\n\
              /confirm to proceed, /cancel to abort."
         )
