@@ -268,6 +268,43 @@ fn record_scan(cache_dir: &Path) {
         .insert(cache_dir.to_path_buf(), SystemTime::now());
 }
 
+/// How long a resolved `git rev-parse HEAD` result is reused before we re-shell
+/// out to git. A branch/commit switch is still detected on (almost) every query
+/// because `index_is_stale` compares the *cached* SHA against the index sidecar
+/// before the mtime walk; this TTL only bounds how often we pay the fork/exec
+/// cost of `git` itself, not how quickly a switch is noticed. Two seconds keeps
+/// switch detection effectively immediate while avoiding a subprocess per call.
+const GIT_SHA_CACHE_TTL: Duration = Duration::from_secs(2);
+
+/// Currently resolved git SHA per working dir, so the branch-change check doesn't
+/// spawn `git` on every query. Keyed by working dir (not cache dir) since HEAD
+/// is a property of the repo, not the cache.
+static LAST_GIT_SHA: OnceLock<Mutex<HashMap<PathBuf, (SystemTime, String)>>> = OnceLock::new();
+
+/// Return the current git SHA, reusing a recently resolved value so we don't
+/// fork `git` on every query. Falls back to `None` (mtime walk) exactly when
+/// `current_git_sha` would, and refreshes at most once per `GIT_SHA_CACHE_TTL`.
+fn current_git_sha_cached(working_dir: &Path) -> Option<String> {
+    let map = LAST_GIT_SHA.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let guard = map.lock().unwrap();
+        if let Some((t, sha)) = guard.get(working_dir)
+            && t.elapsed().map(|d| d < GIT_SHA_CACHE_TTL).unwrap_or(false)
+        {
+            return Some(sha.clone());
+        }
+    } // Drop the read lock before shelling out to git.
+    match current_git_sha(working_dir) {
+        Some(sha) => {
+            map.lock()
+                .unwrap()
+                .insert(working_dir.to_path_buf(), (SystemTime::now(), sha.clone()));
+            Some(sha)
+        }
+        None => None,
+    }
+}
+
 /// Name of the sidecar file that records the git commit the index was built
 /// against, stored alongside `graph.json`. A mismatch means the user switched
 /// branches/commits, so the index must be rebuilt.
@@ -430,7 +467,7 @@ fn ensure_fresh_engine(
                 // branch/commit switch is detected immediately and bypasses the
                 // throttled mtime walk; otherwise it relies on the per-cache
                 // STALE_RESCAN_TTL to skip the walk, and finally walks the tree.
-                let current_sha = current_git_sha(working_dir);
+                let current_sha = current_git_sha_cached(working_dir);
                 if !index_is_stale(working_dir, graph_path, current_sha.as_deref(), cache_dir) {
                     record_scan(cache_dir);
                     return Ok(engine);
@@ -980,5 +1017,58 @@ mod tests {
             index_is_stale(&root, &graph_path, current_git_sha(&root).as_deref(), &cache),
             "branch/commit change must mark the index stale even with unchanged mtimes"
         );
+    }
+
+    // `current_git_sha_cached` must resolve a real repo's HEAD and reuse it
+    // within the TTL (so we don't fork `git` on every query), while a non-git
+    // dir falls back to None just like the raw `current_git_sha`. Skips when git
+    // is unavailable.
+    #[test]
+    fn git_sha_is_cached_per_working_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        // Non-git dir: neither raw nor cached should resolve a SHA.
+        assert!(current_git_sha(&root).is_none());
+        assert!(current_git_sha_cached(&root).is_none());
+
+        let ok = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return; // git not available.
+        }
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&root)
+            .status()
+            .ok();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&root)
+            .status()
+            .ok();
+        std::fs::write(root.join("main.rs"), "fn a() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .status()
+            .ok();
+        if !std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&root)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        let sha1 = current_git_sha_cached(&root).expect("cached sha on a real repo");
+        let sha2 = current_git_sha_cached(&root).expect("cached sha reused");
+        assert_eq!(sha1, sha2, "SHA must be reused within the cache TTL");
     }
 }
