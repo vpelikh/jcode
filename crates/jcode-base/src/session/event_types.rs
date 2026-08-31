@@ -130,6 +130,12 @@ impl SessionEventMap {
             SessionEventOp::SetCompaction { .. } => {
                 self.compaction_event_index = Some(event);
             }
+            SessionEventOp::ClearAll => {
+                // Any cached compaction state refers to messages that no longer
+                // exist after a clear; drop it so current_compaction() reflects
+                // the cleared transcript.
+                self.compaction_event_index = None;
+            }
             _ => {}
         }
     }

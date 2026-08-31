@@ -487,3 +487,84 @@ fn test_replace_after_truncate_replays_deterministically() {
     let ids: Vec<&str> = derived.iter().map(|m| m.id.as_str()).collect();
     assert_eq!(ids, vec!["x", "y", "z"], "full replacement must drop earlier tail, not splice");
 }
+
+#[test]
+fn test_append_stored_message_with_empty_id_records_event() {
+    let mut session = Session::create_with_id(
+        "test_empty_id_append".to_string(),
+        None,
+        Some("Empty id".to_string()),
+    );
+    let empty_id_msg = StoredMessage {
+        id: String::new(),
+        role: Role::User,
+        content: vec![text_block("no id")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    };
+    session.append_stored_message(empty_id_msg);
+
+    // Both sources of truth must stay in sync.
+    assert_eq!(session.messages.len(), 1);
+    assert_eq!(session.event_map.events.len(), 1);
+    let (derived, _) = session.rederive_all_checked().expect("consistent");
+    assert_eq!(derived.len(), 1);
+}
+
+#[test]
+fn test_clear_messages_emits_clearall_and_drops_compaction() {
+    let mut session = Session::create_with_id(
+        "test_clear".to_string(),
+        None,
+        Some("Clear".to_string()),
+    );
+    session.append_stored_message(StoredMessage {
+        id: "m1".to_string(),
+        role: Role::User,
+        content: vec![text_block("hi")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    session.set_compaction(StoredCompactionState {
+        summary_text: "sum".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 1,
+    });
+    assert!(session.compaction.is_some());
+
+    session.clear_messages();
+    assert!(session.messages.is_empty());
+    assert!(session.compaction.is_none());
+    assert!(session.derive_messages().is_empty());
+    assert!(session.derive_compaction().is_none());
+}
+
+#[test]
+fn test_session_fork_event_log_prefix() {
+    // Session-level fork: derived fields reflect only the prefix events.
+    let mut session = Session::create_with_id(
+        "test_fork_session".to_string(),
+        None,
+        Some("Fork".to_string()),
+    );
+    for i in 0..5usize {
+        session.append_stored_message(StoredMessage {
+            id: format!("msg_{}", i),
+            role: Role::User,
+            content: vec![text_block(&format!("m{}", i))],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+    let fork = session.fork_up_to_boundary(2);
+    assert_eq!(fork.derive_messages().len(), 3);
+    assert_ne!(fork.id, session.id);
+}

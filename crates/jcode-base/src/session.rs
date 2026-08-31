@@ -195,9 +195,13 @@ pub struct Session {
     /// Non-conversation UI/state events persisted for higher-fidelity replay.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub replay_events: Vec<StoredReplayEvent>,
-    /// Event-sourced session log - single source of truth for all session state
+    /// Event-sourced session log - single source of truth for all session state.
+    ///
+    /// Kept `pub(crate)` so callers outside this crate must go through the
+    /// `Session` mutation API (which keeps `messages` and the event log in
+    /// sync). Direct external mutation would desync the two sources of truth.
     #[serde(skip)]
-    pub event_map: SessionEventMap,
+    pub(crate) event_map: SessionEventMap,
     #[serde(skip)]
     persist_state: SessionPersistState,
     #[serde(skip)]
@@ -1278,8 +1282,15 @@ request in this new forked session, using the inherited conversation only as con
     }
 
     pub fn append_stored_message(&mut self, message: StoredMessage) {
-        // Append to event log
-        let message_id = message.id.clone();
+        // Ensure a stable event id even when the message id is empty, so the
+        // event log and the legacy `messages` vector never diverge (an empty
+        // event_id is rejected by validation, which would skip the event while
+        // the message is still pushed below).
+        let message_id = if message.id.is_empty() {
+            crate::id::new_id("message")
+        } else {
+            message.id.clone()
+        };
         let event = SessionEvent {
             timestamp: chrono::Utc::now(),
             event_id: message_id.clone(),
@@ -1368,6 +1379,29 @@ request in this new forked session, using the inherited conversation only as con
             self.mark_memory_profile_dirty();
             self.mark_messages_full_dirty();
         }
+    }
+
+    /// Clear every message in the transcript.
+    ///
+    /// Emits a `ClearAll` event so replay deterministically yields an empty
+    /// transcript regardless of preceding message/replace/truncate events.
+    /// Unlike `truncate_messages(0)`, this does not leave a stale snapshot of
+    /// the prefix; the event log records the intent instead.
+    pub fn clear_messages(&mut self) {
+        let event = SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: "clear_all".to_string(),
+            op: SessionEventOp::ClearAll,
+            parent_id: None,
+            version: 1,
+        };
+        self.event_map.append_event(event);
+        self.messages.clear();
+        // Also drop any persisted compaction state, since it refers to
+        // messages that no longer exist.
+        self.compaction = None;
+        self.mark_memory_profile_dirty();
+        self.mark_messages_full_dirty();
     }
 
     /// Drop oversized inline images from the stored transcript, oldest-first,
@@ -1599,6 +1633,24 @@ request in this new forked session, using the inherited conversation only as con
         self.event_map.replay_events()
     }
 
+    /// Append a session event through the validated event log.
+    ///
+    /// Callers outside `jcode-base` should use this instead of reaching into
+    /// `event_map` so the append path stays consistent. Returns `false` if the
+    /// event was rejected by validation (and therefore not recorded).
+    pub fn append_session_event(&mut self, event: SessionEvent) -> bool {
+        // Capture whether the event was recorded before mutating (append_event
+        // skips invalid events internally).
+        let before = self.event_map.events.len();
+        self.event_map.append_event(event);
+        self.event_map.events.len() > before
+    }
+
+    /// Fork the event log up to a boundary and return the prefix as a new map.
+    pub fn fork_event_log(&self, boundary_index: usize) -> SessionEventMap {
+        self.event_map.fork_up_to_boundary(boundary_index)
+    }
+
     /// Set compaction state in event log
     pub fn set_compaction(&mut self, compaction: StoredCompactionState) {
         let event = SessionEvent {
@@ -1620,7 +1672,7 @@ request in this new forked session, using the inherited conversation only as con
         let mut fork = self.clone();
         
         // Create fork with prefix of events
-        fork.event_map = self.event_map.fork_up_to_boundary(boundary_index);
+        fork.event_map = self.fork_event_log(boundary_index);
         
         // Reset the derived fields for the fork
         fork.messages = fork.derive_messages();
