@@ -286,10 +286,10 @@ impl SessionEventMap {
                 Self::validate_message(message, &event.event_id)?;
             }
             SessionEventOp::SetCompaction { compaction } => {
-                self.validate_compaction(compaction)?;
+                Self::validate_compaction(compaction)?;
             }
             SessionEventOp::MemoryInjection { memory_injection } => {
-                self.validate_memory_injection(memory_injection)?;
+                Self::validate_memory_injection(memory_injection)?;
             }
             SessionEventOp::ReplayEvent { replay_event } => {
 Self::validate_replay_event(replay_event)?;
@@ -318,7 +318,7 @@ Self::validate_replay_event(replay_event)?;
     }
     
     /// Validate compaction state
-    fn validate_compaction(&self, compaction: &StoredCompactionState) -> Result<(), SessionEventError> {
+    fn validate_compaction(compaction: &StoredCompactionState) -> Result<(), SessionEventError> {
         if compaction.covers_up_to_turn > compaction.original_turn_count {
             return Err(SessionEventError::InvalidCompactionState {
                 reason: format!(
@@ -341,7 +341,7 @@ Self::validate_replay_event(replay_event)?;
     }
     
     /// Validate memory injection data
-    fn validate_memory_injection(&self, injection: &StoredMemoryInjection) -> Result<(), SessionEventError> {
+    fn validate_memory_injection(injection: &StoredMemoryInjection) -> Result<(), SessionEventError> {
         if injection.content.is_empty() {
             return Err(SessionEventError::InvalidMemoryInjection {
                 reason: "Memory injection content cannot be empty".to_string()
