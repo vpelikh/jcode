@@ -247,6 +247,11 @@ impl Session {
         session.reset_persist_state(path.exists());
         session.reset_provider_messages_cache();
         session.mark_memory_profile_dirty();
+        // Hydrate the event-sourced log from the legacy vectors so that
+        // `event_map` is the single source of truth for resumed sessions.
+        // `rebuild_event_map` is a no-op when the log is already populated
+        // (in-process sessions append events directly).
+        session.rebuild_event_map();
         if replay_stats.is_corrupt() {
             session.schedule_checkpoint_after_corrupt_journal(&journal_path);
         }
@@ -338,6 +343,11 @@ impl Session {
         session.reset_persist_state(path.exists());
         session.reset_provider_messages_cache();
         session.mark_memory_profile_dirty();
+        // Hydrate the event-sourced log from the legacy vectors so that
+        // `event_map` is the single source of truth for resumed sessions.
+        // `rebuild_event_map` is a no-op when the log is already populated
+        // (in-process sessions append events directly).
+        session.rebuild_event_map();
         let finalize_ms = finalize_start.elapsed().as_millis();
         crate::logging::info(&format!(
             "[TIMING] remote_startup_load: session={}, snapshot={}ms, journal={}ms, finalize={}ms, snapshot_bytes={}, journal_bytes={}, journal_entries={}, messages={}, total={}ms",

@@ -471,9 +471,12 @@ impl Agent {
     }
 
     fn seed_compaction_from_session(&mut self) {
+        // Read the event-sourced log once; on resume this is hydrated from disk
+        // in Session::load_from_path so it reflects the full transcript.
+        let messages = self.session.event_map.derive_messages();
         logging::info(&format!(
             "seed_compaction_from_session: session has {} messages via event log",
-            self.session.event_map.derive_messages().len()
+            messages.len()
         ));
         let compaction = self.registry.compaction();
         let mut manager = match compaction.try_write() {
@@ -490,9 +493,9 @@ impl Agent {
         manager.set_budget(budget);
         let current_compaction = self.session.event_map.current_compaction();
         if let Some(state) = current_compaction {
-            manager.restore_persisted_stored_state_with(&state, &self.session.event_map.derive_messages());
+            manager.restore_persisted_stored_state_with(&state, &messages);
         } else {
-            manager.seed_restored_stored_messages_with(&self.session.event_map.derive_messages());
+            manager.seed_restored_stored_messages_with(&messages);
         }
         let sanitized_state = if manager.discard_oversized_openai_native_compaction() {
             Some(manager.persisted_state())
@@ -501,7 +504,7 @@ impl Agent {
         };
         logging::info(&format!(
             "seed_compaction_from_session: seeded compaction with {} messages via event log",
-            self.session.event_map.derive_messages().len()
+            messages.len()
         ));
         drop(manager);
         if let Some(state) = sanitized_state {
