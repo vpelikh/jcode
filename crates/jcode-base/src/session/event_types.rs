@@ -371,7 +371,3 @@ impl SessionEventMap {
         Ok(())
     }
 }
-
-// Re-export types
-pub use SessionEventOp as EventOp;
-pub use SessionEvent as Event;
