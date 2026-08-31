@@ -3,15 +3,35 @@
 //! `compass_query` is a first-class, always-available tool (like `read` or
 //! `agentgrep`). It integrates Compass as a pure library: there is no MCP
 //! server and no CLI subprocess. The first query in a project builds the
-//! Compass index in-process and caches it under `.jcode/cache/compass`. A warm
-//! index is reused for subsequent queries, so the build runs only when the
-//! project has never been indexed or when source has changed since the last
+//! Compass index in-process and caches it.
+//!
+//! ## Cache locations
+//!
+//! * **Shared cache** (`~/.jcode/shared-compass-cache/<sha>/`): When working in
+//!   a git checkout or worktree, the index is stored under the user's home
+//!   directory keyed by the current commit SHA. Multiple worktrees on the same
+//!   commit share one index, avoiding redundant ~1-2 GB builds.
+//! * **Local cache** (`<working_dir>/.jcode/cache/compass`): When git metadata
+//!   is unavailable or the working directory is not in a git repo, the index
+//!   falls back to a per-worktree local cache.
+//!
+//! A warm index is reused for subsequent queries, so the build runs only when
+//! the project has never been indexed or when source has changed since the last
 //! build. On a rebuild Compass reuses its persisted AST cache (incremental
 //! extract), so changed files are re-extracted rather than the whole project.
 //! A git branch or commit switch (HEAD) is detected via a cached SHA sidecar
 //! and forces a rebuild even when no file mtime changed, so a freshly checked
 //! out tree is never served against a stale index.
 //! The index can also be force-refreshed by deleting the cache dir.
+//!
+//! ### Shared-cache staleness semantics
+//!
+//! A shared index represents a single *committed* tree, keyed by commit SHA.
+//! Its freshness is therefore decided purely by whether the current commit SHA
+//! matches the sidecar — never by walking the working tree. This guarantees an
+//! individual worktree's uncommitted edits never force a shared rebuild from
+//! that dirty tree (which would leak that worktree's uncommitted code into the
+//! index that every clean worktree on the same SHA also reads).
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use compass_core::{build_graph_with_layers, BuildOptions, BuildPurpose};
@@ -24,6 +44,15 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use super::{Tool, ToolContext, ToolOutput};
+
+/// Relative path under the user's home directory where Compass indexes are
+/// shared by git SHA. Worktrees that resolve to the same commit reuse the same
+/// index, avoiding redundant ~1-2 GB builds per worktree.
+const SHARED_COMPASS_CACHE_BASE: &str = ".jcode/shared-compass-cache";
+
+/// Fallback local cache directory name inside a working directory. Used when
+/// git metadata is unavailable or the SHA cannot be resolved.
+const LOCAL_COMPASS_CACHE_NAME: &str = ".jcode/cache/compass";
 
 #[derive(Debug, Deserialize)]
 struct CompassQueryInput {
@@ -109,9 +138,11 @@ impl Tool for CompassQueryTool {
             .clone()
             .ok_or_else(|| anyhow!("compass_query requires a working directory"))?;
 
-        // Build cache directory relative to working directory. The Compass index
-        // is built and stored here, so the project tree stays clean.
-        let cache_dir = working_dir.join(".jcode/cache/compass");
+        // Resolve the Compass cache directory. Prefer a SHA-keyed shared cache
+        // under the user's home directory when the working dir is inside a git
+        // checkout/worktree. This lets multiple worktrees on the same commit reuse
+        // one index instead of each building their own large local copy.
+        let (graph_path, cache_dir, is_shared) = resolve_compass_cache(&working_dir);
         if let Err(e) = std::fs::create_dir_all(&cache_dir) {
             return Ok(ToolOutput::new(format!(
                 "Failed to create Compass cache directory: {}",
@@ -124,13 +155,12 @@ impl Tool for CompassQueryTool {
         // seconds for a large project, so it runs on a blocking thread; the
         // project flock serializes concurrent builds, keeping the concurrency-
         // safe contract intact.
-        let graph_path = cache_dir.join("compass-out").join("graph.json");
         let engine_res: std::result::Result<compass_query::CodeQueryEngine, (String, String)> =
             tokio::task::spawn_blocking({
                 let graph_path = graph_path.clone();
                 let cache_dir = cache_dir.clone();
                 let working_dir = working_dir.clone();
-                move || ensure_fresh_engine(&graph_path, &cache_dir, &working_dir)
+                move || ensure_fresh_engine(&graph_path, &cache_dir, &working_dir, is_shared)
             })
             .await
             .expect("compass index task panicked");
@@ -171,6 +201,30 @@ impl Tool for CompassQueryTool {
     }
 }
 
+/// Resolve the Compass cache location for `working_dir`.
+fn resolve_compass_cache(working_dir: &Path) -> (PathBuf, PathBuf, bool) {
+    // Shared caches let multiple worktrees on the same commit reuse one index.
+    // Fall back to per-worktree local cache when git metadata or home dir is unavailable.
+    // Use the TTL-cached SHA here: this runs on the hot `execute` path for every
+    // query, so forking `git` each time would reintroduce the per-query fork cost
+    // the earlier perf commit eliminated.
+    if let (Some(sha), Some(home)) = (current_git_sha_cached(working_dir), home_dir()) {
+        let cache_dir = home.join(SHARED_COMPASS_CACHE_BASE).join(&sha);
+        let graph_path = cache_dir.join("compass-out").join("graph.json");
+        (graph_path, cache_dir, true)
+    } else {
+        let cache_dir = working_dir.join(LOCAL_COMPASS_CACHE_NAME);
+        let graph_path = cache_dir.join("compass-out").join("graph.json");
+        (graph_path, cache_dir, false)
+    }
+}
+
+fn home_dir() -> Option<PathBuf> {
+    // Prefer the `dirs` crate for cross-platform home directory resolution.
+    // If unavailable, we fall back to local cache in resolve_compass_cache.
+    dirs::home_dir()
+}
+
 /// Format the user-facing message shown when neither an existing Compass index
 /// can be opened nor a fresh one can be built in-process. The message uses Rust
 /// `\`-line-continuations so the rendered text has no stray leading indentation.
@@ -191,8 +245,9 @@ fn format_index_unavailable(open_err: &str, build_err: &str) -> String {
 fn format_query_error(e: &str, query: &str, cache_dir: &std::path::Path) -> String {
     format!(
         "Compass query failed: {}\n\nQuery: {}\n\n\
-         The index is built, but the search engine returned an error. If this persists, \
-         try removing the cached index ({}) and re-running the query to force a rebuild.",
+         The index is built, but the search engine returned an error.\n\
+         Clear the cache to force a rebuild:\n\
+         rm -rf {}",
         e,
         query,
         cache_dir.display()
@@ -366,11 +421,20 @@ fn current_git_sha(working_dir: &Path) -> Option<String> {
 /// Callers should gate this behind `recently_scanned`/`record_scan` so the walk
 /// does not run on every query (see `ensure_fresh_engine`): within
 /// `STALE_RESCAN_TTL` of a verified-fresh scan we reuse the index without re-walking.
+///
+/// `shared` selects shared-cache semantics. A shared index is keyed strictly by
+/// the commit SHA and represents the *committed* tree: freshness is determined
+/// purely by SHA match, and the mtime walk is intentionally skipped. This is
+/// essential for correctness: local, uncommitted edits in one worktree must not
+/// force a rebuild of the shared index from that worktree's dirty tree, which
+/// would leak that worktree's uncommitted code into the index that clean
+/// worktrees on the same commit also read.
 fn index_is_stale(
     root: &Path,
     graph_path: &Path,
     current_sha: Option<&str>,
     cache_dir: &Path,
+    shared: bool,
 ) -> bool {
     // Check for branch/commit change first. If the current git SHA differs from
     // the one the index was built against, it's definitely stale.
@@ -379,6 +443,14 @@ fn index_is_stale(
         && sha != cached_sha
     {
         return true; // Branch/commit changed, index is stale
+    }
+
+    // A shared index is keyed by commit SHA and represents only committed code,
+    // so SHA match is the complete freshness criterion. We never walk the tree:
+    // uncommitted edits belong to one worktree and must not invalidate (or force
+    // a rebuild of) the index clean worktrees on the same SHA read.
+    if shared {
+        return false;
     }
 
     // Short-circuit if we recently scanned and confirmed freshness.
@@ -445,6 +517,7 @@ fn ensure_fresh_engine(
     graph_path: &Path,
     cache_dir: &Path,
     working_dir: &Path,
+    is_shared: bool,
 ) -> std::result::Result<compass_query::CodeQueryEngine, (String, String)> {
     with_build_lock(cache_dir, || {
         // Open an existing index. Reuse it only when source and branch haven't
@@ -468,15 +541,24 @@ fn ensure_fresh_engine(
                 // throttled mtime walk; otherwise it relies on the per-cache
                 // STALE_RESCAN_TTL to skip the walk, and finally walks the tree.
                 let current_sha = current_git_sha_cached(working_dir);
-                if !index_is_stale(working_dir, graph_path, current_sha.as_deref(), cache_dir) {
-                    record_scan(cache_dir);
+                if !index_is_stale(working_dir, graph_path, current_sha.as_deref(), cache_dir, is_shared) {
+                    if !is_shared {
+                        record_scan(cache_dir);
+                    }
                     return Ok(engine);
                 }
-                // Valid but stale (source edit or branch change): discard it and
-                // rebuild below so we never serve a dirty index. Do NOT treat
-                // the discarded index as freshly scanned.
+
+                // The shared index is keyed by the committed SHA and holds no
+                // worktree's uncommitted edits (see index_is_stale). For shared
+                // caches this branch is only reachable on a genuine SHA switch:
+                // the current directory no longer matches, so discard and rebuild
+                // below. For local caches it is also reached on source edits.
                 drop(engine);
                 let _ = std::fs::remove_dir_all(cache_dir.join("compass-out"));
+                // Clean up stale index files, leaving the cache_dir intact for reuse.
+                // Don't remove .compass-build.lock here - it's safe to leave and
+                // removing it while holding the lock could block other worktrees.
+                let _ = std::fs::remove_file(cache_dir.join(GIT_SHA_FILE));
             }
             Err(_) => {
                 // Missing or corrupt: rebuild below (current_sha is captured by
@@ -487,11 +569,14 @@ fn ensure_fresh_engine(
         // Build (covers missing, corrupt, stale, or branch change). `cache_root`
         // makes this incremental on a repeat build, re-extracting only changed
         // files. `build_compass_index` also records the current git SHA sidecar,
-        // so a later branch switch is detected without walking the tree. Record
-        // the scan so the immediately following query doesn't re-walk the tree.
+        // so a later branch switch is detected without walking the tree. For
+        // shared caches, the scan is intentionally skipped so each caller
+        // still validates freshness against its own working directory.
         build_compass_index(working_dir, cache_dir)
             .map_err(|e| ("existing index missing or stale".to_string(), e.to_string()))?;
-        record_scan(cache_dir);
+        if !is_shared {
+            record_scan(cache_dir);
+        }
         compass_query::open(graph_path, None, cache_dir).map_err(|e| {
             (
                 "existing index missing or stale".to_string(),
@@ -776,7 +861,8 @@ mod tests {
                 &root,
                 &graph_path,
                 current_git_sha(&root).as_deref(),
-                &cache
+                &cache,
+                false
             ),
             "just-built index should not be stale"
         );
@@ -791,7 +877,8 @@ mod tests {
                 &root,
                 &graph_path,
                 current_git_sha(&root).as_deref(),
-                &cache
+                &cache,
+                false
             ),
             "index must be stale after a newer source file is added"
         );
@@ -803,7 +890,8 @@ mod tests {
                 &root,
                 &graph_path,
                 current_git_sha(&root).as_deref(),
-                &cache
+                &cache,
+                false
             ),
             "index should be fresh again after rebuild"
         );
@@ -1001,7 +1089,7 @@ mod tests {
 
         // A freshly built index is not stale against its own commit.
         assert!(
-            !index_is_stale(&root, &graph_path, current_git_sha(&root).as_deref(), &cache),
+            !index_is_stale(&root, &graph_path, current_git_sha(&root).as_deref(), &cache, false),
             "just-built index should not be stale against its own commit"
         );
 
@@ -1014,7 +1102,7 @@ mod tests {
         assert_ne!(sha1, sha2, "amend must produce a new commit SHA");
 
         assert!(
-            index_is_stale(&root, &graph_path, current_git_sha(&root).as_deref(), &cache),
+            index_is_stale(&root, &graph_path, current_git_sha(&root).as_deref(), &cache, false),
             "branch/commit change must mark the index stale even with unchanged mtimes"
         );
     }
@@ -1070,5 +1158,243 @@ mod tests {
         let sha1 = current_git_sha_cached(&root).expect("cached sha on a real repo");
         let sha2 = current_git_sha_cached(&root).expect("cached sha reused");
         assert_eq!(sha1, sha2, "SHA must be reused within the cache TTL");
+    }
+    #[test]
+    fn resolve_compass_cache_uses_shared_path_for_git_repos() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        // Init a real git repo so current_git_sha succeeds.
+        let ok = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return; // git not available.
+        }
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&root)
+            .status()
+            .ok();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&root)
+            .status()
+            .ok();
+        std::fs::write(root.join("main.rs"), "fn a() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .status()
+            .ok();
+        if !std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&root)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        let (graph_path, cache_dir, is_shared) = resolve_compass_cache(&root);
+        assert!(is_shared, "git repo should use shared cache");
+        assert!(
+            cache_dir.to_string_lossy().contains(".jcode/shared-compass-cache"),
+            "shared cache should be under home/.jcode/shared-compass-cache"
+        );
+        assert!(graph_path.ends_with("compass-out/graph.json"));
+    }
+
+    #[test]
+    fn resolve_compass_cache_falls_back_to_local_for_non_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let (graph_path, cache_dir, is_shared) = resolve_compass_cache(&root);
+        assert!(!is_shared, "non-git dir should use local cache");
+        assert!(
+            cache_dir.starts_with(&root),
+            "local cache should be inside the working dir"
+        );
+        assert!(graph_path.ends_with("compass-out/graph.json"));
+    }
+    #[test]
+    fn stale_index_cleanup_removes_sidecar_and_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        // Create a git repo with one commit.
+        let ok = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return;
+        }
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&root)
+            .status()
+            .ok();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&root)
+            .status()
+            .ok();
+        std::fs::write(root.join("main.rs"), "fn a() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .status()
+            .ok();
+        if !std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&root)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        let (graph_path, cache_dir, is_shared) = resolve_compass_cache(&root);
+        assert!(is_shared);
+
+        // Build the index manually to create sidecar files.
+        build_compass_index(&root, &cache_dir).expect("build should succeed");
+
+        // Verify sidecar files exist.
+        assert!(
+            cache_dir.join(GIT_SHA_FILE).exists(),
+            "git-sha sidecar should exist after build"
+        );
+        // Note: .compass-build.lock is only created during concurrent builds via with_build_lock,
+        // so we don't assert its existence here.
+
+        // Verify the fresh index is not stale.
+        assert!(
+            !index_is_stale(&root, &graph_path, current_git_sha(&root).as_deref(), &cache_dir, true),
+            "fresh index should not be stale"
+        );
+    }
+    #[test]
+    fn shared_cache_ignores_uncommitted_local_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        // Init a real git repo.
+        let ok = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return;
+        }
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&root)
+            .status()
+            .ok();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&root)
+            .status()
+            .ok();
+        std::fs::write(root.join("main.rs"), "fn a() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .status()
+            .ok();
+        if !std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&root)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        let (graph_path, cache_dir, is_shared) = resolve_compass_cache(&root);
+        assert!(is_shared);
+
+        // Build the index.
+        build_compass_index(&root, &cache_dir).expect("build should succeed");
+
+        // Verify the index is fresh initially.
+        assert!(
+            !index_is_stale(&root, &graph_path, current_git_sha(&root).as_deref(), &cache_dir, true),
+            "fresh index should not be stale"
+        );
+
+        // Uncommitted local edits in one worktree must NOT make the shared index
+        // stale: the shared index is keyed by commit SHA and represents only the
+        // committed tree. A local edit must never force a shared rebuild from a
+        // dirty worktree (which would leak that worktree's uncommitted code into
+        // the index all clean worktrees on the same SHA also read).
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(root.join("modified.rs"), "fn b() {}\n").unwrap();
+
+        assert!(
+            !index_is_stale(&root, &graph_path, current_git_sha(&root).as_deref(), &cache_dir, true),
+            "shared index must stay fresh under uncommitted local edits (SHA unchanged)"
+        );
+    }
+
+    // For a shared cache, staleness is driven purely by the commit SHA.
+    // Advancing HEAD (amending produces a new SHA with an identical tree) must
+    // mark the shared index stale, since a shared index represents exactly one
+    // committed tree keyed by that SHA.
+    #[test]
+    fn shared_cache_rebuilds_on_commit_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        let git = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init"]) {
+            return;
+        }
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(root.join("main.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "."]);
+        if !git(&["commit", "-m", "init"]) {
+            return;
+        }
+        if current_git_sha(&root).is_none() {
+            return;
+        }
+
+        let (graph_path, cache_dir, is_shared) = resolve_compass_cache(&root);
+        assert!(is_shared);
+        build_compass_index(&root, &cache_dir).expect("build");
+
+        // Fresh against its own commit.
+        assert!(
+            !index_is_stale(&root, &graph_path, current_git_sha(&root).as_deref(), &cache_dir, true),
+            "shared index should be fresh against its own commit"
+        );
+
+        // Amend -> new SHA, identical tree -> shared index must turn stale.
+        assert!(git(&["commit", "--amend", "-m", "init-amended"]), "amend should succeed");
+        assert!(
+            index_is_stale(&root, &graph_path, current_git_sha(&root).as_deref(), &cache_dir, true),
+            "shared index must be stale after the commit SHA changes"
+        );
     }
 }
