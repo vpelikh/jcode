@@ -263,6 +263,56 @@ fn record_scan(cache_dir: &Path) {
         .insert(cache_dir.to_path_buf(), SystemTime::now());
 }
 
+/// Name of the sidecar file that records the git commit the index was built
+/// against, stored alongside `graph.json`. A mismatch means the user switched
+/// branches/commits, so the index must be rebuilt.
+const GIT_SHA_FILE: &str = ".git-sha";
+
+/// Read the git SHA the index at `cache_dir` was last built against, if any.
+fn index_git_sha(cache_dir: &Path) -> Option<String> {
+    let p = cache_dir.join(GIT_SHA_FILE);
+    std::fs::read_to_string(&p).ok().and_then(|s| {
+        let s = s.trim();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        }
+    })
+}
+
+/// Persist the git SHA the index was built against, so a later checkout that
+/// changes HEAD is detected and forces a rebuild. Best-effort: a write failure
+/// just means branch switches won't be detected (we fall back to the mtime walk).
+fn write_index_git_sha(cache_dir: &Path, sha: &str) {
+    let _ = std::fs::write(cache_dir.join(GIT_SHA_FILE), sha);
+}
+
+/// Return the current working dir's git commit SHA, or None if the dir is
+/// not a git repo, detached, or if git is missing/non-UTF8. This does NOT block:
+/// a failed git call just returns None, and the index will rely on the mtime walk.
+///
+/// Non-git dirs, detached HEAD, or any failure (git absent, read error, non-UTF8)
+/// all return `None`, which is treated as "no branch information to compare" —
+/// the index then relies on the mtime walk. We deliberately do not block on git:
+/// a slow or broken `git rev-parse` must not stall a query.
+fn current_git_sha(working_dir: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(working_dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha)
+    }
+}
+
 /// Decide whether `graph_path`'s index is older than any source under `root`.
 ///
 /// Best-effort: a missing index, or any IO error while walking the tree, is
@@ -274,7 +324,27 @@ fn record_scan(cache_dir: &Path) {
 /// Callers should gate this behind `recently_scanned`/`record_scan` so the walk
 /// does not run on every query (see `ensure_fresh_engine`): within
 /// `STALE_RESCAN_TTL` of a verified-fresh scan we reuse the index without re-walking.
-fn index_is_stale(root: &Path, graph_path: &Path) -> bool {
+fn index_is_stale(
+    root: &Path,
+    graph_path: &Path,
+    current_sha: Option<&str>,
+    cache_dir: &Path,
+) -> bool {
+    // Check for branch/commit change first. If the current git SHA differs from
+    // the one the index was built against, it's definitely stale.
+    if let Some(sha) = current_sha {
+        if let Some(cached_sha) = index_git_sha(cache_dir) {
+            if sha != cached_sha {
+                return true; // Branch/commit changed, index is stale
+            }
+        }
+    }
+
+    // Short-circuit if we recently scanned and confirmed freshness.
+    if recently_scanned(cache_dir) {
+        return false;
+    }
+
     let Ok(index_meta) = std::fs::metadata(graph_path) else {
         return false; // No index (or unreadable): handle the cold case elsewhere.
     };
@@ -323,39 +393,46 @@ fn index_is_stale(root: &Path, graph_path: &Path) -> bool {
 }
 
 /// Open the Compass engine for `graph_path`, building (or rebuilding) it under a
-/// project flock when it is missing, corrupt, or stale. Returns the engine, or
-/// `(open_err, build_err)` describing why neither an open nor a build succeeded.
+/// project flock when it is missing, corrupt, stale, or on a different branch.
+/// Returns the engine, or `(open_err, build_err)` describing why neither an open
+/// nor a build succeeded.
 ///
 /// Staleness is checked *before* an opened engine is trusted: a valid-but-old
-/// index must not be served, so a present index is only reused when
-/// `index_is_stale` reports no newer source. Both the open probe and any rebuild
-/// run inside `with_build_lock`, which serializes concurrent/stale rebuilds so
-/// two parallel calls can't write `graph.json` at once.
+/// index must not be served. Both the open probe and any rebuild run inside
+/// `with_build_lock`, which serializes concurrent/stale rebuilds so two parallel
+/// calls can't write `graph.json` at once.
 fn ensure_fresh_engine(
     graph_path: &Path,
     cache_dir: &Path,
     working_dir: &Path,
 ) -> std::result::Result<compass_query::CodeQueryEngine, (String, String)> {
     with_build_lock(cache_dir, || {
-        // Open an existing index. Reuse it only when source hasn't moved past it.
-        // The mtime scan that proves freshness is throttled to once per
-        // STALE_RESCAN_TTL per project (see `recently_scanned`/`record_scan`) so a
-        // busy agent doesn't re-stat the whole source tree on every call. Correctness
-        // holds because a scan always runs before reuse once the window lapses (or if
-        // no scan has been recorded yet for this cache), so a source change is caught
-        // by the first query after the window, never served indefinitely.
+        // Get the current git SHA once so we can compare it against the cached one.
+        let current_sha = current_git_sha(working_dir);
+
+        // Open an existing index. Reuse it only when source and branch haven't
+        // moved past it. The mtime scan that proves freshness is throttled to
+        // once per STALE_RESCAN_TTL per project (see `recently_scanned`/
+        // `record_scan`) so a busy agent doesn't re-stat the whole source tree
+        // on every call. Correctness holds because a scan always runs before
+        // reuse once the window lapses (or if no scan has been recorded yet for
+        // this cache), so a source change is caught by the first query after the
+        // window, never served indefinitely. A branch change bypasses the TTL
+        // and forces a rebuild immediately.
         match compass_query::open(graph_path, None, cache_dir) {
             Ok(engine) => {
-                let stale = !recently_scanned(cache_dir) && index_is_stale(working_dir, graph_path);
+                let stale = !recently_scanned(cache_dir)
+                    && index_is_stale(working_dir, graph_path, current_sha.as_deref(), cache_dir);
                 if !stale {
                     if !recently_scanned(cache_dir) {
                         record_scan(cache_dir);
                     }
                     return Ok(engine);
                 }
-                // Valid but stale: discard it and rebuild below so we never serve
-                // source that has since changed. Do NOT record the scan: the next
-                // call must re-check rather than trust a now-discarded index.
+                // Valid but stale (source edit or branch change): discard it and
+                // rebuild below so we never serve a dirty index. Do NOT record
+                // the scan: the next call must re-check rather than trust a now-
+                // discarded index.
                 drop(engine);
                 let _ = std::fs::remove_dir_all(cache_dir.join("compass-out"));
             }
@@ -364,10 +441,15 @@ fn ensure_fresh_engine(
             }
         }
 
-        // Build (covers missing, corrupt, or stale). `cache_root` makes this
-        // incremental on a repeat build, re-extracting only changed files.
+        // Build (covers missing, corrupt, stale, or branch change). `cache_root`
+        // makes this incremental on a repeat build, re-extracting only changed
+        // files. Persist the current git SHA so future queries can detect
+        // subsequent branch changes without walking the tree.
         build_compass_index(working_dir, cache_dir)
             .map_err(|e| ("existing index missing or stale".to_string(), e.to_string()))?;
+        if let Some(sha) = &current_sha {
+            write_index_git_sha(cache_dir, sha);
+        }
         compass_query::open(graph_path, None, cache_dir).map_err(|e| {
             (
                 "existing index missing or stale".to_string(),
@@ -635,7 +717,12 @@ mod tests {
 
         // A fresh index is not considered stale against its own source.
         assert!(
-            !index_is_stale(&root, &graph_path),
+            !index_is_stale(
+                &root,
+                &graph_path,
+                current_git_sha(&root).as_deref(),
+                &cache
+            ),
             "just-built index should not be stale"
         );
 
@@ -645,14 +732,24 @@ mod tests {
         writeln!(f, "fn newly_added() {{ }}").unwrap();
         drop(f);
         assert!(
-            index_is_stale(&root, &graph_path),
+            index_is_stale(
+                &root,
+                &graph_path,
+                current_git_sha(&root).as_deref(),
+                &cache
+            ),
             "index must be stale after a newer source file is added"
         );
 
         // Rebuilding refreshes the index mtime, so it is no longer stale.
         build_compass_index(&root, &cache).expect("rebuild");
         assert!(
-            !index_is_stale(&root, &graph_path),
+            !index_is_stale(
+                &root,
+                &graph_path,
+                current_git_sha(&root).as_deref(),
+                &cache
+            ),
             "index should be fresh again after rebuild"
         );
     }
