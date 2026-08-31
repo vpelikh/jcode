@@ -123,12 +123,12 @@ impl SessionEventMap {
             eprintln!("session_event: skipping invalid event {}: {}", event.event_id, err);
             return;
         }
-        self.events.push(event.clone());
 
-        // Update caches
+        // Update caches before moving `event` into `self.events`, so we only
+        // clone when the cache actually needs to retain the value.
         match &event.op {
             SessionEventOp::SetCompaction { .. } => {
-                self.compaction_event_index = Some(event);
+                self.compaction_event_index = Some(event.clone());
             }
             SessionEventOp::ClearAll => {
                 // Any cached compaction state refers to messages that no longer
@@ -138,6 +138,7 @@ impl SessionEventMap {
             }
             _ => {}
         }
+        self.events.push(event);
     }
     
     /// Derive current messages from events
