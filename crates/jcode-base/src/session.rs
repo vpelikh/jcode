@@ -1345,7 +1345,7 @@ request in this new forked session, using the inherited conversation only as con
         // "to the end".
         let event = SessionEvent {
             timestamp: chrono::Utc::now(),
-            event_id: "replace_all".to_string(),
+            event_id: crate::id::new_id("replace_all"),
             op: SessionEventOp::ReplaceMessages {
                 start_index: 0,
                 end_index: usize::MAX,
@@ -1377,7 +1377,7 @@ request in this new forked session, using the inherited conversation only as con
             // Append to event log
             let event = SessionEvent {
                 timestamp: chrono::Utc::now(),
-                event_id: "truncate".to_string(),
+                event_id: crate::id::new_id("truncate"),
                 op: SessionEventOp::ReplaceMessages {
                     start_index: 0,
                     end_index: len,
@@ -1403,7 +1403,7 @@ request in this new forked session, using the inherited conversation only as con
     pub fn clear_messages(&mut self) {
         let event = SessionEvent {
             timestamp: chrono::Utc::now(),
-            event_id: "clear_all".to_string(),
+            event_id: crate::id::new_id("clear_all"),
             op: SessionEventOp::ClearAll,
             parent_id: None,
             version: 1,
@@ -1550,7 +1550,7 @@ request in this new forked session, using the inherited conversation only as con
         // Append to event log
         let event = SessionEvent {
             timestamp: injection.timestamp,
-            event_id: format!("mem_inj_{}", self.memory_injections.len()),
+            event_id: crate::id::new_id("mem_inj"),
             op: SessionEventOp::MemoryInjection {
                 memory_injection: injection.clone(),
             },
@@ -1588,31 +1588,14 @@ request in this new forked session, using the inherited conversation only as con
                 content: content.into(),
             },
         };
-        
-        // Append to event log
-        let event = SessionEvent {
-            timestamp: event_data.timestamp,
-            event_id: format!("replay_{}", self.replay_events.len()),
-            op: SessionEventOp::ReplayEvent {
-                replay_event: event_data.clone(),
-            },
-            parent_id: None,
-            version: 1,
-        };
-        self.event_map.append_event(event);
-        
-        // Keep backward compatibility
-        self.memory_profile_cache.replay_events_count += 1;
-        self.memory_profile_cache.replay_events_json_bytes += estimate_json_bytes(&event_data);
-        self.replay_events.push(event_data);
-        self.mark_replay_events_append_dirty();
+        self.record_replay_event(&event_data);
     }
 
     /// Record an already-constructed replay event into the event log.
     pub fn record_replay_event(&mut self, replay_event: &StoredReplayEvent) {
         let event = SessionEvent {
             timestamp: replay_event.timestamp,
-            event_id: format!("replay_{}", self.replay_events.len()),
+            event_id: crate::id::new_id("replay"),
             op: SessionEventOp::ReplayEvent {
                 replay_event: replay_event.clone(),
             },
