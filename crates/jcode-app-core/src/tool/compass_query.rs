@@ -5,15 +5,16 @@
 //! server and no CLI subprocess. The first query in a project builds the
 //! Compass index in-process and caches it under `.jcode/cache/compass`; every
 //! later query reuses that cache, so the (relatively expensive) build runs at
-//! most once per project. Re-running a query after deleting the cache dir
-//! forces a rebuild.
+//! most once per project. The cache is automatically rebuilt when source files
+//! change (a stale index is detected and refreshed), and can also be forced by
+//! deleting the cache dir.
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use compass_core::{build_graph_with_layers, BuildOptions, BuildPurpose};
 use compass_model::query_contract::{CodeQueryLimits, SearchRequest};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::Path;
 
 use super::{Tool, ToolContext, ToolOutput};
 
@@ -111,51 +112,27 @@ impl Tool for CompassQueryTool {
             )));
         }
 
-        // Open the Compass query engine. If no index exists yet, build one
-        // in-process using Compass's library API (compass_core::build_graph_with_layers),
-        // then reopen. The index is written into cache_dir/compass-out/graph.json.
-        // The cold build is serialized with an exclusive flock so that parallel
-        // calls (this tool is concurrency-safe) cannot race on the same index.
+        // Open (or build) the Compass query engine. A cold or stale index is
+        // (re)built in-process via Compass's library API. The build can take
+        // seconds for a large project, so it runs on a blocking thread; the
+        // project flock serializes concurrent builds, keeping the concurrency-
+        // safe contract intact.
         let graph_path = cache_dir.join("compass-out").join("graph.json");
-        let engine = match compass_query::open(&graph_path, None, &cache_dir) {
+        let engine_res: std::result::Result<compass_query::CodeQueryEngine, (String, String)> =
+            tokio::task::spawn_blocking({
+                let graph_path = graph_path.clone();
+                let cache_dir = cache_dir.clone();
+                let working_dir = working_dir.clone();
+                move || ensure_fresh_engine(&graph_path, &cache_dir, &working_dir)
+            })
+            .await
+            .expect("compass index task panicked");
+        let engine = match engine_res {
             Ok(engine) => engine,
-            Err(open_err) => {
-                // Cold cache. The in-process index build can take seconds for a
-                // large project, so it must not run on the async executor. Offload
-                // the whole probe+build+reopen to a blocking thread; the flock is
-                // process-wide so it still serializes concurrent builds correctly.
-                let result: anyhow::Result<compass_query::CodeQueryEngine> =
-                    tokio::task::spawn_blocking({
-                        let graph_path = graph_path.clone();
-                        let cache_dir = cache_dir.clone();
-                        let working_dir = working_dir.clone();
-                        move || {
-                            with_build_lock(&cache_dir, || {
-                                // Another call may have finished the build while we
-                                // waited for the lock; reuse it instead of rebuilding.
-                                if let Ok(engine) =
-                                    compass_query::open(&graph_path, None, &cache_dir)
-                                {
-                                    return Ok(engine);
-                                }
-                                build_compass_index(&working_dir, &cache_dir)?;
-                                compass_query::open(&graph_path, None, &cache_dir).map_err(|e| {
-                                    anyhow!("Index was built but could not be opened: {}", e)
-                                })
-                            })
-                        }
-                    })
-                    .await
-                    .expect("compass index build task panicked");
-                match result {
-                    Ok(engine) => engine,
-                    Err(build_err) => {
-                        return Ok(ToolOutput::new(format_index_unavailable(
-                            &open_err.to_string(),
-                            &build_err.to_string(),
-                        )));
-                    }
-                }
+            Err((open_err, build_err)) => {
+                return Ok(ToolOutput::new(format_index_unavailable(
+                    &open_err, &build_err,
+                )));
             }
         };
 
@@ -248,6 +225,102 @@ where
     f()
 }
 
+/// Decide whether `graph_path`'s index is older than any source under `root`.
+///
+/// Best-effort: a missing index, or any IO error while walking the tree, is
+/// treated as "not stale" (so we just build if it is missing, and never block a
+/// query on a failed scan). We compare the index mtime against the newest mtime
+/// among source files Compass can parse; new/moved dirs are also detected because
+/// the walk descends through them.
+fn index_is_stale(root: &Path, graph_path: &Path) -> bool {
+    let Ok(index_meta) = std::fs::metadata(graph_path) else {
+        return false; // No index (or unreadable): handle the cold case elsewhere.
+    };
+    let Ok(index_mtime) = index_meta.modified() else {
+        return false;
+    };
+
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if ft.is_dir() {
+                // Skip caches/VCS so unrelated churn (e.g. .git, target) does not
+                // force constant rebuilds.
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if matches!(name, ".git" | "target" | "node_modules" | ".jcode") {
+                        continue;
+                    }
+                }
+                stack.push(path);
+            } else if ft.is_file() {
+                let is_source = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| matches!(e, "rs" | "py" | "js" | "ts" | "go" | "tsx" | "jsx"));
+                if !is_source {
+                    continue;
+                }
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    if let Ok(m) = meta.modified() {
+                        if m > index_mtime {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Open the Compass engine for `graph_path`, building (or rebuilding) it under a
+/// project flock when it is missing or stale. Returns the engine, or
+/// `(open_err, build_err)` describing why neither an open nor a build succeeded.
+///
+/// Both the initial open and the rebuild run inside `with_build_lock`: the flock
+/// serializes concurrent/stale rebuilds so two parallel calls can't write
+/// `graph.json` at once.
+fn ensure_fresh_engine(
+    graph_path: &Path,
+    cache_dir: &Path,
+    working_dir: &Path,
+) -> std::result::Result<compass_query::CodeQueryEngine, (String, String)> {
+    with_build_lock(cache_dir, || {
+        // Another caller may have finished a build while we waited for the lock;
+        // reuse it instead of rebuilding.
+        if let Ok(engine) = compass_query::open(graph_path, None, cache_dir) {
+            return Ok(engine);
+        }
+        let open_err = match compass_query::open(graph_path, None, cache_dir) {
+            Ok(engine) => return Ok(engine),
+            Err(e) => e.to_string(),
+        };
+
+        if index_is_stale(working_dir, graph_path) {
+            // Best-effort: empty the stale output so a partial build can't be
+            // reopened. A failure here is reported via the subsequent build error.
+            let _ = std::fs::remove_dir_all(cache_dir.join("compass-out"));
+        }
+
+        match build_compass_index(working_dir, cache_dir) {
+            Ok(()) => compass_query::open(graph_path, None, cache_dir).map_err(|e| {
+                (
+                    open_err,
+                    format!("Index was built but could not be opened: {e}"),
+                )
+            }),
+            Err(build_err) => Err((open_err, build_err.to_string())),
+        }
+    })
+}
+
 /// Build a Compass knowledge-graph index for the project in-process, using the
 /// Compass library API (`compass_core::build_graph_with_layers`). The resulting
 /// store is written into `output_dir` so the project tree stays untouched.
@@ -282,7 +355,9 @@ fn execute_query(
     let request = SearchRequest {
         query: query.to_string(),
         limits: CodeQueryLimits {
-            max_nodes: limit as u32,
+            // Clamp instead of casting: a pathological usize > u32::MAX must not
+            // silently wrap to 0 and violate CodeQueryLimits::is_valid().
+            max_nodes: limit.clamp(1, u32::MAX as usize) as u32,
             ..Default::default()
         },
     };
@@ -336,6 +411,7 @@ mod tests {
     use super::*;
     use jcode_tool_core::ToolExecutionMode;
     use std::io::Write;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     /// Create an isolated temp project with a single source file, returning the
@@ -486,6 +562,91 @@ mod tests {
         assert!(
             compass_query::open(&graph_path, None, &cache).is_ok(),
             "index left by concurrent builds must be openable"
+        );
+    }
+
+    #[test]
+    fn index_is_stale_detects_new_source() {
+        let (_tmp, root, cache) = make_isolated_project();
+        let graph_path = cache.join("compass-out").join("graph.json");
+        build_compass_index(&root, &cache).expect("build");
+
+        // A fresh index is not considered stale against its own source.
+        assert!(
+            !index_is_stale(&root, &graph_path),
+            "just-built index should not be stale"
+        );
+
+        // Adding a new source file (mtime strictly after the build) makes it stale.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let mut f = std::fs::File::create(root.join("added.rs")).unwrap();
+        writeln!(f, "fn newly_added() {{ }}").unwrap();
+        drop(f);
+        assert!(
+            index_is_stale(&root, &graph_path),
+            "index must be stale after a newer source file is added"
+        );
+
+        // Rebuilding refreshes the index mtime, so it is no longer stale.
+        build_compass_index(&root, &cache).expect("rebuild");
+        assert!(
+            !index_is_stale(&root, &graph_path),
+            "index should be fresh again after rebuild"
+        );
+    }
+
+    // A stale index must be transparently rebuilt when the tool is invoked, with
+    // no manual cache deletion required by the caller.
+    #[tokio::test]
+    async fn stale_index_is_rebuilt_on_query() {
+        let (_tmp, root, cache) = make_isolated_project();
+        let graph_path = cache.join("compass-out").join("graph.json");
+        build_compass_index(&root, &cache).expect("build");
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let mut f = std::fs::File::create(root.join("added.rs")).unwrap();
+        writeln!(f, "fn newly_added() {{ }}").unwrap();
+        drop(f);
+
+        let ctx = ToolContext {
+            session_id: "s".into(),
+            message_id: "m".into(),
+            tool_call_id: "t".into(),
+            working_dir: Some(root),
+            stdin_request_tx: None,
+            graceful_shutdown_signal: None,
+            execution_mode: ToolExecutionMode::Direct,
+        };
+        let out = CompassQueryTool::new()
+            .execute(serde_json::json!({ "query": "authentication" }), ctx)
+            .await
+            .expect("execute");
+        assert!(
+            !out.output.contains("is not available for this project yet"),
+            "stale index should rebuild and not report unavailability: {}",
+            out.output
+        );
+        assert!(
+            compass_query::open(&graph_path, None, &cache).is_ok(),
+            "rebuilt index must be openable"
+        );
+    }
+
+    // A pathological limit above u32::MAX must not wrap to 0 (which would violate
+    // CodeQueryLimits::is_valid) and fail the query.
+    #[test]
+    fn huge_limit_is_clamped_not_wrapped() {
+        let (_tmp, root, cache) = make_isolated_project();
+        let graph_path = cache.join("compass-out").join("graph.json");
+        build_compass_index(&root, &cache).expect("build");
+        let engine = compass_query::open(&graph_path, None, &cache).expect("open after build");
+
+        // u32::MAX + 1 would wrap to 0 under a naive `as u32`.
+        let out = execute_query(&engine, "authentication", None, u64::MAX as usize, "search")
+            .expect("query with clamped limit must succeed");
+        assert!(
+            out.contains("result(s)"),
+            "expected a result report, got: {out}"
         );
     }
 }
