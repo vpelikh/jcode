@@ -351,10 +351,11 @@ impl TelegramChannel {
                 if cleared {
                     "✓ Cleared the active session. Use `/use <id>` to select another.".to_string()
                 } else {
-                    format!("No active session to clear{}.{}", help_footer())
+                    format!("No active session to clear{}", help_footer())
                 }
             }
-            "/abort" | "/cancel" => self.abort_reply().await,
+            "/abort" => self.abort_reply().await,
+            "/cancel" => self.cancel_reply().await,
             "/resume" => {
                 let prompt = rest.trim();
                 self.resume_reply(prompt).await
@@ -693,14 +694,14 @@ impl TelegramChannel {
         }
     }
 
-    /// `/peek [n|id]`: show a compact preview (first user msg + first assistant
+    /// `/peek [n]`: show a compact preview (first user msg + first assistant
     /// msg) of the active session so the user can remember what it is about
     /// before committing to `/use`. No inline picker is needed — just send
     /// the two-line summary directly.
     fn peek_reply(&self, arg: &str) -> String {
         let Some(session_id) = crate::server::telegram_control::active_session_for(&self.chat_id)
         else {
-            return format!("No active session. Use `/use <n>` after `/list`{}.{}", help_footer());
+            return format!("No active session. Use `/use <n>` after `/list`{}", help_footer());
         };
         let limit = arg
             .trim()
@@ -722,9 +723,10 @@ impl TelegramChannel {
         } else {
             "(no messages to preview)".to_string()
         };
+        let message_count = lines.len().max(entries.chars().filter(|&c| c == '\n').count());
         format!("📖 **Preview** `{}`, {} messages\n{}",
             short_id(&session_id),
-            entries.chars().filter(|&c| c == '\n').count() + 1,
+            message_count,
             preview)
     }
 
@@ -850,7 +852,7 @@ impl TelegramChannel {
         let Some(session_id) =
             crate::server::telegram_control::active_session_for(&self.chat_id)
         else {
-            return format!("No active session to abort. Use `/use <n>` first{}.{}", help_footer());
+            return format!("No active session to abort. Use `/use <n>` first{}", help_footer());
         };
         let mut tracker = self.confirmation_tracker.lock().await;
         let prompt = tracker.request("abort", session_id.clone());
@@ -899,6 +901,16 @@ impl TelegramChannel {
                 }
             }
             _ => unreachable!(),
+        }
+    }
+
+    /// `/cancel`: cancel a pending `/free` or `/abort` confirmation.
+    async fn cancel_reply(&self) -> String {
+        let mut tracker = self.confirmation_tracker.lock().await;
+        if tracker.clear() {
+            "✅ Cancelled pending confirmation.".to_string()
+        } else {
+            "⚠️ No pending confirmation to cancel.".to_string()
         }
     }
 
@@ -1062,10 +1074,9 @@ impl TelegramChannel {
             String::new()
         };
         // Count saved vs recent sessions for richer status
-        let total_recent = crate::recent_session_index::recent(100).map(|r| r.len()).unwrap_or(0);
-        let total_saved = crate::recent_session_index::recent(100)
-            .map(|r| r.iter().filter(|s| s.saved).count())
-            .unwrap_or(0);
+        let recent_entries = crate::recent_session_index::recent(100).unwrap_or_default();
+        let total_recent = recent_entries.len();
+        let total_saved = recent_entries.iter().filter(|s| s.saved).count();
         let has_pending_confirm = self.confirmation_tracker.lock().await.pending.is_some();
         let confirm_line = if has_pending_confirm {
             "⚠️ Pending confirmation (use /confirm or /cancel)"
@@ -1582,6 +1593,7 @@ const HELP_TEXT: &str = "\
 /free (id) — drop a live headless session (requires /confirm)
 /abort — stop the active session's running turn (requires /confirm)
 /confirm — execute a pending destructive action
+/cancel — cancel a pending destructive action
 /clear — stop talking to the selected session
 /status — show ambient & control status
 /whoami — show this chat's id for config
