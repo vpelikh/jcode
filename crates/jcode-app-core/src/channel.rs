@@ -204,6 +204,9 @@ pub struct TelegramChannel {
     /// Wrapped in a Mutex because `reply_loop` runs on `Arc<Self>` and needs
     /// `&mut` access to flip the `warned` flag across an `.await`.
     auth_warning_tracker: tokio::sync::Mutex<AuthWarningTracker>,
+    /// Tracks pending confirmation state for destructive operations (/free, /abort).
+    /// Wrapped in a Mutex for the same reason as `auth_warning_tracker`.
+    confirmation_tracker: tokio::sync::Mutex<ConfirmationTracker>,
 }
 
 impl TelegramChannel {
@@ -250,6 +253,7 @@ impl TelegramChannel {
             process_lock: tokio::sync::Mutex::new(()),
             consecutive_discovery_failures: tokio::sync::Mutex::new(0),
             auth_warning_tracker: tokio::sync::Mutex::new(AuthWarningTracker::default()),
+            confirmation_tracker: tokio::sync::Mutex::new(ConfirmationTracker::new()),
         }
     }
 
@@ -315,7 +319,8 @@ impl TelegramChannel {
         match cmd.as_str() {
             "/help" | "/start" | "help" | "start" => HELP_TEXT.to_string(),
             "/list" | "/sessions" => {
-                self.send_session_picker().await;
+                let args = rest.trim();
+                self.send_session_picker(args).await;
                 String::new()
             }
             "/status" => self.status_reply(runner).await,
@@ -330,6 +335,7 @@ impl TelegramChannel {
                 self.find_session_reply(q).await
             }
             "/whoami" => self.whoami_reply(),
+            "/peek" => self.peek_reply(&rest),
             "/live" | "/ls" => {
                 self.send_live_sessions_picker().await;
                 String::new()
@@ -345,7 +351,7 @@ impl TelegramChannel {
                 if cleared {
                     "✓ Cleared the active session. Use `/use <id>` to select another.".to_string()
                 } else {
-                    "No active session to clear.".to_string()
+                    format!("No active session to clear{}.{}", help_footer())
                 }
             }
             "/abort" | "/cancel" => self.abort_reply().await,
@@ -353,37 +359,70 @@ impl TelegramChannel {
                 let prompt = rest.trim();
                 self.resume_reply(prompt).await
             }
+            "/confirm" => self.confirm_reply().await,
             _ => format!(
-                "Unknown command `{}`. Use `/help` for available commands.",
-                cmd
+                "Unknown command `{}`. Use `/help` for available commands{}.",
+                cmd,
+                help_footer()
             ),
         }
     }
 
-    /// Send an inline-keyboard session picker to the chat. Each button's
-    /// `callback_data` is the session id, so tapping it selects that session.
-    async fn send_session_picker(&self) {
+    /// Send an inline-keyboard session picker to the chat. Supports filter
+    /// flags: `--saved` (saved sessions only), `--today` (active today),
+    /// `--recent` (last 50 by recency, default). Each button's `callback_data`
+    /// is the session id, so tapping it selects that session.
+    async fn send_session_picker(&self, args: &str) {
         let client = self.client_or_default().await;
-        let entries = crate::recent_session_index::recent(12);
-        let sessions = match entries {
+        // Determine filter mode from arguments
+        let today_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let one_day_ago_ms = today_ms - 24 * 60 * 60 * 1000;
+        let limit = if args.contains("--saved") {
+            24
+        } else if args.contains("--today") {
+            12
+        } else {
+            12
+        };
+
+        let entries = match crate::recent_session_index::recent(limit) {
             Ok(list) => list,
             Err(e) => {
                 logging::warn(&format!("telegram session picker index error: {e}"));
                 return;
             }
         };
+
+        // Filter based on flags
+        let filtered: Vec<_> = if args.contains("--saved") {
+            entries.into_iter().filter(|s| s.saved).collect()
+        } else if args.contains("--today") {
+            entries
+                .into_iter()
+                .filter(|s| {
+                    s.last_active_at_ms
+                        .map(|t| t >= one_day_ago_ms)
+                        .unwrap_or(false)
+                })
+                .collect()
+        } else {
+            entries
+        };
+
+        let sessions = filtered;
         if sessions.is_empty() {
-            // Enhanced UX: helpful empty state instead of bare text
+            let empty_msg = if args.contains("--saved") {
+                "📚 **No Saved Sessions Found**\n\nNo saved sessions yet.\n▪️ Save a session with `/save` in the TUI\n▪️ Use `/new` to start a new session\n▪️ Use `/help` for all available commands"
+            } else if args.contains("--today") {
+                "📚 **No Recent Sessions**\n\nNo sessions active in the last 24 hours.\n▪️ Send any message to create a new session\n▪️ Use `/new` for an empty session\n▪️ Use `/list` to see recent sessions\n▪️ Use `/help` for all available commands"
+            } else {
+                "📚 **No Sessions Found**\n\nYou haven't started any conversations yet.\n▪️ Send any message to create a new session\n▪️ Use `/new` for an empty session\n▪️ Use `/help` for all available commands"
+            };
             let _ = self
-                .send_reply(
-                    "📚 **No Sessions Found**\n\
-                     \n\
-                     You haven't started any conversations yet.\n\
-                     ▪️ Send any message to create a new session\n\
-                     ▪️ Use `/new` for an empty session\n\
-                     ▪️ Use `/help` for all available commands",
-                    None,
-                )
+                .send_reply(empty_msg, None)
                 .await;
             return;
         }
@@ -400,6 +439,8 @@ impl TelegramChannel {
             let short: String = s.session_id.chars().take(8).collect();
             let prefix = if active.as_deref() == Some(s.session_id.as_str()) {
                 "✅ "
+            } else if s.saved {
+                "⭐ "
             } else {
                 ""
             };
@@ -409,14 +450,24 @@ impl TelegramChannel {
             }]);
         }
         // Enhanced UX: informative header with count/instructions
-        let header = if sessions.len() == 1 {
-            "📚 1 session available:".to_string()
+        let filter_label = if args.contains("--saved") {
+            "saved"
+        } else if args.contains("--today") {
+            "recent (24h)"
         } else {
-            format!("📚 {} sessions available:", sessions.len())
+            "recent"
+        };
+        let header = if sessions.len() == 1 {
+            format!("📚 1 {} session available:", filter_label)
+        } else {
+            format!("📚 {} {} sessions available:", sessions.len(), filter_label)
         };
         let mut picker_header = header;
         if active.is_some() {
             picker_header.push_str("\n✅ = active session");
+        }
+        if args.contains("--saved") {
+            picker_header.push_str("\n⭐ = saved session");
         }
         let _ = crate::telegram::send_message_with_keyboard(
             &client,
@@ -623,7 +674,7 @@ impl TelegramChannel {
     fn history_reply(&self, arg: &str) -> String {
         let Some(session_id) = crate::server::telegram_control::active_session_for(&self.chat_id)
         else {
-            return "No active session. Use `/use <n>` after `/list`.".to_string();
+            return format!("No active session. Use `/use <n>` after `/list`.{}", help_footer());
         };
         let limit = arg
             .trim()
@@ -640,6 +691,41 @@ impl TelegramChannel {
                 e
             ),
         }
+    }
+
+    /// `/peek [n|id]`: show a compact preview (first user msg + first assistant
+    /// msg) of the active session so the user can remember what it is about
+    /// before committing to `/use`. No inline picker is needed — just send
+    /// the two-line summary directly.
+    fn peek_reply(&self, arg: &str) -> String {
+        let Some(session_id) = crate::server::telegram_control::active_session_for(&self.chat_id)
+        else {
+            return format!("No active session. Use `/use <n>` after `/list`{}.{}", help_footer());
+        };
+        let limit = arg
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=20).contains(n))
+            .unwrap_or(10);
+        let entries = match crate::server::telegram_control::render_session_history(&session_id, limit) {
+            Ok(text) => text,
+            Err(_) => return format!("⚠️ Could not read session `{}` for preview.", short_id(&session_id)),
+        };
+        // Render compact 2-line preview: split on first two paragraph blocks
+        let lines: Vec<&str> = entries.split("\n\n").filter(|s| !s.trim().is_empty()).collect();
+        let preview = if lines.len() >= 2 {
+            format!("👤 *you:* {}\n🤖 *jcode:* {}",
+                lines[0], lines[1])
+        } else if lines.len() == 1 {
+            format!("👤 *you:* {}", lines[0])
+        } else {
+            "(no messages to preview)".to_string()
+        };
+        format!("📖 **Preview** `{}`, {} messages\n{}",
+            short_id(&session_id),
+            entries.chars().filter(|&c| c == '\n').count() + 1,
+            preview)
     }
 
     /// `/find <query>`: search recent sessions by title/working-dir/id and send
@@ -719,6 +805,7 @@ impl TelegramChannel {
 
     /// `/free <id-or-prefix>`: drop a live (headless) session from the in-memory
     /// registry so it no longer consumes resources. Use `/live` to list ids.
+    /// Shows a confirmation prompt; use `/confirm` to execute.
     async fn free_session_reply(&self, arg: &str) -> String {
         let arg = arg.trim();
         if arg.is_empty() {
@@ -741,18 +828,12 @@ impl TelegramChannel {
             0 => format!("No live session matches `{}`.", escape_markdown_v2(arg)),
             1 => {
                 let id = &matches[0];
-                let removed = crate::server::telegram_control::free_session_for_control(id).await;
-                if removed {
-                    // Also clear it if it was the active session for this chat.
-                    if crate::server::telegram_control::active_session_for(&self.chat_id).as_deref()
-                        == Some(id.as_str())
-                    {
-                        crate::server::telegram_control::clear_active_session(&self.chat_id);
-                    }
-                    format!("🗑️ Freed live session `{}`.", short_id(id))
-                } else {
-                    format!("⚠️ Could not free `{}` (already gone?).", short_id(id))
-                }
+                // Show confirmation prompt instead of executing directly
+                let mut tracker = self.confirmation_tracker.lock().await;
+                let prompt = tracker.request("free", id.clone());
+                drop(tracker);
+                let _ = self.send_reply(&prompt, None).await;
+                String::new()
             }
             _ => format!(
                 "`{}` matches {} live sessions; use a longer prefix.",
@@ -763,26 +844,61 @@ impl TelegramChannel {
     }
 
     /// `/abort` (alias `/cancel`): request a graceful stop of the active
-    /// session's in-flight turn. The agent stops at the next safe point and the
-    /// partial response already produced is delivered.
+    /// session's in-flight turn. Shows a confirmation prompt first so the
+    /// user must tap `/confirm` to actually trigger the abort.
     async fn abort_reply(&self) -> String {
         let Some(session_id) =
             crate::server::telegram_control::active_session_for(&self.chat_id)
         else {
-            return "No active session to abort. Use `/use <n>` first.".to_string();
+            return format!("No active session to abort. Use `/use <n>` first{}.{}", help_footer());
         };
-        let signaled =
-            crate::server::telegram_control::request_graceful_shutdown_for_control(&session_id).await;
-        if signaled {
-            format!(
-                "🛑 Abort requested for `{}`. The agent will stop at the next safe point.",
-                short_id(&session_id)
-            )
-        } else {
-            format!(
-                "⚠️ `{}` is not a live session (it was resumed headlessly or has ended).",
-                short_id(&session_id)
-            )
+        let mut tracker = self.confirmation_tracker.lock().await;
+        let prompt = tracker.request("abort", session_id.clone());
+        drop(tracker);
+        // Send the confirmation prompt as a reply so the user can tap /confirm.
+        let _ = self.send_reply(&prompt, None).await;
+        String::new()
+    }
+
+    /// `/confirm` (alias for tapping the confirm button): execute the pending
+    /// destructive action stored in `confirmation_tracker`.
+    async fn confirm_reply(&self) -> String {
+        let mut tracker = self.confirmation_tracker.lock().await;
+        let Some((action, session_id)) = tracker.verify("__confirm__") else {
+            return "⚠️ No pending confirmation found or it has expired.".to_string();
+        };
+        drop(tracker);
+        match action {
+            "abort" => {
+                let signaled =
+                    crate::server::telegram_control::request_graceful_shutdown_for_control(&session_id).await;
+                if signaled {
+                    format!(
+                        "🛑 Abort confirmed for `{}`. The agent will stop at the next safe point.",
+                        short_id(&session_id)
+                    )
+                } else {
+                    format!(
+                        "⚠️ `{}` is not a live session (it was resumed headlessly or has ended).",
+                        short_id(&session_id)
+                    )
+                }
+            }
+            "free" => {
+                let removed = crate::server::telegram_control::free_session_for_control(&session_id).await;
+                if removed {
+                    // Also clear it if it was the active session for this chat.
+                    if crate::server::telegram_control::active_session_for(&self.chat_id).as_deref()
+                        == Some(session_id.as_str())
+                    {
+                        crate::server::telegram_control::clear_active_session(&self.chat_id);
+                    }
+                    format!("🗑️ Session `{}` freed.", short_id(&session_id))
+                } else {
+                    format!("⚠️ Could not free `{}` (already gone?).", short_id(&session_id))
+                }
+            }
+            _ => unreachable!(),
         }
     }
 
@@ -887,7 +1003,7 @@ impl TelegramChannel {
         }
     }
 
-    /// `/status`: report ambient mode availability and remote-control readiness.
+    /// `/status`: report ambient mode availability, session counts, and remote-control readiness.
     async fn status_reply(&self, runner: Option<&AmbientRunnerHandle>) -> String {
         let active = crate::server::telegram_control::active_session_for(&self.chat_id);
         let ambient = if let Some(r) = runner {
@@ -945,15 +1061,29 @@ impl TelegramChannel {
         } else {
             String::new()
         };
+        // Count saved vs recent sessions for richer status
+        let total_recent = crate::recent_session_index::recent(100).map(|r| r.len()).unwrap_or(0);
+        let total_saved = crate::recent_session_index::recent(100)
+            .map(|r| r.iter().filter(|s| s.saved).count())
+            .unwrap_or(0);
+        let has_pending_confirm = self.confirmation_tracker.lock().await.pending.is_some();
+        let confirm_line = if has_pending_confirm {
+            "⚠️ Pending confirmation (use /confirm or /cancel)"
+        } else {
+            "No pending confirmations"
+        };
         format!(
             "🤖 *jcode Telegram control*\n\
              *Ambient mode:* {}\n\
              {}\n\
              {}\n\n\
              {}{}\n\n\
-             📋 *Commands:* /list /find /use /new /history /resume /live /free /abort /clear /whoami /status /help\n\
+             📊 *Sessions:* {} total, {} saved, {} live\n\
+             🛡️ *Safety:* {}\n\n\
+             📋 *Commands:* /list [--saved|--today] /find /use /new /peek /history /resume /live /free /abort /clear /whoami /status /help\n\
              💡 Tip: send any message to talk to a session, or `/list` to browse.",
-            ambient, active_line, discovery_line, health_line, auth_hint
+            ambient, active_line, discovery_line, health_line, auth_hint,
+            total_recent, total_saved, live_count, confirm_line
         )
     }
 
@@ -1172,6 +1302,12 @@ fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
+/// Returns a small guidance footer for use after error or help messages,
+/// so users know where to find available commands when they hit a dead end.
+fn help_footer() -> &'static str {
+    "\n💡 Tip: use `/help` for all commands or `/list` to browse sessions."
+}
+
 /// Render a user-facing, friendly version of an internal error so the Telegram
 /// user gets actionable guidance instead of a raw stack trace. Used for logging
 /// and (optionally) for surfacing recovery hints back to the chat.
@@ -1252,6 +1388,65 @@ impl AuthWarningTracker {
              🔧 Use `/help` for setup instructions and troubleshooting."
                 .to_string(),
         )
+    }
+}
+
+
+/// Tracks confirmation state for destructive operations (/free, /abort).
+/// Holds at most one pending confirmation per channel at a time, with a TTL
+/// so a stale prompt cannot be confirmed long after it was issued.
+#[derive(Default)]
+struct ConfirmationTracker {
+    pending: Option<PendingConfirmation>,
+}
+
+struct PendingConfirmation {
+    action: &'static str,
+    session_id: String,
+    expires_at: std::time::Instant,
+}
+
+const CONFIRM_TIMEOUT_SECS: u64 = 120;
+
+impl ConfirmationTracker {
+    fn new() -> Self {
+        Self { pending: None }
+    }
+
+    /// Create a new confirmation and return the prompt text + callback data
+    /// to be used as the inline-keyboard button. The button's callback data
+    /// is `__confirm__`; the action is encoded in the tracker.
+    fn request(&mut self, action: &'static str, session_id: String) -> String {
+        self.pending = Some(PendingConfirmation {
+            action,
+            session_id,
+            expires_at: std::time::Instant::now()
+                + std::time::Duration::from_secs(CONFIRM_TIMEOUT_SECS),
+        });
+        let sid = short_id(&session_id);
+        format!(
+            "⚠️ *Confirm `{action} session `{sid}`*\n\n\
+             This cannot be undone.\n\
+             /confirm to proceed, /cancel to abort."
+        )
+    }
+
+    /// Verify a confirmation token and consume it. Returns the action and
+    /// session id if the token matches a non-expired pending confirmation.
+    fn verify(&mut self, token: &str) -> Option<(&'static str, String)> {
+        let pending = self.pending.take()?;
+        if token != "__confirm__" {
+            return None;
+        }
+        if std::time::Instant::now() > pending.expires_at {
+            return None;
+        }
+        Some((pending.action, pending.session_id))
+    }
+
+    /// Drop any pending confirmation (e.g. after /cancel).
+    fn clear(&mut self) -> bool {
+        self.pending.take().is_some()
     }
 }
 
@@ -1376,25 +1571,29 @@ const HELP_TEXT: &str = "\
 🤖 *jcode Telegram session control*
 
 *Commands:*
-/list — list sessions (tap to select)
+/list [--saved|--today] — list sessions (tap to select)
 /find (text) — search sessions by title or id
 /new (prompt) — start a new session (optional opening prompt)
 /use (n or id) — select a session to talk to
 /history (n) — show recent messages of the selected session
+/peek (n) — quick 2-line preview of the active session
 /resume (id) (prompt) — ask a session directly
 /live — list live sessions (tap 🗑️ to free one)
-/free (id) — drop a live headless session
-/abort — stop the active session's running turn
-/whoami — show this chat's id for config
+/free (id) — drop a live headless session (requires /confirm)
+/abort — stop the active session's running turn (requires /confirm)
+/confirm — execute a pending destructive action
 /clear — stop talking to the selected session
 /status — show ambient & control status
+/whoami — show this chat's id for config
 /help — this help
 
 *Tips:*
 • Send any plain message after /use or /new to talk to a session.
 • /list shows an inline picker: tap a row to select that session.
+• /list --saved shows only saved sessions; /list --today shows today's activity.
 • /use 2 selects the 2nd session; /use abc123… matches by id prefix.
-• A ✅ marks the active session in the picker.";
+• A ✅ marks the active session in the picker.
+• /free and /abort now require /confirm for safety.";
 
 // ---------------------------------------------------------------------------
 // Discord channel
