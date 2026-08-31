@@ -967,7 +967,9 @@ mod tests {
 
         // Re-point HEAD at a new commit with an identical tree: file mtimes are
         // unchanged, so only the SHA mismatch can detect staleness.
-        assert!(git(&["commit", "--amend", "--no-edit"]), "amend should succeed");
+        // Use a distinct commit message to guarantee a new SHA even if
+        // timestamps are clamped by the test environment.
+        assert!(git(&["commit", "--amend", "-m", "init-amended"]), "amend should succeed");
         let sha2 = current_git_sha(&root).expect("sha after amend");
         assert_ne!(sha1, sha2, "amend must produce a new commit SHA");
 
