@@ -987,6 +987,10 @@ impl Session {
                 *text = wrapped;
                 self.mark_memory_profile_dirty();
                 self.mark_messages_full_dirty();
+                // `refresh_initial_session_context_message` mutates the
+                // session-context message's content in-place without emitting
+                // an event. Rebuild the event log so it stays in sync.
+                self.rebuild_event_map();
                 return true;
             }
         }
