@@ -1942,8 +1942,12 @@ request in this new forked session, using the inherited conversation only as con
     /// server once the connection is established, so keeping another owned copy
     /// in the client only inflates memory during idle remote sessions.
     pub fn strip_transcript_for_remote_client(&mut self) {
-        self.messages.clear();
-        self.compaction = None;
+        // Emit ClearAll so the event log reflects the strip and replay is consistent.
+        // (The messages are already emitted as events during load; this ClearAll
+        // ensures the log agrees with the cleared legacy vectors.)
+        if !self.messages.is_empty() {
+            self.clear_messages();
+        }
         self.env_snapshots.clear();
         self.memory_injections.clear();
         self.replay_events.clear();
