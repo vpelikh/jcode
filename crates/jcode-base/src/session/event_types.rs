@@ -10,10 +10,6 @@ use std::fmt;
 pub enum SessionEventError {
     /// Event ID is invalid or malformed
     InvalidEventId { event_id: String },
-    /// Event index is out of bounds
-    IndexOutOfBounds { index: usize, max: usize },
-    /// Event operation is invalid in current context
-    InvalidOperation { op: String },
     /// Event timestamp is invalid (too far in future or past)
     InvalidTimestamp { timestamp: DateTime<Utc> },
     /// Message content is invalid
@@ -29,12 +25,6 @@ impl fmt::Display for SessionEventError {
         match self {
             SessionEventError::InvalidEventId { event_id } => {
                 write!(f, "Invalid event ID: {}", event_id)
-            }
-            SessionEventError::IndexOutOfBounds { index, max } => {
-                write!(f, "Index {} is out of bounds (max: {})", index, max)
-            }
-            SessionEventError::InvalidOperation { op } => {
-                write!(f, "Invalid operation: {}", op)
             }
             SessionEventError::InvalidTimestamp { timestamp } => {
                 write!(f, "Invalid timestamp: {}", timestamp)
