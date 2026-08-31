@@ -53,11 +53,7 @@ impl Tool for CompassQueryTool {
     }
 
     fn description(&self) -> &str {
-        "Semantic code search and structural analysis backed by Compass's knowledge graph. \
-         Use for natural-language code search, finding call sites, impact analysis, dependency \
-         traversal, and architecture discovery. The first query in a project automatically builds \
-         a Compass index in-process using the Compass library (no CLI required), then caches it in \
-         the project's .jcode/cache/compass directory."
+        "Semantic code search and structural analysis via Compass's knowledge graph."
     }
 
     fn concurrency_safe_marker(&self) -> bool {
@@ -77,20 +73,20 @@ impl Tool for CompassQueryTool {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Natural language query or pattern. Examples: 'how does authentication work', 'functions that call web_client.send', 'impact of changing User struct'."
+                    "description": "Natural language query or code pattern to search for."
                 },
                 "path": {
                     "type": "string",
-                    "description": "Optional path filter to scope results (file or directory substring)."
+                    "description": "Optional path filter (file or directory substring)."
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum number of results to return. Default depends on query type."
+                    "description": "Maximum results to return."
                 },
                 "intent": {
                     "type": "string",
                     "enum": ["search", "impact", "discovery", "callers", "callees", "traverse"],
-                    "description": "Advisory hint for how to present results. All intents currently use Compass's semantic search engine; this value is surfaced in the report and can refine future result ranking. search = find by description, impact = change analysis, discovery = architecture overview, callers/callees = navigation, traverse = bounded path."
+                    "description": "Advisory presentation hint: search, impact, discovery, callers, callees, or traverse."
                 }
             },
             "required": ["query"]
@@ -124,16 +120,24 @@ impl Tool for CompassQueryTool {
         let engine = match compass_query::open(&graph_path, None, &cache_dir) {
             Ok(engine) => engine,
             Err(open_err) => {
-                match with_build_lock(&cache_dir, || {
-                    // A concurrent caller may have finished the build while we
-                    // waited for the lock. Re-check before spending time rebuilding.
-                    if compass_query::open(&graph_path, None, &cache_dir).is_ok() {
-                        return Ok(());
-                    }
-                    build_compass_index(&working_dir, &cache_dir)
-                }) {
-                    Ok(()) => compass_query::open(&graph_path, None, &cache_dir)
-                        .map_err(|e| anyhow!("Index was built but could not be opened: {}", e))?,
+                // Cold cache. Serialize the whole probe+build+reopen under the
+                // project lock so parallel calls (this tool is concurrency-safe,
+                // so the harness may dispatch siblings at the same time) cannot
+                // race on graph.json. The engine is returned straight out of the
+                // lock, so no open happens against a half-written index.
+                let result: anyhow::Result<compass_query::CodeQueryEngine> =
+                    with_build_lock(&cache_dir, || {
+                        // Another call may have finished the build while we
+                        // waited for the lock; reuse it instead of rebuilding.
+                        if let Ok(engine) = compass_query::open(&graph_path, None, &cache_dir) {
+                            return Ok(engine);
+                        }
+                        build_compass_index(&working_dir, &cache_dir)?;
+                        compass_query::open(&graph_path, None, &cache_dir)
+                            .map_err(|e| anyhow!("Index was built but could not be opened: {}", e))
+                    });
+                match result {
+                    Ok(engine) => engine,
                     Err(build_err) => {
                         return Ok(ToolOutput::new(format_index_unavailable(
                             &open_err.to_string(),
@@ -316,6 +320,7 @@ fn execute_query(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jcode_tool_core::ToolExecutionMode;
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -392,5 +397,82 @@ mod tests {
         // the real invariant being tested. Exact hit counts depend on the
         // semantic model, and a 1-line fixture is not guaranteed to match.
         let _ = response.results.len();
+    }
+
+    // Validates the concurrency contract: `concurrency_safe_marker()` is true,
+    // so the harness may dispatch this tool in parallel with siblings. On a cold
+    // cache the tool writes graph.json, so without the flock added in deba52e74
+    // concurrent calls would race and could corrupt the index. We run several
+    // real OS threads (each with its own tiny runtime) so the builds genuinely
+    // overlap, then assert every call succeeds and a single valid index remains.
+    #[test]
+    fn concurrent_cold_builds_do_not_race() {
+        let (_tmp, root, cache) = make_isolated_project();
+        let graph_path = cache.join("compass-out").join("graph.json");
+        assert!(!graph_path.exists(), "fixture should start with no index");
+
+        let tool = std::sync::Arc::new(CompassQueryTool::new());
+        let failures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let success = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        std::thread::scope(|s| {
+            for i in 0..4 {
+                let tool = tool.clone();
+                let failures = failures.clone();
+                let success = success.clone();
+                let root = root.clone();
+                let cache = cache.clone();
+                s.spawn(move || {
+                    // Each thread runs its own current-thread runtime so the
+                    // blocking builds overlap on real cores, like parallel dispatch.
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .expect("runtime");
+                    let ctx = ToolContext {
+                        session_id: "s".into(),
+                        message_id: "m".into(),
+                        tool_call_id: format!("t-{i}"),
+                        working_dir: Some(root),
+                        stdin_request_tx: None,
+                        graceful_shutdown_signal: None,
+                        execution_mode: ToolExecutionMode::Direct,
+                    };
+                    let out = rt.block_on(
+                        tool.execute(serde_json::json!({ "query": "authentication" }), ctx),
+                    );
+                    match out {
+                        Ok(out)
+                            if !out.output.contains("is not available for this project yet") =>
+                        {
+                            success.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        _ => {
+                            failures.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                });
+            }
+        });
+
+        assert_eq!(
+            failures.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "concurrent cold builds must all succeed"
+        );
+        assert_eq!(
+            success.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "all four concurrent builds must succeed"
+        );
+
+        // Exactly one valid index must exist and be reopenable after the race.
+        assert!(
+            graph_path.exists(),
+            "index should exist after concurrent builds"
+        );
+        assert!(
+            compass_query::open(&graph_path, None, &cache).is_ok(),
+            "index left by concurrent builds must be openable"
+        );
     }
 }
