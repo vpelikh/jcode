@@ -512,7 +512,7 @@ impl Agent {
             if let Some(inner) = state {
                 self.session.append_session_event(SessionEvent {
                     timestamp: Utc::now(),
-                    event_id: format!("compaction_{}", self.session.messages.len()),
+                    event_id: crate::id::new_id("compaction"),
                     op: SessionEventOp::SetCompaction { compaction: inner },
                     parent_id: None,
                     version: 1,
@@ -631,6 +631,13 @@ impl Agent {
         let new_state = manager.persisted_state();
         if self.session.compaction != new_state {
             self.session.compaction = new_state;
+            // Emit a SetCompaction event so the event log stays in sync with
+            // the compaction mutation. `set_compaction` also updates
+            // `self.compaction`, so the direct assignment above is redundant
+            // but makes the intent explicit.
+            if let Some(state) = self.session.compaction.clone() {
+                self.session.set_compaction(state);
+            }
             if let Err(err) = self.session.save() {
                 logging::error(&format!(
                     "Failed to persist compaction state for session {}: {}",
