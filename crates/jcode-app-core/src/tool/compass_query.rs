@@ -15,7 +15,10 @@ use compass_core::{build_graph_with_layers, BuildOptions, BuildPurpose};
 use compass_model::query_contract::{CodeQueryLimits, SearchRequest};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
 
 use super::{Tool, ToolContext, ToolOutput};
 
@@ -226,6 +229,40 @@ where
     f()
 }
 
+/// Maximum time we trust a previously verified-fresh index without re-walking the
+/// source tree for staleness. Within this window, repeated queries on an unchanged
+/// project skip the mtime scan entirely. The tradeoff (intentional): a source edit
+/// is guaranteed to be detected on the first query *after* the window elapses, not
+/// necessarily within it. The scan itself stays fully correct; this only throttles
+/// how often it runs so a busy agent doesn't re-stat the tree on every single call.
+const STALE_RESCAN_TTL: Duration = Duration::from_secs(5);
+
+/// Last time a correct staleness scan proved `cache_dir` fresh, keyed by cache dir
+/// so each project is throttled independently. Bounded in size by the number of
+/// distinct projects indexed in this process.
+static LAST_STALE_SCAN: OnceLock<Mutex<HashMap<PathBuf, SystemTime>>> = OnceLock::new();
+
+/// True when this cache was verified fresh within `STALE_RESCAN_TTL`. On any error
+/// (missing entry, clock skew) we return false so correctness wins over the shortcut.
+fn recently_scanned(cache_dir: &Path) -> bool {
+    let map = LAST_STALE_SCAN
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    match map.get(cache_dir) {
+        Some(&t) => t.elapsed().map(|d| d < STALE_RESCAN_TTL).unwrap_or(false),
+        None => false,
+    }
+}
+
+fn record_scan(cache_dir: &Path) {
+    LAST_STALE_SCAN
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(cache_dir.to_path_buf(), SystemTime::now());
+}
+
 /// Decide whether `graph_path`'s index is older than any source under `root`.
 ///
 /// Best-effort: a missing index, or any IO error while walking the tree, is
@@ -234,10 +271,9 @@ where
 /// among source files Compass can parse; new/moved dirs are also detected because
 /// the walk descends through them.
 ///
-/// NOTE: this runs on every query that has an existing index, so the walk cost
-/// is paid on the warm path too. It is the price of correct staleness; the walk
-/// only recurses into source dirs and skips VCS/build caches, so it stays
-/// proportional to the project's source footprint rather than its build outputs.
+/// Callers should gate this behind `recently_scanned`/`record_scan` so the walk
+/// does not run on every query (see `ensure_fresh_engine`): within
+/// `STALE_RESCAN_TTL` of a verified-fresh scan we reuse the index without re-walking.
 fn index_is_stale(root: &Path, graph_path: &Path) -> bool {
     let Ok(index_meta) = std::fs::metadata(graph_path) else {
         return false; // No index (or unreadable): handle the cold case elsewhere.
@@ -302,12 +338,25 @@ fn ensure_fresh_engine(
 ) -> std::result::Result<compass_query::CodeQueryEngine, (String, String)> {
     with_build_lock(cache_dir, || {
         // Open an existing index. Reuse it only when source hasn't moved past it.
+        // The mtime scan that proves freshness is throttled to once per
+        // STALE_RESCAN_TTL per project (see `recently_scanned`/`record_scan`) so a
+        // busy agent doesn't re-stat the whole source tree on every call. Correctness
+        // holds because a scan always runs before reuse once the window lapses (or if
+        // no scan has been recorded yet for this cache), so a source change is caught
+        // by the first query after the window, never served indefinitely.
         match compass_query::open(graph_path, None, cache_dir) {
-            Ok(engine) if !index_is_stale(working_dir, graph_path) => return Ok(engine),
-            Ok(stale_engine) => {
+            Ok(engine) => {
+                let stale = !recently_scanned(cache_dir) && index_is_stale(working_dir, graph_path);
+                if !stale {
+                    if !recently_scanned(cache_dir) {
+                        record_scan(cache_dir);
+                    }
+                    return Ok(engine);
+                }
                 // Valid but stale: discard it and rebuild below so we never serve
-                // source that has since changed.
-                drop(stale_engine);
+                // source that has since changed. Do NOT record the scan: the next
+                // call must re-check rather than trust a now-discarded index.
+                drop(engine);
                 let _ = std::fs::remove_dir_all(cache_dir.join("compass-out"));
             }
             Err(_) => {
@@ -726,6 +775,34 @@ mod tests {
         assert!(
             out.contains("result(s)"),
             "expected a result report, got: {out}"
+        );
+    }
+
+    // The staleness scan is throttled per cache dir: an unseen cache is never
+    // short-circuited, and a just-recorded scan is treated as fresh for the TTL.
+    // This guards the caveat that the mtime walk must not run on every query.
+    // (The time-based expiry half is covered by STALE_RESCAN_TTL + the integration
+    // behavior in fresh/stale index tests; we keep this deterministic and instant.)
+    #[test]
+    fn staleness_scan_is_throttled_per_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().to_path_buf();
+
+        assert!(
+            !recently_scanned(&cache),
+            "an unseen cache must never be short-circuited as fresh"
+        );
+        record_scan(&cache);
+        assert!(
+            recently_scanned(&cache),
+            "a just-recorded scan must throttle the next reuse in this window"
+        );
+
+        // A different cache dir is tracked independently.
+        let other = dir.path().join("other");
+        assert!(
+            !recently_scanned(&other),
+            "throttle state must be per-cache, not global"
         );
     }
 }
