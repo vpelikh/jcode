@@ -1768,13 +1768,35 @@ impl App {
         }
         let before = (self.scroll_offset, self.auto_scroll_paused);
         let max = self.scroll_max_estimate();
+        let rendered_max = super::super::ui::last_max_scroll();
+
+        // When there is no rendered content (confirmed by the last frame), we are at
+        // the bottom. Stay in bottom-follow mode so the input cursor stays in place
+        // and doesn't appear to "jump". The `is_processing` override is only for
+        // the case where the renderer hasn't rendered yet (stale rendered_max > 0).
+        if rendered_max == 0 && !self.auto_scroll_paused {
+            return false;
+        }
+
+        // Compute how far from the top we can scroll. This mirrors the
+        // `bottom_threshold` logic in `scroll_down` and accounts for the case
+        // where the renderer's LAST_MAX_SCROLL is stale (e.g., during processing).
+        let top_threshold = if rendered_max > 0 {
+            rendered_max.min(max)
+        } else if self.is_processing || !self.streaming.streaming_text.is_empty() {
+            max
+        } else {
+            0
+        };
+
+        if top_threshold == 0 && !self.auto_scroll_paused {
+            return false;
+        }
+
         if !self.auto_scroll_paused {
-            let rendered_max = super::super::ui::last_max_scroll();
             let current_abs = max.saturating_sub(self.scroll_offset);
             self.scroll_offset = current_abs.saturating_sub(amount);
-            if rendered_max > 0 {
-                self.scroll_offset = self.scroll_offset.min(rendered_max.saturating_sub(amount));
-            }
+            self.scroll_offset = self.scroll_offset.min(rendered_max.saturating_sub(amount));
         } else {
             self.scroll_offset = self.scroll_offset.saturating_sub(amount);
         }
