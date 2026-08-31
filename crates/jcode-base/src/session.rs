@@ -1360,6 +1360,16 @@ request in this new forked session, using the inherited conversation only as con
     }
 
     pub fn truncate_messages(&mut self, len: usize) {
+        // Truncating to zero messages is a full clear. Emit `ClearAll` rather
+        // than a `ReplaceMessages` with an empty prefix: a `ReplaceMessages`
+        // with `start == end` cannot clear an already-empty transcript during
+        // replay, so the event log would otherwise desync from `self.messages`.
+        if len == 0 {
+            if !self.messages.is_empty() {
+                self.clear_messages();
+            }
+            return;
+        }
         if len < self.messages.len() {
             // Append to event log
             let event = SessionEvent {
@@ -1764,10 +1774,10 @@ request in this new forked session, using the inherited conversation only as con
             });
         }
 
-        for injection in &self.memory_injections {
+        for (j, injection) in self.memory_injections.iter().enumerate() {
             map.append_event(SessionEvent {
                 timestamp: injection.timestamp,
-                event_id: format!("rehydrate_mem_{}", self.memory_injections.len()),
+                event_id: format!("rehydrate_mem_{}", j),
                 op: SessionEventOp::MemoryInjection {
                     memory_injection: injection.clone(),
                 },
@@ -1776,10 +1786,10 @@ request in this new forked session, using the inherited conversation only as con
             });
         }
 
-        for replay in &self.replay_events {
+        for (k, replay) in self.replay_events.iter().enumerate() {
             map.append_event(SessionEvent {
                 timestamp: replay.timestamp,
-                event_id: format!("rehydrate_replay_{}", self.replay_events.len()),
+                event_id: format!("rehydrate_replay_{}", k),
                 op: SessionEventOp::ReplayEvent {
                     replay_event: replay.clone(),
                 },
