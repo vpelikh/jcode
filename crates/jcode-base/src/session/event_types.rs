@@ -161,12 +161,7 @@ impl SessionEventMap {
     pub fn fork_up_to_boundary(&self, boundary_index: usize) -> Self {
         let mut fork = SessionEventMap::default();
         
-        for event in &self.events {
-            // Handle both numeric string event IDs (legacy) and message IDs
-            let event_index = event.event_id.parse::<usize>().unwrap_or_else(|| {
-                // If not numeric, use version or fallback
-                event.version as usize
-            });
+        for (event_index, event) in self.events.iter().enumerate() {
             if event_index <= boundary_index {
                 fork.append_event(event.clone());
             }
