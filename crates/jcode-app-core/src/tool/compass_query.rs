@@ -1,9 +1,18 @@
+//! Semantic code search backed by Compass's knowledge graph.
+//!
+//! `compass_query` is a first-class, always-available tool (like `read` or
+//! `agentgrep`). It integrates Compass as a pure library: there is no MCP
+//! server and no CLI subprocess. The first query in a project builds the
+//! Compass index in-process and caches it under `.jcode/cache/compass`; every
+//! later query reuses that cache, so the (relatively expensive) build runs at
+//! most once per project. Re-running a query after deleting the cache dir
+//! forces a rebuild.
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use compass_core::{build_graph_with_layers, BuildOptions, BuildPurpose};
 use compass_model::query_contract::{CodeQueryLimits, SearchRequest};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::path::PathBuf;
 
 use super::{Tool, ToolContext, ToolOutput};
@@ -109,20 +118,18 @@ impl Tool for CompassQueryTool {
         let graph_path = cache_dir.join("compass-out").join("graph.json");
         let engine = match compass_query::open(&graph_path, None, &cache_dir) {
             Ok(engine) => engine,
-            Err(open_err) => {
-                match build_compass_index(&working_dir, &cache_dir) {
-                    Ok(()) => compass_query::open(&graph_path, None, &cache_dir)
-                        .map_err(|e| anyhow!("Index built but open failed: {}", e))?,
-                    Err(build_err) => {
-                        return Ok(ToolOutput::new(format!(
-                            "Compass knowledge graph is not available for this project.\n\n\
-                             Open failed: {}\nAuto-build failed: {}\n\n\
-                             In the meantime, use agentgrep for grep/find/trace-style searches.",
-                            open_err, build_err
-                        )));
-                    }
+            Err(open_err) => match build_compass_index(&working_dir, &cache_dir) {
+                Ok(()) => compass_query::open(&graph_path, None, &cache_dir)
+                    .map_err(|e| anyhow!("Index was built but could not be opened: {}", e))?,
+                Err(build_err) => {
+                    return Ok(ToolOutput::new(format!(
+                        "Compass knowledge graph is not available for this project yet.\n\n\n                             Compass could not open an existing index ({}), and an attempt to build \n                             one in-process also failed ({}).\n\n\n                             Common causes: the project has no source files Compass can parse, or the 
+                             Compass extractor hit an unsupported dependency. As a workaround, use 
+                             agentgrep for grep/find/trace-style searches in the meantime.",
+                        open_err, build_err
+                    )));
                 }
-            }
+            },
         };
 
         let result = execute_query(
@@ -143,16 +150,24 @@ impl Tool for CompassQueryTool {
                     "path_filter": params.path,
                 }))),
             Err(e) => Ok(ToolOutput::new(format!(
-                "Compass query failed: {}\n\nQuery: {}",
-                e, params.query
+                "Compass query failed: {}\n\nQuery: {}\n\n\
+                 The index is built, but the search engine returned an error. If this persists, \
+                 try removing the cached index ({}) and re-running the query to force a rebuild.",
+                e,
+                params.query,
+                cache_dir.display()
             ))),
         }
     }
 }
 
 /// Build a Compass knowledge-graph index for the project in-process, using the
-/// Compass library API (compass_core::build_graph). The resulting store is
-/// written into `output_dir` so the project tree stays untouched.
+/// Compass library API (`compass_core::build_graph_with_layers`). The resulting
+/// store is written into `output_dir` so the project tree stays untouched.
+///
+/// This runs once per project: the output is cached under `output_dir` and the
+/// caller re-opens it via `compass_query::open`, so subsequent queries skip the
+/// (relatively expensive) build entirely.
 fn build_compass_index(root: &PathBuf, output_dir: &PathBuf) -> Result<(), anyhow::Error> {
     let mut options = BuildOptions::new(root);
     options.output_root = Some(output_dir.clone());
@@ -192,21 +207,14 @@ fn execute_query(
             .map(|n| n.qualified_name.as_str())
             .unwrap_or(hit.node_id.as_str())
             .to_string();
-        let file = node
-            .and_then(|n| n.source.as_ref())
-            .map(|s| s.file.clone());
+        let file = node.and_then(|n| n.source.as_ref()).map(|s| s.file.clone());
         // Apply path filter (substring match on the resolved file path).
         if let (Some(filter), Some(file)) = (path_filter, &file) {
             if !file.contains(filter) {
                 continue;
             }
         }
-        rows.push((
-            name,
-            file,
-            hit.score,
-            hit.matched_fields.clone(),
-        ));
+        rows.push((name, file, hit.score, hit.matched_fields.clone()));
     }
 
     let mut output = String::new();
@@ -237,27 +245,36 @@ fn execute_query(
 mod tests {
     use super::*;
     use std::io::Write;
+    use tempfile::TempDir;
+
+    /// Create an isolated temp project with a single source file, returning the
+    /// project dir and its `.jcode/cache/compass` cache dir. The `TempDir` is
+    /// dropped (and the directory removed) automatically when the test ends, so
+    /// each test gets a unique, isolated workspace with no cross-test leakage.
+    fn make_isolated_project() -> (TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let root = tmp.path().to_path_buf();
+        let mut f = std::fs::File::create(root.join("main.rs")).unwrap();
+        writeln!(f, "fn authenticate(user: &str) {{ let _ = user; }}").unwrap();
+        drop(f);
+
+        let cache = root.join(".jcode/cache/compass");
+        std::fs::create_dir_all(&cache).unwrap();
+        (tmp, root, cache)
+    }
 
     // Smoke test: build a Compass index for a tiny project in-process and query it.
     #[test]
     fn builds_and_queries_index() {
-        let tmp = std::env::temp_dir().join(format!("compass_smoke_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        let mut f = std::fs::File::create(tmp.join("main.rs")).unwrap();
-        writeln!(f, "fn authenticate(user: &str) {{ let _ = user; }}").unwrap();
-        drop(f);
-
-        let cache = tmp.join(".jcode/cache/compass");
-        std::fs::create_dir_all(&cache).unwrap();
+        let (_tmp, root, cache) = make_isolated_project();
 
         // Build the index in-process.
-        let r = build_compass_index(&tmp, &cache);
-        eprintln!("BUILD RESULT: {:?}", r);
-        r.expect("build should succeed");
+        build_compass_index(&root, &cache).expect("build should succeed");
 
         // Open and run a search.
-        let engine = compass_query::open(&cache.join("compass-out").join("graph.json"), None, &cache).expect("open after build");
+        let engine =
+            compass_query::open(&cache.join("compass-out").join("graph.json"), None, &cache)
+                .expect("open after build");
         let response = engine
             .search(SearchRequest {
                 query: "authentication".to_string(),
@@ -268,10 +285,9 @@ mod tests {
             })
             .expect("search should succeed");
 
-        let _ = std::fs::remove_dir_all(&tmp);
         // The full build→open→search pipeline completed without error, which is
         // the real invariant being tested. Exact hit counts depend on the
-        // semantic model and a 1-line fixture is not guaranteed to match.
+        // semantic model, and a 1-line fixture is not guaranteed to match.
         let _ = response.results.len();
     }
 }
