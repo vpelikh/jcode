@@ -679,8 +679,19 @@ pub async fn send_chat_action(
     }
 }
 
+/// How many times to retry `setMyCommands` before giving up. The Telegram Bot
+/// API returns 429 during temporary flooding; a couple of attempts with backoff
+/// lets the command list settle even if the bot is briefly rate-limited at
+/// startup.
+const SET_MY_COMMANDS_RETRIES: u32 = 3;
+/// Base delay between retries (doubles each attempt). Kept short so a transient
+/// rate-limit at startup does not block the reply loop for long.
+const SET_MY_COMMANDS_RETRY_BASE_SECS: u64 = 1;
+
 /// Register the bot's slash command list in the Telegram client so users can
-/// discover commands via the `/` menu. Non-fatal: failures are swallowed.
+/// discover commands via the `/` menu. Retries on transient failures so the
+/// menu is actually populated — a single one-shot call at startup would leave
+/// it empty if the first attempt hit a 429 or transient network blip.
 pub async fn set_my_commands(
     client: &reqwest::Client,
     bot_token: &str,
@@ -690,22 +701,46 @@ pub async fn set_my_commands(
         "commands": [
             { "command": "start", "description": "Show help and available commands" },
             { "command": "list", "description": "List recent sessions" },
+            { "command": "sessions", "description": "Alias for /list" },
             { "command": "find", "description": "Search sessions by title or id" },
             { "command": "new", "description": "Start a new session (optionally with a prompt)" },
             { "command": "use", "description": "Select a session to talk to (id or #)" },
             { "command": "history", "description": "Show recent messages of the active session" },
             { "command": "resume", "description": "Ask a session (id + prompt)" },
-            { "command": "live", "description": "List live sessions (free with a tap)" },
+            { "command": "live", "description": "List live sessions (tap to free)" },
+            { "command": "ls", "description": "Alias for /live" },
             { "command": "free", "description": "Drop a live headless session" },
             { "command": "abort", "description": "Stop the active session's running turn" },
+            { "command": "cancel", "description": "Alias for /abort" },
+            { "command": "confirm", "description": "Confirm a pending /free or /abort action" },
             { "command": "whoami", "description": "Show this chat's id for config" },
             { "command": "clear", "description": "Stop talking to the active session" },
+            { "command": "stop", "description": "Alias for /clear" },
             { "command": "status", "description": "Show control & ambient status" },
             { "command": "help", "description": "Show help" },
         ]
     });
-    if let Err(e) = post_telegram(client, bot_token, "setMyCommands", body, base_override).await {
-        logging::warn(&format!("failed to register telegram commands: {e}"));
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match post_telegram(client, bot_token, "setMyCommands", body.clone(), base_override).await
+        {
+            Ok(()) => break,
+            Err(e) if attempt >= SET_MY_COMMANDS_RETRIES => {
+                logging::warn(&format!("failed to register telegram commands after {attempt} attempts: {e}"));
+                break;
+            }
+            Err(e) => {
+                logging::warn(&format!(
+                    "setMyCommands attempt {attempt} failed ({e}), retrying in {}s",
+                    SET_MY_COMMANDS_RETRY_BASE_SECS * 2u64.pow(attempt - 1)
+                ));
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    SET_MY_COMMANDS_RETRY_BASE_SECS * 2u64.pow(attempt - 1),
+                ))
+                .await;
+            }
+        }
     }
 }
 
