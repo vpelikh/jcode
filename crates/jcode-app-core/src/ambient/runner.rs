@@ -437,6 +437,7 @@ impl AmbientRunnerHandle {
                 child.memory_injections = parent.memory_injections.clone();
                 child.replay_events = parent.replay_events.clone();
                 child.working_dir = item.working_dir.clone().or(parent.working_dir.clone());
+                child.rebuild_event_map();
                 child
             }
             Err(err) => {
@@ -453,6 +454,7 @@ impl AmbientRunnerHandle {
                     ),
                 );
                 child.working_dir = item.working_dir.clone();
+                child.rebuild_event_map();
                 child
             }
         };

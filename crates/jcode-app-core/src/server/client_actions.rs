@@ -668,6 +668,7 @@ fn clone_split_session(parent_session_id: &str) -> anyhow::Result<(String, Strin
     // forked agent so it treats the next prompt as fresh work instead of
     // continuing (and duplicating) the parent's current turn.
     child.append_fork_notice(parent_session_id, parent.display_name());
+    child.rebuild_event_map();
     child.save()?;
 
     let name = child.display_name().to_string();
@@ -707,6 +708,7 @@ fn create_transfer_child_session(
     child.testing_build = parent.testing_build.clone();
     child.provider_session_id = None;
     child.status = crate::session::SessionStatus::Closed;
+    child.rebuild_event_map();
     child.save()?;
     crate::todo::save_todos(&child.id, &todos)?;
     Ok((child.id.clone(), child.display_name().to_string()))
