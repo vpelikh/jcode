@@ -1314,8 +1314,11 @@ request in this new forked session, using the inherited conversation only as con
     }
 
     pub fn insert_message(&mut self, index: usize, message: StoredMessage) {
-        // Append to event log
-        let message_id = format!("insert_{}", index);
+        // Append to event log. Use a unique event id rather than one derived
+        // from the index: inserting at the same index twice (e.g. repeated
+        // tool-output repair) would otherwise collide and be skipped by
+        // validation.
+        let message_id = crate::id::new_id("insert");
         let event = SessionEvent {
             timestamp: chrono::Utc::now(),
             event_id: message_id.clone(),
@@ -1813,14 +1816,6 @@ request in this new forked session, using the inherited conversation only as con
         self.event_map = map;
     }
 
-    /// Ensure backward compatibility - update messages from event log if needed
-    pub fn sync_backward_compatibility(&mut self) {
-        let derived_messages = self.derive_messages();
-        if self.messages.len() != derived_messages.len() {
-            self.messages = derived_messages;
-        }
-    }
-
     pub fn record_swarm_status_event(&mut self, members: Vec<crate::protocol::SwarmMemberStatus>) {
         let kind = StoredReplayEventKind::SwarmStatus { members };
         if self
@@ -1834,10 +1829,9 @@ request in this new forked session, using the inherited conversation only as con
             timestamp: Utc::now(),
             kind,
         };
-        self.memory_profile_cache.replay_events_count += 1;
-        self.memory_profile_cache.replay_events_json_bytes += estimate_json_bytes(&event);
-        self.replay_events.push(event);
-        self.mark_replay_events_append_dirty();
+        // Route through record_replay_event so the swarm status is captured in
+        // the event log (derive_replay_events is authoritative in-process).
+        self.record_replay_event(&event);
     }
 
     pub fn record_swarm_plan_event(
@@ -1866,10 +1860,9 @@ request in this new forked session, using the inherited conversation only as con
             timestamp: Utc::now(),
             kind,
         };
-        self.memory_profile_cache.replay_events_count += 1;
-        self.memory_profile_cache.replay_events_json_bytes += estimate_json_bytes(&event);
-        self.replay_events.push(event);
-        self.mark_replay_events_append_dirty();
+        // Route through record_replay_event so the swarm plan is captured in
+        // the event log (derive_replay_events is authoritative in-process).
+        self.record_replay_event(&event);
     }
 
     pub fn provider_messages(&mut self) -> &[Message] {

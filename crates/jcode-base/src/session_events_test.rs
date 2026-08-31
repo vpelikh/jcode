@@ -223,7 +223,6 @@ fn test_event_map_backward_compatibility() {
         session.append_stored_message(msg);
     }
 
-    session.sync_backward_compatibility();
     assert!(session.messages.len() >= 3);
     assert!(session.event_map.events.len() >= 3);
 }

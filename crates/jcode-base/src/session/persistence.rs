@@ -256,13 +256,13 @@ impl Session {
         // agree with the legacy transcript vector. This catches any code path
         // that mutates `messages` without emitting a corresponding event.
         // Gated to debug builds so production stays quiet on a benign mismatch.
-        if cfg!(debug_assertions) {
-            if let Err(e) = session.rederive_all_checked() {
-                eprintln!(
-                    "session_event: event-log/legacy-vector desync after load: {}",
-                    e
-                );
-            }
+        if cfg!(debug_assertions)
+            && let Err(e) = session.rederive_all_checked()
+        {
+            eprintln!(
+                "session_event: event-log/legacy-vector desync after load: {}",
+                e
+            );
         }
         if replay_stats.is_corrupt() {
             session.schedule_checkpoint_after_corrupt_journal(&journal_path);
