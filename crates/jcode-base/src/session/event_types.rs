@@ -124,8 +124,8 @@ impl SessionEventMap {
             return;
         }
         self.events.push(event.clone());
-        
-        // Update indices
+
+        // Update caches
         match &event.op {
             SessionEventOp::SetCompaction { .. } => {
                 self.compaction_event_index = Some(event);
@@ -155,11 +155,14 @@ impl SessionEventMap {
                     }
                 }
                 SessionEventOp::ReplaceMessages { start_index, end_index, messages: replace_with, .. } => {
-                    let start = *start_index;
-                    if start < messages.len() {
-                        let end = (*end_index).min(messages.len());
-                        messages.splice(start..end, replace_with.clone());
-                    }
+                    // Clamp so the splice is always valid. `start_index` may
+                    // equal the current length (a replacement issued after the
+                    // transcript was cleared/truncated to empty must append
+                    // rather than be silently dropped), and `end_index` may be
+                    // usize::MAX for a full replacement.
+                    let start = (*start_index).min(messages.len());
+                    let end = (*end_index).min(messages.len());
+                    messages.splice(start..end, replace_with.clone());
                 }
                 SessionEventOp::ClearAll => {
                     messages.clear();
@@ -285,13 +288,13 @@ impl SessionEventMap {
                 message_id: message_id.to_string()
             });
         }
-        
-        // Validate message content structure
+        // A message with no content blocks carries no signal (neither text nor
+        // tool use/result); refuse to record it so the log stays meaningful.
         if message.content.is_empty() {
-            // Empty content is allowed for some message types
+            return Err(SessionEventError::InvalidMessageContent {
+                message_id: if message.id.is_empty() { message_id.to_string() } else { message.id.clone() }
+            });
         }
-        
-        // Additional validation can be added here
         Ok(())
     }
     

@@ -265,7 +265,7 @@ fn test_session_event_map_indices() {
     let msg1 = StoredMessage {
         id: "msg_1".to_string(),
         role: Role::User,
-        content: vec![],
+        content: vec![text_block("placeholder")],
         display_role: None,
         timestamp: None,
         tool_duration_ms: None,
@@ -282,7 +282,7 @@ fn test_session_event_map_indices() {
     let msg2 = StoredMessage {
         id: "msg_2".to_string(),
         role: Role::User,
-        content: vec![],
+        content: vec![text_block("placeholder")],
         display_role: None,
         timestamp: None,
         tool_duration_ms: None,
@@ -567,4 +567,76 @@ fn test_session_fork_event_log_prefix() {
     let fork = session.fork_up_to_boundary(2);
     assert_eq!(fork.derive_messages().len(), 3);
     assert_ne!(fork.id, session.id);
+}
+
+#[test]
+fn test_replace_after_clear_replays_deterministically() {
+    use crate::session::event_types::SessionEventMap;
+
+    let mut map = SessionEventMap::default();
+    let mk = |id: &str| StoredMessage {
+        id: id.to_string(),
+        role: Role::User,
+        content: vec![text_block(id)],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    };
+
+    // 1) append two messages
+    for id in ["a", "b"] {
+        map.append_event(SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: format!("rehydrate_{}", id),
+            op: SessionEventOp::AppendMessage { message_id: id.to_string(), message: mk(id) },
+            parent_id: None,
+            version: 1,
+        });
+    }
+    // 2) clear all
+    map.append_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "clear_all".to_string(),
+        op: SessionEventOp::ClearAll,
+        parent_id: None,
+        version: 1,
+    });
+    // 3) replace (a full replacement issued after a clear must populate the
+    //    transcript, not be silently dropped because the derived length is 0).
+    map.append_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "replace_all".to_string(),
+        op: SessionEventOp::ReplaceMessages {
+            start_index: 0,
+            end_index: usize::MAX,
+            messages: vec![mk("x"), mk("y")],
+        },
+        parent_id: None,
+        version: 1,
+    });
+
+    let derived = map.derive_messages();
+    let ids: Vec<&str> = derived.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, vec!["x", "y"], "replace after clear must repopulate, not stay empty");
+}
+
+#[test]
+fn test_truncate_to_zero_keeps_event_log_consistent() {
+    let mut session = Session::create_with_id("truncate_zero".to_string(), None, None);
+    for (i, id) in ["a", "b", "c"].iter().enumerate() {
+        session.append_stored_message(StoredMessage {
+            id: format!("m_{}", i),
+            role: Role::User,
+            content: vec![text_block(id)],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+    assert_eq!(session.derive_messages().len(), 3);
+    session.truncate_messages(0);
+    assert_eq!(session.messages.len(), 0, "legacy vector cleared");
+    assert_eq!(session.derive_messages().len(), 0, "event log must also be empty");
 }

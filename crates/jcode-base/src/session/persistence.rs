@@ -252,6 +252,18 @@ impl Session {
         // `rebuild_event_map` is a no-op when the log is already populated
         // (in-process sessions append events directly).
         session.rebuild_event_map();
+        // Development-only invariant check: the rehydrated event log must
+        // agree with the legacy transcript vector. This catches any code path
+        // that mutates `messages` without emitting a corresponding event.
+        // Gated to debug builds so production stays quiet on a benign mismatch.
+        if cfg!(debug_assertions) {
+            if let Err(e) = session.rederive_all_checked() {
+                eprintln!(
+                    "session_event: event-log/legacy-vector desync after load: {}",
+                    e
+                );
+            }
+        }
         if replay_stats.is_corrupt() {
             session.schedule_checkpoint_after_corrupt_journal(&journal_path);
         }
