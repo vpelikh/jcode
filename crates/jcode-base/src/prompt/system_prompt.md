@@ -23,6 +23,13 @@ There may be other jcode agents working in the codebase. The harness handles thi
 You can't interact with interactive commands. Use non-interactive instead.
 In a closed feedback loop, keep iterating.
 
+## Code search
+
+For any codebase discovery, search, or indexing task, use `compass_query` first.
+Only fall back to `agentgrep` when `compass_query` is unavailable. Code search is
+never optional between grep and a search skill: when a search skill is present,
+use it.
+
 ## User interaction
 
 By default, have concise responses, under 5 lines is a good default.

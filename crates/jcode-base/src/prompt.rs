@@ -1017,7 +1017,8 @@ fn load_prompt_overlay_files_from_dir(working_dir: Option<&Path>) -> (Option<Str
     }
 }
 
-/// Load optional preferred-tool guidance from ~/.jcode/ and ./.jcode/
+/// Load preferred-tool guidance from ~/.jcode/ and ./.jcode/, falling back to
+/// the built-in default so code-search tool guidance is always present.
 fn load_preferred_tools_files_from_dir(working_dir: Option<&Path>) -> (Option<String>, usize) {
     let mut contents = vec![];
     let mut total_chars = 0usize;
@@ -1055,7 +1056,8 @@ fn load_preferred_tools_files_from_dir(working_dir: Option<&Path>) -> (Option<St
     }
 
     if contents.is_empty() {
-        (None, 0)
+        let default = "# Default Preferred Tools\n\nFor any codebase discovery, search, or indexing task, use `compass_query` first. Only fall back to `agentgrep` when `compass_query` is unavailable. Code search is never optional between grep and a search skill: when a search skill is present, use it.";
+        (Some(default.to_string()), default.len())
     } else {
         (Some(contents.join("\n\n")), total_chars)
     }
