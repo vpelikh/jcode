@@ -1635,6 +1635,25 @@ request in this new forked session, using the inherited conversation only as con
         (messages, compaction)
     }
 
+    /// Re-derive all state and validate internal consistency.
+    ///
+    /// Returns an error if the derived state violates basic invariants
+    /// (e.g. compaction covering more turns than exist). This is a diagnostic
+    /// aid for the event-sourced migration and never mutates the session.
+    pub fn rederive_all_checked(&self) -> Result<(Vec<StoredMessage>, Option<StoredCompactionState>), String> {
+        let (messages, compaction) = self.rederive_all();
+        if let Some(comp) = &compaction {
+            if comp.covers_up_to_turn > messages.len() {
+                return Err(format!(
+                    "compaction covers_up_to_turn ({}) exceeds derived message count ({})",
+                    comp.covers_up_to_turn,
+                    messages.len()
+                ));
+            }
+        }
+        Ok((messages, compaction))
+    }
+
     /// Ensure backward compatibility - update messages from event log if needed
     pub fn sync_backward_compatibility(&mut self) {
         let derived_messages = self.derive_messages();
