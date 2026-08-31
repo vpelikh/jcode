@@ -1668,7 +1668,7 @@ request in this new forked session, using the inherited conversation only as con
     pub fn set_compaction(&mut self, compaction: StoredCompactionState) {
         let event = SessionEvent {
             timestamp: chrono::Utc::now(),
-            event_id: "set_compaction".to_string(),
+            event_id: crate::id::new_id("set_compaction"),
             op: SessionEventOp::SetCompaction {
                 compaction: compaction.clone(),
             },
@@ -1723,6 +1723,28 @@ request in this new forked session, using the inherited conversation only as con
                 "event_map derived {} messages but session.messages has {} (hydration mismatch)",
                 messages.len(),
                 self.messages.len()
+            ));
+        }
+        for (i, (derived, legacy)) in messages.iter().zip(self.messages.iter()).enumerate() {
+            if derived.id != legacy.id {
+                return Err(format!(
+                    "event_map message[{}] id mismatch: derived={}, legacy={}",
+                    i, derived.id, legacy.id
+                ));
+            }
+            if derived.content.len() != legacy.content.len() {
+                return Err(format!(
+                    "event_map message[{}] content block count mismatch: derived={}, legacy={}",
+                    i, derived.content.len(), legacy.content.len()
+                ));
+            }
+        }
+
+        // Compaction must also agree.
+        if compaction != self.compaction {
+            return Err(format!(
+                "event_map compaction mismatch: derived={:?}, legacy={:?}",
+                compaction, self.compaction
             ));
         }
 
