@@ -1637,21 +1637,111 @@ request in this new forked session, using the inherited conversation only as con
 
     /// Re-derive all state and validate internal consistency.
     ///
-    /// Returns an error if the derived state violates basic invariants
-    /// (e.g. compaction covering more turns than exist). This is a diagnostic
-    /// aid for the event-sourced migration and never mutates the session.
+    /// The event-sourced migration relies on `event_map` being the single
+    /// source of truth. This diagnostic checks that the state derived from the
+    /// event log matches the legacy vectors (`messages`, `compaction`), and
+    /// that compaction turn bounds are internally sane. It never mutates the
+    /// session.
     pub fn rederive_all_checked(&self) -> Result<(Vec<StoredMessage>, Option<StoredCompactionState>), String> {
         let (messages, compaction) = self.rederive_all();
+
+        // The event log must agree with the legacy transcript vector.
+        if messages.len() != self.messages.len() {
+            return Err(format!(
+                "event_map derived {} messages but session.messages has {} (hydration mismatch)",
+                messages.len(),
+                self.messages.len()
+            ));
+        }
+
         if let Some(comp) = &compaction {
-            if comp.covers_up_to_turn > messages.len() {
+            // covers_up_to_turn must not exceed the original turn count.
+            if comp.covers_up_to_turn > comp.original_turn_count {
                 return Err(format!(
-                    "compaction covers_up_to_turn ({}) exceeds derived message count ({})",
+                    "compaction covers_up_to_turn ({}) exceeds original_turn_count ({})",
                     comp.covers_up_to_turn,
-                    messages.len()
+                    comp.original_turn_count
+                ));
+            }
+            if comp.compacted_count > comp.original_turn_count {
+                return Err(format!(
+                    "compaction compacted_count ({}) exceeds original_turn_count ({})",
+                    comp.compacted_count,
+                    comp.original_turn_count
                 ));
             }
         }
+
         Ok((messages, compaction))
+    }
+
+    /// Rebuild the event log from the legacy session vectors.
+    ///
+    /// `event_map` is `#[serde(skip)]`, so after loading a session from disk
+    /// (snapshot + journal replay) the log is empty while `messages`,
+    /// `compaction`, `memory_injections`, and `replay_events` are populated.
+    /// Without this step the event log would not be the single source of truth
+    /// for resumed sessions. Call this once after load/construct-from-disk.
+    pub fn rebuild_event_map(&mut self) {
+        // Idempotent: only build from legacy vectors when the log is empty
+        // (e.g. right after loading from disk). In-process sessions already
+        // populate the log via append/insert/replace, so never clobber that.
+        if !self.event_map.events.is_empty() {
+            return;
+        }
+        let mut map = SessionEventMap::default();
+        let now = chrono::Utc::now();
+
+        for (i, message) in self.messages.iter().enumerate() {
+            map.append_event(SessionEvent {
+                timestamp: message.timestamp.unwrap_or(now),
+                event_id: format!("rehydrate_{}", i),
+                op: SessionEventOp::AppendMessage {
+                    message_id: message.id.clone(),
+                    message: message.clone(),
+                },
+                parent_id: None,
+                version: 1,
+            });
+        }
+
+        for injection in &self.memory_injections {
+            map.append_event(SessionEvent {
+                timestamp: injection.timestamp,
+                event_id: format!("rehydrate_mem_{}", self.memory_injections.len()),
+                op: SessionEventOp::MemoryInjection {
+                    memory_injection: injection.clone(),
+                },
+                parent_id: None,
+                version: 1,
+            });
+        }
+
+        for replay in &self.replay_events {
+            map.append_event(SessionEvent {
+                timestamp: replay.timestamp,
+                event_id: format!("rehydrate_replay_{}", self.replay_events.len()),
+                op: SessionEventOp::ReplayEvent {
+                    replay_event: replay.clone(),
+                },
+                parent_id: None,
+                version: 1,
+            });
+        }
+
+        if let Some(compaction) = &self.compaction {
+            map.append_event(SessionEvent {
+                timestamp: now,
+                event_id: "rehydrate_compaction".to_string(),
+                op: SessionEventOp::SetCompaction {
+                    compaction: compaction.clone(),
+                },
+                parent_id: None,
+                version: 1,
+            });
+        }
+
+        self.event_map = map;
     }
 
     /// Ensure backward compatibility - update messages from event log if needed

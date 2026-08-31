@@ -382,3 +382,53 @@ fn test_rederive_all_checked_consistency() {
     assert_eq!(msgs.len(), 3);
     assert!(compaction.is_none());
 }
+
+#[test]
+fn test_event_map_hydrated_on_disk_round_trip() {
+    use std::io::Write;
+
+    let dir = std::env::temp_dir().join(format!("jcode_event_map_rt_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("session.json");
+
+    // Build a session in memory; its event_map is populated via append path.
+    let mut session = Session::create_with_id(
+        "test_session_rt".to_string(),
+        None,
+        Some("Round-trip".to_string()),
+    );
+    for i in 0..4 {
+        session.append_stored_message(StoredMessage {
+            id: format!("rt_{}", i),
+            role: Role::User,
+            content: vec![text_block(&format!("msg {}", i))],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+    let in_memory_events = session.event_map.events.len();
+    assert!(in_memory_events >= 4);
+
+    // Serialize and reload through the real load path (snapshot + hydrate).
+    let json = serde_json::to_string(&session).expect("serialize");
+    let mut f = std::fs::File::create(&path).unwrap();
+    f.write_all(json.as_bytes()).unwrap();
+    drop(f);
+
+    let loaded = Session::load_from_path(&path).expect("load_from_path");
+    // event_map is #[serde(skip)], so without hydration it would be empty.
+    assert_eq!(
+        loaded.event_map.events.len(),
+        loaded.messages.len(),
+        "event_map must be hydrated to match the transcript on load"
+    );
+    assert_eq!(loaded.event_map.events.len(), 4);
+
+    // Derived state must equal the legacy vector after hydration.
+    let (derived, _) = loaded.rederive_all_checked().expect("hydration consistent");
+    assert_eq!(derived.len(), 4);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

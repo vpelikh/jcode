@@ -2,7 +2,6 @@ use chrono::{DateTime, Utc};
 use jcode_session_types::{StoredCompactionState, StoredMemoryInjection, StoredMessage};
 use crate::session::model::StoredReplayEvent;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
@@ -109,9 +108,7 @@ pub struct SessionEvent {
 pub struct SessionEventMap {
     /// All events in append-only order
     pub events: Vec<SessionEvent>,
-    /// Index of events by type for efficient querying
-    #[serde(skip)]
-    message_index: HashMap<usize, SessionEvent>,
+    /// Cache of the most recent SetCompaction event, for O(1) current_compaction.
     #[serde(skip)]
     compaction_event_index: Option<SessionEvent>,
 }
@@ -126,17 +123,10 @@ impl SessionEventMap {
             eprintln!("session_event: skipping invalid event {}: {}", event.event_id, err);
             return;
         }
-        let _event_index = self.events.len();
         self.events.push(event.clone());
         
         // Update indices
         match &event.op {
-            SessionEventOp::AppendMessage { message_id, .. } => {
-                // Parse message_id to get index if available, or store by event_id
-                if let Ok(index) = message_id.parse::<usize>() {
-                    self.message_index.insert(index, event.clone());
-                }
-            }
             SessionEventOp::SetCompaction { .. } => {
                 self.compaction_event_index = Some(event);
             }
