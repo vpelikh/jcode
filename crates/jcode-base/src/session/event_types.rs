@@ -125,7 +125,7 @@ impl SessionEventMap {
     /// Events are validated before insertion. Invalid events are skipped with a
     /// stderr diagnostic (the event log must stay append-only and corruption-tolerant).
     pub fn append_event(&mut self, event: SessionEvent) {
-        if let Err(err) = self.validate_event(&event) {
+        if let Err(err) = Self::validate_event(&event) {
             eprintln!("session_event: skipping invalid event {}: {}", event.event_id, err);
             return;
         }
@@ -260,7 +260,7 @@ impl SessionEventMap {
     ///
     /// # Returns
     /// Ok(()) if event is valid, Err(SessionEventError) otherwise
-    fn validate_event(&self, event: &SessionEvent) -> Result<(), SessionEventError> {
+    fn validate_event(event: &SessionEvent) -> Result<(), SessionEventError> {
         // Validate event_id
         if event.event_id.is_empty() {
             return Err(SessionEventError::InvalidEventId {
@@ -292,7 +292,7 @@ impl SessionEventMap {
                 Self::validate_memory_injection(memory_injection)?;
             }
             SessionEventOp::ReplayEvent { replay_event } => {
-Self::validate_replay_event(replay_event)?;
+                Self::validate_replay_event(replay_event)?;
             }
             _ => {} // Other operations don't need additional validation
         }
