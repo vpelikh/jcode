@@ -267,6 +267,37 @@ pub async fn discover_client(
 /// Escape text for Telegram's legacy `Markdown` parse mode so it renders
 /// literally and cannot be misinterpreted as formatting.
 ///
+/// Escape user-controlled text for `parse_mode=MarkdownV2`. MarkdownV2 reserves
+/// every `_*[]()~\`>#+-=|{}.!` character, so leaving any one unescaped would
+/// crash parsing (and trigger the parse-error plain-text resend) or silently
+/// change the message. Unlike legacy Markdown, backslashes inside a code block
+/// are NOT doubled (Telegram renders code blocks literally).
+pub fn escape_markdown_v2(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 16);
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        // Inside a pre block (`...` or `\`\`\`...\`\`\`) MarkdownV2 does not
+        // interpret backslash escapes — only the closing backtick is special.
+        // For simplicity (and because dynamic agent output is rarely a single
+        // fenced block), we still escape backslashes in the body; the only
+        // safe no-escape zone is inside a `\`\`\`...\`\`\`, which is left to
+        // the caller to construct.
+        if matches!(
+            ch,
+            '_' | '*' | '[' | ']' | '(' | ')' | '~' | '`' | '>' | '#' | '+' | '-' | '=' | '|' | '{' | '}' | '.' | '!' | '\\'
+        ) {
+            out.push('\\');
+            out.push(ch);
+        } else {
+            out.push(ch);
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Legacy Markdown treats `_`, `*`, `` ` ``, `[`, `]`, and `\` as control
 /// characters. When embedding user-provided or otherwise untrusted content into
 /// a message that is sent with `parse_mode=Markdown`, escape these so the text
@@ -455,7 +486,7 @@ pub async fn send_message_with_base(
         let mut body = serde_json::json!({
             "chat_id": chat_id,
             "text": chunk,
-            "parse_mode": "Markdown",
+            "parse_mode": "MarkdownV2",
             "disable_web_page_preview": true,
         });
         if let Some(rt) = reply_to {
@@ -477,6 +508,51 @@ pub async fn send_message_with_base(
         if chunks.len() == 1 { "" } else { "s" }
     ));
     Ok(())
+}
+
+/// Send a single message and return the created message id, or `None` if more
+/// than one chunk was required (editing a streamed reply needs a single
+/// message to target). Used by the Telegram streaming-progress flow, which
+/// posts one placeholder message and then edits it as tokens arrive.
+pub async fn send_message_raw(
+    client: &reqwest::Client,
+    bot_token: &str,
+    chat_id: &str,
+    text: &str,
+    base_override: Option<&str>,
+    reply_to_message_id: Option<i64>,
+) -> anyhow::Result<Option<i64>> {
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    let chunks = chunk_message(text, MAX_MESSAGE_CHARS);
+    if chunks.len() != 1 {
+        return Ok(None);
+    }
+    let url = format!("{}{}/sendMessage", api_base(base_override), bot_token);
+    let mut body = serde_json::json!({
+        "chat_id": chat_id,
+        "text": chunks[0],
+        "parse_mode": "MarkdownV2",
+        "disable_web_page_preview": true,
+    });
+    if let Some(rt) = reply_to_message_id {
+        body["reply_to_message_id"] = serde_json::json!(rt);
+    }
+    let resp = client.post(&url).json(&body).send().await?;
+    let status = resp.status();
+    let parsed: TelegramResponse<serde_json::Value> = resp.json().await?;
+    if !parsed.ok {
+        anyhow::bail!(
+            "Telegram API error ({}): {}",
+            status,
+            parsed.description.unwrap_or_default()
+        );
+    }
+    let id = parsed
+        .result
+        .and_then(|r| r.get("message_id").and_then(|v| v.as_i64()));
+    Ok(id)
 }
 
 /// Send one Telegram message, handling transient HTTP 429 rate limits (with
@@ -525,11 +601,11 @@ async fn send_message_once(
         }
         let description = parsed.description.clone().unwrap_or_default();
         if allow_plain_fallback
-            && is_markdown_parse_error(&description)
+            && is_markdown_parse_error_v2(&description)
             && !body.get("parse_mode").map(|v| v.is_null()).unwrap_or(true)
         {
             logging::warn(&format!(
-                "Telegram rejected Markdown, resending as plain text: {description}"
+                "Telegram rejected MarkdownV2, resending as plain text: {description}"
             ));
             if let Some(obj) = body.as_object_mut() {
                 obj.remove("parse_mode");
@@ -545,11 +621,26 @@ async fn send_message_once(
 }
 
 /// Whether a Bot API error description indicates a Markdown parse failure
-/// (which can be retried without `parse_mode`).
+/// (which can be retried without `parse_mode`). Retained as a legacy helper;
+/// the V2 variant is what live code uses.
+#[allow(dead_code)]
 fn is_markdown_parse_error(description: &str) -> bool {
     let d = description.to_lowercase();
     d.contains("can't parse entities")
         || d.contains("cannot parse entities")
+        || d.contains("unsupported start tag")
+        || (d.contains("parse:") && d.contains("entity"))
+}
+
+/// Whether a Bot API error description indicates a MarkdownV2 parse failure
+/// (which can be retried without `parse_mode`). MarkdownV2 error messages from
+/// Telegram typically say "can't parse entities" or "unsupported start tag", or
+/// the body contains "parse:" with "entity".
+fn is_markdown_parse_error_v2(description: &str) -> bool {
+    let d = description.to_lowercase();
+    d.contains("can't parse entities")
+        || d.contains("cannot parse entities")
+        || d.contains("unsupported start tag")
         || (d.contains("parse:") && d.contains("entity"))
 }
 
@@ -599,10 +690,15 @@ pub async fn set_my_commands(
         "commands": [
             { "command": "start", "description": "Show help and available commands" },
             { "command": "list", "description": "List recent sessions" },
+            { "command": "find", "description": "Search sessions by title or id" },
             { "command": "new", "description": "Start a new session (optionally with a prompt)" },
             { "command": "use", "description": "Select a session to talk to (id or #)" },
             { "command": "history", "description": "Show recent messages of the active session" },
             { "command": "resume", "description": "Ask a session (id + prompt)" },
+            { "command": "live", "description": "List live sessions (free with a tap)" },
+            { "command": "free", "description": "Drop a live headless session" },
+            { "command": "abort", "description": "Stop the active session's running turn" },
+            { "command": "whoami", "description": "Show this chat's id for config" },
             { "command": "clear", "description": "Stop talking to the active session" },
             { "command": "status", "description": "Show control & ambient status" },
             { "command": "help", "description": "Show help" },
@@ -610,6 +706,35 @@ pub async fn set_my_commands(
     });
     if let Err(e) = post_telegram(client, bot_token, "setMyCommands", body, base_override).await {
         logging::warn(&format!("failed to register telegram commands: {e}"));
+    }
+}
+
+/// Edit the text of an already-sent message. Used to stream partial agent
+/// replies into a single message so the user sees progress instead of a long
+/// blank wait. Non-fatal: failures (e.g. editing too fast, or a message that
+/// was deleted) are logged and ignored.
+pub async fn edit_message_text(
+    client: &reqwest::Client,
+    bot_token: &str,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+    base_override: Option<&str>,
+) {
+    let url = format!("{}{}/editMessageText", api_base(base_override), bot_token);
+    let body = serde_json::json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "MarkdownV2",
+        "disable_web_page_preview": true,
+    });
+    // editMessageText has the same parse-mode pitfalls as sendMessage; if the
+    // escaped Markdown is still rejected, retry once as plain text.
+    if let Err(e) = send_message_once(client, &url, body, true).await {
+        logging::warn(&format!(
+            "failed to edit telegram message chat={chat_id} msg={message_id}: {e}"
+        ));
     }
 }
 
@@ -670,7 +795,7 @@ pub async fn send_message_with_keyboard(
         let mut body = serde_json::json!({
             "chat_id": chat_id,
             "text": chunk,
-            "parse_mode": "Markdown",
+            "parse_mode": "MarkdownV2",
             "disable_web_page_preview": true,
         });
         // Keyboard is attached to the first chunk only; the rest are plain
@@ -1166,5 +1291,32 @@ mod tests {
         assert!(build_probe_client(None, None).is_ok());
         // A valid pinned IP builds a probe client.
         assert!(build_probe_client(None, Some("149.154.167.220")).is_ok());
+    }
+
+    #[test]
+    fn test_escape_markdown_v2_escapes_all_reserved_chars() {
+        // Every MarkdownV2 reserved character must be escaped.
+        let input = "_*[]()~`>#+-=|{}.!";
+        let out = escape_markdown_v2(input);
+        assert_eq!(
+            out,
+            "\\_\\*\\[\\]\\(\\)\\~\\`\\>\\#\\+\\-\\=\\|\\{\\}\\.\\!"
+        );
+    }
+
+    #[test]
+    fn test_escape_markdown_v2_leaves_plain_text_untouched() {
+        assert_eq!(escape_markdown_v2("hello world"), "hello world");
+        assert_eq!(
+            escape_markdown_v2("session_abc123 done"),
+            "session\\_abc123 done"
+        );
+    }
+
+    #[test]
+    fn test_is_markdown_parse_error_v2_detects_new_errors() {
+        assert!(is_markdown_parse_error_v2("can't parse entities"));
+        assert!(is_markdown_parse_error_v2("Bad Request: unsupported start tag"));
+        assert!(!is_markdown_parse_error_v2("message text is empty"));
     }
 }
