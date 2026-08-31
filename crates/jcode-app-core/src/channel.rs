@@ -723,7 +723,7 @@ impl TelegramChannel {
         } else {
             "(no messages to preview)".to_string()
         };
-        let message_count = lines.len().max(entries.chars().filter(|&c| c == '\n').count());
+        let message_count = lines.len();
         format!("📖 **Preview** `{}`, {} messages\n{}",
             short_id(&session_id),
             message_count,
@@ -1428,13 +1428,13 @@ impl ConfirmationTracker {
     /// to be used as the inline-keyboard button. The button's callback data
     /// is `__confirm__`; the action is encoded in the tracker.
     fn request(&mut self, action: &'static str, session_id: String) -> String {
+        let sid = short_id(&session_id);
         self.pending = Some(PendingConfirmation {
             action,
             session_id,
             expires_at: std::time::Instant::now()
                 + std::time::Duration::from_secs(CONFIRM_TIMEOUT_SECS),
         });
-        let sid = short_id(&session_id);
         format!(
             "⚠️ *Confirm `{action} session `{sid}`*\n\n\
              This cannot be undone.\n\
@@ -2775,5 +2775,42 @@ mod tests {
             "response event should be readable back from the relay"
         );
         eprintln!("LIVE ROUNDTRIP OK: prompt -> poll -> response verified");
+    }
+
+    #[test]
+    fn test_confirmation_tracker_basic() {
+        let mut tracker = ConfirmationTracker::new();
+        let prompt = tracker.request("abort", "session_abc123".to_string());
+        assert!(prompt.contains("Confirm `abort` session `abc123`"));
+        // Verify matches
+        let Some((action, id)) = tracker.verify("__confirm__") else {
+            panic!("Expected verification to succeed");
+        };
+        assert_eq!(action, "abort");
+        assert_eq!(id, "session_abc123");
+        // After consume, should be None
+        assert!(tracker.verify("__confirm__").is_none());
+        // Clear works
+        tracker.request("free", "session_xyz".to_string());
+        assert!(tracker.clear());
+        assert!(!tracker.clear());
+    }
+
+    #[test]
+    fn test_confirmation_tracker_ttl() {
+        use std::time::{Duration, Instant};
+        let mut tracker = ConfirmationTracker::new();
+        tracker.request("abort", "session_test".to_string());
+        // Manually expire
+        tracker.pending.as_mut().unwrap().expires_at =
+            Instant::now() - Duration::from_secs(1);
+        assert!(tracker.verify("__confirm__").is_none());
+    }
+
+    #[test]
+    fn test_help_footer() {
+        let footer = help_footer();
+        assert!(footer.contains("/help"));
+        assert!(footer.contains("/list"));
     }
 }
