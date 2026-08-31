@@ -61,10 +61,13 @@ impl Tool for CompassQueryTool {
     }
 
     fn concurrency_safe_marker(&self) -> bool {
-        // Read-only inspection tool: opens a pre-built Compass index and runs
-        // semantic search. It is a pure function of its input plus the index
-        // files, mutates no shared agent/session state, spawns no subprocesses,
-        // and does not depend on sibling tool results.
+        // Read-only inspection tool for the common path (warm cache): pure
+        // function of its input plus the index files, mutates no shared
+        // agent/session state, spawns no subprocesses, and does not depend on
+        // sibling tool results. A cold cache triggers an in-process index build
+        // that writes files, but that build is serialized via an exclusive
+        // `flock` (see `with_build_lock`), so concurrent calls cannot clobber
+        // each other's `graph.json`. Safe to run in parallel with siblings.
         true
     }
 
@@ -113,23 +116,32 @@ impl Tool for CompassQueryTool {
         }
 
         // Open the Compass query engine. If no index exists yet, build one
-        // in-process using Compass's library API (compass_core::build_graph),
+        // in-process using Compass's library API (compass_core::build_graph_with_layers),
         // then reopen. The index is written into cache_dir/compass-out/graph.json.
+        // The cold build is serialized with an exclusive flock so that parallel
+        // calls (this tool is concurrency-safe) cannot race on the same index.
         let graph_path = cache_dir.join("compass-out").join("graph.json");
         let engine = match compass_query::open(&graph_path, None, &cache_dir) {
             Ok(engine) => engine,
-            Err(open_err) => match build_compass_index(&working_dir, &cache_dir) {
-                Ok(()) => compass_query::open(&graph_path, None, &cache_dir)
-                    .map_err(|e| anyhow!("Index was built but could not be opened: {}", e))?,
-                Err(build_err) => {
-                    return Ok(ToolOutput::new(format!(
-                        "Compass knowledge graph is not available for this project yet.\n\n\n                             Compass could not open an existing index ({}), and an attempt to build \n                             one in-process also failed ({}).\n\n\n                             Common causes: the project has no source files Compass can parse, or the 
-                             Compass extractor hit an unsupported dependency. As a workaround, use 
-                             agentgrep for grep/find/trace-style searches in the meantime.",
-                        open_err, build_err
-                    )));
+            Err(open_err) => {
+                match with_build_lock(&cache_dir, || {
+                    // A concurrent caller may have finished the build while we
+                    // waited for the lock. Re-check before spending time rebuilding.
+                    if compass_query::open(&graph_path, None, &cache_dir).is_ok() {
+                        return Ok(());
+                    }
+                    build_compass_index(&working_dir, &cache_dir)
+                }) {
+                    Ok(()) => compass_query::open(&graph_path, None, &cache_dir)
+                        .map_err(|e| anyhow!("Index was built but could not be opened: {}", e))?,
+                    Err(build_err) => {
+                        return Ok(ToolOutput::new(format_index_unavailable(
+                            &open_err.to_string(),
+                            &build_err.to_string(),
+                        )));
+                    }
                 }
-            },
+            }
         };
 
         let result = execute_query(
@@ -149,16 +161,76 @@ impl Tool for CompassQueryTool {
                     "limit": params.limit.unwrap_or(20),
                     "path_filter": params.path,
                 }))),
-            Err(e) => Ok(ToolOutput::new(format!(
-                "Compass query failed: {}\n\nQuery: {}\n\n\
-                 The index is built, but the search engine returned an error. If this persists, \
-                 try removing the cached index ({}) and re-running the query to force a rebuild.",
-                e,
-                params.query,
-                cache_dir.display()
+            Err(e) => Ok(ToolOutput::new(format_query_error(
+                &e.to_string(),
+                &params.query,
+                &cache_dir,
             ))),
         }
     }
+}
+
+/// Format the user-facing message shown when neither an existing Compass index
+/// can be opened nor a fresh one can be built in-process. The message uses Rust
+/// `\`-line-continuations so the rendered text has no stray leading indentation.
+fn format_index_unavailable(open_err: &str, build_err: &str) -> String {
+    format!(
+        "Compass knowledge graph is not available for this project yet.\n\n\
+         Compass could not open an existing index ({}), and an attempt to build \
+         one in-process also failed ({}).\n\n\
+         Common causes: the project has no source files Compass can parse, or the \
+         Compass extractor hit an unsupported dependency. As a workaround, use \
+         agentgrep for grep/find/trace-style searches in the meantime.",
+        open_err, build_err
+    )
+}
+
+/// Format the user-facing message shown when the search engine errors after the
+/// index is successfully built/opened.
+fn format_query_error(e: &str, query: &str, cache_dir: &std::path::Path) -> String {
+    format!(
+        "Compass query failed: {}\n\nQuery: {}\n\n\
+         The index is built, but the search engine returned an error. If this persists, \
+         try removing the cached index ({}) and re-running the query to force a rebuild.",
+        e,
+        query,
+        cache_dir.display()
+    )
+}
+
+/// Run `f` while holding an exclusive lock on the project's Compass build lock.
+///
+/// The index build writes `graph.json`, so concurrent calls (this tool is
+/// concurrency-safe and may be dispatched in parallel with siblings) must not
+/// run it at the same time. We serialize on an exclusive `flock` over a lock
+/// file in `cache_dir`, mirroring the daemon/build-lock pattern used elsewhere
+/// in this crate. The lock is released when the file is closed (dropped), even
+/// if `f` errors. On non-Unix targets without `flock` we run `f` unguarded,
+/// accepting the same (rare) single-build-per-project race as before.
+fn with_build_lock<F, T>(cache_dir: &std::path::Path, f: F) -> T
+where
+    F: FnOnce() -> T,
+{
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+
+        let lock_path = cache_dir.join(".compass-build.lock");
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+        {
+            // Blocking exclusive lock: concurrent callers queue here instead of
+            // racing. Blocking is acceptable because a build runs at most once
+            // per project, and the harness already blocks the executor during it.
+            let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            // `file` is dropped (releasing the lock) when this scope ends.
+            return f();
+        }
+    }
+    f()
 }
 
 /// Build a Compass knowledge-graph index for the project in-process, using the
@@ -192,7 +264,7 @@ fn execute_query(
     let request = SearchRequest {
         query: query.to_string(),
         limits: CodeQueryLimits {
-            max_nodes: limit.max(1) as u32,
+            max_nodes: limit as u32,
             ..Default::default()
         },
     };
@@ -263,7 +335,38 @@ mod tests {
         (tmp, root, cache)
     }
 
-    // Smoke test: build a Compass index for a tiny project in-process and query it.
+    #[test]
+    fn index_unavailable_message_has_no_stray_indentation() {
+        let msg = format_index_unavailable("open-booms", "build-booms");
+        assert!(msg.contains("open-booms"));
+        assert!(msg.contains("build-booms"));
+        // No embedded indentation from source formatting.
+        assert!(
+            !msg.contains("                             "),
+            "message contained embedded indentation: {:?}",
+            msg
+        );
+        // Every physical line begins at column 0.
+        for line in msg.lines() {
+            assert!(
+                !line.starts_with(' '),
+                "unexpected leading space: {:?}",
+                line
+            );
+        }
+    }
+
+    #[test]
+    fn query_error_message_names_cache_dir() {
+        let msg = format_query_error(
+            "boom",
+            "auth",
+            std::path::Path::new("/tmp/x/.jcode/cache/compass"),
+        );
+        assert!(msg.contains("boom"));
+        assert!(msg.contains("auth"));
+        assert!(msg.contains("/tmp/x/.jcode/cache/compass"));
+    }
     #[test]
     fn builds_and_queries_index() {
         let (_tmp, root, cache) = make_isolated_project();
