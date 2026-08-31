@@ -104,18 +104,8 @@ pub struct SessionEventMap {
 }
 
 impl SessionEventMap {
-    /// Append a new event to the map.
-    ///
-    /// Events are validated before insertion. Invalid events are skipped with a
-    /// stderr diagnostic (the event log must stay append-only and corruption-tolerant).
-    pub fn append_event(&mut self, event: SessionEvent) {
-        if let Err(err) = self.validate_event(&event) {
-            eprintln!("session_event: skipping invalid event {}: {}", event.event_id, err);
-            return;
-        }
-
-        // Update caches before moving `event` into `self.events`, so we only
-        // clone when the cache actually needs to retain the value.
+    /// Update caches when appending an event (SetCompaction / ClearAll).
+    fn update_caches(&mut self, event: &SessionEvent) {
         match &event.op {
             SessionEventOp::SetCompaction { .. } => {
                 self.compaction_event_index = Some(event.clone());
@@ -128,22 +118,24 @@ impl SessionEventMap {
             }
             _ => {}
         }
+    }
+
+    /// Append a new event to the map.
+    ///
+    /// Events are validated before insertion. Invalid events are skipped with a
+    /// stderr diagnostic (the event log must stay append-only and corruption-tolerant).
+    pub fn append_event(&mut self, event: SessionEvent) {
+        if let Err(err) = self.validate_event(&event) {
+            eprintln!("session_event: skipping invalid event {}: {}", event.event_id, err);
+            return;
+        }
+        self.update_caches(&event);
         self.events.push(event);
     }
 
     /// Append without validation — used for rehydration from trusted legacy vectors.
     pub(crate) fn push_event(&mut self, event: SessionEvent) {
-        // Update caches before moving `event` into `self.events`, so we only
-        // clone when the cache actually needs to retain the value.
-        match &event.op {
-            SessionEventOp::SetCompaction { .. } => {
-                self.compaction_event_index = Some(event.clone());
-            }
-            SessionEventOp::ClearAll => {
-                self.compaction_event_index = None;
-            }
-            _ => {}
-        }
+        self.update_caches(&event);
         self.events.push(event);
     }
     
@@ -288,10 +280,10 @@ impl SessionEventMap {
         // Validate operation based on event type
         match &event.op {
             SessionEventOp::AppendMessage { message, .. } => {
-                self.validate_message(message, &event.event_id)?;
+                validate_message(message, &event.event_id)?;
             }
             SessionEventOp::InsertMessage { message, .. } => {
-                self.validate_message(message, &event.event_id)?;
+                validate_message(message, &event.event_id)?;
             }
             SessionEventOp::SetCompaction { compaction } => {
                 self.validate_compaction(compaction)?;
@@ -309,7 +301,7 @@ impl SessionEventMap {
     }
     
     /// Validate a message content
-    fn validate_message(&self, message: &StoredMessage, message_id: &str) -> Result<(), SessionEventError> {
+    fn validate_message(message: &StoredMessage, message_id: &str) -> Result<(), SessionEventError> {
         if message.id.is_empty() && message_id.is_empty() {
             return Err(SessionEventError::InvalidMessageContent {
                 message_id: message_id.to_string()
