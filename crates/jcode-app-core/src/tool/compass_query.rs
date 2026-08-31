@@ -8,6 +8,9 @@
 //! project has never been indexed or when source has changed since the last
 //! build. On a rebuild Compass reuses its persisted AST cache (incremental
 //! extract), so changed files are re-extracted rather than the whole project.
+//! A git branch or commit switch (HEAD) is detected via a cached SHA sidecar
+//! and forces a rebuild even when no file mtime changed, so a freshly checked
+//! out tree is never served against a stale index.
 //! The index can also be force-refreshed by deleting the cache dir.
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -421,18 +424,18 @@ fn ensure_fresh_engine(
         // and forces a rebuild immediately.
         match compass_query::open(graph_path, None, cache_dir) {
             Ok(engine) => {
-                let stale = !recently_scanned(cache_dir)
-                    && index_is_stale(working_dir, graph_path, current_sha.as_deref(), cache_dir);
-                if !stale {
-                    if !recently_scanned(cache_dir) {
-                        record_scan(cache_dir);
-                    }
+                // Reuse the index only when nothing has moved past it.
+                // `index_is_stale` checks the cached git SHA first, so a
+                // branch/commit switch is detected immediately and bypasses the
+                // throttled mtime walk; otherwise it relies on the per-cache
+                // STALE_RESCAN_TTL to skip the walk, and finally walks the tree.
+                if !index_is_stale(working_dir, graph_path, current_sha.as_deref(), cache_dir) {
+                    record_scan(cache_dir);
                     return Ok(engine);
                 }
                 // Valid but stale (source edit or branch change): discard it and
-                // rebuild below so we never serve a dirty index. Do NOT record
-                // the scan: the next call must re-check rather than trust a now-
-                // discarded index.
+                // rebuild below so we never serve a dirty index. Do NOT treat
+                // the discarded index as freshly scanned.
                 drop(engine);
                 let _ = std::fs::remove_dir_all(cache_dir.join("compass-out"));
             }
@@ -443,13 +446,12 @@ fn ensure_fresh_engine(
 
         // Build (covers missing, corrupt, stale, or branch change). `cache_root`
         // makes this incremental on a repeat build, re-extracting only changed
-        // files. Persist the current git SHA so future queries can detect
-        // subsequent branch changes without walking the tree.
+        // files. `build_compass_index` also records the current git SHA sidecar,
+        // so a later branch switch is detected without walking the tree. Record
+        // the scan so the immediately following query doesn't re-walk the tree.
         build_compass_index(working_dir, cache_dir)
             .map_err(|e| ("existing index missing or stale".to_string(), e.to_string()))?;
-        if let Some(sha) = &current_sha {
-            write_index_git_sha(cache_dir, sha);
-        }
+        record_scan(cache_dir);
         compass_query::open(graph_path, None, cache_dir).map_err(|e| {
             (
                 "existing index missing or stale".to_string(),
@@ -468,6 +470,12 @@ fn ensure_fresh_engine(
 /// Compass re-extract only changed files instead of the whole project, i.e. the
 /// index is incrementally maintained rather than fully re-derived each time.
 ///
+/// On success the current git commit SHA is recorded in a sidecar next to the
+/// index, so a later `index_is_stale` call can detect a branch/commit switch
+/// (HEAD moving) even when no file mtime changes. The sidecar lives with the
+/// index (`output_dir`), so any build path — including direct callers — captures
+/// it rather than relying on the caller to remember.
+///
 /// The output is cached under `output_dir` and the caller re-opens it via
 /// `compass_query::open`, so subsequent queries skip the build entirely unless
 /// source has since changed.
@@ -483,8 +491,15 @@ fn build_compass_index(
     options.graph_storage = compass_core::GraphStorage::Json;
 
     build_graph_with_layers(&options, None, &[])
-        .map(|_| ())
-        .map_err(|e| anyhow!("compass_core build_graph failed: {}", e))
+        .map_err(|e| anyhow!("compass_core build_graph failed: {}", e))?;
+
+    // Record the commit we built against so a later branch switch is detected.
+    // Best-effort: if git/SHA is unavailable we simply skip the sidecar and the
+    // staleness check falls back to the mtime walk.
+    if let Some(sha) = current_git_sha(root) {
+        write_index_git_sha(output_dir, &sha);
+    }
+    Ok(())
 }
 
 /// Run a search through the Compass `CodeQueryEngine`. Returns a model-ready
@@ -900,6 +915,65 @@ mod tests {
         assert!(
             !recently_scanned(&other),
             "throttle state must be per-cache, not global"
+        );
+    }
+
+    // A git branch/commit switch must mark the index stale even when no source
+    // file mtime advances. We isolate the SHA-based detection by amending the
+    // commit (new SHA, identical tree) so the mtime walk alone would report
+    // "not stale". Skips gracefully when git is unavailable in the test env.
+    #[test]
+    fn branch_change_forces_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        let git = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init"]) {
+            return; // git not available; nothing to exercise.
+        }
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(root.join("main.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "."]);
+        if !git(&["commit", "-m", "init"]) {
+            return;
+        }
+        // Sanity: the feature this test exercises needs a real SHA.
+        if current_git_sha(&root).is_none() {
+            return;
+        }
+
+        let cache = root.join(".jcode/cache/compass");
+        std::fs::create_dir_all(&cache).unwrap();
+        let graph_path = cache.join("compass-out").join("graph.json");
+        build_compass_index(&root, &cache).expect("build");
+
+        // Sidecar was written at build time and matches HEAD.
+        let sha1 = current_git_sha(&root).expect("sha after init");
+        assert_eq!(index_git_sha(&cache).as_deref(), Some(sha1.as_str()));
+
+        // A freshly built index is not stale against its own commit.
+        assert!(
+            !index_is_stale(&root, &graph_path, current_git_sha(&root).as_deref(), &cache),
+            "just-built index should not be stale against its own commit"
+        );
+
+        // Re-point HEAD at a new commit with an identical tree: file mtimes are
+        // unchanged, so only the SHA mismatch can detect staleness.
+        assert!(git(&["commit", "--amend", "--no-edit"]), "amend should succeed");
+        let sha2 = current_git_sha(&root).expect("sha after amend");
+        assert_ne!(sha1, sha2, "amend must produce a new commit SHA");
+
+        assert!(
+            index_is_stale(&root, &graph_path, current_git_sha(&root).as_deref(), &cache),
+            "branch/commit change must mark the index stale even with unchanged mtimes"
         );
     }
 }
