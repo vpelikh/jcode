@@ -38,7 +38,8 @@ use crate::session::{
     event_types::{SessionEvent, SessionEventOp},
 };
 use crate::skill::SkillRegistry;
-use chrono::{DateTime, Utc};
+use crate::tool::{Registry, ToolContext, ToolExecutionMode};
+use chrono::Utc;
 use anyhow::Result;
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
@@ -504,14 +505,16 @@ impl Agent {
         ));
         drop(manager);
         if let Some(state) = sanitized_state {
-            self.session.compaction = state;
-            self.session.event_map.append_event(SessionEvent {
-                timestamp: chrono::Utc::now(),
-                event_id: format!("compaction_{}", self.session.messages.len()),
-                op: SessionEventOp::SetCompaction { compaction: state.clone() },
-                parent_id: None,
-                version: 1,
-            });
+            self.session.compaction = state.clone();
+            if let Some(inner) = state {
+                self.session.event_map.append_event(SessionEvent {
+                    timestamp: Utc::now(),
+                    event_id: format!("compaction_{}", self.session.messages.len()),
+                    op: SessionEventOp::SetCompaction { compaction: inner },
+                    parent_id: None,
+                    version: 1,
+                });
+            }
             self.persist_session_best_effort("sanitized oversized OpenAI native compaction");
         }
     }
@@ -888,7 +891,7 @@ impl Agent {
                     role: Role::User,
                     content: vec![tool_block],
                     display_role: None,
-                    timestamp: Some(chrono::Utc::now()),
+                    timestamp: Some(Utc::now()),
                     tool_duration_ms: None,
                     token_usage: None,
                 };

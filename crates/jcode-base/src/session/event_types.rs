@@ -3,6 +3,57 @@ use jcode_session_types::{StoredCompactionState, StoredMemoryInjection, StoredMe
 use crate::session::model::StoredReplayEvent;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::error::Error;
+use std::fmt;
+
+/// Errors that can occur when working with session events
+#[derive(Debug, Clone)]
+pub enum SessionEventError {
+    /// Event ID is invalid or malformed
+    InvalidEventId { event_id: String },
+    /// Event index is out of bounds
+    IndexOutOfBounds { index: usize, max: usize },
+    /// Event operation is invalid in current context
+    InvalidOperation { op: String },
+    /// Event timestamp is invalid (too far in future or past)
+    InvalidTimestamp { timestamp: DateTime<Utc> },
+    /// Message content is invalid
+    InvalidMessageContent { message_id: String },
+    /// Compaction state is invalid
+    InvalidCompactionState { reason: String },
+    /// Memory injection data is invalid
+    InvalidMemoryInjection { reason: String },
+}
+
+impl fmt::Display for SessionEventError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SessionEventError::InvalidEventId { event_id } => {
+                write!(f, "Invalid event ID: {}", event_id)
+            }
+            SessionEventError::IndexOutOfBounds { index, max } => {
+                write!(f, "Index {} is out of bounds (max: {})", index, max)
+            }
+            SessionEventError::InvalidOperation { op } => {
+                write!(f, "Invalid operation: {}", op)
+            }
+            SessionEventError::InvalidTimestamp { timestamp } => {
+                write!(f, "Invalid timestamp: {}", timestamp)
+            }
+            SessionEventError::InvalidMessageContent { message_id } => {
+                write!(f, "Invalid message content for message ID: {}", message_id)
+            }
+            SessionEventError::InvalidCompactionState { reason } => {
+                write!(f, "Invalid compaction state: {}", reason)
+            }
+            SessionEventError::InvalidMemoryInjection { reason } => {
+                write!(f, "Invalid memory injection: {}", reason)
+            }
+        }
+    }
+}
+
+impl Error for SessionEventError {}
 
 /// Surface operations for events in the SessionEventMap
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,9 +117,16 @@ pub struct SessionEventMap {
 }
 
 impl SessionEventMap {
-    /// Append a new event to the map
+    /// Append a new event to the map.
+    ///
+    /// Events are validated before insertion. Invalid events are skipped with a
+    /// stderr diagnostic (the event log must stay append-only and corruption-tolerant).
     pub fn append_event(&mut self, event: SessionEvent) {
-        let event_index = self.events.len();
+        if let Err(err) = self.validate_event(&event) {
+            eprintln!("session_event: skipping invalid event {}: {}", event.event_id, err);
+            return;
+        }
+        let _event_index = self.events.len();
         self.events.push(event.clone());
         
         // Update indices
@@ -175,6 +233,116 @@ impl SessionEventMap {
         let messages = self.derive_messages();
         let compaction = self.current_compaction();
         (messages, compaction)
+    }
+    
+    /// Validate an event before adding to the map
+    ///
+    /// # Arguments
+    /// * `event` - The event to validate
+    ///
+    /// # Returns
+    /// Ok(()) if event is valid, Err(SessionEventError) otherwise
+    fn validate_event(&self, event: &SessionEvent) -> Result<(), SessionEventError> {
+        // Validate event_id
+        if event.event_id.is_empty() {
+            return Err(SessionEventError::InvalidEventId {
+                event_id: event.event_id.clone()
+            });
+        }
+        
+        // Validate timestamp (not too far in future or past)
+        let now = chrono::Utc::now();
+        let timestamp_diff = (event.timestamp - now).num_seconds().abs();
+        if timestamp_diff > 86400 * 365 { // Within 1 year
+            return Err(SessionEventError::InvalidTimestamp {
+                timestamp: event.timestamp
+            });
+        }
+        
+        // Validate operation based on event type
+        match &event.op {
+            SessionEventOp::AppendMessage { message, .. } => {
+                self.validate_message(message, &event.event_id)?;
+            }
+            SessionEventOp::InsertMessage { message, .. } => {
+                self.validate_message(message, &event.event_id)?;
+            }
+            SessionEventOp::SetCompaction { compaction } => {
+                self.validate_compaction(compaction)?;
+            }
+            SessionEventOp::MemoryInjection { memory_injection } => {
+                self.validate_memory_injection(memory_injection)?;
+            }
+            SessionEventOp::ReplayEvent { replay_event } => {
+                self.validate_replay_event(replay_event)?;
+            }
+            _ => {} // Other operations don't need additional validation
+        }
+        
+        Ok(())
+    }
+    
+    /// Validate a message content
+    fn validate_message(&self, message: &StoredMessage, message_id: &str) -> Result<(), SessionEventError> {
+        if message.id.is_empty() && message_id.is_empty() {
+            return Err(SessionEventError::InvalidMessageContent {
+                message_id: message_id.to_string()
+            });
+        }
+        
+        // Validate message content structure
+        if message.content.is_empty() {
+            // Empty content is allowed for some message types
+        }
+        
+        // Additional validation can be added here
+        Ok(())
+    }
+    
+    /// Validate compaction state
+    fn validate_compaction(&self, compaction: &StoredCompactionState) -> Result<(), SessionEventError> {
+        if compaction.covers_up_to_turn > compaction.original_turn_count {
+            return Err(SessionEventError::InvalidCompactionState {
+                reason: format!(
+                    "covers_up_to_turn ({}) cannot be greater than original_turn_count ({})",
+                    compaction.covers_up_to_turn, compaction.original_turn_count
+                )
+            });
+        }
+        
+        if compaction.compacted_count > compaction.original_turn_count {
+            return Err(SessionEventError::InvalidCompactionState {
+                reason: format!(
+                    "compacted_count ({}) cannot be greater than original_turn_count ({})",
+                    compaction.compacted_count, compaction.original_turn_count
+                )
+            });
+        }
+        
+        Ok(())
+    }
+    
+    /// Validate memory injection data
+    fn validate_memory_injection(&self, injection: &StoredMemoryInjection) -> Result<(), SessionEventError> {
+        if injection.content.is_empty() {
+            return Err(SessionEventError::InvalidMemoryInjection {
+                reason: "Memory injection content cannot be empty".to_string()
+            });
+        }
+        
+        // Additional validation can be added here
+        Ok(())
+    }
+    
+    /// Validate replay event
+    fn validate_replay_event(&self, replay_event: &StoredReplayEvent) -> Result<(), SessionEventError> {
+        if replay_event.timestamp > chrono::Utc::now() {
+            return Err(SessionEventError::InvalidTimestamp {
+                timestamp: replay_event.timestamp
+            });
+        }
+        
+        Ok(())
     }
 }
 

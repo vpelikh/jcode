@@ -2,7 +2,7 @@
 
 use crate::session::event_types::SessionEventOp;
 use crate::session::Session;
-use crate::session::event_types::SessionEventMap;
+use crate::session::event_types::{SessionEvent, SessionEventMap};
 use crate::message::ContentBlock;
 use jcode_session_types::{StoredCompactionState, StoredMemoryInjection, StoredMessage};
 use jcode_message_types::Role;
@@ -296,4 +296,89 @@ fn test_session_event_map_indices() {
     let id1 = session1.event_map.events[0].event_id.clone();
     let id2 = session2.event_map.events[0].event_id.clone();
     assert_ne!(id1, id2);
+}
+
+#[test]
+fn test_session_event_validation_accepts_valid_events() {
+    let mut map = SessionEventMap::default();
+    let valid_event = SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "msg_valid".to_string(),
+        op: SessionEventOp::AppendMessage {
+            message_id: "0".to_string(),
+            message: StoredMessage {
+                id: "0".to_string(),
+                role: Role::User,
+                content: vec![text_block("hello")],
+                display_role: None,
+                timestamp: None,
+                tool_duration_ms: None,
+                token_usage: None,
+            },
+        },
+        parent_id: None,
+        version: 1,
+    };
+    map.append_event(valid_event);
+    assert_eq!(map.events.len(), 1);
+}
+
+#[test]
+fn test_session_event_validation_skips_invalid_event_id() {
+    let mut map = SessionEventMap::default();
+    let invalid_event = SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: String::new(), // invalid: empty
+        op: SessionEventOp::ClearAll,
+        parent_id: None,
+        version: 1,
+    };
+    map.append_event(invalid_event);
+    assert_eq!(map.events.len(), 0);
+}
+
+#[test]
+fn test_session_event_validation_skips_invalid_compaction() {
+    let mut map = SessionEventMap::default();
+    let invalid_event = SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "compact_bad".to_string(),
+        op: SessionEventOp::SetCompaction {
+            compaction: StoredCompactionState {
+                summary_text: "x".to_string(),
+                openai_encrypted_content: None,
+                covers_up_to_turn: 100,
+                original_turn_count: 10, // invalid: covers > original
+                compacted_count: 5,
+            },
+        },
+        parent_id: None,
+        version: 1,
+    };
+    map.append_event(invalid_event);
+    assert_eq!(map.events.len(), 0);
+}
+
+#[test]
+fn test_rederive_all_checked_consistency() {
+    let mut session = Session::create_with_id(
+        "test_session_rederive_checked".to_string(),
+        None,
+        Some("Re-derive checked".to_string()),
+    );
+    for i in 0..3 {
+        session.append_stored_message(StoredMessage {
+            id: format!("m_{}", i),
+            role: Role::User,
+            content: vec![text_block(&format!("msg {}", i))],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+    // No compaction: should be Ok and match message count
+    let (msgs, compaction) = session.rederive_all_checked().expect("derived state consistent");
+    assert_eq!(msgs.len(), 3);
+    assert!(compaction.is_none());
 }
