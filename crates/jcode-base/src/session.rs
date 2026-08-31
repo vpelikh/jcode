@@ -1,5 +1,5 @@
+use crate::message::{ContentBlock, Message};
 use crate::id::{extract_session_name, new_id, new_memorable_session_id_avoiding};
-use crate::message::{ContentBlock, Message, Role};
 pub use crate::storage::{
     SessionCounts, SessionPresence, active_session_ids, find_active_session_id_by_pid,
     mark_streaming, session_counts, session_presence, unmark_streaming, user_session_counts,
@@ -35,12 +35,13 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
+pub mod event_types;
 mod crash;
 mod journal;
 mod load_telemetry;
 mod maintenance;
 mod memory_profile;
-mod model;
+pub mod model;
 mod persistence;
 mod render;
 mod storage_paths;
@@ -53,6 +54,9 @@ pub use jcode_session_types::{
     StoredCompactionState, StoredDisplayRole, StoredMemoryInjection, StoredMessage,
     StoredTokenUsage,
 };
+use event_types::{SessionEvent, SessionEventMap};
+pub use event_types::SessionEventOp;
+use jcode_message_types::Role;
 use journal::{PersistVectorMode, SessionJournalMeta, SessionPersistState};
 pub use maintenance::prune_old_session_backups;
 pub use memory_profile::SessionMemoryProfileSnapshot;
@@ -60,7 +64,8 @@ use memory_profile::{
     ContentBlockMemoryStats, SessionMemoryProfileCache, summarize_blocks, summarize_message_content,
 };
 use model::SESSION_CONTEXT_PREFIX;
-pub use model::{StoredReplayEvent, StoredReplayEventKind};
+pub use model::StoredReplayEvent;
+pub use model::StoredReplayEventKind;
 pub use render::{
     RenderedCompactedHistoryInfo, RenderedImage, RenderedImageAnchor, RenderedImageSource,
     RenderedMessage, has_rendered_images, is_attached_image_label_text, render_images,
@@ -190,6 +195,9 @@ pub struct Session {
     /// Non-conversation UI/state events persisted for higher-fidelity replay.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub replay_events: Vec<StoredReplayEvent>,
+    /// Event-sourced session log - single source of truth for all session state
+    #[serde(skip)]
+    pub event_map: SessionEventMap,
     #[serde(skip)]
     persist_state: SessionPersistState,
     #[serde(skip)]
@@ -769,6 +777,7 @@ impl Session {
             env_snapshots: Vec::new(),
             memory_injections: Vec::new(),
             replay_events: Vec::new(),
+            event_map: SessionEventMap::default(),
             persist_state: SessionPersistState::default(),
             provider_messages_cache: Vec::new(),
             provider_message_prefix_hashes_cache: Vec::new(),
@@ -824,6 +833,7 @@ impl Session {
             env_snapshots: Vec::new(),
             memory_injections: Vec::new(),
             replay_events: Vec::new(),
+            event_map: SessionEventMap::default(),
             persist_state: SessionPersistState::default(),
             provider_messages_cache: Vec::new(),
             provider_message_prefix_hashes_cache: Vec::new(),
@@ -1268,6 +1278,21 @@ request in this new forked session, using the inherited conversation only as con
     }
 
     pub fn append_stored_message(&mut self, message: StoredMessage) {
+        // Append to event log
+        let message_id = self.messages.len().to_string();
+        let event = SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: message_id.clone(),
+            op: SessionEventOp::AppendMessage {
+                message_id,
+                message: message.clone(),
+            },
+            parent_id: None,
+            version: 1,
+        };
+        self.event_map.append_event(event);
+        
+        // Keep backward compatibility
         self.memory_profile_cache.messages_count += 1;
         self.memory_profile_cache.messages_json_bytes += estimate_json_bytes(&message);
         self.memory_profile_cache
@@ -1278,12 +1303,39 @@ request in this new forked session, using the inherited conversation only as con
     }
 
     pub fn insert_message(&mut self, index: usize, message: StoredMessage) {
+        // Append to event log
+        let message_id = format!("insert_{}", index);
+        let event = SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: message_id.clone(),
+            op: SessionEventOp::InsertMessage { index, message: message.clone() },
+            parent_id: None,
+            version: 1,
+        };
+        self.event_map.append_event(event);
+        
+        // Keep backward compatibility
         self.messages.insert(index, message);
         self.mark_memory_profile_dirty();
         self.mark_messages_full_dirty();
     }
 
     pub fn replace_messages(&mut self, messages: Vec<StoredMessage>) {
+        // Append to event log (replace all)
+        let event = SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: "replace_all".to_string(),
+            op: SessionEventOp::ReplaceMessages {
+                start_index: 0,
+                end_index: self.messages.len(),
+                messages: messages.clone(),
+            },
+            parent_id: None,
+            version: 1,
+        };
+        self.event_map.append_event(event);
+        
+        // Keep backward compatibility
         self.messages = messages;
         self.mark_memory_profile_dirty();
         self.mark_messages_full_dirty();
@@ -1291,6 +1343,20 @@ request in this new forked session, using the inherited conversation only as con
 
     pub fn truncate_messages(&mut self, len: usize) {
         if len < self.messages.len() {
+            // Append to event log
+            let event = SessionEvent {
+                timestamp: chrono::Utc::now(),
+                event_id: "truncate".to_string(),
+                op: SessionEventOp::ReplaceMessages {
+                    start_index: 0,
+                    end_index: len,
+                    messages: self.messages[..len].to_vec(),
+                },
+                parent_id: None,
+                version: 1,
+            };
+            self.event_map.append_event(event);
+            
             self.messages.truncate(len);
             self.mark_memory_profile_dirty();
             self.mark_messages_full_dirty();
@@ -1426,6 +1492,20 @@ request in this new forked session, using the inherited conversation only as con
             before_message: Some(self.messages.len()),
             timestamp: Utc::now(),
         };
+        
+        // Append to event log
+        let event = SessionEvent {
+            timestamp: injection.timestamp,
+            event_id: format!("mem_inj_{}", self.memory_injections.len()),
+            op: SessionEventOp::MemoryInjection {
+                memory_injection: injection.clone(),
+            },
+            parent_id: None,
+            version: 1,
+        };
+        self.event_map.append_event(event);
+        
+        // Keep backward compatibility
         self.memory_profile_cache.memory_injections_count += 1;
         self.memory_profile_cache.memory_injections_json_bytes += estimate_json_bytes(&injection);
         self.memory_injections.push(injection);
@@ -1446,7 +1526,7 @@ request in this new forked session, using the inherited conversation only as con
         title: Option<String>,
         content: impl Into<String>,
     ) {
-        let event = StoredReplayEvent {
+        let event_data = StoredReplayEvent {
             timestamp: Utc::now(),
             kind: StoredReplayEventKind::DisplayMessage {
                 role: role.into(),
@@ -1454,10 +1534,113 @@ request in this new forked session, using the inherited conversation only as con
                 content: content.into(),
             },
         };
+        
+        // Append to event log
+        let event = SessionEvent {
+            timestamp: event_data.timestamp,
+            event_id: format!("replay_{}", self.replay_events.len()),
+            op: SessionEventOp::ReplayEvent {
+                replay_event: event_data.clone(),
+            },
+            parent_id: None,
+            version: 1,
+        };
+        self.event_map.append_event(event);
+        
+        // Keep backward compatibility
         self.memory_profile_cache.replay_events_count += 1;
-        self.memory_profile_cache.replay_events_json_bytes += estimate_json_bytes(&event);
-        self.replay_events.push(event);
+        self.memory_profile_cache.replay_events_json_bytes += estimate_json_bytes(&event_data);
+        self.replay_events.push(event_data);
         self.mark_replay_events_append_dirty();
+    }
+
+    /// Record an already-constructed replay event into the event log.
+    pub fn record_replay_event(&mut self, replay_event: &StoredReplayEvent) {
+        let event = SessionEvent {
+            timestamp: replay_event.timestamp,
+            event_id: format!("replay_{}", self.replay_events.len()),
+            op: SessionEventOp::ReplayEvent {
+                replay_event: replay_event.clone(),
+            },
+            parent_id: None,
+            version: 1,
+        };
+        self.event_map.append_event(event);
+        self.memory_profile_cache.replay_events_count += 1;
+        self.memory_profile_cache.replay_events_json_bytes += estimate_json_bytes(replay_event);
+        self.replay_events.push(replay_event.clone());
+        self.mark_replay_events_append_dirty();
+    }
+
+    /// Get current messages from event log (derives pure state)
+    pub fn derive_messages(&self) -> Vec<StoredMessage> {
+        self.event_map.derive_messages()
+    }
+
+    /// Get current compaction from event log (derives pure state)
+    pub fn derive_compaction(&self) -> Option<StoredCompactionState> {
+        self.event_map.current_compaction()
+    }
+
+    /// Get memory injections from event log (derives pure state)
+    pub fn derive_memory_injections(&self) -> Vec<StoredMemoryInjection> {
+        self.event_map.memory_injections()
+    }
+
+    /// Get replay events from event log (derives pure state)
+    pub fn derive_replay_events(&self) -> Vec<StoredReplayEvent> {
+        self.event_map.replay_events()
+    }
+
+    /// Set compaction state in event log
+    pub fn set_compaction(&mut self, compaction: StoredCompactionState) {
+        let event = SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: "set_compaction".to_string(),
+            op: SessionEventOp::SetCompaction {
+                compaction: compaction.clone(),
+            },
+            parent_id: None,
+            version: 1,
+        };
+        self.event_map.append_event(event);
+        self.compaction = Some(compaction);
+        self.mark_messages_append_dirty();
+    }
+
+    /// Fork session up to a boundary (returns new session with prefix of events)
+    pub fn fork_up_to_boundary(&self, boundary_index: usize) -> Self {
+        let mut fork = self.clone();
+        
+        // Create fork with prefix of events
+        fork.event_map = self.event_map.fork_up_to_boundary(boundary_index);
+        
+        // Reset the derived fields for the fork
+        fork.messages = fork.derive_messages();
+        fork.compaction = fork.derive_compaction();
+        fork.memory_injections = fork.derive_memory_injections();
+        fork.replay_events = fork.derive_replay_events();
+        
+        // Generate new ID for the fork
+        fork.id = new_id("fork");
+        fork.updated_at = chrono::Utc::now();
+        
+        fork
+    }
+
+    /// Re-derive all state from event log (pure computation)
+    pub fn rederive_all(&self) -> (Vec<StoredMessage>, Option<StoredCompactionState>) {
+        let messages = self.derive_messages();
+        let compaction = self.derive_compaction();
+        (messages, compaction)
+    }
+
+    /// Ensure backward compatibility - update messages from event log if needed
+    pub fn sync_backward_compatibility(&mut self) {
+        let derived_messages = self.derive_messages();
+        if self.messages.len() != derived_messages.len() {
+            self.messages = derived_messages;
+        }
     }
 
     pub fn record_swarm_status_event(&mut self, members: Vec<crate::protocol::SwarmMemberStatus>) {
