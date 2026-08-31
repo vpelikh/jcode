@@ -473,7 +473,7 @@ impl Agent {
     fn seed_compaction_from_session(&mut self) {
         // Read the event-sourced log once; on resume this is hydrated from disk
         // in Session::load_from_path so it reflects the full transcript.
-        let messages = self.session.event_map.derive_messages();
+        let messages = self.session.derive_messages();
         logging::info(&format!(
             "seed_compaction_from_session: session has {} messages via event log",
             messages.len()
@@ -491,7 +491,7 @@ impl Agent {
         manager.reset();
         let budget = self.provider.context_window();
         manager.set_budget(budget);
-        let current_compaction = self.session.event_map.current_compaction();
+        let current_compaction = self.session.derive_compaction();
         if let Some(state) = current_compaction {
             manager.restore_persisted_stored_state_with(&state, &messages);
         } else {
@@ -510,7 +510,7 @@ impl Agent {
         if let Some(state) = sanitized_state {
             self.session.compaction = state.clone();
             if let Some(inner) = state {
-                self.session.event_map.append_event(SessionEvent {
+                self.session.append_session_event(SessionEvent {
                     timestamp: Utc::now(),
                     event_id: format!("compaction_{}", self.session.messages.len()),
                     op: SessionEventOp::SetCompaction { compaction: inner },
@@ -818,7 +818,7 @@ impl Agent {
     }
 
     fn repair_missing_tool_outputs(&mut self) -> usize {
-        let messages = self.session.event_map.derive_messages();
+        let messages = self.session.derive_messages();
         
         if self.tool_output_scan_index > messages.len() {
             self.reset_tool_output_tracking();
@@ -905,7 +905,7 @@ impl Agent {
             inserted += missing_for_message.len();
         }
 
-        self.tool_output_scan_index = self.session.event_map.derive_messages().len();
+        self.tool_output_scan_index = self.session.derive_messages().len();
 
         if repaired > 0 {
             self.persist_session_best_effort("missing tool-output repair");
