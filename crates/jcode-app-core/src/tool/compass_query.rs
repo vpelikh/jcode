@@ -3,11 +3,12 @@
 //! `compass_query` is a first-class, always-available tool (like `read` or
 //! `agentgrep`). It integrates Compass as a pure library: there is no MCP
 //! server and no CLI subprocess. The first query in a project builds the
-//! Compass index in-process and caches it under `.jcode/cache/compass`; every
-//! later query reuses that cache, so the (relatively expensive) build runs at
-//! most once per project. The cache is automatically rebuilt when source files
-//! change (a stale index is detected and refreshed), and can also be forced by
-//! deleting the cache dir.
+//! Compass index in-process and caches it under `.jcode/cache/compass`. A warm
+//! index is reused for subsequent queries, so the build runs only when the
+//! project has never been indexed or when source has changed since the last
+//! build. On a rebuild Compass reuses its persisted AST cache (incremental
+//! extract), so changed files are re-extracted rather than the whole project.
+//! The index can also be force-refreshed by deleting the cache dir.
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use compass_core::{build_graph_with_layers, BuildOptions, BuildPurpose};
@@ -232,6 +233,11 @@ where
 /// query on a failed scan). We compare the index mtime against the newest mtime
 /// among source files Compass can parse; new/moved dirs are also detected because
 /// the walk descends through them.
+///
+/// NOTE: this runs on every query that has an existing index, so the walk cost
+/// is paid on the warm path too. It is the price of correct staleness; the walk
+/// only recurses into source dirs and skips VCS/build caches, so it stays
+/// proportional to the project's source footprint rather than its build outputs.
 fn index_is_stale(root: &Path, graph_path: &Path) -> bool {
     let Ok(index_meta) = std::fs::metadata(graph_path) else {
         return false; // No index (or unreadable): handle the cold case elsewhere.
@@ -281,43 +287,44 @@ fn index_is_stale(root: &Path, graph_path: &Path) -> bool {
 }
 
 /// Open the Compass engine for `graph_path`, building (or rebuilding) it under a
-/// project flock when it is missing or stale. Returns the engine, or
+/// project flock when it is missing, corrupt, or stale. Returns the engine, or
 /// `(open_err, build_err)` describing why neither an open nor a build succeeded.
 ///
-/// Both the initial open and the rebuild run inside `with_build_lock`: the flock
-/// serializes concurrent/stale rebuilds so two parallel calls can't write
-/// `graph.json` at once.
+/// Staleness is checked *before* an opened engine is trusted: a valid-but-old
+/// index must not be served, so a present index is only reused when
+/// `index_is_stale` reports no newer source. Both the open probe and any rebuild
+/// run inside `with_build_lock`, which serializes concurrent/stale rebuilds so
+/// two parallel calls can't write `graph.json` at once.
 fn ensure_fresh_engine(
     graph_path: &Path,
     cache_dir: &Path,
     working_dir: &Path,
 ) -> std::result::Result<compass_query::CodeQueryEngine, (String, String)> {
     with_build_lock(cache_dir, || {
-        // Another caller may have finished a build while we waited for the lock;
-        // reuse it instead of rebuilding.
-        if let Ok(engine) = compass_query::open(graph_path, None, cache_dir) {
-            return Ok(engine);
-        }
-        let open_err = match compass_query::open(graph_path, None, cache_dir) {
-            Ok(engine) => return Ok(engine),
-            Err(e) => e.to_string(),
-        };
-
-        if index_is_stale(working_dir, graph_path) {
-            // Best-effort: empty the stale output so a partial build can't be
-            // reopened. A failure here is reported via the subsequent build error.
-            let _ = std::fs::remove_dir_all(cache_dir.join("compass-out"));
+        // Open an existing index. Reuse it only when source hasn't moved past it.
+        match compass_query::open(graph_path, None, cache_dir) {
+            Ok(engine) if !index_is_stale(working_dir, graph_path) => return Ok(engine),
+            Ok(stale_engine) => {
+                // Valid but stale: discard it and rebuild below so we never serve
+                // source that has since changed.
+                drop(stale_engine);
+                let _ = std::fs::remove_dir_all(cache_dir.join("compass-out"));
+            }
+            Err(_) => {
+                // Missing or corrupt: rebuild below.
+            }
         }
 
-        match build_compass_index(working_dir, cache_dir) {
-            Ok(()) => compass_query::open(graph_path, None, cache_dir).map_err(|e| {
-                (
-                    open_err,
-                    format!("Index was built but could not be opened: {e}"),
-                )
-            }),
-            Err(build_err) => Err((open_err, build_err.to_string())),
-        }
+        // Build (covers missing, corrupt, or stale). `cache_root` makes this
+        // incremental on a repeat build, re-extracting only changed files.
+        build_compass_index(working_dir, cache_dir)
+            .map_err(|e| ("existing index missing or stale".to_string(), e.to_string()))?;
+        compass_query::open(graph_path, None, cache_dir).map_err(|e| {
+            (
+                "existing index missing or stale".to_string(),
+                format!("Index was built but could not be opened: {e}"),
+            )
+        })
     })
 }
 
@@ -325,15 +332,21 @@ fn ensure_fresh_engine(
 /// Compass library API (`compass_core::build_graph_with_layers`). The resulting
 /// store is written into `output_dir` so the project tree stays untouched.
 ///
-/// This runs once per project: the output is cached under `output_dir` and the
-/// caller re-opens it via `compass_query::open`, so subsequent queries skip the
-/// (relatively expensive) build entirely.
+/// `cache_root` points at the same dir as `output_dir` so Compass can persist
+/// its AST-fact digests across builds. On a rebuild (stale index) this lets
+/// Compass re-extract only changed files instead of the whole project, i.e. the
+/// index is incrementally maintained rather than fully re-derived each time.
+///
+/// The output is cached under `output_dir` and the caller re-opens it via
+/// `compass_query::open`, so subsequent queries skip the build entirely unless
+/// source has since changed.
 fn build_compass_index(
     root: &std::path::Path,
     output_dir: &std::path::Path,
 ) -> Result<(), anyhow::Error> {
     let mut options = BuildOptions::new(root);
     options.output_root = Some(output_dir.to_path_buf());
+    options.cache_root = Some(output_dir.to_path_buf());
     options.purpose = BuildPurpose::Extract;
     options.scan_filesystem = true;
     options.graph_storage = compass_core::GraphStorage::Json;
@@ -596,12 +609,21 @@ mod tests {
     }
 
     // A stale index must be transparently rebuilt when the tool is invoked, with
-    // no manual cache deletion required by the caller.
+    // no manual cache deletion required by the caller. This verifies a rebuild
+    // actually happened (the index mtime advances) rather than just that the
+    // query succeeds — a valid-but-stale index would also satisfy the latter.
     #[tokio::test]
     async fn stale_index_is_rebuilt_on_query() {
         let (_tmp, root, cache) = make_isolated_project();
         let graph_path = cache.join("compass-out").join("graph.json");
         build_compass_index(&root, &cache).expect("build");
+
+        let out_dir = cache.join("compass-out");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let before = std::fs::metadata(&out_dir)
+            .expect("index dir exists")
+            .modified()
+            .expect("index dir mtime");
 
         std::thread::sleep(std::time::Duration::from_millis(10));
         let mut f = std::fs::File::create(root.join("added.rs")).unwrap();
@@ -626,9 +648,66 @@ mod tests {
             "stale index should rebuild and not report unavailability: {}",
             out.output
         );
+
+        // The rebuild must have refreshed the index on disk (the compass-out dir
+        // is recreated on a rebuild, so its mtime advances).
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let after = std::fs::metadata(&out_dir)
+            .expect("index dir exists after query")
+            .modified()
+            .expect("index dir mtime after");
+        assert!(
+            after > before,
+            "stale index must be rebuilt (dir mtime {after:?} should be after {before:?})"
+        );
         assert!(
             compass_query::open(&graph_path, None, &cache).is_ok(),
             "rebuilt index must be openable"
+        );
+    }
+
+    // A fresh (non-stale) index must be served as-is: a follow-up query with no
+    // source change must NOT rebuild it (the index dir mtime stays stable). This
+    // guards against regressions where the cache is needlessly discarded.
+    #[tokio::test]
+    async fn fresh_index_is_not_rebuilt_on_query() {
+        let (_tmp, root, cache) = make_isolated_project();
+        let out_dir = cache.join("compass-out");
+        build_compass_index(&root, &cache).expect("build");
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let before = std::fs::metadata(&out_dir)
+            .expect("index dir exists")
+            .modified()
+            .expect("index dir mtime");
+
+        let ctx = ToolContext {
+            session_id: "s".into(),
+            message_id: "m".into(),
+            tool_call_id: "t".into(),
+            working_dir: Some(root),
+            stdin_request_tx: None,
+            graceful_shutdown_signal: None,
+            execution_mode: ToolExecutionMode::Direct,
+        };
+        let out = CompassQueryTool::new()
+            .execute(serde_json::json!({ "query": "authentication" }), ctx)
+            .await
+            .expect("execute");
+        assert!(
+            !out.output.contains("is not available for this project yet"),
+            "fresh index query should succeed: {}",
+            out.output
+        );
+
+        // No rebuild => the index dir mtime is unchanged.
+        let after = std::fs::metadata(&out_dir)
+            .expect("index dir exists after query")
+            .modified()
+            .expect("index dir mtime after");
+        assert_eq!(
+            after, before,
+            "fresh index must not be rebuilt when source is unchanged"
         );
     }
 
