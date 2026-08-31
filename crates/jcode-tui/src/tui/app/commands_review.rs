@@ -712,6 +712,7 @@ fn clone_session_for_review(
     child.autoreview_enabled = Some(false);
     child.autojudge_enabled = Some(false);
     child.status = crate::session::SessionStatus::Closed;
+    child.rebuild_event_map();
     child.save()?;
     Ok((child.id.clone(), child.display_name().to_string()))
 }
@@ -732,6 +733,7 @@ fn clone_session_for_prompt(app: &App) -> anyhow::Result<(String, String)> {
     // forked agent so it treats the next prompt as fresh work instead of
     // continuing (and duplicating) the parent's current turn.
     child.append_fork_notice(&parent_session_id, app.session.display_name());
+    child.rebuild_event_map();
     child.save()?;
     Ok((child.id.clone(), child.display_name().to_string()))
 }

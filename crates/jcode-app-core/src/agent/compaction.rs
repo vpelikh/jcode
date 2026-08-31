@@ -237,6 +237,11 @@ impl Agent {
             self.sync_session_compaction_state_from_manager(&manager);
         }
 
+        // `strip_oversized_images` and `emergency_truncate_tool_results` mutate
+        // `self.session.messages` in-place without emitting events. Rebuild the
+        // event log so it stays in sync with the modified transcript.
+        self.session.rebuild_event_map();
+
         self.cache_tracker.reset();
         self.locked_tools = None;
         self.provider_session_id = None;
