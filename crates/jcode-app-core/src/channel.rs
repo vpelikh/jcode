@@ -1853,6 +1853,10 @@ mod tests {
         }
     }
 
+    // The test-env lock is held across the `.await` points on purpose (it
+    // isolates JCODE_HOME and the recent-session index for the whole test), so
+    // clippy's await_holding_lock finding is intentional here.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn test_session_picker_menu_flow() {
         // Isolate the recent-session index (and the per-chat active-session
