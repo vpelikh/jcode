@@ -143,21 +143,23 @@ impl Tool for CompassQueryTool {
             }
         };
 
+        let effective_limit = params.limit.unwrap_or(20).max(1);
         let result = execute_query(
             &engine,
             &params.query,
             params.path.as_deref(),
-            params.limit.unwrap_or(20).max(1),
+            effective_limit,
             params.intent.as_deref().unwrap_or("search"),
         );
 
+        let reported_limit = effective_limit;
         match result {
             Ok(output) => Ok(ToolOutput::new(output)
                 .with_title(format!("compass_query: {}", params.query))
                 .with_metadata(json!({
                     "engine": "compass",
                     "intent": params.intent.unwrap_or_else(|| "search".to_string()),
-                    "limit": params.limit.unwrap_or(20),
+                    "limit": reported_limit,
                     "path_filter": params.path,
                 }))),
             Err(e) => Ok(ToolOutput::new(format_query_error(
@@ -408,9 +410,6 @@ fn ensure_fresh_engine(
     working_dir: &Path,
 ) -> std::result::Result<compass_query::CodeQueryEngine, (String, String)> {
     with_build_lock(cache_dir, || {
-        // Get the current git SHA once so we can compare it against the cached one.
-        let current_sha = current_git_sha(working_dir);
-
         // Open an existing index. Reuse it only when source and branch haven't
         // moved past it. The mtime scan that proves freshness is throttled to
         // once per STALE_RESCAN_TTL per project (see `recently_scanned`/
@@ -420,6 +419,10 @@ fn ensure_fresh_engine(
         // this cache), so a source change is caught by the first query after the
         // window, never served indefinitely. A branch change bypasses the TTL
         // and forces a rebuild immediately.
+        //
+        // `current_sha` is resolved lazily only when we actually have to
+        // reconcile staleness against an open index: it shells out to `git`, so
+        // we avoid that per query on the warm, recently-scanned path.
         match compass_query::open(graph_path, None, cache_dir) {
             Ok(engine) => {
                 // Reuse the index only when nothing has moved past it.
@@ -427,6 +430,7 @@ fn ensure_fresh_engine(
                 // branch/commit switch is detected immediately and bypasses the
                 // throttled mtime walk; otherwise it relies on the per-cache
                 // STALE_RESCAN_TTL to skip the walk, and finally walks the tree.
+                let current_sha = current_git_sha(working_dir);
                 if !index_is_stale(working_dir, graph_path, current_sha.as_deref(), cache_dir) {
                     record_scan(cache_dir);
                     return Ok(engine);
@@ -438,7 +442,8 @@ fn ensure_fresh_engine(
                 let _ = std::fs::remove_dir_all(cache_dir.join("compass-out"));
             }
             Err(_) => {
-                // Missing or corrupt: rebuild below.
+                // Missing or corrupt: rebuild below (current_sha is captured by
+                // build_compass_index itself).
             }
         }
 
