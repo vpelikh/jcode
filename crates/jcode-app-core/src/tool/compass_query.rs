@@ -362,7 +362,11 @@ fn looks_like_sha(name: &str) -> bool {
 /// reachable from `working_dir`'s repo and have not been touched within the
 /// retention window. This keeps `~/.jcode/compass/<project>/` bounded as a user
 /// visits many commits. Best-effort: any failure just skips pruning.
-fn prune_stale_sha_outputs(project_root: &Path, working_dir: &Path) {
+///
+/// `current_sha` (the HEAD this build is for) is always kept, even if it is a
+/// detached checkout that no ref points to — pruning it would delete the index
+/// the very worktree currently uses.
+fn prune_stale_sha_outputs(project_root: &Path, working_dir: &Path, current_sha: &str) {
     // Never prune the shared AST cache, the non-git workspace, or any lock file.
     let Some(reachable) = git_reachable_shas(working_dir) else {
         return;
@@ -380,7 +384,11 @@ fn prune_stale_sha_outputs(project_root: &Path, working_dir: &Path) {
         if name == AST_CACHE_DIR || name == WORKSPACE_DIR || !looks_like_sha(name) {
             continue;
         }
-        // Reachable commits (HEAD or any branch) are kept regardless of age.
+        // The current HEAD is always kept, even a detached HEAD with no ref.
+        if name == current_sha {
+            continue;
+        }
+        // Reachable commits (any branch/tag) are kept regardless of age.
         if reachable.contains(name) {
             continue;
         }
@@ -845,9 +853,12 @@ fn ensure_fresh_engine(
             record_scan(output_dir);
         } else {
             // Prune unreachable, aged-out per-SHA graphs so the shared cache
-            // does not grow unbounded as the user visits many commits.
-            if let Some(project_root) = output_dir.parent() {
-                prune_stale_sha_outputs(project_root, working_dir);
+            // does not grow unbounded as the user visits many commits. Always
+            // keep the current HEAD's dir, even a detached HEAD with no ref.
+            if let Some(project_root) = output_dir.parent()
+                && let Some(current_sha) = current_git_sha_cached(working_dir)
+            {
+                prune_stale_sha_outputs(project_root, working_dir, &current_sha);
             }
         }
         compass_query::open(graph_path, None, output_dir).map_err(|e| {
@@ -1860,7 +1871,7 @@ mod tests {
         let filetime_old = filetime::FileTime::from_system_time(old);
         filetime::set_file_mtime(project_root.join(&stale_sha), filetime_old).unwrap();
 
-        prune_stale_sha_outputs(&project_root, &root);
+        prune_stale_sha_outputs(&project_root, &root, &head_sha);
 
         assert!(
             project_root.join(&head_sha).exists(),
@@ -1877,6 +1888,62 @@ mod tests {
         assert!(
             !project_root.join(&stale_sha).exists(),
             "old, unreachable per-SHA dir must be pruned"
+        );
+    }
+
+    // The current HEAD's per-SHA dir must survive GC even when that commit is a
+    // detached checkout (unreachable from any ref): pruning it would delete the
+    // index the very worktree currently uses.
+    #[test]
+    fn prune_keeps_detached_head_even_if_unreachable() {
+        let (_home, _home_path) = HomeGuard::set();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        let git = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init", "-q"]) {
+            return;
+        }
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(root.join("main.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "."]);
+        if !git(&["commit", "-qm", "init"]) {
+            return;
+        }
+        if current_git_sha(&root).is_none() {
+            return;
+        }
+        // Move HEAD off the only ref so the commit is unreachable (detached);
+        // create a sibling commit so the old one has no ref.
+        let old_sha = current_git_sha(&root).unwrap();
+        git(&["checkout", "-q", "-b", "other"]);
+        std::fs::write(root.join("main.rs"), "fn b() {}\n").unwrap();
+        git(&["commit", "-aqm", "other"]);
+
+        let project_root = root.join("compass/proj");
+        std::fs::create_dir_all(project_root.join(&old_sha)).unwrap();
+        let old = std::time::SystemTime::now()
+            .checked_sub(SHA_RETENTION_TTL + std::time::Duration::from_secs(1))
+            .unwrap();
+        filetime::set_file_mtime(
+            project_root.join(&old_sha),
+            filetime::FileTime::from_system_time(old),
+        )
+        .unwrap();
+
+        // Simulate the user currently being on old_sha (detached): GC must keep it.
+        prune_stale_sha_outputs(&project_root, &root, &old_sha);
+        assert!(
+            project_root.join(&old_sha).exists(),
+            "detached current HEAD must be kept even though it is unreachable and old"
         );
     }
 
