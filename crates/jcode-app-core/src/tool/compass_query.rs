@@ -626,6 +626,13 @@ fn current_git_top_cached(working_dir: &Path) -> Option<String> {
 /// the git common dir (identical across all worktrees) and falling back to the
 /// working-tree toplevel for older git. Returns `None` when git is unavailable
 /// or `working_dir` is not inside a git repo.
+///
+/// Note on the fallback: `--show-toplevel` resolves to the *current worktree's*
+/// own top directory, which differs for each linked worktree. That is safe
+/// (it never causes cross-worktree contamination), but on git < 2.31 the
+/// shared-cache benefit across linked worktrees is reduced because each worktree
+/// maps to its own identity. The absolute common-dir primary path (git >= 2.31)
+/// is what actually gives all worktrees one shared key.
 fn git_repo_identity(working_dir: &Path) -> Option<String> {
     // Primary: absolute common dir.
     let common = std::process::Command::new("git")
