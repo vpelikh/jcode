@@ -1034,12 +1034,19 @@ fn load_preferred_tools_files_from_dir(working_dir: Option<&Path>) -> (Option<St
     let mut total_chars = 0usize;
 
     let load_file = |path: &Path, label: &str| -> Option<(String, usize)> {
+        // Only treat an existing, non-blank file as guidance. A whitespace-only
+        // or empty `preferred-tools.md` should fall through to the built-in
+        // default rather than silently disabling it (mirrors
+        // `load_base_system_prompt`).
         if path.exists() {
-            std::fs::read_to_string(path).ok().map(|content| {
+            let content = std::fs::read_to_string(path).ok()?;
+            if !content.trim().is_empty() {
                 let raw_size = content.len();
                 let formatted = format!("# {}\n\n{}", label, content.trim());
-                (formatted, raw_size)
-            })
+                Some((formatted, raw_size))
+            } else {
+                None
+            }
         } else {
             None
         }
