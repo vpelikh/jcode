@@ -352,10 +352,11 @@ fn git_reachable_shas(working_dir: &Path) -> Option<std::collections::HashSet<St
     Some(shas)
 }
 
-/// True if `name` looks like a git commit hash (40 hex chars), i.e. a per-SHA
-/// output dir that GC may consider.
+/// True if `name` looks like a git commit hash (40 hex for SHA-1, or 64 hex for
+/// SHA-256 object format), i.e. a per-SHA output dir that GC may consider.
 fn looks_like_sha(name: &str) -> bool {
-    name.len() == 40 && name.chars().all(|c| c.is_ascii_hexdigit())
+    let len = name.len();
+    (len == 40 || len == 64) && name.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Garbage-collect per-SHA output dirs under `project_root` that are no longer
@@ -1806,8 +1807,10 @@ mod tests {
     fn looks_like_sha_classifies_commit_hashes() {
         assert!(looks_like_sha(&"a".repeat(40)));
         assert!(looks_like_sha(&"0".repeat(40)));
+        assert!(looks_like_sha(&"a".repeat(64)), "sha256-object-format hash");
         assert!(!looks_like_sha("short"));
         assert!(!looks_like_sha(&"g".repeat(40)), "non-hex must not match");
+        assert!(!looks_like_sha(&"g".repeat(64)), "non-hex 64 must not match");
         assert!(!looks_like_sha(AST_CACHE_DIR));
         assert!(!looks_like_sha(WORKSPACE_DIR));
     }
