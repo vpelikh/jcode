@@ -1255,6 +1255,14 @@ pub(super) fn maybe_enter_review_loop(app: &mut App) {
     if app.is_remote || app.is_replay || !app.autoreview_enabled {
         return;
     }
+    // Skip auto-seeding under the unit-test harness: the loop drives
+    // independent reviewer child sessions, which would add non-deterministic
+    // state to tests that complete todos. The loop still runs in the real
+    // product (normal TUI / remote client). Review-loop logic itself is still
+    // unit-tested directly against the engine and command surface.
+    if app.runtime_mode == super::AppRuntimeMode::TestHarness {
+        return;
+    }
     if !crate::config::config().autoreview.loop_mode {
         return;
     }
