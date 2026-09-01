@@ -462,19 +462,41 @@ impl StatusSpinnerRenderer {
 
     /// Render a full frame into the live terminal.
     ///
-    /// This is the only production entry point into a full repaint. It wraps
-    /// [`Self::draw_full_core`] in a synchronized-update window so the whole frame
-    /// (clear/invalidate + diff flush) applies atomically, always closes that window
-    /// (even on a failed draw, so the terminal is not left in sync mode), and re-shows
-    /// the cursor after a failed frame (the errored draw in `draw_full_core` returns
-    /// before the composer reaches its own re-show). Every call site routes through
-    /// here; [`Self::draw_full_core`] is the backend-generic body, kept separate so
+    /// This is the only production entry point into a full repaint. It dispatches to
+    /// the backend-generic [`Self::draw_full_with`], which owns the synchronized-
+    /// update window and the cursor error-recovery. Every call site routes through
+    /// here; [`Self::draw_full_core`] is the backend-generic body kept separate so
     /// tests can drive the real production path against a captured backend.
     pub(super) fn draw_full(
         &mut self,
         app: &mut App,
         terminal: &mut DefaultTerminal,
     ) -> Result<()> {
+        self.draw_full_with(app, terminal)
+    }
+
+    /// The synchronized-update wrapper shared by every full-frame repaint.
+    ///
+    /// Splitting this out generically (rather than inlining it in
+    /// [`Self::draw_full`], which is pinned to `DefaultTerminal = CrosstermBackend<Stdout>`)
+    /// lets a test drive the exact wrapper — the `BeginSynchronizedUpdate` /
+    /// `EndSynchronizedUpdate` window and the error-path cursor re-show — against a
+    /// captured `CrosstermBackend<Vec<u8>>`, instead of leaving it untestable on
+    /// real stdout.
+    ///
+    /// On a failed draw `draw_full_core` has already hidden the cursor but the
+    /// composer never reached its re-show (the errored `terminal.draw` aborts before
+    /// `apply_buffer_with_cursor` restores the caret). Re-show it so a fatal frame
+    /// error cannot leave the terminal with the cursor hidden after teardown.
+    pub(super) fn draw_full_with<B>(
+        &mut self,
+        app: &mut App,
+        terminal: &mut ratatui::Terminal<B>,
+    ) -> Result<()>
+    where
+        B: ratatui::backend::Backend + Write,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
         // Wrap the whole frame in a synchronized update so the terminal applies
         // every cell change atomically. Without this, ratatui's crossterm backend
         // streams cells one-by-one and eagerly-repainting terminals (and slow/remote
@@ -486,10 +508,9 @@ impl StatusSpinnerRenderer {
         if sync {
             let _ = crossterm::execute!(terminal.backend_mut(), EndSynchronizedUpdate);
         }
-        // On a failed draw, `draw_full_core` has already hidden the cursor but the
-        // composer never reached its re-show (the errored `terminal.draw` aborts before
-        // `apply_buffer_with_cursor` restores the caret). Re-show it so a fatal frame
-        // error cannot leave the terminal with the cursor hidden after teardown.
+        // On a failed draw the cursor was hidden but the composer's re-show never ran
+        // (see the note above); re-show it so a fatal frame error cannot leave the
+        // terminal with the caret hidden after teardown.
         if result.is_err() {
             let _ = crossterm::execute!(terminal.backend_mut(), Show);
         }

@@ -1914,3 +1914,69 @@ fn scroll_repaint_hides_cursor_before_cell_moves_via_draw_core() {
         );
     }
 }
+
+/// The production entry point to a full-frame repaint is [`StatusSpinnerRenderer::draw_full`],
+/// which delegates to the backend-generic [`StatusSpinnerRenderer::draw_full_with`] wrapper. That
+/// wrapper owns two things the `draw_full_core` body does not: the synchronized-update window
+/// (`ESC[?2026h` / `ESC[?2026l`) and the error-path cursor re-show. This test drives the exact
+/// wrapper against a captured `CrosstermBackend<Vec<u8>>` and asserts:
+///   - the sync window opens (`?2026h`) and closes (`?2026l`);
+///   - the cursor `Hide` (`?25l`) precedes the first cell `MoveTo` (the sweep guard);
+///   - the composer re-shows the caret (`?25h`) inside the frame.
+#[test]
+fn full_frame_wrapper_opens_and_closes_sync_window_around_cursor_hidden_draw() {
+    use regex::Regex;
+    // draw_full_with/ draw_full_core render through the shared unscoped ui::draw, which
+    // mutates process-global render state (layout snapshots, mermaid, etc.). Serialize
+    // with the sibling scroll/repaint tests exactly as they do.
+    let _render_lock = scroll_render_test_lock();
+
+    let mut app = create_test_app();
+    app.force_full_repaint = true; // the exact flag scroll_up/scroll_down set
+
+    let stream = {
+        let mut output: Vec<u8> = Vec::new();
+        let mut renderer = crate::tui::app::run_shell::StatusSpinnerRenderer::default();
+        let backend = ratatui::backend::CrosstermBackend::new(&mut output);
+        let mut terminal = ratatui::Terminal::new(backend).expect("capture terminal");
+        renderer
+            .draw_full_with(&mut app, &mut terminal)
+            .expect("draw_full_with");
+        drop(terminal); // release the backend borrow on `output`
+        String::from_utf8_lossy(&output).into_owned()
+    };
+
+    let begin_sync = "\u{1b}[?2026h";
+    let end_sync = "\u{1b}[?2026l";
+    let hide = "\u{1b}[?25l";
+    let show = "\u{1b}[?25h";
+    let move_re = Regex::new(r"\x1b\[[0-9]+;[0-9]+H").expect("static move-regex");
+
+    let first_moveto = move_re.find(&stream).expect("full frame must emit a cell MoveTo");
+    let hide_at = stream
+        .find(hide)
+        .unwrap_or_else(|| panic!("full wrapper must hide the cursor; got: {stream:?}"));
+    let show_at = stream
+        .find(show)
+        .unwrap_or_else(|| panic!("composer frame must re-show the caret; got: {stream:?}"));
+    let begin_at = stream
+        .find(begin_sync)
+        .unwrap_or_else(|| panic!("wrapper must open the sync window; got: {stream:?}"));
+    let end_at = stream
+        .find(end_sync)
+        .unwrap_or_else(|| panic!("wrapper must close the sync window; got: {stream:?}"));
+
+    assert!(
+        begin_at < end_at,
+        "sync window must open before it closes; begin@{begin_at} end@{end_at}"
+    );
+    assert!(
+        begin_at <= hide_at && end_at >= show_at,
+        "the whole hide/log/re-show must sit inside the sync window; begin@{begin_at} hide@{hide_at} show@{show_at} end@{end_at}"
+    );
+    assert!(
+        hide_at <= first_moveto.start(),
+        "Hide must precede the first MoveTo; hide@{hide_at} move@{}",
+        first_moveto.start()
+    );
+}
