@@ -684,7 +684,11 @@ impl TelegramChannel {
             .filter(|n| (1..=50).contains(n))
             .unwrap_or(10);
         match crate::server::telegram_control::render_session_history(&session_id, limit) {
-            Ok(text) if text != "(no visible messages)" => format!("📜 [{}]\n{}", short_id(&session_id), text),
+            Ok(text) if text != "(no visible messages)" => {
+                // Escape only the dynamic message bodies so the history cannot
+                // break parse_mode=MarkdownV2, while keeping the role labels bold.
+                format!("📜 [{}]\n{}", short_id(&session_id), escape_history_entries(&text))
+            }
             Ok(text) => format!("[{}] {}", short_id(&session_id), text),
             Err(e) => format!(
                 "⚠️ Could not read history for `{}`: {}",
@@ -1331,6 +1335,27 @@ fn peek_preview_lines(entries: &str) -> Vec<String> {
             crate::telegram::escape_markdown_v2(text)
         })
         .collect()
+}
+
+/// Escape the body text of a `render_session_history` block while preserving
+/// each line's role prefix (`🧑 *you:* <text>` / `🤖 *jcode:* <text>`). The
+/// unchanged role markers stay bold; only the dynamic body is escaped so the
+/// history cannot break `parse_mode=MarkdownV2`.
+fn escape_history_entries(entries: &str) -> String {
+    entries
+        .split("\n\n")
+        .filter(|s| !s.trim().is_empty())
+        .map(|para| {
+            if let Some(body) = para.strip_prefix("🧑 *you:* ") {
+                format!("🧑 *you:* {}", crate::telegram::escape_markdown_v2(body))
+            } else if let Some(body) = para.strip_prefix("🤖 *jcode:* ") {
+                format!("🤖 *jcode:* {}", crate::telegram::escape_markdown_v2(body))
+            } else {
+                crate::telegram::escape_markdown_v2(para)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// Returns a small guidance footer for use after error or help messages,
@@ -2857,5 +2882,18 @@ mod tests {
         );
         assert!(peek_preview_lines("").is_empty());
         assert!(peek_preview_lines("   \n\n  ").is_empty());
+    }
+
+    #[test]
+    fn test_escape_history_entries_preserves_labels_and_escapes_bodies() {
+        // The `*role*` markers stay bold; only the dynamic body is escaped.
+        let entries = "🧑 *you:* hello _world_\n\n🤖 *jcode:* reply `x` & [y]";
+        let out = escape_history_entries(entries);
+        let expected =
+            "🧑 *you:* hello \\_world\\_\n\n🤖 *jcode:* reply \\`x\\` & \\[y\\]";
+        assert_eq!(out, expected);
+        // A body with no role prefix is escaped wholesale.
+        let plain = escape_history_entries("solo _line_");
+        assert_eq!(plain, "solo \\_line\\_");
     }
 }
