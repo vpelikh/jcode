@@ -920,3 +920,93 @@ fn test_rebuild_event_map_after_clearing_compaction_drops_stale_setcompaction() 
     assert!(session.derive_messages().len() == 1, "message log must be preserved");
     session.rederive_all_checked().expect("event log must agree with legacy vectors");
 }
+
+#[test]
+fn test_strip_transcript_for_remote_client_keeps_event_log_consistent() {
+    // strip_transcript_for_remote_client clears messages (via clear_messages),
+    // memory injections, and replay events directly. The derived views must all
+    // agree with the emptied legacy state after the rebuild.
+    let mut session = Session::create_with_id("test_strip_remote".to_string(), None, None);
+    session.append_stored_message(StoredMessage {
+        id: "m1".to_string(),
+        role: Role::User,
+        content: vec![text_block("hi")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    session.record_memory_injection(
+        "auto-recalled".to_string(),
+        "some content".to_string(),
+        1,
+        0,
+        vec![],
+    );
+    session.record_replay_event(&crate::session::StoredReplayEvent {
+        timestamp: Utc::now(),
+        kind: crate::session::StoredReplayEventKind::DisplayMessage {
+            role: "system".to_string(),
+            title: None,
+            content: "notice".to_string(),
+        },
+    });
+
+    assert!(session.derive_messages().len() == 1);
+    assert_eq!(session.derive_memory_injections().len(), 1);
+    assert_eq!(session.derive_replay_events().len(), 1);
+
+    session.strip_transcript_for_remote_client();
+
+    assert!(session.messages.is_empty());
+    assert!(session.memory_injections.is_empty());
+    assert!(session.replay_events.is_empty());
+    // Derived views must match the cleared legacy vectors.
+    assert!(session.derive_messages().is_empty());
+    assert!(session.derive_memory_injections().is_empty());
+    assert!(session.derive_replay_events().is_empty());
+    assert!(session.derive_compaction().is_none());
+}
+
+#[test]
+fn test_replace_messages_then_direct_compaction_clear_stays_consistent() {
+    // Mirrors apply_judge_visible_context_if_needed: replace the transcript
+    // (emits a ReplaceMessages event) then clear compaction directly and
+    // rebuild. derive_compaction() must be None while messages reflect the
+    // replacement.
+    let mut session = Session::create_with_id("test_judge_fork".to_string(), None, None);
+    session.append_stored_message(StoredMessage {
+        id: "orig".to_string(),
+        role: Role::User,
+        content: vec![text_block("original")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    session.set_compaction(StoredCompactionState {
+        summary_text: "old".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 1,
+    });
+
+    let transcript = vec![StoredMessage {
+        id: "replaced".to_string(),
+        role: Role::Assistant,
+        content: vec![text_block("judge view")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    }];
+    session.replace_messages(transcript);
+    session.compaction = None;
+    session.rebuild_event_map();
+
+    session.rederive_all_checked().expect("event log must agree with legacy vectors");
+    assert_eq!(session.derive_messages().len(), 1);
+    assert_eq!(session.derive_messages()[0].id, "replaced");
+    assert!(session.derive_compaction().is_none());
+}
