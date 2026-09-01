@@ -203,3 +203,27 @@ fn review_loop_status_reports_active_and_no_loop() {
         msg.content
     );
 }
+
+#[test]
+fn review_loop_start_restarts_after_finished() {
+    // The help advertises "/review-loop start: Start (or restart)". A finished
+    // loop must restart from the first lens when start is re-submitted.
+    let mut app = create_test_app();
+    app.input = "/review-loop start".to_string();
+    app.submit_input();
+
+    // Finish it (simulate convergence by marking the persisted state).
+    app.session.review_loop.as_mut().unwrap().finish_with("converged");
+    assert!(app.session.review_loop.as_ref().unwrap().finished);
+
+    // Restart.
+    app.input = "/review-loop start".to_string();
+    app.submit_input();
+    let state = app.session.review_loop.as_ref().unwrap();
+    assert!(!state.finished, "start must restart a finished loop");
+    assert_eq!(
+        state.current_lens,
+        Some(jcode_session_types::ReviewLens::Correctness),
+        "restarted loop must begin at the first lens"
+    );
+}
