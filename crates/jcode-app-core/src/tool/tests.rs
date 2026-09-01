@@ -2002,3 +2002,51 @@ async fn batch_subcall_agentgrep_is_redirected_to_compass() {
     );
     clear_session_tool_policy("enforcement-batch-test");
 }
+
+#[test]
+fn truncate_middle_shortens_long_input_but_keeps_short_input_unchanged() {
+    use super::truncate_middle;
+
+    // Short input passes through untouched.
+    assert_eq!(truncate_middle("hello", 200), "hello");
+    // Exactly-at-cap passes through.
+    let exact: String = "x".repeat(200);
+    assert_eq!(truncate_middle(&exact, 200), exact);
+    // Long input is elided with an ellipsis and kept within the cap.
+    let long = format!("{}END", "a".repeat(500));
+    let trimmed = truncate_middle(&long, 200);
+    assert!(trimmed.contains("..."), "should contain an ellipsis: {trimmed}");
+    assert!(
+        trimmed.chars().count() <= 200,
+        "trimmed length {} should be <= cap 200",
+        trimmed.chars().count()
+    );
+    assert!(
+        trimmed.ends_with("END"),
+        "should preserve the tail: {trimmed}"
+    );
+    // Unicode-aware: no panicking on multibyte characters.
+    let unicode = format!("{}end", "✓".repeat(300));
+    let u_trim = truncate_middle(&unicode, 100);
+    assert!(u_trim.chars().count() <= 100, "unicode trimmed too long");
+}
+
+#[test]
+fn compass_redirect_output_handles_very_long_query_gracefully() {
+    use super::compass_redirect_output;
+
+    // A pathological query must not blow up the message or produce an enormous
+    // output; the query is echoed with middle-truncation.
+    let long_query = format!("find {}", "fn".repeat(1000));
+    let out = compass_redirect_output(&serde_json::json!({ "query": long_query }));
+    assert!(out.output.contains("compass_query"));
+    assert!(
+        out.output.contains("allow_raw_fallback"),
+        "escape hatch must still be documented"
+    );
+    assert!(
+        out.output.len() < 3000,
+        "redirect output should stay bounded, got {} bytes",
+        out.output.len()
+    );
+}

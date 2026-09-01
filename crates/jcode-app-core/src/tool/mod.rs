@@ -816,9 +816,12 @@ impl Registry {
             && !tool_is_policy_disabled(&ctx.session_id, "compass_query")
         {
             let redirect = compass_redirect_output(&input);
-            // Route the interception through the same post_tool observer hook so
-            // telemetry/observers see the call as a (redirected) tool outcome
-            // rather than a silent short-circuit.
+            // Route the interception through the same observer/telemetry
+            // surfaces as a normal tool outcome so dashboards, hooks, and the
+            // session tool-usage counters all see the redirected call (recorded
+            // as successful, since it resolved to a coherent result), rather
+            // than treating it as a silent short-circuit.
+            crate::telemetry::record_tool_execution(resolved_name, &input, true, 0);
             Self::fire_post_tool_hook(resolved_name, &ctx, &Ok(redirect.clone()), 0);
             crate::logging::event_warn(
                 "TOOL_LIFECYCLE",
