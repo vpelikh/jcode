@@ -1531,3 +1531,61 @@ fn test_empty_and_replay_only_session_hydrate_consistently() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_multi_insert_repair_pattern_stays_consistent() {
+    // Round U: mirrors agent.rs repair_missing_tool_outputs - an assistant
+    // message with two missing tool uses is followed by two sequential
+    // insert_message calls using the (index + 1 + inserted + offset) arithmetic.
+    // The event log must stay consistent with the legacy vector throughout.
+    let mut session = Session::create_with_id("test_multi_repair".to_string(), None, None);
+    session.append_stored_message(StoredMessage {
+        id: "user".to_string(),
+        role: Role::User,
+        content: vec![text_block("run tools")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    // Assistant at index 1, with two ToolUse blocks that need results.
+    session.append_stored_message(StoredMessage {
+        id: "asst".to_string(),
+        role: Role::Assistant,
+        content: vec![
+            ContentBlock::ToolUse { id: "t1".to_string(), name: "tool".to_string(), input: json!({"a":1}), thought_signature: None },
+            ContentBlock::ToolUse { id: "t2".to_string(), name: "tool".to_string(), input: json!({"b":2}), thought_signature: None },
+        ],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+
+    // Repair: insert two tool results after the assistant (index 1), using the
+    // offset arithmetic from repair_missing_tool_outputs. `inserted` only
+    // advances per assistant message (by this message's missing count), while
+    // `offset` indexes within the message's missing items.
+    let missing_for_message = vec!["t1", "t2"];
+    let mut inserted = 0usize;
+    for (offset, tid) in missing_for_message.iter().enumerate() {
+        let stored = StoredMessage {
+            id: format!("result_{tid}"),
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult { tool_use_id: tid.to_string(), content: "ok".to_string(), is_error: Some(false) }],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        };
+        session.insert_message(1 + 1 + inserted + offset, stored);
+    }
+    inserted += missing_for_message.len();
+
+    session.rederive_all_checked().expect("multi-insert repair must stay consistent");
+    let ids: Vec<String> = session.messages.iter().map(|m| m.id.clone()).collect();
+    let dids: Vec<String> = session.derive_messages().iter().map(|m| m.id.clone()).collect();
+    assert_eq!(ids, dids);
+    // Expected order: user, asst, result_t1, result_t2
+    assert_eq!(ids, vec!["user", "asst", "result_t1", "result_t2"]);
+}
