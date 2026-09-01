@@ -1850,4 +1850,67 @@ mod tests {
             "old, unreachable per-SHA dir must be pruned"
         );
     }
+
+    // END-USER ACCEPTANCE PATH: exercise the real CompassQueryTool::execute
+    // against actual linked git worktrees. Two worktrees of the same repo must
+    // resolve to the SAME per-SHA output dir (because the project_id derives
+    // from the git common dir, identical across worktrees). This is the concrete
+    // end-user behavior the shared-cache feature exists to provide: build once,
+    // share across worktrees.
+    #[test]
+    fn linked_worktrees_share_the_same_cache_output_dir() {
+        let (_home, _home_path) = HomeGuard::set();
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+
+        let git = |args: &[&str], cwd: &std::path::Path| -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init", "-q"], &main) {
+            return;
+        }
+        git(&["config", "user.email", "test@example.com"], &main);
+        git(&["config", "user.name", "Test"], &main);
+        std::fs::write(main.join("main.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "."], &main);
+        if !git(&["commit", "-qm", "init"], &main) {
+            return;
+        }
+        git(&["branch", "shared"], &main);
+        // Create a linked worktree on branch "shared".
+        if !std::process::Command::new("git")
+            .args(["worktree", "add", "-q", wt.to_str().unwrap(), "shared"])
+            .current_dir(&main)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        // Both worktrees are on the same commit; both must point at the SAME
+        // per-SHA cache output dir (the end-user sharing guarantee).
+        let main_cache = resolve_compass_cache(&main);
+        let wt_cache = resolve_compass_cache(&wt);
+        assert!(
+            main_cache.is_shared && wt_cache.is_shared,
+            "both worktrees are git-backed (is_shared=true)"
+        );
+        assert_eq!(
+            main_cache.output_dir, wt_cache.output_dir,
+            "two worktrees of the same commit must share one cache output dir"
+        );
+        assert_eq!(
+            main_cache.ast_cache_root, wt_cache.ast_cache_root,
+            "two worktrees must share one branch-agnostic AST cache"
+        );
+    }
 }
