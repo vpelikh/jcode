@@ -1560,7 +1560,19 @@ impl ConfirmationTracker {
 
     /// Drop any pending confirmation (e.g. after /cancel).
     fn clear(&mut self) -> bool {
-        self.pending.take().is_some()
+        // A pending entry that has expired holds nothing actionable to cancel,
+        // so clearing it is a no-op from the caller's perspective (mirroring
+        // has_pending_active's expiry check used by /status).
+        if self
+            .pending
+            .as_ref()
+            .is_none_or(|p| std::time::Instant::now() > p.expires_at)
+        {
+            self.pending = None;
+            return false;
+        }
+        self.pending = None;
+        true
     }
 }
 
@@ -3023,6 +3035,22 @@ mod tests {
         };
         assert_eq!(action, "free");
         assert_eq!(id, "session_b");
+    }
+
+    #[test]
+    fn test_confirmation_tracker_clear_ignores_expired() {
+        use std::time::{Duration, Instant};
+        let mut tracker = ConfirmationTracker::new();
+        // Fresh entry clears as a real cancellation.
+        tracker.request("free", "session_x".to_string());
+        assert!(tracker.clear());
+        // An expired entry reports false (nothing actionable to cancel).
+        tracker.request("abort", "session_y".to_string());
+        tracker.pending.as_mut().unwrap().expires_at =
+            Instant::now() - Duration::from_secs(1);
+        assert!(!tracker.clear(), "expired confirmation has nothing to cancel");
+        // No pending at all also reports false.
+        assert!(!tracker.clear());
     }
 
     #[test]
