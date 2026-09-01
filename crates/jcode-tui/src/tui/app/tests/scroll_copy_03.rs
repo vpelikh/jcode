@@ -1852,6 +1852,11 @@ fn command_palette_open_does_not_move_existing_rows() {
 #[test]
 fn scroll_repaint_hides_cursor_before_cell_moves_via_draw_core() {
     use regex::Regex;
+    // draw_full_core renders through the shared unscoped ui::draw, which mutates
+    // process-global render state (layout snapshots, mermaid, etc.). Serialize with
+    // the other scroll/repaint tests exactly as they do, so this test does not race
+    // a parallel sibling that holds the same state.
+    let _render_lock = scroll_render_test_lock();
     let mut app = create_test_app();
     app.force_full_repaint = true; // the exact flag scroll_up/scroll_down set
 
