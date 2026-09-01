@@ -1546,6 +1546,14 @@ impl App {
         // Review loop runs as a post-completion follow-up. If a loop is active it
         // owns the turn-end continuation; let it drive spawning/fixing/polling.
         if super::commands::is_review_loop_active(self) {
+            // The one-shot "double-check this turn's weak points" digest would
+            // otherwise be suppressed by the early return below. Keep it firing
+            // even while the loop is active (it is cheap and asks the model to
+            // verify weak points its own assessments surfaced). Delivering it
+            // first lets the digest continuation run before any heavier loop step.
+            if self.deliver_deferred_gate_digest_if_needed() {
+                return true;
+            }
             return super::commands::step_review_loop(self);
         }
         self.schedule_auto_poke_followup_if_needed()

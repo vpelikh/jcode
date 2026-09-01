@@ -904,14 +904,14 @@ impl Default for HooksConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AutoReviewConfig {
-    /// Enable autoreview by default for new/resumed sessions (default: false)
+    /// Enable autoreview by default for new/resumed sessions (default: true)
     pub enabled: bool,
     /// Optional model override for autoreview reviewer sessions.
     pub model: Option<String>,
     /// When true, autoreview runs as a post-completion review loop: after the
     /// completion gates pass, an independent per-lens reviewer inspects the
     /// batch diff, findings are fixed, and the loop re-reviews until clean or a
-    /// stall cap is hit. Disabled by default; when false, autoreview stays
+    /// stall cap is hit. Enabled by default; when false, autoreview stays
     /// one-shot per turn (no loop).
     pub loop_mode: bool,
     /// Churn cap for the review loop: max consecutive rounds that report no new
@@ -923,9 +923,11 @@ pub struct AutoReviewConfig {
 impl Default for AutoReviewConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            // Enabled by default: end-of-turn review runs as part of the flow.
+            enabled: true,
             model: None,
-            loop_mode: false,
+            // Loop mode on by default: review rounds are part of the flow.
+            loop_mode: true,
             // Mirror the proposal's documented default churn cap.
             max_stalled_turns: 3,
         }
