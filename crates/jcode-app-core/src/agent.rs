@@ -509,14 +509,24 @@ impl Agent {
         drop(manager);
         if let Some(state) = sanitized_state {
             self.session.compaction = state.clone();
-            if let Some(inner) = state {
-                self.session.append_session_event(SessionEvent {
-                    timestamp: Utc::now(),
-                    event_id: crate::id::new_id("compaction"),
-                    op: SessionEventOp::SetCompaction { compaction: inner },
-                    parent_id: None,
-                    version: 1,
-                });
+            match state {
+                Some(inner) => {
+                    // Emit a SetCompaction event so the event log stays in sync
+                    // with the sanitized compaction state.
+                    self.session.append_session_event(SessionEvent {
+                        timestamp: Utc::now(),
+                        event_id: crate::id::new_id("compaction"),
+                        op: SessionEventOp::SetCompaction { compaction: inner },
+                        parent_id: None,
+                        version: 1,
+                    });
+                }
+                None => {
+                    // Sanitizing cleared the compaction entirely. Rebuild the
+                    // event log so derive_compaction() agrees with the cleared
+                    // legacy state instead of returning a stale SetCompaction.
+                    self.session.rebuild_event_map();
+                }
             }
             self.persist_session_best_effort("sanitized oversized OpenAI native compaction");
         }
@@ -631,12 +641,21 @@ impl Agent {
         let new_state = manager.persisted_state();
         if self.session.compaction != new_state {
             self.session.compaction = new_state;
-            // Emit a SetCompaction event so the event log stays in sync with
-            // the compaction mutation. `set_compaction` also updates
-            // `self.compaction`, so the direct assignment above is redundant
-            // but makes the intent explicit.
-            if let Some(state) = self.session.compaction.clone() {
-                self.session.set_compaction(state);
+            match self.session.compaction.clone() {
+                Some(state) => {
+                    // Emit a SetCompaction event so the event log stays in sync
+                    // with the compaction mutation. `set_compaction` also
+                    // updates `self.compaction`, so the direct assignment above
+                    // is redundant but makes the intent explicit.
+                    self.session.set_compaction(state);
+                }
+                None => {
+                    // Compaction was cleared (active_summary is None). There is
+                    // no dedicated clear op, so rebuild the event log from the
+                    // legacy vectors to drop any stale SetCompaction event;
+                    // otherwise derive_compaction() would still return it.
+                    self.session.rebuild_event_map();
+                }
             }
             if let Err(err) = self.session.save() {
                 logging::error(&format!(
@@ -679,6 +698,10 @@ impl Agent {
         };
 
         self.session.compaction = Some(state.clone());
+        // Emit a SetCompaction event so the event log stays in sync with the
+        // compaction mutation. `set_compaction` also sets `self.compaction`,
+        // making the direct assignment above redundant but explicit.
+        self.session.set_compaction(state.clone());
         let compaction = self.registry.compaction();
         if let Ok(mut manager) = compaction.try_write() {
             manager.set_budget(self.provider.context_window());

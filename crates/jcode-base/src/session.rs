@@ -367,6 +367,9 @@ impl Session {
         session.env_snapshots.clear();
         session.memory_injections.clear();
         session.replay_events.clear();
+        // Keep the (empty) event log consistent with the stripped legacy state
+        // so any later derived view on this stub stays in sync.
+        session.rebuild_event_map();
         session.rebuild_memory_profile_cache();
         session.reset_persist_state(true);
         session
@@ -401,6 +404,8 @@ impl Session {
         session.replay_events.clear();
         session.env_snapshots.clear();
         session.memory_injections.clear();
+        // Rebuild so the (non-empty) event log agrees with the snapshot vectors.
+        session.rebuild_event_map();
         session.mark_memory_profile_dirty();
         session.reset_persist_state(true);
         session.reset_provider_messages_cache();
@@ -987,10 +992,7 @@ impl Session {
                 *text = wrapped;
                 self.mark_memory_profile_dirty();
                 self.mark_messages_full_dirty();
-                // `refresh_initial_session_context_message` mutates the
-                // session-context message's content in-place without emitting
-                // an event. Rebuild the event log so it stays in sync.
-                self.rebuild_event_map();
+                self.record_transcript_replacement();
                 return true;
             }
         }
@@ -1285,6 +1287,30 @@ request in this new forked session, using the inherited conversation only as con
         id
     }
 
+    /// Emit a `ReplaceMessages` event capturing the full current transcript.
+    ///
+    /// Used by in-place transcript mutations (`strip_oversized_images`,
+    /// `emergency_truncate_tool_results`, `remove_tool_use_blocks`, and
+    /// `refresh_initial_session_context_message`) that modify `self.messages`
+    /// directly without re-entering an event-emitting append/insert/replace
+    /// path. Emitting a full replacement keeps the event log the single source
+    /// of truth and stays robust regardless of where in the log the mutation
+    /// lands.
+    fn record_transcript_replacement(&mut self) {
+        let event = SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: crate::id::new_id("transcript_mutation"),
+            op: SessionEventOp::ReplaceMessages {
+                start_index: 0,
+                end_index: usize::MAX,
+                messages: self.messages.clone(),
+            },
+            parent_id: None,
+            version: 1,
+        };
+        self.event_map.append_event(event);
+    }
+
     pub fn append_stored_message(&mut self, message: StoredMessage) {
         // Ensure a stable event id even when the message id is empty, so the
         // event log and the legacy `messages` vector never diverge (an empty
@@ -1441,6 +1467,7 @@ request in this new forked session, using the inherited conversation only as con
         if stripped > 0 {
             self.mark_memory_profile_dirty();
             self.mark_messages_full_dirty();
+            self.record_transcript_replacement();
         }
         stripped
     }
@@ -1467,6 +1494,7 @@ request in this new forked session, using the inherited conversation only as con
         if truncated > 0 {
             self.mark_memory_profile_dirty();
             self.mark_messages_full_dirty();
+            self.record_transcript_replacement();
         }
         truncated
     }
@@ -1763,13 +1791,15 @@ request in this new forked session, using the inherited conversation only as con
     /// `compaction`, `memory_injections`, and `replay_events` are populated.
     /// Without this step the event log would not be the single source of truth
     /// for resumed sessions. Call this once after load/construct-from-disk.
+    ///
+    /// This is *not* idempotent-by-guard: it unconditionally rebuilds the log
+    /// from the authoritative legacy vectors. Forking a session sets
+    /// `compaction`/`memory_injections`/`replay_events` directly without
+    /// emitting matching events, so a guard that bails on a non-empty log would
+    /// leave those fields missing from the derived event state. Rebuilding from
+    /// the vectors guarantees every call yields a log that agrees with the
+    /// legacy state, regardless of prior content.
     pub fn rebuild_event_map(&mut self) {
-        // Idempotent: only build from legacy vectors when the log is empty
-        // (e.g. right after loading from disk). In-process sessions already
-        // populate the log via append/insert/replace, so never clobber that.
-        if !self.event_map.events.is_empty() {
-            return;
-        }
         let mut map = SessionEventMap::default();
         let now = chrono::Utc::now();
 
@@ -1938,6 +1968,11 @@ request in this new forked session, using the inherited conversation only as con
         self.env_snapshots.clear();
         self.memory_injections.clear();
         self.replay_events.clear();
+        // `clear_messages()` only reconciles the messages/compaction event state.
+        // The memory-injection and replay-event vectors were cleared directly
+        // above, so rebuild the whole log from the now-empty legacy state to keep
+        // the derived views (derive_memory_injections/derive_replay_events) in sync.
+        self.rebuild_event_map();
         self.rebuild_memory_profile_cache();
         self.reset_provider_messages_cache();
         self.reset_persist_state(true);
@@ -1946,14 +1981,24 @@ request in this new forked session, using the inherited conversation only as con
     /// Remove all ToolUse content blocks from a specific message.
     /// Used when tool calls are discarded (e.g. due to truncated output / max_tokens).
     pub fn remove_tool_use_blocks(&mut self, message_id: &str) {
+        let mut removed = false;
         for msg in &mut self.messages {
             if msg.id == *message_id {
+                let before = msg.content.len();
                 msg.content
                     .retain(|block| !matches!(block, ContentBlock::ToolUse { .. }));
-                self.mark_memory_profile_dirty();
-                self.mark_messages_full_dirty();
+                removed = before != msg.content.len();
+                if removed {
+                    self.mark_memory_profile_dirty();
+                    self.mark_messages_full_dirty();
+                }
                 break;
             }
+        }
+        // Only emit a replacement event if a block was actually removed, so we
+        // do not pollute the log when the message has no ToolUse blocks to drop.
+        if removed {
+            self.record_transcript_replacement();
         }
     }
 }

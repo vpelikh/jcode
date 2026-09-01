@@ -401,9 +401,6 @@ impl Agent {
             ));
             if let Some(msg_id) = assistant_message_id {
                 self.session.remove_tool_use_blocks(msg_id);
-                // `remove_tool_use_blocks` mutates `self.session.messages` in-place
-                // without emitting an event. Rebuild the event log so it stays in sync.
-                self.session.rebuild_event_map();
                 self.persist_session_best_effort("truncated tool-call repair");
             }
         }
