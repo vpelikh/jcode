@@ -470,11 +470,13 @@ impl StatusSpinnerRenderer {
         // streams cells one-by-one and eagerly-repainting terminals (and slow/remote
         // or multiplexed sessions) show visible flicker. See issue #282.
         let sync = crossterm::execute!(terminal.backend_mut(), BeginSynchronizedUpdate).is_ok();
-        self.draw_full_core(app, terminal)?;
+        // Always close the sync window, even if the draw fails; otherwise the
+        // terminal is left in synchronized-update mode and later output glitches.
+        let result = self.draw_full_core(app, terminal);
         if sync {
             let _ = crossterm::execute!(terminal.backend_mut(), EndSynchronizedUpdate);
         }
-        Ok(())
+        result
     }
 
     /// The backend-generic body of a full-frame repaint. Split out from
