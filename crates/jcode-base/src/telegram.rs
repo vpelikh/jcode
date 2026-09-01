@@ -172,9 +172,11 @@ pub fn is_transient_api_error(e: &anyhow::Error) -> bool {
     // codes as `"Telegram API error (<status-code Display>): ..."`. The
     // `Display` for `reqwest::StatusCode::TOO_MANY_REQUESTS` renders as
     // `"429 Too Many Requests"`, so match on the numeric code whether or not
-    // the reason phrase is present.
-    let s = e.to_string();
-    s.contains("429 Too Many Requests") || s.contains("flood control")
+    // the reason phrase is present. Lowercase to keep the check
+    // case-insensitive so a varied-case reason phrase or description on the
+    // wire still matches, matching the style of `is_connectivity_error`.
+    let s = e.to_string().to_lowercase();
+    s.contains("429") || s.contains("too many requests") || s.contains("flood control")
 }
 
 /// Build a short-timeout client used only for the discovery probe (`getMe`).
@@ -1371,6 +1373,10 @@ mod tests {
         // Root-cause based description of flood control.
         assert!(is_transient_api_error(&anyhow::anyhow!(
             "telegram flood control, please wait"
+        )));
+        // Matching is case-insensitive, covering varied casing from the wire.
+        assert!(is_transient_api_error(&anyhow::anyhow!(
+            "Telegram API error (429 Too Many Requests): Bad Request: Flood Control"
         )));
 
         // Permanent errors should NOT be transient.
