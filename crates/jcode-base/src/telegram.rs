@@ -167,16 +167,22 @@ pub fn is_transient_api_error(e: &anyhow::Error) -> bool {
     if is_connectivity_error(e) {
         return true;
     }
-    // Telegram returns 429 with "flood control" during rapid polling. We can
-    // detect this from the error string since `post_telegram` wraps status
-    // codes as `"Telegram API error (<status-code Display>): ..."`. The
-    // `Display` for `reqwest::StatusCode::TOO_MANY_REQUESTS` renders as
-    // `"429 Too Many Requests"`, so match on the numeric code whether or not
-    // the reason phrase is present. Lowercase to keep the check
-    // case-insensitive so a varied-case reason phrase or description on the
-    // wire still matches, matching the style of `is_connectivity_error`.
+    // Telegram returns 429 with "flood control" or "Too Many Requests: retry
+    // after X" in the description. We detect retryable rate-limits from these
+    // standard fragments rather than a bare "429" number, which could appear
+    // incidentally in a permanent error's description and cause a false
+    // positive (retrying an error that will never succeed). The description
+    // text is reliable across both an HTTP-429 response and a body-only
+    // error_code=429 (HTTP 200) path. Lowercase keeps the check
+    // case-insensitive, matching `is_connectivity_error`.
     let s = e.to_string().to_lowercase();
-    s.contains("429") || s.contains("too many requests") || s.contains("flood control")
+    // `; code 429` is a precise marker from post_telegram when the body's
+    // error_code is 429 even if the HTTP status differs; it cannot appear
+    // incidentally in a description, so it is safe to match.
+    s.contains("; code 429")
+        || s.contains("too many requests")
+        || s.contains("flood control")
+        || s.contains("retry after")
 }
 
 /// Build a short-timeout client used only for the discovery probe (`getMe`).
@@ -1387,20 +1393,31 @@ mod tests {
             "Telegram API error (429 Too Many Requests): Bad Request: Flood Control"
         )));
         // Rate-limit surfacing only via the body's error_code (HTTP 200) is
-        // still classified as transient thanks to the "; code 429" text.
+        // still classified as transient thanks to the "; code 429" marker,
+        // even with an unusual description that lacks the standard wording.
         assert!(is_transient_api_error(&anyhow::anyhow!(
             "Telegram API error (200 OK; code 429): Too Many Requests: retry after 11"
+        )));
+        assert!(is_transient_api_error(&anyhow::anyhow!(
+            "Telegram API error (200 OK; code 429): throttled"
         )));
 
         // Permanent errors should NOT be transient.
         assert!(!is_transient_api_error(&anyhow::anyhow!(
             "Telegram auth failed: Unauthorized"
         )));
+        // Real post_telegram format now renders the code with a '; code N'
+        // suffix when the body carries an error_code.
         assert!(!is_transient_api_error(&anyhow::anyhow!(
-            "Telegram API error (400 Bad Request): Bad Request: chat not found"
+            "Telegram API error (400 Bad Request; code 400): Bad Request: chat not found"
         )));
         assert!(!is_transient_api_error(&anyhow::anyhow!(
-            "Telegram API error (403 Forbidden): Forbidden"
+            "Telegram API error (403 Forbidden; code 403): Forbidden"
+        )));
+        // A description mentioning an unrelated number must not trip the
+        // bare "429" matcher (only rate-limit context is transient).
+        assert!(!is_transient_api_error(&anyhow::anyhow!(
+            "Telegram API error (400 Bad Request): message 429 is not found"
         )));
     }
 
