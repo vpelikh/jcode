@@ -493,8 +493,10 @@ impl StatusSpinnerRenderer {
         // is still visible. On terminals without synchronized-update support this makes
         // the visible block cursor sweep across the whole screen ("cursor jumps to
         // random places") during scroll. Hide it for the diff flush; `terminal.draw`
-        // always issues `Show` + `MoveTo` to the caret afterwards because `draw_input`
-        // sets a cursor position, so the cursor reappears exactly where it belongs.
+        // then either restores the caret (the normal composer path, where `draw_input`
+        // sets a cursor position) or leaves the cursor hidden (overlay branches such as
+        // the changelog/help/pickers, where ratatui also hides when no position is set),
+        // so the cursor ends exactly where it belongs in every case.
         let _ = crossterm::execute!(terminal.backend_mut(), Hide);
         let previous_frame = self.last_frame.as_ref();
         let draw_start = Instant::now();
