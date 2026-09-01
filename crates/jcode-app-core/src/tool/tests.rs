@@ -1878,3 +1878,127 @@ async fn agentgrep_runs_when_compass_is_policy_disabled() {
     );
     clear_session_tool_policy("enforcement-no-compass-test");
 }
+
+#[tokio::test]
+async fn agentgrep_runs_when_prefer_compass_query_is_disabled_via_config() {
+    // The operator can turn the enforcement tier off through the public config
+    // surface ([tools] prefer_compass_query = false). This exercises the config
+    // opt-out through a real config file, not just the in-code default.
+    let _guard = crate::storage::lock_test_env();
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let temp = tempfile::tempdir().unwrap();
+    crate::env::set_var("JCODE_HOME", temp.path());
+    std::fs::write(
+        temp.path().join("config.toml"),
+        "[tools]\nprefer_compass_query = false\n",
+    )
+    .unwrap();
+    // Force the config cache to reload so the test reflects the written file.
+    crate::config::invalidate_config_cache();
+
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    std::fs::write(temp_dir.path().join("sample.txt"), "gamma_uniquetoken delta\n")
+        .expect("write file");
+
+    let ctx = ToolContext {
+        session_id: "enforcement-config-off-test".to_string(),
+        message_id: "test".to_string(),
+        tool_call_id: "test".to_string(),
+        working_dir: Some(temp_dir.path().to_path_buf()),
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: ToolExecutionMode::Direct,
+    };
+
+    let out = registry
+        .execute("agentgrep", serde_json::json!({ "query": "uniquetoken" }), ctx.clone())
+        .await
+        .expect("agentgrep should run when enforcement is disabled via config");
+    assert!(
+        out.output.contains("uniquetoken"),
+        "grep should run with enforcement off, got: {}",
+        out.output
+    );
+
+    if let Some(prev) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    crate::config::invalidate_config_cache();
+}
+
+#[tokio::test]
+async fn grep_alias_is_also_redirected_to_compass() {
+    // `grep` is an alias that resolves to agentgrep, so the same enforcement
+    // must apply to legacy grep calls.
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+    let temp = tempfile::TempDir::new().expect("temp dir");
+
+    let ctx = ToolContext {
+        session_id: "enforcement-grep-alias-test".to_string(),
+        message_id: "test".to_string(),
+        tool_call_id: "test".to_string(),
+        working_dir: Some(temp.path().to_path_buf()),
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: ToolExecutionMode::Direct,
+    };
+
+    let out = registry
+        .execute("grep", serde_json::json!({ "pattern": "fn main" }), ctx.clone())
+        .await
+        .expect("grep alias should be redirectable");
+    assert!(
+        out.output.contains("compass_query"),
+        "grep alias should be redirected to compass_query, got: {}",
+        out.output
+    );
+    clear_session_tool_policy("enforcement-grep-alias-test");
+}
+
+#[tokio::test]
+async fn batch_subcall_agentgrep_is_redirected_to_compass() {
+    // batch sub-calls re-enter Registry::execute, so enforcement must also fire
+    // for an agentgrep embedded in a batch. Without this, a model could route
+    // around the enforcement tier via batch.
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+    let temp = tempfile::TempDir::new().expect("temp dir");
+
+    let ctx = ToolContext {
+        session_id: "enforcement-batch-test".to_string(),
+        message_id: "test".to_string(),
+        tool_call_id: "test".to_string(),
+        working_dir: Some(temp.path().to_path_buf()),
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: ToolExecutionMode::Direct,
+    };
+
+    let out = registry
+        .execute(
+            "batch",
+            serde_json::json!({
+                "tool_calls": [
+                    {"tool": "ls", "parameters": {"path": "."}},
+                    {"tool": "agentgrep", "parameters": {"query": "fn main"}}
+                ]
+            }),
+            ctx.clone(),
+        )
+        .await
+        .expect("batch should succeed");
+    let text = out.output.to_string();
+    assert!(
+        text.contains("compass_query"),
+        "a batch agentgrep subcall should be redirected to compass_query, got: {}",
+        text
+    );
+    clear_session_tool_policy("enforcement-batch-test");
+}
