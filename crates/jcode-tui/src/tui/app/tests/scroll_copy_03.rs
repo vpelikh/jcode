@@ -1897,6 +1897,23 @@ fn scroll_repaint_hides_cursor_before_cell_moves_via_draw_core() {
         let hide_at = stream
             .find(hide)
             .unwrap_or_else(|| panic!("{arm} must hide the cursor; got: {stream:?}"));
+        // Prove each arm reproduced its real invalidation, not just any repaint:
+        // HardClear predates the draw with `Terminal::clear()` (an ED2 `ESC[2J`
+        // Clear-All), while SoftRepaint is sentinel-invalidate only and must NOT
+        // emit a clear. This ensures the two arms genuinely differ and the hide
+        // check guards each distinct branch.
+        let has_clear = stream.contains("\u{1b}[2J");
+        match arm {
+            "soft_repaint" => assert!(
+                !has_clear,
+                "soft_repaint arm must not emit an ED2 clear; got: {stream:?}"
+            ),
+            "hard_clear" => assert!(
+                has_clear,
+                "hard_clear arm must emit an ED2 clear; got: {stream:?}"
+            ),
+            _ => unreachable!(),
+        }
         // The re-show must come strictly after the hide, so the caret is frozen for
         // the whole sweep interval (all MoveTo of the diff flush). A `?25h` emitted
         // before the hide would mean the cursor was visible during part of the sweep.
