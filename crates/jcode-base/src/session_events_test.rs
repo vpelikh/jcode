@@ -602,9 +602,12 @@ fn test_session_fork_event_log_prefix() {
             token_usage: None,
         });
     }
-    let fork = session.fork_up_to_boundary(2);
+    let mut fork = session.fork_up_to_boundary(2);
     assert_eq!(fork.derive_messages().len(), 3);
     assert_ne!(fork.id, session.id);
+    // The fork's provider-message cache must reflect the truncated transcript,
+    // not the parent's longer cache.
+    assert_eq!(fork.messages_for_provider().len(), 3);
 }
 
 #[test]

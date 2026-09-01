@@ -1722,6 +1722,13 @@ request in this new forked session, using the inherited conversation only as con
         fork.memory_injections = fork.derive_memory_injections();
         fork.replay_events = fork.derive_replay_events();
         
+        // The parent's provider message cache reflects the full (longer)
+        // transcript; the fork is truncated, so any cached provider messages and
+        // prefix hashes are stale. Reset them so the next call to
+        // provider_messages()/messages_for_provider() recomputes from the fork's
+        // truncated transcript rather than returning the parent's cache.
+        fork.reset_provider_messages_cache();
+        
         // Generate new ID for the fork
         fork.id = new_id("fork");
         fork.updated_at = chrono::Utc::now();
@@ -1793,6 +1800,26 @@ request in this new forked session, using the inherited conversation only as con
                     comp.original_turn_count
                 ));
             }
+        }
+
+        // Memory injections must also agree (by count; the type lacks PartialEq).
+        let derived_inj = self.derive_memory_injections();
+        if derived_inj.len() != self.memory_injections.len() {
+            return Err(format!(
+                "event_map derived {} memory injections but session.memory_injections has {}",
+                derived_inj.len(),
+                self.memory_injections.len()
+            ));
+        }
+
+        // Replay events must also agree (StoredReplayEvent derives PartialEq).
+        let derived_replay = self.derive_replay_events();
+        if derived_replay != self.replay_events {
+            return Err(format!(
+                "event_map replay events diverge from session.replay_events (derived {} vs {} legacy)",
+                derived_replay.len(),
+                self.replay_events.len()
+            ));
         }
 
         Ok((messages, compaction))

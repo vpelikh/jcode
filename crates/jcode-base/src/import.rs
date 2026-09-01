@@ -1010,6 +1010,10 @@ fn finalize_imported_session(
         && existing.messages.len() > session.messages.len()
     {
         if normalize_imported_history(&mut existing, false) {
+            // normalize_imported_history mutates messages in place (rewrites
+            // content, drops empty-text messages) without emitting events.
+            // Rebuild so the event log agrees with the normalized transcript.
+            existing.rebuild_event_map();
             existing.save()?;
         }
         return Ok(existing);
@@ -1021,6 +1025,9 @@ fn finalize_imported_session(
     session.last_active_at = updated_at.or(Some(created_at));
     session.status = SessionStatus::Closed;
     normalize_imported_history(&mut session, true);
+    // Reconcile the event log with the normalized transcript (normalization
+    // mutates messages directly and may drop empty-content messages).
+    session.rebuild_event_map();
     session.save()?;
     crate::logging::info(&format!(
         "Imported session prepared: source_messages={original_messages} kept_messages={}",

@@ -162,6 +162,11 @@ fn imported_history_is_bounded_for_fast_initial_render() {
         session.messages[0].content.first(),
         Some(ContentBlock::Text { text, .. }) if text.contains("older messages were omitted")
     ));
+    // finalize_imported_session reconciles the event log with the normalized
+    // transcript; the two sources of truth must agree.
+    session.rebuild_event_map();
+    session.rederive_all_checked().expect("import normalization must stay consistent");
+    assert_eq!(session.derive_messages().len(), session.messages.len());
 }
 
 #[test]
