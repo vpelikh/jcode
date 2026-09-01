@@ -2050,3 +2050,49 @@ fn compass_redirect_output_handles_very_long_query_gracefully() {
         out.output.len()
     );
 }
+
+#[tokio::test]
+async fn agentgrep_runs_when_compass_is_excluded_by_allow_list() {
+    // Restricted tool profiles (acp/minimal) expose agentgrep but not
+    // compass_query via the allow-list. Redirecting agentgrep in that case
+    // would dead-end the model against an uninvocable tool, so raw grep must
+    // run. This mirrors the acp/minimal base_allowed_tools shape.
+    use std::collections::HashSet;
+
+    let _guard = crate::storage::lock_test_env();
+    set_session_tool_policy(
+        "enforcement-minimal-profile-test",
+        Some(HashSet::from([
+            "agentgrep".to_string(),
+            "read".to_string(),
+            "bash".to_string(),
+        ])),
+        HashSet::new(),
+    );
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    std::fs::write(temp.path().join("sample.txt"), "delta_uniquetoken epsilon\n")
+        .expect("write file");
+
+    let ctx = ToolContext {
+        session_id: "enforcement-minimal-profile-test".to_string(),
+        message_id: "test".to_string(),
+        tool_call_id: "test".to_string(),
+        working_dir: Some(temp.path().to_path_buf()),
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: ToolExecutionMode::Direct,
+    };
+
+    let out = registry
+        .execute("agentgrep", serde_json::json!({ "query": "uniquetoken" }), ctx.clone())
+        .await
+        .expect("agentgrep should run when compass is allowed-list excluded");
+    assert!(
+        out.output.contains("uniquetoken"),
+        "grep should run under a restricted profile, got: {}",
+        out.output
+    );
+    clear_session_tool_policy("enforcement-minimal-profile-test");
+}
