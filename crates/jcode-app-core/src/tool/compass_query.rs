@@ -312,12 +312,15 @@ fn resolve_compass_cache(working_dir: &Path) -> CompassCachePaths {
     }
 }
 
-/// Cheap, stable identifier for a path (used for the shared-cache partition).
+/// Deterministic, stable identifier for a path (used for the shared-cache
+/// partition). Uses SHA-256 rather than `DefaultHasher`, whose algorithm is
+/// explicitly documented as unstable across Rust releases/builds — a stable
+/// key is required so an on-disk cache id does not change (and orphan the
+/// cache) when jcode is rebuilt or upgraded.
 fn short_id(s: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    format!("{:016x}", h.finish())
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(s.as_bytes());
+    digest.iter().map(|b| format!("{b:02x}")).take(16).collect()
 }
 
 /// Canonical absolute string form of a path, for a stable non-git project id.
@@ -1791,6 +1794,24 @@ mod tests {
         assert!(!looks_like_sha(&"g".repeat(40)), "non-hex must not match");
         assert!(!looks_like_sha(AST_CACHE_DIR));
         assert!(!looks_like_sha(WORKSPACE_DIR));
+    }
+
+    // The shared-cache project id must be deterministic and stable: the same
+    // repo id must hash to the same value across calls (and thus across
+    // processes/builds), so an on-disk cache is never orphaned by id drift.
+    #[test]
+    fn short_id_is_deterministic_and_hex() {
+        let a = short_id("/some/repo/.git");
+        let b = short_id("/some/repo/.git");
+        assert_eq!(a, b, "same input must hash identically");
+        assert_eq!(a.len(), a.chars().count());
+        assert_eq!(a.chars().count(), 32, "16 bytes * 2 hex chars = 32 chars");
+        assert!(
+            a.chars().all(|c| c.is_ascii_hexdigit()),
+            "id must be hex only, got {a}"
+        );
+        // Different inputs differ.
+        assert_ne!(short_id("/repo/one/.git"), short_id("/repo/two/.git"));
     }
 
     #[test]
