@@ -160,9 +160,13 @@ fn test_reload_preserves_completed_confidence_spike_challenge() {
         // re-arming; this test is about the spike-challenge flag, not the
         // default-on re-arm behavior.
         reloaded_app.auto_poke_default_on = false;
-        assert!(!reloaded_app.schedule_auto_poke_followup_if_needed());
+        // With all todos complete, validation passing, and the spike already
+        // challenged, the clean finish queues one final-response continuation
+        // (so the call returns true), disarms auto-poke (default off), and
+        // keeps the challenge latched so the unchanged spike is not re-raised.
+        assert!(reloaded_app.schedule_auto_poke_followup_if_needed());
         assert!(!reloaded_app.auto_poke_incomplete_todos);
-        assert!(!reloaded_app.todo_confidence_spike_challenged);
+        assert!(reloaded_app.todo_confidence_spike_challenged);
         assert!(reloaded_app.hidden_queued_system_messages.is_empty());
     });
 }
