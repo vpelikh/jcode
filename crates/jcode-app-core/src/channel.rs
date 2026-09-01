@@ -573,7 +573,7 @@ impl TelegramChannel {
             let prompt = tracker.request("free", id.clone());
             drop(tracker);
             let ack = format!(
-                "🗑️ Free `{}`? Tap /confirm to confirm, /cancel to abort.",
+                "🗑️ Free `{}`? Reply /confirm to confirm, /cancel to abort.",
                 short_id(&id)
             );
             let _ = crate::telegram::answer_callback_query(
@@ -883,9 +883,9 @@ impl TelegramChannel {
         }
     }
 
-    /// `/abort` (alias `/cancel`): request a graceful stop of the active
-    /// session's in-flight turn. Shows a confirmation prompt first so the
-    /// user must tap `/confirm` to actually trigger the abort.
+    /// `/abort`: request a graceful stop of the active session's in-flight
+    /// turn. Shows a confirmation prompt first so the user must type
+    /// `/confirm` to actually trigger the abort (or `/cancel` to decline).
     async fn abort_reply(&self) -> String {
         let Some(session_id) =
             crate::server::telegram_control::active_session_for(&self.chat_id)
@@ -895,7 +895,7 @@ impl TelegramChannel {
         let mut tracker = self.confirmation_tracker.lock().await;
         let prompt = tracker.request("abort", session_id.clone());
         drop(tracker);
-        // Send the confirmation prompt as a reply so the user can tap /confirm.
+        // Send the confirmation prompt as a reply so the user can type /confirm.
         let _ = self.send_reply(&prompt, None).await;
         String::new()
     }
@@ -1518,6 +1518,7 @@ impl ConfirmationTracker {
         format!(
             "⚠️ *Confirm `{action}` session `{sid}`*\n\n\
              This cannot be undone.\n\
+             Expires in {CONFIRM_TIMEOUT_SECS}s.\n\
              /confirm to proceed, /cancel to abort."
         )
     }
@@ -2939,6 +2940,10 @@ mod tests {
         let prompt = tracker.request("abort", "session_abc123".to_string());
         // The prompt shows the 8-char short id, so assert on the rendered value.
         assert!(prompt.contains(&format!("Confirm `abort` session `{}`", short_id("session_abc123"))));
+        // The prompt advertises the expiry window and both follow-up commands.
+        assert!(prompt.contains(&format!("Expires in {CONFIRM_TIMEOUT_SECS}s")));
+        assert!(prompt.contains("/confirm to proceed"));
+        assert!(prompt.contains("/cancel to abort"));
         // Verify matches
         let Some((action, id)) = tracker.verify("__confirm__") else {
             panic!("Expected verification to succeed");
