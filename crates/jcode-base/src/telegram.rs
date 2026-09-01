@@ -696,22 +696,19 @@ pub async fn send_chat_action(
 }
 
 /// How many total attempts to make for `setMyCommands` before giving up. The
-/// Telegram Bot API returns 429 during temporary flooding; a few attempts with
-/// backoff lets the command list settle even if the bot is briefly
-/// rate-limited at startup.
-const SET_MY_COMMANDS_MAX_ATTEMPTS: u32 = 5;
+/// Telegram Bot API returns 429 during temporary flooding; a couple of attempts
+/// with backoff lets the command list settle even if the bot is briefly
+/// rate-limited at startup. Kept deliberately small because this runs inline
+/// before the reply-poll loop begins, so the attempt budget bounds how long a
+/// start-up retry churn can block the bot from answering messages.
+const SET_MY_COMMANDS_MAX_ATTEMPTS: u32 = 3;
 /// Base delay between retry attempts (doubles each attempt). Kept short so a
 /// transient rate-limit at startup does not block the reply loop for long.
 const SET_MY_COMMANDS_RETRY_BASE_SECS: u64 = 1;
-/// Maximum delay between retry attempts. Prevents the backoff from growing
-/// indefinitely if the bot is persistently rate-limited. With
-/// `SET_MY_COMMANDS_MAX_ATTEMPTS = 5` the last retry delay reaches this bound,
-/// so the cap is not dead configuration.
-const SET_MY_COMMANDS_RETRY_MAX_SECS: u64 = 8;
 /// Hard per-attempt budget for a single `setMyCommands` request. The shared
 /// client only sets a connect timeout (no overall request timeout), so without
-/// this a hung request could stall a retry leg indefinitely. A timeout here is
-/// treated as a transient failure and retried like a network error.
+/// this a hung connection could stall a retry leg indefinitely. A timeout here
+/// is treated as a transient failure and retried like a network error.
 const SET_MY_COMMANDS_ATTEMPT_TIMEOUT_SECS: u64 = 10;
 
 /// Register the bot's slash command list in the Telegram client so users can
@@ -781,9 +778,10 @@ pub async fn set_my_commands(
                     ));
                     break;
                 }
-                // Compute the delay once to avoid duplicating the formula.
-                let delay_secs = (SET_MY_COMMANDS_RETRY_BASE_SECS * 2u64.pow(attempt - 1))
-                    .min(SET_MY_COMMANDS_RETRY_MAX_SECS);
+                // Compute the delay once to avoid duplicating the formula. The
+                // attempt budget already bounds total sleep, so no separate
+                // upper cap is needed here.
+                let delay_secs = SET_MY_COMMANDS_RETRY_BASE_SECS * 2u64.pow(attempt - 1);
                 logging::debug(&format!(
                     "setMyCommands attempt {attempt} failed (transient), retrying in {delay_secs}s"
                 ));
