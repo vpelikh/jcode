@@ -1184,6 +1184,112 @@ mod tests {
         );
     }
 
+    // Two worktrees of the same repo on DIFFERENT commits must be able to build
+    // concurrently without corrupting the shared .ast-cache. This is the race the
+    // per-project build lock (vs a per-SHA lock) exists to prevent: Compass does
+    // not internally lock its shared-history cache.
+    #[test]
+    fn concurrent_cross_worktree_builds_do_not_corrupt_shared_cache() {
+        let (_home, _home_path) = HomeGuard::set();
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+
+        let git = |args: &[&str], cwd: &std::path::Path| -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init", "-q"], &main) {
+            return;
+        }
+        git(&["config", "user.email", "test@example.com"], &main);
+        git(&["config", "user.name", "Test"], &main);
+        std::fs::write(main.join("main.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "."], &main);
+        if !git(&["commit", "-qm", "init"], &main) {
+            return;
+        }
+        // Create a second commit on a different branch so the worktrees are on
+        // DIFFERENT SHAs.
+        git(&["checkout", "-qb", "other"], &main);
+        std::fs::write(main.join("main.rs"), "fn b() {}\n").unwrap();
+        git(&["commit", "-aqm", "other"], &main);
+        // Two linked worktrees, one per branch/commit.
+        git(&["checkout", "-q", "master"], &main);
+        if !std::process::Command::new("git")
+            .args(["worktree", "add", "-qb", "wother", wt.to_str().unwrap(), "other"])
+            .current_dir(&main)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        let tool = std::sync::Arc::new(CompassQueryTool::new());
+        let failures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        std::thread::scope(|s| {
+            for wd in [main.clone(), wt.clone()] {
+                let tool = tool.clone();
+                let failures = failures.clone();
+                s.spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .expect("runtime");
+                    let ctx = ToolContext {
+                        session_id: "s".into(),
+                        message_id: "m".into(),
+                        tool_call_id: "t".into(),
+                        working_dir: Some(wd),
+                        stdin_request_tx: None,
+                        graceful_shutdown_signal: None,
+                        execution_mode: ToolExecutionMode::Direct,
+                    };
+                    let out = rt.block_on(
+                        tool.execute(serde_json::json!({ "query": "authentication" }), ctx),
+                    );
+                    match out {
+                        Ok(out) if out.output.contains("**Found ") => {}
+                        _ => {
+                            failures.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            failures.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "both cross-worktree concurrent builds must succeed against a shared .ast-cache"
+        );
+        // Both per-SHA outputs must be independently valid.
+        let main_shas = git_reachable_shas(&main).unwrap();
+        let (a_sha, b_sha) = {
+            let mut v: Vec<&String> = main_shas.iter().collect();
+            v.sort();
+            (v[0].clone(), v[1].clone())
+        };
+        for sha in [a_sha, b_sha] {
+            let out_dir = crate::storage::jcode_dir()
+                .unwrap()
+                .join(COMPASS_CACHE_HOME)
+                .join(short_id(
+                    &git_repo_identity(&main).unwrap(),
+                ))
+                .join(&sha);
+            assert!(
+                compass_query::open(&out_dir.join("compass-out/graph.json"), None, &out_dir).is_ok(),
+                "per-SHA index for {sha} must be openable after concurrent builds"
+            );
+        }
+    }
+
     #[test]
     fn index_is_stale_detects_new_source() {
         let (_tmp, root, output_dir, ast_cache_root) = make_isolated_project();
