@@ -915,6 +915,17 @@ fn build_compass_index(
     options.purpose = BuildPurpose::Extract;
     options.scan_filesystem = true;
     options.graph_storage = compass_core::GraphStorage::Json;
+    // The query engine opens the persisted `graph.json` and reads nodes, edges,
+    // and files directly; it does not need community clustering or the HTML
+    // viz artifacts. Skipping them cuts unrelated build work on large projects
+    // (the 300MB+ case that makes a cold build stall a query for minutes).
+    options.no_cluster = true;
+    options.no_viz = true;
+    // A bounded worker pool so a build never oversubscribes the host with the
+    // default `num_cpus` threads on a many-core machine. Compass caps at 12;
+    // we pin to a sane ceiling so a background pre-warm co-exists with other
+    // work without exhausting the process's threads.
+    options.max_workers = Some(MAX_BUILD_WORKERS);
 
     build_graph_with_layers(&options, None, &[])
         .map_err(|e| anyhow!("compass_core build_graph failed: {}", e))?;
@@ -926,6 +937,85 @@ fn build_compass_index(
         write_index_git_sha(output_dir, &sha);
     }
     Ok(())
+}
+
+/// Bounded ceiling for the Compass build worker pool. Compass itself
+/// self-bounds to at most `PIPELINE_RAYON_WORKER_CAP` (12), so this just pins
+/// that ceiling explicitly rather than depending on the transitive library
+/// default. Kept small so a background pre-warm shard does not starve jcode's
+/// own rayon/tokio parallelism on big projects.
+const MAX_BUILD_WORKERS: usize = 4;
+
+/// Process-global set of project roots currently being pre-warmed, so a swarm
+/// of sessions that all subscribe to the same repo don't each spawn a duplicate
+/// cold build. Tolerant of poisoning (a panic in a pre-warm thread must not
+/// brick later dedup).
+static PREWARM_IN_FLIGHT: OnceLock<Mutex<HashMap<PathBuf, ()>>> = OnceLock::new();
+
+/// Best-effort, off-the-query-path pre-warm of the Compass knowledge graph for
+/// `working_dir`.
+///
+/// This is the helper that backs the session-subscribe hook: it resolves the
+/// cache layout, cheaply decides freshness WITHOUT building (so the subscribe
+/// path never blocks on git or a tree walk), and only if the index is stale or
+/// missing does it spawn a background thread to build it under the existing
+/// per-project build lock. Duplicate builds for the same project are suppressed
+/// with a process-global in-flight set, so a busy agent session triggers at
+/// most one cold build per project per process.
+///
+/// Returns `false` (and does nothing) when pre-warming should not run: the
+/// index is already fresh, the working dir has no git identity, or the caller
+/// opted out. `true` means a background build was scheduled (or was already
+/// in flight). Errors are swallowed: pre-warm is best-effort and must never
+/// disturb session bind.
+pub(crate) fn prewarm_compass_index(working_dir: &Path) -> bool {
+    // Cheap staleness gate that never shells out to git or walks the tree: an
+    // existing index needs no pre-warm. Anything already on disk (even mildly
+    // stale) is served cheaply by the query path, which handles incremental
+    // rebuilds itself; this feature only targets the cases where there is
+    // *nothing* to serve yet — the multi-minute cold build that would otherwise
+    // block a query.
+    let cache = resolve_compass_cache(working_dir);
+    if cache.graph_path.is_file() {
+        return false;
+    }
+
+    // Even in the "no index yet" case, confirm there is actually source to index
+    // before spawning a thread (e.g. empty dirs, non-git scratch folders).
+    if current_git_top_cached(working_dir).is_none() {
+        return false;
+    }
+
+    // Deduplicate concurrent pre-warm builds per project root.
+    let mut map = lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())));
+    if map.contains_key(&cache.output_dir) {
+        return true; // already being built by another subscriber
+    }
+    map.insert(cache.output_dir.clone(), ());
+
+    let out_dir = cache.output_dir.clone();
+    let error_out_dir = out_dir.clone(); // for cleanup if spawn fails
+    let ast_cache = cache.ast_cache_root.clone();
+    let root = working_dir.to_path_buf();
+    std::thread::Builder::new()
+        .name("compass-prewarm".to_string())
+        .spawn(move || {
+            // The build lock serializes against any on-query build already
+            // running, and against other worktrees sharing the AST cache.
+            let _ = build_compass_index(&root, &out_dir, &ast_cache);
+            lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())))
+                .remove(&out_dir);
+        })
+        .map_err(|e| {
+            crate::logging::event_warn(
+                "COMPASS_PREWARM",
+                vec![("error", format!("failed to spawn pre-warm thread: {e}"))],
+            );
+            // Do not leave a stale in-flight marker behind if the spawn failed.
+            lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())))
+                .remove(&error_out_dir);
+        })
+        .is_ok()
 }
 
 /// Run a search through the Compass `CodeQueryEngine`. Returns a model-ready
@@ -2074,6 +2164,79 @@ mod tests {
         assert!(
             project_root.join(&detached_sha).exists(),
             "detached current HEAD must be kept even though it is unreachable and old"
+        );
+    }
+
+    // Pre-warm is the session-subscribe hook that kicks the cold build off the
+    // query path. It must (a) return true and schedule a build for a git dir
+    // with no index, (b) not build again once the index exists, and (c) swallow
+    // failures for non-git/empty dirs without panicking.
+    #[test]
+    fn prewarm_schedules_build_then_noops_when_warm() {
+        let (_home, _home_path) = HomeGuard::set();
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let mut f = std::fs::File::create(main.join("main.rs")).unwrap();
+        writeln!(f, "fn authenticate(user: &str) {{ let _ = user; }}").unwrap();
+        drop(f);
+
+        let git = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&main)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init", "-q"]) {
+            return;
+        }
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+
+        // No index yet: pre-warm must schedule a background build.
+        let edge = resolve_compass_cache(&main);
+        assert!(!edge.graph_path.is_file(), "fixture should start cold");
+        assert!(
+            prewarm_compass_index(&main),
+            "cold git working dir must schedule a pre-warm build"
+        );
+
+        // Wait (bounded) for the background build to finish and produce an index.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !edge.graph_path.is_file() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            edge.graph_path.is_file(),
+            "pre-warm background build must produce a graph.json"
+        );
+
+        // Now warm: a second pre-warm must not schedule a redundant build.
+        assert!(
+            !prewarm_compass_index(&main),
+            "pre-warm must no-op once an index exists"
+        );
+    }
+
+    // A non-git working dir must not spawn a pre-warm build (nothing authoritative
+    // to index, and resolve_compass_cache falls back to a local dir). It should
+    // return false quietly — the pre-warm path must never panic or disturb bind.
+    #[test]
+    fn prewarm_noops_for_non_git_dir() {
+        let (_home, _home_path) = HomeGuard::set();
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let mut f = std::fs::File::create(scratch.join("notes.txt")).unwrap();
+        writeln!(f, "not really source code").unwrap();
+        drop(f);
+        assert!(
+            !prewarm_compass_index(&scratch),
+            "non-git dir must not schedule a pre-warm build"
         );
     }
 

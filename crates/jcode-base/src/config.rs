@@ -679,6 +679,17 @@ pub struct ToolConfig {
     /// index covers the task.
     #[serde(default = "default_true")]
     pub prefer_compass_query: bool,
+    /// Kick off a background Compass knowledge-graph build when a session binds
+    /// to a working directory whose index is missing, so the agent's first
+    /// `compass_query` finds a warm index instead of blocking the turn while a
+    /// (potentially multi-minute) cold build runs inline. The build runs off the
+    /// query path on a background thread under the per-project build lock, and
+    /// is deduplicated per commit (worktrees on different SHAs build
+    /// independently). It is skipped when the session cannot use `compass_query`
+    /// (e.g. tools.disabled), and a failed build backs off for ~5 minutes before
+    /// retrying. Default: on.
+    #[serde(default = "default_true")]
+    pub prewarm_compass_index: bool,
 }
 
 fn default_true() -> bool {
@@ -696,6 +707,7 @@ impl Default for ToolConfig {
             mcp_tools_token_threshold: 8_000,
             read_dedup: true,
             prefer_compass_query: true,
+            prewarm_compass_index: true,
         }
     }
 }

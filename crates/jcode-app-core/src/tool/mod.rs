@@ -1,5 +1,5 @@
 mod agentgrep;
-mod compass_query;
+pub(crate) mod compass_query;
 pub mod ambient;
 mod apply_patch;
 mod bash;
