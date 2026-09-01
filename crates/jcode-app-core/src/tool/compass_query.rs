@@ -1861,12 +1861,33 @@ mod tests {
 
     // END-USER ACCEPTANCE PATH: exercise the real CompassQueryTool::execute
     // against actual linked git worktrees. Two worktrees of the same repo must
-    // resolve to the SAME per-SHA output dir (because the project_id derives
-    // from the git common dir, identical across worktrees). This is the concrete
-    // end-user behavior the shared-cache feature exists to provide: build once,
-    // share across worktrees.
-    #[test]
-    fn linked_worktrees_share_the_same_cache_output_dir() {
+    // (a) resolve to the SAME per-SHA output dir and AST cache root (from the
+    // git common dir), and (b) running the real tool in each worktree produces
+    // real results with only ONE on-disk index, proving the second worktree
+    // reused the first's shared index rather than building its own.
+    async fn run_execute(working_dir: &std::path::Path) -> bool {
+        let ctx = ToolContext {
+            session_id: "s".into(),
+            message_id: "m".into(),
+            tool_call_id: "t".into(),
+            working_dir: Some(working_dir.to_path_buf()),
+            stdin_request_tx: None,
+            graceful_shutdown_signal: None,
+            execution_mode: ToolExecutionMode::Direct,
+        };
+        match CompassQueryTool::new()
+            .execute(serde_json::json!({ "query": "authentication" }), ctx)
+            .await
+        {
+            Ok(out) => {
+                out.output.contains("**Found ") && out.output.contains(" result(s)**")
+            }
+            Err(_) => false,
+        }
+    }
+
+    #[tokio::test]
+    async fn linked_worktrees_share_one_index_end_to_end() {
         let (_home, _home_path) = HomeGuard::set();
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("main");
@@ -1893,7 +1914,6 @@ mod tests {
             return;
         }
         git(&["branch", "shared"], &main);
-        // Create a linked worktree on branch "shared".
         if !std::process::Command::new("git")
             .args(["worktree", "add", "-q", wt.to_str().unwrap(), "shared"])
             .current_dir(&main)
@@ -1904,21 +1924,31 @@ mod tests {
             return;
         }
 
-        // Both worktrees are on the same commit; both must point at the SAME
-        // per-SHA cache output dir (the end-user sharing guarantee).
         let main_cache = resolve_compass_cache(&main);
         let wt_cache = resolve_compass_cache(&wt);
+        assert!(main_cache.is_shared && wt_cache.is_shared);
+        assert_eq!(main_cache.output_dir, wt_cache.output_dir);
+        assert_eq!(main_cache.ast_cache_root, wt_cache.ast_cache_root);
+
+        // Run the real tool in BOTH worktrees; each must return indexed results.
+        assert!(run_execute(&main).await, "main worktree must return results");
+        // The second run (in the linked worktree) must reuse the shared index.
+        let shared_graph = main_cache.output_dir.join("compass-out/graph.json");
+        assert!(shared_graph.exists(), "shared index must exist after first execute");
         assert!(
-            main_cache.is_shared && wt_cache.is_shared,
-            "both worktrees are git-backed (is_shared=true)"
+            run_execute(&wt).await,
+            "linked worktree must also return results via the shared index"
         );
-        assert_eq!(
-            main_cache.output_dir, wt_cache.output_dir,
-            "two worktrees of the same commit must share one cache output dir"
-        );
-        assert_eq!(
-            main_cache.ast_cache_root, wt_cache.ast_cache_root,
-            "two worktrees must share one branch-agnostic AST cache"
-        );
+
+        // Exactly one index must exist for both worktrees (the sharing guarantee).
+        let mut index_count = 0usize;
+        if let Ok(entries) = std::fs::read_dir(&main_cache.output_dir) {
+            for e in entries.flatten() {
+                if e.file_name().to_string_lossy() == "compass-out" {
+                    index_count += 1;
+                }
+            }
+        }
+        assert_eq!(index_count, 1, "one shared index, not one per worktree");
     }
 }
