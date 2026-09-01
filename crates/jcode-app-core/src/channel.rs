@@ -713,15 +713,10 @@ impl TelegramChannel {
             Ok(text) => text,
             Err(_) => return format!("⚠️ Could not read session `{}` for preview.", short_id(&session_id)),
         };
-        // Render compact 2-line preview: split on first two paragraph blocks.
-        // The two rendered lines must escape any MarkdownV2-reserved characters
-        // in the raw session text; otherwise Telegram rejects the whole message
-        // when the preview is sent with `parse_mode=MarkdownV2`.
-        let lines: Vec<String> = entries
-            .split("\n\n")
-            .filter(|s| !s.trim().is_empty())
-            .map(crate::telegram::escape_markdown_v2)
-            .collect();
+        // Split the renderer's block into preview lines: strip each role prefix
+        // and escape the raw content (see peek_preview_lines) so the preview
+        // neither drops to a doubled role label nor breaks parse_mode=MarkdownV2.
+        let lines = peek_preview_lines(&entries);
         let preview = if lines.len() >= 2 {
             format!("👤 *you:* {}\n🤖 *jcode:* {}", lines[0], lines[1])
         } else if lines.len() == 1 {
@@ -1317,6 +1312,25 @@ fn split_command(line: &str) -> (String, String) {
 /// First 8 characters of a session id, for compact display.
 fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
+}
+
+/// Split a `render_session_history` block into preview lines: one per
+/// message paragraph, with the renderer's role prefix (`🧑 *you:* ` /
+/// `🤖 *jcode:* `) stripped and each body's MarkdownV2-reserved characters
+/// escaped. Used by `/peek` so the preview neither doubles the role label nor
+/// breaks `parse_mode=MarkdownV2` with raw session content.
+fn peek_preview_lines(entries: &str) -> Vec<String> {
+    entries
+        .split("\n\n")
+        .filter(|s| !s.trim().is_empty())
+        .map(|para| {
+            let text = para
+                .strip_prefix("🧑 *you:* ")
+                .or_else(|| para.strip_prefix("🤖 *jcode:* "))
+                .unwrap_or(para);
+            crate::telegram::escape_markdown_v2(text)
+        })
+        .collect()
 }
 
 /// Returns a small guidance footer for use after error or help messages,
@@ -2819,5 +2833,29 @@ mod tests {
         let footer = help_footer();
         assert!(footer.contains("/help"));
         assert!(footer.contains("/list"));
+    }
+
+    #[test]
+    fn test_peek_preview_lines_strips_prefix_and_escapes() {
+        // A block as render_session_history emits it.
+        let entries = "🧑 *you:* hello _world_ & code `x`\n\n🤖 *jcode:* reply ok `z`";
+        let lines = peek_preview_lines(entries);
+        // One line per message paragraph, no doubled role label.
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "hello \\_world\\_ & code \\`x\\`");
+        assert_eq!(lines[1], "reply ok \\`z\\`");
+        // Body reserved chars are escaped; role label asterisks are gone.
+        assert!(!lines[0].contains("*you:*"));
+        assert!(lines[0].contains("\\_world\\_"));
+    }
+
+    #[test]
+    fn test_peek_preview_lines_single_and_empty() {
+        assert_eq!(
+            peek_preview_lines("🧑 *you:* only one"),
+            vec!["only one".to_string()]
+        );
+        assert!(peek_preview_lines("").is_empty());
+        assert!(peek_preview_lines("   \n\n  ").is_empty());
     }
 }
