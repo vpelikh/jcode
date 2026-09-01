@@ -254,3 +254,28 @@ fn review_loop_run_alias_starts_loop() {
         "/review-loop run must begin at the first lens"
     );
 }
+
+#[test]
+fn review_loop_start_clears_improve_mode() {
+    // Mutual exclusion: only one loop-mode per session. Starting the review
+    // loop must clear an active improve/refactor mode.
+    let mut app = create_test_app();
+    app.improve_mode = Some(ImproveMode::ImproveRun);
+    app.session.improve_mode = Some(crate::session::SessionImproveMode::ImproveRun);
+
+    app.input = "/review-loop start".to_string();
+    app.submit_input();
+
+    assert!(
+        app.improve_mode.is_none(),
+        "starting review loop must clear app.improve_mode"
+    );
+    assert!(
+        app.session.improve_mode.is_none(),
+        "starting review loop must clear session.improve_mode"
+    );
+    assert!(
+        app.session.review_loop.as_ref().is_some_and(|s| !s.finished),
+        "review loop must be active after start"
+    );
+}
