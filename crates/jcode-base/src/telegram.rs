@@ -133,7 +133,12 @@ const DISCOVERY_PROBE_TIMEOUT_SECS: u64 = 8;
 /// and rely on `resolve`/`dns`/`name resolution`/`no address` for the common
 /// poisoned-DNS case.
 pub fn is_connectivity_error(e: &anyhow::Error) -> bool {
-    let s = e.to_string().to_lowercase();
+    // Concatenate the whole error chain, not just the outermost Display. A
+    // reqwest failure surfaces as a top-level `"error sending request for
+    // url (...)"` with the real cause (`Connection refused`, DNS, timeout)
+    // deeper in the chain; inspecting only the top level would miss it and
+    // misclassify a transient network failure as permanent.
+    let s = error_chain_text(e);
     s.contains("dns")
         || s.contains("resolve")
         || s.contains("lookup")
@@ -158,6 +163,18 @@ pub fn is_connectivity_error(e: &anyhow::Error) -> bool {
         || s.contains("connect: ")
 }
 
+/// Lowercased concatenation of every error in the chain. Inspecting only the
+/// outermost `Display` misses the real cause (e.g. a reqwest failure whose top
+/// level is `"error sending request for url (...)"` while `Connection refused`
+/// sits deeper in the chain), so classifiers walk the full chain.
+fn error_chain_text(e: &anyhow::Error) -> String {
+    e.chain()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase()
+}
+
 /// Whether an error indicates a transient API-level failure that warrants
 /// retry. This includes both connectivity errors (DNS failures, timeouts, TLS
 /// issues) and Telegram's 429 flood-control responses. Permanent errors
@@ -175,7 +192,7 @@ pub fn is_transient_api_error(e: &anyhow::Error) -> bool {
     // text is reliable across both an HTTP-429 response and a body-only
     // error_code=429 (HTTP 200) path. Lowercase keeps the check
     // case-insensitive, matching `is_connectivity_error`.
-    let s = e.to_string().to_lowercase();
+    let s = error_chain_text(e);
     // `; code 429` is a precise marker from post_telegram when the body's
     // error_code is 429 even if the HTTP status differs; it cannot appear
     // incidentally in a description, so it is safe to match.
@@ -1315,6 +1332,34 @@ mod tests {
     #[test]
     fn test_discovery_backoff_is_reasonable() {
         assert!(DISCOVERY_BACKOFF_SECS >= 30);
+    }
+
+    #[test]
+    fn connection_refused_reqwest_error_is_connectivity() {
+        // Regression: a real reqwest connect failure surfaces as a top-level
+        // "error sending request for url (...)" with the actual cause
+        // ("Connection refused") only in its error chain. The classifier must
+        // inspect the chain to catch it; otherwise set_my_commands would treat
+        // a transient network failure as permanent and never retry.
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port = listener.local_addr().unwrap().port();
+                drop(listener);
+                let url = format!("http://127.0.0.1:{port}/x");
+                let client = reqwest::Client::new();
+                let err = client.post(&url).body("hi").send().await.unwrap_err();
+                let e: anyhow::Error = anyhow::Error::new(err);
+                assert!(
+                    is_connectivity_error(&e),
+                    "top-level was: {e} (real cause is in the chain)"
+                );
+                assert!(
+                    is_transient_api_error(&e),
+                    "a connection-refused error must be classified transient"
+                );
+            });
     }
 
     #[test]
