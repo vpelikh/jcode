@@ -884,3 +884,39 @@ fn test_rebuild_event_map_reflects_direct_field_sync() {
     assert_eq!(session.derive_compaction().map(|c| c.summary_text), Some("summary".to_string()));
     assert_eq!(session.derive_memory_injections().len(), 1);
 }
+
+#[test]
+fn test_rebuild_event_map_after_clearing_compaction_drops_stale_setcompaction() {
+    // Mirrors the agent/TUI compaction-clear path: set a compaction (emits a
+    // SetCompaction event), then clear the legacy `compaction` field directly
+    // and rebuild the log. derive_compaction() must return None; otherwise a
+    // stale SetCompaction event would make the derived view disagree with the
+    // cleared legacy state.
+    let mut session = Session::create_with_id("test_clear_compaction_rebuild".to_string(), None, None);
+    session.append_stored_message(StoredMessage {
+        id: "m1".to_string(),
+        role: Role::User,
+        content: vec![text_block("hi")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    session.set_compaction(StoredCompactionState {
+        summary_text: "sum".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 1,
+    });
+    assert!(session.derive_compaction().is_some());
+
+    // Simulation of sync_session_compaction_state_from_manager clearing state.
+    session.compaction = None;
+    session.rebuild_event_map();
+
+    assert!(session.compaction.is_none());
+    assert!(session.derive_compaction().is_none());
+    assert!(session.derive_messages().len() == 1, "message log must be preserved");
+    session.rederive_all_checked().expect("event log must agree with legacy vectors");
+}
