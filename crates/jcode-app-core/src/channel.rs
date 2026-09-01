@@ -849,7 +849,7 @@ impl TelegramChannel {
     async fn free_session_reply(&self, arg: &str) -> String {
         let arg = arg.trim();
         if arg.is_empty() {
-            return "Usage: `/free <session-id-or-prefix>`. List live sessions with `/live`.".to_string();
+            return "Usage: `/free <session-id-or-prefix>` (requires `/confirm`). List live sessions with `/live`.".to_string();
         }
         let Some(sessions) = crate::server::telegram_control::live_sessions_snapshot().await else {
             return "Telegram control is not wired to a server runtime.".to_string();
