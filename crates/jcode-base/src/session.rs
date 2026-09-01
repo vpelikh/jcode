@@ -1331,12 +1331,18 @@ request in this new forked session, using the inherited conversation only as con
             parent_id: None,
             version: 1,
         };
+        let events_before = self.event_map.events.len();
         self.event_map.append_event(event);
         // If validation rejected the event (e.g. an empty-content message from
         // an external import), the legacy vector below will still receive the
         // message. Rebuild the log from the legacy vector afterwards so the two
         // sources of truth never silently diverge.
-        let recorded = self.event_map.events.last().is_some_and(|e| e.event_id == message_id);
+        //
+        // Detect rejection by event-count growth rather than by the tail id: a
+        // message may legitimately share an id with a prior accepted event (e.g.
+        // the same message id appended more than once), which would make a
+        // last-event-id comparison falsely report success.
+        let recorded = self.event_map.events.len() > events_before;
         
         // Keep backward compatibility
         self.memory_profile_cache.messages_count += 1;
@@ -1364,10 +1370,12 @@ request in this new forked session, using the inherited conversation only as con
             parent_id: None,
             version: 1,
         };
+        let events_before = self.event_map.events.len();
         self.event_map.append_event(event);
         // If validation rejected the event, the legacy insert below still
-        // applies; rebuild so the log agrees with the legacy vector.
-        let recorded = self.event_map.events.last().is_some_and(|e| e.event_id == message_id);
+        // applies; rebuild so the log agrees with the legacy vector. Use
+        // event-count growth (not tail-id compare) for robustness.
+        let recorded = self.event_map.events.len() > events_before;
         
         // Keep backward compatibility
         self.messages.insert(index, message);

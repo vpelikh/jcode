@@ -1451,3 +1451,40 @@ fn test_in_place_mutation_reflects_in_derived_and_provider_view() {
     assert_eq!(provider_after[0].content.len(), 1);
     session.rederive_all_checked().expect("in-place mutation must stay consistent");
 }
+
+#[test]
+fn test_duplicate_id_empty_content_append_stays_consistent() {
+    // Round O regression: a later append whose content is empty (rejected by
+    // event validation) but whose id matches an earlier accepted message must
+    // still trigger the rebuild fallback. The previous tail-id heuristic was
+    // fooled by the shared id and left the log and legacy vector desynced.
+    let mut session = Session::create_with_id("test_dup_id_empty".to_string(), None, None);
+    // First: an accepted message with id "X".
+    session.append_stored_message(StoredMessage {
+        id: "X".to_string(),
+        role: Role::User,
+        content: vec![text_block("ok")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+
+    // Second: same id "X" but empty content -> validation rejects the event.
+    session.append_stored_message(StoredMessage {
+        id: "X".to_string(),
+        role: Role::User,
+        content: vec![], // rejected
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+
+    // The log must be reconciled: derived id list equals legacy id list.
+    let legacy_ids: Vec<String> = session.messages.iter().map(|m| m.id.clone()).collect();
+    let derived_ids: Vec<String> = session.derive_messages().iter().map(|m| m.id.clone()).collect();
+    assert_eq!(derived_ids, legacy_ids, "log and legacy must agree even with duplicate empty-content append");
+    assert_eq!(derived_ids, vec!["X", "X"]);
+    session.rederive_all_checked().expect("duplicate-id empty append must stay consistent");
+}
