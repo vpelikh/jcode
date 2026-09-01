@@ -64,6 +64,15 @@ const COMPASS_CACHE_HOME: &str = "compass";
 /// a branch switch only re-extracts files that actually changed.
 const AST_CACHE_DIR: &str = ".ast-cache";
 
+/// Name of the non-git (workspace) output dir inside a project root.
+const WORKSPACE_DIR: &str = "workspace";
+
+/// How long a per-SHA output dir is retained before it is eligible for GC, if
+/// its SHA is no longer reachable from the repo. Older, unreachable per-commit
+/// graphs are pruned so `~/.jcode/compass/<project>/` does not grow unbounded
+/// as a user visits many commits over time.
+const SHA_RETENTION_TTL: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+
 /// Resolved Compass cache paths for a working directory.
 ///
 /// * `output_dir` — Compass's *output root*. Compass writes its output under
@@ -316,6 +325,78 @@ fn canonical_string(p: &Path) -> Option<String> {
     std::fs::canonicalize(p)
         .ok()
         .map(|c| c.to_string_lossy().into_owned())
+}
+
+/// Returns the set of commit SHAs reachable in `working_dir`'s repo (HEAD and
+/// all refs), or `None` if git is unavailable. Used to identify per-SHA output
+/// dirs that are no longer reachable and can be garbage-collected.
+fn git_reachable_shas(working_dir: &Path) -> Option<std::collections::HashSet<String>> {
+    let output = std::process::Command::new("git")
+        .args(["rev-list", "--all"])
+        .current_dir(working_dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut shas = std::collections::HashSet::new();
+    for line in String::from_utf8(output.stdout).ok()?.lines() {
+        let sha = line.trim();
+        if !sha.is_empty() {
+            shas.insert(sha.to_string());
+        }
+    }
+    Some(shas)
+}
+
+/// True if `name` looks like a git commit hash (40 hex chars), i.e. a per-SHA
+/// output dir that GC may consider.
+fn looks_like_sha(name: &str) -> bool {
+    name.len() == 40 && name.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Garbage-collect per-SHA output dirs under `project_root` that are no longer
+/// reachable from `working_dir`'s repo and have not been touched within the
+/// retention window. This keeps `~/.jcode/compass/<project>/` bounded as a user
+/// visits many commits. Best-effort: any failure just skips pruning.
+fn prune_stale_sha_outputs(project_root: &Path, working_dir: &Path) {
+    // Never prune the shared AST cache, the non-git workspace, or any lock file.
+    let Some(reachable) = git_reachable_shas(working_dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    let Ok(entries) = std::fs::read_dir(project_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        // Only per-SHA dirs are candidates; never touch shared/workspace/others.
+        if name == AST_CACHE_DIR || name == WORKSPACE_DIR || !looks_like_sha(name) {
+            continue;
+        }
+        // Reachable commits (HEAD or any branch) are kept regardless of age.
+        if reachable.contains(name) {
+            continue;
+        }
+        // Unreachable dirs must be older than the retention window before being
+        // removed, so a recent checkout that happens to be unreachable from refs
+        // is not deleted immediately.
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(mtime) = meta.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(mtime) else {
+            continue;
+        };
+        if age >= SHA_RETENTION_TTL {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// Format the user-facing message shown when neither an existing Compass index
@@ -718,6 +799,12 @@ fn ensure_fresh_engine(
             .map_err(|e| ("existing index missing or stale".to_string(), e.to_string()))?;
         if !is_shared {
             record_scan(output_dir);
+        } else {
+            // Prune unreachable, aged-out per-SHA graphs so the shared cache
+            // does not grow unbounded as the user visits many commits.
+            if let Some(project_root) = output_dir.parent() {
+                prune_stale_sha_outputs(project_root, working_dir);
+            }
         }
         compass_query::open(graph_path, None, output_dir).map_err(|e| {
             (
@@ -847,7 +934,6 @@ mod tests {
     struct HomeGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
         _dir: tempfile::TempDir,
-        path: PathBuf,
     }
 
     impl HomeGuard {
@@ -856,15 +942,7 @@ mod tests {
             let dir = tempfile::tempdir().expect("temp home");
             let path = dir.path().to_path_buf();
             crate::env::set_var("JCODE_HOME", &path);
-            let ret = path.clone();
-            (
-                HomeGuard {
-                    _lock,
-                    _dir: dir,
-                    path,
-                },
-                ret,
-            )
+            (HomeGuard { _lock, _dir: dir }, path)
         }
     }
 
@@ -1616,6 +1694,82 @@ mod tests {
         assert!(
             index_is_stale(&root, graph_path, current_git_sha(&root).as_deref(), output_dir, true),
             "shared index must be stale after the commit SHA changes"
+        );
+    }
+
+    #[test]
+    fn looks_like_sha_classifies_commit_hashes() {
+        assert!(looks_like_sha(&"a".repeat(40)));
+        assert!(looks_like_sha(&"0".repeat(40)));
+        assert!(!looks_like_sha("short"));
+        assert!(!looks_like_sha(&"g".repeat(40)), "non-hex must not match");
+        assert!(!looks_like_sha(AST_CACHE_DIR));
+        assert!(!looks_like_sha(WORKSPACE_DIR));
+    }
+
+    #[test]
+    fn prune_stale_sha_outputs_spares_reachable_shared_and_workspace() {
+        let (_home, _home_path) = HomeGuard::set();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        // A real git repo so `git rev-list --all` yields a reachable SHA.
+        let git = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init"]) {
+            return;
+        }
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(root.join("main.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "."]);
+        if !git(&["commit", "-m", "init"]) {
+            return;
+        }
+        let Some(reachable) = git_reachable_shas(&root) else {
+            return;
+        };
+        assert_eq!(reachable.len(), 1, "exactly one commit in the fresh repo");
+        let head_sha = reachable.iter().next().unwrap().clone();
+
+        // Simulate the shared layout: reachable SHA dir, an unreachable old fake
+        // SHA dir, the AST cache, and a workspace dir.
+        let project_root = root.join("compass/proj");
+        std::fs::create_dir_all(project_root.join(&head_sha)).unwrap();
+        std::fs::create_dir_all(project_root.join(AST_CACHE_DIR)).unwrap();
+        std::fs::create_dir_all(project_root.join(WORKSPACE_DIR)).unwrap();
+        let stale_sha = "f".repeat(40);
+        std::fs::create_dir_all(project_root.join(&stale_sha)).unwrap();
+        // Backdate the unreachable dir beyond the retention window.
+        let old = std::time::SystemTime::now()
+            .checked_sub(SHA_RETENTION_TTL + std::time::Duration::from_secs(1))
+            .unwrap();
+        let filetime_old = filetime::FileTime::from_system_time(old);
+        filetime::set_file_mtime(project_root.join(&stale_sha), filetime_old).unwrap();
+
+        prune_stale_sha_outputs(&project_root, &root);
+
+        assert!(
+            project_root.join(&head_sha).exists(),
+            "reachable SHA dir must be kept"
+        );
+        assert!(
+            project_root.join(AST_CACHE_DIR).exists(),
+            "shared AST cache must be kept"
+        );
+        assert!(
+            project_root.join(WORKSPACE_DIR).exists(),
+            "workspace dir must be kept"
+        );
+        assert!(
+            !project_root.join(&stale_sha).exists(),
+            "old, unreachable per-SHA dir must be pruned"
         );
     }
 }

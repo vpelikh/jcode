@@ -4133,6 +4133,7 @@ dependencies = [
  "core-graphics",
  "crossterm",
  "dirs",
+ "filetime",
  "flate2",
  "futures",
  "glob",
