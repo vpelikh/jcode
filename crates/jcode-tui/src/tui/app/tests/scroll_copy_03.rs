@@ -1917,12 +1917,14 @@ fn scroll_repaint_hides_cursor_before_cell_moves_via_draw_core() {
 
 /// The production entry point to a full-frame repaint is [`StatusSpinnerRenderer::draw_full`],
 /// which delegates to the backend-generic [`StatusSpinnerRenderer::draw_full_with`] wrapper. That
-/// wrapper owns two things the `draw_full_core` body does not: the synchronized-update window
-/// (`ESC[?2026h` / `ESC[?2026l`) and the error-path cursor re-show. This test drives the exact
-/// wrapper against a captured `CrosstermBackend<Vec<u8>>` and asserts:
+/// wrapper owns the synchronized-update window (`ESC[?2026h` / `ESC[?2026l`) around the body it
+/// calls. This test drives the exact wrapper against a captured `CrosstermBackend<Vec<u8>>` on the
+/// success path and asserts:
 ///   - the sync window opens (`?2026h`) and closes (`?2026l`);
 ///   - the cursor `Hide` (`?25l`) precedes the first cell `MoveTo` (the sweep guard);
 ///   - the composer re-shows the caret (`?25h`) inside the frame.
+/// The wrapper's error-path cursor re-show is not exercised here (that requires a backend whose
+/// draw fails); it is verified by inspection of `draw_full_with`.
 #[test]
 fn full_frame_wrapper_opens_and_closes_sync_window_around_cursor_hidden_draw() {
     use regex::Regex;
