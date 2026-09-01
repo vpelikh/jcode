@@ -279,8 +279,12 @@ pub async fn discover_client(
                 return Ok(client);
             }
             Ok(Err(e)) => {
-                // Probe returned an application-level error (e.g. 401 Unauthorized).
-                if !is_connectivity_error(&e) {
+                // Probe returned an application-level error. Only a genuinely
+                // permanent error (e.g. 401 bad token) should stop discovery;
+                // transient failures (network, TLS, or a 429 rate-limit) mean
+                // try the next candidate. Classifying a 429 as permanent would
+                // abort all discovery with a misleading "bad token?" message.
+                if !is_transient_api_error(&e) {
                     anyhow::bail!(
                         "Telegram auth failed (bad token?): {e}. Stopping IP discovery."
                     );
