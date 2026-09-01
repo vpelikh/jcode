@@ -290,9 +290,13 @@ fn resolve_compass_cache(working_dir: &Path) -> CompassCachePaths {
         // immutable graph. Worktrees on the same SHA share it exactly.
         let output_dir = project_root.join(&sha);
         let graph_path = output_dir.join("compass-out/graph.json");
+        // Serialize on the *project root* (not per-SHA): all worktrees of one
+        // repo write the same shared `.ast-cache`, and Compass does not lock
+        // its cache internally. A per-project flock prevents two worktrees on
+        // different SHAs from corrupting the shared history index concurrently.
         CompassCachePaths {
+            build_lock_dir: project_root.clone(),
             ast_cache_root,
-            build_lock_dir: output_dir.clone(),
             output_dir,
             graph_path,
             is_shared: true,
