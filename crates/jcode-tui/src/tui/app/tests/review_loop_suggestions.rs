@@ -21,7 +21,12 @@ fn typing_review_loop_suggests_subcommands() {
         .iter()
         .map(|(cmd, _)| cmd.as_str())
         .collect();
-    for expected in ["/review-loop start", "/review-loop stop", "/review-loop status"] {
+    for expected in [
+        "/review-loop start",
+        "/review-loop run",
+        "/review-loop stop",
+        "/review-loop status",
+    ] {
         assert!(
             commands.contains(expected),
             "bare /review-loop must offer {expected}, got {:?}",
@@ -225,5 +230,27 @@ fn review_loop_start_restarts_after_finished() {
         state.current_lens,
         Some(jcode_session_types::ReviewLens::Correctness),
         "restarted loop must begin at the first lens"
+    );
+}
+
+#[test]
+fn review_loop_run_alias_starts_loop() {
+    // `/review-loop run` is a silent-but-valid alias for `/review-loop start`
+    // (accepted by the handler). Now that it is advertised in suggestions and
+    // help, it must actually dispatch and seed a runnable loop.
+    let mut app = create_test_app();
+    app.input = "/review-loop run".to_string();
+    app.submit_input();
+
+    let state = app
+        .session
+        .review_loop
+        .as_ref()
+        .expect("submitting /review-loop run must seed session.review_loop");
+    assert!(!state.finished);
+    assert_eq!(
+        state.current_lens,
+        Some(jcode_session_types::ReviewLens::Correctness),
+        "/review-loop run must begin at the first lens"
     );
 }

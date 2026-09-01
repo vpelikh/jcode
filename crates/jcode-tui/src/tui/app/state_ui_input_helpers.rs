@@ -638,6 +638,10 @@ impl App {
                         "Run the per-lens review loop on this session",
                     ),
                     (
+                        "/review-loop run".into(),
+                        "Alias for /review-loop start",
+                    ),
+                    (
                         "/review-loop stop".into(),
                         "Stop the active review loop",
                     ),
@@ -654,6 +658,10 @@ impl App {
                 (
                     "/review-loop start".into(),
                     "Run the per-lens review loop on this session",
+                ),
+                (
+                    "/review-loop run".into(),
+                    "Alias for /review-loop start",
                 ),
                 (
                     "/review-loop stop".into(),
