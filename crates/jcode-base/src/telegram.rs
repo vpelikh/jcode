@@ -1426,6 +1426,24 @@ mod tests {
     }
 
     #[test]
+    fn test_telegram_api_error_scope_renders_status_and_code() {
+        // No error_code in the body: render just the HTTP status.
+        assert_eq!(
+            telegram_api_error_scope(StatusCode::BAD_REQUEST, None),
+            "400 Bad Request"
+        );
+        // error_code present: append it so a body-only 429 is recognizable.
+        assert_eq!(
+            telegram_api_error_scope(StatusCode::OK, Some(429)),
+            "200 OK; code 429"
+        );
+        assert_eq!(
+            telegram_api_error_scope(StatusCode::TOO_MANY_REQUESTS, Some(429)),
+            "429 Too Many Requests; code 429"
+        );
+    }
+
+    #[test]
     fn test_discovery_candidate_ordering() {
         // Simulate the ordering used in discover_client: override first, then
         // default DNS, then the curated list.
