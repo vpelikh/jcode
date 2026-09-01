@@ -11,6 +11,10 @@ async fn handle_resume_session_registers_live_events_before_history_replay() -> 
         None,
         Some("Resume Registration Ordering".to_string()),
     );
+    // Persist the restore target so `handle_resume_session` can load it (and
+    // always overwrite any stale leftover with the fixed id). Without this the
+    // save() skip for untouched sessions leaves it off disk / stale.
+    persisted.saved = true;
     persisted.save()?;
 
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
