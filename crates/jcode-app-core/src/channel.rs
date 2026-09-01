@@ -866,11 +866,20 @@ impl TelegramChannel {
         {
             vec![exact.clone()]
         } else {
-            sessions
-                .iter()
-                .filter(|id| id.starts_with(arg))
-                .cloned()
-                .collect()
+            // Match by memorable name (as displayed in pickers) before falling
+            // back to id-prefix matching, so `/free fox` works for
+            // `session_fox_...`.
+            let by_name: Vec<&String> =
+                sessions.iter().filter(|id| short_id(id) == arg).collect();
+            if by_name.len() == 1 {
+                vec![by_name[0].clone()]
+            } else {
+                sessions
+                    .iter()
+                    .filter(|id| id.starts_with(arg))
+                    .cloned()
+                    .collect()
+            }
         };
         match matches.len() {
             0 => format!("No live session matches `{}`.", escape_markdown_v2(arg)),
@@ -1042,6 +1051,22 @@ impl TelegramChannel {
         let reference = reference.trim();
         if let Some(id) = sessions.iter().find(|id| id.as_str() == reference) {
             return Ok(id.clone());
+        }
+        // Also accept the memorable short name that the pickers and prompts now
+        // display (e.g. `fox` for `session_fox_...`) so a user can `/use fox`.
+        let by_name: Vec<&String> = sessions
+            .iter()
+            .filter(|id| short_id(id) == reference)
+            .collect();
+        if by_name.len() == 1 {
+            return Ok(by_name[0].clone());
+        }
+        if by_name.len() > 1 {
+            return Err(format!(
+                "`{}` matches {} sessions by name; use a longer prefix.",
+                escape_markdown_v2(reference),
+                by_name.len()
+            ));
         }
         let matches: Vec<&String> = sessions
             .iter()
