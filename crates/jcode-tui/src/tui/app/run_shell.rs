@@ -460,6 +460,16 @@ impl StatusSpinnerRenderer {
         Ok(true)
     }
 
+    /// Render a full frame into the live terminal.
+    ///
+    /// This is the only production entry point into a full repaint. It wraps
+    /// [`Self::draw_full_core`] in a synchronized-update window so the whole frame
+    /// (clear/invalidate + diff flush) applies atomically, always closes that window
+    /// (even on a failed draw, so the terminal is not left in sync mode), and re-shows
+    /// the cursor after a failed frame (the errored draw in `draw_full_core` returns
+    /// before the composer reaches its own re-show). Every call site routes through
+    /// here; [`Self::draw_full_core`] is the backend-generic body, kept separate so
+    /// tests can drive the real production path against a captured backend.
     pub(super) fn draw_full(
         &mut self,
         app: &mut App,
