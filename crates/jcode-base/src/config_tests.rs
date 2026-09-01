@@ -463,6 +463,24 @@ fn tool_config_defaults_to_full_toolset() {
     assert!(selection.disabled_tools.is_empty());
     assert_eq!(config.mcp_tools, McpToolsMode::Auto);
     assert_eq!(config.mcp_tools_token_threshold, 8_000);
+    // The compass_query-first enforcement is on by default, matching the
+    // built-in preferred-tools guidance that tells agents to try semantic
+    // search first. An operator can turn it off via [tools] below.
+    assert!(config.prefer_compass_query);
+}
+
+#[test]
+fn tool_config_prefer_compass_query_round_trips_through_toml() {
+    // Explicitly off.
+    let off: Config = toml::from_str("[tools]\nprefer_compass_query = false\n").unwrap();
+    assert!(!off.tools.prefer_compass_query);
+    // Explicitly on.
+    let on: Config = toml::from_str("[tools]\nprefer_compass_query = true\n").unwrap();
+    assert!(on.tools.prefer_compass_query);
+    // Absent key falls back to the default (on) for backward compatibility
+    // with config files written before the flag existed.
+    let absent: Config = toml::from_str("[tools]\nread_dedup = true\n").unwrap();
+    assert!(absent.tools.prefer_compass_query);
 }
 
 #[test]
