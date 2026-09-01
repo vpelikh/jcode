@@ -320,11 +320,12 @@ fn resolve_compass_cache(working_dir: &Path) -> CompassCachePaths {
 /// partition). Uses SHA-256 rather than `DefaultHasher`, whose algorithm is
 /// explicitly documented as unstable across Rust releases/builds — a stable
 /// key is required so an on-disk cache id does not change (and orphan the
-/// cache) when jcode is rebuilt or upgraded.
+/// cache) when jcode is rebuilt or upgraded. The full 256-bit digest is used:
+/// a collision here would silently merge two distinct projects' caches.
 fn short_id(s: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(s.as_bytes());
-    digest.iter().map(|b| format!("{b:02x}")).take(16).collect()
+    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Canonical absolute string form of a path, for a stable non-git project id.
@@ -334,9 +335,10 @@ fn canonical_string(p: &Path) -> Option<String> {
         .map(|c| c.to_string_lossy().into_owned())
 }
 
-/// Returns the set of commit SHAs reachable in `working_dir`'s repo (HEAD and
-/// all refs), or `None` if git is unavailable. Used to identify per-SHA output
-/// dirs that are no longer reachable and can be garbage-collected.
+/// Returns the set of commit SHAs reachable in `working_dir`'s repo via
+/// `git rev-list --all` (all refs: heads, tags, remotes), or `None` if git is
+/// unavailable. Used to identify per-SHA output dirs that are no longer
+/// reachable and can be garbage-collected.
 fn git_reachable_shas(working_dir: &Path) -> Option<std::collections::HashSet<String>> {
     let output = std::process::Command::new("git")
         .args(["rev-list", "--all"])
@@ -1830,7 +1832,7 @@ mod tests {
         let b = short_id("/some/repo/.git");
         assert_eq!(a, b, "same input must hash identically");
         assert_eq!(a.len(), a.chars().count());
-        assert_eq!(a.chars().count(), 32, "16 bytes * 2 hex chars = 32 chars");
+        assert_eq!(a.chars().count(), 64, "full 32-byte SHA-256 digest = 64 hex chars");
         assert!(
             a.chars().all(|c| c.is_ascii_hexdigit()),
             "id must be hex only, got {a}"
