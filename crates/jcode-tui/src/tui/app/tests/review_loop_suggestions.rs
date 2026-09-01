@@ -1,11 +1,11 @@
-// Tests for `/review-loop` typing suggestions and help.
+// Tests for `/review-loop` typing suggestions, help, and dispatch.
 //
 // `/review-loop` was previously dispatchable but produced no suggestion while
 // typing (it was absent from the suggestion registry). These pin the observable
-// UX: typing `/review-loop` must offer `status` / `start` / `stop` completions
-// and `/help review-loop` must show them, matching the existing `/autoreview`
-// and `/judge` style. (Registry presence is asserted in
-// `state_ui_input_helpers.rs` alongside the other registrations.)
+// UX: typing `/review-loop` must offer `status` / `start` / `stop` completions,
+// `/help review-loop` must show them, and submitting `/review-loop start|stop`
+// must actually drive the local review-loop handler. (Registry presence is
+// asserted in `state_ui_input_helpers.rs` alongside the other registrations.)
 
 #[test]
 fn typing_review_loop_suggests_subcommands() {
@@ -86,4 +86,50 @@ fn help_review_loop_topic_shows_loop_details() {
     assert!(msg.content.contains("/review-loop"));
     assert!(msg.content.contains("/review-loop status"));
     assert!(msg.content.contains("/review-loop stop"));
+}
+
+#[test]
+fn review_loop_start_command_seeds_loop() {
+    // Submitting `/review-loop start` must dispatch to the local command handler
+    // and seed a runnable review loop on the session (first lens set, not
+    // finished). This pins the end-to-end wiring that the suggestion + help
+    // surfaces advertise.
+    let mut app = create_test_app();
+    app.input = "/review-loop start".to_string();
+    app.submit_input();
+
+    let state = app
+        .session
+        .review_loop
+        .as_ref()
+        .expect("submitting /review-loop start must seed session.review_loop");
+    assert!(!state.finished);
+    assert_eq!(
+        state.current_lens,
+        Some(jcode_session_types::ReviewLens::Correctness),
+        "seeded loop must begin at the first lens"
+    );
+}
+
+#[test]
+fn review_loop_stop_marks_finished() {
+    let mut app = create_test_app();
+    // Seed a running loop first.
+    app.input = "/review-loop start".to_string();
+    app.submit_input();
+    assert!(
+        app.session.review_loop.as_ref().is_some_and(|s| !s.finished),
+        "review loop should be active after start"
+    );
+
+    // Stop it.
+    app.input = "/review-loop stop".to_string();
+    app.submit_input();
+    let state = app
+        .session
+        .review_loop
+        .as_ref()
+        .expect("loop state still present after stop");
+    assert!(state.finished);
+    assert_eq!(state.finish_reason.as_deref(), Some("user_stopped"));
 }
