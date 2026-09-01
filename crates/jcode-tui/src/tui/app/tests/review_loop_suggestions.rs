@@ -279,3 +279,30 @@ fn review_loop_start_clears_improve_mode() {
         "review loop must be active after start"
     );
 }
+
+#[test]
+fn review_loop_manual_start_clears_stale_reviewer() {
+    // A manual `/review-loop start` must not keep polling a stale in-flight
+    // reviewer id from a previous run/lens. It matches the auto-entry path
+    // (maybe_enter_review_loop) which clears active_reviewer_id after seeding.
+    let mut app = create_test_app();
+    app.input = "/review-loop start".to_string();
+    app.submit_input();
+    // Simulate an in-flight reviewer from a prior lens.
+    app.session.review_loop.as_mut().unwrap().active_reviewer_id =
+        Some("stale-reviewer".to_string());
+
+    // Re-start manually.
+    app.input = "/review-loop start".to_string();
+    app.submit_input();
+    let state = app.session.review_loop.as_ref().unwrap();
+    assert_eq!(
+        state.active_reviewer_id, None,
+        "manual start must clear a stale active_reviewer_id"
+    );
+    assert_eq!(
+        state.current_lens,
+        Some(jcode_session_types::ReviewLens::Correctness),
+        "manual restart must reseed from the first lens"
+    );
+}

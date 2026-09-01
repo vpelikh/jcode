@@ -1472,12 +1472,7 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
                         false
                     }
                     review_loop::ReviewLoopAction::SpawnReviewer(lens) => {
-                        if let Ok(id) = spawn_loop_reviewer(app, lens) {
-                            state.active_reviewer_id = Some(id);
-                        }
-                        app.session.review_loop = Some(state);
-                        let _ = app.session.save();
-                        true
+                        spawn_review_loop_reviewer(app, &mut state, lens)
                     }
                     review_loop::ReviewLoopAction::None => {
                         app.session.review_loop = Some(state);
@@ -1490,12 +1485,7 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
         let action = review_loop::next_action(&mut state);
         match action {
             review_loop::ReviewLoopAction::SpawnReviewer(lens) => {
-                if let Ok(id) = spawn_loop_reviewer(app, lens) {
-                    state.active_reviewer_id = Some(id);
-                }
-                app.session.review_loop = Some(state);
-                let _ = app.session.save();
-                true
+                spawn_review_loop_reviewer(app, &mut state, lens)
             }
             review_loop::ReviewLoopAction::Converged
             | review_loop::ReviewLoopAction::Stalled => {
@@ -1512,6 +1502,46 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
         }
     };
     result
+}
+
+/// Spawn the per-lens reviewer for the current lens and persist the resulting
+/// loop state. Returns `false` and ends the loop cleanly when spawn fails, so
+/// a transient spawn failure does not re-trigger an infinite spawn-and-poll
+/// cycle every turn-end.
+fn spawn_review_loop_reviewer(
+    app: &mut App,
+    state: &mut jcode_session_types::ReviewLoopState,
+    lens: jcode_session_types::ReviewLens,
+) -> bool {
+    match spawn_loop_reviewer(app, lens) {
+        Ok(id) => {
+            state.active_reviewer_id = Some(id);
+            app.session.review_loop = Some(state.clone());
+            let _ = app.session.save();
+            true
+        }
+        Err(error) => {
+            state.finished = true;
+            state.finish_reason = Some("spawn_failed".to_string());
+            let record = state.record.get_or_insert_with(jcode_session_types::ReviewRecord::default);
+            record.digest = Some(
+                format!(
+                    "## Review stopped\n\nCould not spawn the reviewer for the '{}' lens: {}",
+                    lens.label(),
+                    error
+                ),
+            );
+            app.session.review_loop = Some(state.clone());
+            let _ = app.session.save();
+            app.push_display_message(DisplayMessage::error(format!(
+                "Review loop stopped: failed to spawn reviewer for '{}': {}",
+                lens.label(),
+                error
+            )));
+            app.set_status_notice("Review loop: spawn failed");
+            false
+        }
+    }
 }
 
 /// Manual `/review-loop` command (mirrors `/improve`): start a full per-lens
@@ -1532,6 +1562,10 @@ pub(super) fn handle_review_loop_command_local(app: &mut App, trimmed: &str) -> 
                 .review_loop
                 .get_or_insert_with(crate::session::ReviewLoopState::new);
             review_loop::enter_review_loop(state);
+            // Match the auto-entry path (maybe_enter_review_loop): a manual
+            // start must not keep polling a stale in-flight reviewer from a
+            // previous run/lens.
+            state.active_reviewer_id = None;
             let _ = app.session.save();
             app.push_display_message(DisplayMessage::system(
                 "🔁 Review loop started (manual). Reviewing across 6 lenses.".to_string(),
