@@ -1893,7 +1893,10 @@ mod tests {
 
     // The current HEAD's per-SHA dir must survive GC even when that commit is a
     // detached checkout (unreachable from any ref): pruning it would delete the
-    // index the very worktree currently uses.
+    // index the very worktree currently uses. We simulate this directly: a
+    // 40-hex `current_sha` that is NOT in `git rev-list --all` (so reachability
+    // alone would not protect it), with an old mtime beyond the retention window.
+    // It must still be kept purely because it equals the active HEAD.
     #[test]
     fn prune_keeps_detached_head_even_if_unreachable() {
         let (_home, _home_path) = HomeGuard::set();
@@ -1918,31 +1921,34 @@ mod tests {
         if !git(&["commit", "-qm", "init"]) {
             return;
         }
-        if current_git_sha(&root).is_none() {
+        let Some(reachable) = git_reachable_shas(&root) else {
             return;
-        }
-        // Move HEAD off the only ref so the commit is unreachable (detached);
-        // create a sibling commit so the old one has no ref.
-        let old_sha = current_git_sha(&root).unwrap();
-        git(&["checkout", "-q", "-b", "other"]);
-        std::fs::write(root.join("main.rs"), "fn b() {}\n").unwrap();
-        git(&["commit", "-aqm", "other"]);
+        };
+
+        // A detached-HEAD sha that is NOT reachable from any ref (so reachability
+        // alone would NOT protect it), yet describes the currently checked-out
+        // commit and must survive GC.
+        let detached_sha = "a".repeat(40);
+        assert!(
+            !reachable.contains(&detached_sha),
+            "detached_sha must be unreachable so the test isolates the HEAD guard"
+        );
 
         let project_root = root.join("compass/proj");
-        std::fs::create_dir_all(project_root.join(&old_sha)).unwrap();
+        std::fs::create_dir_all(project_root.join(&detached_sha)).unwrap();
         let old = std::time::SystemTime::now()
             .checked_sub(SHA_RETENTION_TTL + std::time::Duration::from_secs(1))
             .unwrap();
         filetime::set_file_mtime(
-            project_root.join(&old_sha),
+            project_root.join(&detached_sha),
             filetime::FileTime::from_system_time(old),
         )
         .unwrap();
 
-        // Simulate the user currently being on old_sha (detached): GC must keep it.
-        prune_stale_sha_outputs(&project_root, &root, &old_sha);
+        // GC with the active detached HEAD equal to detached_sha.
+        prune_stale_sha_outputs(&project_root, &root, &detached_sha);
         assert!(
-            project_root.join(&old_sha).exists(),
+            project_root.join(&detached_sha).exists(),
             "detached current HEAD must be kept even though it is unreachable and old"
         );
     }
