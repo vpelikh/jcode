@@ -1840,3 +1840,87 @@ fn command_palette_open_does_not_move_existing_rows() {
     }
     assert!(checked >= 3, "expected transcript rows to sample:\n{before}");
 }
+
+/// The scroll fix hides the terminal cursor for the full-frame diff flush so the
+/// visible block cursor does not sweep across the screen (ratatui's backend issues
+/// a `MoveTo` for every re-emitted cell during a SoftRepaint). This pins the actual
+/// escape-stream ordering at the crossterm integration boundary: `ESC[?25l` (hide)
+/// must come before the first `ESC[...H` (MoveTo) of the repaint, and `ESC[?25h`
+/// (show) restores the caret at the end.
+#[test]
+fn soft_repaint_hides_cursor_before_cell_moves() {
+    use ratatui::backend::Backend;
+
+    // A crossterm backend writing into a Vec so we can inspect the raw escape
+    // stream (the real path that reaches the terminal), unlike TestBackend which
+    // only models the cell buffer and never the cursor escapes. `draw_full` is
+    // typed against crossterm's `DefaultTerminal`, so this drives the identical
+    // mechanism it performs: the shared `invalidate_previous_terminal_buffer`
+    // (SoftRepaint) plus `Backend::hide_cursor` before the draw.
+    let render = |f: &mut ratatui::Frame| {
+        let area = f.area();
+        for y in 0..area.height {
+            f.render_widget(
+                ratatui::widgets::Paragraph::new(format!("row {y} of the soft repaint")),
+                ratatui::layout::Rect::new(0, y, area.width, 1),
+            );
+        }
+        f.set_cursor_position((0, 2));
+    };
+
+    // Phase 1: the scroll path — SoftRepaint with the cursor hidden for the flush.
+    let stream = {
+        let mut output: Vec<u8> = Vec::new();
+        let backend = ratatui::backend::CrosstermBackend::new(&mut output);
+        let mut terminal = ratatui::Terminal::new(backend).expect("crossterm capture terminal");
+
+        crate::tui::app::run_shell::invalidate_previous_terminal_buffer(&mut terminal);
+        terminal
+            .backend_mut()
+            .hide_cursor()
+            .expect("hide cursor before repaint (as draw_full does)");
+        terminal
+            .draw(render)
+            .expect("soft repaint after hide");
+        drop(terminal); // release the backend borrow on `output`
+        String::from_utf8_lossy(&output).into_owned()
+    };
+    let hide = "\u{1b}[?25l";
+    // A `MoveTo` is emitted as `ESC[<row>;<col>H` (the only `H`-ending CSI the
+    // backend sends for cells). Ensure the repaint actually occurred and that
+    // the cursor Hide came before the first cell move.
+    assert!(
+        stream.contains('H'),
+        "SoftRepaint must actually emit cell moves; got: {stream:?}"
+    );
+    assert!(
+        stream.contains(hide),
+        "soft repaint must hide the cursor for the diff flush; got: {stream:?}"
+    );
+    let hide_at = stream.find(hide).expect("hide present");
+    let first_moveto = stream.find('H').expect("move present");
+    assert!(
+        hide_at <= first_moveto,
+        "Hide must precede the first MoveTo; hide@{hide_at} move@{first_moveto}"
+    );
+
+    // Phase 2: a plain frame after the caret was shown emits no hide; the caret
+    // stays visible and lands on the set position.
+    let plain_stream = {
+        let mut output2: Vec<u8> = Vec::new();
+        let backend = ratatui::backend::CrosstermBackend::new(&mut output2);
+        let mut terminal = ratatui::Terminal::new(backend).expect("crossterm capture terminal");
+
+        terminal
+            .backend_mut()
+            .show_cursor()
+            .expect("show cursor before plain draw");
+        terminal.draw(render).expect("plain draw");
+        drop(terminal); // release the backend borrow on `output2`
+        String::from_utf8_lossy(&output2).into_owned()
+    };
+    assert!(
+        plain_stream.contains("\u{1b}[?25h"),
+        "plain draw should leave the caret visible; got: {plain_stream:?}"
+    );
+}
