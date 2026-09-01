@@ -233,8 +233,7 @@ pub struct SkillInfo {
 /// Default preferred-tools guidance injected when no project/global
 /// `preferred-tools.md` is present. This ensures code-search tool ordering is
 /// always enforced even in a clean environment.
-const DEFAULT_PREFERRED_TOOLS: &str =
-    "# Default Preferred Tools\n\n\
+const DEFAULT_PREFERRED_TOOLS: &str = "# Default Preferred Tools\n\n\
     For any codebase discovery, search, or indexing task, use `compass_query` first.\n\
     Only fall back to `agentgrep` when `compass_query` is unavailable. Code search is\n\
     never optional between grep and a search skill: when a search skill is present,\n\
@@ -1073,7 +1072,10 @@ fn load_preferred_tools_files_from_dir(working_dir: Option<&Path>) -> (Option<St
     }
 
     if contents.is_empty() {
-        (Some(DEFAULT_PREFERRED_TOOLS.to_string()), DEFAULT_PREFERRED_TOOLS.len())
+        (
+            Some(DEFAULT_PREFERRED_TOOLS.to_string()),
+            DEFAULT_PREFERRED_TOOLS.len(),
+        )
     } else {
         (Some(contents.join("\n\n")), total_chars)
     }
