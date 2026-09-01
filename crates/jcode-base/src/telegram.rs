@@ -762,14 +762,6 @@ pub async fn set_my_commands(
 
         match outcome {
             Ok(Ok(())) => break,
-            Ok(Err(e)) | Err(e)
-                if attempt >= SET_MY_COMMANDS_MAX_ATTEMPTS =>
-            {
-                logging::warn(&format!(
-                    "failed to register telegram commands after {attempt} attempts: {e}"
-                ));
-                break;
-            }
             Ok(Err(e)) | Err(e) => {
                 // Only retry transient errors (connectivity issues, rate
                 // limits, timeouts). Permanent failures like invalid token or
@@ -777,7 +769,14 @@ pub async fn set_my_commands(
                 // hidden behind retries.
                 if !is_transient_api_error(&e) {
                     logging::warn(&format!(
-                        "setMyCommands failed with non-transient error ({e}), not retrying"
+                        "setMyCommands failed with non-transient error ({e}); not retrying"
+                    ));
+                    break;
+                }
+                // Exhausted the retry budget.
+                if attempt >= SET_MY_COMMANDS_MAX_ATTEMPTS {
+                    logging::warn(&format!(
+                        "failed to register telegram commands after {attempt} attempts: {e}"
                     ));
                     break;
                 }
