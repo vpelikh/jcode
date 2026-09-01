@@ -1488,3 +1488,46 @@ fn test_duplicate_id_empty_content_append_stays_consistent() {
     assert_eq!(derived_ids, vec!["X", "X"]);
     session.rederive_all_checked().expect("duplicate-id empty append must stay consistent");
 }
+
+#[test]
+fn test_empty_and_replay_only_session_hydrate_consistently() {
+    // Round T: an empty session and a replay-only session (no messages) must
+    // round-trip through the real load path and stay consistent after rebuild.
+    use std::io::Write;
+
+    let dir = std::env::temp_dir().join(format!("jcode_edge_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // 1) Empty session (no messages/injections/compaction/replay).
+    let empty = Session::create_with_id("edge_empty".to_string(), None, None);
+    let p1 = dir.join("empty.json");
+    std::fs::write(&p1, serde_json::to_string(&empty).unwrap()).unwrap();
+    let loaded_empty = Session::load_from_path(&p1).expect("load empty");
+    loaded_empty.rederive_all_checked().expect("empty session consistent");
+    assert!(loaded_empty.messages.is_empty());
+    assert!(loaded_empty.derive_messages().is_empty());
+
+    // 2) Replay-only session (a replay event but no messages). before_message on
+    //    the replay event is independent; hydration must preserve the event.
+    let mut replay_only = Session::create_with_id("edge_replay".to_string(), None, None);
+    replay_only.record_replay_event(&crate::session::StoredReplayEvent {
+        timestamp: Utc::now(),
+        kind: crate::session::StoredReplayEventKind::DisplayMessage {
+            role: "system".to_string(),
+            title: None,
+            content: "notice".to_string(),
+        },
+    });
+    // Bypass the in-process event append to simulate a persisted-session load
+    // where only the legacy replay vector is present.
+    replay_only.rebuild_event_map();
+    let p2 = dir.join("replay.json");
+    std::fs::write(&p2, serde_json::to_string(&replay_only).unwrap()).unwrap();
+    let loaded_replay = Session::load_from_path(&p2).expect("load replay-only");
+    loaded_replay.rederive_all_checked().expect("replay-only consistent");
+    assert!(loaded_replay.messages.is_empty());
+    assert_eq!(loaded_replay.derive_replay_events().len(), 1);
+    assert_eq!(loaded_replay.replay_events.len(), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
