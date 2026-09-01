@@ -19,7 +19,7 @@ fn report_reload_interaction_gap() {
     ));
 }
 use crate::tui::TuiState;
-use crossterm::cursor::{RestorePosition, SavePosition};
+use crossterm::cursor::{Hide, RestorePosition, SavePosition};
 use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use ratatui::{buffer::Buffer, layout::Rect, style::Style};
 use std::io::Write;
@@ -488,6 +488,14 @@ impl StatusSpinnerRenderer {
         app.force_full_redraw = false;
         app.force_full_repaint = false;
 
+        // A full frame (and any SoftRepaint the scroll path triggers) writes the diff
+        // through the backend's `MoveTo(x, y)` for every changed cell while the cursor
+        // is still visible. On terminals without synchronized-update support this makes
+        // the visible block cursor sweep across the whole screen ("cursor jumps to
+        // random places") during scroll. Hide it for the diff flush; `terminal.draw`
+        // always issues `Show` + `MoveTo` to the caret afterwards because `draw_input`
+        // sets a cursor position, so the cursor reappears exactly where it belongs.
+        let _ = crossterm::execute!(terminal.backend_mut(), Hide);
         let previous_frame = self.last_frame.as_ref();
         let draw_start = Instant::now();
         let mut render_elapsed = Duration::ZERO;
