@@ -822,16 +822,21 @@ fn ensure_fresh_engine(
 
                 // The shared index is keyed by the committed SHA and holds no
                 // worktree's uncommitted edits (see index_is_stale). For shared
-                // caches this branch is only reachable on a genuine SHA switch:
-                // the current output dir no longer matches, so discard and
-                // rebuild below. For non-shared caches it is also reached on
-                // source edits.
+                // caches this branch is only reachable in the transient window
+                // after a checkout where the cached SHA lags HEAD. The output
+                // dir is already keyed by the current SHA, so we do NOT delete
+                // it here: Compass republishes atomically on rebuild, and
+                // removing it could destroy another worktree's still-in-use
+                // index on the same SHA. Non-shared caches (single output that
+                // evolves in place) still need a clean discard on source edits.
                 drop(engine);
-                let _ = std::fs::remove_dir_all(output_dir);
-                // Clean up stale index files. Don't remove .compass-build.lock
-                // here - it's safe to leave and removing it while holding the
-                // lock could block other worktrees.
-                let _ = std::fs::remove_file(output_dir.join(GIT_SHA_FILE));
+                if !is_shared {
+                    let _ = std::fs::remove_dir_all(output_dir);
+                    // Don't remove .compass-build.lock here - it's safe to leave
+                    // and removing it while holding the lock could block other
+                    // worktrees.
+                    let _ = std::fs::remove_file(output_dir.join(GIT_SHA_FILE));
+                }
             }
             Err(_) => {
                 // Missing or corrupt: rebuild below (current_sha is captured by
