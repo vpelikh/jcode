@@ -1589,3 +1589,37 @@ fn test_multi_insert_repair_pattern_stays_consistent() {
     // Expected order: user, asst, result_t1, result_t2
     assert_eq!(ids, vec!["user", "asst", "result_t1", "result_t2"]);
 }
+
+#[test]
+fn test_fork_preserves_aged_events() {
+    // Round AA: forking a log whose events carry old (beyond the ±1yr insert
+    // validation window) timestamps must NOT drop them. Re-validating on fork
+    // would silently truncate long-lived or imported sessions.
+    use crate::session::event_types::SessionEventMap;
+
+    let old = chrono::Utc::now() - chrono::Duration::days(700); // ~2 years ago
+    let mut map = SessionEventMap::default();
+    map.push_event(SessionEvent {
+        timestamp: old,
+        event_id: "rehydrate_0".to_string(),
+        op: SessionEventOp::AppendMessage {
+            message_id: "m0".to_string(),
+            message: StoredMessage {
+                id: "m0".to_string(),
+                role: Role::User,
+                content: vec![text_block("aged")],
+                display_role: None,
+                timestamp: Some(old),
+                tool_duration_ms: None,
+                token_usage: None,
+            },
+        },
+        parent_id: None,
+        version: 1,
+    });
+
+    // Fork up to boundary 0 must preserve the aged message.
+    let fork = map.fork_up_to_boundary(0);
+    let ids: Vec<String> = fork.derive_messages().iter().map(|m| m.id.clone()).collect();
+    assert_eq!(ids, vec!["m0"], "fork must not drop an aged (validated-at-insert) event");
+}
