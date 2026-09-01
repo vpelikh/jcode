@@ -370,9 +370,9 @@ impl TelegramChannel {
     }
 
     /// Send an inline-keyboard session picker to the chat. Supports filter
-    /// flags: `--saved` (saved sessions only), `--today` (active today),
-    /// `--recent` (last 50 by recency, default). Each button's `callback_data`
-    /// is the session id, so tapping it selects that session.
+    /// flags: `--saved` (saved sessions only), `--today` (active in the last
+    /// 24h). Each button's `callback_data` is the session id, so tapping it
+    /// selects that session.
     async fn send_session_picker(&self, args: &str) {
         let client = self.client_or_default().await;
         // Determine filter mode from arguments
@@ -381,7 +381,12 @@ impl TelegramChannel {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let one_day_ago_ms = today_ms - 24 * 60 * 60 * 1000;
-        let limit = if args.contains("--saved") { 24 } else { 12 };
+        // Fetch a larger candidate pool for the filtered modes: the SQL `recent`
+        // applies `LIMIT` before our Rust-side `--saved`/`--today` filter, so a
+        // small pool could hide matching sessions that sit past the cap. We cap
+        // the displayed rows afterwards.
+        let filtered_mode = args.contains("--saved") || args.contains("--today");
+        let limit = if filtered_mode { 50 } else { 12 };
 
         let entries = match crate::recent_session_index::recent(limit) {
             Ok(list) => list,
@@ -393,7 +398,7 @@ impl TelegramChannel {
 
         // Filter based on flags
         let filtered: Vec<_> = if args.contains("--saved") {
-            entries.into_iter().filter(|s| s.saved).collect()
+            entries.into_iter().filter(|s| s.saved).take(24).collect()
         } else if args.contains("--today") {
             entries
                 .into_iter()
@@ -402,6 +407,7 @@ impl TelegramChannel {
                         .map(|t| t >= one_day_ago_ms)
                         .unwrap_or(false)
                 })
+                .take(12)
                 .collect()
         } else {
             entries
