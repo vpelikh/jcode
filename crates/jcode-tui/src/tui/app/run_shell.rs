@@ -483,10 +483,11 @@ impl StatusSpinnerRenderer {
     /// `ratatui::backend::Backend` in tests, instead of being approximated by a
     /// stand-in harness.
     ///
-    /// Completing the repaint as part of the screen surface is what matters: this is
-    /// the shared code path the scroll-triggered `SoftRepaint` runs (request_full_repaint
-    /// → invalidate_previous_terminal_buffer → here), and it is where the fix hides the
-    /// cursor so its visible caret does not sweep across the re-emitted cells.
+    /// This is the exact code path the scroll-triggered `SoftRepaint` runs
+    /// (request_full_repaint → invalidate_previous_terminal_buffer → here), and the
+    /// place the cursor is hidden so its visible caret does not sweep across the
+    /// re-emitted cells. Testing it directly keeps the regression guard on the real
+    /// production code rather than a copy of its steps.
     pub(super) fn draw_full_core<B>(
         &mut self,
         app: &mut App,
@@ -516,14 +517,16 @@ impl StatusSpinnerRenderer {
 
         // A full frame (and any SoftRepaint the scroll path triggers) writes the diff
         // through the backend's `MoveTo(x, y)` for every changed cell while the cursor
-        // is still visible. On terminals that carry a block/bar cursor this makes the
-        // visible caret sweep across the whole screen ("cursor jumps to random places")
-        // during scroll. Hide it for the diff flush; `terminal.draw` then either
-        // restores the caret (the normal composer path, where `draw_input` sets a
-        // cursor position) or leaves the cursor hidden (overlay branches such as the
-        // changelog/help/pickers, where ratatui also hides when no position is set),
-        // so the cursor ends exactly where it belongs in every case.
-        terminal.backend_mut().hide_cursor()?;
+        // is still visible. On terminals without synchronized-update support this makes
+        // the visible block cursor sweep across the whole screen ("cursor jumps to
+        // random places") during scroll. Hide it for the diff flush; `terminal.draw`
+        // then either restores the caret (the normal composer path, where `draw_input`
+        // sets a cursor position) or leaves the cursor hidden (overlay branches such as
+        // the changelog/help/pickers, where ratatui also hides when no position is set),
+        // so the cursor ends exactly where it belongs in every case. The hide is
+        // best-effort: skipping it must not abort the frame (the soft-repaint buffer
+        // invalidation has already happened), so the error is deliberately ignored.
+        let _ = terminal.backend_mut().hide_cursor();
         let previous_frame = self.last_frame.as_ref();
         let draw_start = Instant::now();
         let mut render_elapsed = Duration::ZERO;
