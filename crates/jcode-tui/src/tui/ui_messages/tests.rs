@@ -665,9 +665,14 @@ fn render_todos_message_shows_user_intention_when_understanding_is_unclear() {
             .any(|line| line.contains("Intent partial: This deliberately long assessment detail")),
         "wide={wide:?}"
     );
+    let wide_joined = wide.join("\n");
     assert!(
-        wide.iter().any(|line| line.contains('…')),
-        "wide intent should remain on one ellipsized line: {wide:?}"
+        wide_joined.contains(long_text),
+        "wide intent should be preserved in full by wrapping, not ellipsized: {wide:?}"
+    );
+    assert!(
+        !wide.iter().any(|line| line.contains('…') && line.contains("Intent")),
+        "wide intent should not be ellipsized when it can wrap: {wide:?}"
     );
     assert!(
         !narrow
