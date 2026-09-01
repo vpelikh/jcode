@@ -828,14 +828,17 @@ impl TelegramChannel {
     /// paste them into `[safety] telegram_chat_id` / `telegram_allowed_user_id`.
     fn whoami_reply(&self) -> String {
         let mut msg = String::from("👤 *You are:*\n");
-        msg.push_str(&format!(
-            "• chat\\_id: `{}`\n",
-            escape_markdown_v2(&self.chat_id)
-        ));
+        // chat_id and allowed_user_id are numeric config values rendered inside
+        // inline code spans and a fenced block, where MarkdownV2 treats content
+        // literally (backslashes are not escape markers there). Escaping them
+        // would inject literal backslashes into negative ids (e.g. `\-100...`),
+        // corrupting the value the user copies into their config. So they are
+        // emitted raw inside code spans.
+        msg.push_str(&format!("• chat\\_id: `{}`\n", self.chat_id));
         if let Some(uid) = self.allowed_user_id.as_ref() {
             msg.push_str(&format!(
                 "• configured allowed\\_user\\_id: `{}`\n",
-                escape_markdown_v2(uid)
+                uid
             ));
         } else {
             msg.push_str("• allowed\\_user\\_id: _(not set — any sender in this chat is accepted)_\n");
@@ -843,7 +846,7 @@ impl TelegramChannel {
         msg.push_str("\n📋 Copy these into your config:\n");
         msg.push_str(&format!(
             "```\n[safety]\ntelegram_chat_id = \"{}\"\n```",
-            escape_markdown_v2(&self.chat_id)
+            self.chat_id
         ));
         msg
     }
@@ -2737,6 +2740,27 @@ mod tests {
         let (cmd, rest) = split_command("/list");
         assert_eq!(cmd, "/list");
         assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn test_whoami_reply_preserves_negative_chat_id() {
+        // A negative (supergroup) chat id must render its leading dash literally
+        // inside the inline-code and fenced-block spans, not as an escaped `\-`
+        // that would corrupt the value the user copies into config.
+        let ch = TelegramChannel::with_connectivity(
+            "tok".into(),
+            "-1001234567890".into(),
+            true,
+            None,
+            None,
+            None,
+            None,
+        );
+        let out = ch.whoami_reply();
+        assert!(out.contains("chat\\_id: `-1001234567890`"), "got {out:?}");
+        assert!(out.contains("telegram_chat_id = \"-1001234567890\""), "got {out:?}");
+        // No stray backslash before the dash.
+        assert!(!out.contains("\\-1001234567890"), "negative id must not be escaped: {out:?}");
     }
 
     #[test]
