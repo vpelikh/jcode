@@ -555,6 +555,20 @@ impl TelegramChannel {
         // asks the user to `/confirm` to proceed (or `/cancel`).
         if let Some(id) = data.strip_prefix("__free__") {
             let id = id.trim().to_string();
+            // Tolerate a degenerate empty payload (e.g. a hand-crafted callback
+            // `__free__` with no id) rather than queuing a bogus confirmation
+            // for an empty session id that could never be freed.
+            if id.is_empty() {
+                let _ = crate::telegram::answer_callback_query(
+                    &client,
+                    &self.token,
+                    &cb.id,
+                    "No session id to free.",
+                    self.api_base.as_deref(),
+                )
+                .await;
+                return;
+            }
             let mut tracker = self.confirmation_tracker.lock().await;
             let prompt = tracker.request("free", id.clone());
             drop(tracker);
@@ -1103,7 +1117,7 @@ impl TelegramChannel {
         // Count saved vs recent sessions for richer status
         let total_recent = recent_entries.len();
         let total_saved = recent_entries.iter().filter(|s| s.saved).count();
-        let has_pending_confirm = self.confirmation_tracker.lock().await.pending.is_some();
+        let has_pending_confirm = self.confirmation_tracker.lock().await.has_pending_active();
         let confirm_line = if has_pending_confirm {
             "⚠️ Pending confirmation (use /confirm or /cancel)"
         } else {
@@ -1519,6 +1533,15 @@ impl ConfirmationTracker {
             return None;
         }
         Some((pending.action, pending.session_id))
+    }
+
+    /// Whether a confirmation is currently pending and has not yet expired.
+    /// Unlike `verify`, this does not consume the pending state, so it is safe
+    /// to call from e.g. `/status` to report accurate confirmation state.
+    fn has_pending_active(&self) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|p| std::time::Instant::now() <= p.expires_at)
     }
 
     /// Drop any pending confirmation (e.g. after /cancel).
@@ -2939,6 +2962,21 @@ mod tests {
         tracker.pending.as_mut().unwrap().expires_at =
             Instant::now() - Duration::from_secs(1);
         assert!(tracker.verify("__confirm__").is_none());
+    }
+
+    #[test]
+    fn test_confirmation_tracker_has_pending_active_respects_ttl() {
+        use std::time::{Duration, Instant};
+        let mut tracker = ConfirmationTracker::new();
+        // Fresh confirmation: active.
+        tracker.request("free", "session_active".to_string());
+        assert!(tracker.has_pending_active());
+        // Expire it: no longer active, and not consumed by the check.
+        tracker.pending.as_mut().unwrap().expires_at =
+            Instant::now() - Duration::from_secs(1);
+        assert!(!tracker.has_pending_active());
+        // The expired entry is still present (only verify consumes it).
+        assert!(tracker.pending.is_some());
     }
 
     #[test]
