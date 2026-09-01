@@ -572,7 +572,7 @@ pub async fn send_message_raw(
     if !parsed.ok {
         anyhow::bail!(
             "Telegram API error ({}): {}",
-            status,
+            telegram_api_error_scope(status, parsed.error_code),
             parsed.description.unwrap_or_default()
         );
     }
@@ -641,7 +641,7 @@ async fn send_message_once(
         }
         anyhow::bail!(
             "Telegram API error ({}): {}",
-            status,
+            telegram_api_error_scope(status, parsed.error_code),
             description
         );
     }
@@ -924,6 +924,18 @@ pub async fn answer_callback_query(
     post_telegram(client, bot_token, "answerCallbackQuery", body, base_override).await
 }
 
+/// Format the status/code scope shared by all Bot API error messages. When the
+/// response body carries an `error_code` it is appended so transient failures
+/// (429 rate-limit) are recognizable even when the HTTP layer reports a
+/// success status. Kept identical across call sites so error strings are
+/// consistent for anything that parses or classifies them.
+fn telegram_api_error_scope(status: reqwest::StatusCode, error_code: Option<i64>) -> String {
+    match error_code {
+        Some(c) => format!("{status}; code {c}"),
+        None => status.to_string(),
+    }
+}
+
 /// POST a JSON body to a Bot API method and return whether it succeeded,
 /// logging on failure but not erroring (agnostic callers decide).
 async fn post_telegram(
@@ -938,15 +950,7 @@ async fn post_telegram(
     let status = resp.status();
     let parsed: TelegramResponse<serde_json::Value> = resp.json().await?;
     if !parsed.ok {
-        // Include the Bot API `error_code` when present so transient failures
-        // are recognizable even when the HTTP layer reports a success status
-        // (some API error paths surface the real code only in the body). This
-        // matters for callers like `set_my_commands` that classify retryable
-        // failures (429 rate-limit) from the message text.
-        let scope = match parsed.error_code {
-            Some(c) => format!("{status}; code {c}"),
-            None => status.to_string(),
-        };
+        let scope = telegram_api_error_scope(status, parsed.error_code);
         anyhow::bail!(
             "Telegram API error ({scope}): {}",
             parsed.description.unwrap_or_default()
