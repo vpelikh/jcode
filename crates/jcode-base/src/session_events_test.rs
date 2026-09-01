@@ -1218,3 +1218,158 @@ fn test_mixed_sequence_replays_consistently_after_serialize() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_replace_messages_clamps_out_of_range_bounds() {
+    // Round C: derive_messages must clamp ReplaceMessages bounds. A replacement
+    // issued against a shorter-than-expected transcript (e.g. after a clear)
+    // where start_index exceeds the live length must append rather than be
+    // silently dropped, and end_index=usize::MAX always means "to the end".
+    use crate::session::event_types::SessionEventMap;
+
+    let mk = |id: &str| StoredMessage {
+        id: id.to_string(),
+        role: Role::User,
+        content: vec![text_block(id)],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    };
+
+    // Empty transcript, then a full replacement with a high start index
+    // (simulating a replace issued after the transcript was cleared to empty).
+    let mut map = SessionEventMap::default();
+    map.append_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "r1".to_string(),
+        op: SessionEventOp::ReplaceMessages {
+            start_index: 5, // exceeds the (empty) current transcript
+            end_index: 8,
+            messages: vec![mk("a"), mk("b")],
+        },
+        parent_id: None,
+        version: 1,
+    });
+    let ids: Vec<String> = map.derive_messages().iter().map(|m| m.id.clone()).collect();
+    assert_eq!(ids, vec!["a", "b"], "out-of-range start must append, not drop");
+
+    // A mid-list replace where end_index exceeds the live length is clamped.
+    let mut map2 = SessionEventMap::default();
+    for id in ["a", "b", "c"] {
+        map2.append_event(SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: format!("append_{}", id),
+            op: SessionEventOp::AppendMessage { message_id: id.to_string(), message: mk(id) },
+            parent_id: None,
+            version: 1,
+        });
+    }
+    map2.append_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "partial".into(),
+        op: SessionEventOp::ReplaceMessages {
+            start_index: 1,
+            end_index: 999, // exceeds live length; clamped to 3
+            messages: vec![mk("X"), mk("Y")],
+        },
+        parent_id: None,
+        version: 1,
+    });
+    let ids2: Vec<String> = map2.derive_messages().iter().map(|m| m.id.clone()).collect();
+    assert_eq!(ids2, vec!["a", "X", "Y"], "end clamped to live length");
+}
+
+#[test]
+fn test_memory_injection_and_replay_event_derived_order_matches_legacy() {
+    // Round B: at the public Session API boundary, derived memory injections and
+    // replay events must come back in the same submission order as the legacy
+    // vectors, including after a rebuild/reload (hydration preserves order).
+    use std::io::Write;
+
+    let dir = std::env::temp_dir().join(format!("jcode_ord_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("session.json");
+
+    let mut session = Session::create_with_id("test_order".to_string(), None, None);
+    session.append_stored_message(StoredMessage {
+        id: "m1".to_string(),
+        role: Role::User,
+        content: vec![text_block("hi")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    session.record_memory_injection("first".to_string(), "A".to_string(), 1, 0, vec![]);
+    session.record_replay_event(&crate::session::StoredReplayEvent {
+        timestamp: Utc::now(),
+        kind: crate::session::StoredReplayEventKind::DisplayMessage {
+            role: "system".to_string(),
+            title: None,
+            content: "notice1".to_string(),
+        },
+    });
+    session.record_memory_injection("second".to_string(), "B".to_string(), 2, 0, vec![]);
+    session.record_replay_event(&crate::session::StoredReplayEvent {
+        timestamp: Utc::now(),
+        kind: crate::session::StoredReplayEventKind::DisplayMessage {
+            role: "system".to_string(),
+            title: None,
+            content: "notice2".to_string(),
+        },
+    });
+
+    let inj_derived: Vec<String> =
+        session.derive_memory_injections().iter().map(|i| i.summary.clone()).collect();
+    let inj_legacy: Vec<String> =
+        session.memory_injections.iter().map(|i| i.summary.clone()).collect();
+    assert_eq!(inj_derived, vec!["first", "second"]);
+    assert_eq!(inj_derived, inj_legacy);
+
+    let rp_derived: Vec<String> = session
+        .derive_replay_events()
+        .iter()
+        .filter_map(|e| match &e.kind {
+            crate::session::StoredReplayEventKind::DisplayMessage { content, .. } => {
+                Some(content.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    let rp_legacy: Vec<String> = session
+        .replay_events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            crate::session::StoredReplayEventKind::DisplayMessage { content, .. } => {
+                Some(content.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rp_derived, vec!["notice1", "notice2"]);
+    assert_eq!(rp_derived, rp_legacy);
+
+    // Persist + reload: hydration must preserve this order.
+    let json = serde_json::to_string(&session).expect("serialize");
+    let mut f = std::fs::File::create(&path).unwrap();
+    f.write_all(json.as_bytes()).unwrap();
+    drop(f);
+    let loaded = Session::load_from_path(&path).expect("load_from_path");
+    let li: Vec<String> =
+        loaded.derive_memory_injections().iter().map(|i| i.summary.clone()).collect();
+    assert_eq!(li, vec!["first", "second"]);
+    let lr: Vec<String> = loaded
+        .derive_replay_events()
+        .iter()
+        .filter_map(|e| match &e.kind {
+            crate::session::StoredReplayEventKind::DisplayMessage { content, .. } => {
+                Some(content.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(lr, vec!["notice1", "notice2"]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
