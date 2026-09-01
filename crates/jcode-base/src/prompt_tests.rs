@@ -788,3 +788,40 @@ fn custom_preferred_tools_override_default_fallback() {
         crate::env::remove_var("JCODE_HOME");
     }
 }
+
+#[test]
+fn preferred_tools_global_only_uses_global_without_default_duplication() {
+    use crate::prompt::load_preferred_tools_files_from_dir;
+
+    let _guard = crate::storage::lock_test_env();
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let temp = tempfile::TempDir::new().unwrap();
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    // Global present, no project file.
+    std::fs::write(
+        temp.path().join("preferred-tools.md"),
+        "global custom guidance",
+    )
+    .unwrap();
+    let project_dir = tempfile::TempDir::new().unwrap();
+
+    let (content, _) = load_preferred_tools_files_from_dir(Some(project_dir.path()));
+    let content = content.expect("global preferred-tools should be loaded");
+    assert!(content.contains("global custom guidance"));
+    assert!(
+        content.contains("Global Preferred Tools (~/.jcode/preferred-tools.md)"),
+        "expected global heading"
+    );
+    // The default must not be appended when a real file is present.
+    assert!(
+        !content.contains("# Default Preferred Tools"),
+        "default fallback should not be mixed with real config"
+    );
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}

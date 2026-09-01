@@ -12,6 +12,9 @@ files, so you can tune agent behavior without rebuilding.
 4. `AGENTS.md` — project `./AGENTS.md` and global `~/AGENTS.md`.
 5. Prompt overlay — `./.jcode/prompt-overlay.md` and `~/.jcode/prompt-overlay.md`.
 6. Preferred tools — `./.jcode/preferred-tools.md` and `~/.jcode/preferred-tools.md`.
+   Project beats global. If neither exists, a built-in default that prefers the
+   `compass_query` code-search skill over `agentgrep` is injected so the guidance
+   is always present.
 7. Memory and the active skill prompt (dynamic, not cached).
 
 ## Adding guidance (most common)
