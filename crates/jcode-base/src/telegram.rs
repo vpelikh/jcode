@@ -932,9 +932,19 @@ async fn post_telegram(
     let status = resp.status();
     let parsed: TelegramResponse<serde_json::Value> = resp.json().await?;
     if !parsed.ok {
+        // Include the Bot API `error_code` when present so transient failures
+        // are recognizable even when the HTTP layer reports 200 OK (some API
+        // error paths surface the real code only in the body). This matters for
+        // callers like `set_my_commands` that classify retryable failures
+        // (429 rate-limit) from the message text.
+        let code = parsed
+            .error_code
+            .map(|c| format!(", code {c}"))
+            .unwrap_or_default();
         anyhow::bail!(
-            "Telegram API error ({}): {}",
+            "Telegram API error ({}): {}{}",
             status,
+            code,
             parsed.description.unwrap_or_default()
         );
     }
@@ -1377,6 +1387,11 @@ mod tests {
         // Matching is case-insensitive, covering varied casing from the wire.
         assert!(is_transient_api_error(&anyhow::anyhow!(
             "Telegram API error (429 Too Many Requests): Bad Request: Flood Control"
+        )));
+        // Rate-limit surfacing only via the body's error_code (HTTP 200) is
+        // still classified as transient thanks to the ", code 429" text.
+        assert!(is_transient_api_error(&anyhow::anyhow!(
+            "Telegram API error (200 OK): , code 429: Too Many Requests: retry after 11"
         )));
 
         // Permanent errors should NOT be transient.
