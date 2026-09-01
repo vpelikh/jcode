@@ -157,6 +157,85 @@ fn accepts_large_output(input: &Value) -> bool {
     }
 }
 
+/// The input key that disables the "redirect agentgrep to compass_query"
+/// enforcement for a single call. Mirrored in the agentgrep schema.
+const AGENTGREP_RAW_FALLBACK_KEY: &str = "allow_raw_fallback";
+
+/// Whether an agentgrep call explicitly opted out of `compass_query`-first
+/// enforcement. This is the caller's documented escape hatch for searches that
+/// Compass cannot serve: building outputs, logs, and files outside the indexed
+/// tree (see the redirected message and the agentgrep schema).
+fn agentgrep_requests_raw_fallback(input: &Value) -> bool {
+    match input.get(AGENTGREP_RAW_FALLBACK_KEY) {
+        Some(Value::Bool(opted_out)) => *opted_out,
+        Some(Value::String(raw)) => raw.trim().eq_ignore_ascii_case("true"),
+        _ => false,
+    }
+}
+
+/// Whether the session tool policy disables `name` for `session_id`. Mirrors
+/// the allow/deny logic in [`Registry::execute`] so the enforcement tier can
+/// check `compass_query` availability against the same policy a caller would
+/// be subject to.
+fn tool_is_policy_disabled(session_id: &str, name: &str) -> bool {
+    let Some(policy) = session_tool_policy(session_id) else {
+        return false;
+    };
+    if tool_name_is_disabled(&policy.disabled_tools, name) {
+        return true;
+    }
+    if let Some(allowed) = policy.allowed_tools.as_ref() {
+        // Only if compass_query is not allowed at all.
+        !tool_name_is_allowed(allowed, name)
+    } else {
+        false
+    }
+}
+
+/// The redirecting output returned when an `agentgrep` call is intercepted by
+/// the `compass_query`-first code-enforcement tier. It explains why grep did
+/// not run, directs the model to `compass_query`, and gives the explicit,
+/// self-documenting escape hatch (retry with `allow_raw_fallback`) for searches
+/// that genuinely need raw grep.
+fn compass_redirect_output(input: &Value) -> ToolOutput {
+    let query = input
+        .get("query")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let query_text = if query.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" (query: {})", truncate_middle(query, 200))
+    };
+    ToolOutput::new(format!(
+        "⚠️ `agentgrep` was intercepted before running: `compass_query` is available \
+         for this workspace and must be attempted before raw grep.\n\n\
+         Do not repeat this `agentgrep` call unchanged. Instead call `compass_query` \
+         with the same intent (natural language query + optional `path`) to search the \
+         code graph first{query_text}. The first call may build the index for this \
+         workspace; that is expected.\n\n\
+         Only if `compass_query` genuinely cannot answer (for example you need to search \
+         files outside the indexed tree, build outputs, or logs; or the index fails to \
+         build) retry `agentgrep` with `\"allow_raw_fallback\": true` to force raw grep \
+         for this one call."
+    ))
+    .with_title("agentgrep redirected to compass_query")
+}
+
+fn truncate_middle(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let half = (max.saturating_sub(3)) / 2;
+    let mut prefix: Vec<char> = s.chars().take(half).collect();
+    let mut suffix: Vec<char> = s.chars().rev().take(half).collect();
+    suffix.reverse();
+    let mut out: String = prefix.drain(..).collect();
+    out.push_str("...");
+    out.push_str(&suffix.iter().collect::<String>());
+    out
+}
+
 /// Registry of available tools (Arc-wrapped for sharing)
 ///
 /// Clone creates a fresh CompactionManager so each subagent gets independent
@@ -710,6 +789,49 @@ impl Registry {
                 return Err(anyhow::anyhow!(msg));
             }
         };
+
+        // Code-enforcement tier for the "use `compass_query` before `agentgrep`"
+        // guidance. The prompt tier only *asks* the model to try semantic search
+        // first; this tier makes it impossible for an `agentgrep` call to run grep
+        // when a Compass index is available, guaranteeing `compass_query` is
+        // attempted before raw grep at the tool level.
+        //
+        // Enforcement is deliberately skipped when:
+        //   - the caller passed the explicit `allow_raw_fallback` bypass flag
+        //     (agentgrep's documented escape hatch for building outputs, logs,
+        //     and files outside the indexed tree);
+        //   - `compass_query` is not authoritative here: it is not registered
+        //     (removed/unknown) or the session tool policy disables it, so
+        //     redirecting the call would dead-end the model against a tool it
+        //     cannot actually invoke; or
+        //   - the operator opted out via `tools.prefer_compass_query = false`.
+        //     This is checked against a cached snapshot so a marathon session
+        //     still honors the file setting it started with (and the flag is
+        //     evaluated before the pre_tool hook so the gate sees grep calls as
+        //     the model intended them).
+        if resolved_name == "agentgrep"
+            && crate::config::config().tools.prefer_compass_query
+            && !agentgrep_requests_raw_fallback(&input)
+            && tools.contains_key("compass_query")
+            && !tool_is_policy_disabled(&ctx.session_id, "compass_query")
+        {
+            let redirect = compass_redirect_output(&input);
+            // Route the interception through the same post_tool observer hook so
+            // telemetry/observers see the call as a (redirected) tool outcome
+            // rather than a silent short-circuit.
+            Self::fire_post_tool_hook(resolved_name, &ctx, &Ok(redirect.clone()), 0);
+            crate::logging::event_warn(
+                "TOOL_LIFECYCLE",
+                Self::tool_lifecycle_fields(
+                    "redirected_to_compass",
+                    name,
+                    resolved_name,
+                    &input,
+                    &ctx,
+                ),
+            );
+            return Ok(redirect);
+        }
 
         // Drop the lock before executing
         drop(tools);
