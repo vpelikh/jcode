@@ -1509,14 +1509,27 @@ impl ConfirmationTracker {
     /// proceed or `/cancel` to abort.
     fn request(&mut self, action: &'static str, session_id: String) -> String {
         let sid = short_id(&session_id);
+        // Making a new request while a previous one is still pending and valid
+        // silently swaps the destructive target. Surface that replacement so
+        // the user cannot realize the wrong action/session is being confirmed.
+        let replaced = self.pending.as_ref().is_some_and(|p| {
+            std::time::Instant::now() <= p.expires_at
+                && (p.action != action || p.session_id != session_id)
+        });
         self.pending = Some(PendingConfirmation {
             action,
             session_id,
             expires_at: std::time::Instant::now()
                 + std::time::Duration::from_secs(CONFIRM_TIMEOUT_SECS),
         });
+        let replace_notice = if replaced {
+            "⚠️ This replaces an earlier pending confirmation.\n"
+        } else {
+            ""
+        };
         format!(
             "⚠️ *Confirm `{action}` session `{sid}`*\n\n\
+             {replace_notice}\
              This cannot be undone.\n\
              Expires in {CONFIRM_TIMEOUT_SECS}s.\n\
              /confirm to proceed, /cancel to abort."
@@ -1602,7 +1615,11 @@ async fn stream_reply_to_session(
         Err(e) => {
             let _ = self
                 .send_reply(
-                    &format!("⚠️ Could not start reply for `{}`: {}", short_id(session_id), e),
+                    &format!(
+                        "⚠️ Could not start reply for `{}`: {}",
+                        short_id(session_id),
+                        escape_markdown_v2(&e.to_string())
+                    ),
                     reply_to,
                 )
                 .await;
@@ -1659,7 +1676,11 @@ async fn fallback_reply(&self, session_id: &str, reply_to: Option<i64>, text: &s
         Err(e) => {
             let _ = self
                 .send_reply(
-                    &format!("⚠️ Could not reach session `{}`: {}", short_id(session_id), e),
+                    &format!(
+                        "⚠️ Could not reach session `{}`: {}",
+                        short_id(session_id),
+                        escape_markdown_v2(&e.to_string())
+                    ),
                     reply_to,
                 )
                 .await;
@@ -2982,6 +3003,26 @@ mod tests {
         assert!(!tracker.has_pending_active());
         // The expired entry is still present (only verify consumes it).
         assert!(tracker.pending.is_some());
+    }
+
+    #[test]
+    fn test_confirmation_tracker_notes_when_replacing_pending() {
+        let mut tracker = ConfirmationTracker::new();
+        // First request: no prior pending, so no replacement notice.
+        let first = tracker.request("free", "session_a".to_string());
+        assert!(!first.contains("replaces an earlier"));
+        // Second request with a different session while one is active: notice.
+        let second = tracker.request("free", "session_b".to_string());
+        assert!(second.contains("replaces an earlier pending confirmation"));
+        // Same action+session again is not treated as a replacement.
+        let third = tracker.request("free", "session_b".to_string());
+        assert!(!third.contains("replaces an earlier"));
+        // After a duplicate (no notice), the pending is now session_b.
+        let Some((action, id)) = tracker.verify("__confirm__") else {
+            panic!("expected a pending confirmation");
+        };
+        assert_eq!(action, "free");
+        assert_eq!(id, "session_b");
     }
 
     #[test]
