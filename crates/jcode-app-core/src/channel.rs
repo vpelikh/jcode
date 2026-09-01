@@ -762,9 +762,14 @@ impl TelegramChannel {
             "(no messages to preview)".to_string()
         };
         let message_count = lines.len();
-        format!("📖 **Preview** `{}`, {} messages\n{}",
+        let messages_label = if message_count == 1 {
+            "1 message"
+        } else {
+            &format!("{message_count} messages")
+        };
+        format!("📖 **Preview** `{}`, {}\n{}",
             short_id(&session_id),
-            message_count,
+            messages_label,
             preview)
     }
 
