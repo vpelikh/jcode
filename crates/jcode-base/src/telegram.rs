@@ -169,9 +169,12 @@ pub fn is_transient_api_error(e: &anyhow::Error) -> bool {
     }
     // Telegram returns 429 with "flood control" during rapid polling. We can
     // detect this from the error string since `post_telegram` wraps status
-    // codes as `"Telegram API error (429): ..."`.
+    // codes as `"Telegram API error (<status-code Display>): ..."`. The
+    // `Display` for `reqwest::StatusCode::TOO_MANY_REQUESTS` renders as
+    // `"429 Too Many Requests"`, so match on the numeric code whether or not
+    // the reason phrase is present.
     let s = e.to_string();
-    s.contains("(429)") || s.contains("flood control")
+    s.contains("429 Too Many Requests") || s.contains("flood control")
 }
 
 /// Build a short-timeout client used only for the discovery probe (`getMe`).
@@ -1358,11 +1361,17 @@ mod tests {
         )));
 
         // Telegram 429 flood control should be transient (retryable).
+        // `reqwest::StatusCode` Display renders TOO_MANY_REQUESTS as
+        // "429 Too Many Requests", so the wrapped error reads as below.
         assert!(is_transient_api_error(&anyhow::anyhow!(
-            "Telegram API error (429): Bad Request: flood control"
+            "Telegram API error (429 Too Many Requests): Bad Request: flood control"
         )));
         assert!(is_transient_api_error(&anyhow::anyhow!(
-            "Telegram API error (429): Too Many Requests"
+            "Telegram API error (429 Too Many Requests): Too Many Requests: retry after 8"
+        )));
+        // Root-cause based description of flood control.
+        assert!(is_transient_api_error(&anyhow::anyhow!(
+            "telegram flood control, please wait"
         )));
 
         // Permanent errors should NOT be transient.
@@ -1370,10 +1379,10 @@ mod tests {
             "Telegram auth failed: Unauthorized"
         )));
         assert!(!is_transient_api_error(&anyhow::anyhow!(
-            "Telegram API error (400): Bad Request: chat not found"
+            "Telegram API error (400 Bad Request): Bad Request: chat not found"
         )));
         assert!(!is_transient_api_error(&anyhow::anyhow!(
-            "Telegram API error (403): Forbidden"
+            "Telegram API error (403 Forbidden): Forbidden"
         )));
     }
 
