@@ -815,6 +815,11 @@ impl Registry {
             && tools.contains_key("compass_query")
             && !tool_is_policy_disabled(&ctx.session_id, "compass_query")
         {
+            // Release the tools read lock before running the observer/telemetry
+            // hooks, matching the normal execution path (which drops it before
+            // any post-processing). This keeps the guard scoped to the lookup so
+            // a future hook change that re-enters the registry can't deadlock.
+            drop(tools);
             let redirect = compass_redirect_output(&input);
             // Route the interception through the same observer/telemetry
             // surfaces as a normal tool outcome so dashboards, hooks, and the
