@@ -19,7 +19,7 @@ fn report_reload_interaction_gap() {
     ));
 }
 use crate::tui::TuiState;
-use crossterm::cursor::{RestorePosition, SavePosition};
+use crossterm::cursor::{RestorePosition, SavePosition, Show};
 use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use ratatui::{buffer::Buffer, layout::Rect, style::Style};
 use std::io::Write;
@@ -475,6 +475,13 @@ impl StatusSpinnerRenderer {
         let result = self.draw_full_core(app, terminal);
         if sync {
             let _ = crossterm::execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+        }
+        // On a failed draw, `draw_full_core` has already hidden the cursor but the
+        // composer never reached its re-show (the errored `terminal.draw` aborts before
+        // `apply_buffer_with_cursor` restores the caret). Re-show it so a fatal frame
+        // error cannot leave the terminal with the cursor hidden after teardown.
+        if result.is_err() {
+            let _ = crossterm::execute!(terminal.backend_mut(), Show);
         }
         result
     }

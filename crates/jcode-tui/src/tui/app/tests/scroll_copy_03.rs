@@ -1876,22 +1876,27 @@ fn scroll_repaint_hides_cursor_before_cell_moves_via_draw_core() {
     // the first bare `H` (which could also hit an unrelated CSI command), so the
     // ordering assertion is precise: the cursor `Hide` must come before any move.
     let hide = "\u{1b}[?25l";
+    let show = "\u{1b}[?25h";
     let move_re = Regex::new(r"\x1b\[[0-9]+;[0-9]+H").expect("static move-regex");
     let first_moveto = move_re
         .find(&stream)
         .expect("SoftRepaint must emit a cell MoveTo");
-    assert!(
-        stream.contains(hide),
-        "scroll-triggered repaint must hide the cursor for the diff flush; got: {stream:?}"
-    );
-    let hide_at = stream.find(hide).expect("hide present");
+    let hide_at = stream
+        .find(hide)
+        .expect("scroll-triggered repaint must hide the cursor; got: {stream:?}");
+    // The re-show must come strictly after the hide, so the caret is frozen for
+    // the whole sweep interval (all MoveTo of the diff flush). A `?25h` emitted
+    // before the hide would mean the cursor was visible during part of the sweep.
+    let show_at = stream
+        .find(show)
+        .expect("composer frame must re-show the caret; got: {stream:?}");
     assert!(
         hide_at <= first_moveto.start(),
         "Hide must precede the first MoveTo; hide@{hide_at} move@{}",
         first_moveto.start()
     );
     assert!(
-        stream.contains("\u{1b}[?25h"),
-        "composer frame must re-show the caret; got: {stream:?}"
+        hide_at < show_at,
+        "Hide must precede the re-show so the caret stays frozen through the diff; hide@{hide_at} show@{show_at}"
     );
 }
