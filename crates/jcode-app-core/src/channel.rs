@@ -761,7 +761,7 @@ impl TelegramChannel {
         } else {
             "(no messages to preview)".to_string()
         };
-        let message_count = lines.len();
+        let message_count = lines.len().min(2);
         let messages_label = if message_count == 1 {
             "1 message"
         } else {
