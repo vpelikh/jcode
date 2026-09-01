@@ -193,6 +193,28 @@ impl Tool for CompassQueryTool {
             )));
         }
 
+        // A session-subscribe pre-warm may still be building this project's
+        // index in the background. If so, joining it from here would hold the
+        // same per-project build lock and turn this otherwise-instant query
+        // into a multi-minute blocking build — the exact stall pre-warming is
+        // meant to remove. Instead, fail fast with a retryable message so the
+        // agent can use `agentgrep` now and `compass_query` again once the
+        // pre-warm has populated the index.
+        if prewarm_in_flight(&working_dir) {
+            return Ok(ToolOutput::new(
+                "A Compass index is being built for this workspace in the \
+                 background and is not ready yet.\n\n\
+                 Use `agentgrep` (or `compass_query` again shortly) for now; \
+                 the background build finishes on its own and the next \
+                 `compass_query` will be served from the warm index.",
+            )
+            .with_title("compass_query: index building in background")
+            .with_metadata(json!({
+                "engine": "compass",
+                "status": "building-in-background",
+            })));
+        }
+
         // Open (or build) the Compass query engine. A cold or stale index is
         // (re)built in-process via Compass's library API. The build can take
         // seconds for a large project, so it runs on a blocking thread; the
@@ -952,16 +974,37 @@ const MAX_BUILD_WORKERS: usize = 4;
 /// brick later dedup).
 static PREWARM_IN_FLIGHT: OnceLock<Mutex<HashMap<PathBuf, ()>>> = OnceLock::new();
 
+/// True when a background pre-warm is currently building the Compass index for
+/// `working_dir`. Used by `CompassQueryTool::execute` to short-circuit a query
+/// that would otherwise race ahead of the pre-warm and, by holding the same
+/// per-project build lock, turn a normally-instant warm query into a minutes-
+/// long blocking build of its own.
+fn prewarm_in_flight(working_dir: &Path) -> bool {
+    let cache = resolve_compass_cache(working_dir);
+    // Only meaningful when there is still nothing ready to serve; a finished
+    // pre-warm leaves a graph.json and is served directly.
+    if cache.graph_path.is_file() {
+        return false;
+    }
+    lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())))
+        .contains_key(&cache.output_dir)
+}
+
 /// Best-effort, off-the-query-path pre-warm of the Compass knowledge graph for
 /// `working_dir`.
 ///
 /// This is the helper that backs the session-subscribe hook: it resolves the
 /// cache layout, cheaply decides freshness WITHOUT building (so the subscribe
-/// path never blocks on git or a tree walk), and only if the index is stale or
-/// missing does it spawn a background thread to build it under the existing
-/// per-project build lock. Duplicate builds for the same project are suppressed
-/// with a process-global in-flight set, so a busy agent session triggers at
-/// most one cold build per project per process.
+/// path never runs a full build), and only if the index is missing does it
+/// spawn a background thread to build it under the existing per-project build
+/// lock. Duplicate builds for the same project are suppressed with a
+/// process-global in-flight set, so a busy agent session triggers at most one
+/// cold build per project per process.
+///
+/// Note on cost: resolving the cache and confirming git identity shells out to
+/// `git` on a cold cache (typically a few ms per call, and cached for ~60s
+/// within a process), but never runs the Compass build itself. That is the
+/// expensive, multi-minute work this helper moves onto a background thread.
 ///
 /// Returns `false` (and does nothing) when pre-warming should not run: the
 /// index is already fresh, the working dir has no git identity, or the caller
@@ -969,12 +1012,13 @@ static PREWARM_IN_FLIGHT: OnceLock<Mutex<HashMap<PathBuf, ()>>> = OnceLock::new(
 /// in flight). Errors are swallowed: pre-warm is best-effort and must never
 /// disturb session bind.
 pub(crate) fn prewarm_compass_index(working_dir: &Path) -> bool {
-    // Cheap staleness gate that never shells out to git or walks the tree: an
-    // existing index needs no pre-warm. Anything already on disk (even mildly
-    // stale) is served cheaply by the query path, which handles incremental
-    // rebuilds itself; this feature only targets the cases where there is
-    // *nothing* to serve yet — the multi-minute cold build that would otherwise
-    // block a query.
+    // Cheap staleness gate: an existing index needs no pre-warm. Anything
+    // already on disk (even mildly stale) is served cheaply by the query path,
+    // which handles incremental rebuilds itself; this feature only targets the
+    // cases where there is *nothing* to serve yet — the multi-minute cold build
+    // that would otherwise block a query. (Resolving the cache shells out to
+    // `git` once on a cold cache; that ~ms cost is inlined and cached by
+    // `resolve_compass_cache`/`current_git_top_cached`.)
     let cache = resolve_compass_cache(working_dir);
     if cache.graph_path.is_file() {
         return false;
@@ -2238,6 +2282,54 @@ mod tests {
             !prewarm_compass_index(&scratch),
             "non-git dir must not schedule a pre-warm build"
         );
+    }
+
+    // When a session-subscribe pre-warm is still building a project's index,
+    // a `compass_query` must NOT join that build (which would block the turn
+    // on the shared per-project build lock). Instead it returns a retryable
+    // "building in background" message directing the agent to agentgrep.
+    #[tokio::test]
+    async fn execute_fails_fast_while_prewarm_in_flight() {
+        let (_home, root) = HomeGuard::set();
+        let root = root.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut f = std::fs::File::create(root.join("main.rs")).unwrap();
+        writeln!(f, "fn authenticate(user: &str) {{ let _ = user; }}").unwrap();
+        drop(f);
+        let edge = resolve_compass_cache(&root);
+        assert!(!edge.graph_path.is_file(), "fixture should start cold");
+
+        // Simulate a background pre-warm still in flight for this project.
+        lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())))
+            .insert(edge.output_dir.clone(), ());
+
+        let ctx = ToolContext {
+            session_id: "s".into(),
+            message_id: "m".into(),
+            tool_call_id: "t".into(),
+            working_dir: Some(root),
+            stdin_request_tx: None,
+            graceful_shutdown_signal: None,
+            execution_mode: ToolExecutionMode::Direct,
+        };
+        let out = CompassQueryTool::new()
+            .execute(serde_json::json!({ "query": "authentication" }), ctx)
+            .await
+            .expect("execute");
+        assert!(
+            out.output.contains("being built for this workspace in the background"),
+            "must report the index is still building, got: {}",
+            out.output
+        );
+        assert!(
+            out.output.contains("agentgrep"),
+            "must suggest agentgrep as a fallback, got: {}",
+            out.output
+        );
+
+        // Clean up the in-flight marker so other tests are unaffected.
+        lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())))
+            .remove(&edge.output_dir);
     }
 
     // END-USER ACCEPTANCE PATH: exercise the real CompassQueryTool::execute
