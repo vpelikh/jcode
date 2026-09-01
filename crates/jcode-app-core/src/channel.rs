@@ -1356,8 +1356,21 @@ fn split_command(line: &str) -> (String, String) {
     (cmd, rest.to_string())
 }
 
-/// First 8 characters of a session id, for compact display.
+/// Compact, human-readable short form of a session id for display. For a
+/// standard `session_<name>_...` id this is the memorable name; for other
+/// strings it is the first 8 characters.
 fn short_id(id: &str) -> String {
+    // Standard ids look like `session_<name>_<millis>_<hex>`. A naive 8-char
+    // truncation yields `session_` (7 letters + underscore) for every session,
+    // which is useless for distinguishing them in prompts and pickers. Show the
+    // memorable name (the token right after `session_`) instead; fall back to
+    // first-8 chars for ids that don't match that shape.
+    if let Some(rest) = id.strip_prefix("session_") {
+        return match rest.find('_') {
+            Some(end) => rest[..end].to_string(),
+            None => rest.to_string(),
+        };
+    }
     id.chars().take(8).collect()
 }
 
@@ -2740,6 +2753,25 @@ mod tests {
         let (cmd, rest) = split_command("/list");
         assert_eq!(cmd, "/list");
         assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn test_short_id_uses_memorable_name() {
+        // The old 8-char truncation produced "session_" for every standard id,
+        // which is useless for telling sessions apart. It must now surface the
+        // memorable name so prompts/pickers distinguish sessions.
+        assert_eq!(
+            short_id("session_fox_1717000000000_abcdef0123456789"),
+            "fox"
+        );
+        assert_eq!(
+            short_id("session_sabertooth_1717000000000_1234567890abcdef"),
+            "sabertooth"
+        );
+        // A bare "session_<name>" id has no millis/hex suffix.
+        assert_eq!(short_id("session_otter"), "otter");
+        // Non-standard ids keep the old first-8-chars behavior.
+        assert_eq!(short_id("abc1234567890"), "abc12345");
     }
 
     #[test]
