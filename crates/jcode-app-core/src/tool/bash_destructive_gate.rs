@@ -77,7 +77,7 @@ pub(super) fn bash_parameters_schema() -> serde_json::Value {
             },
             "stall_wake_seconds": {
                 "type": "integer",
-                "description": "With run_in_background: wake the agent after this many seconds of no output/progress (min 30, resets on activity). Use for long jobs that may hang silently."
+                "description": "Wake after N secs without output/progress (min 30)."
             },
             "justification": {
                 "type": "string",

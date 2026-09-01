@@ -506,7 +506,19 @@ async fn tool_descriptions_stay_under_token_cap() {
     // integration_tools keeps a deliberate second sentence explaining that catalog
     // entries integrate directly with the agent.
     // swarm appends the user-tunable swarm-prompt.md by design.
-    const EXEMPT: &[&str] = &["integration_tools", "swarm"];
+    // batch spells out an example tool_calls payload; the shape is load-bearing
+    // and can't be fully conveyed in a one-liner.
+    // macos_computer_use carries a safety contract (live machine, prefer
+    // BACKGROUND AX over focus steal); it must stay visible on every call.
+    // skill_manage names its actions and the proactive-load nudge inline
+    // (`skill::tests::test_tool_description` asserts that content).
+    const EXEMPT: &[&str] = &[
+        "integration_tools",
+        "swarm",
+        "batch",
+        "macos_computer_use",
+        "skill_manage",
+    ];
 
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let registry = Registry::new(provider).await;
@@ -563,6 +575,16 @@ fn collect_param_descriptions(schema: &Value, path: &str, out: &mut Vec<(String,
 #[tokio::test]
 async fn tool_parameter_descriptions_stay_under_token_cap() {
     const PARAM_DESCRIPTION_TOKEN_CAP: usize = 25;
+    // todo's feedback-loop calibration descriptions document every enum value
+    // (relevance, coverage, traceability). They are the always-on contract the
+    // model reads to score a goal's feedback loop; keeping the full rubric is
+    // deliberate and asserted by `schema_advertises_intent_and_todos`.
+    // integration_tools' action parameter carries the off-catalog selection
+    // disclosure sentence asserted by `schema_is_compact_and_self_contained`.
+    fn is_exempt(tool: &str, path: &str) -> bool {
+        (tool == "todo" && path.starts_with("$.properties.goals.items.properties.feedback_loop_"))
+            || (tool == "integration_tools" && path == "$.properties.action")
+    }
 
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let registry = Registry::new(provider).await;
@@ -571,6 +593,9 @@ async fn tool_parameter_descriptions_stay_under_token_cap() {
         let mut descriptions = Vec::new();
         collect_param_descriptions(&def.input_schema, "$", &mut descriptions);
         for (path, description) in descriptions {
+            if is_exempt(&def.name, &path) {
+                continue;
+            }
             let tokens = crate::util::estimate_tokens(&description);
             if tokens > PARAM_DESCRIPTION_TOKEN_CAP {
                 over_cap.push(format!(

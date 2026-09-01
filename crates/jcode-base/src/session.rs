@@ -932,6 +932,18 @@ impl Session {
         })
     }
 
+    /// Whether the session carries any message content beyond the auto-added
+    /// session-context placeholder. Sessions whose only transcript is that
+    /// context stub are effectively untouched and may be skipped on save.
+    pub(crate) fn has_message_beyond_session_context(&self) -> bool {
+        self.messages.iter().any(|message| {
+            message.content.iter().any(|block| match block {
+                ContentBlock::Text { text, .. } => !text.starts_with(SESSION_CONTEXT_PREFIX),
+                _ => true,
+            })
+        })
+    }
+
     /// Persist an immutable session-context snapshot as the first provider-visible
     /// transcript item for new sessions. Existing non-empty sessions are left
     /// untouched so their historical context is never rewritten with newer state.

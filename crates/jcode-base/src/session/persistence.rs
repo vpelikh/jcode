@@ -399,18 +399,39 @@ impl Session {
         // the user (or a programmatic caller) adds a real conversation message,
         // the normal first snapshot includes all of the accumulated context.
         //
-        // A caller-chosen `title` (review/judge sessions, menubar sessions) is
-        // explicit state just like `custom_title`, so it must persist even
-        // before the first visible message (#1144). Otherwise later lookups by
-        // id find no file and silently treat the session as missing.
+        // Persist even without a visible conversation message when the session
+        // carries configured state that an explicit save() intends to preserve:
+        // a provider route (model/provider_key/effort), a bound parent, a
+        // self-dev/canary build, or a save label. The `pre_spawn_session` swarm
+        // path, restart-recovery fixtures, and persisted soft-interrupt/restore
+        // flows all rely on such sessions being written to disk immediately.
+        let has_configured_state = self.model.is_some()
+            || self.provider_key.is_some()
+            || self.route_api_method.is_some()
+            || self.reasoning_effort.is_some()
+            || self.subagent_model.is_some()
+            || self.parent_id.is_some()
+            || self.is_canary
+            || self.save_label.is_some()
+            || self.compaction.is_some()
+            // Structured transcript state (swarm status/plan events, memory
+            // injections, compaction markers) is meaningful and must not be
+            // dropped, so persist it even without a visible conversation line.
+            || !self.replay_events.is_empty()
+            || !self.memory_injections.is_empty()
+            // An actively-run session (a PID marker was registered via
+            // `mark_active`/`mark_active_with_pid`) must persist even before a
+            // conversation message exists so restart/crash recovery can find it.
+            || crate::storage::active_session_ids().iter().any(|id| id == &self.id);
+        // A session pointing at real transcript content beyond the auto-added
+        // session-context placeholder (e.g. system-reminder lines, display-role
+        // notices) must be persisted so tools like session_search can read it.
+        let has_non_placeholder_message = self.has_message_beyond_session_context();
         if !self.persist_state.snapshot_exists
-            && !self
-                .messages
-                .iter()
-                .any(super::is_visible_conversation_message)
+            && !has_non_placeholder_message
             && !self.saved
             && self.custom_title.is_none()
-            && self.title.is_none()
+            && !has_configured_state
         {
             return Ok(());
         }

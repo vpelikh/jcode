@@ -166,7 +166,7 @@ impl Tool for CompassQueryTool {
                 "intent": {
                     "type": "string",
                     "enum": ["search", "impact", "discovery", "callers", "callees", "traverse"],
-                    "description": "Advisory presentation hint: search, impact, discovery, callers, callees, or traverse."
+                    "description": "Advisory presentation hint shown in the UI: search, impact, discovery, callers, callees, or traverse."
                 }
             },
             "required": ["query"]
