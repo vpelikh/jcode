@@ -609,20 +609,54 @@ fn current_git_top_cached(working_dir: &Path) -> Option<String> {
             return Some(top.clone());
         }
     } // Drop the read lock before shelling out to git.
-    let output = std::process::Command::new("git")
-        .args(["--path-format=absolute", "rev-parse", "--git-common-dir"])
-        .current_dir(working_dir)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let top = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    // Prefer the git *common dir* (identical across all worktrees). `--path-format=absolute`
+    // is a rev-parse flag (requires git >= 2.31); on older git it fails and we fall back
+    // to `--show-toplevel`, which is also an absolute, subdir-stable repo identity.
+    let top = git_repo_identity(working_dir);
+    let top = top?;
     if top.is_empty() {
         return None;
     }
-    map.lock().unwrap().insert(working_dir.to_path_buf(), (SystemTime::now(), top.clone()));
-    Some(top)
+    let result = top.clone();
+    map.lock().unwrap().insert(working_dir.to_path_buf(), (SystemTime::now(), top));
+    Some(result)
+}
+
+/// Resolve a stable repository identity string for `working_dir`, preferring
+/// the git common dir (identical across all worktrees) and falling back to the
+/// working-tree toplevel for older git. Returns `None` when git is unavailable
+/// or `working_dir` is not inside a git repo.
+fn git_repo_identity(working_dir: &Path) -> Option<String> {
+    // Primary: absolute common dir.
+    let common = std::process::Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .current_dir(working_dir)
+        .output()
+        .ok();
+    if let Some(out) = common
+        && out.status.success()
+        && let Ok(s) = String::from_utf8(out.stdout)
+    {
+        let s = s.trim().to_string();
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    // Fallback: toplevel (absolute, subdir-stable).
+    let top = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(working_dir)
+        .output()
+        .ok()?;
+    if !top.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(top.stdout).ok()?.trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 /// Decide whether `graph_path`'s index is older than any source under `root`.
@@ -1440,6 +1474,43 @@ mod tests {
         let sha1 = current_git_sha_cached(&root).expect("cached sha on a real repo");
         let sha2 = current_git_sha_cached(&root).expect("cached sha reused");
         assert_eq!(sha1, sha2, "SHA must be reused within the cache TTL");
+    }
+
+    // `git_repo_identity` must return one stable absolute value from any
+    // subdirectory of a repo. This is what makes the shared cache key identical
+    // across all worktrees of one repo. Skips when git is unavailable.
+    #[test]
+    fn git_repo_identity_is_stable_across_subdirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let git = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init"]) {
+            return;
+        }
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::write(root.join("a/b/main.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "."]);
+        if !git(&["commit", "-m", "init"]) {
+            return;
+        }
+
+        let top = git_repo_identity(&root).expect("identity in repo");
+        assert!(std::path::Path::new(&top).is_absolute(), "identity must be absolute: {top}");
+        let sub = git_repo_identity(&root.join("a/b")).expect("identity in subdir");
+        assert_eq!(top, sub, "identity must be identical from any subdir");
+        assert!(
+            !top.is_empty(),
+            "identity must not be empty"
+        );
     }
     #[test]
     fn resolve_compass_cache_uses_shared_path_for_git_repos() {
