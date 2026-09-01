@@ -1309,6 +1309,14 @@ mod tests {
             "fresh index query should succeed: {}",
             out.output
         );
+        // The query must actually return real search results through the public
+        // execute interface, not merely not-error: the built index must contain
+        // at least one node for "authentication".
+        assert!(
+            out.output.contains("**Found ") && out.output.contains(" result(s)**"),
+            "execute must return a result report, got: {}",
+            out.output
+        );
 
         // No rebuild => the index dir mtime is unchanged.
         let after = std::fs::metadata(&out_dir)
