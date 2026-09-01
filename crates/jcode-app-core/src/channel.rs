@@ -381,13 +381,7 @@ impl TelegramChannel {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let one_day_ago_ms = today_ms - 24 * 60 * 60 * 1000;
-        let limit = if args.contains("--saved") {
-            24
-        } else if args.contains("--today") {
-            12
-        } else {
-            12
-        };
+        let limit = if args.contains("--saved") { 24 } else { 12 };
 
         let entries = match crate::recent_session_index::recent(limit) {
             Ok(list) => list,
@@ -713,11 +707,17 @@ impl TelegramChannel {
             Ok(text) => text,
             Err(_) => return format!("⚠️ Could not read session `{}` for preview.", short_id(&session_id)),
         };
-        // Render compact 2-line preview: split on first two paragraph blocks
-        let lines: Vec<&str> = entries.split("\n\n").filter(|s| !s.trim().is_empty()).collect();
+        // Render compact 2-line preview: split on first two paragraph blocks.
+        // The two rendered lines must escape any MarkdownV2-reserved characters
+        // in the raw session text; otherwise Telegram rejects the whole message
+        // when the preview is sent with `parse_mode=MarkdownV2`.
+        let lines: Vec<String> = entries
+            .split("\n\n")
+            .filter(|s| !s.trim().is_empty())
+            .map(crate::telegram::escape_markdown_v2)
+            .collect();
         let preview = if lines.len() >= 2 {
-            format!("👤 *you:* {}\n🤖 *jcode:* {}",
-                lines[0], lines[1])
+            format!("👤 *you:* {}\n🤖 *jcode:* {}", lines[0], lines[1])
         } else if lines.len() == 1 {
             format!("👤 *you:* {}", lines[0])
         } else {
@@ -2781,7 +2781,8 @@ mod tests {
     fn test_confirmation_tracker_basic() {
         let mut tracker = ConfirmationTracker::new();
         let prompt = tracker.request("abort", "session_abc123".to_string());
-        assert!(prompt.contains("Confirm `abort` session `abc123`"));
+        // The prompt shows the 8-char short id, so assert on the rendered value.
+        assert!(prompt.contains(&format!("Confirm `abort` session `{}`", short_id("session_abc123"))));
         // Verify matches
         let Some((action, id)) = tracker.verify("__confirm__") else {
             panic!("Expected verification to succeed");
