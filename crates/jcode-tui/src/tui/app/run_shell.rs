@@ -19,7 +19,7 @@ fn report_reload_interaction_gap() {
     ));
 }
 use crate::tui::TuiState;
-use crossterm::cursor::{Hide, RestorePosition, SavePosition};
+use crossterm::cursor::{RestorePosition, SavePosition};
 use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use ratatui::{buffer::Buffer, layout::Rect, style::Style};
 use std::io::Write;
@@ -465,15 +465,41 @@ impl StatusSpinnerRenderer {
         app: &mut App,
         terminal: &mut DefaultTerminal,
     ) -> Result<()> {
+        // Wrap the whole frame in a synchronized update so the terminal applies
+        // every cell change atomically. Without this, ratatui's crossterm backend
+        // streams cells one-by-one and eagerly-repainting terminals (and slow/remote
+        // or multiplexed sessions) show visible flicker. See issue #282.
+        let sync = crossterm::execute!(terminal.backend_mut(), BeginSynchronizedUpdate).is_ok();
+        self.draw_full_core(app, terminal)?;
+        if sync {
+            let _ = crossterm::execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+        }
+        Ok(())
+    }
+
+    /// The backend-generic body of a full-frame repaint. Split out from
+    /// [`Self::draw_full`] so the actual production path (including the
+    /// cursor-hide for the diff flush) can be exercised directly against any
+    /// `ratatui::backend::Backend` in tests, instead of being approximated by a
+    /// stand-in harness.
+    ///
+    /// Completing the repaint as part of the screen surface is what matters: this is
+    /// the shared code path the scroll-triggered `SoftRepaint` runs (request_full_repaint
+    /// → invalidate_previous_terminal_buffer → here), and it is where the fix hides the
+    /// cursor so its visible caret does not sweep across the re-emitted cells.
+    pub(super) fn draw_full_core<B>(
+        &mut self,
+        app: &mut App,
+        terminal: &mut ratatui::Terminal<B>,
+    ) -> Result<()>
+    where
+        B: ratatui::backend::Backend,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
         // Painting a frame is progress, including during long streaming turns.
         crate::logging::watchdog::beat("tui.draw");
         let invalidation = full_frame_invalidation(app.force_full_redraw, app.force_full_repaint);
         let force_full_redraw = invalidation != FullFrameInvalidation::None;
-        // Wrap the whole frame (optional clear + diff flush) in a synchronized update so the
-        // terminal applies every cell change atomically. Without this, ratatui's crossterm
-        // backend streams cells one-by-one and eagerly-repainting terminals (and slow/remote or
-        // multiplexed sessions) show visible flicker. See issue #282.
-        let sync = crossterm::execute!(terminal.backend_mut(), BeginSynchronizedUpdate).is_ok();
         match invalidation {
             FullFrameInvalidation::HardClear => {
                 terminal.clear()?;
@@ -490,14 +516,14 @@ impl StatusSpinnerRenderer {
 
         // A full frame (and any SoftRepaint the scroll path triggers) writes the diff
         // through the backend's `MoveTo(x, y)` for every changed cell while the cursor
-        // is still visible. On terminals without synchronized-update support this makes
-        // the visible block cursor sweep across the whole screen ("cursor jumps to
-        // random places") during scroll. Hide it for the diff flush; `terminal.draw`
-        // then either restores the caret (the normal composer path, where `draw_input`
-        // sets a cursor position) or leaves the cursor hidden (overlay branches such as
-        // the changelog/help/pickers, where ratatui also hides when no position is set),
+        // is still visible. On terminals that carry a block/bar cursor this makes the
+        // visible caret sweep across the whole screen ("cursor jumps to random places")
+        // during scroll. Hide it for the diff flush; `terminal.draw` then either
+        // restores the caret (the normal composer path, where `draw_input` sets a
+        // cursor position) or leaves the cursor hidden (overlay branches such as the
+        // changelog/help/pickers, where ratatui also hides when no position is set),
         // so the cursor ends exactly where it belongs in every case.
-        let _ = crossterm::execute!(terminal.backend_mut(), Hide);
+        terminal.backend_mut().hide_cursor()?;
         let previous_frame = self.last_frame.as_ref();
         let draw_start = Instant::now();
         let mut render_elapsed = Duration::ZERO;
@@ -521,9 +547,6 @@ impl StatusSpinnerRenderer {
         let completed_buffer = completed.buffer.clone();
         // `completed` borrows the terminal; it is unused past this point, so the
         // borrow ends here (NLL) before we touch the backend again below.
-        if sync {
-            let _ = crossterm::execute!(terminal.backend_mut(), EndSynchronizedUpdate);
-        }
         crate::tui::ui::record_draw_call_attribution(crate::tui::ui::DrawCallAttribution {
             timestamp_ms: crate::tui::ui::wall_clock_ms(),
             total_ms: total_elapsed.as_secs_f64() * 1000.0,
@@ -539,7 +562,7 @@ impl StatusSpinnerRenderer {
         }
         self.last_frame = Some(completed_buffer);
         self.last_full_frame_at = Some(Instant::now());
-        // A full frame rewrote the whole surface, so ratatui's working buffer no
+        // A full frame fully rewrote the whole screen, so ratatui's working buffer no
         // longer matches `last_frame` outside the animated rows. Force the next
         // animation-only repaint to re-seed before it trusts that again.
         self.seeded_animation_area = None;
@@ -550,7 +573,7 @@ impl StatusSpinnerRenderer {
             self.last_full_frame_input.push_str(&app.input);
         }
         // Close the key-to-paint clock here rather than at render time: the user
-        // sees the keystroke when the frame reaches the terminal, so anything
+        // sees the keystroke when the stream reaches the screen, so anything
         // before the flush would understate the latency they feel.
         crate::tui::ui::note_frame_painted();
         Ok(())
