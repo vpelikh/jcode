@@ -174,3 +174,32 @@ fn review_loop_suggestion_partial_narrowing() {
         "partial 's' must offer stop, got {:?}", cmds
     );
 }
+
+#[test]
+fn review_loop_status_reports_active_and_no_loop() {
+    // `/review-loop status` must report gracefully both when no loop exists and
+    // when one is active (showing the current lens), never an error.
+    let mut app = create_test_app();
+
+    // No loop yet: status reports there is none.
+    app.input = "/review-loop status".to_string();
+    app.submit_input();
+    let msg = app.display_messages().last().expect("status response");
+    assert!(
+        msg.content.contains("No review loop"),
+        "no-loop status must say none, got {:?}",
+        msg.content
+    );
+
+    // Start, then status shows the active loop / first lens.
+    app.input = "/review-loop start".to_string();
+    app.submit_input();
+    app.input = "/review-loop status".to_string();
+    app.submit_input();
+    let msg = app.display_messages().last().expect("status response");
+    assert!(
+        msg.content.contains("Review loop active at lens: Correctness"),
+        "active status must show the lens, got {:?}",
+        msg.content
+    );
+}
