@@ -1325,13 +1325,18 @@ request in this new forked session, using the inherited conversation only as con
             timestamp: chrono::Utc::now(),
             event_id: message_id.clone(),
             op: SessionEventOp::AppendMessage {
-                message_id,
+                message_id: message_id.clone(),
                 message: message.clone(),
             },
             parent_id: None,
             version: 1,
         };
         self.event_map.append_event(event);
+        // If validation rejected the event (e.g. an empty-content message from
+        // an external import), the legacy vector below will still receive the
+        // message. Rebuild the log from the legacy vector afterwards so the two
+        // sources of truth never silently diverge.
+        let recorded = self.event_map.events.last().is_some_and(|e| e.event_id == message_id);
         
         // Keep backward compatibility
         self.memory_profile_cache.messages_count += 1;
@@ -1341,6 +1346,9 @@ request in this new forked session, using the inherited conversation only as con
             .merge_from(&summarize_blocks(&message.content));
         self.messages.push(message);
         self.mark_messages_append_dirty();
+        if !recorded {
+            self.rebuild_event_map();
+        }
     }
 
     pub fn insert_message(&mut self, index: usize, message: StoredMessage) {
@@ -1357,11 +1365,17 @@ request in this new forked session, using the inherited conversation only as con
             version: 1,
         };
         self.event_map.append_event(event);
+        // If validation rejected the event, the legacy insert below still
+        // applies; rebuild so the log agrees with the legacy vector.
+        let recorded = self.event_map.events.last().is_some_and(|e| e.event_id == message_id);
         
         // Keep backward compatibility
         self.messages.insert(index, message);
         self.mark_memory_profile_dirty();
         self.mark_messages_full_dirty();
+        if !recorded {
+            self.rebuild_event_map();
+        }
     }
 
     pub fn replace_messages(&mut self, messages: Vec<StoredMessage>) {
@@ -1965,6 +1979,11 @@ request in this new forked session, using the inherited conversation only as con
         if !self.messages.is_empty() {
             self.clear_messages();
         }
+        // Even when `self.messages` was already empty, drop any compaction state:
+        // a compacted remote transcript rendered locally must not leave stale
+        // compaction behind in the surviving event log (rebuild_event_map below
+        // would otherwise re-record a SetCompaction event).
+        self.compaction = None;
         self.env_snapshots.clear();
         self.memory_injections.clear();
         self.replay_events.clear();
