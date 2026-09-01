@@ -224,3 +224,24 @@ fn alias_and_bare_edges_are_preserved() {
         "bare /review should suggest only itself, got {suggestions:?}"
     );
 }
+
+/// Render-level acceptance check: with the input set to a table-driven
+/// subcommand prefix, the actual rendered frame shows the completion. This
+/// validates the user-visible output (not just the data layer) for the
+/// registry-driven suggestions.
+#[test]
+fn rendered_frame_shows_registry_subcommand_suggestion() {
+    let _lock = scroll_render_test_lock();
+    let mut app = create_test_app();
+    app.input = "/memory ".to_string();
+    app.cursor_pos = app.input.len();
+
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20))
+        .expect("failed to create test terminal");
+    let snap = render_and_snap(&app, &mut terminal);
+
+    assert!(
+        snap.contains("/memory status"),
+        "rendered frame should show the /memory status completion, got:\n{snap}"
+    );
+}
