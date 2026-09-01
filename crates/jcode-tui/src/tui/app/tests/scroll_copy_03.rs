@@ -1940,6 +1940,7 @@ fn scroll_repaint_hides_cursor_before_cell_moves_via_draw_core() {
 ///   - the sync window opens (`?2026h`) and closes (`?2026l`);
 ///   - the cursor `Hide` (`?25l`) precedes the first cell `MoveTo` (the sweep guard);
 ///   - the composer re-shows the caret (`?25h`) inside the frame.
+///
 /// The wrapper's error-path cursor re-show is not exercised here (that requires a backend whose
 /// draw fails); it is verified by inspection of `draw_full_with`.
 #[test]
