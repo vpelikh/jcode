@@ -753,22 +753,24 @@ pub async fn set_my_commands(
     bot_token: &str,
     base_override: Option<&str>,
 ) {
-    // Build the command list once outside the retry loop so we don't clone it
+// Build the command list once outside the retry loop so we don't clone it
     // on every failed attempt.
     let commands = serde_json::json!([
         { "command": "start", "description": "Show help and available commands" },
-        { "command": "list", "description": "List recent sessions" },
+        { "command": "list", "description": "List sessions (--saved / --today)" },
         { "command": "sessions", "description": "Alias for /list" },
         { "command": "find", "description": "Search sessions by title or id" },
         { "command": "new", "description": "Start a new session (optionally with a prompt)" },
-        { "command": "use", "description": "Select a session to talk to (id or #)" },
+        { "command": "use", "description": "Select a session to talk to (id or number)" },
         { "command": "history", "description": "Show recent messages of the active session" },
+        { "command": "peek", "description": "Quick preview of the active session" },
         { "command": "resume", "description": "Ask a session (id + prompt)" },
-        { "command": "live", "description": "List live sessions (tap to free)" },
+        { "command": "live", "description": "List live sessions" },
         { "command": "ls", "description": "Alias for /live" },
-        { "command": "free", "description": "Drop a live headless session" },
-        { "command": "abort", "description": "Stop the active session's running turn" },
-        { "command": "cancel", "description": "Alias for /abort" },
+        { "command": "free", "description": "Drop a live headless session (requires /confirm)" },
+        { "command": "abort", "description": "Stop the active turn (requires /confirm)" },
+        { "command": "confirm", "description": "Confirm a pending free or abort" },
+        { "command": "cancel", "description": "Cancel a pending confirmation" },
         { "command": "whoami", "description": "Show this chat's id for config" },
         { "command": "clear", "description": "Stop talking to the active session" },
         { "command": "stop", "description": "Alias for /clear" },

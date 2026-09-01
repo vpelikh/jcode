@@ -363,7 +363,7 @@ impl TelegramChannel {
             "/confirm" => self.confirm_reply().await,
             _ => format!(
                 "Unknown command `{}`. Use `/help` for available commands{}.",
-                cmd,
+                escape_markdown_v2(&cmd),
                 help_footer()
             ),
         }
