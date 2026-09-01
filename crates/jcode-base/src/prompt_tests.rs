@@ -844,3 +844,36 @@ fn preferred_tools_global_only_uses_global_without_default_duplication() {
         crate::env::remove_var("JCODE_HOME");
     }
 }
+
+#[test]
+fn preferred_tools_blank_file_falls_through_to_default() {
+    use crate::prompt::load_preferred_tools_files_from_dir;
+
+    let _guard = crate::storage::lock_test_env();
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let temp = tempfile::TempDir::new().unwrap();
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    let project_dir = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(project_dir.path().join(".jcode")).unwrap();
+    // A whitespace-only project file must not disable the default guidance.
+    std::fs::write(project_dir.path().join(".jcode/preferred-tools.md"), "   \n").unwrap();
+
+    let (content, chars) = load_preferred_tools_files_from_dir(Some(project_dir.path()));
+    let content = content.expect("blank project file should still yield guidance");
+    assert!(
+        content.contains("compass_query"),
+        "blank file should not suppress the default code-search guidance"
+    );
+    assert!(
+        content.contains("agentgrep"),
+        "blank file should not suppress the default fallback guidance"
+    );
+    assert!(chars > 0, "blank file should yield non-zero character count");
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}
