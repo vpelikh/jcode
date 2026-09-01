@@ -79,7 +79,7 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     ),
     RegisteredCommand::hidden("/model-status", "Alias for /provider-test-coverage"),
     RegisteredCommand::public("/refresh-model-list", "Refresh provider model catalogs"),
-        RegisteredCommand::with_subcommands(
+    RegisteredCommand::with_subcommands(
         "/agents",
         "Configure models for agent roles",
         &[
@@ -94,13 +94,22 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
         "/swarm-prompt",
         "Open the active swarm routing prompt in your editor",
     ),
-        RegisteredCommand::with_subcommands(
+    RegisteredCommand::with_subcommands(
         "/subagent",
         "Launch a subagent manually",
         &[
-            ("/subagent --type general ", "Launch a general-purpose subagent"),
-            ("/subagent --model ", "Launch a subagent with an explicit model"),
-            ("/subagent --continue ", "Resume an existing subagent session"),
+            (
+                "/subagent --type general ",
+                "Launch a general-purpose subagent",
+            ),
+            (
+                "/subagent --model ",
+                "Launch a subagent with an explicit model",
+            ),
+            (
+                "/subagent --continue ",
+                "Resume an existing subagent session",
+            ),
         ],
     ),
     RegisteredCommand::public("/observe", "Show the latest tool context in the side panel"),
@@ -110,12 +119,10 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/split-view", "Alias for /splitview"),
     RegisteredCommand::public("/btw", "Ask a side question in the side panel"),
     RegisteredCommand::public("/ssh", "Connect to a remote machine using system SSH"),
-        RegisteredCommand::with_subcommands(
+    RegisteredCommand::with_subcommands(
         "/git",
         "Show git status for the session working directory",
-        &[
-            ("/git status", "Show branch and working tree status"),
-        ],
+        &[("/git status", "Show branch and working tree status")],
     ),
     RegisteredCommand::public("/colors", "List, configure, and score every TUI color"),
     RegisteredCommand::hidden("/color", "Alias for /colors"),
@@ -146,22 +153,23 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
         "/triage",
         "Triage new GitHub issues and autonomously fix the safe ones",
     ),
-        RegisteredCommand::with_subcommands(
+    RegisteredCommand::with_subcommands(
         "/transcript",
         "Open the current session transcript file",
-        &[
-            ("/transcript path", "Print transcript path without opening"),
-        ],
+        &[("/transcript path", "Print transcript path without opening")],
     ),
-        RegisteredCommand::with_subcommands(
+    RegisteredCommand::with_subcommands(
         "/subagent-model",
         "Show/change subagent model policy",
         &[
             ("/subagent-model inherit", "Use the current active model"),
-            ("/subagent-model show", "Show the current subagent model policy"),
+            (
+                "/subagent-model show",
+                "Show the current subagent model policy",
+            ),
         ],
     ),
-        RegisteredCommand::with_subcommands(
+    RegisteredCommand::with_subcommands(
         "/autoreview",
         "Show/toggle automatic end-of-turn review",
         &[
@@ -171,7 +179,7 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
             ("/autoreview now", "Launch a reviewer immediately"),
         ],
     ),
-        RegisteredCommand::with_subcommands(
+    RegisteredCommand::with_subcommands(
         "/autojudge",
         "Show/toggle automatic end-of-turn judging",
         &[
@@ -182,12 +190,15 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
         ],
     ),
     RegisteredCommand::public("/review", "Launch a one-shot headed review session"),
-        RegisteredCommand::with_subcommands(
+    RegisteredCommand::with_subcommands(
         "/review-loop",
         "Start/stop/post-completion per-lens review loop",
         &[
             ("/review-loop status", "Show current review loop status"),
-            ("/review-loop start", "Run the per-lens review loop on this session"),
+            (
+                "/review-loop start",
+                "Run the per-lens review loop on this session",
+            ),
             ("/review-loop run", "Alias for /review-loop start"),
             ("/review-loop stop", "Stop the active review loop"),
         ],
@@ -196,43 +207,76 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/effort", crate::tui::keybind::EFFORT_HELP),
     RegisteredCommand::public("/fast", "Toggle fast mode"),
     RegisteredCommand::public("/transport", "Show/change connection transport"),
-        RegisteredCommand::with_subcommands(
+    RegisteredCommand::with_subcommands(
         "/alignment",
         "Show/change default text alignment",
         &[
             ("/alignment status", "Show current and saved alignment"),
-            ("/alignment centered", "Save centered alignment and apply it now"),
-            ("/alignment left", "Save left-aligned layout and apply it now"),
+            (
+                "/alignment centered",
+                "Save centered alignment and apply it now",
+            ),
+            (
+                "/alignment left",
+                "Save left-aligned layout and apply it now",
+            ),
         ],
     ),
-        RegisteredCommand::with_subcommands(
+    RegisteredCommand::with_subcommands(
         "/compact-notifications",
         "Show/toggle single-line swarm/file-activity notifications",
         &[
-            ("/compact-notifications status", "Show whether notifications are compact"),
-            ("/compact-notifications on", "Collapse swarm/file-activity notifications to one line"),
-            ("/compact-notifications off", "Show full multi-line notification cards"),
+            (
+                "/compact-notifications status",
+                "Show whether notifications are compact",
+            ),
+            (
+                "/compact-notifications on",
+                "Collapse swarm/file-activity notifications to one line",
+            ),
+            (
+                "/compact-notifications off",
+                "Show full multi-line notification cards",
+            ),
         ],
     ),
-        RegisteredCommand::with_subcommands(
+    RegisteredCommand::with_subcommands(
         "/show-agentgrep-output",
         "Show/toggle full agentgrep search output inline in chat",
         &[
-            ("/show-agentgrep-output status", "Show whether agentgrep output is shown inline"),
-            ("/show-agentgrep-output on", "Render full agentgrep search results inline in chat"),
-            ("/show-agentgrep-output off", "Show only the one-line agentgrep summary"),
+            (
+                "/show-agentgrep-output status",
+                "Show whether agentgrep output is shown inline",
+            ),
+            (
+                "/show-agentgrep-output on",
+                "Render full agentgrep search results inline in chat",
+            ),
+            (
+                "/show-agentgrep-output off",
+                "Show only the one-line agentgrep summary",
+            ),
         ],
     ),
-        RegisteredCommand::with_subcommands(
+    RegisteredCommand::with_subcommands(
         "/tool-call-details",
         "Show/toggle dimmed technical details on tool rows with an intent",
         &[
-            ("/tool-call-details status", "Show whether technical details render on intent rows"),
-            ("/tool-call-details on", "Show bash full command block + technical detail on tool rows"),
-            ("/tool-call-details off", "Show only the intent on tool rows that have one"),
+            (
+                "/tool-call-details status",
+                "Show whether technical details render on intent rows",
+            ),
+            (
+                "/tool-call-details on",
+                "Show bash full command block + technical detail on tool rows",
+            ),
+            (
+                "/tool-call-details off",
+                "Show only the intent on tool rows that have one",
+            ),
         ],
     ),
-        RegisteredCommand::with_subcommands(
+    RegisteredCommand::with_subcommands(
         "/thinking-display",
         "Show/hide the model's thinking text (off/full/current)",
         &[
@@ -248,7 +292,7 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/cls", "Clear the view only, keeping context"),
     RegisteredCommand::hidden("/clear-view", "Alias for /cls"),
     RegisteredCommand::public("/rewind", "Rewind conversation to previous message"),
-        RegisteredCommand::with_subcommands(
+    RegisteredCommand::with_subcommands(
         "/poke",
         "Poke model to resume with incomplete todos",
         &[
@@ -258,27 +302,51 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
         ],
     ),
     RegisteredCommand::public("/plan", "Create a plan-only response as a plan card"),
-        RegisteredCommand::with_subcommands(
+    RegisteredCommand::with_subcommands(
         "/improve",
         "Autonomously improve the repository",
         &[
-            ("/improve plan", "Generate a ranked improve todo list without editing"),
-            ("/improve resume", "Resume the last saved improve mode for this session"),
-            ("/improve status", "Show current improve batch and inferred status"),
-            ("/improve stop", "Stop improvement mode after the next safe point"),
+            (
+                "/improve plan",
+                "Generate a ranked improve todo list without editing",
+            ),
+            (
+                "/improve resume",
+                "Resume the last saved improve mode for this session",
+            ),
+            (
+                "/improve status",
+                "Show current improve batch and inferred status",
+            ),
+            (
+                "/improve stop",
+                "Stop improvement mode after the next safe point",
+            ),
         ],
     ),
-        RegisteredCommand::with_subcommands(
+    RegisteredCommand::with_subcommands(
         "/refactor",
         "Run a safe refactor loop",
         &[
-            ("/refactor plan", "Generate a ranked refactor todo list without editing"),
-            ("/refactor resume", "Resume the last saved refactor mode for this session"),
-            ("/refactor status", "Show current refactor batch and inferred status"),
-            ("/refactor stop", "Stop refactor mode after the next safe point"),
+            (
+                "/refactor plan",
+                "Generate a ranked refactor todo list without editing",
+            ),
+            (
+                "/refactor resume",
+                "Resume the last saved refactor mode for this session",
+            ),
+            (
+                "/refactor status",
+                "Show current refactor batch and inferred status",
+            ),
+            (
+                "/refactor stop",
+                "Stop refactor mode after the next safe point",
+            ),
         ],
     ),
-        RegisteredCommand::with_subcommands(
+    RegisteredCommand::with_subcommands(
         "/compact",
         "Compact context",
         &[
@@ -292,7 +360,7 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/fix", "Recover when the model cannot continue"),
     RegisteredCommand::public("/dictate", "Run configured external dictation command"),
     RegisteredCommand::public("/dictation", "Alias for /dictate"),
-        RegisteredCommand::with_subcommands(
+    RegisteredCommand::with_subcommands(
         "/memory",
         "Toggle memory feature",
         &[
@@ -302,7 +370,7 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
         ],
     ),
     RegisteredCommand::public("/test", "Verify a claim/current changes with layered tests"),
-        RegisteredCommand::with_subcommands(
+    RegisteredCommand::with_subcommands(
         "/initiatives",
         "Open initiatives overview / resume tracked initiatives",
         &[
@@ -310,7 +378,7 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
             ("/initiatives show", "Open a specific initiative by id"),
         ],
     ),
-        RegisteredCommand::with_subcommands(
+    RegisteredCommand::with_subcommands(
         "/goals",
         "Legacy alias for /initiatives",
         &[
@@ -318,7 +386,7 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
             ("/goals show", "Open a specific goal by id"),
         ],
     ),
-        RegisteredCommand::with_subcommands(
+    RegisteredCommand::with_subcommands(
         "/swarm",
         "Toggle swarm feature",
         &[
@@ -327,7 +395,7 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
             ("/swarm status", "Show swarm feature status"),
         ],
     ),
-        RegisteredCommand::with_subcommands(
+    RegisteredCommand::with_subcommands(
         "/overnight",
         "Run a supervised overnight coordinator",
         &[
@@ -355,15 +423,13 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/feedback", "Send feedback about jcode"),
     RegisteredCommand::public("/telemetry", "Show or change what jcode sends"),
     RegisteredCommand::public("/support", "Email support with diagnostics prefilled"),
-        RegisteredCommand::with_subcommands(
+    RegisteredCommand::with_subcommands(
         "/subscription",
         "Show jcode subscription status",
-        &[
-            ("/subscription status", "Show subscription status"),
-        ],
+        &[("/subscription status", "Show subscription status")],
     ),
     RegisteredCommand::public("/subscribe", "Why and how to subscribe to jcode"),
-        RegisteredCommand::with_subcommands(
+    RegisteredCommand::with_subcommands(
         "/config",
         "Show or edit configuration",
         &[
@@ -393,7 +459,7 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/reload", "Reload into newest available binary"),
     RegisteredCommand::public("/restart", "Restart with current binary"),
     RegisteredCommand::public("/rebuild", "Background rebuild and auto reload"),
-        RegisteredCommand::with_subcommands(
+    RegisteredCommand::with_subcommands(
         "/selfdev",
         "Open a new self-dev jcode session",
         &[
@@ -423,7 +489,7 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/logout", "Log out of a provider"),
     RegisteredCommand::public("/account", "Open the combined account picker"),
     RegisteredCommand::public("/accounts", "Alias for /account"),
-        RegisteredCommand::with_subcommands(
+    RegisteredCommand::with_subcommands(
         "/cache",
         "Show cache stats or set cache TTL",
         &[
@@ -761,9 +827,6 @@ impl App {
             return self.rank_suggestions(input, suggestions);
         }
 
-
-
-
         if prefix_trimmed == "/autoreview" && !input.ends_with(' ') {
             return vec![
                 (
@@ -775,7 +838,6 @@ impl App {
                 ("/autoreview now".into(), "Launch a reviewer immediately"),
             ];
         }
-
 
         if prefix_trimmed == "/autojudge" && !input.ends_with(' ') {
             return vec![
@@ -797,7 +859,6 @@ impl App {
             return vec![("/review".into(), "Launch a one-shot review immediately")];
         }
 
-
         if prefix_trimmed == "/review-loop" && !input.ends_with(' ') {
             return vec![
                 (
@@ -808,14 +869,8 @@ impl App {
                     "/review-loop start".into(),
                     "Run the per-lens review loop on this session",
                 ),
-                (
-                    "/review-loop run".into(),
-                    "Alias for /review-loop start",
-                ),
-                (
-                    "/review-loop stop".into(),
-                    "Stop the active review loop",
-                ),
+                ("/review-loop run".into(), "Alias for /review-loop start"),
+                ("/review-loop stop".into(), "Stop the active review loop"),
             ];
         }
 
@@ -842,7 +897,6 @@ impl App {
                 ),
             ];
         }
-
 
         if prefix_trimmed == "/subagent" && !input.ends_with(' ') {
             return vec![("/subagent ".into(), "Launch a subagent with a prompt")];
@@ -897,10 +951,6 @@ impl App {
             return self.rank_suggestions(input, suggestions);
         }
 
-
-
-
-
         if prefix.starts_with("/effort ") {
             let efforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
             return self.rank_suggestions(
@@ -937,9 +987,6 @@ impl App {
                     .collect(),
             );
         }
-
-
-
 
         if prefix.starts_with("/login ") || prefix.starts_with("/auth ") {
             let base = if prefix.starts_with("/auth ") {
@@ -1023,17 +1070,6 @@ impl App {
             return self.rank_suggestions(input, suggestions);
         }
 
-
-
-
-
-
-
-
-
-
-
-
         if prefix.starts_with("/goals show ") {
             let relevant_goals = crate::goal::list_relevant_goals(
                 self.session
@@ -1048,8 +1084,6 @@ impl App {
                 .collect();
             return self.rank_suggestions(input, suggestions);
         }
-
-
 
         if prefix.starts_with("/rewind ") {
             let arg = prefix.strip_prefix("/rewind ").unwrap_or_default().trim();
@@ -1080,7 +1114,10 @@ impl App {
         // branch above. This keeps suggestions connected to the registry: adding
         // `subcommands` to a command below makes them show up while typing with no
         // further wiring.
-        let head = prefix_trimmed.split_whitespace().next().unwrap_or(prefix_trimmed);
+        let head = prefix_trimmed
+            .split_whitespace()
+            .next()
+            .unwrap_or(prefix_trimmed);
         if let Some(spec) = RegisteredCommand::spec_for(head)
             && !spec.subcommands.is_empty()
         {
