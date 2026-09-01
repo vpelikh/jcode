@@ -1684,3 +1684,197 @@ async fn read_only_tools_are_concurrency_safe() {
     // Unknown tools are conservatively unsafe.
     assert!(!registry.is_concurrency_safe("does_not_exist").await);
 }
+
+// ---------------------------------------------------------------------------
+// compass_query-first code-enforcement tier
+// ---------------------------------------------------------------------------
+
+#[test]
+fn agentgrep_raw_fallback_flag_is_only_an_unambiguous_yes() {
+    use super::agentgrep_requests_raw_fallback;
+
+    assert!(agentgrep_requests_raw_fallback(
+        &serde_json::json!({ "allow_raw_fallback": true })
+    ));
+    assert!(agentgrep_requests_raw_fallback(
+        &serde_json::json!({ "allow_raw_fallback": "true" })
+    ));
+
+    // Anything else means enforcement stays on.
+    for input in [
+        serde_json::json!({}),
+        serde_json::json!({ "allow_raw_fallback": false }),
+        serde_json::json!({ "allow_raw_fallback": "false" }),
+        serde_json::json!({ "allow_raw_fallback": 1 }),
+        serde_json::json!({ "allow_raw_fallback": "yes" }),
+        serde_json::json!({ "query": "allow_raw_fallback" }),
+    ] {
+        assert!(
+            !agentgrep_requests_raw_fallback(&input),
+            "should not bypass enforcement for {input}"
+        );
+    }
+}
+
+#[test]
+fn compass_redirect_output_mentions_escape_hatch_and_query() {
+    use super::compass_redirect_output;
+
+    let out = compass_redirect_output(&serde_json::json!({ "query": "find init" }));
+    assert!(out.output.contains("compass_query"), "must point at compass_query");
+    assert!(
+        out.output.contains("allow_raw_fallback"),
+        "must document the escape hatch"
+    );
+    assert!(out.output.contains("find init"), "should echo the query");
+}
+
+#[test]
+fn tool_is_policy_disabled_reflects_allow_and_deny_sets() {
+    use super::{set_session_tool_policy, tool_is_policy_disabled};
+    use std::collections::HashSet;
+
+    const SID: &str = "enforcement-policy-test";
+
+    // No policy configured: never disabled by policy.
+    clear_session_tool_policy(SID);
+    assert!(!tool_is_policy_disabled(SID, "compass_query"));
+
+    // Disabled set: compass_query present -> disabled.
+    set_session_tool_policy(SID, None, HashSet::from(["compass_query".to_string()]));
+    assert!(tool_is_policy_disabled(SID, "compass_query"));
+    // A different tool is not disabled by that policy.
+    assert!(!tool_is_policy_disabled(SID, "agentgrep"));
+
+    // Allow-list omitted compass_query -> disabled (not invocable).
+    set_session_tool_policy(SID, Some(HashSet::new()), HashSet::new());
+    assert!(tool_is_policy_disabled(SID, "compass_query"));
+
+    // Allow-list includes compass_query -> enabled.
+    set_session_tool_policy(
+        SID,
+        Some(HashSet::from(["compass_query".to_string()])),
+        HashSet::new(),
+    );
+    assert!(!tool_is_policy_disabled(SID, "compass_query"));
+
+    clear_session_tool_policy(SID);
+}
+
+#[tokio::test]
+async fn agentgrep_is_redirected_to_compass_when_available() {
+    // `prefer_compass_query` defaults to true and a default registry registers
+    // both `agentgrep` and `compass_query`, so enforcement must redirect.
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+    let temp = tempfile::TempDir::new().expect("temp dir");
+
+    let ctx = ToolContext {
+        session_id: "enforcement-redirect-test".to_string(),
+        message_id: "test".to_string(),
+        tool_call_id: "test".to_string(),
+        working_dir: Some(temp.path().to_path_buf()),
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: ToolExecutionMode::Direct,
+    };
+
+    let out = registry
+        .execute("agentgrep", serde_json::json!({ "query": "fn main" }), ctx.clone())
+        .await
+        .expect("redirect should be an Ok result, not an error");
+    assert!(
+        out.output.contains("compass_query"),
+        "agentgrep should be redirected to compass_query, got: {}",
+        out.output
+    );
+    assert!(
+        out.output.contains("allow_raw_fallback"),
+        "redirect should document the escape hatch"
+    );
+    clear_session_tool_policy("enforcement-redirect-test");
+}
+
+#[tokio::test]
+async fn agentgrep_runs_when_allow_raw_fallback_is_passed() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    std::fs::write(temp.path().join("sample.txt"), "alpha_uniquetoken beta\n")
+        .expect("write file");
+
+    let ctx = ToolContext {
+        session_id: "enforcement-bypass-test".to_string(),
+        message_id: "test".to_string(),
+        tool_call_id: "test".to_string(),
+        working_dir: Some(temp.path().to_path_buf()),
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: ToolExecutionMode::Direct,
+    };
+
+    let out = registry
+        .execute(
+            "agentgrep",
+            serde_json::json!({
+                "query": "uniquetoken",
+                "allow_raw_fallback": true,
+            }),
+            ctx.clone(),
+        )
+        .await
+        .expect("bypassed agentgrep should run and succeed");
+    assert!(
+        out.output.contains("uniquetoken"),
+        "bypassed grep should return real matches, got: {}",
+        out.output
+    );
+    assert!(
+        !out.output.contains("intercepted"),
+        "raw fallback should skip the redirect message"
+    );
+    clear_session_tool_policy("enforcement-bypass-test");
+}
+
+#[tokio::test]
+async fn agentgrep_runs_when_compass_is_policy_disabled() {
+    use std::collections::HashSet;
+
+    // If compass_query is disabled by the session policy, redirecting agentgrep
+    // would dead-end the model against a tool it cannot call. So agentgrep must
+    // run normally instead.
+    let _guard = crate::storage::lock_test_env();
+    set_session_tool_policy(
+        "enforcement-no-compass-test",
+        None,
+        HashSet::from(["compass_query".to_string()]),
+    );
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    std::fs::write(temp.path().join("sample.txt"), "beta_uniquetoken gamma\n")
+        .expect("write file");
+
+    let ctx = ToolContext {
+        session_id: "enforcement-no-compass-test".to_string(),
+        message_id: "test".to_string(),
+        tool_call_id: "test".to_string(),
+        working_dir: Some(temp.path().to_path_buf()),
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: ToolExecutionMode::Direct,
+    };
+
+    let out = registry
+        .execute("agentgrep", serde_json::json!({ "query": "uniquetoken" }), ctx.clone())
+        .await
+        .expect("agentgrep should run when compass is disabled");
+    assert!(
+        out.output.contains("uniquetoken"),
+        "grep should run when compass is not available, got: {}",
+        out.output
+    );
+    clear_session_tool_policy("enforcement-no-compass-test");
+}

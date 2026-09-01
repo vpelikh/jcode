@@ -666,6 +666,20 @@ pub struct ToolConfig {
     /// when the file changed. Default: on.
     #[serde(alias = "read_dedup")]
     pub read_dedup: bool,
+    /// Enforce the "use `compass_query` before `agentgrep`" guidance at the
+    /// code level. When on, an `agentgrep` call is redirected to `compass_query`
+    /// (instead of executing grep) as long as `compass_query` is actually
+    /// available and not disabled by the session tool policy. The model can
+    /// still force raw grep by passing `allow_raw_fallback` (a documented
+    /// agentgrep input field). Default: on, matching the built-in preferred-tools
+    /// guidance that tells agents to try semantic search first and only fall
+    /// back to grep when no index covers the task.
+    #[serde(default = "default_true")]
+    pub prefer_compass_query: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for ToolConfig {
@@ -678,6 +692,7 @@ impl Default for ToolConfig {
             mcp_tools: McpToolsMode::Auto,
             mcp_tools_token_threshold: 8_000,
             read_dedup: true,
+            prefer_compass_query: true,
         }
     }
 }
