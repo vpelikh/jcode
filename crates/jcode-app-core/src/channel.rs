@@ -651,7 +651,7 @@ impl TelegramChannel {
             match crate::recent_session_index::recent(200) {
                 Ok(list) if n >= 1 && n <= list.len() => list[n - 1].session_id.clone(),
                 Ok(_) => return format!("`{n}` is out of range for `/list`.").to_string(),
-                Err(e) => return format!("⚠️ Could not read the session index: {e}").to_string(),
+                Err(e) => return format!("⚠️ Could not read the session index: {}", escape_markdown_v2(&e.to_string())),
             }
         } else {
             match self.resolve_session_id(arg).await {
@@ -680,7 +680,7 @@ impl TelegramChannel {
                         short_id(&id)
                     )
                 }
-                Err(e) => format!("⚠️ Could not create a session: {e}"),
+                Err(e) => format!("⚠️ Could not create a session: {}", escape_markdown_v2(&e.to_string())),
             };
         }
         match self
@@ -693,7 +693,7 @@ impl TelegramChannel {
                 crate::server::telegram_control::set_active_session(&self.chat_id, &id);
                 agent_reply_message(&id, &reply)
             }
-            Err(e) => format!("⚠️ Could not create a session: {e}"),
+            Err(e) => format!("⚠️ Could not create a session: {}", escape_markdown_v2(&e.to_string())),
         }
     }
 
@@ -779,7 +779,7 @@ impl TelegramChannel {
             Ok(list) => list,
             Err(e) => {
                 logging::warn(&format!("telegram /find index error: {e}"));
-                return format!("⚠️ Could not search sessions: {e}");
+                return format!("⚠️ Could not search sessions: {}", escape_markdown_v2(&e.to_string()));
             }
         };
         if entries.is_empty() {
