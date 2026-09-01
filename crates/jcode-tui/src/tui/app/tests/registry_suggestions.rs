@@ -92,3 +92,135 @@ fn every_registered_command_yields_a_suggestion_while_typing() {
         }
     }
 }
+
+/// End-to-end workflow: typing a partial subcommand surfaces a completion
+/// from the registry, accepting it fills in the full command, and submitting
+/// it actually dispatches to the handler. This pins the full path a user goes
+/// through, including the previously-disconnected commands.
+#[test]
+fn accept_suggestion_dispatches_the_completed_command() {
+    let mut app = create_test_app();
+
+    // /memory status is observable via app.memory_enabled / status message.
+    app.input = "/memory st".to_string();
+    app.cursor_pos = app.input.len();
+    let suggestions = app.command_suggestions();
+    assert!(
+        suggestions.iter().any(|(c, _)| c == "/memory status"),
+        "/memory st should suggest /memory status, got {suggestions:?}"
+    );
+    // Accept the top (selected) suggestion; it fills in /memory status.
+    app.command_suggestion_selected = suggestions
+        .iter()
+        .position(|(c, _)| c == "/memory status")
+        .unwrap();
+    assert!(
+        app.accept_selected_command_suggestion(),
+        "accepting the suggestion should fill in the input"
+    );
+    assert_eq!(app.input, "/memory status");
+
+    // Submitting dispatches and shows the status message.
+    app.submit_input();
+    let last = app.display_messages().last().expect("memory status reply");
+    assert!(
+        last.content.contains("Memory feature"),
+        "/memory status should report the feature state, got {:?}",
+        last.content
+    );
+
+    // /swarm status likewise dispatches (no panic, status handled).
+    app.input = "/swarm ".to_string();
+    app.cursor_pos = app.input.len();
+    let suggestions = app.command_suggestions();
+    assert!(
+        suggestions.iter().any(|(c, _)| c == "/swarm status"),
+        "/swarm should suggest status, got {suggestions:?}"
+    );
+    app.command_suggestion_selected = suggestions
+        .iter()
+        .position(|(c, _)| c == "/swarm status")
+        .unwrap();
+    assert!(app.accept_selected_command_suggestion());
+    assert_eq!(app.input, "/swarm status");
+    app.submit_input();
+}
+
+/// Nested-subcommand narrowing: /compact mode surfaces the mode choices, and
+/// /goals show surfaces goal ids. These exercise the deeper completion levels
+/// that the table-driven fallback must still deliver.
+#[test]
+fn nested_subcommands_narrow_while_typing() {
+    let mut app = create_test_app();
+
+    app.input = "/compact mode ".to_string();
+    app.cursor_pos = app.input.len();
+    let suggestions = app.command_suggestions();
+    assert!(
+        suggestions
+            .iter()
+            .any(|(c, _)| c == "/compact mode reactive"),
+        "/compact mode should suggest reactive, got {suggestions:?}"
+    );
+
+    // Narrowing /compact mode r → reactive.
+    app.input = "/compact mode r".to_string();
+    app.cursor_pos = app.input.len();
+    let suggestions = app.command_suggestions();
+    assert!(
+        suggestions
+            .iter()
+            .any(|(c, _)| c == "/compact mode reactive"),
+        "partial /compact mode r should keep reactive, got {suggestions:?}"
+    );
+
+    // Goals show surfaces goal ids (may be empty in a fresh app, but must not
+    // panic and /goals show <id> suggestion set stays valid).
+    app.input = "/goals show".to_string();
+    app.cursor_pos = app.input.len();
+    let _ = app.command_suggestions();
+}
+
+/// Alias and canonical-form edges still behave: typing an alias surfaces the
+/// canonical command (e.g. /models → /model), and /review stays a single
+/// suggestion (the one-shot command), not its /review-loop sibling.
+#[test]
+fn alias_and_bare_edges_are_preserved() {
+    let mut app = create_test_app();
+
+    // /models is an alias of /model and surfaces the canonical completion.
+    app.input = "/models".to_string();
+    app.cursor_pos = app.input.len();
+    let suggestions = app.command_suggestions();
+    assert!(
+        !suggestions.is_empty(),
+        "/models should yield suggestions, got none"
+    );
+    assert!(
+        suggestions.iter().any(|(c, _)| c.starts_with("/model")),
+        "/models should suggest /model or a model completion, got {suggestions:?}"
+    );
+
+    // /?: bare ? maps to help completions, not nothing.
+    app.input = "/?".to_string();
+    app.cursor_pos = app.input.len();
+    let suggestions = app.command_suggestions();
+    assert!(
+        !suggestions.is_empty(),
+        "/? should yield suggestions, got none"
+    );
+
+    // /review yields exactly the one-shot command (single suggestion), not the
+    // /review-loop sibling.
+    app.input = "/review".to_string();
+    app.cursor_pos = app.input.len();
+    let suggestions = app.command_suggestions();
+    assert_eq!(
+        suggestions
+            .iter()
+            .map(|(c, _)| c.as_str())
+            .collect::<Vec<_>>(),
+        vec!["/review"],
+        "bare /review should suggest only itself, got {suggestions:?}"
+    );
+}
