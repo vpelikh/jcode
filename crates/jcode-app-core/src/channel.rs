@@ -701,7 +701,7 @@ impl TelegramChannel {
     fn history_reply(&self, arg: &str) -> String {
         let Some(session_id) = crate::server::telegram_control::active_session_for(&self.chat_id)
         else {
-            return format!("No active session. Use `/use <n>` after `/list`.{}", help_footer());
+            return format!("No active session. Use `/use <n>` after `/list`{}", help_footer());
         };
         let limit = arg
             .trim()
