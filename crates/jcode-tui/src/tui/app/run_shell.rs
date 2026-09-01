@@ -523,13 +523,19 @@ impl StatusSpinnerRenderer {
         // then writes the diff through the backend's `MoveTo(x, y)` for every changed cell.
         // While the cursor is visible, eager terminals (especially ones without synchronized-
         // update support) let the visible block cursor sweep across the re-emitted cells, which
-        // reads as "cursor jumps to random places" during scroll. Hide it for the whole frame;
-        // `terminal.draw` then either restores the caret (the normal composer path, where
-        // `draw_input` sets a cursor position) or leaves it hidden (overlay branches such as the
-        // changelog/help/pickers, where ratatui also hides when no position is set), so the
-        // cursor ends exactly where it belongs in every case. The hide is best-effort: skipping
-        // it must not abort the frame (the soft-repaint buffer invalidation has already
-        // happened), so the error is deliberately ignored.
+        // reads as "cursor jumps to random places" during scroll. Hide it for EVERY full frame,
+        // not only the sentinel-invalidated repaints: streaming and plain-keystroke frames also
+        // come through here with `FullFrameInvalidation::None` (turn.rs and the input loop don't
+        // set the repaint flags), yet still `MoveTo` the cells that shift as content grows —
+        // including the composer row the caret sits in — so gating the hide on
+        // `invalidation != None` would let the caret sweep on those paths again. `terminal.draw`
+        // then either restores the caret (the normal composer path, where `draw_input` sets a
+        // cursor position) or leaves it hidden (overlay branches such as the changelog/help/
+        // pickers, where ratatui also hides when no position is set), so the cursor ends exactly
+        // where it belongs in every case. The hide/show is atomic within the synchronized-update
+        // frame (or a sub-frame burst on non-sync terminals), so it is invisible in steady state.
+        // The hide is best-effort: skipping it must not abort the frame (the soft-repaint buffer
+        // invalidation has already happened), so the error is deliberately ignored.
         let _ = terminal.backend_mut().hide_cursor();
 
         let invalidation = full_frame_invalidation(app.force_full_redraw, app.force_full_repaint);
