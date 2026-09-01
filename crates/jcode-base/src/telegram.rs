@@ -1540,6 +1540,14 @@ mod tests {
     }
 
     #[test]
+    fn test_escape_markdown_v2_escapes_backslash() {
+        // The backslash escape marker itself must also be escaped, otherwise
+        // it would escape the following character or break parsing.
+        assert_eq!(escape_markdown_v2("a\\b"), "a\\\\b");
+        assert_eq!(escape_markdown_v2("\\"), "\\\\");
+    }
+
+    #[test]
     fn test_escape_markdown_v2_leaves_plain_text_untouched() {
         assert_eq!(escape_markdown_v2("hello world"), "hello world");
         assert_eq!(
