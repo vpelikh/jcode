@@ -716,7 +716,10 @@ fn default_system_prompt_contains_code_search_guidance() {
 
 #[test]
 fn preferred_tools_fallback_is_used_when_no_config_exists() {
-    use crate::prompt::{build_system_prompt_full, load_preferred_tools_files_from_dir};
+    use crate::prompt::{
+        build_system_prompt_full, build_system_prompt_split_with_agents_md,
+        load_preferred_tools_files_from_dir,
+    };
 
     let _guard = crate::storage::lock_test_env();
     let prev_home = std::env::var_os("JCODE_HOME");
@@ -745,6 +748,22 @@ fn preferred_tools_fallback_is_used_when_no_config_exists() {
         "system prompt should include code-search guidance from default preferred-tools"
     );
     assert!(info.preferred_tools_chars > 0);
+
+    // The split builder (used by live agents for cache-friendly prompts) must
+    // also inject the fallback into its cacheable static part.
+    let (split, split_info) = build_system_prompt_split_with_agents_md(
+        None,
+        &[],
+        false,
+        None,
+        Some(project_dir.path()),
+        (None, crate::prompt::ContextInfo::default()),
+    );
+    assert!(
+        split.static_part.contains("compass_query"),
+        "split static part should include the fallback guidance"
+    );
+    assert!(split_info.preferred_tools_chars > 0);
 
     if let Some(prev_home) = prev_home {
         crate::env::set_var("JCODE_HOME", prev_home);
