@@ -6,6 +6,8 @@ use crate::session::event_types::{SessionEvent, SessionEventMap};
 use crate::message::ContentBlock;
 use jcode_session_types::{StoredCompactionState, StoredMemoryInjection, StoredMessage};
 use jcode_message_types::Role;
+use chrono::Utc;
+use serde_json::json;
 
 fn text_block(text: &str) -> ContentBlock {
     ContentBlock::Text { text: text.to_string(), cache_control: None }
@@ -78,6 +80,43 @@ fn test_event_map_message_operations() {
     assert_eq!(session.messages.len(), 3);
     assert_eq!(session.messages[1].id, "msg_3");
     assert!(session.event_map.events.len() >= 3);
+}
+
+#[test]
+fn test_insert_message_at_end_keeps_event_log_consistent() {
+    // `insert_message` delegates to `Vec::insert`, which accepts `index == len`
+    // as an append-at-end. `derive_messages` must replay that identically or the
+    // event log desyncs from the legacy vector.
+    let mut session = Session::create_with_id("test_insert_end".to_string(), None, None);
+    let msg1 = StoredMessage {
+        id: "msg1".to_string(),
+        role: Role::User,
+        content: vec![text_block("one")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    };
+    let msg_end = StoredMessage {
+        id: "end".to_string(),
+        role: Role::Assistant,
+        content: vec![text_block("end")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    };
+    session.append_stored_message(msg1.clone());
+    // Insert at the exact end (index == current len).
+    session.insert_message(session.messages.len(), msg_end.clone());
+
+    assert_eq!(session.messages.len(), 2);
+    assert_eq!(session.messages[1].id, "end");
+    let derived = session.derive_messages();
+    assert_eq!(derived.len(), 2, "append-at-end insert must survive replay");
+    assert_eq!(derived[0].id, "msg1");
+    assert_eq!(derived[1].id, "end");
+    session.rederive_all_checked().expect("event log must agree with legacy vector");
 }
 
 #[test]
@@ -638,4 +677,210 @@ fn test_truncate_to_zero_keeps_event_log_consistent() {
     session.truncate_messages(0);
     assert_eq!(session.messages.len(), 0, "legacy vector cleared");
     assert_eq!(session.derive_messages().len(), 0, "event log must also be empty");
+}
+
+
+#[test]
+fn test_strip_and_truncate_keep_event_log_consistent() {
+    // Test strip_oversized_images
+    let mut session = Session::create_with_id("test_strip".to_string(), None, None);
+    session.append_stored_message(StoredMessage {
+        id: "msg1".to_string(),
+        role: Role::User,
+        content: vec![ContentBlock::Image {
+            media_type: "image/jpeg".to_string(),
+            data: "dGVzdA==".to_string(),
+        }],
+        display_role: None,
+        timestamp: Some(Utc::now()),
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    let before_event_count = session.event_map.events.len();
+    let before_msg_count = session.messages.len();
+    let stripped = session.strip_oversized_images(0); // force strip
+    assert!(stripped > 0);
+    assert_eq!(session.messages.len(), before_msg_count); // legacy vector unchanged count-wise
+    // event log should have grown by exactly one event (the strip emits ClearAll)
+    assert_eq!(session.event_map.events.len(), before_event_count + 1);
+
+    // Test emergency_truncate_tool_results (truncates ToolResult blocks only)
+    let mut session2 = Session::create_with_id("test_trunc".to_string(), None, None);
+    session2.append_stored_message(StoredMessage {
+        id: "msg2".to_string(),
+        role: Role::User,
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: "tool1".to_string(),
+            content: "very long tool result that will be truncated".repeat(200),
+            is_error: None,
+        }],
+        display_role: None,
+        timestamp: Some(Utc::now()),
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    let before_event_count2 = session2.event_map.events.len();
+    let before_msg_count2 = session2.messages.len();
+    let truncated = session2.emergency_truncate_tool_results(10); // tiny budget
+    assert!(truncated > 0);
+    assert_eq!(session2.messages.len(), before_msg_count2); // legacy vector unchanged count-wise
+    // event log should have grown by exactly one event (the mutation emits a ReplaceMessages event)
+    assert_eq!(session2.event_map.events.len(), before_event_count2 + 1);
+}
+
+#[test]
+fn test_remove_tool_use_blocks_keeps_event_log_consistent() {
+    let mut session = Session::create_with_id("test_tooluse".to_string(), None, None);
+    let tool_msg = StoredMessage {
+        id: "tool_msg".to_string(),
+        role: Role::Assistant,
+        content: vec![
+            ContentBlock::Text { text: "Before tool".to_string(), cache_control: None },
+            ContentBlock::ToolUse { id: "tool1".to_string(), name: "test_tool".to_string(), input: json!({"arg": "value"}), thought_signature: None },
+            ContentBlock::Text { text: "After tool".to_string(), cache_control: None },
+        ],
+        display_role: None,
+        timestamp: Some(Utc::now()),
+        tool_duration_ms: None,
+        token_usage: None,
+    };
+    session.append_stored_message(tool_msg.clone());
+    let before_event_count = session.event_map.events.len();
+    let before_msg_content_len = session.messages[0].content.len();
+
+    session.remove_tool_use_blocks("tool_msg");
+    // legacy vector still has one message, but content blocks changed
+    assert_eq!(session.messages.len(), 1);
+    assert_eq!(session.messages[0].id, "tool_msg");
+    // content should have lost the ToolUse block
+    assert_eq!(session.messages[0].content.len(), before_msg_content_len - 1);
+    // event log should have grown by exactly one event (rebuild adds a rehydrate event)
+    assert_eq!(session.event_map.events.len(), before_event_count + 1);
+    // derived messages should reflect the stripped content
+    let derived = session.derive_messages();
+    assert_eq!(derived.len(), 1);
+    assert_eq!(derived[0].content.len(), before_msg_content_len - 1);
+}
+
+#[test]
+fn test_refresh_initial_session_context_message_keeps_event_log_consistent() {
+    let mut session = Session::create_with_id("test_context".to_string(), None, None);
+    // ensure we have a session-context message
+    assert!(session.ensure_initial_session_context_message());
+    let before_event_count = session.event_map.events.len();
+    let before_ctx_text: String = session.messages[0]
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .concat();
+
+    // change the working directory to trigger a refresh
+    session.working_dir = Some("/new/path".to_string());
+    let changed = session.refresh_initial_session_context_message();
+    assert!(changed); // should have changed since working_dir changed
+
+    // legacy vector still has one message
+    assert_eq!(session.messages.len(), 1);
+    // content text should reflect the new context (edited in place, same block count)
+    let mut ctx_text = String::new();
+    for block in &session.messages[0].content {
+        if let ContentBlock::Text { text, .. } = block {
+            ctx_text.push_str(text);
+        }
+    }
+    assert!(ctx_text.contains("/new/path"), "refreshed context should mention the new working dir");
+    assert_ne!(ctx_text, before_ctx_text);
+    // event log should have grown by exactly one event (the mutation emits a ReplaceMessages event)
+    assert_eq!(session.event_map.events.len(), before_event_count + 1);
+    // derived messages should reflect the new context
+    let derived = session.derive_messages();
+    assert_eq!(derived.len(), 1);
+    assert!(derived[0]
+        .content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Text { text, .. } if text.contains("/new/path"))));
+}
+
+#[test]
+fn test_rebuild_event_map_agrees_with_legacy_state() {
+    let mut session = Session::create_with_id("test_idempotent".to_string(), None, None);
+    session.append_stored_message(StoredMessage {
+        id: "msg1".to_string(),
+        role: Role::User,
+        content: vec![text_block("hello")],
+        display_role: None,
+        timestamp: Some(Utc::now()),
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    session.append_stored_message(StoredMessage {
+        id: "msg2".to_string(),
+        role: Role::Assistant,
+        content: vec![text_block("world")],
+        display_role: None,
+        timestamp: Some(Utc::now()),
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+
+    // A rebuild replaces the event log with the legacy vectors as the source of
+    // truth: one AppendMessage event per stored message.
+    session.rebuild_event_map();
+    assert_eq!(session.derive_messages().len(), 2);
+    assert_eq!(session.event_map.events.len(), 2);
+    let (derived, _) = session.rederive_all_checked().expect("must stay consistent");
+
+    // Rebuilding again is a stable no-op on the derived state (same messages).
+    let events_after_first = session.event_map.events.len();
+    session.rebuild_event_map();
+    assert_eq!(session.event_map.events.len(), events_after_first);
+    assert_eq!(session.derive_messages().len(), 2);
+    let (derived_again, _) = session.rederive_all_checked().expect("still consistent");
+    let ids: Vec<_> = derived.iter().map(|m| m.id.clone()).collect();
+    let ids_again: Vec<_> = derived_again.iter().map(|m| m.id.clone()).collect();
+    assert_eq!(ids, ids_again);
+}
+
+#[test]
+fn test_rebuild_event_map_reflects_direct_field_sync() {
+    // Forking sets compaction/memory_injections/replay_events directly without
+    // emitting matching events. rebuild_event_map must capture them so derived
+    // state matches the legacy vectors (the unconditional-rebuild contract).
+    let mut session = Session::create_with_id("test_direct_sync".to_string(), None, None);
+    session.append_stored_message(StoredMessage {
+        id: "msg1".to_string(),
+        role: Role::User,
+        content: vec![text_block("hello")],
+        display_role: None,
+        timestamp: Some(Utc::now()),
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+
+    // Simulate a fork path that sets fields directly.
+    session.compaction = Some(StoredCompactionState {
+        summary_text: "summary".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 2,
+        compacted_count: 1,
+    });
+    session.memory_injections.push(StoredMemoryInjection {
+        summary: "🧠 auto-recalled 1 memory".to_string(),
+        content: "note".to_string(),
+        count: 1,
+        memory_ids: vec![],
+        age_ms: None,
+        before_message: Some(1),
+        timestamp: Utc::now(),
+    });
+
+    session.rebuild_event_map();
+    session.rederive_all_checked().expect("fork sync must be consistent");
+    assert_eq!(session.derive_compaction().map(|c| c.summary_text), Some("summary".to_string()));
+    assert_eq!(session.derive_memory_injections().len(), 1);
 }

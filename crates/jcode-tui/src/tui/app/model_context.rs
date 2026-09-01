@@ -989,10 +989,6 @@ impl App {
             if stripped > 0 || truncated > 0 {
                 self.messages.clear();
                 self.reseed_compaction_from_provider_messages();
-                // `strip_oversized_images` and `emergency_truncate_tool_results`
-                // mutate `self.session.messages` in-place without emitting events.
-                // Rebuild the event log so it stays in sync.
-                self.session.rebuild_event_map();
                 self.push_display_message(DisplayMessage::error(format!(
                     "Error: {} Dropped {} oversized image(s) and truncated {} tool result(s); you can retry.",
                     error, stripped, truncated
@@ -1136,10 +1132,6 @@ impl App {
         // bookkeeping from the new provider view.
         self.messages.clear();
         self.reseed_compaction_from_provider_messages();
-        // `strip_oversized_images` and `emergency_truncate_tool_results` mutate
-        // `self.session.messages` in-place without emitting events. Rebuild the
-        // event log so it stays in sync with the modified transcript.
-        self.session.rebuild_event_map();
 
         self.push_display_message(DisplayMessage::system(format!(
             "⚡ Request was too large; dropped {} oversized image(s), truncated {} tool result(s), and retrying...",
