@@ -531,6 +531,11 @@ impl TelegramChannel {
             .await;
             return;
         }
+        // Serialize callback handling with text-message processing so mutating
+        // state (confirmation_tracker, active session) and reply ordering stay
+        // consistent: text messages are handled under process_lock in spawned
+        // tasks, so callbacks must take the same lock or they can interleave.
+        let _guard = self.process_lock.lock().await;
         let Some(data) = cb.data.as_deref() else {
             let _ = crate::telegram::answer_callback_query(
                 &client,
@@ -724,6 +729,13 @@ impl TelegramChannel {
             Ok(text) => text,
             Err(_) => return format!("⚠️ Could not read session `{}` for preview.", short_id(&session_id)),
         };
+        // An empty session yields a distinctive sentinel rather than messages.
+        if entries == "(no visible messages)" {
+            return format!(
+                "📖 **Preview** `{}`, 0 messages\n(no messages to preview)",
+                short_id(&session_id)
+            );
+        }
         // Split the renderer's block into preview lines: strip each role prefix
         // and escape the raw content (see peek_preview_lines) so the preview
         // neither drops to a doubled role label nor breaks parse_mode=MarkdownV2.
