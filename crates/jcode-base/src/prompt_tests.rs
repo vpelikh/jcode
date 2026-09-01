@@ -715,6 +715,34 @@ fn default_system_prompt_contains_code_search_guidance() {
 }
 
 #[test]
+fn default_preferred_tools_guidance_matches_system_prompt_code_search_section() {
+    // The built-in preferred-tools fallback must stay in sync with the base
+    // system prompt's code-search section so the rule never drifts between the
+    // two injection points. Compare the body (after each file's heading).
+    let md_section = DEFAULT_SYSTEM_PROMPT
+        .split("## Code search\n\n")
+        .nth(1)
+        .expect("system prompt should contain the code search section")
+        .split("\n## ")
+        .next()
+        .unwrap_or("")
+        .trim();
+
+    // DEFAULT_PREFERRED_TOOLS starts with a "# Default Preferred Tools" heading
+    // then the guidance paragraphs.
+    let const_body = DEFAULT_PREFERRED_TOOLS
+        .splitn(2, "\n\n")
+        .nth(1)
+        .expect("default preferred tools should have a body")
+        .trim();
+
+    assert_eq!(
+        const_body, md_section,
+        "DEFAULT_PREFERRED_TOOLS body must match the system prompt code-search section"
+    );
+}
+
+#[test]
 fn preferred_tools_fallback_is_used_when_no_config_exists() {
     use crate::prompt::{
         build_system_prompt_full, build_system_prompt_split_with_agents_md,
