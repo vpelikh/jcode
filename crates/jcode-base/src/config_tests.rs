@@ -679,6 +679,15 @@ fn test_generated_default_config_has_expected_user_defaults() {
     let parsed: Config =
         toml::from_str(&content).expect("generated default config should parse as Config");
     assert_eq!(parsed.agents.swarm_spawn_mode, SwarmSpawnMode::Inline);
+    // The compass_query-first enforcement knob ships documented and defaults on.
+    assert!(
+        content.contains("prefer_compass_query"),
+        "generated default config should document prefer_compass_query"
+    );
+    assert!(
+        parsed.tools.prefer_compass_query,
+        "generated default config keeps compass_query-first enforcement on"
+    );
     assert!(
         parsed.display.show_thinking,
         "freshly created user config should request model reasoning"
