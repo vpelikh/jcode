@@ -237,8 +237,9 @@ fn build_probe_client(proxy: Option<&str>, api_ip: Option<&str>) -> anyhow::Resu
 /// tried, followed by the curated list of known DC IPs (`TELEGRAM_DC_CANDIDATES`).
 /// Each candidate is probed with a short-timeout client; the first whose
 /// `verify_bot_auth` probe succeeds is returned (and reused for the real path).
-/// A non-connectivity error (e.g. a bad bot token) stops discovery immediately,
-/// since no IP will help.
+/// A permanent error (e.g. a bad bot token) stops discovery immediately, since
+/// no IP will help; transient failures (network, TLS, or a 429 rate-limit) move
+/// on to the next candidate.
 pub async fn discover_client(
     bot_token: &str,
     proxy: Option<&str>,
