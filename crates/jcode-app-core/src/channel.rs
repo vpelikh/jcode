@@ -544,15 +544,19 @@ impl TelegramChannel {
         };
 
         // A tap on a `/free` picker button carries a `__free__<session_id>`
-        // payload: drop that live session instead of selecting it.
+        // payload: request freeing that live session. To honor the same
+        // safety guarantee as the `/free` command, this does not drop the
+        // session immediately; it registers a pending "free" confirmation and
+        // asks the user to `/confirm` to proceed (or `/cancel`).
         if let Some(id) = data.strip_prefix("__free__") {
             let id = id.trim().to_string();
-            let removed = crate::server::telegram_control::free_session_for_control(&id).await;
-            let ack = if removed {
-                format!("🗑️ Freed `{}`", short_id(&id))
-            } else {
-                format!("⚠️ `{}` already gone", short_id(&id))
-            };
+            let mut tracker = self.confirmation_tracker.lock().await;
+            let prompt = tracker.request("free", id.clone());
+            drop(tracker);
+            let ack = format!(
+                "🗑️ Free `{}`? Tap /confirm to confirm, /cancel to abort.",
+                short_id(&id)
+            );
             let _ = crate::telegram::answer_callback_query(
                 &client,
                 &self.token,
@@ -561,6 +565,9 @@ impl TelegramChannel {
                 self.api_base.as_deref(),
             )
             .await;
+            // Post the confirmation prompt so the user can act on it.
+            let _ = self.send_reply(&prompt, picker_message_id).await;
+            // Collapse the picker's inline keyboard now that a free was queued.
             if let Some(message_id) = picker_message_id
                 && let Ok(chat_id_num) = chat_id.parse::<i64>()
             {
@@ -867,8 +874,8 @@ impl TelegramChannel {
         String::new()
     }
 
-    /// `/confirm` (alias for tapping the confirm button): execute the pending
-    /// destructive action stored in `confirmation_tracker`.
+    /// `/confirm`: execute the pending destructive action (`/free` or `/abort`)
+    /// stored in the confirmation tracker.
     async fn confirm_reply(&self) -> String {
         let mut tracker = self.confirmation_tracker.lock().await;
         let Some((action, session_id)) = tracker.verify("__confirm__") else {
@@ -1063,7 +1070,10 @@ impl TelegramChannel {
         // rather than printing a static "all green". Cheap and worth it because
         // a silently-dead bot is the #1 Telegram support complaint.
         let (auth_ok, auth_detail) = self.live_auth_status().await;
-        let store_ok = crate::recent_session_index::recent(1).map(|r| !r.is_empty()).unwrap_or(false);
+        // Single recent-session read: it both reports store health and counts
+        // saved/recent sessions, so we avoid opening the index twice.
+        let recent_entries = crate::recent_session_index::recent(100).unwrap_or_default();
+        let store_ok = !recent_entries.is_empty();
         let live_count = crate::server::telegram_control::live_session_count()
             .await
             .unwrap_or(0);
@@ -1079,7 +1089,6 @@ impl TelegramChannel {
             String::new()
         };
         // Count saved vs recent sessions for richer status
-        let recent_entries = crate::recent_session_index::recent(100).unwrap_or_default();
         let total_recent = recent_entries.len();
         let total_saved = recent_entries.iter().filter(|s| s.saved).count();
         let has_pending_confirm = self.confirmation_tracker.lock().await.pending.is_some();
@@ -1469,9 +1478,9 @@ impl ConfirmationTracker {
         Self { pending: None }
     }
 
-    /// Create a new confirmation and return the prompt text + callback data
-    /// to be used as the inline-keyboard button. The button's callback data
-    /// is `__confirm__`; the action is encoded in the tracker.
+    /// Create a new confirmation and return the prompt text shown to the user.
+    /// The action is encoded in the tracker; the user then types `/confirm` to
+    /// proceed or `/cancel` to abort.
     fn request(&mut self, action: &'static str, session_id: String) -> String {
         let sid = short_id(&session_id);
         self.pending = Some(PendingConfirmation {
@@ -1634,7 +1643,7 @@ const HELP_TEXT: &str = "\
 /history (n) — show recent messages of the selected session
 /peek (n) — quick 2-line preview of the active session
 /resume (id) (prompt) — ask a session directly
-/live — list live sessions (tap 🗑️ to free one)
+/live — list live sessions (tap 🗑️ to request freeing one)
 /free (id) — drop a live headless session (requires /confirm)
 /abort — stop the active session's running turn (requires /confirm)
 /confirm — execute a pending destructive action
@@ -2580,6 +2589,73 @@ mod tests {
             answer_body.get("text").is_none() || !answer_body["text"].as_str().unwrap_or("").is_empty(),
             "answerCallbackQuery must not send an empty `text` (would leave the button stuck)"
         );
+    }
+
+    #[tokio::test]
+    async fn test_free_callback_requests_confirmation_instead_of_freeing() {
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::TempDir::new().expect("temp home");
+        crate::env::set_var("JCODE_HOME", home.path());
+        let mock = MockTelegram::start().await;
+        let ch = TelegramChannel::with_connectivity(
+            "tok".into(),
+            "77".into(),
+            true,
+            Some(mock.base()),
+            None,
+            None,
+            None,
+        );
+
+        // Tap the 🗑️ button on a /live picker: it carries `__free__<id>`.
+        ch.handle_callback_query(crate::telegram::CallbackQuery {
+            id: "cb_free".into(),
+            from: Some(crate::telegram::TelegramFrom { id: 1 }),
+            data: Some("__free__session_free_1_aabbccddeeff".into()),
+            message: Some(crate::telegram::CallbackMessage {
+                chat: Some(crate::telegram::Chat { id: 77 }),
+                message_id: Some(42),
+            }),
+        })
+        .await;
+
+        // The tap must be answered, a confirmation prompt posted, and the
+        // picker keyboard collapsed — but the session must NOT be freed yet.
+        let (methods, bodies) = (mock.methods().await, mock.bodies().await);
+        assert!(
+            methods.iter().any(|m| m == "answerCallbackQuery"),
+            "a free button tap must be answered, got {methods:?}"
+        );
+        assert!(
+            methods.iter().any(|m| m == "editMessageReplyMarkup"),
+            "picker keyboard should be collapsed after a queued free, got {methods:?}"
+        );
+        let prompt = bodies
+            .iter()
+            .zip(methods.iter())
+            .find(|(_, m)| m.as_str() == "sendMessage")
+            .map(|(b, _)| b["text"].as_str().unwrap_or("").to_string())
+            .expect("a confirmation prompt message should be sent");
+        assert!(
+            prompt.contains("/confirm to proceed"),
+            "confirmation prompt should ask for /confirm, got {prompt:?}"
+        );
+
+        // Confirm consumes the pending "free". Since the session is not a real
+        // live registry entry, it must NOT report a successful free (it should
+        // say the session could not be freed / is gone).
+        let msg = ch.confirm_reply().await;
+        assert!(
+            !free_confirmed(&msg),
+            "/confirm must not report a successful free for a non-live session, got {msg:?}"
+        );
+        ch.cancel_reply().await;
+    }
+
+    /// Whether a confirm reply actually freed/aborted (i.e. it is not the
+    /// "no pending confirmation" or an "is not a live session" message).
+    fn free_confirmed(msg: &str) -> bool {
+        msg.contains("freed") || msg.contains("Abort confirmed")
     }
 
     #[test]
