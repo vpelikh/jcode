@@ -1,10 +1,11 @@
-// Tests for `/review-loop` typing suggestions.
+// Tests for `/review-loop` typing suggestions and help.
 //
 // `/review-loop` was previously dispatchable but produced no suggestion while
 // typing (it was absent from the suggestion registry). These pin the observable
-// UX: typing `/review-loop` must offer `status` / `start` / `stop` completions,
-// matching the existing `/autoreview` and `/judge` style. (Registry presence is
-// asserted in `state_ui_input_helpers.rs` alongside the other registrations.)
+// UX: typing `/review-loop` must offer `status` / `start` / `stop` completions
+// and `/help review-loop` must show them, matching the existing `/autoreview`
+// and `/judge` style. (Registry presence is asserted in
+// `state_ui_input_helpers.rs` alongside the other registrations.)
 
 #[test]
 fn typing_review_loop_suggests_subcommands() {
@@ -65,4 +66,24 @@ fn review_loop_suggestions_do_not_collide_with_one_shot_review() {
         "typing /review-loop must offer loop subcommands, got {:?}",
         loop_suggestions
     );
+}
+
+#[test]
+fn help_review_loop_topic_shows_loop_details() {
+    // `/review-loop` is a public registered command, so it is both suggested by
+    // the `/help <topic>` completions and listed in the palette. Selecting it
+    // must not fall through to an "Unknown command" error, so it needs a help
+    // topic.
+    let mut app = create_test_app();
+    app.input = "/help review-loop".to_string();
+    app.submit_input();
+
+    let msg = app
+        .display_messages()
+        .last()
+        .expect("missing help response");
+    assert_eq!(msg.role, "system");
+    assert!(msg.content.contains("/review-loop"));
+    assert!(msg.content.contains("/review-loop status"));
+    assert!(msg.content.contains("/review-loop stop"));
 }

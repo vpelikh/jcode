@@ -97,6 +97,9 @@ impl App {
             "review" => {
                 "/review\nLaunch a one-shot headed review session immediately.\n\nThe reviewer will DM this session when done. If OpenAI ChatGPT OAuth is available, it prefers gpt-5.5."
             }
+            "review-loop" => {
+                "/review-loop\nRun a post-completion per-lens review loop on this session.\n\nA loop mode review spawns an independent read-only reviewer per lens (correctness, edges/errors, security, performance, build/leftovers, requirement traceability), reports findings back as fix turns, and re-reviews each lens until it is clean or a stall cap is hit, ending with a final confirmation pass.\n\n/review-loop start\nStart (or restart) the per-lens review loop on this session.\n\n/review-loop stop\nStop the active review loop.\n\n/review-loop status\nShow the current review loop status or the final digest if the loop has finished.\n\nTo run the loop automatically after completion, enable autoreview loop_mode in config."
+            }
             "judge" => {
                 "/judge\nLaunch a one-shot headed judge session immediately.\n\nThe judge will DM this session when done. If OpenAI ChatGPT OAuth is available, it prefers gpt-5.5."
             }
