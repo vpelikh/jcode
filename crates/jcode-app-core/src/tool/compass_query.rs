@@ -483,6 +483,15 @@ where
 /// how often it runs so a busy agent doesn't re-stat the tree on every single call.
 const STALE_RESCAN_TTL: Duration = Duration::from_secs(5);
 
+/// Lock a process-global `Mutex` for these per-process caches, tolerating
+/// poisoning. If a thread panics while holding one of these locks (e.g. inside a
+/// build path), `Mutex::lock()` would otherwise make every subsequent `.unwrap()`
+/// panic and break the tool for the whole process. `into_inner()` recovers the
+/// (consistent-enough) guard instead.
+fn lock_cached<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Last time a correct staleness scan proved `cache_dir` fresh, keyed by cache dir
 /// so each project is throttled independently. Bounded in size by the number of
 /// distinct projects indexed in this process.
@@ -491,10 +500,7 @@ static LAST_STALE_SCAN: OnceLock<Mutex<HashMap<PathBuf, SystemTime>>> = OnceLock
 /// True when this cache was verified fresh within `STALE_RESCAN_TTL`. On any error
 /// (missing entry, clock skew) we return false so correctness wins over the shortcut.
 fn recently_scanned(cache_dir: &Path) -> bool {
-    let map = LAST_STALE_SCAN
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap();
+    let map = lock_cached(LAST_STALE_SCAN.get_or_init(|| Mutex::new(HashMap::new())));
     match map.get(cache_dir) {
         Some(&t) => t.elapsed().map(|d| d < STALE_RESCAN_TTL).unwrap_or(false),
         None => false,
@@ -502,10 +508,7 @@ fn recently_scanned(cache_dir: &Path) -> bool {
 }
 
 fn record_scan(cache_dir: &Path) {
-    LAST_STALE_SCAN
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap()
+    lock_cached(LAST_STALE_SCAN.get_or_init(|| Mutex::new(HashMap::new())))
         .insert(cache_dir.to_path_buf(), SystemTime::now());
 }
 
@@ -528,7 +531,7 @@ static LAST_GIT_SHA: OnceLock<Mutex<HashMap<PathBuf, (SystemTime, String)>>> = O
 fn current_git_sha_cached(working_dir: &Path) -> Option<String> {
     let map = LAST_GIT_SHA.get_or_init(|| Mutex::new(HashMap::new()));
     {
-        let guard = map.lock().unwrap();
+        let guard = lock_cached(map);
         if let Some((t, sha)) = guard.get(working_dir)
             && t.elapsed().map(|d| d < GIT_SHA_CACHE_TTL).unwrap_or(false)
         {
@@ -537,8 +540,7 @@ fn current_git_sha_cached(working_dir: &Path) -> Option<String> {
     } // Drop the read lock before shelling out to git.
     match current_git_sha(working_dir) {
         Some(sha) => {
-            map.lock()
-                .unwrap()
+            lock_cached(map)
                 .insert(working_dir.to_path_buf(), (SystemTime::now(), sha.clone()));
             Some(sha)
         }
@@ -614,7 +616,7 @@ static LAST_GIT_TOP: OnceLock<Mutex<HashMap<PathBuf, (SystemTime, String)>>> = O
 fn current_git_top_cached(working_dir: &Path) -> Option<String> {
     let map = LAST_GIT_TOP.get_or_init(|| Mutex::new(HashMap::new()));
     {
-        let guard = map.lock().unwrap();
+        let guard = lock_cached(map);
         if let Some((t, top)) = guard.get(working_dir)
             && t.elapsed().map(|d| d < GIT_TOP_CACHE_TTL).unwrap_or(false)
         {
@@ -630,7 +632,7 @@ fn current_git_top_cached(working_dir: &Path) -> Option<String> {
         return None;
     }
     let result = top.clone();
-    map.lock().unwrap().insert(working_dir.to_path_buf(), (SystemTime::now(), top));
+    lock_cached(map).insert(working_dir.to_path_buf(), (SystemTime::now(), top));
     Some(result)
 }
 
