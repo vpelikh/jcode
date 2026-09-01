@@ -518,10 +518,10 @@ impl StatusSpinnerRenderer {
     }
 
     /// The backend-generic body of a full-frame repaint. Split out from
-    /// [`Self::draw_full`] so the actual production path (including the
-    /// cursor-hide for the diff flush) can be exercised directly against any
-    /// `ratatui::backend::Backend` in tests, instead of being approximated by a
-    /// stand-in harness.
+    /// [`Self::draw_full_with`] (which in turn is dispatched from [`Self::draw_full`])
+    /// so the actual production path (including the cursor-hide for the diff flush)
+    /// can be exercised directly against any `ratatui::backend::Backend` in tests,
+    /// instead of being approximated by a stand-in harness.
     ///
     /// This is the exact code path the scroll-triggered `SoftRepaint` runs
     /// (request_full_repaint → invalidate_previous_terminal_buffer → here), and the
