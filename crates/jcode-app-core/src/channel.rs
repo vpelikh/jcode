@@ -1000,7 +1000,7 @@ impl TelegramChannel {
         let active = crate::server::telegram_control::active_session_for(&self.chat_id);
         let mut rows: Vec<InlineKeyboardRow> = Vec::new();
         for id in sessions.iter() {
-            let short: String = id.chars().take(8).collect();
+            let short: String = short_id(id);
             let prefix = if active.as_deref() == Some(id.as_str()) {
                 "✅ "
             } else {
