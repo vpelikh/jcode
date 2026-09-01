@@ -1464,17 +1464,20 @@ impl MessageChannel for TelegramChannel {
         // silently re-polling an auth error forever. Discovery resolves a
         // reachable DC first, so a blocked default endpoint does not block auth.
         let client = self.client_or_default().await;
-        match crate::telegram::verify_bot_auth(
+        let auth_ok = match crate::telegram::verify_bot_auth(
             &client,
             &self.token,
             self.api_base.as_deref(),
         )
         .await
         {
-            Ok(id) => logging::info(&format!(
-                "telegram auth ok bot_id={} username={:?}",
-                id.id, id.username
-            )),
+            Ok(id) => {
+                logging::info(&format!(
+                    "telegram auth ok bot_id={} username={:?}",
+                    id.id, id.username
+                ));
+                true
+            }
             Err(e) => {
                 logging::error(&format!(
                     "telegram bot token invalid/unreachable (config issue): {e}"
@@ -1494,12 +1497,18 @@ impl MessageChannel for TelegramChannel {
                     )
                     .await;
                 }
+                false
             }
-        }
+        };
 
         // Register the bot's slash commands with Telegram so they show up in the
-        // user's `/` menu. Non-fatal on failure.
-        crate::telegram::set_my_commands(&client, &self.token, self.api_base.as_deref()).await;
+        // user's `/` menu. Non-fatal on failure. Skipped when auth already
+        // failed: an invalid token or unreachable server would only produce a
+        // redundant setMyCommands failure and (on an outage) extra retry
+        // blocking just before the reply loop starts.
+        if auth_ok {
+            crate::telegram::set_my_commands(&client, &self.token, self.api_base.as_deref()).await;
+        }
 
         loop {
             let client = self.client_or_default().await;
