@@ -696,16 +696,23 @@ pub async fn send_chat_action(
 }
 
 /// How many total attempts to make for `setMyCommands` before giving up. The
-/// Telegram Bot API returns 429 during temporary flooding; a couple of attempts
-/// with backoff lets the command list settle even if the bot is briefly
+/// Telegram Bot API returns 429 during temporary flooding; a few attempts with
+/// backoff lets the command list settle even if the bot is briefly
 /// rate-limited at startup.
-const SET_MY_COMMANDS_MAX_ATTEMPTS: u32 = 3;
+const SET_MY_COMMANDS_MAX_ATTEMPTS: u32 = 5;
 /// Base delay between retry attempts (doubles each attempt). Kept short so a
 /// transient rate-limit at startup does not block the reply loop for long.
 const SET_MY_COMMANDS_RETRY_BASE_SECS: u64 = 1;
 /// Maximum delay between retry attempts. Prevents the backoff from growing
-/// indefinitely if the bot is persistently rate-limited.
+/// indefinitely if the bot is persistently rate-limited. With
+/// `SET_MY_COMMANDS_MAX_ATTEMPTS = 5` the last retry delay reaches this bound,
+/// so the cap is not dead configuration.
 const SET_MY_COMMANDS_RETRY_MAX_SECS: u64 = 8;
+/// Hard per-attempt budget for a single `setMyCommands` request. The shared
+/// client only sets a connect timeout (no overall request timeout), so without
+/// this a hung request could stall a retry leg indefinitely. A timeout here is
+/// treated as a transient failure and retried like a network error.
+const SET_MY_COMMANDS_ATTEMPT_TIMEOUT_SECS: u64 = 10;
 
 /// Register the bot's slash command list in the Telegram client so users can
 /// discover commands via the `/` menu. Retries on transient failures so the
@@ -743,20 +750,31 @@ pub async fn set_my_commands(
     let mut attempt = 0;
     loop {
         attempt += 1;
-        match post_telegram(client, bot_token, "setMyCommands", body.clone(), base_override).await
-        {
-            Ok(()) => break,
-            Err(e) if attempt >= SET_MY_COMMANDS_MAX_ATTEMPTS => {
+        // Bound each request with a hard timeout so a hung connection cannot
+        // stall the whole registration (the shared client only has a connect
+        // timeout). A timeout is a transient failure and is retried below.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(SET_MY_COMMANDS_ATTEMPT_TIMEOUT_SECS),
+            post_telegram(client, bot_token, "setMyCommands", body.clone(), base_override),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("setMyCommands request timed out"));
+
+        match outcome {
+            Ok(Ok(())) => break,
+            Ok(Err(e)) | Err(e)
+                if attempt >= SET_MY_COMMANDS_MAX_ATTEMPTS =>
+            {
                 logging::warn(&format!(
                     "failed to register telegram commands after {attempt} attempts: {e}"
                 ));
                 break;
             }
-            Err(e) => {
+            Ok(Err(e)) | Err(e) => {
                 // Only retry transient errors (connectivity issues, rate
-                // limits). Permanent failures like invalid token or bad
-                // request should surface immediately instead of being hidden
-                // behind retries.
+                // limits, timeouts). Permanent failures like invalid token or
+                // bad request should surface immediately instead of being
+                // hidden behind retries.
                 if !is_transient_api_error(&e) {
                     logging::warn(&format!(
                         "setMyCommands failed with non-transient error ({e}), not retrying"
@@ -1334,6 +1352,11 @@ mod tests {
         )));
         assert!(is_transient_api_error(&anyhow::anyhow!(
             "failed to lookup host: dns resolution failed"
+        )));
+        // A request timeout (from the per-attempt bound in set_my_commands)
+        // should also be transient.
+        assert!(is_transient_api_error(&anyhow::anyhow!(
+            "setMyCommands request timed out"
         )));
 
         // Telegram 429 flood control should be transient (retryable).
