@@ -919,7 +919,7 @@ impl TelegramChannel {
                     )
                 } else {
                     format!(
-                        "⚠️ `{}` is not a live session (it was resumed headlessly or has ended).",
+                        "⚠️ `{}` is not a live session, or Telegram control is not wired to a server runtime.",
                         short_id(&session_id)
                     )
                 }
@@ -935,7 +935,7 @@ impl TelegramChannel {
                     }
                     format!("🗑️ Session `{}` freed.", short_id(&session_id))
                 } else {
-                    format!("⚠️ Could not free `{}` (already gone?).", short_id(&session_id))
+                    format!("⚠️ Could not free `{}` (already gone, or Telegram control is not wired).", short_id(&session_id))
                 }
             }
             _ => unreachable!(),
