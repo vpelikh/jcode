@@ -1376,3 +1376,78 @@ fn test_memory_injection_and_replay_event_derived_order_matches_legacy() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_compaction_cache_tracks_clear_and_reset_order() {
+    // Round H: the compaction_event_index cache must reflect the physical event
+    // order across mixed streams (SetCompaction -> ClearAll -> re-set). At the
+    // public Session API boundary, derive_compaction must agree with the
+    // current_compaction cache and the legacy compaction field.
+    let mk_comp = |summary: &str| StoredCompactionState {
+        summary_text: summary.to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 1,
+    };
+
+    let mut session = Session::create_with_id("test_comp_order".to_string(), None, None);
+    session.append_stored_message(StoredMessage {
+        id: "m1".to_string(),
+        role: Role::User,
+        content: vec![text_block("hi")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+
+    // Set -> Clear -> re-set.
+    session.set_compaction(mk_comp("first"));
+    assert_eq!(session.derive_compaction().map(|c| c.summary_text), Some("first".to_string()));
+    assert!(session.event_map.current_compaction().is_some());
+
+    session.clear_messages();
+    assert!(session.derive_compaction().is_none(), "ClearAll must drop cached compaction");
+    assert!(session.event_map.current_compaction().is_none());
+
+    session.set_compaction(mk_comp("second"));
+    assert_eq!(session.derive_compaction().map(|c| c.summary_text), Some("second".to_string()));
+
+    // Legacy and derived must agree throughout.
+    session.rederive_all_checked().expect("compaction ordering must stay consistent");
+    assert_eq!(session.compaction.as_ref().map(|c| c.summary_text.clone()),
+               session.derive_compaction().map(|c| c.summary_text.clone()));
+}
+
+#[test]
+fn test_in_place_mutation_reflects_in_derived_and_provider_view() {
+    // Round F: an in-place content mutation (remove_tool_use_blocks) must be
+    // reflected in both the derived event-log view AND the provider message
+    // view (which rebuilds from the mutated legacy transcript).
+    let mut session = Session::create_with_id("test_provider_mutation".to_string(), None, None);
+    session.append_stored_message(StoredMessage {
+        id: "tool_msg".to_string(),
+        role: Role::Assistant,
+        content: vec![
+            ContentBlock::Text { text: "before".to_string(), cache_control: None },
+            ContentBlock::ToolUse { id: "t1".to_string(), name: "tool".to_string(), input: json!({"a":1}), thought_signature: None },
+        ],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+
+    let provider_before = session.messages_for_provider();
+    assert_eq!(provider_before[0].content.len(), 2);
+
+    session.remove_tool_use_blocks("tool_msg");
+    assert_eq!(session.messages[0].content.len(), 1);
+    assert_eq!(session.derive_messages()[0].content.len(), 1);
+
+    // Provider view must rebuild and reflect the mutation.
+    let provider_after = session.messages_for_provider();
+    assert_eq!(provider_after[0].content.len(), 1);
+    session.rederive_all_checked().expect("in-place mutation must stay consistent");
+}
