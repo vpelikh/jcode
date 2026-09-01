@@ -2119,4 +2119,16 @@ mod external_cli_suggestion_tests {
             assert!(names.contains(alias), "{alias} is not registered");
         }
     }
+
+    /// Working commands that users type directly must stay in the registry so
+    /// the palette, `/help`, and command completion do not silently omit them.
+    #[test]
+    fn review_loop_command_is_registered() {
+        let names: std::collections::HashSet<&str> =
+            REGISTERED_COMMANDS.iter().map(|c| c.name).collect();
+        assert!(
+            names.contains("/review-loop"),
+            "/review-loop must be registered (was missing from suggestions while typing)"
+        );
+    }
 }
