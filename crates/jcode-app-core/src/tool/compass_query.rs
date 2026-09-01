@@ -30,7 +30,9 @@
 //! A git branch or commit switch (HEAD) is detected via a cached SHA sidecar
 //! and forces a rebuild even when no file mtime changed, so a freshly checked
 //! out tree is never served against a stale index.
-//! The index can also be force-refreshed by deleting the cache dir.
+//! The current commit's index can be force-refreshed by deleting just its
+//! per-SHA dir (`<project_id>/<sha>/`); deleting the whole `<project_id>/` root
+//! also discards the shared `.ast-cache` and forces a full re-extract.
 //!
 //! ### Shared-cache staleness semantics
 //!
