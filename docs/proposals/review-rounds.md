@@ -31,6 +31,31 @@ Naive iterative review fails: "review again, anything missed?" makes the model
 invent marginal findings to avoid saying "done". A bare `continue` loop
 manufactures its own churn.
 
+### Relationship to the RALPH loop
+
+This review loop is a jcode-flavored instance of the *RALPH* (Ralph Wiggum) loop
+pattern: evaluate finished work, feed the verdict back as a fix turn, and iterate
+until a reviewer reports clean. Two deliberate differences from the canonical
+RALPH loop keep it from being a strict match:
+
+- **No context reset.** RALPH spawns a fresh agent instance each iteration to
+  fight context collapse. Here reviewers are per-lens and read-only and reuse
+  one reviewer window; fixes run in the *parent* session, not a fresh child.
+- **"Memory" is the session.** RALPH persists state to files (specs + plan +
+  git); jcode persists it in `Session.review_loop`.
+
+So the outer naming and CLI stay "review loop" / `/review-loop`; RALPH is the
+pattern this loop implements, not a rename target.
+
+### Auto-entry is once per session
+
+`maybe_enter_review_loop` seeds the loop at most once per session (guarded by
+`session.review_loop.is_some()`), so a converged/stopped loop does not restart
+after every turn — that would re-run all six lenses as churn. Re-running a
+finished loop is a deliberate, manual action via `/review-loop start`. Because
+the loop replaces one-shot autoreview when `loop_mode` is on, this is what
+"ran automatically only once" means in practice.
+
 ## Overview
 
 A **review loop** runs after the existing completion gates pass. It uses the
