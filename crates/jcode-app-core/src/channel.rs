@@ -437,7 +437,7 @@ impl TelegramChannel {
                 .chars()
                 .take(30)
                 .collect();
-            let short: String = s.session_id.chars().take(8).collect();
+            let short: String = short_id(&s.session_id);
             let prefix = if active.as_deref() == Some(s.session_id.as_str()) {
                 "✅ "
             } else if s.saved {
@@ -799,7 +799,7 @@ impl TelegramChannel {
                 .chars()
                 .take(30)
                 .collect();
-            let short: String = s.session_id.chars().take(8).collect();
+            let short: String = short_id(&s.session_id);
             let prefix = if active.as_deref() == Some(s.session_id.as_str()) {
                 "✅ "
             } else {
@@ -1780,7 +1780,7 @@ const HELP_TEXT: &str = "\
 • Send any plain message after /use or /new to talk to a session.
 • /list shows an inline picker: tap a row to select that session.
 • /list --saved shows only saved sessions; /list --today shows today's activity.
-• /use 2 selects the 2nd session; /use abc123… matches by id prefix.
+• /use 2 selects the 2nd session; /use abc123… matches by id prefix; /use fox selects by memorable name.
 • A ✅ marks the active session in the picker.
 • /free and /abort now require /confirm for safety.";
 
@@ -2645,8 +2645,8 @@ mod tests {
         let row = keyboard[0].as_array().expect("button row");
         assert_eq!(row.len(), 1, "one button per row");
         assert_eq!(
-            row[0]["text"], "fox (session_)",
-            "menu button must fall back to the memorable session name, not <untitled>"
+            row[0]["text"], "fox (fox)",
+            "menu button must show the memorable name as its short-id suffix"
         );
         assert_eq!(
             row[0]["callback_data"], "session_fox_1_aabbccddeeff0011",
