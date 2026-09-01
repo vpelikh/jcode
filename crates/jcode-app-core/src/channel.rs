@@ -873,6 +873,14 @@ impl TelegramChannel {
                 sessions.iter().filter(|id| short_id(id) == arg).collect();
             if by_name.len() == 1 {
                 vec![by_name[0].clone()]
+            } else if by_name.len() > 1 {
+                // Ambiguous memorable name: don't fall through to prefix
+                // matching (a name is not an id prefix), report it clearly.
+                return format!(
+                    "`{}` matches {} live sessions by name; they are ambiguous, use the full id.",
+                    escape_markdown_v2(arg),
+                    by_name.len()
+                );
             } else {
                 sessions
                     .iter()
@@ -1063,7 +1071,7 @@ impl TelegramChannel {
         }
         if by_name.len() > 1 {
             return Err(format!(
-                "`{}` matches {} sessions by name; use a longer prefix.",
+                "`{}` matches {} sessions by name; they are ambiguous, use the full id.",
                 escape_markdown_v2(reference),
                 by_name.len()
             ));
