@@ -114,6 +114,24 @@ fn session_tool_policy(session_id: &str) -> Option<SessionToolPolicy> {
         .cloned()
 }
 
+/// Whether the session's tool policy disables `name` for `session_id`. Mirrors
+/// the allow/deny logic a caller would be subject to, so pre-warm and other
+/// side effects can skip work for tools the session cannot actually invoke.
+pub(crate) fn session_tool_is_disabled(session_id: &str, name: &str) -> bool {
+    let Some(policy) = session_tool_policy(session_id) else {
+        return false;
+    };
+    if tool_name_is_disabled(&policy.disabled_tools, name) {
+        return true;
+    }
+    if let Some(allowed) = policy.allowed_tools.as_ref() {
+        // If a caller-facing allow-list is present, disabled unless named.
+        !tool_name_is_allowed(allowed, name)
+    } else {
+        false
+    }
+}
+
 /// Apply the current session policy to an MCP server tool invoked through a
 /// fixed deferred surface. Explicitly enabling the fixed surface authorizes its
 /// underlying MCP calls, while per-tool allow/deny entries remain effective.

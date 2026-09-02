@@ -663,9 +663,13 @@ pub(super) async fn handle_subscribe(
         // instead of blocking a turn on a multi-minute cold build. Uses the
         // effective *bound* directory (not the raw subscribe report) so a
         // home-dir subscribe while the agent is already bound to a project does
-        // not pre-warm the wrong path (issue #481). Best-effort and off this
-        // hot path; gated by `tools.prewarm_compass_index`.
-        if crate::config::config().tools.prewarm_compass_index {
+        // not pre-warm the wrong path (issue #481). Skipped when the session
+        // tool policy disables `compass_query` (no point building an index the
+        // session cannot query) or when the operator turned pre-warm off.
+        // Best-effort and off this hot path.
+        if crate::config::config().tools.prewarm_compass_index
+            && !crate::tool::session_tool_is_disabled(client_session_id, "compass_query")
+        {
             crate::tool::compass_query::prewarm_compass_index(Path::new(&bound_dir));
         }
 
