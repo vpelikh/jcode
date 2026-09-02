@@ -299,3 +299,39 @@ fn spaced_input_does_not_prime_the_bare_toggle() {
         "typing '/cache ' should prefer a subcommand, got {suggestions:?}"
     );
 }
+
+/// Progressive typing keeps every target reachable: a partial command prefix
+/// surfaces the top-level command, and a partial subcommand prefix surfaces
+/// the matching subcommand. This is the real "always has suggestions while
+/// typing" path a user experiences keystroke by keystroke.
+#[test]
+fn partial_prefixes_surface_command_and_subcommand_at_each_stage() {
+    let mut app = create_test_app();
+
+    // Partial command prefix -> the top-level command appears.
+    app.input = "/mem".to_string();
+    app.cursor_pos = app.input.len();
+    let s = app.command_suggestions();
+    assert!(
+        s.iter().any(|(c, _)| c == "/memory"),
+        "/mem should reach /memory, got {s:?}"
+    );
+
+    // Full command -> subcommands appear.
+    app.input = "/memory ".to_string();
+    app.cursor_pos = app.input.len();
+    let s = app.command_suggestions();
+    assert!(
+        s.iter().any(|(c, _)| c == "/memory on"),
+        "/memory  should reach subcommands, got {s:?}"
+    );
+
+    // Partial subcommand -> the specific subcommand is reachable.
+    app.input = "/memory of".to_string();
+    app.cursor_pos = app.input.len();
+    let s = app.command_suggestions();
+    assert!(
+        s.iter().any(|(c, _)| c == "/memory off"),
+        "/memory of should reach /memory off, got {s:?}"
+    );
+}
