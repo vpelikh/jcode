@@ -1468,7 +1468,7 @@ fn config_reload_generation_increments_on_cache_invalidation() {
 fn test_autoreview_loop_mode_and_stall_defaults() {
     // Phase 1b: review-loop config scaffolding on AutoReviewConfig.
     let cfg = Config::default();
-    assert!(!cfg.autoreview.loop_mode, "loop_mode must default to false");
+    assert!(cfg.autoreview.loop_mode, "loop_mode must default to true");
     assert_eq!(
         cfg.autoreview.max_stalled_turns, 3,
         "max_stalled_turns must default to 3"
@@ -1503,6 +1503,6 @@ fn test_autoreview_loop_mode_stall_tolerates_missing_fields() {
     )
     .expect("config without loop fields must still deserialize");
 
-    assert!(!cfg.autoreview.loop_mode);
+    assert!(cfg.autoreview.loop_mode);
     assert_eq!(cfg.autoreview.max_stalled_turns, 3);
 }
