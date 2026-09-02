@@ -341,4 +341,47 @@ mod tests {
         // `render_thread_never_blocks_when_the_pty_is_wedged` test, which
         // forces the byte cap.)
     }
+
+    /// Acceptance-aligned: use a *real* OS pipe whose buffer is full, so the
+    /// underlying write is a genuine blocking `write(2)` (exactly how a full pty
+    /// wedges). The shim must absorb the real syscall block so the caller never
+    /// parks.
+    #[cfg(unix)]
+    #[test]
+    fn real_full_pipe_write_never_blocks_the_caller() {
+        use std::os::fd::FromRawFd;
+        // Create an OS pipe. Keep the read end open but never read from it, so
+        // once the kernel buffer fills, the write end becomes a blocking fd.
+        let mut fds = [0i32; 2];
+        let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(ret, 0, "pipe() failed");
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        let pipe_writer = unsafe { std::fs::File::from_raw_fd(write_fd) };
+
+        let mut shim = TerminalWriter::new(pipe_writer);
+        // Feed far more than the kernel pipe buffer (typically ~64 KiB).
+        let big = vec![b'x'; 1024 * 1024];
+        let start = std::time::Instant::now();
+        for _ in 0..8 {
+            // write_all through the shim; the shim must not block even though the
+            // underlying pipe write would.
+            assert!(shim.write_all(&big).is_ok());
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "caller blocked on a real full pipe: {elapsed:?}"
+        );
+
+        // Drop: the writer thread is genuinely stuck in write(2); shutdown's
+        // bounded drain must abandon it rather than hang.
+        let drop_start = std::time::Instant::now();
+        drop(shim);
+        assert!(
+            drop_start.elapsed() < std::time::Duration::from_secs(1),
+            "drop hung on a real full pipe"
+        );
+        // Clean up the read end so the blocking writer thread can be reaped.
+        unsafe { libc::close(read_fd) };
+    }
 }
