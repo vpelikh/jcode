@@ -173,6 +173,18 @@ fn agentgrep_requests_raw_fallback(input: &Value) -> bool {
     }
 }
 
+/// Whether an agentgrep call is a full-text/pattern grep search (mode "grep"
+/// or omitted, which defaults to grep). Filename (`find`), single-file
+/// (`outline`), and relationship (`trace`) lookups are distinct operations that
+/// Compass's semantic search does not replace, so enforcement targets only the
+/// grep mode.
+fn agentgrep_call_is_grep_mode(input: &Value) -> bool {
+    match input.get("mode").and_then(|v| v.as_str()) {
+        Some(m) => m.eq_ignore_ascii_case("grep"),
+        None => true,
+    }
+}
+
 /// Whether the session tool policy disables `name` for `session_id`. Mirrors
 /// the allow/deny logic in [`Registry::execute`] so the enforcement tier can
 /// check `compass_query` availability against the same policy a caller would
@@ -813,6 +825,9 @@ impl Registry {
         if resolved_name == "agentgrep"
             && crate::config::config().tools.prefer_compass_query
             && !agentgrep_requests_raw_fallback(&input)
+            // Only full-text grep searches are redirected; find/outline/trace
+            // are distinct operations compass does not replace.
+            && agentgrep_call_is_grep_mode(&input)
             && tools.contains_key("compass_query")
             && !tool_is_policy_disabled(&ctx.session_id, "compass_query")
             // `compass_query` needs a real workspace to search (it fails with
