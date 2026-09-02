@@ -20,12 +20,15 @@
 //! ## Backpressure policy
 //!
 //! The channel is bounded in *bytes* by a shared atomic counter. When the pty
-//! is not draining and the queue fills beyond the cap, the render thread
-//! *drops the newest* chunk instead of blocking or growing memory. This is the
-//! natural policy for an interactive TUI: the latest frame is what the user
+//! is not draining and the outstanding backlog reaches the cap, the render
+//! thread *drops newer* chunks instead of blocking or growing memory. This is
+//! the natural policy for an interactive TUI: the latest frame is what the user
 //! should see, and once the pty drains again the next full frame supersedes
-//! whatever was dropped. The render loop stays alive and responsive regardless
-//! of the pty state.
+//! whatever was dropped. A single over-cap frame is still enqueued on a draining
+//! consumer (so a large full-screen redraw is never spuriously lost), but once
+//! the backlog saturates because the consumer is genuinely not draining, newer
+//! chunks are dropped. The render loop stays alive and responsive regardless of
+//! the pty state.
 //!
 //! ## Lifecycle
 //!
@@ -43,9 +46,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-/// Cap on queued (not-yet-written) output bytes. Once the render thread would
-/// push the backlog past this the chunk is dropped rather than blocking. 256
-/// KiB is comfortably larger than the kernel pty buffer and small enough that a
+/// Cap on the *outstanding* (queued-but-not-yet-drained) output backlog in
+/// bytes. Once the pty is not draining and this backlog saturates, the render
+/// thread drops newer chunks rather than blocking or growing memory. 256 KiB is
+/// comfortably larger than the kernel pty buffer and small enough that a
 /// wedged-pty backlog can never balloon.
 const QUEUE_CAPACITY_BYTES: usize = 256 * 1024;
 
@@ -133,12 +137,12 @@ impl TerminalWriter {
                     false
                 }
             };
-            if drained {
-                if let Some(handle) = self.inner.handle.lock().unwrap().take() {
-                    // Only join when the writer actually finished, so we never
-                    // block on a wedged pty.
-                    let _ = handle.join();
-                }
+            if drained
+                && let Some(handle) = self.inner.handle.lock().unwrap().take()
+            {
+                // Only join when the writer actually finished, so we never
+                // block on a wedged pty.
+                let _ = handle.join();
             }
         }
     }
@@ -181,9 +185,16 @@ impl Write for TerminalWriter {
                 RESYNC_REQUESTED.store(true, Ordering::Release);
                 return Ok(len); // accepted-with-drop so the render loop never blocks
             }
+            // `checked_add` guards against a pathological `len` (or cumulative
+            // backlog) that would overflow `usize` and wrap the reservation to a
+            // tiny value, which would otherwise defeat the cap entirely.
+            let Some(next) = prev.checked_add(len) else {
+                RESYNC_REQUESTED.store(true, Ordering::Release);
+                return Ok(len);
+            };
             match self.inner.buffered.compare_exchange(
                 prev,
-                prev + len,
+                next,
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
@@ -262,15 +273,28 @@ mod tests {
         }
     }
 
-    /// A writer that parks forever on the first write, simulating a pty whose
-    /// output buffer is full and never drains. The writer thread parks in
-    /// `write` (like a kernel `write(2)` on a full pty). This thread is a
-    /// detached daemon and is reaped when the test process exits.
-    struct WedgedWriter;
+    /// A writer that blocks on the first write until released, simulating a pty
+    /// whose output buffer is full and never drains. The writer thread blocks in
+    /// `write` (like a kernel `write(2)` on a full pty). The test holds the
+    /// [`Sender`] side and can release the thread before returning so no OS thread
+    /// is leaked across test runs.
+    struct WedgedWriter {
+        release: Receiver<()>,
+    }
+
+    impl WedgedWriter {
+        /// Create a wedge gate. `release` is the sender the test holds; the writer
+        /// thread blocks until the test drops/sends it.
+        fn new() -> (Self, Sender<()>) {
+            let (tx, rx) = mpsc::channel();
+            (Self { release: rx }, tx)
+        }
+    }
 
     impl Write for WedgedWriter {
         fn write(&mut self, _b: &[u8]) -> io::Result<usize> {
-            std::thread::park();
+            // Block until released, modeling write(2) blocked on a full pty.
+            let _ = self.release.recv();
             Ok(0)
         }
         fn flush(&mut self) -> io::Result<()> {
@@ -280,7 +304,8 @@ mod tests {
 
     #[test]
     fn render_thread_never_blocks_when_the_pty_is_wedged() {
-        let mut writer = TerminalWriter::new(WedgedWriter);
+        let (wedge, release) = WedgedWriter::new();
+        let mut writer = TerminalWriter::new(wedge);
         let start = std::time::Instant::now();
         for i in 0..5000 {
             let data = vec![b'x'; 1024];
@@ -309,6 +334,8 @@ mod tests {
             drop_start.elapsed() < std::time::Duration::from_secs(1),
             "drop blocked on a wedged pty"
         );
+        // Release the wedged writer thread so the test leaves no leaked thread.
+        drop(release);
     }
 
     #[test]
@@ -330,7 +357,8 @@ mod tests {
     /// blocking even when the underlying pty is wedged and never drains.
     #[test]
     fn app_terminal_draw_never_blocks_on_a_wedged_pty() {
-        let mut writer = TerminalWriter::new(WedgedWriter);
+        let (wedge, release) = WedgedWriter::new();
+        let mut writer = TerminalWriter::new(wedge);
         let backend = ratatui::backend::CrosstermBackend::new(writer);
         let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
         let start = std::time::Instant::now();
@@ -365,6 +393,8 @@ mod tests {
             drop_start.elapsed() < std::time::Duration::from_secs(1),
             "drop hung on a wedged pty"
         );
+        // Release the wedged writer thread so the test leaves no leaked thread.
+        drop(release);
         // (The resync-after-drop behavior is covered by the dedicated
         // `render_thread_never_blocks_when_the_pty_is_wedged` test, which
         // forces the byte cap.)
