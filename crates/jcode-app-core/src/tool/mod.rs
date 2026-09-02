@@ -220,11 +220,21 @@ fn compass_redirect_output(input: &Value) -> ToolOutput {
     } else {
         format!(" (query: {})", truncate_middle(query, 200))
     };
+    // Preserve an explicit search scope so the follow-up compass_query stays
+    // confined to the same subset the grep call was targeting.
+    let scope = input
+        .get("path")
+        .or_else(|| input.get("glob"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+    let scope_text = scope
+        .map(|s| format!(", keeping the search scope `{}`", truncate_middle(s, 120)))
+        .unwrap_or_default();
     ToolOutput::new(format!(
         "⚠️ `agentgrep` was intercepted before running: `compass_query` is available \
          for this workspace and must be attempted before raw grep.\n\n\
          Do not repeat this `agentgrep` call unchanged. Instead call `compass_query` \
-         with the same intent (natural language query + optional `path`) to search the \
+         with the same intent (natural language query + optional `path`{scope_text}) to search the \
          code graph first{query_text}. The first call may build the index for this \
          workspace; that is expected.\n\n\
          Only if `compass_query` genuinely cannot answer (for example you need to search \
