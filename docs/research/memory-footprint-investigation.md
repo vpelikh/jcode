@@ -285,8 +285,11 @@ Inspecting the real code: `jcode-base/src/process_memory.rs::allocator_info()` r
 `#[cfg(feature="jemalloc")]`; otherwise it returns `name:"system"` with no stats. So the
 daemon's exact observed output is itself proof its binary was built without `jemalloc`.
 The `#[global_allocator] Jemalloc` + `malloc_conf` tuning live in `src/main.rs`, gated the
-same way and absent from `default = ["pdf","embeddings","bedrock"]`. The source wiring and
-the running process are therefore linked by direct inspection, not inference.
+same way and (at the time of this measurement) absent from `default = ["pdf","embeddings","bedrock"]`.
+The source wiring and the running process are therefore linked by direct inspection, not
+inference. (Note: `jemalloc` has since been moved into the root `default` features as part of
+this fix — see the "Implementation" section below — so *new* default builds are
+jemalloc-backed, while the installed binary measured here predates that change.)
 
 ### Installed-binary linkage (fast direct check, no build needed)
 `readlink -f ~/.jcode/builds/shared-server/jcode` →
@@ -294,9 +297,11 @@ the running process are therefore linked by direct inspection, not inference.
 - `otool -L` → **no jemalloc dylib**;
 - `strings | grep dirty_decay_ms:1000` → **0 matches** (the `malloc_conf` tuning symbol is
   absent).
-So the install is definitively a **non-jemalloc** build — consistent with default features.
-This corroborates `server:memory`'s `allocator:{name:system}` and the `allocator:purge`
-error without needing to rebuild.
+So the install is definitively a **non-jemalloc** build — consistent with the default features
+at that time (jemalloc was not yet in `default`). This corroborates `server:memory`'s
+`allocator:{name:system}` and the `allocator:purge` error without needing to rebuild. It
+describes the then-installed binary; the project default has since moved jemalloc into
+`default` (see "Implementation" below).
 
 ### Validation scope & honest remaining limitation
 Every claim above was validated either by a real build/execution (the allocator probe, on
