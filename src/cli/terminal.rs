@@ -4,6 +4,7 @@ use std::panic;
 use std::sync::RwLock;
 
 use crate::{id, session, telemetry, tui};
+use jcode_tui::tui::terminal_writer::{AppTerminal, TerminalWriter};
 
 /// A function usable as (part of) a Rust panic hook.
 type PanicHook = dyn Fn(&panic::PanicHookInfo<'_>) + Sync + Send;
@@ -428,23 +429,48 @@ mod crash_resume_hint_tests {
     }
 }
 
-fn init_tui_terminal(inherited_terminal: bool) -> Result<ratatui::DefaultTerminal> {
+fn init_tui_terminal(inherited_terminal: bool) -> Result<AppTerminal> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         anyhow::bail!("jcode TUI requires an interactive terminal (stdin/stdout must be a TTY)");
     }
     if inherited_terminal {
         init_tui_terminal_resume()
     } else {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(ratatui::init)).map_err(|payload| {
-            anyhow::anyhow!(
-                "failed to initialize terminal: {}",
-                panic_payload_to_string(payload.as_ref())
-            )
-        })
+        init_tui_terminal_fresh()
     }
 }
 
-pub fn init_tui_runtime() -> Result<(ratatui::DefaultTerminal, TuiRuntimeGuard)> {
+/// Build an [`AppTerminal`] whose backend writes through a [`TerminalWriter`]
+/// so the render loop never blocks on a wedged pty.
+fn build_app_terminal() -> AppTerminal {
+    let writer = jcode_tui::tui::terminal_writer::TerminalWriter::new(io::stdout());
+    let backend = ratatui::backend::CrosstermBackend::new(writer);
+    ratatui::Terminal::new(backend).expect("failed to create terminal with writer thread")
+}
+
+/// Fresh (non-resume) init: equivalent to `ratatui::init()` but routes output
+/// through the non-blocking [`TerminalWriter`].
+fn init_tui_terminal_fresh() -> Result<AppTerminal> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crossterm::terminal::enable_raw_mode()
+            .map_err(|e| anyhow::anyhow!("failed to enable raw mode: {}", e))?;
+        crossterm::execute!(
+            io::stdout(),
+            crossterm::terminal::EnterAlternateScreen,
+            crossterm::cursor::Hide
+        )
+        .map_err(|e| anyhow::anyhow!("failed to enter alternate screen: {}", e))?;
+        Ok(build_app_terminal())
+    }))
+    .map_err(|payload| {
+        anyhow::anyhow!(
+            "failed to initialize terminal: {}",
+            panic_payload_to_string(payload.as_ref())
+        )
+    })?
+}
+
+pub fn init_tui_runtime() -> Result<(AppTerminal, TuiRuntimeGuard)> {
     let is_resuming = std::env::var_os("JCODE_RESUMING").is_some();
     let inherited_theme = std::env::var(INHERITED_THEME_ENV).ok();
     let inherited_modes_raw = std::env::var(INHERITED_MODES_ENV).ok();
@@ -654,14 +680,13 @@ fn write_session_resume_hint(mut writer: impl Write, session_id: &str) -> io::Re
     Ok(())
 }
 
-fn init_tui_terminal_resume() -> Result<ratatui::DefaultTerminal> {
-    use ratatui::{Terminal, backend::CrosstermBackend};
-
+fn init_tui_terminal_resume() -> Result<AppTerminal> {
     crossterm::terminal::enable_raw_mode()
         .map_err(|e| anyhow::anyhow!("failed to enable raw mode on resume: {}", e))?;
 
-    let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::new(backend)
+    let writer = TerminalWriter::new(io::stdout());
+    let backend = ratatui::backend::CrosstermBackend::new(writer);
+    let mut terminal = ratatui::Terminal::new(backend)
         .map_err(|e| anyhow::anyhow!("failed to create terminal on resume: {}", e))?;
 
     terminal

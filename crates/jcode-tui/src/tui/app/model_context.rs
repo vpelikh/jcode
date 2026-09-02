@@ -1106,7 +1106,7 @@ impl App {
     /// request and the retry would 413 again.
     pub(super) async fn try_recover_payload_too_large_and_retry(
         &mut self,
-        terminal: &mut DefaultTerminal,
+        terminal: &mut AppTerminal,
         event_stream: &mut EventStream,
     ) -> bool {
         if self.is_remote {
@@ -1172,7 +1172,7 @@ impl App {
     /// any turn error. Shared by every compaction auto-retry path.
     async fn run_compaction_retry_turn(
         &mut self,
-        terminal: &mut DefaultTerminal,
+        terminal: &mut AppTerminal,
         event_stream: &mut EventStream,
     ) -> bool {
         let retry_result = self
@@ -1195,7 +1195,7 @@ impl App {
     /// Returns true if the retry succeeded.
     pub(super) async fn try_auto_compact_and_retry(
         &mut self,
-        terminal: &mut DefaultTerminal,
+        terminal: &mut AppTerminal,
         event_stream: &mut EventStream,
     ) -> bool {
         if self.is_remote || !self.provider.supports_compaction() {
