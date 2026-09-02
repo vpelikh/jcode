@@ -667,14 +667,16 @@ pub struct ToolConfig {
     #[serde(alias = "read_dedup")]
     pub read_dedup: bool,
     /// Enforce the "use `compass_query` before `agentgrep`" guidance at the
-    /// code level. When on, an `agentgrep` call is redirected to `compass_query`
-    /// (instead of executing grep) as long as `compass_query` is actually
-    /// available: it is registered, not disabled by the session tool policy, and
-    /// the session has a working directory to search. The model can still force
-    /// raw grep by passing `allow_raw_fallback` (a documented agentgrep input
-    /// field). Default: on, matching the built-in preferred-tools guidance that
-    /// tells agents to try semantic search first and only fall back to grep when
-    /// no index covers the task.
+    /// code level. When on, a full-text `agentgrep` grep search is redirected to
+    /// `compass_query` (instead of executing grep) as long as `compass_query` is
+    /// actually available: it is registered, not disabled by the session tool
+    /// policy, and the session has a working directory to search. Filename and
+    /// file-inspection modes (find/outline/trace) are left to run normally
+    /// because compass does not replace them. The model can still force raw grep
+    /// by passing `allow_raw_fallback` (a documented agentgrep input field).
+    /// Default: on, matching the built-in preferred-tools guidance that tells
+    /// agents to try semantic search first and only fall back to grep when no
+    /// index covers the task.
     #[serde(default = "default_true")]
     pub prefer_compass_query: bool,
 }
