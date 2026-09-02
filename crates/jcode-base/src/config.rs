@@ -670,11 +670,12 @@ pub struct ToolConfig {
     /// Enforce the "use `compass_query` before `agentgrep`" guidance at the
     /// code level. When on, an `agentgrep` call is redirected to `compass_query`
     /// (instead of executing grep) as long as `compass_query` is actually
-    /// available and not disabled by the session tool policy. The model can
-    /// still force raw grep by passing `allow_raw_fallback` (a documented
-    /// agentgrep input field). Default: on, matching the built-in preferred-tools
-    /// guidance that tells agents to try semantic search first and only fall
-    /// back to grep when no index covers the task.
+    /// available: it is registered, not disabled by the session tool policy, and
+    /// the session has a working directory to search. The model can still force
+    /// raw grep by passing `allow_raw_fallback` (a documented agentgrep input
+    /// field). Default: on, matching the built-in preferred-tools guidance that
+    /// tells agents to try semantic search first and only fall back to grep when
+    /// no index covers the task.
     #[serde(default = "default_true")]
     pub prefer_compass_query: bool,
 }
