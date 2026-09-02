@@ -233,6 +233,7 @@ fn compass_redirect_output(input: &Value) -> ToolOutput {
         .filter(|s| !s.trim().is_empty());
     let glob = input
         .get("glob")
+        .or_else(|| input.get("include")) // legacy grep-alias calls pass `include`
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty());
     let path_text = path
@@ -804,6 +805,13 @@ impl Registry {
         // interrupted one and inject a duplicate synthetic result. See
         // `tool::inflight`.
         let _in_flight = inflight::mark_tool_in_flight(&ctx.tool_call_id);
+        // Snapshot the compass-first enforcement flag before taking the tools
+        // lock. `config()` can trigger a reload (disk read + listener dispatch)
+        // on a cold or stale cache, and doing that while holding the read lock
+        // would risk a deadlock if a reload listener ever re-entered the tool
+        // registry. Reading it once up front keeps the reload off the locked
+        // path and the guard free of that coupling.
+        let prefer_compass_query = crate::config::config().tools.prefer_compass_query;
         let tools = self.tools.read().await;
         let resolved_name = Self::resolve_tool_name(name);
         if let Some(policy) = session_tool_policy(&ctx.session_id) {
@@ -859,7 +867,7 @@ impl Registry {
         // is what the hook gates. If enforcement ever needs the pre_tool gate
         // to observe the original grep intent, move this block to after it.
         if resolved_name == "agentgrep"
-            && crate::config::config().tools.prefer_compass_query
+            && prefer_compass_query
             && !agentgrep_requests_raw_fallback(&input)
             // Only full-text grep searches are redirected; find/outline/trace
             // are distinct operations compass does not replace.
