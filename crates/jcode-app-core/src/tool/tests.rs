@@ -2148,3 +2148,64 @@ async fn agentgrep_runs_when_there_is_no_working_dir() {
     );
     clear_session_tool_policy("enforcement-no-cwd-test");
 }
+
+#[tokio::test]
+async fn batch_grep_alias_subcall_is_redirected_and_raw_fallback_runs() {
+    // batch subcalls re-enter Registry::execute and resolve aliases, so a
+    // nested `grep` must be redirected to compass_query just like agentgrep,
+    // and an `allow_raw_fallback` grep subcall must run raw grep.
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    std::fs::write(temp.path().join("sample.txt"), "zeta_uniquetoken eta\n").expect("write");
+
+    let ctx = ToolContext {
+        session_id: "enforcement-batch-alias-test".to_string(),
+        message_id: "test".to_string(),
+        tool_call_id: "test".to_string(),
+        working_dir: Some(temp.path().to_path_buf()),
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: ToolExecutionMode::Direct,
+    };
+
+    // Nested `grep` alias is intercepted.
+    let redirected = registry
+        .execute(
+            "batch",
+            serde_json::json!({
+                "tool_calls": [
+                    {"tool": "grep", "parameters": {"pattern": "fn main"}}
+                ]
+            }),
+            ctx.clone(),
+        )
+        .await
+        .expect("batch should succeed");
+    assert!(
+        redirected.output.to_string().contains("compass_query"),
+        "a batch grep-alias subcall should be redirected, got: {}",
+        redirected.output.to_string()
+    );
+
+    // Nested `grep` with allow_raw_fallback runs real grep.
+    let fallback = registry
+        .execute(
+            "batch",
+            serde_json::json!({
+                "tool_calls": [
+                    {"tool": "grep", "parameters": {"pattern": "uniquetoken", "allow_raw_fallback": true}}
+                ]
+            }),
+            ctx.clone(),
+        )
+        .await
+        .expect("batch should succeed");
+    let text = fallback.output.to_string();
+    assert!(
+        text.contains("uniquetoken"),
+        "batch grep-alias raw fallback should return real matches, got: {text}"
+    );
+    clear_session_tool_policy("enforcement-batch-alias-test");
+}
