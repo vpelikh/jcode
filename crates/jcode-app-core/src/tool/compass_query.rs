@@ -200,7 +200,7 @@ impl Tool for CompassQueryTool {
         // meant to remove. Instead, fail fast with a retryable message so the
         // agent can use `agentgrep` now and `compass_query` again once the
         // pre-warm has populated the index.
-        if prewarm_in_flight(&working_dir) {
+        if prewarm_in_flight(&cache.graph_path, &cache.output_dir) {
             return Ok(ToolOutput::new(
                 "A Compass index is being built for this workspace in the \
                  background and is not ready yet.\n\n\
@@ -969,19 +969,22 @@ fn build_compass_index(
 static PREWARM_IN_FLIGHT: OnceLock<Mutex<HashMap<PathBuf, ()>>> = OnceLock::new();
 
 /// True when a background pre-warm is currently building the Compass index for
-/// `working_dir`. Used by `CompassQueryTool::execute` to short-circuit a query
-/// that would otherwise race ahead of the pre-warm and, by holding the same
-/// per-project build lock, turn a normally-instant warm query into a minutes-
-/// long blocking build of its own.
-fn prewarm_in_flight(working_dir: &Path) -> bool {
-    let cache = resolve_compass_cache(working_dir);
+/// `graph_path`'s project. Used by `CompassQueryTool::execute` to short-circuit
+/// a query that would otherwise race ahead of the pre-warm and, by holding the
+/// same per-project build lock, turn a normally-instant warm query into a
+/// minutes-long blocking build of its own.
+///
+/// Takes the already-resolved `graph_path` (per-SHA) and `output_dir` so
+/// `execute` does not resolve the cache a second time; a finished pre-warm
+/// leaves a graph.json there and is served directly.
+fn prewarm_in_flight(graph_path: &Path, output_dir: &Path) -> bool {
     // Only meaningful when there is still nothing ready to serve; a finished
     // pre-warm leaves a graph.json and is served directly.
-    if cache.graph_path.is_file() {
+    if graph_path.is_file() {
         return false;
     }
     lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())))
-        .contains_key(&cache.output_dir)
+        .contains_key(output_dir)
 }
 
 /// Best-effort, off-the-query-path pre-warm of the Compass knowledge graph for
