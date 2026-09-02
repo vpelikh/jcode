@@ -1121,8 +1121,11 @@ impl App {
         }
 
         // Table-driven fallback: any registered command that declares subcommand
-        // completions surfaces them while typing, even when it has no hand-written
-        // branch above. This keeps suggestions connected to the registry: adding
+        // completions surfaces them back into the typed suggestions, even when it
+        // has no hand-written branch above. The bare command itself is included
+        // too so an actionable bare form (e.g. `/cache`, which toggles when run
+        // with no argument) remains selectable from the palette alongside its
+        // subcommands. This keeps suggestions connected to the registry: adding
         // `subcommands` to a command below makes them show up while typing with no
         // further wiring.
         let head = prefix_trimmed
@@ -1132,11 +1135,10 @@ impl App {
         if let Some(spec) = RegisteredCommand::spec_for(head)
             && !spec.subcommands.is_empty()
         {
-            let completions: Vec<(String, &'static str)> = spec
-                .subcommands
-                .iter()
-                .map(|(c, h)| ((*c).to_string(), *h))
-                .collect();
+            let mut completions: Vec<(String, &'static str)> =
+                Vec::with_capacity(spec.subcommands.len() + 1);
+            completions.push((head.to_string(), spec.help));
+            completions.extend(spec.subcommands.iter().map(|(c, h)| ((*c).to_string(), *h)));
             return self.rank_suggestions(input, completions);
         }
 

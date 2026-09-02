@@ -245,3 +245,22 @@ fn rendered_frame_shows_registry_subcommand_suggestion() {
         "rendered frame should show the /memory status completion, got:\n{snap}"
     );
 }
+
+/// A command with a bare (no-arg) actionable form must keep offering that bare
+/// form as a completion, not only its subcommands. E.g. typing day-toggling
+/// command like `/cache` (which toggles when run bare) should still surface
+/// `/cache` itself so a user can act on it from the palette.
+#[test]
+fn bare_command_with_subcommands_still_offers_itself() {
+    let mut app = create_test_app();
+
+    // /cache toggles when run bare; the completion set should let the user
+    // pick the bare command to toggle, alongside its subcommands.
+    app.input = "/cache".to_string();
+    app.cursor_pos = app.input.len();
+    let suggestions = app.command_suggestions();
+    assert!(
+        suggestions.iter().any(|(c, _)| c == "/cache"),
+        "bare /cache should offer /cache itself so it can be toggled, got {suggestions:?}"
+    );
+}
