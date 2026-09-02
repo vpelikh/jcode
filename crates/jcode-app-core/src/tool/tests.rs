@@ -2084,6 +2084,19 @@ fn truncate_middle_shortens_long_input_but_keeps_short_input_unchanged() {
     let unicode = format!("{}end", "✓".repeat(300));
     let u_trim = truncate_middle(&unicode, 100);
     assert!(u_trim.chars().count() <= 100, "unicode trimmed too long");
+
+    // The result must never exceed `max`, even for tiny caps where the
+    // `...` ellipsis cannot fit, so the function degrades to a plain prefix.
+    for max in 0..=3 {
+        let out = truncate_middle("abcdefghij", max);
+        assert!(
+            out.chars().count() <= max,
+            "truncate_middle(\"abcdefghij\", {max}) returned {} chars: \"{out}\"",
+            out.chars().count()
+        );
+    }
+    assert_eq!(truncate_middle("abcdefghij", 2), "ab");
+    assert_eq!(truncate_middle("abcdefghij", 0), "");
 }
 
 #[test]

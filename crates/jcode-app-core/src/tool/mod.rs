@@ -264,6 +264,11 @@ fn truncate_middle(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
+    // Below 3 chars the ellipsis itself cannot fit, so fall back to a plain
+    // prefix to preserve the invariant that the result is at most `max` chars.
+    if max < 3 {
+        return s.chars().take(max).collect();
+    }
     let half = (max.saturating_sub(3)) / 2;
     let mut prefix: Vec<char> = s.chars().take(half).collect();
     let mut suffix: Vec<char> = s.chars().rev().take(half).collect();
