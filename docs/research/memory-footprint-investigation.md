@@ -485,8 +485,13 @@ So making `jemalloc` part of `default = [...]` would regress the Linux release b
 opposite of the goal. Cargo `default` features cannot be target-gated, and the underlying
 problem here is a **macOS system-malloc retention** issue.
 
-**What landed (this change):** macOS memory **reporting** is now accurate
-(recommendation #2). A follow-up ships the allocator fix (#1) scoped to macOS only.
+**What landed (this change):** two things.
+1. macOS memory **reporting** is now accurate (recommendation #2).
+2. The allocator fix (#1) shipped as a **global default**: `jemalloc` is a member of the root
+   `default` features so it applies on every platform (see "Way forward" below). This is the
+   user's explicit decision to use a single page-returning allocator everywhere, accepting
+   the Linux glibc + `malloc_trim` trade recorded above rather than the earlier
+   macOS-only scoping.
 
 - `process_memory.rs` adds a macOS `snapshot_with_source` that fills, from
   `proc_pid_rusage(pid, RUSAGE_INFO_V4, …)`:
