@@ -72,12 +72,12 @@ pub struct OsProcessMemoryInfo {
     pub shared_clean_bytes: Option<u64>,
     pub shared_dirty_bytes: Option<u64>,
     pub swap_bytes: Option<u64>,
-    /// macOS physical footprint (`task_info` `phys_footprint`). This is the
-    /// real resident memory the process holds, which excludes reserved-but-
-    /// unwritten malloc arena VM that `ps` RSS counts on macOS. See the
-    /// memory-footprint investigation for why `ps` RSS over-accounts on
-    /// macOS system malloc (retained arenas show up as resident but are
-    /// mostly untouched pages).
+    /// macOS physical footprint (`proc_pid_rusage` `ri_phys_footprint`). This
+    /// is the real resident memory the process holds, which excludes reserved-
+    /// but-unwritten malloc arena VM that `ps` RSS counts on macOS (the same
+    /// number the `footprint` tool prints). See the memory-footprint
+    /// investigation for why `ps` RSS over-accounts on macOS system malloc
+    /// (retained arenas show up as resident but are mostly untouched pages).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phys_footprint_bytes: Option<u64>,
 }
