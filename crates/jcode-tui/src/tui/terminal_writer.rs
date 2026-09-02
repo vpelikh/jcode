@@ -37,7 +37,7 @@
 //! output on a wedged pty cannot be flushed anyway.
 
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -52,6 +52,24 @@ const QUEUE_CAPACITY_BYTES: usize = 256 * 1024;
 /// How long `drop` may wait for the writer thread to drain before abandoning it
 /// (the pty is wedged and would block forever).
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Set when a chunk is dropped because the pty is not draining, and cleared by
+/// [`take_resync_requested`] once the app has forced a full re-emit.
+///
+/// When the writer drops output, ratatui's internal previous buffer diverges
+/// from the real terminal: it still believes the dropped cells reached the
+/// screen, so the next differential frame will not re-emit them. After the pty
+/// drains, the app must force a soft full repaint so every cell is re-emitted
+/// and ratatui's model matches the screen again. There is only ever one live
+/// writer (the app terminal), so a crate-level flag is both safe and avoids
+/// exposing unstable backend writer access.
+static RESYNC_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the app should force a full re-emit because the writer dropped
+/// output while the pty was wedged. Clears the flag.
+pub fn take_resync_requested() -> bool {
+    RESYNC_REQUESTED.swap(false, Ordering::AcqRel)
+}
 
 enum Chunk {
     Data(Box<[u8]>),
@@ -146,6 +164,10 @@ impl Write for TerminalWriter {
         let prev = self.inner.buffered.fetch_add(len, Ordering::Relaxed);
         if prev + len > QUEUE_CAPACITY_BYTES {
             self.inner.buffered.fetch_sub(len, Ordering::Relaxed);
+            // The pty is wedged; remember that we dropped output so the app can
+            // force a full re-emit once the pty drains (ratatui's model no
+            // longer matches the real screen).
+            RESYNC_REQUESTED.store(true, Ordering::Release);
             return Ok(len); // accepted-with-drop so the render loop never blocks
         }
         let chunk: Box<[u8]> = buf.to_vec().into_boxed_slice();
@@ -245,6 +267,16 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(2),
             "render thread blocked on a wedged pty: {elapsed:?}"
+        );
+        // Dropped output must flag a resync so the app re-emits the screen once
+        // the pty drains, and reading it clears the flag for the next frame.
+        assert!(
+            take_resync_requested(),
+            "expected a resync request after output was dropped"
+        );
+        assert!(
+            !take_resync_requested(),
+            "resync request should be cleared after reading"
         );
         // Drop must return promptly too: the writer thread is wedged in `write`,
         // so the bounded shutdown drain abandons it rather than joining forever.

@@ -559,7 +559,15 @@ impl StatusSpinnerRenderer {
         // invalidation has already happened), so the error is deliberately ignored.
         let _ = terminal.backend_mut().hide_cursor();
 
-        let invalidation = full_frame_invalidation(app.force_full_redraw, app.force_full_repaint);
+        // If the writer dropped output while the pty was wedged, ratatui's
+        // internal previous buffer no longer matches the real terminal. Force a
+        // full re-emit (soft repaint) so the screen and ratatui's model are
+        // realigned once the pty can drain again.
+        let resync_requested = crate::tui::terminal_writer::take_resync_requested();
+        let invalidation = full_frame_invalidation(
+            app.force_full_redraw,
+            app.force_full_repaint || resync_requested,
+        );
         let force_full_redraw = invalidation != FullFrameInvalidation::None;
         match invalidation {
             FullFrameInvalidation::HardClear => {
