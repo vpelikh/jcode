@@ -2710,6 +2710,66 @@ mod tests {
         );
     }
 
+    // A query racing a concurrent pre-warm must never corrupt or error: it is
+    // served either the retryable "building in background" fail-fast or real
+    // results once the pre-warm finishes. This is the live embodiment of the
+    // concurrency-safe contract (fail-fast intercepts, and any query that does
+    // reach the build is serialized by the shared project flock). No timing
+    // assumption — we only assert the outcome is one of the two valid ones.
+    #[tokio::test]
+    async fn query_racing_prewarm_is_safe() {
+        let (_home, root) = HomeGuard::set();
+        let root = root.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init", "-q"]) {
+            return;
+        }
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        let mut f = std::fs::File::create(root.join("main.rs")).unwrap();
+        writeln!(f, "fn authenticate(user: &str) {{ let _ = user; }}").unwrap();
+        drop(f);
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+
+        let edge = resolve_compass_cache(&root);
+        assert!(!edge.graph_path.is_file(), "fixture should start cold");
+
+        // Fire a real background pre-warm, then immediately run a query while
+        // it may still be building.
+        assert!(prewarm_compass_index(&root), "pre-warm must schedule");
+        let ctx = ToolContext {
+            session_id: "s".into(),
+            message_id: "m".into(),
+            tool_call_id: "t".into(),
+            working_dir: Some(root),
+            stdin_request_tx: None,
+            graceful_shutdown_signal: None,
+            execution_mode: ToolExecutionMode::Direct,
+        };
+        let out = CompassQueryTool::new()
+            .execute(serde_json::json!({ "query": "authentication" }), ctx)
+            .await
+            .expect("execute");
+        // Either "still building" (pre-warm in flight) or a real report (pre-
+        // warm already finished) — never a corruption/crash.
+        let building = out.output.contains("being built for this workspace in the background");
+        let report = out.output.contains("Compass query");
+        assert!(
+            building || report,
+            "query racing pre-warm must fail-fast OR return a report, got: {}",
+            out.output
+        );
+    }
+
     // END-USER ACCEPTANCE PATH: exercise the real CompassQueryTool::execute
     // against actual linked git worktrees. Two worktrees of the same repo must
     // (a) resolve to the SAME per-SHA output dir and AST cache root (from the
