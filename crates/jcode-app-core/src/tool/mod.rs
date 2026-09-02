@@ -222,20 +222,31 @@ fn compass_redirect_output(input: &Value) -> ToolOutput {
     };
     // Preserve an explicit search scope so the follow-up compass_query stays
     // confined to the same subset the grep call was targeting.
-    let scope = input
+    //
+    // Only `path` maps cleanly onto `compass_query`'s `path` filter (a file or
+    // directory substring). `glob` is a filename pattern that has no direct
+    // compass_query equivalent, so it is surfaced separately as a narrowing
+    // hint rather than as a `path` value the model would blindly re-use.
+    let path = input
         .get("path")
-        .or_else(|| input.get("glob"))
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty());
-    let scope_text = scope
-        .map(|s| format!(", keeping the search scope `{}`", truncate_middle(s, 120)))
+    let glob = input
+        .get("glob")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+    let path_text = path
+        .map(|s| format!(", keeping the search path `{}`", truncate_middle(s, 120)))
+        .unwrap_or_default();
+    let glob_text = glob
+        .map(|s| format!(", and only files matching `{}`", truncate_middle(s, 120)))
         .unwrap_or_default();
     ToolOutput::new(format!(
         "⚠️ `agentgrep` was intercepted before running: `compass_query` is available \
          for this workspace and must be attempted before raw grep.\n\n\
          Do not repeat this `agentgrep` call unchanged. Instead call `compass_query` \
-         with the same intent (natural language query + optional `path`{scope_text}) to search the \
-         code graph first{query_text}. The first call may build the index for this \
+         with the same intent (natural language query + optional `path`{path_text}) to search the \
+         code graph first{glob_text}{query_text}. The first call may build the index for this \
          workspace; that is expected.\n\n\
          Only if `compass_query` genuinely cannot answer (for example you need to search \
          files outside the indexed tree, build outputs, or logs; or the index fails to \

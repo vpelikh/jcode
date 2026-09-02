@@ -1746,13 +1746,32 @@ fn compass_redirect_output_mentions_escape_hatch_and_query() {
     assert!(empty.output.contains("compass_query"));
     assert!(!empty.output.contains("(query:"));
 
-    // A path/glob scope is echoed so the follow-up compass_query stays confined.
+    // A path scope is echoed so the follow-up compass_query stays confined.
     let scoped = compass_redirect_output(&serde_json::json!({
         "query": "init", "path": "src/"
     }));
     assert!(
-        scoped.output.contains("keeping the search scope `src/`"),
+        scoped.output.contains("keeping the search path `src/`"),
         "redirect should echo the path scope"
+    );
+    assert!(
+        !scoped.output.contains("only files matching"),
+        "a path scope alone should not add a glob hint"
+    );
+
+    // A glob is a filename pattern with no compass_query `path` equivalent, so
+    // it must be surfaced as a separate narrowing hint, not re-used as a `path`
+    // value the model would blindly hand to compass_query.
+    let globbed = compass_redirect_output(&serde_json::json!({
+        "query": "init", "glob": "**/*.rs"
+    }));
+    assert!(
+        !globbed.output.contains("keeping the search path"),
+        "a glob must not be presented as a compass_query path scope"
+    );
+    assert!(
+        globbed.output.contains("only files matching `**/*.rs`"),
+        "a glob should be echoed as a narrowing hint"
     );
 }
 
