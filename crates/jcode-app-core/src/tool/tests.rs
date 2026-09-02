@@ -1793,6 +1793,32 @@ fn compass_redirect_output_mentions_escape_hatch_and_query() {
         "query echo should precede the glob hint: {}",
         globbed.output
     );
+
+    // Combined query + path + glob: everything is echoed, in a readable order
+    // (path inside the parenthetical, query then glob after "first"),
+    // and each hint is distinct.
+    let combined = compass_redirect_output(&serde_json::json!({
+        "query": "init", "path": "src/", "glob": "**/*.rs"
+    }));
+    assert!(
+        combined.output.contains("keeping the search path `src/`"),
+        "combined should echo the path: {}",
+        combined.output
+    );
+    assert!(
+        combined.output.contains("only files matching `**/*.rs`"),
+        "combined should echo the glob: {}",
+        combined.output
+    );
+    let first = combined.output.find("code graph first (query: init)");
+    let path_vs_glob = combined.output.find("keeping the search path")
+        .and_then(|i| combined.output.find("only files matching").map(|j| (i, j)))
+        .map(|(i, j)| i < j);
+    assert!(
+        first.is_some() && path_vs_glob == Some(true),
+        "combined message should read path then query then glob: {}",
+        combined.output
+    );
 }
 
 #[test]
