@@ -1030,6 +1030,20 @@ pub(crate) fn prewarm_compass_index(working_dir: &Path) -> bool {
         return false;
     }
 
+    // Back off after a recent failed build so an unindexable project does not
+    // trigger a full multi-minute build attempt on every subscribe. The query
+    // path's own build-on-demand still runs and surfaces the failure to the
+    // agent; pre-warm just stops amplifying it.
+    {
+        let failed_map =
+            lock_cached(PREWARM_LAST_FAILED.get_or_init(|| Mutex::new(HashMap::new())));
+        if let Some(&at) = failed_map.get(&cache.output_dir) {
+            if at.elapsed().map(|d| d < PREWARM_FAIL_COOLDOWN).unwrap_or(false) {
+                return false; // recent failure; don't re-spawn yet
+            }
+        }
+    }
+
     // Deduplicate concurrent pre-warm builds per project root.
     let mut map = lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())));
     if map.contains_key(&cache.output_dir) {
@@ -1057,7 +1071,21 @@ pub(crate) fn prewarm_compass_index(working_dir: &Path) -> bool {
             // output dir and shared AST cache — the exact corruption the lock
             // (commit 24ccf8e2c) exists to prevent.
             with_build_lock(&build_lock_dir, || {
-                let _ = build_compass_index(&root, &out_dir, &ast_cache);
+                let result = build_compass_index(&root, &out_dir, &ast_cache);
+                // Record a failed attempt so we don't hot-loop re-spawning a full
+                // cold build on every subscribe for a project Compass genuinely
+                // cannot index (e.g. unsupported dependency). A recent success
+                // clears the marker; a failure sets a cooldown.
+                let mut failed_map =
+                    lock_cached(PREWARM_LAST_FAILED.get_or_init(|| Mutex::new(HashMap::new())));
+                match result {
+                    Ok(()) => {
+                        failed_map.remove(&out_dir);
+                    }
+                    Err(_) => {
+                        failed_map.insert(out_dir.clone(), SystemTime::now());
+                    }
+                }
             });
         })
         .map_err(|e| {
@@ -1071,6 +1099,15 @@ pub(crate) fn prewarm_compass_index(working_dir: &Path) -> bool {
         })
         .is_ok()
 }
+
+/// Window within which a failed pre-warm build is not retried, so a project
+/// that Compass cannot index does not trigger a multi-minute full build attempt
+/// (and its repeated cost) on every session subscribe. Short enough that a
+/// transient hiccup resolves quickly; long enough to stop a tight retry loop.
+const PREWARM_FAIL_COOLDOWN: Duration = Duration::from_secs(300);
+
+/// When the last pre-warm build for an output dir failed, keyed for cooldown.
+static PREWARM_LAST_FAILED: OnceLock<Mutex<HashMap<PathBuf, SystemTime>>> = OnceLock::new();
 
 /// RAII guard that removes this project's pre-warm in-flight marker when it is
 /// dropped. Created at the top of the pre-warm thread so the marker is released
@@ -2479,6 +2516,67 @@ mod tests {
         drop(map);
         lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())))
             .remove(&edge.output_dir);
+    }
+
+    // After a failed pre-warm build, `prewarm_compass_index` must back off for
+    // `PREWARM_FAIL_COOLDOWN` instead of re-spawning a full multi-minute build
+    // on every subscribe for a project Compass cannot index. We seed
+    // `PREWARM_LAST_FAILED` with a just-now failure and assert the next call
+    // returns false (no new build). The query path's on-demand build still
+    // surfaces failures; pre-warm just stops amplifying them.
+    #[test]
+    fn prewarm_backs_off_after_recent_failure() {
+        let (_home, _home_path) = HomeGuard::set();
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let mut f = std::fs::File::create(main.join("main.rs")).unwrap();
+        writeln!(f, "fn authenticate(user: &str) {{ let _ = user; }}").unwrap();
+        drop(f);
+
+        let git = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&main)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init", "-q"]) {
+            return;
+        }
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+
+        let edge = resolve_compass_cache(&main);
+        assert!(!edge.graph_path.is_file(), "fixture should start cold");
+
+        // Seed a "just failed" marker. Clean it up afterwards so other tests
+        // are unaffected.
+        lock_cached(PREWARM_LAST_FAILED.get_or_init(|| Mutex::new(HashMap::new())))
+            .insert(edge.output_dir.clone(), SystemTime::now());
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                lock_cached(PREWARM_LAST_FAILED.get_or_init(|| Mutex::new(HashMap::new())))
+                    .remove(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(edge.output_dir.clone());
+
+        // Within the cooldown window, pre-warm must not re-spawn a build.
+        assert!(
+            !prewarm_compass_index(&main),
+            "pre-warm must back off within the failure cooldown"
+        );
+        // And it must not have inserted an in-flight marker (no build started).
+        let map = lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())));
+        assert!(
+            !map.contains_key(&edge.output_dir),
+            "no build may start while backing off after a recent failure"
+        );
     }
 
     // END-USER ACCEPTANCE PATH: exercise the real CompassQueryTool::execute
