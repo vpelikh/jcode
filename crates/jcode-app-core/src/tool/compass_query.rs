@@ -140,10 +140,13 @@ impl Tool for CompassQueryTool {
         // Read-only inspection tool for the common path (warm cache): pure
         // function of its input plus the index files, mutates no shared
         // agent/session state, spawns no subprocesses, and does not depend on
-        // sibling tool results. A cold cache triggers an in-process index build
-        // that writes files, but that build is serialized via an exclusive
-        // `flock` (see `with_build_lock`), so concurrent calls cannot clobber
-        // each other's `graph.json`. Safe to run in parallel with siblings.
+        // sibling tool results. A cold cache may (a) fail fast with a "still
+        // building" message when a session-subscribe pre-warm is already
+        // building this project on a background thread, or (b) trigger an
+        // in-process index build that writes files, serialized via an exclusive
+        // `flock` (see `with_build_lock`) so concurrent calls cannot clobber
+        // each other's `graph.json`. Either way it is safe to run in parallel
+        // with siblings.
         true
     }
 
