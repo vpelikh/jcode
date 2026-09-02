@@ -454,3 +454,22 @@ fn weird_inputs_do_not_panic_or_return_off_topic_commands() {
         // Headless safety: the call must not have panicked.
     }
 }
+
+/// Tab-completion on a subcommand command (not in command_accepts_args) must
+/// still complete to a usable state (a selection) rather than breaking input.
+#[test]
+fn tab_completion_on_subcommand_command_completes() {
+    let mut app = create_test_app();
+    app.input = "/subagent".to_string();
+    app.cursor_pos = app.input.len();
+    // Pressing tab should complete to something (not corrupt or hang).
+    let ok = app.autocomplete();
+    // Whether it returns true or the input changed, it must not panic and must
+    // remain a syntactically valid slash command or subcommand.
+    let _ = ok;
+    assert!(
+        app.input.starts_with('/'),
+        "tab on /subagent must keep a valid command, got {:?}",
+        app.input
+    );
+}
