@@ -121,6 +121,34 @@ impl TerminalWriter {
         Self { tx: Some(tx), inner }
     }
 
+    /// Create a writer thread over a `dup` of fd 1 (stdout) that does not
+    /// participate in the process-wide [`Stdout`] lock.
+    ///
+    /// Why this matters: a `Stdout` handle acquires the global stdout reentrant
+    /// mutex for the duration of each `write`. If the pty is wedged, the writer
+    /// thread blocks inside `write(2)` while *holding that lock*, so any other
+    /// `io::stdout()` caller on the render loop (mode re-application on
+    /// `FocusGained`, OSC‑52 clipboard, window title) would block waiting for the
+    /// lock — reintroducing the exact render-loop freeze the shim removes. Using a
+    /// raw duplicated fd means the wedged `write(2)` holds no user-space lock, so
+    /// concurrent `io::stdout()` calls proceed independently.
+    ///
+    /// [`Stdout`]: std::io::Stdout
+    #[cfg(unix)]
+    pub fn stdout() -> io::Result<Self> {
+        use std::os::fd::FromRawFd;
+        // Use `dup` so we own a private descriptor to the terminal; closing it on
+        // teardown never affects the real fd 1.
+        let dup = unsafe { libc::dup(libc::STDOUT_FILENO) };
+        if dup < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // `File` has no user-space locking, so the writer thread's blocking
+        // `write(2)` holds no process-wide lock.
+        let file = unsafe { std::fs::File::from_raw_fd(dup) };
+        Ok(Self::new(file))
+    }
+
     fn shutdown(&mut self) {
         let tx = self.tx.take();
         if let Some(tx) = tx {
@@ -508,5 +536,45 @@ mod tests {
         drop(shim);
         let delivered: usize = wrx.try_iter().map(|c| c.len()).sum();
         assert_eq!(delivered, QUEUE_CAPACITY_BYTES + 1, "large frame was dropped");
+    }
+
+    /// Regression guard for the round-D fix: a writer over a raw `File` (e.g. the
+    /// `dup` of fd 1 used by [`TerminalWriter::stdout`]) must not hold the global
+    /// `Stdout` lock while blocked in `write(2)`. If it did, a wedged pty would
+    /// block *every other* `io::stdout()` caller on the render loop — reintroducing
+    /// the freeze we removed.
+    ///
+    /// We model the wedge with a pipe whose reader is never read: the raw `File`
+    /// writer blocks in `write(2)`, but a concurrent `io::stdout()` call must still
+    /// complete (they do not share a lock).
+    #[cfg(unix)]
+    #[test]
+    fn raw_file_writer_does_not_block_io_stdout_when_wedged() {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe() failed");
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        // Wrap the blocking pipe write end in a raw File (no user-space lock).
+        let file = unsafe { std::fs::File::from_raw_fd(write_fd) };
+        let mut shim = TerminalWriter::new(file);
+
+        // Saturate the pipe so further write(2) on the writer thread blocks.
+        let big = vec![b'x'; 1024 * 1024];
+        for _ in 0..4 {
+            assert!(shim.write_all(&big).is_ok());
+        }
+        // The writer thread is now blocked in write(2) on the raw File.
+        // A concurrent io::stdout() write must still succeed (proving it does not
+        // contend on the same lock).
+        let mut out = std::io::stdout();
+        let start = std::time::Instant::now();
+        assert!(out.write_all(b"\x1b]0;\x07").is_ok()); // harmless OSC0 (clear title)
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "io::stdout() blocked on a wedged raw-file writer"
+        );
+
+        drop(shim);
+        unsafe { libc::close(read_fd) };
     }
 }

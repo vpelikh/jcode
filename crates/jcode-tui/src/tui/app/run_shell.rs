@@ -343,6 +343,15 @@ impl StatusSpinnerRenderer {
     }
 
     pub(super) fn idle_animation_only_available(&self, app: &App) -> bool {
+        // If the terminal writer dropped output (wedged pty), ratatui's model no
+        // longer matches the screen. The cheap animation-only path clones
+        // `last_frame` and would paint a stale screen, so it must stand down and
+        // let the full frame heal the divergence. This also lets `draw_full_core`
+        // consume the resync flag.
+        if crate::tui::terminal_writer::take_resync_requested() {
+            crate::tui::ui::note_idle_animation_fast_path_blocked("resync_pending");
+            return false;
+        }
         let blocked = idle_animation_fast_path_blocked_reason(&IdleAnimationFastPathInputs {
             has_previous_frame: self.last_frame.is_some(),
             animation_active: crate::tui::idle_donut_active(app),
