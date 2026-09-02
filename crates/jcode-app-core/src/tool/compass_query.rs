@@ -943,11 +943,12 @@ fn build_compass_index(
     // (the 300MB+ case that makes a cold build stall a query for minutes).
     options.no_cluster = true;
     options.no_viz = true;
-    // A bounded worker pool so a build never oversubscribes the host with the
-    // default `num_cpus` threads on a many-core machine. Compass caps at 12;
-    // we pin to a sane ceiling so a background pre-warm co-exists with other
-    // work without exhausting the process's threads.
-    options.max_workers = Some(MAX_BUILD_WORKERS);
+    // Worker sizing is left to Compass's own bounded default (it self-limits
+    // to at most PIPELINE_RAYON_WORKER_CAP = 12 and only spins up the full pool
+    // once enough files are missing to amortize it). We deliberately do NOT
+    // pin a stricter ceiling here: this function serves both the background
+    // pre-warm AND the on-query cold build, and capping the latter below the
+    // machine default would make the blocking fallback slower, not faster.
 
     build_graph_with_layers(&options, None, &[])
         .map_err(|e| anyhow!("compass_core build_graph failed: {}", e))?;
@@ -960,13 +961,6 @@ fn build_compass_index(
     }
     Ok(())
 }
-
-/// Bounded ceiling for the Compass build worker pool. Compass itself
-/// self-bounds to at most `PIPELINE_RAYON_WORKER_CAP` (12), so this just pins
-/// that ceiling explicitly rather than depending on the transitive library
-/// default. Kept small so a background pre-warm shard does not starve jcode's
-/// own rayon/tokio parallelism on big projects.
-const MAX_BUILD_WORKERS: usize = 4;
 
 /// Process-global set of project roots currently being pre-warmed, so a swarm
 /// of sessions that all subscribe to the same repo don't each spawn a duplicate
@@ -1040,15 +1034,25 @@ pub(crate) fn prewarm_compass_index(working_dir: &Path) -> bool {
     let out_dir = cache.output_dir.clone();
     let error_out_dir = out_dir.clone(); // for cleanup if spawn fails
     let ast_cache = cache.ast_cache_root.clone();
+    let build_lock_dir = cache.build_lock_dir.clone();
     let root = working_dir.to_path_buf();
     std::thread::Builder::new()
         .name("compass-prewarm".to_string())
         .spawn(move || {
-            // The build lock serializes against any on-query build already
-            // running, and against other worktrees sharing the AST cache.
-            let _ = build_compass_index(&root, &out_dir, &ast_cache);
-            lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())))
-                .remove(&out_dir);
+            // Remove the in-flight marker on BOTH normal completion and panic
+            // unwind. A leaked marker would make every subsequent query for this
+            // project fail-fast with "still building" until process restart.
+            let _guard = PrewarmMarkerGuard(out_dir.clone());
+            // Serialize against any on-query build AND other pre-warm threads
+            // sharing this project's `.ast-cache` via the same per-project flock
+            // that `ensure_fresh_engine` uses. A bare `build_compass_index`
+            // here (without the lock) could otherwise run `build_graph_with_layers`
+            // concurrently with a query-triggered rebuild against the same
+            // output dir and shared AST cache — the exact corruption the lock
+            // (commit 24ccf8e2c) exists to prevent.
+            with_build_lock(&build_lock_dir, || {
+                let _ = build_compass_index(&root, &out_dir, &ast_cache);
+            });
         })
         .map_err(|e| {
             crate::logging::event_warn(
@@ -1060,6 +1064,20 @@ pub(crate) fn prewarm_compass_index(working_dir: &Path) -> bool {
                 .remove(&error_out_dir);
         })
         .is_ok()
+}
+
+/// RAII guard that removes this project's pre-warm in-flight marker when it is
+/// dropped. Created at the top of the pre-warm thread so the marker is released
+/// on normal completion AND on panic unwind (a panic anywhere in
+/// `build_compass_index` / `build_graph_with_layers` must not permanently wedge
+/// every later query for the project with a stale "building" marker).
+struct PrewarmMarkerGuard(PathBuf);
+
+impl Drop for PrewarmMarkerGuard {
+    fn drop(&mut self) {
+        lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())))
+            .remove(&self.0);
+    }
 }
 
 /// Run a search through the Compass `CodeQueryEngine`. Returns a model-ready
