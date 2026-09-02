@@ -301,4 +301,44 @@ mod tests {
         }
         assert_eq!(got, "hello world");
     }
+
+    /// End-to-end: a real `Terminal<CrosstermBackend<TerminalWriter>>` — the exact
+    /// `AppTerminal` shape the app runs on — must complete `draw`+`flush` without
+    /// blocking even when the underlying pty is wedged and never drains.
+    #[test]
+    fn app_terminal_draw_never_blocks_on_a_wedged_pty() {
+        let mut writer = TerminalWriter::new(WedgedWriter);
+        let backend = ratatui::backend::CrosstermBackend::new(writer);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        let start = std::time::Instant::now();
+        for _ in 0..50 {
+            terminal
+                // Draw a non-trivial frame (a full-width paragraph) so the backend
+                // actually emits a meaningful diff, not a no-op.
+                .draw(|frame| {
+                    let p = ratatui::widgets::Paragraph::new(
+                        ratatui::text::Text::from("the quick brown fox jumps over the lazy dog"),
+                    );
+                    frame.render_widget(p, frame.area());
+                })
+                .expect("draw");
+            terminal.flush().expect("flush");
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "draw pipeline blocked on a wedged pty: {elapsed:?}"
+        );
+        // Drop drains with a bounded timeout and abandons a wedged pty; it must
+        // not hang the caller.
+        let drop_start = std::time::Instant::now();
+        drop(terminal);
+        assert!(
+            drop_start.elapsed() < std::time::Duration::from_secs(1),
+            "drop hung on a wedged pty"
+        );
+        // (The resync-after-drop behavior is covered by the dedicated
+        // `render_thread_never_blocks_when_the_pty_is_wedged` test, which
+        // forces the byte cap.)
+    }
 }
