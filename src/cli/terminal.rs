@@ -29,6 +29,13 @@ fn tui_is_active() -> bool {
     TUI_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Serializes the tests that read or write the process-global panic-hook / TUI
+/// state (`DEFAULT_HOOK`, `TUI_ACTIVE`, the current session). Those globals are
+/// shared across the test binaries, so without this lock sibling tests running
+/// on parallel threads race each other and flake.
+#[cfg(test)]
+static GLOBAL_HOOK_TEST_LOCK: RwLock<()> = RwLock::new(());
+
 pub struct TuiRuntimeState {
     mouse_capture: bool,
     keyboard_enhanced: bool,
@@ -871,6 +878,54 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_clears_tui_active_after_full_restore() {
+        let _lock = GLOBAL_HOOK_TEST_LOCK.write().unwrap();
+        // The panic-hook restore only runs while `TUI_ACTIVE` is set, so a full
+        // teardown must clear it; otherwise a later panic in CLI code would try
+        // to restore a no-longer-live terminal and emit escape sequences.
+        let saved = TUI_ACTIVE.load(std::sync::atomic::Ordering::SeqCst);
+        TUI_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+        let state = TuiRuntimeState {
+            mouse_capture: false,
+            keyboard_enhanced: false,
+            focus_change: false,
+        };
+        cleanup_tui_runtime(&state, true);
+        assert!(
+            !tui_is_active(),
+            "a full terminal restore must clear TUI_ACTIVE"
+        );
+        TUI_ACTIVE.store(saved, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    fn cleanup_keeps_tui_active_on_exec_handoff() {
+        let _lock = GLOBAL_HOOK_TEST_LOCK.write().unwrap();
+        // When the terminal is handed off across exec (reload/rebuild/update),
+        // the restore does not run and `TUI_ACTIVE` must stay set so the next
+        // process's early panics still attempt a safe restore.
+        TUI_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+        let state = TuiRuntimeState {
+            mouse_capture: false,
+            keyboard_enhanced: false,
+            focus_change: false,
+        };
+        cleanup_tui_runtime_for_run_result(
+            &state,
+            &crate::tui::RunResult {
+                reload_session: Some("session_test".into()),
+                ..Default::default()
+            },
+            false,
+        );
+        assert!(
+            tui_is_active(),
+            "an exec handoff must keep TUI_ACTIVE set for the next process"
+        );
+        TUI_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
     fn test_session_recovery_tracking() {
         let _guard = TEST_SESSION_LOCK.lock().unwrap();
         set_current_session("test_session_123");
@@ -966,6 +1021,9 @@ mod panic_crash_labeling_tests {
 
     #[test]
     fn reinstall_panic_hook_outermost_keeps_default_backtrace_chain() {
+        // Serialize against sibling tests that touch the shared DEFAULT_HOOK /
+        // TUI_ACTIVE globals.
+        let _lock = GLOBAL_HOOK_TEST_LOCK.write().unwrap();
         // Simulate ratatui::init() wrapping our hook: install our hook first,
         // then call reinstall_panic_hook_outermost() the way init_tui_runtime
         // does after ratatui::init(). A panicking closure must unwind normally
@@ -1004,6 +1062,9 @@ mod panic_crash_labeling_tests {
 
     #[test]
     fn tui_active_flag_toggles_with_restore() {
+        // The flag should not be toggled concurrently by sibling tests, which
+        // would race on this shared global.
+        let _lock = GLOBAL_HOOK_TEST_LOCK.write().unwrap();
         // The flag starts false, is set true on TUI init, and is cleared when
         // the terminal is restored. On restore it ends false again.
         let save = TUI_ACTIVE.load(std::sync::atomic::Ordering::SeqCst);
