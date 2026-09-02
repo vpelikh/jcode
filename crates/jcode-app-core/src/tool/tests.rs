@@ -2209,3 +2209,63 @@ async fn batch_grep_alias_subcall_is_redirected_and_raw_fallback_runs() {
     );
     clear_session_tool_policy("enforcement-batch-alias-test");
 }
+
+#[test]
+fn agentgrep_grep_mode_detection_targets_only_full_text_searches() {
+    use super::agentgrep_call_is_grep_mode;
+
+    // Omitted mode defaults to grep.
+    assert!(agentgrep_call_is_grep_mode(&serde_json::json!({})));
+    assert!(agentgrep_call_is_grep_mode(&serde_json::json!({ "query": "x" })));
+    // Explicit grep (case-insensitive) is targeted.
+    assert!(agentgrep_call_is_grep_mode(&serde_json::json!({ "mode": "grep", "query": "x" })));
+    assert!(agentgrep_call_is_grep_mode(&serde_json::json!({ "mode": "GREP" })));
+    // Other modes are not full-text grep and must not be redirected.
+    for mode in ["find", "outline", "trace"] {
+        assert!(
+            !agentgrep_call_is_grep_mode(&serde_json::json!({ "mode": mode })),
+            "mode {mode} must not be treated as grep"
+        );
+    }
+}
+
+#[tokio::test]
+async fn agentgrep_find_mode_runs_normally_and_is_not_redirected() {
+    // filename/file lookups (find) are not semantic-search replacements, so the
+    // enforcement must let them through.
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    std::fs::write(temp.path().join("find_me.rs"), "fn zeta() {}\n").expect("write");
+
+    let ctx = ToolContext {
+        session_id: "enforcement-find-mode-test".to_string(),
+        message_id: "test".to_string(),
+        tool_call_id: "test".to_string(),
+        working_dir: Some(temp.path().to_path_buf()),
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: ToolExecutionMode::Direct,
+    };
+
+    let out = registry
+        .execute(
+            "agentgrep",
+            serde_json::json!({ "mode": "find", "query": "find_me", "allow_raw_fallback": false }),
+            ctx.clone(),
+        )
+        .await
+        .expect("find mode agentgrep should run, not redirect");
+    assert!(
+        out.output.contains("find_me.rs"),
+        "find mode should return the file path, got: {}",
+        out.output
+    );
+    assert!(
+        !out.output.contains("compass_query"),
+        "find mode must not be redirected, got: {}",
+        out.output
+    );
+    clear_session_tool_policy("enforcement-find-mode-test");
+}
