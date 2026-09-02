@@ -855,7 +855,7 @@ impl Registry {
             // than treating it as a silent short-circuit.
             crate::telemetry::record_tool_execution(resolved_name, &input, true, 0);
             Self::fire_post_tool_hook(resolved_name, &ctx, &Ok(redirect.clone()), 0);
-            crate::logging::event_warn(
+            crate::logging::event_info(
                 "TOOL_LIFECYCLE",
                 Self::tool_lifecycle_fields(
                     "redirected_to_compass",
