@@ -75,6 +75,13 @@ pub fn take_resync_requested() -> bool {
     RESYNC_REQUESTED.swap(false, Ordering::AcqRel)
 }
 
+/// Non-consuming peek at whether a resync is pending. Used by the idle-animation
+/// fast path to decide whether to stand down, *without* clearing the flag so the
+/// following full frame can still consume it and actually perform the heal.
+pub fn resync_pending() -> bool {
+    RESYNC_REQUESTED.load(Ordering::Acquire)
+}
+
 enum Chunk {
     Data(Box<[u8]>),
     Shutdown,
@@ -346,9 +353,15 @@ mod tests {
         );
         // Dropped output must flag a resync so the app re-emits the screen once
         // the pty drains, and reading it clears the flag for the next frame.
+        // A peek (used by the idle-animation gate) must not consume it, so the
+        // full frame's take still sees it and performs the heal.
+        assert!(
+            resync_pending(),
+            "expected a resync request after output was dropped"
+        );
         assert!(
             take_resync_requested(),
-            "expected a resync request after output was dropped"
+            "peek must not consume the resync request"
         );
         assert!(
             !take_resync_requested(),
@@ -576,5 +589,43 @@ mod tests {
 
         drop(shim);
         unsafe { libc::close(read_fd) };
+    }
+
+    /// Concurrent stress: many threads write through the shim simultaneously and
+    /// the writer is dropped mid-flight. The shim must never hang, crash, or lose
+    /// the ordering guarantee on a healthy consumer.
+    #[test]
+    fn concurrent_writers_and_shutdown_do_not_deadlock() {
+        let (t, wrx) = mpsc::channel::<Vec<u8>>();
+        let shim = Arc::new(Mutex::new(TerminalWriter::new(ChannelWriter { tx: t })));
+
+        let mut handles = Vec::new();
+        for tid in 0..8 {
+            let shim = Arc::clone(&shim);
+            handles.push(thread::spawn(move || {
+                for i in 0..200 {
+                    let msg = format!("t{tid}-{i};");
+                    let mut g = shim.lock().unwrap();
+                    assert!(g.write_all(msg.as_bytes()).is_ok());
+                }
+            }));
+        }
+
+        let start = std::time::Instant::now();
+        for h in handles {
+            h.join().unwrap();
+        }
+        // All writers finished quickly (no deadlock between writers).
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        drop(shim); // shutdown drains + joins
+
+        // The consumer received every message. Each message ends in ';', so counting
+        // ';' tells us exactly how many chunks arrived. 8 threads * 200 writes.
+        let semicolons: usize = wrx
+            .try_iter()
+            .flat_map(|c| c)
+            .filter(|&b| b == b';')
+            .count();
+        assert_eq!(semicolons, 8 * 200, "healthy-path concurrent delivery lost data");
     }
 }
