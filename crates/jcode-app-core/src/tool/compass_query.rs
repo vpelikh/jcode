@@ -2350,6 +2350,64 @@ mod tests {
             .remove(&edge.output_dir);
     }
 
+    // A second pre-warm call while a build is already in flight for the same
+    // project must NOT spawn a duplicate build. It returns `true` (a build is,
+    // or will be, happening) without inserting a second marker. This guards
+    // against multiple sessions / reconnect storming a cold project. Needs a
+    // real git dir (like prewarm_schedules) so the function passes its git
+    // gate before reaching the dedup branch.
+    #[test]
+    fn prewarm_dedups_concurrent_in_flight_builds() {
+        let (_home, _home_path) = HomeGuard::set();
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let mut f = std::fs::File::create(main.join("main.rs")).unwrap();
+        writeln!(f, "fn authenticate(user: &str) {{ let _ = user; }}").unwrap();
+        drop(f);
+
+        let git = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&main)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init", "-q"]) {
+            return;
+        }
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+
+        let edge = resolve_compass_cache(&main);
+        assert!(!edge.graph_path.is_file(), "fixture should start cold");
+
+        // Simulate a build already in flight for this project.
+        lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())))
+            .insert(edge.output_dir.clone(), ());
+        // Cleanup guard to avoid leaking the marker for the rest of the suite.
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())))
+                    .remove(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(edge.output_dir.clone());
+
+        // The caller must see "already building" (true) and NOT schedule a second.
+        assert!(
+            prewarm_compass_index(&main),
+            "pre-warm must report in-flight (true) without spawning a duplicate"
+        );
+        // Still exactly one marker present (no duplicate insert).
+        let map = lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())));
+        assert_eq!(map.get(&edge.output_dir), Some(&()), "one in-flight marker");
+    }
+
     // END-USER ACCEPTANCE PATH: exercise the real CompassQueryTool::execute
     // against actual linked git worktrees. Two worktrees of the same repo must
     // (a) resolve to the SAME per-SHA output dir and AST cache root (from the
