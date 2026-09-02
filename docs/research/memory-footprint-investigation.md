@@ -465,6 +465,59 @@ machine's memory budget. (Note: the raw "~500 MB vs ~41 MB" idle numbers are not
 apples-to-apples — the baseline hosted 15 sessions + days of churn while the jemalloc test
 server was fresh — but the controlled same-process reclamation A/B is the rigorous evidence.)
 
+## Implementation (2026-09-02): macOS physical-footprint reporting
+
+Implementing the recommendations surfaced a conflict with prior maintainer intent that
+shapes how "enable jemalloc in default builds" should ship.
+
+**Prior art:** a global `jemalloc` default was enabled once, then **reverted** because
+A/B testing on **Linux** showed the glibc + `malloc_trim` path (already wired in
+`configure_system_allocator`) outperforms tuned jemalloc on every metric:
+
+| Phase | glibc + `malloc_trim` | tuned jemalloc |
+|---|---|---|
+| Fresh | 41 MB | 52 MB |
+| Model loaded | 192 MB | 192 MB |
+| Model unloaded | 60 MB | **115 MB** |
+| Recovered | **132 MB** | 77 MB |
+
+So making `jemalloc` part of `default = [...]` would regress the Linux release build — the
+opposite of the goal. Cargo `default` features cannot be target-gated, and the underlying
+problem here is a **macOS system-malloc retention** issue.
+
+**What landed (this change):** macOS memory **reporting** is now accurate
+(recommendation #2). A follow-up ships the allocator fix (#1) scoped to macOS only.
+
+- `process_memory.rs` adds a macOS `snapshot_with_source` that fills, from
+  `proc_pid_rusage(pid, RUSAGE_INFO_V4, …)`:
+  - `rss_bytes` ← `ri_resident_size`
+  - `peak_rss_bytes` ← `ri_lifetime_max_phys_footprint`
+  - `os.phys_footprint_bytes` ← `ri_phys_footprint` (new `OsProcessMemoryInfo` field) — the
+    real resident number (the same value the `footprint` tool prints), which excludes
+    reserved-but-unwritten malloc arena VM that macOS `ps` RSS counts.
+  - Previously macOS reported **no process memory data at all** (all `None`).
+  - The call uses a self-declared `extern "C"` `proc_pid_rusage` because `libc` declares
+    `buffer: *mut rusage_info_t` (= `*mut *mut c_void`), which does not match how XNU
+    dereferences the caller's buffer and returns all-zeros; the real signature is
+    `buffer: *mut c_void`.
+- `tui/debug_cmds.rs` `allocator:purge` adds `resident_recovered_bytes`, preferring
+  `os.phys_footprint_bytes` when the OS reports it (so reclaimed memory is visible on
+  macOS) and falling back to `rss_bytes` elsewhere.
+- `server:memory` / `server:memory-incident` / `memory` / `memory-history` serialize the
+  snapshot, so they inherit `phys_footprint_bytes` automatically.
+
+**Verified:** a new macOS unit test (`macos_snapshot_populates_physical_footprint`) plus the
+full `process_memory::tests` suite pass; `jcode-base` and `jcode-tui` compile cleanly (Linux
+literal updated to use `..Default::default()` so the new field doesn't break cross-compile).
+
+**Way forward for #1 (enable jemalloc on macOS only):** keep the `jemalloc` feature additive
+globally (honoring the Linux revert) and enable it for the **macOS** daemon build paths only
+(macOS release matrix, `install_release.sh` on Darwin) rather than the global default. That
+bounds macOS RSS to real use (~40-74 MB idle vs the system allocator's GB of retained
+arenas) without regressing the glibc + `malloc_trim` path that wins on Linux. This is a
+build-pipeline / packaging decision, so it is recorded here for a follow-up rather than
+changed speculatively.
+
 ## Evidence references
 - `vmmap -summary 97630`: physical footprint 402.8 MB; MALLOC_SMALL(empty) 2.5 GB.
 - `ps -o rss`: daemon 4189 MB; clients 100-420 MB.
