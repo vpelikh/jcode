@@ -2579,6 +2579,137 @@ mod tests {
         );
     }
 
+    // The cooldown must EXPIRE: after `PREWARM_FAIL_COOLDOWN` elapses since the
+    // last failure, `prewarm_compass_index` must be willing to retry (a new
+    // build starts) instead of backing off forever. Seeds a failure older than
+    // the cooldown and asserts a build begins (an in-flight marker appears).
+    #[test]
+    fn prewarm_retries_after_cooldown_expiry() {
+        let (_home, _home_path) = HomeGuard::set();
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let mut f = std::fs::File::create(main.join("main.rs")).unwrap();
+        writeln!(f, "fn authenticate(user: &str) {{ let _ = user; }}").unwrap();
+        drop(f);
+
+        let git = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&main)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init", "-q"]) {
+            return;
+        }
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+
+        let edge = resolve_compass_cache(&main);
+        assert!(!edge.graph_path.is_file(), "fixture should start cold");
+
+        // Seed a failure from just before the cooldown window (older than
+        // PREWARM_FAIL_COOLDOWN), so expiry must have already happened.
+        let expired = SystemTime::now()
+            .checked_sub(PREWARM_FAIL_COOLDOWN + Duration::from_secs(1))
+            .expect("cooldown overflow");
+        lock_cached(PREWARM_LAST_FAILED.get_or_init(|| Mutex::new(HashMap::new())))
+            .insert(edge.output_dir.clone(), expired);
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                lock_cached(PREWARM_LAST_FAILED.get_or_init(|| Mutex::new(HashMap::new())))
+                    .remove(&self.0);
+                lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())))
+                    .remove(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(edge.output_dir.clone());
+
+        // After expiry, pre-warm must proceed and start a build.
+        assert!(
+            prewarm_compass_index(&main),
+            "pre-warm must retry once the failure cooldown has expired"
+        );
+        let map = lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())));
+        assert!(
+            map.contains_key(&edge.output_dir),
+            "a build must start after the cooldown expires"
+        );
+    }
+
+    // END-TO-END: a real background pre-warm must produce an index that a
+    // subsequent `execute` query can actually serve (real results, not a stuck
+    // "building" fail-fast). This is the composition the feature promises: pre-
+    // warm off the query path, then the query hits a warm index for real.
+    #[tokio::test]
+    async fn prewarm_then_query_succeeds() {
+        let (_home, root) = HomeGuard::set();
+        let root = root.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init", "-q"]) {
+            return;
+        }
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        let mut f = std::fs::File::create(root.join("main.rs")).unwrap();
+        writeln!(f, "fn authenticate(user: &str) {{ let _ = user; }}").unwrap();
+        drop(f);
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+
+        let edge = resolve_compass_cache(&root);
+        assert!(!edge.graph_path.is_file(), "fixture should start cold");
+
+        // Trigger a real background pre-warm.
+        assert!(prewarm_compass_index(&root), "pre-warm must schedule");
+
+        // Wait (bounded) for the pre-warm build to produce graph.json.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !edge.graph_path.is_file() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(edge.graph_path.is_file(), "pre-warm must finish the index");
+
+        // A subsequent query must be served from the warm index and not be the
+        // fail-fast "still building" message.
+        let ctx = ToolContext {
+            session_id: "s".into(),
+            message_id: "m".into(),
+            tool_call_id: "t".into(),
+            working_dir: Some(root),
+            stdin_request_tx: None,
+            graceful_shutdown_signal: None,
+            execution_mode: ToolExecutionMode::Direct,
+        };
+        let out = CompassQueryTool::new()
+            .execute(serde_json::json!({ "query": "authentication" }), ctx)
+            .await
+            .expect("execute");
+        assert!(
+            !out.output.contains("being built for this workspace in the background"),
+            "query after completed pre-warm must not fail fast, got: {}",
+            out.output
+        );
+        assert!(
+            out.output.contains("Compass query"),
+            "query after completed pre-warm must return a real report, got: {}",
+            out.output
+        );
+    }
+
     // END-USER ACCEPTANCE PATH: exercise the real CompassQueryTool::execute
     // against actual linked git worktrees. Two worktrees of the same repo must
     // (a) resolve to the SAME per-SHA output dir and AST cache root (from the
