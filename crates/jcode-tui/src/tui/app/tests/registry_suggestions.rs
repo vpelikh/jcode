@@ -370,3 +370,16 @@ fn accepting_bare_or_subcommand_completion_sets_input_exactly() {
     assert!(app.accept_selected_command_suggestion());
     assert_eq!(app.input, "/memory on");
 }
+
+/// Partial prefix /mod reaches /model (correct discoverability for a partial).
+#[test]
+fn partial_mod_reaches_model() {
+    let mut app = create_test_app();
+    app.input = "/mod".to_string();
+    app.cursor_pos = app.input.len();
+    let s = app.command_suggestions();
+    assert!(
+        s.iter().any(|(c, _)| c == "/model"),
+        "/mod should reach /model, got {s:?}"
+    );
+}
