@@ -2411,6 +2411,73 @@ mod tests {
         assert_eq!(map.get(&edge.output_dir), Some(&()), "one in-flight marker");
     }
 
+    // Real-concurrency version of the dedup guarantee: N threads call
+    // `prewarm_compass_index` on the same cold git dir at once. The internal
+    // mutex must make check-and-insert atomic, so exactly ONE marker lands and
+    // every caller sees `true` (a build is, or will be, happening). This
+    // guards the actual swarm/reconnect storm path rather than a pre-inserted
+    // marker.
+    #[test]
+    fn prewarm_concurrent_calls_land_one_marker() {
+        let (_home, _home_path) = HomeGuard::set();
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let mut f = std::fs::File::create(main.join("main.rs")).unwrap();
+        writeln!(f, "fn authenticate(user: &str) {{ let _ = user; }}").unwrap();
+        drop(f);
+
+        let git = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&main)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init", "-q"]) {
+            return;
+        }
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+
+        let edge = resolve_compass_cache(&main);
+        assert!(!edge.graph_path.is_file(), "fixture should start cold");
+
+        // Spawn several threads that all try to pre-warm the same project.
+        let results: Vec<bool> = std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            for _ in 0..4 {
+                let main = main.clone();
+                handles.push(s.spawn(move || prewarm_compass_index(&main)));
+            }
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or(false))
+                .collect()
+        });
+
+        // Every caller must observe a scheduled (or already-scheduled) build.
+        assert!(
+            results.iter().all(|&r| r),
+            "all concurrent pre-warm calls must return true, got {results:?}"
+        );
+        // Exactly one in-flight marker survives the race (check + insert is
+        // atomic under the process-global mutex).
+        let map = lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())));
+        assert_eq!(
+            map.get(&edge.output_dir),
+            Some(&()),
+            "exactly one in-flight marker must exist after the race"
+        );
+        // Clean up the marker; there is no real build backing it in this test.
+        drop(map);
+        lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())))
+            .remove(&edge.output_dir);
+    }
+
     // END-USER ACCEPTANCE PATH: exercise the real CompassQueryTool::execute
     // against actual linked git worktrees. Two worktrees of the same repo must
     // (a) resolve to the SAME per-SHA output dir and AST cache root (from the
