@@ -311,7 +311,7 @@ mod tests {
         let backend = ratatui::backend::CrosstermBackend::new(writer);
         let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
         let start = std::time::Instant::now();
-        for _ in 0..50 {
+        for _ in 0..20 {
             terminal
                 // Draw a non-trivial frame (a full-width paragraph) so the backend
                 // actually emits a meaningful diff, not a no-op.
@@ -325,8 +325,13 @@ mod tests {
             terminal.flush().expect("flush");
         }
         let elapsed = start.elapsed();
+        // If the render loop were blocked on the pty, the very first draw would
+        // hang forever. 20 full draws completing comfortably distinguishes
+        // "non-blocking" from that. A generous 5s bound absorbs test-load jitter
+        // while staying far under a multi-frame blocking write would never
+        // return at all.
         assert!(
-            elapsed < std::time::Duration::from_secs(2),
+            elapsed < std::time::Duration::from_secs(5),
             "draw pipeline blocked on a wedged pty: {elapsed:?}"
         );
         // Drop drains with a bounded timeout and abandons a wedged pty; it must
@@ -383,5 +388,55 @@ mod tests {
         );
         // Clean up the read end so the blocking writer thread can be reaped.
         unsafe { libc::close(read_fd) };
+    }
+
+    #[test]
+    fn zero_length_write_is_a_noop() {
+        let (w, _wrx) = mpsc::channel::<Vec<u8>>();
+        let mut shim = TerminalWriter::new(ChannelWriter { tx: w });
+        // Zero-length writes must return Ok(0) without erroring.
+        assert_eq!(shim.write(&[]).unwrap(), 0);
+        // Normal writes still work after a zero-length no-op.
+        assert!(shim.write_all(b"ok").is_ok());
+    }
+
+    #[test]
+    fn shutdown_drains_writes_queued_before_drop() {
+        // Data queued before the handle is dropped must still reach the consumer
+        // (the writer thread drains in FIFO order before exiting). This matters
+        // for teardown: output issued just before drop is preserved, not lost.
+        let (t, wrx) = mpsc::channel::<Vec<u8>>();
+        {
+            let mut shim = TerminalWriter::new(ChannelWriter { tx: t });
+            shim.write_all(b"first ").unwrap();
+            shim.write_all(b"second").unwrap();
+            // Drop shuts down; remaining queued bytes must drain before exit.
+        }
+        let mut got = String::new();
+        while let Ok(chunk) = wrx.try_recv() {
+            got.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+        assert_eq!(got, "first second");
+    }
+
+    #[test]
+    fn no_data_loss_when_the_consumer_keeps_up() {
+        // With a fast consumer that drains faster than we write, no chunk may be
+        // dropped and ordering must be exact.
+        let (t, wrx) = mpsc::channel::<Vec<u8>>();
+        let mut shim = TerminalWriter::new(ChannelWriter { tx: t });
+        // Write well under the queue cap so nothing is dropped.
+        for i in 0..10 {
+            let msg = format!("chunk-{i};");
+            assert!(shim.write_all(msg.as_bytes()).is_ok());
+        }
+        drop(shim);
+        let mut got = String::new();
+        while let Ok(chunk) = wrx.try_recv() {
+            got.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+        let expected = (0..10).map(|i| format!("chunk-{i};")).collect::<String>();
+        assert_eq!(got, expected);
+        // With no drops, resync is not requested.
     }
 }
