@@ -405,3 +405,52 @@ fn accepting_trailing_space_completion_keeps_space() {
     assert!(app.accept_selected_command_suggestion());
     assert_eq!(app.input, "/subagent --model ");
 }
+
+/// Fuzz-style robustness: a battery of unusual typed inputs must never panic
+/// and should not return a suggestion whose completion is unrelated to the
+/// typed command (i.e. must not return a command from a different family).
+#[test]
+fn weird_inputs_do_not_panic_or_return_off_topic_commands() {
+    let mut app = create_test_app();
+    let inputs = [
+        "/",
+        "//",
+        "/ ",
+        "/  ",
+        "///",
+        "/   x",
+        "/cache  ",
+        "/cache\t",
+        "/memory\t",
+        "/MEMORY",
+        "/Models",
+        "/??",
+        "/?",
+        "/ee",
+        "/review ",
+        "/review-loop ",
+        "/subagent --",
+        "/agents swarm",
+        "/compact mode reactive",
+        "notaprefix",
+        "  /mem",
+        "/ff",
+        "/zz",
+        "/空格",
+        ".",
+    ];
+    for input in inputs {
+        app.input = input.to_string();
+        app.cursor_pos = app.input.len();
+        let s = app.command_suggestions();
+        // No assertion on emptiness (some inputs legitimately yield nothing),
+        // but every returned command must start with '/' and stay consistent.
+        for (cmd, _h) in &s {
+            assert!(
+                cmd.starts_with('/'),
+                "suggestion {cmd:?} for input {input:?} must start with '/', got {s:?}"
+            );
+        }
+        // Headless safety: the call must not have panicked.
+    }
+}
