@@ -510,13 +510,21 @@ problem here is a **macOS system-malloc retention** issue.
 full `process_memory::tests` suite pass; `jcode-base` and `jcode-tui` compile cleanly (Linux
 literal updated to use `..Default::default()` so the new field doesn't break cross-compile).
 
-**Way forward for #1 (enable jemalloc on macOS only):** keep the `jemalloc` feature additive
-globally (honoring the Linux revert) and enable it for the **macOS** daemon build paths only
-(macOS release matrix, `install_release.sh` on Darwin) rather than the global default. That
-bounds macOS RSS to real use (~40-74 MB idle vs the system allocator's GB of retained
-arenas) without regressing the glibc + `malloc_trim` path that wins on Linux. This is a
-build-pipeline / packaging decision, so it is recorded here for a follow-up rather than
-changed speculatively.
+**Way forward for #1 (enable jemalloc in default builds):** shipped. `jemalloc` is now a
+member of the root `default` features (`default = ["pdf","embeddings","bedrock","jemalloc"]`),
+so **every** build — `cargo run`/`build`, CI, release, and the `selfdev`/dev daemon (which
+builds default features via `scripts/dev_cargo.sh … --profile selfdev`) — is jemalloc-backed
+on every platform. This is a deliberate product decision to trade Linux's marginally-lower
+fresh/unloaded footprint (glibc + `malloc_trim`: 41→60 MB vs jemalloc's 52→115 MB) for a
+single, predictable, page-returning allocator everywhere. It directly bounds the long-running
+daemon's RSS to real use (~40-74 MB idle) and applies uniformly, so the macOS system-malloc
+retention problem and analogous glibc arena retention are both handled the same way.
+
+Because jemalloc is now the default on all platforms, no per-platform `--features jemalloc`
+gating is needed in CI or build scripts; the allocator is chosen by the Cargo default alone.
+The allocator can still be opted out on a platform that proves it wins with system malloc
+(e.g. via `--no-default-features` or a future target-tuned profile), but that's a follow-up
+measured trade, not the shipped default.
 
 ## Evidence references
 - `vmmap -summary 97630`: physical footprint 402.8 MB; MALLOC_SMALL(empty) 2.5 GB.

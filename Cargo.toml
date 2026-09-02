@@ -214,7 +214,14 @@ tempfile = "3"
 # semantic retrieval, and embedding-backed features work out of the box.
 # Use `JCODE_DEV_FEATURE_PROFILE=minimal` for compile-speed probes that need
 # to skip optional default feature stacks.
-default = ["pdf", "embeddings", "bedrock"]
+#
+# jemalloc is a default feature: it gives a page-returning allocator whose
+# decay tuning (in src/main.rs) releases freed heap back to the OS, so a
+# long-running daemon's RSS is bounded to real use instead of growing into
+# retained arenas. This applies on every platform (macOS system malloc
+# retains forever; glibc's arena retention is also released by jemalloc's
+# decay). See docs/research/memory-footprint-investigation.md.
+default = ["pdf", "embeddings", "bedrock", "jemalloc"]
 dev-bins = ["jcode-tui/dev-bins"]
 jemalloc = [
     "dep:tikv-jemallocator",
