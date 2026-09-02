@@ -606,6 +606,7 @@ async fn build_server_memory_incident_payload(
             "pss_bytes": current_pss_bytes,
             "pss_anon_bytes": process.os.as_ref().and_then(|os| os.pss_anon_bytes),
             "pss_file_bytes": process.os.as_ref().and_then(|os| os.pss_file_bytes),
+            "phys_footprint_bytes": process.os.as_ref().and_then(|os| os.phys_footprint_bytes),
             "allocator_live_bytes": allocator_live_bytes,
             "allocator_retained_bytes": process.allocator.stats.as_ref().and_then(|stats| stats.retained_bytes),
             "allocator_retained_resident_bytes": allocator_retained_resident_bytes,
