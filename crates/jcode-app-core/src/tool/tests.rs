@@ -1773,6 +1773,17 @@ fn compass_redirect_output_mentions_escape_hatch_and_query() {
         globbed.output.contains("only files matching `**/*.rs`"),
         "a glob should be echoed as a narrowing hint"
     );
+
+    // agentgrep accepts `include` as an alias for `glob`; the redirect must
+    // honor it so legacy grep-alias calls carry their file filter forward.
+    let inc = compass_redirect_output(&serde_json::json!({
+        "query": "init", "include": "**/*.rs"
+    }));
+    assert!(
+        inc.output.contains("only files matching `**/*.rs`"),
+        "the `include` alias should be echoed as the glob narrowing hint, got: {}",
+        inc.output
+    );
     // Ordering matters for readability: the echoed query must precede the glob
     // hint so it reads "...graph first (query: init), and only files matching...".
     let q_idx = globbed.output.find("first (query: init)");
@@ -2012,6 +2023,24 @@ async fn grep_alias_is_also_redirected_to_compass() {
         out.output.contains("compass_query"),
         "grep alias should be redirected to compass_query, got: {}",
         out.output
+    );
+
+    // The `grep` alias with a non-grep mode (e.g. find) is not a full-text
+    // search, so it must run normally rather than redirect.
+    std::fs::write(temp.path().join("find_me.rs"), "fn eta() {}\n").expect("write file");
+    let find = registry
+        .execute("grep", serde_json::json!({ "mode": "find", "query": "find_me" }), ctx.clone())
+        .await
+        .expect("grep alias find mode should run, not redirect");
+    assert!(
+        find.output.contains("find_me.rs"),
+        "grep alias find mode should return the file, got: {}",
+        find.output
+    );
+    assert!(
+        !find.output.contains("compass_query"),
+        "grep alias find mode must not redirect, got: {}",
+        find.output
     );
     clear_session_tool_policy("enforcement-grep-alias-test");
 }
