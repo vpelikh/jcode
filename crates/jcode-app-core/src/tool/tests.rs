@@ -1773,6 +1773,15 @@ fn compass_redirect_output_mentions_escape_hatch_and_query() {
         globbed.output.contains("only files matching `**/*.rs`"),
         "a glob should be echoed as a narrowing hint"
     );
+    // Ordering matters for readability: the echoed query must precede the glob
+    // hint so it reads "...graph first (query: init), and only files matching...".
+    let q_idx = globbed.output.find("first (query: init)");
+    let g_idx = globbed.output.find("only files matching");
+    assert!(
+        q_idx.is_some() && g_idx.is_some() && q_idx.unwrap() < g_idx.unwrap(),
+        "query echo should precede the glob hint: {}",
+        globbed.output
+    );
 }
 
 #[test]
