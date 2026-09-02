@@ -17,9 +17,10 @@ Phases 1–6 are implemented and unit-tested on branch `jc/review-rounds`.
   hook, `input.rs` turn-end followup arm, `/review-loop` command, double-review
   guard, mutual exclusion) is in `crates/jcode-tui/src/tui/app/commands_review.rs`.
 
-The loop entry is gated behind `loop_mode` and local-session scope, matching the
-proposal. The final confirmation pass re-runs all six lenses against the final code
-state; only an all-CLEAN final pass converges.
+The loop entry is gated behind `loop_mode` and the normal-TUI scope (the manual
+`/review-loop` also runs in remote server-clients); only replay is excluded. The
+final confirmation pass re-runs all six lenses against the final code state;
+only an all-CLEAN final pass converges.
 
 As of the default-on change (`jc/review-flow`), `AutoReviewConfig.enabled` and
 `loop_mode` both default to `true`, so the review loop runs as part of the normal

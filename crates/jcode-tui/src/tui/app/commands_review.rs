@@ -1207,7 +1207,9 @@ pub(super) enum RefactorCommand {
 // The actual state machine lives in `review_loop.rs` (pure, unit-tested). This
 // section only translates between that state machine and the App/TUI: spawning
 // the per-lens reviewer child sessions, polling them for a `VERDICT`, and
-// feeding the result back. The auto loop runs for local sessions only.
+// feeding the result back. The auto loop runs for the normal TUI (including
+// remote server-clients, matching the manual `/review-loop`); replay sessions
+// are excluded.
 // ============================================================================
 
 /// Per-lens reviewer startup message. Independent per-lens reviewers each get a
