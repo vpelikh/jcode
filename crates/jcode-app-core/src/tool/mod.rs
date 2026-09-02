@@ -220,7 +220,7 @@ fn compass_redirect_output(input: &Value) -> ToolOutput {
     } else {
         format!(" (query: {})", truncate_middle(query, 200))
     };
-    // Preserve an explicit search scope so the follow-up compass_query stays
+    // Preserve explicit search filters so the follow-up compass_query stays
     // confined to the same subset the grep call was targeting.
     //
     // Only `path` maps cleanly onto `compass_query`'s `path` filter (a file or
@@ -246,7 +246,7 @@ fn compass_redirect_output(input: &Value) -> ToolOutput {
          for this workspace and must be attempted before raw grep.\n\n\
          Do not repeat this `agentgrep` call unchanged. Instead call `compass_query` \
          with the same intent (natural language query + optional `path`{path_text}) to search the \
-         code graph first{glob_text}{query_text}. The first call may build the index for this \
+         code graph first{query_text}{glob_text}. The first call may build the index for this \
          workspace; that is expected.\n\n\
          Only if `compass_query` genuinely cannot answer (for example you need to search \
          files outside the indexed tree, build outputs, or logs; or the index fails to \
