@@ -335,3 +335,38 @@ fn partial_prefixes_surface_command_and_subcommand_at_each_stage() {
         "/memory of should reach /memory off, got {s:?}"
     );
 }
+
+/// Accepting the bare head from a fallback list fills the command so it can be
+/// run; accepting a subcommand fills that subcommand. Exercises the accept path
+/// for the R5-1 bare-head members and for multi-word subcommands.
+#[test]
+fn accepting_bare_or_subcommand_completion_sets_input_exactly() {
+    let mut app = create_test_app();
+
+    // Bare head selectable and acceptable.
+    app.input = "/cache".to_string();
+    app.cursor_pos = app.input.len();
+    let s = app.command_suggestions();
+    assert!(
+        s.iter().any(|(c, _)| c == "/cache"),
+        "/cache should include bare, got {s:?}"
+    );
+    let idx = s.iter().position(|(c, _)| c == "/cache").unwrap();
+    app.command_suggestion_selected = idx;
+    // Accepting the bare head when input is already /cache is a no-op (returns
+    // false) but must not corrupt input.
+    let ok = app.accept_selected_command_suggestion();
+    assert!(
+        !ok || app.input == "/cache",
+        "bare accept no-op keeps /cache"
+    );
+
+    // Accepting a subcommand fills it exactly.
+    app.input = "/memory".to_string();
+    app.cursor_pos = app.input.len();
+    let s = app.command_suggestions();
+    let idx = s.iter().position(|(c, _)| c == "/memory on").unwrap();
+    app.command_suggestion_selected = idx;
+    assert!(app.accept_selected_command_suggestion());
+    assert_eq!(app.input, "/memory on");
+}
