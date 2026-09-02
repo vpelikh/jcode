@@ -348,7 +348,7 @@ impl StatusSpinnerRenderer {
         // `last_frame` and would paint a stale screen, so it must stand down and
         // let the full frame heal the divergence. This also lets `draw_full_core`
         // consume the resync flag.
-        if crate::tui::terminal_writer::take_resync_requested() {
+        if crate::tui::terminal_writer::resync_pending() {
             crate::tui::ui::note_idle_animation_fast_path_blocked("resync_pending");
             return false;
         }
