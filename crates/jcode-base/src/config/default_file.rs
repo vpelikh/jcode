@@ -346,13 +346,14 @@ mcp_tools_token_threshold = 8000
 # unchanged re-reads (the file mtime must predate the prior read), so fresh
 # content is always returned when the file changed. Set to false to disable.
 read_dedup = true
-# When on (default), an `agentgrep` call is redirected to `compass_query` at
-# the tool level instead of running grep, as long as `compass_query` is
-# available (registered, not disabled by the session tool policy) and the
-# session has a working directory to search. This makes the "try semantic
-# search first" guidance enforceable rather than advisory. The model can still
-# force raw grep for a single call by passing allow_raw_fallback:true to
-# agentgrep.
+# When on (default), a full-text `agentgrep` grep search is redirected to
+# `compass_query` at the tool level instead of running grep, as long as
+# `compass_query` is available (registered, not disabled by the session tool
+# policy) and the session has a working directory to search. Filename and
+# file-inspection modes (find/outline/trace) are left to run normally because
+# compass does not replace them. This makes the "try semantic search first"
+# guidance enforceable rather than advisory. The model can still force raw grep
+# for a single call by passing allow_raw_fallback:true to agentgrep.
 # prefer_compass_query = true
 
 [acp]
