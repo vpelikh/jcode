@@ -805,15 +805,18 @@ impl Registry {
         // interrupted one and inject a duplicate synthetic result. See
         // `tool::inflight`.
         let _in_flight = inflight::mark_tool_in_flight(&ctx.tool_call_id);
-        // Snapshot the compass-first enforcement flag before taking the tools
-        // lock. `config()` can trigger a reload (disk read + listener dispatch)
-        // on a cold or stale cache, and doing that while holding the read lock
-        // would risk a deadlock if a reload listener ever re-entered the tool
-        // registry. Reading it once up front keeps the reload off the locked
-        // path and the guard free of that coupling.
-        let prefer_compass_query = crate::config::config().tools.prefer_compass_query;
-        let tools = self.tools.read().await;
+        // Resolve the canonical tool name up front (pure, no lock needed) so we
+        // can snapshot the compass-first enforcement flag for agentgrep calls
+        // before taking the tools lock. `config()` can trigger a reload (disk
+        // read + listener dispatch) on a cold or stale cache, and doing that
+        // while holding the read lock would risk a deadlock if a reload listener
+        // ever re-entered the tool registry. Keeping this snapshot to the
+        // agentgrep path also avoids paying a config read on every unrelated
+        // tool call.
         let resolved_name = Self::resolve_tool_name(name);
+        let prefer_compass_query = resolved_name == "agentgrep"
+            && crate::config::config().tools.prefer_compass_query;
+        let tools = self.tools.read().await;
         if let Some(policy) = session_tool_policy(&ctx.session_id) {
             if let Some(allowed) = policy.allowed_tools.as_ref()
                 && !tool_name_is_allowed(allowed, resolved_name)
