@@ -1476,6 +1476,29 @@ fn test_autoreview_loop_mode_and_stall_defaults() {
 }
 
 #[test]
+fn test_autoreview_enabled_and_loop_default_on_for_empty_config() {
+    // A brand-new user with no [autoreview] section (or an empty config) must
+    // get the default-on behavior: review runs as part of the flow. This is the
+    // public Config parse boundary for new installs.
+    let cfg: Config = toml::from_str("")
+        .expect("empty config must deserialize");
+    assert!(
+        cfg.autoreview.enabled,
+        "empty config: autoreview must default to enabled"
+    );
+    assert!(
+        cfg.autoreview.loop_mode,
+        "empty config: review loop must default on"
+    );
+
+    // An other-sections-only config (no [autoreview] table) behaves the same.
+    let cfg2: Config = toml::from_str("[features]\nmermaid = false\n")
+        .expect("config without autoreview section must deserialize");
+    assert!(cfg2.autoreview.enabled);
+    assert!(cfg2.autoreview.loop_mode);
+}
+
+#[test]
 fn test_autoreview_loop_mode_and_stall_deserialize() {
     let cfg: Config = toml::from_str(
         r#"
