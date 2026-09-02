@@ -1868,7 +1868,7 @@ fn scroll_repaint_hides_cursor_before_cell_moves_via_draw_core() {
     //   - `hard_clear`: the full-redraw path (`force_full_redraw`, e.g. native
     //     terminal scroll or external commands); clears (ED2) then re-emits.
     //   - `none`: a normal typing/streaming frame; no invalidation flag, yet it
-    //     still MoveTo s the cells that shift as content grows.
+    //     still `MoveTo`s the cells that shift as content grows.
     for arm in ["soft_repaint", "hard_clear", "none"] {
         let mut app = create_test_app();
         match arm {
