@@ -72,6 +72,14 @@ pub struct OsProcessMemoryInfo {
     pub shared_clean_bytes: Option<u64>,
     pub shared_dirty_bytes: Option<u64>,
     pub swap_bytes: Option<u64>,
+    /// macOS physical footprint (`task_info` `phys_footprint`). This is the
+    /// real resident memory the process holds, which excludes reserved-but-
+    /// unwritten malloc arena VM that `ps` RSS counts on macOS. See the
+    /// memory-footprint investigation for why `ps` RSS over-accounts on
+    /// macOS system malloc (retained arenas show up as resident but are
+    /// mostly untouched pages).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phys_footprint_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -177,7 +185,75 @@ pub fn snapshot_with_source(source: impl Into<String>) -> ProcessMemorySnapshot 
     snapshot
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+pub fn snapshot_with_source(source: impl Into<String>) -> ProcessMemorySnapshot {
+    let source = source.into();
+    let rusage = macos_rusage_v4();
+    let snapshot = ProcessMemorySnapshot {
+        rss_bytes: rusage.map(|r| r.ri_resident_size),
+        peak_rss_bytes: rusage.map(|r| r.ri_lifetime_max_phys_footprint),
+        virtual_bytes: None,
+        thread_count: None,
+        main_stack_bytes: None,
+        os: rusage.map(|r| OsProcessMemoryInfo {
+            phys_footprint_bytes: Some(r.ri_phys_footprint),
+            ..Default::default()
+        }),
+        allocator: allocator_info(),
+    };
+    logging::debug(&format!(
+        "process memory snapshot source={source} rss={:?} footprint={:?} allocator={}",
+        snapshot.rss_bytes,
+        snapshot.os.as_ref().and_then(|os| os.phys_footprint_bytes),
+        snapshot.allocator.name
+    ));
+    record_snapshot(source, snapshot.clone());
+    snapshot
+}
+
+/// macOS resident and physical-footprint numbers from the per-process rusage
+/// info (v4).
+///
+/// Fields relevant to memory reporting:
+/// - `ri_resident_size`: resident set size.
+/// - `ri_phys_footprint`: the *physical footprint* — bytes the process
+///   actually holds resident (the same number the `footprint` tool prints).
+///   On macOS `ps` RSS counts reserved-but-unwritten malloc arena VM, so a
+///   long-running daemon that ever touched GB of heap shows GBs of RSS even
+///   though only a few hundred MB are real. `phys_footprint` excludes that
+///   reserved-but-untouched arena VM and is the honest number for memory
+///   pressure (see the memory-footprint investigation).
+/// - `ri_lifetime_max_phys_footprint`: peak physical footprint (surrogate for
+///   peak RSS).
+///
+/// Uses `proc_pid_rusage(pid, RUSAGE_INFO_V4, ...)`.
+/// `rusage_info_v4` adds `ri_phys_footprint`; earlier versions only have
+/// `ri_resident_size`.
+#[cfg(target_os = "macos")]
+fn macos_rusage_v4() -> Option<libc::rusage_info_v4> {
+    // Declare `proc_pid_rusage` ourselves with the real XNU signature
+    // (`void *buffer`) instead of libc's `rusage_info_t`-indirected binding
+    // (`*mut *mut c_void`), which does not match how the syscall dereferences
+    // the caller's buffer and returns all-zeros.
+    unsafe extern "C" {
+        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut libc::c_void) -> i32;
+    }
+    unsafe {
+        let pid = std::process::id() as i32;
+        let mut info: libc::rusage_info_v4 = std::mem::zeroed();
+        let ret = proc_pid_rusage(
+            pid,
+            libc::RUSAGE_INFO_V4,
+            &mut info as *mut libc::rusage_info_v4 as *mut libc::c_void,
+        );
+        if ret != 0 {
+            return None;
+        }
+        Some(info)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn snapshot_with_source(source: impl Into<String>) -> ProcessMemorySnapshot {
     let source = source.into();
     logging::debug(&format!(
@@ -728,6 +804,8 @@ fn read_linux_memory_info(status: &str) -> Option<OsProcessMemoryInfo> {
                 .as_deref()
                 .and_then(|text| parse_proc_value_bytes(text, "Swap:"))
         }),
+        // The rest (e.g. the macOS-only `phys_footprint_bytes`) default empty.
+        ..Default::default()
     };
 
     if info.pss_bytes.is_none()
@@ -1113,6 +1191,33 @@ mod tests {
             assert_eq!(info.stats_available, info.stats.is_some());
             assert!(info.profiling.is_none());
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_snapshot_populates_physical_footprint() {
+        // The whole point of the macOS snapshot is to report `phys_footprint`
+        // (real resident bytes) rather than leave all memory fields empty or
+        // rely on `ps`-style RSS that over-accounts reserved malloc arenas.
+        let snapshot = snapshot();
+        let os = snapshot
+            .os
+            .as_ref()
+            .expect("macOS snapshot should populate os info");
+        let footprint = os
+            .phys_footprint_bytes
+            .expect("macOS snapshot should report phys_footprint");
+        // A small test process still holds at least a handful of MB resident.
+        assert!(
+            footprint > 1 * 1024 * 1024,
+            "physical footprint should be a plausible resident size, got {footprint} bytes"
+        );
+        assert!(
+            footprint < 8 * 1024 * 1024 * 1024,
+            "physical footprint should not exceed a plausible ceiling, got {footprint} bytes"
+        );
+        // rss_bytes is a surrogate convenience; ensure it is at least present.
+        assert!(snapshot.rss_bytes.is_some());
     }
 
     #[cfg(all(target_os = "linux", target_env = "gnu", not(feature = "jemalloc")))]
