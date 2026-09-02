@@ -117,7 +117,9 @@ tempfile = "3"
 agentgrep = { git = "https://github.com/1jehuang/agentgrep.git", tag = "v0.1.6" }
 
 [features]
-default = ["pdf", "embeddings", "bedrock"]
+# jemalloc is a default allocator feature (matches the root crate): it forwards
+# down to jcode-base, giving a page-returning allocator that bounds RSS.
+default = ["pdf", "embeddings", "bedrock", "jemalloc"]
 # jemalloc allocator stats live in jcode-base (process_memory); forward there.
 jemalloc = ["jcode-base/jemalloc"]
 jemalloc-prof = ["jcode-base/jemalloc-prof"]
