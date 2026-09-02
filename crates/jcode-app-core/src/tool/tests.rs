@@ -1727,6 +1727,11 @@ fn compass_redirect_output_mentions_escape_hatch_and_query() {
         "must document the escape hatch"
     );
     assert!(out.output.contains("find init"), "should echo the query");
+    assert_eq!(
+        out.metadata.as_ref().and_then(|m| m.get("redirected_to")).and_then(|v| v.as_str()),
+        Some("compass_query"),
+        "redirect should attach machine-readable redirect metadata"
+    );
 
     // A legacy grep-alias call passes `pattern`, not `query`; the redirect must
     // still echo the intended search so the model can carry it into compass_query.

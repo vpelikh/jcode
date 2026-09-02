@@ -233,6 +233,10 @@ fn compass_redirect_output(input: &Value) -> ToolOutput {
          for this one call."
     ))
     .with_title("agentgrep redirected to compass_query")
+    .with_metadata(serde_json::json!({
+        "redirected_to": "compass_query",
+        "reason": "compass-first enforcement",
+    }))
 }
 
 fn truncate_middle(s: &str, max: usize) -> String {
