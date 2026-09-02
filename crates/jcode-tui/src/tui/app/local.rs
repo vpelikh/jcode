@@ -10,7 +10,7 @@ use crate::message::{
 use crate::session::StoredDisplayRole;
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyEventKind};
-use ratatui::DefaultTerminal;
+use crate::tui::terminal_writer::AppTerminal;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::RecvError;
@@ -20,7 +20,7 @@ const BACKGROUND_PROGRESS_IDENTICAL_NOTICE_TTL: Duration = Duration::from_secs(2
 
 pub(super) async fn process_turn_with_input(
     app: &mut App,
-    terminal: &mut DefaultTerminal,
+    terminal: &mut AppTerminal,
     event_stream: &mut EventStream,
     bus_receiver: &mut Receiver<BusEvent>,
 ) {
@@ -137,7 +137,7 @@ pub(super) fn handle_tick(app: &mut App) -> bool {
 
 pub(super) fn handle_terminal_event(
     app: &mut App,
-    terminal: &mut DefaultTerminal,
+    terminal: &mut AppTerminal,
     event: Option<std::result::Result<Event, std::io::Error>>,
 ) -> Result<bool> {
     crate::logging::watchdog::beat("tui.terminal_event");
@@ -390,7 +390,7 @@ fn handle_manual_tool_completed(app: &mut App, result: ManualToolCompleted) {
 
 fn apply_terminal_event(
     app: &mut App,
-    _terminal: &mut DefaultTerminal,
+    _terminal: &mut AppTerminal,
     event: Option<std::result::Result<Event, std::io::Error>>,
 ) -> Result<bool> {
     match event {

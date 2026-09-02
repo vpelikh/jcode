@@ -28,7 +28,7 @@ use debug::DebugTrace;
 use futures::StreamExt;
 use helpers::*;
 use jcode_tui_messages::DisplayMessage;
-use ratatui::DefaultTerminal;
+pub(crate) use crate::tui::terminal_writer::AppTerminal;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};

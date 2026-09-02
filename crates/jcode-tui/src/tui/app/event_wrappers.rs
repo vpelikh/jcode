@@ -29,7 +29,7 @@ impl App {
     /// Process turn while still accepting input for queueing
     pub(super) async fn process_turn_with_input(
         &mut self,
-        terminal: &mut DefaultTerminal,
+        terminal: &mut AppTerminal,
         event_stream: &mut EventStream,
         bus_receiver: &mut tokio::sync::broadcast::Receiver<crate::bus::BusEvent>,
     ) {

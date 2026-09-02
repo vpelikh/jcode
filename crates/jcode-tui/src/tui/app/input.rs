@@ -13,7 +13,7 @@ use crate::util::truncate_str;
 use anyhow::Result;
 use base64::Engine;
 use crossterm::event::{EventStream, KeyCode, KeyEvent, KeyModifiers};
-use ratatui::DefaultTerminal;
+use crate::tui::terminal_writer::AppTerminal;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -3897,7 +3897,7 @@ impl App {
     /// Loops until queue is empty (in case more messages are queued during processing)
     pub(super) async fn process_queued_messages(
         &mut self,
-        terminal: &mut DefaultTerminal,
+        terminal: &mut AppTerminal,
         event_stream: &mut EventStream,
     ) {
         while !self.queued_messages.is_empty() || !self.hidden_queued_system_messages.is_empty() {

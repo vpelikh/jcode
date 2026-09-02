@@ -13,7 +13,8 @@ use anyhow::Result;
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
-use ratatui::{DefaultTerminal, Terminal, backend::Backend};
+use ratatui::{Terminal, backend::Backend};
+use crate::tui::terminal_writer::AppTerminal;
 use std::time::{Duration, Instant};
 
 mod input_dispatch;
@@ -353,7 +354,7 @@ async fn forward_pending_reasoning_effort(app: &mut App, remote: &mut RemoteConn
 
 pub(super) async fn handle_terminal_event(
     app: &mut App,
-    terminal: &mut DefaultTerminal,
+    terminal: &mut AppTerminal,
     remote: &mut RemoteConnection,
     event: Option<std::result::Result<Event, std::io::Error>>,
 ) -> Result<bool> {
@@ -377,7 +378,7 @@ pub(super) async fn handle_terminal_event(
 
 async fn apply_terminal_event(
     app: &mut App,
-    _terminal: &mut DefaultTerminal,
+    _terminal: &mut AppTerminal,
     remote: &mut RemoteConnection,
     event: Option<std::result::Result<Event, std::io::Error>>,
 ) -> Result<bool> {
@@ -762,7 +763,7 @@ pub(super) async fn check_debug_command(
 
 fn handle_terminal_event_while_disconnected(
     app: &mut App,
-    terminal: &mut DefaultTerminal,
+    terminal: &mut AppTerminal,
     event: Option<std::result::Result<Event, std::io::Error>>,
 ) -> Result<bool> {
     let mut needs_redraw = false;

@@ -4,15 +4,14 @@ use crate::tui::backend::{RemoteEventState, ReplayRemoteState};
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
-use ratatui::{
-    DefaultTerminal, Frame, Terminal, backend::TestBackend, buffer::Buffer, layout::Rect,
-};
+use ratatui::{Frame, Terminal, backend::TestBackend, buffer::Buffer, layout::Rect};
+use crate::tui::terminal_writer::AppTerminal;
 use std::time::{Duration, Instant};
 use tokio::time::interval;
 
 pub(super) async fn run_replay(
     mut app: App,
-    mut terminal: DefaultTerminal,
+    mut terminal: AppTerminal,
     timeline: Vec<TimelineEvent>,
     speed: f64,
 ) -> Result<RunResult> {
@@ -95,7 +94,7 @@ pub(super) async fn run_replay(
 }
 
 pub(super) async fn run_swarm_replay(
-    mut terminal: DefaultTerminal,
+    mut terminal: AppTerminal,
     panes: Vec<PaneReplayInput>,
     speed: f64,
     centered_override: Option<bool>,
@@ -175,7 +174,7 @@ pub(super) async fn run_swarm_replay(
 
 fn handle_replay_input(
     app: &mut App,
-    _terminal: &mut DefaultTerminal,
+    _terminal: &mut AppTerminal,
     event: Event,
     replay_done: bool,
     paused: &mut bool,
@@ -221,7 +220,7 @@ fn handle_replay_input(
 }
 
 fn handle_swarm_replay_input(
-    _terminal: &mut DefaultTerminal,
+    _terminal: &mut AppTerminal,
     event: Event,
     replay_done: bool,
     should_quit: &mut bool,
