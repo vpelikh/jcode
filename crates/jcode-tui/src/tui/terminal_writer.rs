@@ -158,22 +158,45 @@ impl Write for TerminalWriter {
         let Some(tx) = self.tx.as_ref() else {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "writer shut down"));
         };
-        // Byte-bounded, drop-newest policy. Account for the chunk; if it would
-        // push us past the cap, undo the accounting and drop it.
         let len = buf.len();
-        let prev = self.inner.buffered.fetch_add(len, Ordering::Relaxed);
-        if prev + len > QUEUE_CAPACITY_BYTES {
-            self.inner.buffered.fetch_sub(len, Ordering::Relaxed);
-            // The pty is wedged; remember that we dropped output so the app can
-            // force a full re-emit once the pty drains (ratatui's model no
-            // longer matches the real screen).
-            RESYNC_REQUESTED.store(true, Ordering::Release);
-            return Ok(len); // accepted-with-drop so the render loop never blocks
+
+        // Reserve `len` bytes in the byte-bounded backlog, dropping only when the
+        // *current* backlog is already saturated (the consumer is not draining).
+        //
+        // A single large chunk (e.g. a full-screen redraw diff) must NOT be
+        // dropped on a healthy consumer just because `len > cap`; we allow it to
+        // be enqueued and rely on the consumer to drain it. We only stop
+        // enqueueing once the outstanding (queued-but-not-drained) backlog has
+        // already reached `QUEUE_CAPACITY_BYTES`. This bounds sustained memory
+        // when the pty is wedged while never dropping a legitimate fresh frame on
+        // a draining pty.
+        //
+        // We use `compare_exchange` so the reservation is atomic: `buffered` is
+        // mutated when the writer drains (`fetch_sub`) and by concurrent `write`s.
+        let mut prev = self.inner.buffered.load(Ordering::Relaxed);
+        loop {
+            if prev >= QUEUE_CAPACITY_BYTES {
+                // Backlog already saturated (wedged). Drop this chunk and flag a
+                // resync; ratatui's model no longer matches the real screen.
+                RESYNC_REQUESTED.store(true, Ordering::Release);
+                return Ok(len); // accepted-with-drop so the render loop never blocks
+            }
+            match self.inner.buffered.compare_exchange(
+                prev,
+                prev + len,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(cur) => prev = cur,
+            }
         }
+
         let chunk: Box<[u8]> = buf.to_vec().into_boxed_slice();
         match tx.send(Chunk::Data(chunk)) {
             Ok(()) => Ok(len),
             Err(_) => {
+                // Writer exited; undo the reservation.
                 self.inner.buffered.fetch_sub(len, Ordering::Relaxed);
                 Err(io::Error::new(io::ErrorKind::BrokenPipe, "writer thread exited"))
             }
@@ -438,5 +461,22 @@ mod tests {
         let expected = (0..10).map(|i| format!("chunk-{i};")).collect::<String>();
         assert_eq!(got, expected);
         // With no drops, resync is not requested.
+    }
+
+    #[test]
+    fn single_large_chunk_is_not_dropped_on_a_healthy_consumer() {
+        // Regression guard: a frame larger than the byte cap must still be
+        // enqueued on a *draining* consumer. The old code dropped any chunk where
+        // `len > cap`, even when the pty was healthy, which would corrupt a
+        // legitimate full-screen redraw and force a spurious resync.
+        let (t, wrx) = mpsc::channel::<Vec<u8>>();
+        let mut shim = TerminalWriter::new(ChannelWriter { tx: t });
+        let big = vec![b'x'; QUEUE_CAPACITY_BYTES + 1]; // larger than the cap
+        assert!(shim.write_all(&big).is_ok());
+        // Drop waits for the writer to drain everything queued before shutting
+        // down, so after this returns `wrx` holds the complete payload.
+        drop(shim);
+        let delivered: usize = wrx.try_iter().map(|c| c.len()).sum();
+        assert_eq!(delivered, QUEUE_CAPACITY_BYTES + 1, "large frame was dropped");
     }
 }
