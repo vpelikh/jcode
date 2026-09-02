@@ -813,15 +813,21 @@ impl Registry {
         //   - the caller passed the explicit `allow_raw_fallback` bypass flag
         //     (agentgrep's documented escape hatch for building outputs, logs,
         //     and files outside the indexed tree);
+        //   - the call is not a full-text grep search (find/outline/trace are
+        //     distinct operations compass does not replace);
         //   - `compass_query` is not authoritative here: it is not registered
         //     (removed/unknown) or the session tool policy disables it, so
         //     redirecting the call would dead-end the model against a tool it
         //     cannot actually invoke; or
+        //   - the session has no working directory to search (compass_query
+        //     requires one and would otherwise only error); or
         //   - the operator opted out via `tools.prefer_compass_query = false`.
-        //     This is checked against a cached snapshot so a marathon session
-        //     still honors the file setting it started with (and the flag is
-        //     evaluated before the pre_tool hook so the gate sees grep calls as
-        //     the model intended them).
+        //
+        // The interception sits before the `pre_tool` policy hook because a
+        // redirected call executes no tool and so has nothing for the gate to
+        // block; the model's follow-up `compass_query` (or bypassed agentgrep)
+        // is what the hook gates. If enforcement ever needs the pre_tool gate
+        // to observe the original grep intent, move this block to after it.
         if resolved_name == "agentgrep"
             && crate::config::config().tools.prefer_compass_query
             && !agentgrep_requests_raw_fallback(&input)
