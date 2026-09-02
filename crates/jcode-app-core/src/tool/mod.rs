@@ -1554,4 +1554,61 @@ mod mcp_allow_list_tests {
 }
 
 #[cfg(test)]
+mod session_tool_policy_tests {
+    use super::{clear_session_tool_policy, session_tool_is_disabled, set_session_tool_policy};
+    use std::collections::HashSet;
+
+    // Backs the RR14 policy-aware pre-warm skip: a session that cannot invoke
+    // `compass_query` (disabled, or not on a caller-facing allow-list) must not
+    // trigger a background pre-warm build. These cases mirror `validate_tool_allowed`.
+    #[test]
+    fn session_tool_is_disabled_reflects_policy() {
+        // No policy registered -> enabled (nothing to skip).
+        clear_session_tool_policy("no-policy-session");
+        assert!(!session_tool_is_disabled("no-policy-session", "compass_query"));
+
+        // Disabled list: compass_query disabled -> pre-warm must be skipped.
+        set_session_tool_policy(
+            "denied",
+            None,
+            HashSet::from(["compass_query".to_string()]),
+        );
+        assert!(session_tool_is_disabled("denied", "compass_query"));
+
+        // An allow-list that omits compass_query -> disabled (not "allowed").
+        set_session_tool_policy(
+            "allow-bash-only",
+            Some(HashSet::from(["bash".to_string()])),
+            HashSet::new(),
+        );
+        assert!(session_tool_is_disabled("allow-bash-only", "compass_query"));
+
+        // allow-list present AND names compass_query -> enabled.
+        set_session_tool_policy(
+            "allow-both",
+            Some(HashSet::from([
+                "bash".to_string(),
+                "compass_query".to_string(),
+            ])),
+            HashSet::new(),
+        );
+        assert!(!session_tool_is_disabled("allow-both", "compass_query"));
+
+        // No allow-list, empty disabled -> enabled.
+        set_session_tool_policy("open-policy", None, HashSet::new());
+        assert!(!session_tool_is_disabled("open-policy", "compass_query"));
+
+        for sid in [
+            "no-policy-session",
+            "denied",
+            "allow-bash-only",
+            "allow-both",
+            "open-policy",
+        ] {
+            clear_session_tool_policy(sid);
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests;
