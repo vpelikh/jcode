@@ -383,3 +383,25 @@ fn partial_mod_reaches_model() {
         "/mod should reach /model, got {s:?}"
     );
 }
+
+/// The /subagent flag completions carry a trailing space (they expect a value).
+/// Selecting one must fill input with that trailing space intact so the user
+/// can immediately type the value.
+#[test]
+fn accepting_trailing_space_completion_keeps_space() {
+    let mut app = create_test_app();
+    app.input = "/subagent --".to_string();
+    app.cursor_pos = app.input.len();
+    let s = app.command_suggestions();
+    assert!(
+        s.iter().any(|(c, _)| c.starts_with("/subagent --model")),
+        "/subagent -- should offer --model, got {s:?}"
+    );
+    let idx = s
+        .iter()
+        .position(|(c, _)| c.starts_with("/subagent --model "))
+        .unwrap();
+    app.command_suggestion_selected = idx;
+    assert!(app.accept_selected_command_suggestion());
+    assert_eq!(app.input, "/subagent --model ");
+}
