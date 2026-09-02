@@ -1745,6 +1745,15 @@ fn compass_redirect_output_mentions_escape_hatch_and_query() {
     let empty = compass_redirect_output(&serde_json::json!({ "mode": "find" }));
     assert!(empty.output.contains("compass_query"));
     assert!(!empty.output.contains("(query:"));
+
+    // A path/glob scope is echoed so the follow-up compass_query stays confined.
+    let scoped = compass_redirect_output(&serde_json::json!({
+        "query": "init", "path": "src/"
+    }));
+    assert!(
+        scoped.output.contains("keeping the search scope `src/`"),
+        "redirect should echo the path scope"
+    );
 }
 
 #[test]
