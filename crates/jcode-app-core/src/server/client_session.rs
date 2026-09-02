@@ -647,16 +647,6 @@ pub(super) async fn handle_subscribe(
     if let Some(ref dir) = subscribe_working_dir {
         apply_or_defer_subscribe_working_dir(agent, dir, client_session_id);
 
-        // Pre-warm the Compass knowledge graph for this project in the
-        // background, so the agent's first `compass_query` finds a warm index
-        // instead of blocking a turn on a multi-minute cold build. Best-effort
-        // and off this hot path: it resolves paths cheaply and only spawns a
-        // background build when there is genuinely nothing to serve, gated by
-        // `tools.prewarm_compass_index`.
-        if crate::config::config().tools.prewarm_compass_index {
-            crate::tool::compass_query::prewarm_compass_index(Path::new(dir));
-        }
-
         // Swarm grouping must use the *bound* directory, not the raw report, or
         // a home-dir subscribe would still re-key the session's swarm even
         // though its agent stayed in the project (issue #481).
@@ -667,6 +657,18 @@ pub(super) async fn handle_subscribe(
                 .and_then(|guard| guard.working_dir().map(str::to_string));
             effective_subscribe_working_dir(current.as_deref(), dir, dirs::home_dir().as_deref())
         };
+
+        // Pre-warm the Compass knowledge graph for this project in the
+        // background, so the agent's first `compass_query` finds a warm index
+        // instead of blocking a turn on a multi-minute cold build. Uses the
+        // effective *bound* directory (not the raw subscribe report) so a
+        // home-dir subscribe while the agent is already bound to a project does
+        // not pre-warm the wrong path (issue #481). Best-effort and off this
+        // hot path; gated by `tools.prewarm_compass_index`.
+        if crate::config::config().tools.prewarm_compass_index {
+            crate::tool::compass_query::prewarm_compass_index(Path::new(&bound_dir));
+        }
+
         let new_path = PathBuf::from(&bound_dir);
         let mut old_swarm_id: Option<String> = None;
         let mut updated_swarm_id: Option<String> = None;
