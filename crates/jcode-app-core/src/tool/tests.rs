@@ -1727,6 +1727,19 @@ fn compass_redirect_output_mentions_escape_hatch_and_query() {
         "must document the escape hatch"
     );
     assert!(out.output.contains("find init"), "should echo the query");
+
+    // A legacy grep-alias call passes `pattern`, not `query`; the redirect must
+    // still echo the intended search so the model can carry it into compass_query.
+    let legacy = compass_redirect_output(&serde_json::json!({ "pattern": "find structure" }));
+    assert!(
+        legacy.output.contains("find structure"),
+        "redirect should echo the pattern for legacy grep calls"
+    );
+
+    // No query at all: the redirect stays useful and correct.
+    let empty = compass_redirect_output(&serde_json::json!({ "mode": "find" }));
+    assert!(empty.output.contains("compass_query"));
+    assert!(!empty.output.contains("(query:"));
 }
 
 #[test]
@@ -2095,4 +2108,43 @@ async fn agentgrep_runs_when_compass_is_excluded_by_allow_list() {
         out.output
     );
     clear_session_tool_policy("enforcement-minimal-profile-test");
+}
+
+#[tokio::test]
+async fn agentgrep_runs_when_there_is_no_working_dir() {
+    // compass_query requires a working directory to search; in a session with
+    // none there is nothing to index, so redirecting would send the model to a
+    // tool that can only error. agentgrep must run instead.
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+
+    let ctx = ToolContext {
+        session_id: "enforcement-no-cwd-test".to_string(),
+        message_id: "test".to_string(),
+        tool_call_id: "test".to_string(),
+        working_dir: None,
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: ToolExecutionMode::Direct,
+    };
+
+    // agentgrep without a working dir returns an error from its own validation
+    // (it needs a search root); crucially it is NOT redirected, so the error
+    // message is agentgrep's own "requires a session working directory" one,
+    // not the compass redirect.
+    let out = registry
+        .execute("agentgrep", serde_json::json!({ "query": "x" }), ctx.clone())
+        .await;
+    assert!(
+        out.is_err(),
+        "agentgrep without a working dir should yield its own error, not a redirect. But got {:?}",
+        out.map(|o| o.output)
+    );
+    let err = out.err().unwrap().to_string();
+    assert!(
+        !err.contains("compass_query"),
+        "no-working-dir agentgrep must not redirect to compass_query, got: {err}"
+    );
+    clear_session_tool_policy("enforcement-no-cwd-test");
 }
