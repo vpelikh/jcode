@@ -248,7 +248,8 @@ failing, surface + stop (no ping-pong).
 
 ## Config (on `AutoReviewConfig`)
 
-- `enabled`, `model` (existing)
+- `enabled` (existing; default changed to `true` so review runs by default)
+- `model` (existing)
 - `loop_mode` (new, default true, autoreview-only)
 - `max_stalled_turns` (new, default 3, 0 = unlimited)
 
