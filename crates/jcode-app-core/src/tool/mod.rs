@@ -200,6 +200,7 @@ fn tool_is_policy_disabled(session_id: &str, name: &str) -> bool {
 fn compass_redirect_output(input: &Value) -> ToolOutput {
     let query = input
         .get("query")
+        .or_else(|| input.get("pattern")) // legacy grep-alias calls pass `pattern`
         .and_then(|v| v.as_str())
         .unwrap_or_default();
     let query_text = if query.trim().is_empty() {
@@ -814,6 +815,11 @@ impl Registry {
             && !agentgrep_requests_raw_fallback(&input)
             && tools.contains_key("compass_query")
             && !tool_is_policy_disabled(&ctx.session_id, "compass_query")
+            // `compass_query` needs a real workspace to search (it fails with
+            // "requires a working directory" otherwise). In a session with no
+            // working dir there is nothing to index, so redirecting would send
+            // the model to a tool that can only error; let agentgrep run instead.
+            && ctx.working_dir.is_some()
         {
             // Release the tools read lock before running the observer/telemetry
             // hooks, matching the normal execution path (which drops it before
@@ -841,7 +847,7 @@ impl Registry {
             return Ok(redirect);
         }
 
-        // Drop the lock before executing
+        // (Not on the redirect path) drop the lock before executing
         drop(tools);
 
         // User-configured pre_tool gate: external policy hook that can block
