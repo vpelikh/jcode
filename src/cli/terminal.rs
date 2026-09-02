@@ -4,7 +4,7 @@ use std::panic;
 use std::sync::RwLock;
 
 use crate::{id, session, telemetry, tui};
-use jcode_tui::tui::terminal_writer::{AppTerminal, TerminalWriter};
+use jcode_tui::tui::terminal_writer::AppTerminal;
 
 /// A function usable as (part of) a Rust panic hook.
 type PanicHook = dyn Fn(&panic::PanicHookInfo<'_>) + Sync + Send;
@@ -442,10 +442,18 @@ fn init_tui_terminal(inherited_terminal: bool) -> Result<AppTerminal> {
 
 /// Build an [`AppTerminal`] whose backend writes through a [`TerminalWriter`]
 /// so the render loop never blocks on a wedged pty.
-fn build_app_terminal() -> AppTerminal {
+///
+/// On unix the writer thread runs over a `dup` of fd 1 (a raw `File`, no
+/// process-wide `Stdout` lock), so a wedged pty write never blocks other
+/// `io::stdout()` callers on the render loop.
+fn build_app_terminal() -> Result<AppTerminal> {
+    #[cfg(unix)]
+    let writer = jcode_tui::tui::terminal_writer::TerminalWriter::stdout()
+        .map_err(|e| anyhow::anyhow!("failed to set up terminal writer: {e}"))?;
+    #[cfg(not(unix))]
     let writer = jcode_tui::tui::terminal_writer::TerminalWriter::new(io::stdout());
     let backend = ratatui::backend::CrosstermBackend::new(writer);
-    ratatui::Terminal::new(backend).expect("failed to create terminal with writer thread")
+    ratatui::Terminal::new(backend).map_err(|e| anyhow::anyhow!("failed to create terminal: {e}"))
 }
 
 /// Fresh (non-resume) init: equivalent to `ratatui::init()` but routes output
@@ -460,7 +468,7 @@ fn init_tui_terminal_fresh() -> Result<AppTerminal> {
             crossterm::cursor::Hide
         )
         .map_err(|e| anyhow::anyhow!("failed to enter alternate screen: {}", e))?;
-        Ok(build_app_terminal())
+        build_app_terminal()
     }))
     .map_err(|payload| {
         anyhow::anyhow!(
@@ -684,9 +692,7 @@ fn init_tui_terminal_resume() -> Result<AppTerminal> {
     crossterm::terminal::enable_raw_mode()
         .map_err(|e| anyhow::anyhow!("failed to enable raw mode on resume: {}", e))?;
 
-    let writer = TerminalWriter::new(io::stdout());
-    let backend = ratatui::backend::CrosstermBackend::new(writer);
-    let mut terminal = ratatui::Terminal::new(backend)
+    let mut terminal = build_app_terminal()
         .map_err(|e| anyhow::anyhow!("failed to create terminal on resume: {}", e))?;
 
     terminal
