@@ -264,3 +264,38 @@ fn bare_command_with_subcommands_still_offers_itself() {
         "bare /cache should offer /cache itself so it can be toggled, got {suggestions:?}"
     );
 }
+
+/// Probe: what does a SPACED bare command offer? After typing "/cache " the user
+/// wants subcommands, but the bare toggle "/cache" should not be spuriously
+/// absent NOR appear confusingly. Pin the observed shape.
+#[test]
+fn spaced_bare_command_offers_subcommands_and_bare() {
+    let mut app = create_test_app();
+    app.input = "/cache ".to_string();
+    app.cursor_pos = app.input.len();
+    let suggestions = app.command_suggestions();
+    // The relevant subcommands must be present.
+    for expected in ["/cache 1h", "/cache 5m", "/cache stats", "/cache status"] {
+        assert!(
+            suggestions.iter().any(|(c, _)| c == expected),
+            "spacing /cache should keep {expected}, got {suggestions:?}"
+        );
+    }
+}
+
+/// After typing a trailing space (signalling subcommand intent), the bare
+/// command itself should not rank confusingly ahead of its subcommands. The
+/// exact prefix "/cache " must not surface the bare "/cache" as a fuzzy match.
+#[test]
+fn spaced_input_does_not_prime_the_bare_toggle() {
+    let mut app = create_test_app();
+    app.input = "/cache ".to_string();
+    app.cursor_pos = app.input.len();
+    let suggestions = app.command_suggestions();
+    // The first suggestion should be a concrete subcommand, not the bare toggle.
+    assert_ne!(
+        suggestions.first().map(|(c, _)| c.as_str()),
+        Some("/cache"),
+        "typing '/cache ' should prefer a subcommand, got {suggestions:?}"
+    );
+}
