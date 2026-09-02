@@ -196,21 +196,34 @@ impl Tool for CompassQueryTool {
             )));
         }
 
-        // A session-subscribe pre-warm may still be building this project's
-        // index in the background. If so, joining it from here would hold the
-        // same per-project build lock and turn this otherwise-instant query
-        // into a multi-minute blocking build — the exact stall pre-warming is
         // meant to remove. Instead, fail fast with a retryable message so the
-        // agent can use `agentgrep` now and `compass_query` again once the
-        // pre-warm has populated the index.
+        // agent can use `agentgrep` now (for keyword searches) and
+        // `compass_query` again once the pre-warm has populated the index. For
+        // structural intents (callers/callees/impact/discovery/traverse)
+        // agentgrep cannot substitute, so we point the agent at retrying
+        // compass_query after the warm-up rather than at a grep that cannot
+        // produce structural results.
         if prewarm_in_flight(&cache.graph_path, &cache.output_dir) {
-            return Ok(ToolOutput::new(
+            let structural = !params
+                .intent
+                .as_deref()
+                .is_none_or(|i| matches!(i, "search"));
+            let guidance = if structural {
+                "This is a structural query, so `agentgrep` cannot fully \
+                 substitute.\n\
+                 Retry `compass_query` shortly; once the background build \
+                 finishes, the next `compass_query` is served from the warm index."
+            } else {
+                "Use `agentgrep` for keyword searches in the meantime, or \
+                 retry `compass_query` shortly; the background build finishes \
+                 on its own and the next `compass_query` is served from the \
+                 warm index."
+            };
+            return Ok(ToolOutput::new(format!(
                 "A Compass index is being built for this workspace in the \
-                 background and is not ready yet.\n\n\
-                 Use `agentgrep` (or `compass_query` again shortly) for now; \
-                 the background build finishes on its own and the next \
-                 `compass_query` will be served from the warm index.",
-            )
+                 background and is not ready yet.\n\n{}",
+                guidance
+            ))
             .with_title("compass_query: index building in background")
             .with_metadata(json!({
                 "engine": "compass",
@@ -2368,7 +2381,7 @@ mod tests {
             session_id: "s".into(),
             message_id: "m".into(),
             tool_call_id: "t".into(),
-            working_dir: Some(root),
+            working_dir: Some(root.clone()),
             stdin_request_tx: None,
             graceful_shutdown_signal: None,
             execution_mode: ToolExecutionMode::Direct,
@@ -2384,8 +2397,43 @@ mod tests {
         );
         assert!(
             out.output.contains("agentgrep"),
-            "must suggest agentgrep as a fallback, got: {}",
+            "must suggest agentgrep as a fallback for a keyword search, got: {}",
             out.output
+        );
+
+        // A STRUCTURAL intent (e.g. callers) cannot be served by agentgrep, so
+        // the fail-fast must point the agent at retrying compass_query rather
+        // than at a grep that cannot produce structural results.
+        let ctx2 = ToolContext {
+            session_id: "s".into(),
+            message_id: "m".into(),
+            tool_call_id: "t2".into(),
+            working_dir: Some(root.clone()),
+            stdin_request_tx: None,
+            graceful_shutdown_signal: None,
+            execution_mode: ToolExecutionMode::Direct,
+        };
+        let out2 = CompassQueryTool::new()
+            .execute(
+                serde_json::json!({ "query": "callers of authenticate", "intent": "callers" }),
+                ctx2,
+            )
+            .await
+            .expect("execute structural");
+        assert!(
+            out2.output.contains("being built for this workspace in the background"),
+            "structural query during pre-warm must still fail fast, got: {}",
+            out2.output
+        );
+        assert!(
+            out2.output.contains("structural"),
+            "must say grep cannot fully substitute for a structural query, got: {}",
+            out2.output
+        );
+        assert!(
+            out2.output.contains("Retry `compass_query`"),
+            "must point the agent at retrying compass_query for a structural query, got: {}",
+            out2.output
         );
 
         // Clean up the in-flight marker so other tests are unaffected.
