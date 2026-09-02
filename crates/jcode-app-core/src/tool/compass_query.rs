@@ -1050,10 +1050,10 @@ pub(crate) fn prewarm_compass_index(working_dir: &Path) -> bool {
     {
         let failed_map =
             lock_cached(PREWARM_LAST_FAILED.get_or_init(|| Mutex::new(HashMap::new())));
-        if let Some(&at) = failed_map.get(&cache.output_dir) {
-            if at.elapsed().map(|d| d < PREWARM_FAIL_COOLDOWN).unwrap_or(false) {
-                return false; // recent failure; don't re-spawn yet
-            }
+        if let Some(&at) = failed_map.get(&cache.output_dir)
+            && at.elapsed().map(|d| d < PREWARM_FAIL_COOLDOWN).unwrap_or(false)
+        {
+            return false; // recent failure; don't re-spawn yet
         }
     }
 
@@ -1069,6 +1069,14 @@ pub(crate) fn prewarm_compass_index(working_dir: &Path) -> bool {
     let ast_cache = cache.ast_cache_root.clone();
     let build_lock_dir = cache.build_lock_dir.clone();
     let root = working_dir.to_path_buf();
+    // Release the in-flight-map guard before `.spawn(...).map_err(...)`: that
+    // error path re-locks `PREWARM_IN_FLIGHT` to clean up the marker, and `map`
+    // still aliases the same `std::sync::Mutex` until the end of this block. A
+    // `std::sync::Mutex` is not reentrant, so keeping the guard alive would
+    // deadlock the spawn-failure path against itself. (`drop` runs now; NLL only
+    // ends the borrow at last use, it does not move the `Drop` to the end of the
+    // block on its own here because the guard's drop is deferred.)
+    drop(map);
     std::thread::Builder::new()
         .name("compass-prewarm".to_string())
         .spawn(move || {
