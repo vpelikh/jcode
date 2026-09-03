@@ -1037,8 +1037,13 @@ pub(crate) fn prewarm_compass_index(working_dir: &Path) -> bool {
         return false;
     }
 
-    // Even in the "no index yet" case, confirm there is actually source to index
-    // before spawning a thread (e.g. empty dirs, non-git scratch folders).
+    // Even in the "no index yet" case, skip a pre-warm when there is no git repo
+    // to index at all (`current_git_top_cached` is None), so non-git scratch
+    // folders don't spawn a build. Note: a `git init`-ed repo with no commits
+    // still passes this gate (it has a common dir regardless of whether it has
+    // source), which is acceptable: its cold build is near-instant and produces
+    // a trivial empty index that the query path reuses. We deliberately do not
+    // walk the tree here — that would add cost to every session subscribe.
     if current_git_top_cached(working_dir).is_none() {
         return false;
     }
