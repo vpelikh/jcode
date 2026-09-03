@@ -18,10 +18,10 @@
 jobs = 4
 
 [env]
-# Tune the bundled jemalloc at C-build time. The runtime `malloc_conf` global
-# (see src/main.rs) is NOT reliably read by jemalloc on macOS (verified: the
-# allocator reports its default decay, e.g. 10000 ms, ignoring the static), so
-# the only reliable way to apply the decay/narena tuning is to pass it to
+# Tune the bundled jemalloc at C-build time. A runtime `no_mangle` malloc_conf
+# static is not reliably read by jemalloc on macOS (verified: the allocator
+# reports its default decay, e.g. 10000 ms, ignoring the static), so the only
+# reliable way to apply the decay/narena tuning is to pass it to
 # tikv-jemalloc-sys's configure via JEMALLOC_SYS_WITH_MALLOC_CONF, which builds
 # jemalloc with --with-malloc-conf. This is what actually bounds a long-running
 # daemon's RSS: dirty/muzzy pages are returned to the OS after 1 s idle instead
