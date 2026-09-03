@@ -2,8 +2,12 @@
 //!
 //! `compass_query` is a first-class, always-available tool (like `read` or
 //! `agentgrep`). It integrates Compass as a pure library: there is no MCP
-//! server and no CLI subprocess. The first query in a project builds the
-//! Compass index in-process and caches it.
+//! server and no CLI subprocess. When a session binds to a project, a
+//! background pre-warm builds the Compass index off the query path (see
+//! `prewarm_compass_index`); a query that arrives before that completes fails
+//! fast with a retryable "still building" message instead of joining the build.
+//! If no pre-warm ran, the first query builds the index in-process and caches
+//! it.
 //!
 //! ## Cache locations
 //!
