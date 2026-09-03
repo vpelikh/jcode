@@ -173,15 +173,19 @@ a panic in a pre-warm thread cannot brick later dedup or cooldown.
   session quickly switches branches, the new SHA cold-builds unless another
   subscribe pre-warms it.
 
-## Integration with compass-first enforcement (on master)
+## Integration with compass-first enforcement
 
 The compass-first enforcement tier (redirect `agentgrep` → `compass_query`
-when a warm index exists, gated by `tools.prefer_compass_query`) has landed on
-`master`. When this branch is rebased, the two features must coexist. Concrete
-interaction to account for: an `agentgrep` call during an in-flight pre-warm
-could be redirected to a `compass_query` that fails fast with
+when a warm index exists, gated by `tools.prefer_compass_query`) coexists with
+this feature. Both knob types live in `tools`: `prefer_compass_query` (the
+enforcement redirect) and `prewarm_compass_index` (background pre-warm). They
+are independent and both default on.
+
+The one interaction to be aware of: an `agentgrep` call during an in-flight
+pre-warm can be redirected to a `compass_query` that fails fast with
 `building-in-background`, so the agent may see a redirect then a fail-fast.
-That is benign (the message tells the model to retry `compass_query` once the
-background build finishes, or use the `allow_raw_fallback` escape hatch), but
-the redirect's success-based gating should treat "building-in-background" as
-"not ready" rather than as a terminal query failure.
+That is benign — the message tells the model to retry `compass_query` once the
+background build finishes, or use the `allow_raw_fallback` escape hatch — and
+the redirect is safely gated on `prefer_compass_query` + `compass_query` being
+invokable under the session tool policy (same `session_tool_is_disabled` check
+the pre-warm uses).

@@ -688,6 +688,15 @@ fn test_generated_default_config_has_expected_user_defaults() {
         parsed.tools.prefer_compass_query,
         "generated default config keeps compass_query-first enforcement on"
     );
+    // The pre-warm knob ships documented and defaults on.
+    assert!(
+        content.contains("prewarm_compass_index"),
+        "generated default config should document prewarm_compass_index"
+    );
+    assert!(
+        parsed.tools.prewarm_compass_index,
+        "generated default config keeps Compass pre-warm on"
+    );
     assert!(
         parsed.display.show_thinking,
         "freshly created user config should request model reasoning"
