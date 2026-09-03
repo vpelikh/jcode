@@ -115,8 +115,10 @@ fn session_tool_policy(session_id: &str) -> Option<SessionToolPolicy> {
 }
 
 /// Whether the session's tool policy disables `name` for `session_id`. Mirrors
-/// the allow/deny logic a caller would be subject to, so pre-warm and other
-/// side effects can skip work for tools the session cannot actually invoke.
+/// the allow/deny logic in [`Registry::execute`] so callers can skip work for
+/// tools the session cannot actually invoke. Used to (a) gate the Compass
+/// pre-warm on session bind, and (b) decide whether the agentgrep→compass_query
+/// enforcement redirect is safe (i.e. `compass_query` is actually invokable).
 pub(crate) fn session_tool_is_disabled(session_id: &str, name: &str) -> bool {
     let Some(policy) = session_tool_policy(session_id) else {
         return false;
@@ -200,25 +202,6 @@ fn agentgrep_call_is_grep_mode(input: &Value) -> bool {
     match input.get("mode").and_then(|v| v.as_str()) {
         Some(m) => m.eq_ignore_ascii_case("grep"),
         None => true,
-    }
-}
-
-/// Whether the session tool policy disables `name` for `session_id`. Mirrors
-/// the allow/deny logic in [`Registry::execute`] so the enforcement tier can
-/// check `compass_query` availability against the same policy a caller would
-/// be subject to.
-fn tool_is_policy_disabled(session_id: &str, name: &str) -> bool {
-    let Some(policy) = session_tool_policy(session_id) else {
-        return false;
-    };
-    if tool_name_is_disabled(&policy.disabled_tools, name) {
-        return true;
-    }
-    if let Some(allowed) = policy.allowed_tools.as_ref() {
-        // Only if compass_query is not allowed at all.
-        !tool_name_is_allowed(allowed, name)
-    } else {
-        false
     }
 }
 
@@ -894,7 +877,7 @@ impl Registry {
             // are distinct operations compass does not replace.
             && agentgrep_call_is_grep_mode(&input)
             && tools.contains_key("compass_query")
-            && !tool_is_policy_disabled(&ctx.session_id, "compass_query")
+            && !session_tool_is_disabled(&ctx.session_id, "compass_query")
             // `compass_query` needs a real workspace to search (it fails with
             // "requires a working directory" otherwise). In a session with no
             // working dir there is nothing to index, so redirecting would send
@@ -1550,63 +1533,6 @@ mod mcp_allow_list_tests {
         ));
         assert!(!tool_name_is_disabled(&disabled, "mcpish"));
         assert!(!tool_name_is_disabled(&disabled, "bash"));
-    }
-}
-
-#[cfg(test)]
-mod session_tool_policy_tests {
-    use super::{clear_session_tool_policy, session_tool_is_disabled, set_session_tool_policy};
-    use std::collections::HashSet;
-
-    // Backs the RR14 policy-aware pre-warm skip: a session that cannot invoke
-    // `compass_query` (disabled, or not on a caller-facing allow-list) must not
-    // trigger a background pre-warm build. These cases mirror `validate_tool_allowed`.
-    #[test]
-    fn session_tool_is_disabled_reflects_policy() {
-        // No policy registered -> enabled (nothing to skip).
-        clear_session_tool_policy("no-policy-session");
-        assert!(!session_tool_is_disabled("no-policy-session", "compass_query"));
-
-        // Disabled list: compass_query disabled -> pre-warm must be skipped.
-        set_session_tool_policy(
-            "denied",
-            None,
-            HashSet::from(["compass_query".to_string()]),
-        );
-        assert!(session_tool_is_disabled("denied", "compass_query"));
-
-        // An allow-list that omits compass_query -> disabled (not "allowed").
-        set_session_tool_policy(
-            "allow-bash-only",
-            Some(HashSet::from(["bash".to_string()])),
-            HashSet::new(),
-        );
-        assert!(session_tool_is_disabled("allow-bash-only", "compass_query"));
-
-        // allow-list present AND names compass_query -> enabled.
-        set_session_tool_policy(
-            "allow-both",
-            Some(HashSet::from([
-                "bash".to_string(),
-                "compass_query".to_string(),
-            ])),
-            HashSet::new(),
-        );
-        assert!(!session_tool_is_disabled("allow-both", "compass_query"));
-
-        // No allow-list, empty disabled -> enabled.
-        set_session_tool_policy("open-policy", None, HashSet::new());
-        assert!(!session_tool_is_disabled("open-policy", "compass_query"));
-
-        for sid in [
-            "no-policy-session",
-            "denied",
-            "allow-bash-only",
-            "allow-both",
-            "open-policy",
-        ] {
-            clear_session_tool_policy(sid);
-        }
     }
 }
 

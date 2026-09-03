@@ -1822,25 +1822,25 @@ fn compass_redirect_output_mentions_escape_hatch_and_query() {
 }
 
 #[test]
-fn tool_is_policy_disabled_reflects_allow_and_deny_sets() {
-    use super::{set_session_tool_policy, tool_is_policy_disabled};
+fn session_tool_is_disabled_reflects_allow_and_deny_sets() {
+    use super::{set_session_tool_policy, session_tool_is_disabled};
     use std::collections::HashSet;
 
     const SID: &str = "enforcement-policy-test";
 
     // No policy configured: never disabled by policy.
     clear_session_tool_policy(SID);
-    assert!(!tool_is_policy_disabled(SID, "compass_query"));
+    assert!(!session_tool_is_disabled(SID, "compass_query"));
 
     // Disabled set: compass_query present -> disabled.
     set_session_tool_policy(SID, None, HashSet::from(["compass_query".to_string()]));
-    assert!(tool_is_policy_disabled(SID, "compass_query"));
+    assert!(session_tool_is_disabled(SID, "compass_query"));
     // A different tool is not disabled by that policy.
-    assert!(!tool_is_policy_disabled(SID, "agentgrep"));
+    assert!(!session_tool_is_disabled(SID, "agentgrep"));
 
     // Allow-list omitted compass_query -> disabled (not invocable).
     set_session_tool_policy(SID, Some(HashSet::new()), HashSet::new());
-    assert!(tool_is_policy_disabled(SID, "compass_query"));
+    assert!(session_tool_is_disabled(SID, "compass_query"));
 
     // Allow-list includes compass_query -> enabled.
     set_session_tool_policy(
@@ -1848,7 +1848,7 @@ fn tool_is_policy_disabled_reflects_allow_and_deny_sets() {
         Some(HashSet::from(["compass_query".to_string()])),
         HashSet::new(),
     );
-    assert!(!tool_is_policy_disabled(SID, "compass_query"));
+    assert!(!session_tool_is_disabled(SID, "compass_query"));
 
     clear_session_tool_policy(SID);
 }

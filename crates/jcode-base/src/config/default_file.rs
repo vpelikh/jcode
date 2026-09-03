@@ -355,6 +355,14 @@ read_dedup = true
 # guidance enforceable rather than advisory. The model can still force raw grep
 # for a single call by passing allow_raw_fallback:true to agentgrep.
 # prefer_compass_query = true
+# When on (default), a background Compass knowledge-graph build is kicked off
+# when a session binds to a working directory whose index is missing, so the
+# agent's first `compass_query` finds a warm index instead of blocking the turn
+# on a (potentially multi-minute) cold build. The build runs off the query path
+# on a background thread under the per-project build lock, deduplicated per
+# commit, and a failed build backs off for ~5 minutes before retrying. Skipped
+# when the session cannot use compass_query. Set to false to disable.
+# prewarm_compass_index = true
 
 [acp]
 # Agent Client Protocol adapter compatibility profile: standard, extended, or full.
