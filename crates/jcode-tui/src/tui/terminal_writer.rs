@@ -104,6 +104,13 @@ struct WriterInner {
 pub struct TerminalWriter {
     tx: Option<Sender<Chunk>>,
     inner: Arc<WriterInner>,
+    /// Coalescing scratch buffer. ratatui's `CrosstermBackend` calls `write` once
+    /// per cell/command, so buffering here and sending to the channel on `flush`
+    /// turns a per-frame burst of tiny allocations into one chunk (cheaper, and
+    /// drops whole frames instead of individual cells on a wedged pty). This
+    /// buffer lives only on the render thread (behind `&mut self`), never the
+    /// writer thread.
+    pending: Vec<u8>,
 }
 
 impl TerminalWriter {
@@ -125,7 +132,7 @@ impl TerminalWriter {
             .spawn(move || run_writer(writer, rx, done_tx, &thread_inner))
             .expect("failed to spawn terminal writer thread");
         *inner.handle.lock().unwrap() = Some(handle);
-        Self { tx: Some(tx), inner }
+        Self { tx: Some(tx), inner, pending: Vec::new() }
     }
 
     /// Create a writer thread over a `dup` of fd 1 (stdout) that does not
@@ -157,6 +164,8 @@ impl TerminalWriter {
     }
 
     fn shutdown(&mut self) {
+        // Flush any coalesced-but-not-yet-enqueued bytes so Drop loses nothing.
+        let _ = self.flush();
         let tx = self.tx.take();
         if let Some(tx) = tx {
             // Signal the writer to drain+flush and stop.
@@ -194,38 +203,42 @@ impl Write for TerminalWriter {
         if buf.is_empty() {
             return Ok(0);
         }
+        // Buffer on the render thread. Actual enqueue to the channel happens on
+        // `flush`, so a frame's per-cell writes coalesce into one chunk. Never
+        // perform the real pty `write` (blocking) here; the writer thread does.
+        self.pending.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        // Enqueue whatever has accumulated since the last flush (usually one
+        // full frame) to the channel, which the writer thread writes+flushes to
+        // the real pty. This never blocks: sending to an unbounded channel is
+        // non-blocking, and drops happen here if the backlog is saturated.
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let len = self.pending.len();
+        let body: Box<[u8]> = std::mem::take(&mut self.pending).into_boxed_slice();
+
         let Some(tx) = self.tx.as_ref() else {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "writer shut down"));
         };
-        let len = buf.len();
-
-        // Reserve `len` bytes in the byte-bounded backlog, dropping only when the
-        // *current* backlog is already saturated (the consumer is not draining).
-        //
-        // A single large chunk (e.g. a full-screen redraw diff) must NOT be
-        // dropped on a healthy consumer just because `len > cap`; we allow it to
-        // be enqueued and rely on the consumer to drain it. We only stop
-        // enqueueing once the outstanding (queued-but-not-drained) backlog has
-        // already reached `QUEUE_CAPACITY_BYTES`. This bounds sustained memory
-        // when the pty is wedged while never dropping a legitimate fresh frame on
-        // a draining pty.
-        //
-        // We use `compare_exchange` so the reservation is atomic: `buffered` is
-        // mutated when the writer drains (`fetch_sub`) and by concurrent `write`s.
+        // Reserve `len` bytes, dropping the whole frame only when the *current*
+        // backlog is already saturated (the consumer is not draining). This bounds
+        // memory on a wedged pty and never drops a legitimate fresh frame on a
+        // draining consumer.
         let mut prev = self.inner.buffered.load(Ordering::Relaxed);
         loop {
             if prev >= QUEUE_CAPACITY_BYTES {
-                // Backlog already saturated (wedged). Drop this chunk and flag a
+                // Backlog already saturated (wedged). Drop this frame and flag a
                 // resync; ratatui's model no longer matches the real screen.
                 RESYNC_REQUESTED.store(true, Ordering::Release);
-                return Ok(len); // accepted-with-drop so the render loop never blocks
+                return Ok(()); // accepted-with-drop so the render loop never blocks
             }
-            // `checked_add` guards against a pathological `len` (or cumulative
-            // backlog) that would overflow `usize` and wrap the reservation to a
-            // tiny value, which would otherwise defeat the cap entirely.
             let Some(next) = prev.checked_add(len) else {
                 RESYNC_REQUESTED.store(true, Ordering::Release);
-                return Ok(len);
+                return Ok(());
             };
             match self.inner.buffered.compare_exchange(
                 prev,
@@ -238,22 +251,14 @@ impl Write for TerminalWriter {
             }
         }
 
-        let chunk: Box<[u8]> = buf.to_vec().into_boxed_slice();
-        match tx.send(Chunk::Data(chunk)) {
-            Ok(()) => Ok(len),
+        match tx.send(Chunk::Data(body)) {
+            Ok(()) => Ok(()),
             Err(_) => {
                 // Writer exited; undo the reservation.
                 self.inner.buffered.fetch_sub(len, Ordering::Relaxed);
                 Err(io::Error::new(io::ErrorKind::BrokenPipe, "writer thread exited"))
             }
         }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        // No-op on the render thread: bytes are buffered in the channel and the
-        // writer thread flushes the real pty. Returning Ok keeps the ratatui
-        // backend happy without blocking.
-        Ok(())
     }
 }
 
@@ -345,7 +350,14 @@ mod tests {
         for i in 0..5000 {
             let data = vec![b'x'; 1024];
             assert!(writer.write_all(&data).is_ok(), "write {i} failed");
+            // Flush periodically, as the render loop flushes a frame each tick.
+            // This is where the buffered writer enqueues (and, once the wedged
+            // consumer saturates, drops) the accumulated bytes.
+            if i % 8 == 0 {
+                let _ = writer.flush();
+            }
         }
+        let _ = writer.flush();
         let elapsed = start.elapsed();
         assert!(
             elapsed < std::time::Duration::from_secs(2),
@@ -627,5 +639,38 @@ mod tests {
             .filter(|&b| b == b';')
             .count();
         assert_eq!(semicolons, 8 * 200, "healthy-path concurrent delivery lost data");
+    }
+
+    /// Writes coalesce until `flush`, then drain in order as one unit. This is
+    /// the buffered contract: the render loop flushes a frame each tick, turning
+    /// many per-cell `write`s into one channel chunk.
+    #[test]
+    fn writes_coalesce_until_flush_then_deliver_in_order() {
+        let (t, wrx) = mpsc::channel::<Vec<u8>>();
+        let mut shim = TerminalWriter::new(ChannelWriter { tx: t });
+
+        // Writes without flush are not yet delivered.
+        shim.write_all(b"a").unwrap();
+        shim.write_all(b"b").unwrap();
+        assert!(
+            wrx.try_recv().is_err(),
+            "writes should not be delivered until flush"
+        );
+
+        // A flush delivers all accumulated bytes as a unit.
+        shim.flush().unwrap();
+        // The writer thread forwards the chunk to `wrx` asynchronously; wait for
+        // it with a timeout rather than racing `try_recv`.
+        let mut got = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while got.len() < 2 && std::time::Instant::now() < deadline {
+            match wrx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(chunk) => got.push_str(std::str::from_utf8(&chunk).unwrap()),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(e) => panic!("recv failed: {e:?}"),
+            }
+        }
+        assert_eq!(got, "ab", "coalesced bytes lost: {got:?}");
+        drop(shim);
     }
 }
