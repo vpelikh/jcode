@@ -65,10 +65,11 @@ So the whole *logical* session state is ~11-15 MB. The 4.2 GB is not session dat
   `JEMALLOC_SYS_WITH_MALLOC_CONF` env var (set in `.cargo/config.toml` `[env]`), which
   tikv-jemalloc-sys passes to jemalloc's `--with-malloc-conf` configure. This
   `dirty_decay_ms:1000,muzzy_decay_ms:1000,narenas:4` returns dirty pages to the OS after 1s
-  idle — the exact mechanism that bounds RSS. (The runtime `malloc_conf` global exported from
-  `src/main.rs` is NOT reliably read by jemalloc on macOS, so the build-time env is the
-  authoritative wiring; see the corrected "Decay-value reconciliation" note below.) The code
-  comment even notes the untuned defaults "caused 1.4 GB RSS".
+  idle — the exact mechanism that bounds RSS. (A runtime `malloc_conf` global is deliberately
+  NOT relied on, because jemalloc doesn't reliably read it at load time on macOS — so the
+  build-time env is the sole authoritative wiring; see the corrected "Decay-value
+  reconciliation" note below.) The code comment even notes the untuned defaults
+  "caused 1.4 GB RSS".
 
 ## Why `ps` RSS is not the same as "used memory"
 macOS `ps` RSS includes reserved writable VM. For a process that has ever touched
@@ -82,8 +83,8 @@ empty. The relevant number for memory pressure is the **physical/vmmap footprint
    `dirty_decay_ms:1000,muzzy_decay_ms:1000,narenas:4` tuning activates. This is the intended
    fix: `jemalloc` is now a **global default feature** (all platforms), and the decay/narena
    tuning is applied at build time via `JEMALLOC_SYS_WITH_MALLOC_CONF` in `.cargo/config.toml`
-   `[env]` (the `src/main.rs` runtime `malloc_conf` static is a secondary fallback that is not
-   reliably read on macOS). This bounds daemon RSS to actual usage instead of retained arenas.
+   `[env]` (a runtime `malloc_conf` static is deliberately not used — see the "Decay-value
+   reconciliation" note). This bounds daemon RSS to actual usage instead of retained arenas.
 2. **Report physical footprint instead of `ps` RSS** in UI/telemetry for a less
    alarming, more accurate number.
 3. **The practical limiter for many sessions is system-wide CPU and accumulated resident
@@ -555,8 +556,9 @@ build-time `JEMALLOC_SYS_WITH_MALLOC_CONF` env (in `.cargo/config.toml` `[env]`)
 tikv-jemalloc-sys passes as `--with-malloc-conf`. This was previously attributed to the
 runtime `malloc_conf` global in `src/main.rs`, but that static is NOT reliably read by
 jemalloc on macOS (verified with a probe: the allocator kept default `dirty_decay_ms: 10000`).
-The `src/main.rs` static is now also corrected to the right type (`Option<&'static c_char>`)
-as a secondary fallback. See the corrected "Decay-value reconciliation" note above.
+That runtime static has since been REMOVED from `src/main.rs` — the build-time env is the sole
+authoritative mechanism (and it also avoids an unsafe pointer cast). See the corrected
+"Decay-value reconciliation" note above.
 
 ## Evidence references
 - `vmmap -summary 97630`: physical footprint 402.8 MB; MALLOC_SMALL(empty) 2.5 GB.

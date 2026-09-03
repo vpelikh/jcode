@@ -2,43 +2,23 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-// Tune jemalloc for a long-running server with bursty allocations (e.g. loading
-// and unloading an ~87 MB ONNX embedding model). The defaults (muzzy_decay_ms:0,
-// retain:true, narenas:8*ncpu) caused 1.4 GB RSS in previous testing.
+// jemalloc is tuned for a long-running server with bursty allocations (e.g.
+// loading and unloading an ~87 MB ONNX embedding model). The defaults
+// (muzzy_decay_ms:0, retain:true, narenas:8*ncpu) caused 1.4 GB RSS in
+// previous testing.
 //
-// The EFFECTIVE mechanism is the build-time `--with-malloc-conf` passed by
-// tikv-jemalloc-sys from the `JEMALLOC_SYS_WITH_MALLOC_CONF` env var (set in
-// .cargo/config.toml). The runtime `malloc_conf` global exported below is a
-// secondary fallback: jemalloc does NOT reliably read the `no_mangle`
-// `malloc_conf` static on macOS (verified 2026-09: the allocator kept its
-// default decay, ignoring this static), which is why the build-time env is
-// authoritative. Keep both in sync so a platform that does honor the runtime
-// global and builds configured the same way match.
+// The tuning is applied at BUILD time via `JEMALLOC_SYS_WITH_MALLOC_CONF` (a
+// `[env]` entry in `.cargo/config.toml`), which tikv-jemalloc-sys passes to
+// jemalloc's configure as `--with-malloc-conf`. This is the authoritative
+// mechanism. (A `no_mangle` runtime `malloc_conf` static is deliberately NOT
+// used here: it is not reliably read by jemalloc at load time on macOS, and
+// keeping it would require an unsafe pointer cast for no benefit.)
 //
 // dirty_decay_ms:1000  — return dirty pages to OS after 1 s idle
 // muzzy_decay_ms:1000  — release muzzy pages after 1 s
 // narenas:4            — limit arena count (17 threads don't need 64 arenas)
 // prof:true            — enable profiling support in jemalloc-prof builds
 // prof_active:false    — keep sampling disabled until explicitly enabled at runtime
-
-// jemalloc's exported `malloc_conf` is typed `Option<&'static c_char>` (a
-// NUL-terminated C string), not a byte-array reference. `u8` and `c_char`
-// (i8 on most Unix) are the same size/alignment, so the byte-literal pointer
-// reinterprets directly as a C string pointer.
-#[cfg(all(feature = "jemalloc", not(feature = "jemalloc-prof")))]
-#[allow(non_upper_case_globals)]
-#[unsafe(no_mangle)]
-pub static malloc_conf: Option<&'static libc::c_char> = Some(unsafe {
-    &*(b"dirty_decay_ms:1000,muzzy_decay_ms:1000,narenas:4\0".as_ptr() as *const libc::c_char)
-});
-
-#[cfg(feature = "jemalloc-prof")]
-#[allow(non_upper_case_globals)]
-#[unsafe(no_mangle)]
-pub static malloc_conf: Option<&'static libc::c_char> = Some(unsafe {
-    &*(b"dirty_decay_ms:1000,muzzy_decay_ms:1000,narenas:4,prof:true,prof_active:false\0".as_ptr()
-        as *const libc::c_char)
-});
 
 use anyhow::Result;
 
