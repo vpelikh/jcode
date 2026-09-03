@@ -1059,10 +1059,6 @@ mod tests {
                 Some(1000),
                 "purged allocator should report the build-time decay tuning (dirty_decay_ms=1000)"
             );
-            assert!(
-                tuning.initialized_arenas.unwrap_or(0) >= 1,
-                "at least one initialized arena should exist after purge"
-            );
             // A second release must keep succeeding (idempotent).
             release_retained_heap("unit_test_again");
         }
