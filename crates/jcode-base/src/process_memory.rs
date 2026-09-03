@@ -1046,6 +1046,26 @@ mod tests {
         let buffer = vec![0u8; 8 * 1024 * 1024];
         drop(buffer);
         release_retained_heap("unit_test");
+
+        // Under jemalloc, the purge path is the actual memory-reclamation
+        // mechanism (used by `allocator:purge`): assert it fully succeeds and
+        // reports the tuned allocator, not a silent no-op or error.
+        #[cfg(feature = "jemalloc")]
+        {
+            let tuning = purge_allocator()
+                .expect("jemalloc arena purge should succeed under jemalloc builds");
+            assert_eq!(
+                tuning.dirty_decay_ms,
+                Some(1000),
+                "purged allocator should report the build-time decay tuning (dirty_decay_ms=1000)"
+            );
+            assert!(
+                tuning.initialized_arenas.unwrap_or(0) >= 1,
+                "at least one initialized arena should exist after purge"
+            );
+            // A second release must keep succeeding (idempotent).
+            release_retained_heap("unit_test_again");
+        }
     }
 
     #[test]
