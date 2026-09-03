@@ -1193,6 +1193,43 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "jemalloc")]
+    #[test]
+    fn jemalloc_build_applies_decay_tuning_reported_through_public_api() {
+        // Acceptance check: the whole point of making jemalloc a default
+        // feature plus the build-time `JEMALLOC_SYS_WITH_MALLOC_CONF` env
+        // (see .cargo/config.toml) is that jemalloc actually returns dirty
+        // pages to the OS after a short decay so a long-running daemon's RSS
+        // stays bounded. Through the public `allocator_info()` interface, the
+        // effective tuning must report the configured slowdown:
+        // dirty_decay_ms == 1000 (not jemalloc's default 10000).
+        //
+        // This only holds when the build applied the env (i.e. the value was
+        // baked into jemalloc via --with-malloc-conf). If someone overrides or
+        // unsets JEMALLOC_SYS_WITH_MALLOC_CONF, jemalloc's default 10000 would
+        // be reported and this test will fail loudly — which is the point.
+        let info = allocator_info();
+        assert_eq!(info.name, "jemalloc");
+        let tuning = info
+            .tuning
+            .as_ref()
+            .expect("jemalloc build should report tuning info");
+        assert_eq!(
+            tuning.dirty_decay_ms,
+            Some(1000),
+            "jemalloc decay tuning should be applied at build time (dirty_decay_ms=1000); \
+             got {:?}. Ensure .cargo/config.toml sets JEMALLOC_SYS_WITH_MALLOC_CONF to \
+             dirty_decay_ms:1000,... (the runtime malloc_conf static is not reliably read).",
+            tuning.dirty_decay_ms
+        );
+        assert_eq!(
+            tuning.muzzy_decay_ms,
+            Some(1000),
+            "muzzy_decay_ms should also be tuned to 1000, got {:?}",
+            tuning.muzzy_decay_ms
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_snapshot_populates_physical_footprint() {
