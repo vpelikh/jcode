@@ -411,7 +411,7 @@ mod tests {
     #[test]
     fn app_terminal_draw_never_blocks_on_a_wedged_pty() {
         let (wedge, release) = WedgedWriter::new();
-        let mut writer = TerminalWriter::new(wedge);
+        let writer = TerminalWriter::new(wedge);
         let backend = ratatui::backend::CrosstermBackend::new(writer);
         let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
         let start = std::time::Instant::now();
@@ -635,7 +635,7 @@ mod tests {
         // ';' tells us exactly how many chunks arrived. 8 threads * 200 writes.
         let semicolons: usize = wrx
             .try_iter()
-            .flat_map(|c| c)
+            .flatten()
             .filter(|&b| b == b';')
             .count();
         assert_eq!(semicolons, 8 * 200, "healthy-path concurrent delivery lost data");
