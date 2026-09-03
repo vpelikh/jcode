@@ -78,11 +78,12 @@ empty. The relevant number for memory pressure is the **physical/vmmap footprint
 
 ## Recommendations (to run many more sessions)
 
-1. **Enable the `jemalloc` feature in default/release builds on macOS** so the
-   `dirty_decay_ms:1000,muzzy_decay_ms:1000,narenas:4` tuning activates. This is
-   the intended fix already present in `src/main.rs` (comment: reduces fragmented
-   RSS for long-running server). This bounds daemon RSS to actual usage instead of
-   retained arenas.
+1. **Enable the `jemalloc` feature in default/release builds** so the
+   `dirty_decay_ms:1000,muzzy_decay_ms:1000,narenas:4` tuning activates. This is the intended
+   fix: `jemalloc` is now a **global default feature** (all platforms), and the decay/narena
+   tuning is applied at build time via `JEMALLOC_SYS_WITH_MALLOC_CONF` in `.cargo/config.toml`
+   `[env]` (the `src/main.rs` runtime `malloc_conf` static is a secondary fallback that is not
+   reliably read on macOS). This bounds daemon RSS to actual usage instead of retained arenas.
 2. **Report physical footprint instead of `ps` RSS** in UI/telemetry for a less
    alarming, more accurate number.
 3. **The practical limiter for many sessions is system-wide CPU and accumulated resident
