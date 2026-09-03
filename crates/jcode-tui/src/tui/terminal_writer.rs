@@ -746,4 +746,25 @@ mod tests {
         }
         assert_eq!(got, "xy", "writes after empty/repeated flush lost: {got:?}");
     }
+
+    /// The production `TerminalWriter::stdout()` (a `dup` of fd 1) must build a
+    /// working writer: writes succeed, flushes don't block, and dropping doesn't
+    /// hang. This exercises the actual construction path used by
+    /// `build_app_terminal`, not just the generic `new()`.
+    #[cfg(unix)]
+    #[test]
+    fn stdout_dup_constructor_writes_and_drops_cleanly() {
+        let mut shim = TerminalWriter::stdout().expect("stdout() dup failed");
+        // Write a harmless, zero-width terminal sequence (a Bell). Writing to the
+        // real stdout is safe here and verifies the dup'd fd actually carries bytes.
+        assert!(shim.write_all(b"\x07").is_ok());
+        assert!(shim.flush().is_ok());
+        // Dropping flushes pending + shuts down the writer thread; must not hang.
+        let start = std::time::Instant::now();
+        drop(shim);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "stdout() writer drop hung"
+        );
+    }
 }
