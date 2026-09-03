@@ -189,6 +189,14 @@ pub fn snapshot_with_source(source: impl Into<String>) -> ProcessMemorySnapshot 
 pub fn snapshot_with_source(source: impl Into<String>) -> ProcessMemorySnapshot {
     let source = source.into();
     let rusage = macos_rusage_v4();
+    // Note on metrics: macOS has no single "RSS" that is trustworthy (ps RSS
+    // over-counts reserved arenas). `rss_bytes` carries the current resident
+    // set size (`ri_resident_size`) and `peak_rss_bytes` carries the lifetime
+    // peak PHYSICAL FOOTPRINT (`ri_lifetime_max_phys_footprint`) — there is no
+    // peak-resident field in rusage_info_v4, so these are two different
+    // metrics (resident vs footprint). Both are honest real numbers (not the
+    // inflated ps-RSS), which is what matters for pressure; `phys_footprint`
+    // is exposed separately in `os.phys_footprint_bytes`.
     let snapshot = ProcessMemorySnapshot {
         rss_bytes: rusage.map(|r| r.ri_resident_size),
         peak_rss_bytes: rusage.map(|r| r.ri_lifetime_max_phys_footprint),
