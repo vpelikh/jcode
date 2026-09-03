@@ -200,6 +200,10 @@ impl Tool for CompassQueryTool {
             )));
         }
 
+        // A session-subscribe pre-warm may still be building this project's
+        // index in the background. If so, joining it from here would hold the
+        // same per-project build lock and turn this otherwise-instant query
+        // into a multi-minute blocking build — the exact stall pre-warming is
         // meant to remove. Instead, fail fast with a retryable message so the
         // agent can use `agentgrep` now (for keyword searches) and
         // `compass_query` again once the pre-warm has populated the index. For
@@ -982,17 +986,17 @@ fn build_compass_index(
     Ok(())
 }
 
-/// Process-global set of project roots currently being pre-warmed, so a swarm
-/// of sessions that all subscribe to the same repo don't each spawn a duplicate
-/// cold build. Tolerant of poisoning (a panic in a pre-warm thread must not
-/// brick later dedup).
+/// Process-global set of per-SHA output dirs currently being pre-warmed, so a
+/// swarm of sessions that all subscribe to the same repo (and thus the same
+/// SHA) don't each spawn a duplicate cold build. Tolerant of poisoning (a panic
+/// in a pre-warm thread must not brick later dedup).
 static PREWARM_IN_FLIGHT: OnceLock<Mutex<HashMap<PathBuf, ()>>> = OnceLock::new();
 
 /// True when a background pre-warm is currently building the Compass index for
-/// `graph_path`'s project. Used by `CompassQueryTool::execute` to short-circuit
-/// a query that would otherwise race ahead of the pre-warm and, by holding the
-/// same per-project build lock, turn a normally-instant warm query into a
-/// minutes-long blocking build of its own.
+/// `output_dir`'s per-SHA index. Used by `CompassQueryTool::execute` to
+/// short-circuit a query that would otherwise race ahead of the pre-warm and,
+/// by holding the same per-project build lock, turn a normally-instant warm
+/// query into a minutes-long blocking build of its own.
 ///
 /// Takes the already-resolved `graph_path` (per-SHA) and `output_dir` so
 /// `execute` does not resolve the cache a second time; a finished pre-warm
@@ -1074,7 +1078,10 @@ pub(crate) fn prewarm_compass_index(working_dir: &Path) -> bool {
         }
     }
 
-    // Deduplicate concurrent pre-warm builds per project root.
+    // Deduplicate concurrent pre-warm builds per output dir (per-SHA for git
+    // repos), so a swarm of sessions on the same SHA spawns only one build.
+    // Different SHAs index into different output dirs and serialize via the
+    // shared per-project build flock instead.
     let mut map = lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())));
     if map.contains_key(&cache.output_dir) {
         return true; // already being built by another subscriber
@@ -1144,7 +1151,8 @@ pub(crate) fn prewarm_compass_index(working_dir: &Path) -> bool {
 /// transient hiccup resolves quickly; long enough to stop a tight retry loop.
 const PREWARM_FAIL_COOLDOWN: Duration = Duration::from_secs(300);
 
-/// When the last pre-warm build for an output dir failed, keyed for cooldown.
+/// When the last pre-warm build for a project failed, keyed for cooldown by
+/// the project root (`ast_cache_root`, stable across SHAs of one repo).
 static PREWARM_LAST_FAILED: OnceLock<Mutex<HashMap<PathBuf, SystemTime>>> = OnceLock::new();
 
 /// RAII guard that removes this project's pre-warm in-flight marker when it is
