@@ -238,6 +238,15 @@ fn macos_rusage_v4() -> Option<libc::rusage_info_v4> {
     unsafe extern "C" {
         fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut libc::c_void) -> i32;
     }
+    // SAFETY: `proc_pid_rusage` is the macOS kernel's own exported syscall-
+    // wrapper. We pass (a) our own PID, (b) `RUSAGE_INFO_V4` (a valid flavor), and
+    // (c) a pointer to a fully zero-initialized `rusage_info_v4` buffer that is
+    // the correct size for that flavor. The kernel fills exactly that struct and
+    // returns an error code if anything is invalid rather than writing out of
+    // bounds, so the only observer of `info` is us after a 0 (success) return.
+    // There is no safe std API for macOS process rusage, so this FFI call is the
+    // minimal, contained `unsafe` surface; its caller (`snapshot_with_source`) is
+    // fully safe.
     unsafe {
         let pid = std::process::id() as i32;
         let mut info: libc::rusage_info_v4 = std::mem::zeroed();
