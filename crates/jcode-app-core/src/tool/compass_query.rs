@@ -1047,13 +1047,21 @@ pub(crate) fn prewarm_compass_index(working_dir: &Path) -> bool {
     // trigger a full multi-minute build attempt on every subscribe. The query
     // path's own build-on-demand still runs and surfaces the failure to the
     // agent; pre-warm just stops amplifying it.
+    //
+    // Keyed by the *project* (ast_cache_root, stable across SHAs of one repo),
+    // not the per-SHA output_dir: an unindexable project fails on every SHA it
+    // is visited at, so a per-SHA key would both (a) reset the cooldown on every
+    // branch/commit switch, letting each new SHA re-trigger a full cold build,
+    // and (b) grow the failure map one entry per failed SHA over the daemon's
+    // lifetime. The project key keeps the cooldown for the whole repo and bounds
+    // the map to the number of distinct projects.
     {
         let failed_map =
             lock_cached(PREWARM_LAST_FAILED.get_or_init(|| Mutex::new(HashMap::new())));
-        if let Some(&at) = failed_map.get(&cache.output_dir)
+        if let Some(&at) = failed_map.get(&cache.ast_cache_root)
             && at.elapsed().map(|d| d < PREWARM_FAIL_COOLDOWN).unwrap_or(false)
         {
-            return false; // recent failure; don't re-spawn yet
+            return false; // recent project failure; don't re-spawn yet
         }
     }
 
@@ -1101,10 +1109,10 @@ pub(crate) fn prewarm_compass_index(working_dir: &Path) -> bool {
                     lock_cached(PREWARM_LAST_FAILED.get_or_init(|| Mutex::new(HashMap::new())));
                 match result {
                     Ok(()) => {
-                        failed_map.remove(&out_dir);
+                        failed_map.remove(&ast_cache);
                     }
                     Err(_) => {
-                        failed_map.insert(out_dir.clone(), SystemTime::now());
+                        failed_map.insert(ast_cache.clone(), SystemTime::now());
                     }
                 }
             });
@@ -2610,9 +2618,10 @@ mod tests {
         assert!(!edge.graph_path.is_file(), "fixture should start cold");
 
         // Seed a "just failed" marker. Clean it up afterwards so other tests
-        // are unaffected.
+        // are unaffected. The cooldown is keyed by the project (ast_cache_root),
+        // not the per-SHA output_dir.
         lock_cached(PREWARM_LAST_FAILED.get_or_init(|| Mutex::new(HashMap::new())))
-            .insert(edge.output_dir.clone(), SystemTime::now());
+            .insert(edge.ast_cache_root.clone(), SystemTime::now());
         struct Cleanup(PathBuf);
         impl Drop for Cleanup {
             fn drop(&mut self) {
@@ -2620,7 +2629,7 @@ mod tests {
                     .remove(&self.0);
             }
         }
-        let _cleanup = Cleanup(edge.output_dir.clone());
+        let _cleanup = Cleanup(edge.ast_cache_root.clone());
 
         // Within the cooldown window, pre-warm must not re-spawn a build.
         assert!(
@@ -2632,6 +2641,91 @@ mod tests {
         assert!(
             !map.contains_key(&edge.output_dir),
             "no build may start while backing off after a recent failure"
+        );
+    }
+
+    // The failure cooldown must be keyed by *project*, not by the per-SHA
+    // output_dir. Make an uncommitted second commit so the current SHA (and the
+    // per-SHA output_dir) differs, then prove a failure recorded under the first
+    // SHA still blocks a pre-warm for the second — the whole point of backing off
+    // an unindexable project across a branch/commit switch. The project key is
+    // `ast_cache_root`, which is stable across SHAs.
+    #[test]
+    fn prewarm_cooldown_is_keyed_by_project_across_sha_change() {
+        let (_home, _home_path) = HomeGuard::set();
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let mut f = std::fs::File::create(main.join("main.rs")).unwrap();
+        writeln!(f, "fn authenticate(user: &str) {{ let _ = user; }}").unwrap();
+        drop(f);
+
+        let git = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&main)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init", "-q"]) {
+            return;
+        }
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["add", "."]);
+        if !git(&["commit", "-qm", "init"]) {
+            return;
+        }
+
+        // First SHA, cache resolved under it.
+        let edge_sha1 = resolve_compass_cache(&main);
+        assert!(!edge_sha1.graph_path.is_file(), "fixture should start cold");
+
+        // Move to a second commit; the per-SHA output_dir changes but the
+        // project (ast_cache_root) must not. Sleep past `GIT_SHA_CACHE_TTL` so
+        // `current_git_sha_cached` re-reads HEAD (both resolves share the 2s
+        // SHA cache and would otherwise return the first commit for both).
+        let mut f2 = std::fs::File::create(main.join("lib.rs")).unwrap();
+        writeln!(f2, "fn helper() {{}}").unwrap();
+        drop(f2);
+        git(&["add", "."]);
+        if !git(&["commit", "-qm", "second"]) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(2100));
+        let edge_sha2 = resolve_compass_cache(&main);
+        assert_ne!(
+            edge_sha1.output_dir, edge_sha2.output_dir,
+            "per-SHA output dirs must differ across commits"
+        );
+        assert_eq!(
+            edge_sha1.ast_cache_root, edge_sha2.ast_cache_root,
+            "project cache root must be stable across commits"
+        );
+
+        // Seed a recent failure under the (project-keyed) cooldown, clean up later.
+        lock_cached(PREWARM_LAST_FAILED.get_or_init(|| Mutex::new(HashMap::new())))
+            .insert(edge_sha1.ast_cache_root.clone(), SystemTime::now());
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                lock_cached(PREWARM_LAST_FAILED.get_or_init(|| Mutex::new(HashMap::new())))
+                    .remove(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(edge_sha1.ast_cache_root.clone());
+
+        // Even though the HEAD/output_dir changed, a pre-warm for the second SHA
+        // must back off because the *project* recently failed.
+        assert!(
+            !prewarm_compass_index(&main),
+            "cooldown must persist across a SHA change (project keyed)"
+        );
+        let map = lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())));
+        assert!(
+            !map.contains_key(&edge_sha2.output_dir),
+            "no build may start for the new SHA while the project is in cooldown"
         );
     }
 
@@ -2669,22 +2763,30 @@ mod tests {
         assert!(!edge.graph_path.is_file(), "fixture should start cold");
 
         // Seed a failure from just before the cooldown window (older than
-        // PREWARM_FAIL_COOLDOWN), so expiry must have already happened.
+        // PREWARM_FAIL_COOLDOWN), so expiry must have already happened. The
+        // cooldown is keyed by the project (ast_cache_root).
         let expired = SystemTime::now()
             .checked_sub(PREWARM_FAIL_COOLDOWN + Duration::from_secs(1))
             .expect("cooldown overflow");
         lock_cached(PREWARM_LAST_FAILED.get_or_init(|| Mutex::new(HashMap::new())))
-            .insert(edge.output_dir.clone(), expired);
-        struct Cleanup(PathBuf);
+            .insert(edge.ast_cache_root.clone(), expired);
+        struct Cleanup {
+            proj: PathBuf,
+            out: PathBuf,
+        }
         impl Drop for Cleanup {
             fn drop(&mut self) {
+                // Failure map is keyed by project; in-flight marker by output_dir.
                 lock_cached(PREWARM_LAST_FAILED.get_or_init(|| Mutex::new(HashMap::new())))
-                    .remove(&self.0);
+                    .remove(&self.proj);
                 lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())))
-                    .remove(&self.0);
+                    .remove(&self.out);
             }
         }
-        let _cleanup = Cleanup(edge.output_dir.clone());
+        let _cleanup = Cleanup {
+            proj: edge.ast_cache_root.clone(),
+            out: edge.output_dir.clone(),
+        };
 
         // After expiry, pre-warm must proceed and start a build.
         assert!(
