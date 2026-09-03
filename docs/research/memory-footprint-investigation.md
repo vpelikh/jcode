@@ -61,10 +61,14 @@ So the whole *logical* session state is ~11-15 MB. The 4.2 GB is not session dat
   (`#[cfg(not(all(target_os="linux", target_env="gnu", not(feature="jemalloc"))))]`).
   macOS uses stock system malloc with **no arena limit, no decay, no page-return**.
   Freed arenas stay reserved and grow `ps` RSS.
-- With `jemalloc` enabled, `src/main.rs` installs jemalloc and sets
-  `malloc_conf = "dirty_decay_ms:1000,muzzy_decay_ms:1000,narenas:4"`, which
-  returns dirty pages to the OS after 1s idle — the exact mechanism that bounds
-  RSS. The code comment even notes the untuned defaults "caused 1.4 GB RSS".
+- With `jemalloc` enabled, the decay/narena tuning is applied at **build time** via the
+  `JEMALLOC_SYS_WITH_MALLOC_CONF` env var (set in `.cargo/config.toml` `[env]`), which
+  tikv-jemalloc-sys passes to jemalloc's `--with-malloc-conf` configure. This
+  `dirty_decay_ms:1000,muzzy_decay_ms:1000,narenas:4` returns dirty pages to the OS after 1s
+  idle — the exact mechanism that bounds RSS. (The runtime `malloc_conf` global exported from
+  `src/main.rs` is NOT reliably read by jemalloc on macOS, so the build-time env is the
+  authoritative wiring; see the corrected "Decay-value reconciliation" note below.) The code
+  comment even notes the untuned defaults "caused 1.4 GB RSS".
 
 ## Why `ps` RSS is not the same as "used memory"
 macOS `ps` RSS includes reserved writable VM. For a process that has ever touched
@@ -379,12 +383,20 @@ socket (it did not disturb the shared server). Independent re-verification on 20
   (`__rjem_malloc_conf`) are exported, and the global allocator is installed via
   `#[global_allocator] static GLOBAL: tikv_jemallocator::Jemalloc` in `src/main.rs`.
 
-> Decay-value reconciliation: `src/main.rs` sets `malloc_conf = "dirty_decay_ms:1000,…"`,
-> the exported symbol is prefixed `__rjem_` (the crate sets
-> `unprefixed_malloc_on_supported_platforms`, and the runtime/DBG override applied), and the
-> live daemon reported `dirty_decay_ms: 10000` (10 s, from a runtime/env config that took
-> precedence). The exact decay ms differs, but the mechanism is the same and the conclusion
-> (decay/release is active under jemalloc) is unaffected.
+> Decay-value reconciliation (corrected 2026-09): the live daemon reported
+> `dirty_decay_ms: 10000` (10 s), NOT the intended `1000`, because the runtime
+> `malloc_conf` global was not being applied. A standalone probe on this exact
+> macOS confirmed that jemalloc IGNORES a `#[no_mangle] pub static malloc_conf`
+> (even typed correctly as `Option<&'static c_char>`) at load time on macOS — the
+> allocator keeps its compiled-in default decay. The reliable way to apply the
+> decay/narena tuning is at BUILD time, via `JEMALLOC_SYS_WITH_MALLOC_CONF` (which
+> tikv-jemalloc-sys passes as `--with-malloc-conf` to jemalloc's configure). That
+> is now set in `.cargo/config.toml` `[env]`, and validated: the built
+> `libjemalloc.a` embeds `dirty_decay_ms:1000,muzzy_decay_ms:1000,narenas:4`.
+> The earlier interpretation ("a runtime/env config that took precedence") was
+> wrong; it was simply jemalloc's default 10000 ms because no custom config was
+> actually applied. The conclusion that jemalloc decay/release actively bounds
+> RSS is unaffected, and is now actually achieved via the build-time config.
 
 **Footprint / RSS vs the system-malloc daemon:**
 
@@ -535,6 +547,15 @@ gating is needed in CI or build scripts; the allocator is chosen by the Cargo de
 The allocator can still be opted out on a platform that proves it wins with system malloc
 (e.g. via `--no-default-features` or a future target-tuned profile), but that's a follow-up
 measured trade, not the shipped default.
+
+**Tuning applied at build time (correction found during review, 2026-09):** the decay/narena
+tuning that makes jemalloc actually return pages and bound RSS is now delivered via the
+build-time `JEMALLOC_SYS_WITH_MALLOC_CONF` env (in `.cargo/config.toml` `[env]`), which
+tikv-jemalloc-sys passes as `--with-malloc-conf`. This was previously attributed to the
+runtime `malloc_conf` global in `src/main.rs`, but that static is NOT reliably read by
+jemalloc on macOS (verified with a probe: the allocator kept default `dirty_decay_ms: 10000`).
+The `src/main.rs` static is now also corrected to the right type (`Option<&'static c_char>`)
+as a secondary fallback. See the corrected "Decay-value reconciliation" note above.
 
 ## Evidence references
 - `vmmap -summary 97630`: physical footprint 402.8 MB; MALLOC_SMALL(empty) 2.5 GB.
