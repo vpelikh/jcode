@@ -673,4 +673,48 @@ mod tests {
         assert_eq!(got, "ab", "coalesced bytes lost: {got:?}");
         drop(shim);
     }
+
+    /// Byte-exact stream integrity under coalescing: varying-size writes
+    /// interleaved with flushes must deliver an exactly-ordered, lossless byte
+    /// stream on a healthy consumer. This guards against reordering or partial
+    /// loss from the buffered write+flush path.
+    #[test]
+    fn mixed_size_writes_with_interleaved_flushes_are_exact_and_ordered() {
+        let (t, wrx) = mpsc::channel::<Vec<u8>>();
+        let mut shim = TerminalWriter::new(ChannelWriter { tx: t });
+
+        // A deterministic sequence of writes of varying byte lengths, with flush
+        // boundaries between groups (mirroring frames of per-cell writes).
+        let mut expected: Vec<u8> = Vec::new();
+        let mut group = |shim: &mut TerminalWriter, parts: &[&[u8]], flush_after: bool| {
+            for p in parts {
+                shim.write_all(p).unwrap();
+                expected.extend_from_slice(p);
+            }
+            if flush_after {
+                shim.flush().unwrap();
+            }
+        };
+
+        group(&mut shim, &[b"\x1b[2;1H", b"abcdef"], true);
+        group(&mut shim, &[b"\x1b[3;1H", b"x", b"\x1b[4;1H", b"longer-tail-"], false);
+        group(&mut shim, &[b"ZZ"], true);
+        group(&mut shim, &[b""], false); // empty write, no-op
+        group(&mut shim, &[b"\x1b[5;1Hfinal"], true);
+
+        // Drop flushes any remaining pending bytes.
+        drop(shim);
+
+        // Collect everything delivered to the consumer.
+        let mut got: Vec<u8> = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while got.len() < expected.len() && std::time::Instant::now() < deadline {
+            match wrx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(chunk) => got.extend_from_slice(&chunk),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(e) => panic!("recv failed: {e:?}"),
+            }
+        }
+        assert_eq!(got, expected, "buffered stream corrupted; expected {expected:?}, got {got:?}");
+    }
 }
