@@ -717,4 +717,33 @@ mod tests {
         }
         assert_eq!(got, expected, "buffered stream corrupted; expected {expected:?}, got {got:?}");
     }
+
+    /// `flush()` with nothing pending (or called repeatedly) must be a safe no-op,
+    /// and writing after that still works normally.
+    #[test]
+    fn empty_and_repeated_flush_are_noops_and_write_still_works() {
+        let (t, wrx) = mpsc::channel::<Vec<u8>>();
+        let mut shim = TerminalWriter::new(ChannelWriter { tx: t });
+
+        // Empty flush before any writes: no-op, no error.
+        shim.flush().unwrap();
+
+        // Write + flush delivers.
+        shim.write_all(b"x").unwrap();
+        shim.flush().unwrap();
+
+        // A second flush with nothing new pending is also a no-op.
+        shim.flush().unwrap();
+
+        // More writes still work.
+        shim.write_all(b"y").unwrap();
+        shim.flush().unwrap();
+
+        drop(shim);
+        let mut got = String::new();
+        while let Ok(chunk) = wrx.recv_timeout(std::time::Duration::from_millis(200)) {
+            got.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+        assert_eq!(got, "xy", "writes after empty/repeated flush lost: {got:?}");
+    }
 }
