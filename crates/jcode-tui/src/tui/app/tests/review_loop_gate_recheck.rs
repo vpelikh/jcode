@@ -17,26 +17,11 @@ fn gate_recheck_that_fails_surfaces_and_finishes_closed() {
         let mut app = create_test_app();
         let session_id = app.session_id().to_string();
 
-        // A completed todo with NO completion confidence fails the completion
-        // gate. (Give it a passing goal so it is purely the confidence gate that
-        // trips, mirroring how `todo_confidence_summary` flags missing/missing
-        // info as needs-validation.)
-        crate::todo::save_todos(
-            &session_id,
-            &[crate::todo::TodoItem {
-                group: None,
-                id: "todo-1".to_string(),
-                content: "Reviewed work".to_string(),
-                status: "completed".to_string(),
-                priority: "high".to_string(),
-                blocked_by: Vec::new(),
-                assigned_to: None,
-                confidence: None,
-                completion_confidence: None,
-                confidence_history: Vec::new(),
-            }],
-        )
-        .expect("save todos");
+        // A completed todo with NO completion confidence, but a passing goal.
+        // Ownership already holds; only the confidence gate trips, so the
+        // surfaced reason is the confidence branch specifically.
+        save_completed_todo(&session_id, None);
+        crate::todo::save_goals(&session_id, &[passing_goal()]).expect("save goal");
 
         // A converged loop that also fixed files must request the re-check.
         let mut state = jcode_session_types::ReviewLoopState::new();
@@ -53,6 +38,10 @@ fn gate_recheck_that_fails_surfaces_and_finishes_closed() {
         assert!(
             reason.starts_with("converged_gate_recheck_failed"),
             "expected gate-recheck-failed reason, got {reason:?}"
+        );
+        assert!(
+            reason.ends_with("completion confidence needs re-validation"),
+            "expected the confidence gate reason, got {reason:?}"
         );
         // The surfaced message tells the user to review the result themselves.
         assert!(
@@ -76,6 +65,45 @@ fn gate_recheck_that_fails_surfaces_and_finishes_closed() {
 }
 
 #[test]
+fn gate_recheck_that_fails_on_ownership_surfaces_ownership_reason() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        let session_id = app.session_id().to_string();
+
+        // A completed todo, but NO goal recorded for its group and no completion
+        // confidence. Ownership's `completed_groups_have_sufficient_delivery`
+        // needs a goal for every completed group, so it holds false here.
+        save_completed_todo(&session_id, Some(100)); // valid confidence, but no goal
+        // Intentionally no save_goals.
+
+        let mut state = jcode_session_types::ReviewLoopState::new();
+        state.finished = true;
+        state.needs_gate_recheck = true;
+        state.current_lens = Some(jcode_session_types::ReviewLens::Correctness);
+
+        super::commands_review::finish_review_loop(&mut app, &mut state);
+
+        assert!(state.finished);
+        let reason = state.finish_reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.starts_with("converged_gate_recheck_failed"),
+            "expected gate-recheck-failed reason, got {reason:?}"
+        );
+        assert!(
+            reason.ends_with("end-to-end delivery assessment no longer holds"),
+            "expected the ownership gate reason, got {reason:?}"
+        );
+        assert!(
+            app.display_messages().iter().any(|msg| {
+                msg.content
+                    .contains("completion assessment now disagrees")
+            }),
+            "expected the failure to be surfaced for the ownership gate"
+        );
+    });
+}
+
+#[test]
 fn gate_recheck_that_passes_finishes_cleanly() {
     with_temp_jcode_home(|| {
         let mut app = create_test_app();
@@ -83,41 +111,8 @@ fn gate_recheck_that_passes_finishes_cleanly() {
 
         // A completed todo with valid completion confidence + a passing goal so
         // both gates hold.
-        crate::todo::save_todos(
-            &session_id,
-            &[crate::todo::TodoItem {
-                group: None,
-                id: "todo-1".to_string(),
-                content: "Reviewed work".to_string(),
-                status: "completed".to_string(),
-                priority: "high".to_string(),
-                blocked_by: Vec::new(),
-                assigned_to: None,
-                confidence: None,
-                completion_confidence: Some(crate::todo::ConfidenceState::from_legacy_score(100)),
-                confidence_history: vec![
-                    crate::todo::ConfidenceState::from_legacy_score(90),
-                    crate::todo::ConfidenceState::from_legacy_score(100),
-                ],
-            }],
-        )
-        .expect("save todos");
-        crate::todo::save_goals(
-            &session_id,
-            &[crate::todo::TodoGoal {
-                group: None,
-                delivery_state: Some(crate::todo::DeliveryState::WorkflowValidated),
-                autonomy: Some(crate::todo::Autonomy::NecessaryFollowthrough),
-                iteration_maturity: Some(crate::todo::IterationMaturity::OutcomeReached),
-                closed_feedback_loop: Some(crate::todo::FeedbackLoopState::Closed),
-                feedback_loop: Some("verify completed work".to_string()),
-                feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
-                feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::MainPaths),
-                feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
-                ..Default::default()
-            }],
-        )
-        .expect("save goal delivery state");
+        save_completed_todo(&session_id, Some(100));
+        crate::todo::save_goals(&session_id, &[passing_goal()]).expect("save goal");
 
         // Sanity: the plumbing used by finish_review_loop must actually see the
         // goal and todos we just persisted, or this test would be testing the
@@ -146,6 +141,51 @@ fn gate_recheck_that_passes_finishes_cleanly() {
             "a passing gate re-check must not surface a failure"
         );
     });
+}
+
+/// Persist a single completed todo for the given session.
+fn save_completed_todo(session_id: &str, completion_confidence: Option<u8>) {
+    crate::todo::save_todos(
+        session_id,
+        &[crate::todo::TodoItem {
+            group: None,
+            id: "todo-1".to_string(),
+            content: "Reviewed work".to_string(),
+            status: "completed".to_string(),
+            priority: "high".to_string(),
+            blocked_by: Vec::new(),
+            assigned_to: None,
+            confidence: None,
+            completion_confidence: completion_confidence.map(|score| {
+                crate::todo::ConfidenceState::from_legacy_score(score)
+            }),
+            confidence_history: match completion_confidence {
+                Some(_) => vec![
+                    crate::todo::ConfidenceState::from_legacy_score(90),
+                    crate::todo::ConfidenceState::from_legacy_score(100),
+                ],
+                None => Vec::new(),
+            },
+        }],
+    )
+    .expect("save todos");
+}
+
+/// A goal that passes every ownership sub-check for a completed `group: None`
+/// group.
+fn passing_goal() -> crate::todo::TodoGoal {
+    crate::todo::TodoGoal {
+        group: None,
+        delivery_state: Some(crate::todo::DeliveryState::WorkflowValidated),
+        autonomy: Some(crate::todo::Autonomy::NecessaryFollowthrough),
+        iteration_maturity: Some(crate::todo::IterationMaturity::OutcomeReached),
+        closed_feedback_loop: Some(crate::todo::FeedbackLoopState::Closed),
+        feedback_loop: Some("verify completed work".to_string()),
+        feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
+        feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::MainPaths),
+        feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
+        ..Default::default()
+    }
 }
 
 // --- Integration through the real turn-end boundary ---
@@ -201,24 +241,10 @@ fn step_review_loop_converges_with_fix_and_gate_recheck_surfaces_on_failure() {
         let mut app = create_test_app();
         let parent_session_id = app.session_id().to_string();
 
-        // A completed todo with no completion confidence trips the completion
-        // gate when the post-review re-check runs.
-        crate::todo::save_todos(
-            &parent_session_id,
-            &[crate::todo::TodoItem {
-                group: None,
-                id: "todo-1".to_string(),
-                content: "Reviewed work".to_string(),
-                status: "completed".to_string(),
-                priority: "high".to_string(),
-                blocked_by: Vec::new(),
-                assigned_to: None,
-                confidence: None,
-                completion_confidence: None,
-                confidence_history: Vec::new(),
-            }],
-        )
-        .expect("save todos");
+        // A completed todo with no completion confidence, but a passing goal.
+        // Only the confidence gate trips when the post-review re-check runs.
+        save_completed_todo(&parent_session_id, None);
+        crate::todo::save_goals(&parent_session_id, &[passing_goal()]).expect("save goal");
 
         // Move the engine to the final confirmation lens. The recorded touched
         // file means the review's fix changed the work under review.
@@ -255,6 +281,10 @@ fn step_review_loop_converges_with_fix_and_gate_recheck_surfaces_on_failure() {
             "expected gate-recheck-failed reason through step_review_loop, got {reason:?}"
         );
         assert!(
+            reason.ends_with("completion confidence needs re-validation"),
+            "expected the confidence gate reason through step_review_loop, got {reason:?}"
+        );
+        assert!(
             !state.needs_gate_recheck,
             "the one-shot gate re-check flag must be consumed"
         );
@@ -276,41 +306,8 @@ fn step_review_loop_converges_with_fix_and_gate_recheck_passes_cleanly() {
 
         // Completed todo with valid confidence + a fully passing goal so both
         // post-review gates hold.
-        crate::todo::save_todos(
-            &parent_session_id,
-            &[crate::todo::TodoItem {
-                group: None,
-                id: "todo-1".to_string(),
-                content: "Reviewed work".to_string(),
-                status: "completed".to_string(),
-                priority: "high".to_string(),
-                blocked_by: Vec::new(),
-                assigned_to: None,
-                confidence: None,
-                completion_confidence: Some(crate::todo::ConfidenceState::from_legacy_score(100)),
-                confidence_history: vec![
-                    crate::todo::ConfidenceState::from_legacy_score(90),
-                    crate::todo::ConfidenceState::from_legacy_score(100),
-                ],
-            }],
-        )
-        .expect("save todos");
-        crate::todo::save_goals(
-            &parent_session_id,
-            &[crate::todo::TodoGoal {
-                group: None,
-                delivery_state: Some(crate::todo::DeliveryState::WorkflowValidated),
-                autonomy: Some(crate::todo::Autonomy::NecessaryFollowthrough),
-                iteration_maturity: Some(crate::todo::IterationMaturity::OutcomeReached),
-                closed_feedback_loop: Some(crate::todo::FeedbackLoopState::Closed),
-                feedback_loop: Some("verify completed work".to_string()),
-                feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
-                feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::MainPaths),
-                feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
-                ..Default::default()
-            }],
-        )
-        .expect("save goal delivery state");
+        save_completed_todo(&parent_session_id, Some(100));
+        crate::todo::save_goals(&parent_session_id, &[passing_goal()]).expect("save goal");
 
         let mut state = drive_to_final_confirmation_lens(vec!["fixed.rs".to_string()]);
 
