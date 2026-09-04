@@ -182,10 +182,10 @@ impl Serialize for SessionEventOp {
                     }
                 }
                 // Non-object payloads cannot carry an `op` alongside other
-                // fields; emit `op` plus the payload under `data` so the value
-                // survives a round trip losslessly.
+                // fields; emit the payload under `data`. `op` is emitted exactly
+                // once below (after the match), same as the object branch, so the
+                // output never carries duplicate `op` keys.
                 other => {
-                    map.serialize_entry(OP_KEY, event_type)?;
                     map.serialize_entry("data", other)?;
                 }
             }

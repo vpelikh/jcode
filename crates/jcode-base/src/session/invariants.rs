@@ -3,9 +3,12 @@
 //! dsh ships a package-owned `ctx.invariants` registry of runtime assertions;
 //! its headline invariant is "anything that reaches a model request must be
 //! reconstructable from the session log." We take the same shape here: a small
-//! set of *named* checks over the append-only event log that must always hold,
-//! enforced with a hard `debug_assert!` in dev and a structured `InvariantLog`
-//! (metrics/log) in release.
+//! set of *named* checks over the append-only event log. [`InvariantLog::enforce`]
+//! is the seam that turns a violation into a hard `debug_assert!` panic in dev
+//! and a structured log/metric in release, but it is **not yet wired into a
+//! production call site** — callers adopt it explicitly. Today the built-in
+//! checks run as a *diagnostic* pass on the load path (reporting violations to
+//! stderr in debug builds without aborting load) and in tests.
 //!
 //! The registry also provides a minimal **projection seam** (takeaway #4): rather
 //! than re-scanning the raw event stream ad hoc, consumers fold committed
@@ -374,7 +377,23 @@ impl LogProjection for MessageCountProjection {
         match &event.op {
             SessionEventOp::AppendMessage { .. } => *state += 1,
             SessionEventOp::InsertMessage { .. } => *state += 1,
-            SessionEventOp::ReplaceMessages { messages, .. } => *state = messages.len(),
+            SessionEventOp::ReplaceMessages {
+                start_index,
+                end_index,
+                messages,
+                ..
+            } => {
+                // A `ReplaceMessages` is a *splice*: it replaces the span
+                // `start_index..end_index` (capped at the live length, mirroring
+                // `derive_messages`) with `messages`. For a full replacement
+                // (`start=0`, `end=usize::MAX`) the result is simply
+                // `messages.len()`; for a partial splice the result is
+                // `state - (end - start) + messages.len()`. Using
+                // `messages.len()` alone would under-count partial replacements.
+                let end = (*end_index).min(*state);
+                let start = (*start_index).min(end);
+                *state = state.saturating_sub(end - start).saturating_add(messages.len());
+            }
             SessionEventOp::ClearAll => *state = 0,
             _ => {}
         }
@@ -521,5 +540,54 @@ mod tests {
         });
         let count = project_map::<MessageCountProjection>(&map).expect("valid projection");
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn projection_folds_partial_splice_like_derive_messages() {
+        let mut map = SessionEventMap::default();
+        append(&mut map, "e1", text_msg("m1"));
+        append(&mut map, "e2", text_msg("m2"));
+        append(&mut map, "e3", text_msg("m3"));
+        append(&mut map, "e4", text_msg("m4"));
+        assert_eq!(map.derive_messages().len(), 4);
+
+        // Partial replacement: replace m1..m3 (indices 1..=3) with a single
+        // message. Real derived transcript is 4 + 1 - (3-1) = 3.
+        map.events.push(SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: "e_replace".to_string(),
+            op: SessionEventOp::ReplaceMessages {
+                start_index: 1,
+                end_index: 3,
+                messages: vec![text_msg("mnew")],
+            },
+            parent_id: None,
+            version: 1,
+        });
+        assert_eq!(map.derive_messages().len(), 3, "sanity: derive_messages");
+        assert_eq!(
+            project_map::<MessageCountProjection>(&map).expect("valid projection"),
+            3,
+            "projection must match derive_messages for a partial splice"
+        );
+
+        // Full replacement (start=0, end=usize::MAX) collapses to the replacement size.
+        map.events.push(SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: "e_full".to_string(),
+            op: SessionEventOp::ReplaceMessages {
+                start_index: 0,
+                end_index: usize::MAX,
+                messages: vec![text_msg("only"), text_msg("two")],
+            },
+            parent_id: None,
+            version: 1,
+        });
+        assert_eq!(map.derive_messages().len(), 2, "sanity: full replace");
+        assert_eq!(
+            project_map::<MessageCountProjection>(&map).expect("valid projection"),
+            2,
+            "projection must match derive_messages for a full replacement"
+        );
     }
 }

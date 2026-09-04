@@ -2037,6 +2037,37 @@ fn test_compact_transcript_with_bracket_produces_balanced_durable_bracket() {
         .expect("reloaded bracket producer log must stay consistent");
 }
 
+/// An `Unknown` event constructed in-memory with a **non-object** `data` payload
+/// (e.g. `data: json!(123)`) must serialize to exactly one top-level `op` key.
+/// Regression for a bug where the non-object branch emitted `op` inside the
+/// match *and* again after it, producing invalid JSON with duplicate keys:
+/// `{"op":"x","data":123,"op":"x"}`. The serialized form is also shape-stable
+/// after the first round-trip (a scalar becomes the object-wrapped form, matching
+/// the on-wire shape, and stays stable on subsequent round-trips).
+#[test]
+fn test_unknown_op_in_memory_non_object_serializes_single_op() {
+    let op = SessionEventOp::Unknown {
+        event_type: "plugin_scalar".to_string(),
+        data: serde_json::json!(123),
+    };
+    // The RAW serialized string must contain exactly one `op` key (no duplicates).
+    let json = serde_json::to_string(&op).expect("serialize in-memory non-object");
+    let raw_op_count = json.matches("\"op\":").count();
+    assert_eq!(
+        raw_op_count,
+        1,
+        "in-memory non-object Unknown must serialize exactly one op key; got: {json}"
+    );
+    // The round-trip must be stable: after the first deserialize the value settles
+    // into the object-wrapped wire form and stays unchanged on further round-trips.
+    let back: SessionEventOp = serde_json::from_str(&json).expect("deserialize");
+    let json2 = serde_json::to_string(&back).expect("re-serialize");
+    let again: SessionEventOp = serde_json::from_str(&json2).expect("re-deserialize");
+    let json3 = serde_json::to_string(&again).expect("re-serialize 2");
+    assert_eq!(json2, json3, "shape must stabilize after first round-trip");
+    assert_eq!(json2.matches("\"op\":").count(), 1);
+}
+
 /// The `Unknown` escape hatch must round-trip **stably** even when the remaining
 /// payload is not a flat JSON object (e.g. `{"op":"x","data":123}`). Such a
 /// value is preserved as an object wrapper (`data: { "data": 123 }`) so it
