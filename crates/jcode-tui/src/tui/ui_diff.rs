@@ -24,7 +24,7 @@ pub(super) struct ParsedDiffLine {
 }
 
 pub(super) fn diff_change_counts(content: &str) -> (usize, usize) {
-    let lines = collect_diff_lines(content);
+    let lines = filter_unnumbered_prose_lines(collect_diff_lines(content));
     let additions = lines
         .iter()
         .filter(|line| line.kind == DiffLineKind::Add)
@@ -431,7 +431,7 @@ pub(super) fn tint_span_with_diff_color(span: Span<'static>, diff_color: Color) 
 #[cfg(test)]
 mod tests {
     use super::{
-        DiffLineKind, collect_diff_lines, diff_change_counts_for_tool,
+        DiffLineKind, collect_diff_lines, diff_change_counts, diff_change_counts_for_tool,
         diff_counts_from_apply_patch_input, filter_unnumbered_prose_lines,
         generate_diff_lines_from_strings,
     };
@@ -541,5 +541,13 @@ mod tests {
         let lines = collect_diff_lines("- only\n+ pair");
         let filtered = filter_unnumbered_prose_lines(lines);
         assert_eq!(filtered.len(), 2, "plain diff was wrongly pruned: {:?}", filtered);
+    }
+
+    #[test]
+    fn diff_change_counts_exclude_config_notice_bullets() {
+        // The (+N -M) badge must not count a config-notice markdown bullet as a
+        // deletion, which would overstate the diff (here 1 add / 1 del, not 1/2).
+        let content = "Edited config.toml\n2- old\n2+ new\n\nConfig changes:\n- `key`: old -> new (live now)\n";
+        assert_eq!(diff_change_counts(content), (1, 1), "badge counts leaked bullet");
     }
 }
