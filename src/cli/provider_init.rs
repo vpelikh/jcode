@@ -1554,13 +1554,6 @@ async fn init_provider_with_options(
             select_initial_model_provider("openrouter");
             Arc::new(provider::MultiProvider::new_fast())
         }
-        ProviderChoice::OrcaRouter => {
-            disable_subscription_runtime_mode();
-            ensure_external_api_key_auth_allowed_for_explicit_choice("ORCAROUTER_API_KEY")?;
-            init_notice("Using OrcaRouter as the initial provider (use /model to switch)");
-            select_initial_model_provider("orcarouter");
-            Arc::new(provider::MultiProvider::new_fast())
-        }
         ProviderChoice::Bedrock => {
             disable_subscription_runtime_mode();
             init_notice("Using AWS Bedrock as the initial provider (use /model to switch)");
@@ -1580,6 +1573,7 @@ async fn init_provider_with_options(
         ProviderChoice::Opencode
         | ProviderChoice::OpencodeGo
         | ProviderChoice::Zai
+        | ProviderChoice::OrcaRouter
         | ProviderChoice::Ai302
         | ProviderChoice::Baseten
         | ProviderChoice::Conifer
