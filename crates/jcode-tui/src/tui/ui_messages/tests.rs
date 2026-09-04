@@ -665,9 +665,13 @@ fn render_todos_message_shows_user_intention_when_understanding_is_unclear() {
             .any(|line| line.contains("Intent partial: This deliberately long assessment detail")),
         "wide={wide:?}"
     );
-    let wide_joined = wide.join("\n");
+    // Wrapping legitimately splits the intent across lines (with a continuation
+    // indent), so the full text can't appear as one contiguous raw substring.
+    // It must be preserved verbatim across the wrap: every character appears in
+    // order once all inter-line whitespace (wrap newlines + indents) is removed.
+    let wide_compact = without_whitespace(&wide.join("\n"));
     assert!(
-        wide_joined.contains(long_text),
+        wide_compact.contains(&without_whitespace(long_text)),
         "wide intent should be preserved in full by wrapping, not ellipsized: {wide:?}"
     );
     assert!(
