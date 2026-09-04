@@ -1777,6 +1777,44 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         self.mark_messages_append_dirty();
     }
 
+    /// Complete a log-bracketed compaction (deepseek-harness takeaway #5).
+    ///
+    /// Compaction is a **log-bracketed, replayable operation**: a run appends a
+    /// `CompactionStart` marker, replaces the old transcript span with the
+    /// summary, and closes with `CompactionEnd`. A crash between `Start` and
+    /// `End` leaves a *detectable orphaned lock* (see
+    /// [`SessionEventMap::orphaned_compaction`]) rather than a half-applied
+    /// summary, so replay can surface an explicit "incomplete compaction" state
+    /// instead of silently trusting a partial surface mutation.
+    ///
+    /// This is the producer seam producers should call instead of reaching into
+    /// `set_compaction` / `replace_messages` separately. It emits the balanced
+    /// bracket around a single surface mutation and keeps the legacy
+    /// `self.compaction` vector in sync with what the log derives.
+    ///
+    /// Returns the compaction id of the bracket so a caller can correlate a
+    /// later crash-recovery report back to the specific span being summarized.
+    /// Callers should snap `messages` (and `covers_up_to_turn`) to tool-pairing
+    /// boundaries so no open tool/call pair crosses the cut (the
+    /// `ToolPairingBalanced` invariant enforces this on replay).
+    pub fn compact_transcript_with_bracket(
+        &mut self,
+        compaction_id: impl Into<String>,
+        messages: Vec<StoredMessage>,
+        compaction: StoredCompactionState,
+        covers_up_to_turn: usize,
+    ) -> String {
+        let compaction_id = compaction_id.into();
+        self.event_map
+            .start_compaction(compaction_id.clone(), covers_up_to_turn);
+        // One surface mutation inside the bracket: replace the transcript with
+        // the summarized tail. This is the only change replay needs to apply.
+        self.replace_messages(messages);
+        self.event_map.end_compaction(compaction.clone());
+        self.compaction = Some(compaction);
+        compaction_id
+    }
+
     /// Fork session up to a boundary (returns new session with prefix of events)
     pub fn fork_up_to_boundary(&self, boundary_index: usize) -> Self {
         let mut fork = self.clone();
