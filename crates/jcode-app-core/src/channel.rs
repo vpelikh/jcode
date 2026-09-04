@@ -2743,6 +2743,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_concurrent_client_or_default_runs_single_discovery() {
+        // Regression for the discovery-dedup fix: concurrent callers of
+        // client_or_default must not each fire their own discovery sweep. A
+        // single mock mirror records exactly one getMe probe (the first
+        // discovery); the losing caller observes discovered_once under the lock
+        // and reuses the already-set client instead of probing again.
+        let mock = MockTelegram::start().await;
+        let ch = std::sync::Arc::new(TelegramChannel::with_connectivity(
+            "tok".into(),
+            "77".into(),
+            true,
+            Some(mock.base()),
+            None,
+            None,
+            None,
+        ));
+        let ch1 = std::sync::Arc::clone(&ch);
+        let ch2 = std::sync::Arc::clone(&ch);
+        let (r1, r2) = tokio::join!(
+            async move { ch1.client_or_default().await },
+            async move { ch2.client_or_default().await },
+        );
+        // Both got a usable client.
+        assert!(r1.get("http://example.com").build().is_ok());
+        assert!(r2.get("http://example.com").build().is_ok());
+        // Exactly ONE discovery probe (getMe) must have reached the mirror.
+        let getme_count = mock
+            .methods()
+            .await
+            .iter()
+            .filter(|m| m.as_str() == "getMe")
+            .count();
+        assert_eq!(
+            getme_count, 1,
+            "two concurrent client_or_default calls must run a single discovery, found {getme_count}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_free_callback_requests_confirmation_instead_of_freeing() {
         let _guard = crate::storage::lock_test_env();
         let home = tempfile::TempDir::new().expect("temp home");
