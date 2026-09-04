@@ -1437,8 +1437,12 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         // event-count growth (not tail-id compare) for robustness.
         let recorded = self.event_map.events.len() > events_before;
         
-        // Keep backward compatibility
-        self.messages.insert(index, message);
+        // Keep backward compatibility. Clamp the index to the live length to
+        // match `derive_messages` (which clamps `InsertMessage` to `len`): an
+        // out-of-range index must not panic the legacy vector while replay
+        // tolerates it. `index == len` is a valid end-append.
+        let idx = index.min(self.messages.len());
+        self.messages.insert(idx, message);
         self.mark_memory_profile_dirty();
         self.mark_messages_full_dirty();
         if !recorded {
