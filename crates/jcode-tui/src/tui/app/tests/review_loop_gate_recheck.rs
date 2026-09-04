@@ -183,6 +183,51 @@ fn gate_recheck_that_passes_finishes_cleanly() {
     });
 }
 
+#[test]
+fn finish_without_gate_recheck_emits_digest_and_does_not_touch_gates() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+
+        // No todos persisted at all, and the flag is false (converged without
+        // touching files, or stalled). `finish_review_loop` must not evaluate
+        // the gates or surface anything - it just emits the digest and marks
+        // the loop done.
+        let mut state = jcode_session_types::ReviewLoopState::new();
+        state.finished = true;
+        state.needs_gate_recheck = false;
+        state.current_lens = Some(jcode_session_types::ReviewLens::Correctness);
+
+        super::commands_review::finish_review_loop(&mut app, &mut state);
+
+        assert!(state.finished);
+        assert!(!state.needs_gate_recheck);
+        // No failure-surfacing message and no spurious gate evaluation.
+        assert!(
+            !app.display_messages().iter().any(|msg| {
+                msg.content
+                    .contains("completion assessment now disagrees")
+            }),
+            "a no-re-check finish must not surface a gate failure"
+        );
+        assert!(
+            app.session
+                .review_loop
+                .as_ref()
+                .map(|s| s.finished)
+                .unwrap_or(false),
+            "session review loop must be marked finished"
+        );
+        // The digest was still emitted (the end-of-loop summary). With a bare
+        // state (no record) `build_digest` returns the "Review complete." form.
+        assert!(
+            app.display_messages()
+                .iter()
+                .any(|msg| msg.content.contains("Review complete.")),
+            "the digest must still be emitted without a gate re-check"
+        );
+    });
+}
+
 /// Persist a single completed todo for the given session.
 ///
 /// When completion confidence is present, the recorded history climbs one level
