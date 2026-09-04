@@ -241,6 +241,15 @@ const VERSIONS_KEEP_NEWEST: usize = 2;
 /// deletes the rest. Any failure is swallowed so a prune problem never fails an
 /// install.
 pub fn prune_old_versions() -> Result<()> {
+    prune_old_versions_protecting(&[])
+}
+
+/// Same as [`prune_old_versions`] but additionally protects the given version
+/// labels from being pruned, even if they are not (yet) current/stable/shared,
+/// manifest-referenced, or channel-symlinked. Used by the self-dev publish path
+/// to preserve the *previous* current version, which is recorded as a rollback
+/// target only after publish returns — it must not be deleted in the interim.
+pub fn prune_old_versions_protecting(extra_protected: &[String]) -> Result<()> {
     let versions_dir = builds_dir()?.join("versions");
     let Ok(entries) = std::fs::read_dir(&versions_dir) else {
         return Ok(());
@@ -298,6 +307,21 @@ pub fn prune_old_versions() -> Result<()> {
                         .unwrap_or_else(|_| parent.to_path_buf()),
                 );
             }
+        }
+    }
+    // 1c) Explicitly requested extra-protected versions (e.g. the previous
+    //     current preserved as a rollback target by the self-dev publisher).
+    //     These are not yet manifest-referenced or channel-promoted when the
+    //     publisher's in-lining prune runs, so protect them explicitly.
+    for version in extra_protected {
+        if let Ok(bin) = storage_helpers::version_binary_path(version)
+            && let Some(parent) = bin.parent()
+        {
+            protected.push(
+                parent
+                    .canonicalize()
+                    .unwrap_or_else(|_| parent.to_path_buf()),
+            );
         }
     }
     // 2) Any channel symlink under `builds/<channel>/` that resolves into
@@ -838,8 +862,14 @@ pub fn publish_local_current_build_for_source(
 
     // Reclaim space: self-dev builds install an immutable version dir (~611 MB
     // each) that would otherwise accumulate on every build. The current channel
-    // is promoted above, so it (and stable/shared-server) are protected; prune.
-    let _ = prune_old_versions();
+    // is promoted above, so it (and stable/shared-server) are protected. Also
+    // protect the *previous* current: it is recorded as a rollback target (via
+    // pending_activation) only after publish returns, so it must survive here.
+    let mut extra_protected = Vec::new();
+    if let Some(prev) = previous_current_version.clone() {
+        extra_protected.push(prev);
+    }
+    let _ = prune_old_versions_protecting(&extra_protected);
 
     Ok(PublishedBuild {
         version: source.version_label.clone(),
