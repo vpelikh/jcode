@@ -3126,3 +3126,63 @@ std::fs::write(
         .expect("event log must stay consistent after journal salvage");
     Ok(())
 }
+
+/// Fork is a derived operation on the event-sourced log: the child's event map
+/// is the parent's prefix up to the boundary. A fork truncates the event log,
+/// so my persistence guard (`event_map.events.len() < events_len`) must force a
+/// full snapshot on the fork's first save (a tail-delta journal entry would
+/// misrepresent the truncated log). After reload, the fork's event log and
+/// legacy vectors must agree.
+#[test]
+fn forked_session_persists_truncated_event_log_via_snapshot() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-fork-persist-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let parent_id = "fork_parent_rt";
+    let mut parent = Session::create_with_id(parent_id.to_string(), None, Some("parent".to_string()));
+    for i in 0..5 {
+        parent.append_stored_message(StoredMessage {
+            id: format!("m{i}"),
+            role: Role::User,
+            content: vec![crate::message::ContentBlock::Text {
+                text: format!("msg {i}"),
+                cache_control: None,
+            }],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+    // Persist the parent so its snapshot + persist_state.events_len are set.
+    parent.save()?;
+    assert_eq!(parent.messages.len(), 5);
+
+    // Fork at boundary 3 (inclusive): the child keeps events 0..=3 → 4 messages.
+    let mut fork = parent.fork_up_to_boundary(3);
+    assert_eq!(fork.messages.len(), 4);
+    assert_eq!(fork.event_map.events.len(), 4);
+
+    // Save the fork with a distinct id. The truncated event log (< events_len
+    // inherited from the parent) must force a snapshot, not a journal append.
+    let fork_id = fork.id.clone();
+    fork.save()?;
+    let fork_journal = session_journal_path(&fork_id)?;
+    assert!(
+        !fork_journal.exists(),
+        "fork's truncated event log must force a snapshot, not a journal append"
+    );
+
+    // Reload the fork: event log and legacy vectors must agree and be bounded.
+    let reloaded = Session::load(&fork_id)?;
+    assert_eq!(reloaded.messages.len(), 4);
+    assert_eq!(reloaded.event_map.events.len(), 4);
+    reloaded
+        .rederive_all_checked()
+        .expect("fork reload must keep event log consistent with truncated vectors");
+    Ok(())
+}
