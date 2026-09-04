@@ -1565,3 +1565,48 @@ fn test_autoreview_loop_mode_stall_tolerates_missing_fields() {
     assert!(cfg.autoreview.loop_mode);
     assert_eq!(cfg.autoreview.max_stalled_turns, 3);
 }
+
+#[test]
+fn test_telegram_connectivity_fields_round_trip_and_env_override() {
+    // The anti-censorship connectivity fields (mirror base, proxy, pinned IP)
+    // carry routing semantics, so they must survive a Config serialize/parse
+    // round trip and be reachable via their env overrides.
+    let src = r#"
+        [safety]
+        telegram_api_base = "https://mirror.example.com/bot"
+        telegram_proxy = "socks5://127.0.0.1:1080"
+        telegram_api_ip = "149.154.167.220"
+    "#;
+    let cfg: Config = toml::from_str(src).expect("telegram connectivity config parses");
+    assert_eq!(
+        cfg.safety.telegram_api_base.as_deref(),
+        Some("https://mirror.example.com/bot")
+    );
+    assert_eq!(
+        cfg.safety.telegram_proxy.as_deref(),
+        Some("socks5://127.0.0.1:1080")
+    );
+    assert_eq!(
+        cfg.safety.telegram_api_ip.as_deref(),
+        Some("149.154.167.220")
+    );
+
+    // Round-trip through TOML: none of the three fields may be dropped.
+    let serialized = toml::to_string(&cfg).expect("serialize config");
+    let restored: Config = toml::from_str(&serialized).expect("re-parse config");
+    assert_eq!(restored.safety.telegram_api_base, cfg.safety.telegram_api_base);
+    assert_eq!(restored.safety.telegram_proxy, cfg.safety.telegram_proxy);
+    assert_eq!(restored.safety.telegram_api_ip, cfg.safety.telegram_api_ip);
+
+    // Env override wiring reaches the mirror-base field.
+    let _guard = crate::storage::lock_test_env();
+    let prev = std::env::var_os("JCODE_TELEGRAM_API_BASE");
+    crate::env::set_var("JCODE_TELEGRAM_API_BASE", "https://env.example.com/bot");
+    let mut cfg2 = Config::default();
+    cfg2.apply_env_overrides();
+    assert_eq!(
+        cfg2.safety.telegram_api_base.as_deref(),
+        Some("https://env.example.com/bot")
+    );
+    restore_env_var("JCODE_TELEGRAM_API_BASE", prev);
+}
