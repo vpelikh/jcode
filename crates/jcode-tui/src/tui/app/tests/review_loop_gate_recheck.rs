@@ -147,3 +147,204 @@ fn gate_recheck_that_passes_finishes_cleanly() {
         );
     });
 }
+
+// --- Integration through the real turn-end boundary ---
+//
+// The two tests above call `finish_review_loop` directly. These next two drive
+// the *producer*: `step_review_loop`, which is what `schedule_turn_end_followups`
+// invokes every turn while the loop is active. They exercise the real path —
+// poll the persisted reviewer child session, parse its `VERDICT`, run the engine
+// through `apply_verdict`/`advance_lens`, converge, set `needs_gate_recheck`,
+// and then evaluate the completion gates — rather than handing a finished state
+// straight to the digest/emit stage.
+
+/// Drive the review engine to one step short of convergence: all lenses clean on
+/// the first pass, then all but the last lens clean on the confirmation pass,
+/// leaving `current_lens` at the final confirmation lens with `record` recording
+/// the files a fix touched. This is the exact state the real loop is in right
+/// before the reviewer returns the last CLEAN verdict.
+fn drive_to_final_confirmation_lens(
+    touched_files: Vec<String>,
+) -> jcode_session_types::ReviewLoopState {
+    use super::review_loop::ReviewLoopAction;
+    let mut state = jcode_session_types::ReviewLoopState::new();
+    super::review_loop::enter_review_loop(&mut state);
+    for file in touched_files {
+        super::review_loop::record_fix_files(&mut state, vec![file]);
+    }
+    // First pass: 6 clean lenses -> confirmation pass.
+    for _ in 0..6 {
+        let lens = state.current_lens.unwrap();
+        assert_eq!(
+            super::review_loop::next_action(&mut state),
+            ReviewLoopAction::SpawnReviewer(lens)
+        );
+        super::review_loop::apply_verdict(&mut state, &jcode_session_types::ReviewReport::Clean, 3);
+    }
+    assert!(state.phase_is_confirmation());
+    // Confirmation pass: clean the first 5 lenses, staying one short of the 6th.
+    for _ in 0..5 {
+        let lens = state.current_lens.unwrap();
+        assert_eq!(
+            super::review_loop::next_action(&mut state),
+            ReviewLoopAction::SpawnReviewer(lens)
+        );
+        super::review_loop::apply_verdict(&mut state, &jcode_session_types::ReviewReport::Clean, 3);
+    }
+    assert!(!state.finished);
+    state
+}
+
+#[test]
+fn step_review_loop_converges_with_fix_and_gate_recheck_surfaces_on_failure() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        let parent_session_id = app.session_id().to_string();
+
+        // A completed todo with no completion confidence trips the completion
+        // gate when the post-review re-check runs.
+        crate::todo::save_todos(
+            &parent_session_id,
+            &[crate::todo::TodoItem {
+                group: None,
+                id: "todo-1".to_string(),
+                content: "Reviewed work".to_string(),
+                status: "completed".to_string(),
+                priority: "high".to_string(),
+                blocked_by: Vec::new(),
+                assigned_to: None,
+                confidence: None,
+                completion_confidence: None,
+                confidence_history: Vec::new(),
+            }],
+        )
+        .expect("save todos");
+
+        // Move the engine to the final confirmation lens. The recorded touched
+        // file means the review's fix changed the work under review.
+        let mut state = drive_to_final_confirmation_lens(vec!["fixed.rs".to_string()]);
+
+        // A real reviewer child session whose last message is the final CLEAN
+        // verdict. `poll_loop_reviewer` loads and parses this.
+        let mut reviewer = crate::session::Session::create(None, None);
+        let reviewer_id = reviewer.id.clone();
+        reviewer.add_message_with_display_role(
+            crate::message::Role::User,
+            vec![crate::message::ContentBlock::Text {
+                text: "Reviewing finished work.\nVERDICT: CLEAN".to_string(),
+                cache_control: None,
+            }],
+            None,
+        );
+        reviewer.save().expect("save reviewer session");
+
+        state.active_reviewer_id = Some(reviewer_id);
+        app.session.review_loop = Some(state);
+
+        // The real turn-end integration point.
+        let followup = super::commands_review::step_review_loop(&mut app);
+
+        // step_review_loop emits the digest + failure surfacing and stops; it
+        // does not schedule another review round.
+        assert!(!followup);
+        let state = app.session.review_loop.as_ref().unwrap();
+        assert!(state.finished);
+        let reason = state.finish_reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.starts_with("converged_gate_recheck_failed"),
+            "expected gate-recheck-failed reason through step_review_loop, got {reason:?}"
+        );
+        assert!(
+            !state.needs_gate_recheck,
+            "the one-shot gate re-check flag must be consumed"
+        );
+        assert!(
+            app.display_messages().iter().any(|msg| {
+                msg.content
+                    .contains("Review fixed files, but the completion assessment now disagrees")
+            }),
+            "expected the failure to be surfaced through the real turn-end path"
+        );
+    });
+}
+
+#[test]
+fn step_review_loop_converges_with_fix_and_gate_recheck_passes_cleanly() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        let parent_session_id = app.session_id().to_string();
+
+        // Completed todo with valid confidence + a fully passing goal so both
+        // post-review gates hold.
+        crate::todo::save_todos(
+            &parent_session_id,
+            &[crate::todo::TodoItem {
+                group: None,
+                id: "todo-1".to_string(),
+                content: "Reviewed work".to_string(),
+                status: "completed".to_string(),
+                priority: "high".to_string(),
+                blocked_by: Vec::new(),
+                assigned_to: None,
+                confidence: None,
+                completion_confidence: Some(crate::todo::ConfidenceState::from_legacy_score(100)),
+                confidence_history: vec![
+                    crate::todo::ConfidenceState::from_legacy_score(90),
+                    crate::todo::ConfidenceState::from_legacy_score(100),
+                ],
+            }],
+        )
+        .expect("save todos");
+        crate::todo::save_goals(
+            &parent_session_id,
+            &[crate::todo::TodoGoal {
+                group: None,
+                delivery_state: Some(crate::todo::DeliveryState::WorkflowValidated),
+                autonomy: Some(crate::todo::Autonomy::NecessaryFollowthrough),
+                iteration_maturity: Some(crate::todo::IterationMaturity::OutcomeReached),
+                closed_feedback_loop: Some(crate::todo::FeedbackLoopState::Closed),
+                feedback_loop: Some("verify completed work".to_string()),
+                feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
+                feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::MainPaths),
+                feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
+                ..Default::default()
+            }],
+        )
+        .expect("save goal delivery state");
+
+        let mut state = drive_to_final_confirmation_lens(vec!["fixed.rs".to_string()]);
+
+        let mut reviewer = crate::session::Session::create(None, None);
+        let reviewer_id = reviewer.id.clone();
+        reviewer.add_message_with_display_role(
+            crate::message::Role::User,
+            vec![crate::message::ContentBlock::Text {
+                text: "VERDICT: CLEAN".to_string(),
+                cache_control: None,
+            }],
+            None,
+        );
+        reviewer.save().expect("save reviewer session");
+
+        state.active_reviewer_id = Some(reviewer_id);
+        app.session.review_loop = Some(state);
+
+        let followup = super::commands_review::step_review_loop(&mut app);
+
+        assert!(!followup);
+        let state = app.session.review_loop.as_ref().unwrap();
+        assert!(state.finished);
+        assert_eq!(state.finish_reason.as_deref(), Some("converged"));
+        assert!(
+            !state.needs_gate_recheck,
+            "the one-shot gate re-check flag must be consumed"
+        );
+        assert!(
+            !app.display_messages().iter().any(|msg| {
+                msg.content
+                    .contains("completion assessment now disagrees")
+            }),
+            "a passing gate re-check must not surface a failure through step_review_loop"
+        );
+    });
+}
