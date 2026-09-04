@@ -1,4 +1,6 @@
-use super::commands::{REVIEW_PREFERRED_MODEL, active_session_id, active_working_dir};
+use super::commands::{
+    REVIEW_PREFERRED_MODEL, active_session_id, active_working_dir, todo_confidence_summary,
+};
 use super::review_loop;
 use super::{App, DisplayMessage};
 use crate::id;
@@ -1507,11 +1509,7 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
                     }
                     review_loop::ReviewLoopAction::Converged
                     | review_loop::ReviewLoopAction::Stalled => {
-                        let digest = review_loop::build_and_store_digest(&mut state);
-                        app.push_display_message(DisplayMessage::system(digest));
-                        app.session.review_loop = Some(state);
-                        let _ = app.session.save();
-                        app.set_status_notice("Review loop: done");
+                        finish_review_loop(app, &mut state);
                         false
                     }
                     review_loop::ReviewLoopAction::SpawnReviewer(lens) => {
@@ -1532,10 +1530,7 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
             }
             review_loop::ReviewLoopAction::Converged
             | review_loop::ReviewLoopAction::Stalled => {
-                let digest = review_loop::build_and_store_digest(&mut state);
-                app.push_display_message(DisplayMessage::system(digest));
-                app.session.review_loop = Some(state);
-                let _ = app.session.save();
+                finish_review_loop(app, &mut state);
                 false
             }
             _ => {
@@ -1545,6 +1540,63 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
         }
     };
     result
+}
+
+/// Emit the end-of-loop digest and, when the review fixed files (so the work
+/// changed after the completion gates first passed), re-run the completion
+/// gates once against the post-fix state (N2). A failing gate in that one
+/// re-run surfaces and stops; it never re-enters the review loop, so there is
+/// no gates↔review ping-pong. The loop is left finished either way.
+pub(super) fn finish_review_loop(app: &mut App, state: &mut jcode_session_types::ReviewLoopState) {
+    // The N2 gate re-check: if the review touched files, evaluate the completion
+    // gates once against the post-fix state and fold the result into the loop's
+    // finish reason *before* the digest is built, so the digest reports what
+    // actually happened. We clear the flag as we read it so a later pass can
+    // never re-trigger the re-check.
+    if std::mem::take(&mut state.needs_gate_recheck) {
+        let session_id = active_session_id(app);
+        let todos = crate::todo::load_todos(&session_id).unwrap_or_default();
+        let goals = crate::todo::load_goals(&session_id).unwrap_or_default();
+        let ownership_ok = crate::todo::completed_groups_have_sufficient_delivery(&todos, &goals);
+        let confidence = todo_confidence_summary(&todos);
+        let confidence_ok = !confidence.completion_confidence_needs_validation;
+
+        if !(ownership_ok && confidence_ok) {
+            // The completion assessment now disagrees with the reviewed + fixed
+            // result. Surface it and stop; do not run another review round (no
+            // gates↔review ping-pong).
+            let reason = if !ownership_ok {
+                "end-to-end delivery assessment no longer holds"
+            } else {
+                "completion confidence needs re-validation"
+            };
+            state.finish_reason = Some(format!("converged_gate_recheck_failed: {reason}"));
+            app.push_display_message(DisplayMessage::system(format!(
+                "⚠️ Review fixed files, but the completion assessment now disagrees ({reason}). Please review the result yourself."
+            )));
+            app.set_status_notice("Review loop: done (gate re-check failed)");
+        } else {
+            crate::logging::info(&format!(
+                "REVIEW_LOOP_GATE_RECHECK action=passed files_touched={}",
+                state
+                    .record
+                    .as_ref()
+                    .map(|r| r.files_touched.len())
+                    .unwrap_or(0)
+            ));
+            state.finish_reason = Some("converged".to_string());
+            app.set_status_notice("Review loop: done");
+        }
+    } else {
+        // No re-check needed (converged without touching files, or stalled): the
+        // review made no post-gate change, so the original gate pass still holds.
+        app.set_status_notice("Review loop: done");
+    }
+
+    let digest = review_loop::build_and_store_digest(state);
+    app.push_display_message(DisplayMessage::system(digest));
+    app.session.review_loop = Some(state.clone());
+    let _ = app.session.save();
 }
 
 /// Spawn the per-lens reviewer for the current lens and persist the resulting

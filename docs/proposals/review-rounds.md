@@ -249,6 +249,13 @@ excluded from auto-seeding for determinism.
 gates pass → review loop → if review fixed files, re-run gates **once**; if still
 failing, surface + stop (no ping-pong).
 
+This re-run is implemented: when the loop converges and its `record.files_touched`
+is non-empty (the review changed files after the gates first passed), it re-runs the
+ownership and completion-confidence gates once against the post-fix state. A failing
+gate in that one re-run surfaces a "review fixed files, but the completion assessment
+now disagrees" message and stops; it never re-enters the review loop, so there is no
+gates↔review ping-pong.
+
 ## Config (on `AutoReviewConfig`)
 
 - `enabled` (existing; default changed to `true` so review runs by default)

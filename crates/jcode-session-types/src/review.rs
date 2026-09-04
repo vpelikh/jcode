@@ -345,6 +345,14 @@ pub struct ReviewLoopState {
     /// to detect whether the fix actually changed files at re-check poll time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fix_baseline_tree: Option<String>,
+    /// Set when the loop converged but the review fixed files, so the work
+    /// changed after the completion gates first passed. When true, the harness
+    /// must re-run the completion gates exactly once against the post-fix state
+    /// before declaring done (N2). A failing gate in that one re-run surfaces
+    /// and stops; it must NOT re-enter the review loop (no gates↔review
+    /// ping-pong).
+    #[serde(default)]
+    pub needs_gate_recheck: bool,
 }
 
 impl Default for ReviewLoopState {
@@ -361,6 +369,7 @@ impl Default for ReviewLoopState {
             reviewer_session_id: None,
             last_fix_touched_files: false,
             fix_baseline_tree: None,
+            needs_gate_recheck: false,
         }
     }
 }
