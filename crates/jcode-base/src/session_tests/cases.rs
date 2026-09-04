@@ -3039,3 +3039,90 @@ fn session_without_persisted_event_map_loads_via_rebuild() -> Result<()> {
     );
     Ok(())
 }
+
+/// Failure mode: a torn journal append (dead-writer crash mid-append) followed
+/// by a glued complete entry is salvaged by re-parsing the recoverable entry.
+/// The salvaged entry must preserve **log-only events** (here a plugin `Unknown`
+/// event appended via the public API) as well as messages, so replay survives
+/// both the corruption and the event log's journal persistence (#13).
+#[test]
+fn test_journal_salvage_preserves_unknown_event_from_glued_entry() -> Result<()> {
+    use crate::session::event_types::{SessionEvent, SessionEventOp};
+
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-journal-event-salvage-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_journal_event_salvage";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("salvage".to_string()));
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "first".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?; // snapshot, no journal
+
+    // Second save: append a message via the journal (entry 1).
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "second".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+
+    // Third save: append only a log-only plugin Unknown event. Since this is a
+    // pure event-append (no vector delta), the journal entry carries the event
+    // in `append_events` (entry 2).
+    assert!(
+        session.append_session_event(SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: "plugin_salvage_1".to_string(),
+            op: SessionEventOp::Unknown {
+                event_type: "plugin/checkpoint".to_string(),
+                data: serde_json::json!({ "salvaged": true }),
+            },
+            parent_id: None,
+            version: 1,
+        }),
+        "plugin event must be recorded"
+    );
+    session.save()?;
+    let journal_path = session_journal_path(id)?;
+    assert!(journal_path.exists(), "second save must be a journal append");
+
+    // Simulate a torn write (dead-writer crash mid-append): entry 2 (which carries
+// the plugin event) is torn so its tail is truncated, then a complete copy of
+// entry 2 appears glued (no newline) directly after the torn fragment — the
+// exact scenario `salvage_glued_journal_entries` recovers by scanning for a
+// fresh `{"meta":` start and re-parsing.
+let journal = std::fs::read_to_string(&journal_path)?;
+let lines: Vec<&str> = journal.lines().collect();
+assert_eq!(lines.len(), 2, "two journal entries expected");
+let torn = &lines[1][..lines[1].len() * 3 / 4];
+std::fs::write(
+    &journal_path,
+    format!("{}\n{}{}\n", lines[0], torn, lines[1]),
+)?;
+
+    // Reload: the message and the log-only Unknown event must both survive.
+    let loaded = Session::load(id)?;
+    assert_eq!(loaded.messages.len(), 2, "both messages must reload");
+    assert!(
+        loaded.event_map.events.iter().any(|e| matches!(
+            e.op,
+            SessionEventOp::Unknown { .. }
+        )),
+        "log-only plugin event must survive journal salvage"
+    );
+    loaded
+        .rederive_all_checked()
+        .expect("event log must stay consistent after journal salvage");
+    Ok(())
+}
