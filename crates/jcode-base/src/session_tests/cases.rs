@@ -2773,6 +2773,21 @@ fn test_orphaned_compaction_bracket_survives_journal_reload() -> Result<()> {
         reloaded.event_map.orphaned_compaction().is_some(),
         "orphaned bracket must be detectable after journal reload (takeaway #5)"
     );
+    // The acceptance check for the 'incomplete compaction' state is the public
+    // invariant registry flagging the CompactionBracket invariant as violated.
+    let inv = InvariantRegistry::builtin();
+    let inv_log = inv.check(&reloaded.event_map);
+    assert!(
+        !inv_log.is_green(),
+        "orphaned bracket must surface as a CompactionBracket violation after reload"
+    );
+    assert!(
+        inv_log
+            .violations
+            .iter()
+            .any(|v| v.invariant == "session.compaction_bracket_balanced"),
+        "the CompactionBracket invariant must be the reported violation"
+    );
     // The event log must still agree with the legacy vectors.
     reloaded
         .rederive_all_checked()
