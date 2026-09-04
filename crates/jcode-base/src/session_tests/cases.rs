@@ -3583,3 +3583,81 @@ fn empty_replace_messages_persists_via_event_consistent_checkpoint() -> Result<(
         .expect("empty-replacement reload must keep event log consistent");
     Ok(())
 }
+
+/// Forking a session whose boundary cuts through an in-flight compaction bracket
+/// must yield a fork that is internally consistent, not corrupt. If the boundary
+/// keeps a `CompactionStart` but excludes its matching `CompactionEnd`, the fork
+/// legitimately carries an orphaned (incomplete) bracket that a producer can
+/// resolve by calling `compact_transcript_with_bracket` (crash-safe retry) — but
+/// the fork must serialize/reload cleanly and `derive_messages` must reflect the
+/// kept prefix only.
+#[test]
+fn fork_mid_bracket_is_consistent_and_resolvable() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-fork-bracket-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    // Build a parent: messages, then a balanced compaction bracket.
+    let parent_id = "fork_bracket_parent";
+    let mut parent = Session::create_with_id(parent_id.to_string(), None, Some("parent".to_string()));
+    parent.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "m0".to_string(),
+            cache_control: None,
+        }],
+    );
+    parent.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "m1".to_string(),
+            cache_control: None,
+        }],
+    );
+    let comp = StoredCompactionState {
+        summary_text: "s".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 1,
+    };
+    // Event order: append(m0), append(m1), CompactionStart, CompactionEnd.
+    let start_idx = parent.event_map.events.len(); // will be CompactionStart index
+    parent.compact_transcript_with_bracket("comp_x", parent.messages.clone(), comp.clone(), 1);
+    let end_idx = parent.event_map.events.len() - 1;
+    assert!(start_idx < end_idx);
+
+    // Fork at the boundary *inside* the bracket: keep everything up to the
+    // CompactionStart (events 0..=start_idx) — the fork has an orphaned start.
+    let mut fork = parent.fork_up_to_boundary(start_idx);
+    assert!(
+        fork.event_map.orphaned_compaction().is_some(),
+        "fork cut mid-bracket must surface the orphaned CompactionStart"
+    );
+    // The fork must serialize and reload cleanly with the orphan still detectable.
+    fork.save()?;
+    let reloaded = Session::load(&fork.id)?;
+    assert!(reloaded.event_map.orphaned_compaction().is_some());
+    reloaded
+        .rederive_all_checked()
+        .expect("fork mid-bracket must reload consistent");
+    // Resolve the orphan via the crash-safe retry seam.
+    let mut resolved = reloaded;
+    resolved.compact_transcript_with_bracket(
+        "resolved",
+        resolved.messages.clone(),
+        comp.clone(),
+        1,
+    );
+    assert!(
+        resolved.event_map.orphaned_compaction().is_none(),
+        "retry seam must close the forked orphan"
+    );
+    resolved
+        .rederive_all_checked()
+        .expect("resolved fork must be consistent");
+    Ok(())
+}
