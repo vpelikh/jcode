@@ -683,6 +683,14 @@ fn test_recover_crashed_sessions_preserves_debug_flag() -> Result<()> {
 
     let recovered = Session::load(&recovered_ids[0])?;
     assert!(recovered.is_debug);
+    // The crash-recovery path (create_with_id + add_message + save) must produce
+    // a session whose event log is consistent and reloadable.
+    recovered
+        .rederive_all_checked()
+        .expect("recovered session must have a consistent event log");
+    assert_eq!(recovered.messages.len(), 2, // recovery header + copied message
+        "recovered session must carry the recovery header and the surviving text message"
+    );
     Ok(())
 }
 
