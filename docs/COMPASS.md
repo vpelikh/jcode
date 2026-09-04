@@ -64,6 +64,13 @@ does not grow unbounded as a user visits many commits. The shared `.ast-cache`,
 the non-git `workspace` output, and the current HEAD's per-SHA dir are always
 kept even when unreachable (protecting the index a live worktree reads).
 
+To bound the cache even when many commits remain *reachable* from refs (e.g. a
+long-lived backup branch keeps `git rev-list --all` growing), a hard cap
+`SHA_INDEX_MAX_KEPT` (default 3) keeps only the newest per-SHA dirs plus the
+current HEAD, and prunes the oldest regardless of reachability. Since the shared
+`.ast-cache` keeps branch-to-branch re-extract incremental, pruning a stale
+per-SHA graph is cheap to recreate on the next visit.
+
 ## Pre-warm on session bind
 
 The main performance feature: when a session subscribes to a working directory
