@@ -3186,3 +3186,61 @@ fn forked_session_persists_truncated_event_log_via_snapshot() -> Result<()> {
         .expect("fork reload must keep event log consistent with truncated vectors");
     Ok(())
 }
+
+/// A fork that keeps the *entire* event log (boundary at the last index) must
+/// still persist a loadable snapshot under its own (new) id. `fork_up_to_boundary`
+/// clones the parent's persist_state (snapshot_exists, events_len, ...), but the
+/// fork's id has no snapshot file yet — so a fork that keeps all events must not
+/// be written via the journal-append path (which would leave a journal with no
+/// snapshot, orphaned and unloadable). Saving it must force a snapshot.
+#[test]
+fn fork_keeping_all_events_still_writes_a_loadable_snapshot() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-fork-full-persist-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let parent_id = "fork_full_parent_rt";
+    let mut parent = Session::create_with_id(parent_id.to_string(), None, Some("parent".to_string()));
+    for i in 0..3 {
+        parent.append_stored_message(StoredMessage {
+            id: format!("m{i}"),
+            role: Role::User,
+            content: vec![crate::message::ContentBlock::Text {
+                text: format!("msg {i}"),
+                cache_control: None,
+            }],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+    parent.save()?;
+    assert_eq!(parent.event_map.events.len(), 3);
+
+    // Fork keeping ALL events (boundary 2 = last index).
+    let mut fork = parent.fork_up_to_boundary(2);
+    assert_eq!(fork.event_map.events.len(), 3);
+    assert_eq!(fork.messages.len(), 3);
+    assert_ne!(fork.id, parent_id);
+
+    let fork_id = fork.id.clone();
+    fork.save()?;
+
+    // A journal-append with no snapshot would orphan the fork; the fork must have
+    // a snapshot under its own id and be loadable.
+    assert!(
+        session_path(&fork_id)?.exists(),
+        "fork keeping all events must write its own snapshot, not just a journal"
+    );
+    let loaded = Session::load(&fork_id)?;
+    assert_eq!(loaded.messages.len(), 3);
+    assert_eq!(loaded.event_map.events.len(), 3);
+    loaded
+        .rederive_all_checked()
+        .expect("fork keeping all events must reload consistently");
+    Ok(())
+}

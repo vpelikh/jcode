@@ -1849,7 +1849,16 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         // Generate new ID for the fork
         fork.id = new_id("fork");
         fork.updated_at = chrono::Utc::now();
-        
+
+        // The fork cloned the parent's persist_state, which is wrong for a new id:
+        // snapshot_exists and the vector/event lengths describe the PARENT's
+        // on-disk snapshot, not this fork (which has no snapshot file, and whose
+        // event log is truncated to the boundary). Reset so the fork's first save
+        // is forced to write its own snapshot (snapshot_exists=false); otherwise a
+        // fork that keeps the full event log would journal-append with no snapshot
+        // and become unloadable under its own id.
+        fork.reset_persist_state(false);
+
         fork
     }
 
