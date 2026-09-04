@@ -205,7 +205,15 @@ pub struct Session {
     /// Kept `pub(crate)` so callers outside this crate must go through the
     /// `Session` mutation API (which keeps `messages` and the event log in
     /// sync). Direct external mutation would desync the two sources of truth.
-    #[serde(skip)]
+    ///
+    /// Persisted in the snapshot so the append-only event log survives a
+    /// restart as the authoritative record (takeaways #3/#4/#5 target this
+    /// end-to-end). `skip_serializing_if` keeps new/empty logs out of the JSON
+    /// so a session snapshot written with no events round-trips byte-compatible
+    /// with the historical format; load prefers a non-empty persisted log and
+    /// otherwise falls back to `rebuild_event_map()` (migration for sessions
+    /// written before this field was persisted).
+    #[serde(default, skip_serializing_if = "SessionEventMap::is_empty")]
     pub(crate) event_map: SessionEventMap,
     #[serde(skip)]
     persist_state: SessionPersistState,
@@ -556,10 +564,12 @@ impl Session {
             env_snapshots_len: self.env_snapshots.len(),
             memory_injections_len: self.memory_injections.len(),
             replay_events_len: self.replay_events.len(),
+            events_len: self.event_map.events.len(),
             messages_mode: PersistVectorMode::Clean,
             env_snapshots_mode: PersistVectorMode::Clean,
             memory_injections_mode: PersistVectorMode::Clean,
             replay_events_mode: PersistVectorMode::Clean,
+            events_mode: PersistVectorMode::Clean,
             last_meta: Some(self.journal_meta()),
         };
     }
@@ -721,6 +731,13 @@ impl Session {
         if self.persist_state.replay_events_mode != PersistVectorMode::Full {
             self.persist_state.replay_events_mode = PersistVectorMode::Append;
         }
+    }
+
+    /// Mark that the event log was reconstructed (not merely appended to), so a
+    /// tail-delta journal entry would not capture the change. Forces a full
+    /// snapshot on the next save.
+    fn mark_events_full_dirty(&mut self) {
+        self.persist_state.events_mode = PersistVectorMode::Full;
     }
 
     fn apply_journal_meta(&mut self, meta: SessionJournalMeta) {
@@ -1876,13 +1893,55 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         Ok((messages, compaction))
     }
 
+    /// Reconcile the event log after loading a session from disk.
+    ///
+    /// `event_map` is now persisted in the snapshot, so after `load_from_path`
+    /// the log may already be populated (the authoritative append-only record
+    /// from a prior save). This method makes the loaded session's `event_map`
+    /// consistent with the legacy vectors regardless of what the snapshot had:
+    ///
+    /// - If the persisted log is empty but the legacy vectors are populated,
+    ///   rebuild it (migration from sessions written before `event_map` was
+    ///   persisted).
+    /// - If the persisted log is non-empty *and* rederiving from it exactly
+    ///   matches the legacy vectors (`rederive_all_checked`), keep it — it is
+    ///   the authoritative record, including compaction brackets and plugin
+    ///   (`Unknown`) events that a rebuild-from-vectors cannot reproduce.
+    /// - Otherwise (persisted log stale or missing journal-appended events),
+    ///   rebuild from the vectors so the two sources of truth never diverge.
+    ///
+    /// Returns `true` when the authoritative persisted log was kept, `false`
+    /// when it was rebuilt from the legacy vectors.
+    pub fn reconcile_event_map_after_load(&mut self) -> bool {
+        if self.event_map.is_empty() {
+            if !self.messages.is_empty()
+                || !self.memory_injections.is_empty()
+                || !self.replay_events.is_empty()
+                || self.compaction.is_some()
+            {
+                self.rebuild_event_map();
+            }
+            return false;
+        }
+        match self.rederive_all_checked() {
+            Ok(_) => true,
+            Err(_) => {
+                self.rebuild_event_map();
+                false
+            }
+        }
+    }
+
     /// Rebuild the event log from the legacy session vectors.
     ///
-    /// `event_map` is `#[serde(skip)]`, so after loading a session from disk
-    /// (snapshot + journal replay) the log is empty while `messages`,
-    /// `compaction`, `memory_injections`, and `replay_events` are populated.
-    /// Without this step the event log would not be the single source of truth
-    /// for resumed sessions. Call this once after load/construct-from-disk.
+    /// `event_map` is now persisted in the snapshot, so after loading a
+    /// session from disk it is normally already populated as the authoritative
+    /// append-only record. This method discards that record and rebuilds the
+    /// log from the legacy `messages`, `compaction`, `memory_injections`, and
+    /// `replay_events` vectors. Prefer `reconcile_event_map_after_load` for the
+    /// load path, which keeps the persisted log when it agrees with the
+    /// vectors and only rebuilds when they diverge or the log is empty
+    /// (migration of pre-persistence snapshots).
     ///
     /// This is *not* idempotent-by-guard: it unconditionally rebuilds the log
     /// from the authoritative legacy vectors. Forking a session sets
@@ -1945,6 +2004,9 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         }
 
         self.event_map = map;
+        // The log was reconstructed, not appended to — a tail-delta journal
+        // entry could not capture it, so force a full snapshot on the next save.
+        self.mark_events_full_dirty();
     }
 
     pub fn record_swarm_status_event(&mut self, members: Vec<crate::protocol::SwarmMemberStatus>) {

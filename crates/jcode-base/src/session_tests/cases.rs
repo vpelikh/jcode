@@ -2569,3 +2569,213 @@ fn test_rewind_after_undo_uses_the_new_target_not_the_previous_one() {
     assert_eq!(after.last().unwrap(), "prompt-6");
     assert_eq!(session.rewind_target_count(), 11);
 }
+
+/// After a snapshot, appending a message persists through the journal (append
+/// path). The journal now carries both the appended legacy vectors *and* the
+/// appended event-log entries (`SessionJournalEntry::append_events`), so on
+/// reload the log-only events (compaction brackets, plugin `Unknown`) survive a
+/// crash recovered purely from the journal — they are not collapsed into a
+/// rebuild-from-legacy-vectors.
+#[test]
+fn test_journal_append_reload_keeps_sources_consistent() -> Result<()> {
+    use crate::session::event_types::{SessionEvent, SessionEventOp};
+
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-event-journal-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_journal_event_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("journal".to_string()));
+    session.append_stored_message(StoredMessage {
+        id: "m1".to_string(),
+        role: Role::User,
+        content: vec![crate::message::ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+
+    // Bracket + plugin Unknown event only the event log carries.
+    let compaction = StoredCompactionState {
+        summary_text: "summarized".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 1,
+    };
+    session.event_map.start_compaction("comp_1", 1);
+    session.event_map.end_compaction(compaction.clone());
+    session.compaction = Some(compaction.clone());
+    let plugin_event = SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "plugin_1".to_string(),
+        op: SessionEventOp::Unknown {
+            event_type: "review_round".to_string(),
+            data: serde_json::json!({ "rounds": 3 }),
+        },
+        parent_id: None,
+        version: 1,
+    };
+    session.event_map.append_event(plugin_event);
+
+    // First save → snapshot (no journal).
+    session.save()?;
+    let journal_path = session_journal_path(id)?;
+    assert!(!journal_path.exists(), "first save is a snapshot, no journal yet");
+
+    // Reload then append via the journal path.
+    let mut live = Session::load(id)?;
+    assert!(
+        live.event_map.events
+            .iter()
+            .any(|e| matches!(e.op, SessionEventOp::Unknown { .. })),
+        "snapshot reload must keep the plugin Unknown event"
+    );
+    live.append_stored_message(StoredMessage {
+        id: "m2".to_string(),
+        role: Role::User,
+        content: vec![crate::message::ContentBlock::Text {
+            text: "world".to_string(),
+            cache_control: None,
+        }],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    live.save()?;
+    assert!(journal_path.exists(), "second save must be a journal append");
+
+    let reloaded = Session::load(id)?;
+    assert_eq!(
+        reloaded.messages.len(),
+        2,
+        "legacy transcript must include the journal message"
+    );
+    assert_eq!(
+        reloaded.compaction.as_ref().map(|c| &c.summary_text),
+        Some(&"summarized".to_string())
+    );
+    // The log-only events must survive the journal reload, not be lost to a
+    // rebuild-from-legacy-vectors (takeaways #5 / #13 / #3).
+    assert!(
+        reloaded.event_map.events.iter().any(|e| matches!(
+            e.op,
+            SessionEventOp::CompactionStart { .. }
+        )),
+        "compaction bracket (CompactionStart) must survive the journal reload"
+    );
+    assert!(
+        reloaded.event_map.events.iter().any(|e| matches!(
+            e.op,
+            SessionEventOp::Unknown { .. }
+        )),
+        "plugin Unknown event must survive the journal reload"
+    );
+    assert!(
+        reloaded.event_map.orphaned_compaction().is_none(),
+        "balanced bracket must remain balanced after journal reload"
+    );
+    // The event log must agree with the legacy vectors after reload.
+    reloaded
+        .rederive_all_checked()
+        .expect("event log must agree with legacy vectors after journal reload");
+    Ok(())
+}
+
+/// A compaction that crashes mid-summarize leaves an open `CompactionStart`
+/// bracket with no matching `CompactionEnd` (takeaway #5). The orphan marker is
+/// a log-only event, so it must survive a journal-append + reload: a crash
+/// recovered from the journal must still surface the "incomplete compaction"
+/// state instead of silently losing the marker and trusting a half-applied
+/// summary.
+#[test]
+fn test_orphaned_compaction_bracket_survives_journal_reload() -> Result<()> {
+    use crate::session::event_types::{SessionEvent, SessionEventOp};
+
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-event-orphan-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_journal_orphan_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("orphan".to_string()));
+    session.append_stored_message(StoredMessage {
+        id: "m1".to_string(),
+        role: Role::User,
+        content: vec![crate::message::ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    // Crash simulation: a CompactionStart is appended but no CompactionEnd.
+    session.event_map.start_compaction("comp_1", 1);
+    assert!(
+        session.event_map.orphaned_compaction().is_some(),
+        "in-memory orphan bracket must be detected"
+    );
+
+    // First save → snapshot carries the orphan marker.
+    session.save()?;
+    let journal_path = session_journal_path(id)?;
+    assert!(!journal_path.exists(), "first save is a snapshot, no journal yet");
+
+    // Reload then grow the log via the journal path (e.g. a new user message
+    // before the process decides how to resolve the orphan).
+    let mut live = Session::load(id)?;
+    assert!(
+        live.event_map.orphaned_compaction().is_some(),
+        "orphan must survive the snapshot reload"
+    );
+    live.append_stored_message(StoredMessage {
+        id: "m2".to_string(),
+        role: Role::User,
+        content: vec![crate::message::ContentBlock::Text {
+            text: "world".to_string(),
+            cache_control: None,
+        }],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    live.save()?;
+    assert!(journal_path.exists(), "second save must be a journal append");
+
+    let reloaded = Session::load(id)?;
+    assert_eq!(
+        reloaded.messages.len(),
+        2,
+        "legacy transcript must include the journal message"
+    );
+    assert!(
+        reloaded
+            .event_map
+            .events
+            .iter()
+            .any(|e| matches!(e.op, SessionEventOp::CompactionStart { .. })),
+        "orphaned CompactionStart marker must survive the journal reload"
+    );
+    assert!(
+        reloaded.event_map.orphaned_compaction().is_some(),
+        "orphaned bracket must be detectable after journal reload (takeaway #5)"
+    );
+    // The event log must still agree with the legacy vectors.
+    reloaded
+        .rederive_all_checked()
+        .expect("event log must agree with legacy vectors after orphan reload");
+    Ok(())
+}

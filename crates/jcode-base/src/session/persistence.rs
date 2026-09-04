@@ -182,6 +182,13 @@ impl Session {
         self.memory_injections
             .extend(entry.append_memory_injections);
         self.replay_events.extend(entry.append_replay_events);
+        // Replay journaled event-log entries into `SessionEventMap` so log-only
+        // events (compaction brackets, plugin `Unknown`) survive a crash that is
+        // recovered from the journal, and the replayed log agrees with the
+        // replayed legacy vectors when `reconcile_event_map_after_load` runs.
+        for event in entry.append_events {
+            self.event_map.append_event(event);
+        }
         self.mark_memory_profile_dirty();
     }
 
@@ -247,21 +254,14 @@ impl Session {
         session.reset_persist_state(path.exists());
         session.reset_provider_messages_cache();
         session.mark_memory_profile_dirty();
-        // Hydrate the event-sourced log from the legacy vectors so that
-        // `event_map` is the single source of truth for resumed sessions.
-        session.rebuild_event_map();
-        // Development-only invariant check: the rehydrated event log must
-        // agree with the legacy transcript vector. This catches any code path
-        // that mutates `messages` without emitting a corresponding event.
-        // Gated to debug builds so production stays quiet on a benign mismatch.
-        if cfg!(debug_assertions)
-            && let Err(e) = session.rederive_all_checked()
-        {
-            eprintln!(
-                "session_event: event-log/legacy-vector desync after load: {}",
-                e
-            );
-        }
+        // Reconcile the event-sourced log with the legacy vectors. When the
+        // snapshot already carries a persisted `event_map`, keep it as the
+        // authoritative record (it may hold compaction brackets and plugin
+        // `Unknown` events a rebuild-from-vectors cannot reproduce) as long as
+        // it agrees with the legacy vectors; otherwise rebuild/self-heal. This
+        // also serves as the migration path for sessions written before
+        // `event_map` was persisted (those load with an empty log).
+        session.reconcile_event_map_after_load();
         // Structural invariant registry (takeaway #3): run the built-in checks
         // (tool-pairing balance, non-empty ids, parent-edge resolution, replay
         // determinism) over the freshly rehydrated log. Unlike a deliberate
@@ -374,9 +374,10 @@ impl Session {
         session.reset_persist_state(path.exists());
         session.reset_provider_messages_cache();
         session.mark_memory_profile_dirty();
-        // Hydrate the event-sourced log from the legacy vectors so that
-        // `event_map` is the single source of truth for resumed sessions.
-        session.rebuild_event_map();
+        // Reconcile the event-sourced log with the legacy vectors (keep the
+        // persisted authoritative log when it agrees, rebuild/self-heal
+        // otherwise; also migrates pre-persistence snapshots).
+        session.reconcile_event_map_after_load();
         let finalize_ms = finalize_start.elapsed().as_millis();
         crate::logging::info(&format!(
             "[TIMING] remote_startup_load: session={}, snapshot={}ms, journal={}ms, finalize={}ms, snapshot_bytes={}, journal_bytes={}, journal_entries={}, messages={}, total={}ms",
@@ -474,10 +475,12 @@ impl Session {
             || self.persist_state.env_snapshots_mode == PersistVectorMode::Full
             || self.persist_state.memory_injections_mode == PersistVectorMode::Full
             || self.persist_state.replay_events_mode == PersistVectorMode::Full
+            || self.persist_state.events_mode == PersistVectorMode::Full
             || self.messages.len() < self.persist_state.messages_len
             || self.env_snapshots.len() < self.persist_state.env_snapshots_len
             || self.memory_injections.len() < self.persist_state.memory_injections_len
-            || self.replay_events.len() < self.persist_state.replay_events_len;
+            || self.replay_events.len() < self.persist_state.replay_events_len
+            || self.event_map.events.len() < self.persist_state.events_len;
 
         let delta_messages = self
             .messages
@@ -495,6 +498,11 @@ impl Session {
             .replay_events
             .len()
             .saturating_sub(self.persist_state.replay_events_len);
+        let delta_events = self
+            .event_map
+            .events
+            .len()
+            .saturating_sub(self.persist_state.events_len);
         let (
             result,
             save_mode,
@@ -529,6 +537,7 @@ impl Session {
                     .to_vec(),
                 append_replay_events: self.replay_events[self.persist_state.replay_events_len..]
                     .to_vec(),
+                append_events: self.event_map.events[self.persist_state.events_len..].to_vec(),
             };
             let entry_build_ms = entry_build_start.elapsed().as_millis();
             let append_start = Instant::now();
@@ -592,7 +601,7 @@ impl Session {
         let result_ok = result.is_ok();
         if elapsed.as_millis() > 50 {
             crate::logging::info(&format!(
-                "Session save slow: total={:.0}ms mode={} metadata_snapshot={} vectors_snapshot={} entry_build={}ms append={}ms journal_stat={}ms checkpoint={}ms messages={} delta_messages={} delta_env_snapshots={} delta_memory_injections={} delta_replay_events={} snapshot_bytes_before={} journal_bytes_before={} journal_bytes_after={}",
+                "Session save slow: total={:.0}ms mode={} metadata_snapshot={} vectors_snapshot={} entry_build={}ms append={}ms journal_stat={}ms checkpoint={}ms messages={} delta_messages={} delta_env_snapshots={} delta_memory_injections={} delta_replay_events={} delta_events={} snapshot_bytes_before={} journal_bytes_before={} journal_bytes_after={}",
                 elapsed.as_secs_f64() * 1000.0,
                 save_mode,
                 metadata_needs_snapshot,
@@ -606,6 +615,7 @@ impl Session {
                 delta_env_snapshots,
                 delta_memory_injections,
                 delta_replay_events,
+                delta_events,
                 snapshot_bytes_before,
                 journal_bytes_before,
                 journal_bytes_after,
@@ -628,6 +638,7 @@ impl Session {
                 delta_memory_injections.to_string(),
             ),
             ("delta_replay_events", delta_replay_events.to_string()),
+            ("delta_events", delta_events.to_string()),
             ("snapshot_bytes_before", snapshot_bytes_before.to_string()),
             ("snapshot_bytes_after", snapshot_bytes_after.to_string()),
             ("journal_bytes_before", journal_bytes_before.to_string()),

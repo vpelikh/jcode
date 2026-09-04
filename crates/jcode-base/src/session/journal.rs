@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::event_types::SessionEvent;
 use super::{
     EnvSnapshot, ReviewLoopState, SessionImproveMode, SessionStatus, StoredCompactionState,
     StoredMemoryInjection, StoredMessage, StoredReplayEvent,
@@ -48,6 +49,15 @@ pub(super) struct SessionJournalEntry {
     pub(super) append_memory_injections: Vec<StoredMemoryInjection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) append_replay_events: Vec<StoredReplayEvent>,
+    /// Event-log entries appended since the last snapshot. Carried so the
+    /// append-only event log survives a crash that is recovered purely from the
+    /// journal (no new snapshot): replay appends these into `SessionEventMap`
+    /// before reconciling, so log-only events (compaction brackets, plugin
+    /// `Unknown`) are not collapsed into a rebuild-from-legacy-vectors.
+    ///
+    /// `#[serde(default)]` keeps older journals (without this field) readable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) append_events: Vec<SessionEvent>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -65,10 +75,15 @@ pub(super) struct SessionPersistState {
     pub(super) env_snapshots_len: usize,
     pub(super) memory_injections_len: usize,
     pub(super) replay_events_len: usize,
+    /// Number of event-log entries already represented by the last snapshot (or
+    /// the last journal entry). New events beyond this index are journaled in
+    /// `SessionJournalEntry::append_events` and replayed into `SessionEventMap`.
+    pub(super) events_len: usize,
     pub(super) messages_mode: PersistVectorMode,
     pub(super) env_snapshots_mode: PersistVectorMode,
     pub(super) memory_injections_mode: PersistVectorMode,
     pub(super) replay_events_mode: PersistVectorMode,
+    pub(super) events_mode: PersistVectorMode,
     pub(super) last_meta: Option<SessionJournalMeta>,
 }
 
