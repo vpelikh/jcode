@@ -271,6 +271,60 @@ fn idle_animation_fast_path_blocked_reason(
     }
 }
 
+/// Low-frequency state beyond text/caret that relocates the composer row:
+/// an indicator/hint line, a notification row, or queued-message rows inserted
+/// above it. Any of these toggling (without an `input` change) shifts the
+/// caret's terminal row, so it must trigger a cursor hide. Shell mode derives
+/// from `input` and is covered by the text comparator.
+///
+/// This covers the rows that change mid-stream (hint, notification, queued
+/// consumption). The inline-UI and swarm-strip rows above the composer toggle on
+/// bounded user interactions (opening a todo card / swarm view) that are not
+/// streaming-concurrent, so they are expected to land on full repaints rather
+/// than a steady `None` frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ComposerRelocationFlags {
+    /// In-flight turn (a processing hint line shows above the composer).
+    processing: bool,
+    /// "Next prompt → new session" is armed (a hint line shows above the composer).
+    new_session_armed: bool,
+    /// A notification row is present above the composer (`has_notification`).
+    notification: bool,
+    /// Rows shown above the composer for pending prompts: queued messages plus
+    /// soft-interrupts plus an interleave bit, capped at 3 to match the layout's
+    /// `queued_height = min(pending_prompt_count, 3)`. A raw count change above
+    /// the cap does not relocate the composer, so capping avoids a spurious hide.
+    pending_rows: usize,
+}
+
+impl ComposerRelocationFlags {
+    fn from_state(app: &App) -> Self {
+        let pending_rows = {
+            let soft = if app.is_processing() {
+                app.pending_soft_interrupts().len()
+            } else {
+                0
+            };
+            let interleave = app.is_processing()
+                && app
+                    .interleave_message()
+                    .map(|m| !m.is_empty())
+                    .unwrap_or(false);
+            // Mirror ui_input::pending_prompt_count().min(3), which is exactly
+            // what the layout uses for `queued_height`, so a raw count change
+            // above the 3-row cap (which does not relocate the composer) does
+            // not spuriously trip the hide gate.
+            (app.queued_messages().len() + soft + usize::from(interleave)).min(3)
+        };
+        Self {
+            processing: app.is_processing(),
+            new_session_armed: app.next_prompt_new_session_armed(),
+            notification: app.has_notification(),
+            pending_rows,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct StatusSpinnerRenderer {
     last_frame: Option<Buffer>,
@@ -296,6 +350,25 @@ pub(super) struct StatusSpinnerRenderer {
     /// live client: typing echoed to the terminal in ~7ms but only reached the
     /// screen ~500ms later; with the guard the same keystroke paints in ~6ms.
     last_full_frame_input: String,
+    /// Composer caret offset (byte index into `input`) as of the last full frame.
+    ///
+    /// The caret can move without the text changing (Up/Down across wrapped
+    /// rows, arrow keys within a draft). The animation-only path reuses the last
+    /// frame's composer rows, so a caret-only move still needs a full frame that
+    /// redraws the caret row. Tracking it separately from the text keeps the
+    /// "did the composer change" test complete: text, cursor column, or both.
+    last_full_cursor_pos: usize,
+    /// Composer state (beyond text/caret) as of the last full frame.
+    ///
+    /// Low-frequency state that relocates the composer row without touching the
+    /// text or cursor: the in-flight flag (a processing hint `… Ctrl/Cmd+Enter
+    /// to send`), the "next prompt → new session" arm (a hint line), a
+    /// notification row above the composer, and a change in queued-message rows.
+    /// Each must trigger a cursor hide (a rare edge per flag), while still
+    /// letting steady-streaming frames skip the hide. Shell mode is not tracked
+    /// here: it derives from `input`, which the text comparator above already
+    /// covers.
+    last_full_relocation_flags: ComposerRelocationFlags,
 }
 
 impl StatusSpinnerRenderer {
@@ -311,6 +384,8 @@ impl StatusSpinnerRenderer {
         // rows again.
         self.seeded_animation_area = None;
         self.last_full_frame_input.clear();
+        self.last_full_cursor_pos = 0;
+        self.last_full_relocation_flags = ComposerRelocationFlags::default();
     }
 
     /// Present an animation frame and forget its working-buffer seed.
@@ -337,9 +412,20 @@ impl StatusSpinnerRenderer {
     /// Whether the composer differs from what the last full frame drew.
     ///
     /// The animation-only repaint reuses that frame everywhere except the
-    /// decorative rows, so it cannot display a newer input line.
-    fn composer_changed_since_last_full_frame(&self, input: &str) -> bool {
+    /// decorative rows, so it cannot display a newer input line — or a caret
+    /// that moved without the text changing (Up/Down across wrapped rows, arrow
+    /// keys within a draft). Compare text, caret offset, and the hint flags that
+    /// can relocate the composer without a text change (in-flight processing /
+    /// next-prompt-new-session).
+    fn composer_changed_since_last_full_frame(
+        &self,
+        input: &str,
+        cursor_pos: usize,
+        hint_flags: ComposerRelocationFlags,
+    ) -> bool {
         input != self.last_full_frame_input
+            || cursor_pos != self.last_full_cursor_pos
+            || hint_flags != self.last_full_relocation_flags
     }
 
     pub(super) fn idle_animation_only_available(&self, app: &App) -> bool {
@@ -358,7 +444,11 @@ impl StatusSpinnerRenderer {
             has_animation_area: crate::tui::ui::last_idle_animation_area().is_some(),
             force_full_redraw: app.force_full_redraw,
             force_full_repaint: app.force_full_repaint,
-            composer_changed: self.composer_changed_since_last_full_frame(&app.input),
+            composer_changed: self.composer_changed_since_last_full_frame(
+                &app.input,
+                app.cursor_pos(),
+                ComposerRelocationFlags::from_state(app),
+            ),
             command_palette_visible: slash_command_palette_may_be_visible(&app.input, || {
                 !app.command_suggestions().is_empty()
             }),
@@ -517,9 +607,12 @@ impl StatusSpinnerRenderer {
         if sync {
             let _ = crossterm::execute!(terminal.backend_mut(), EndSynchronizedUpdate);
         }
-        // On a failed draw the cursor was hidden but the composer's re-show never ran
-        // (see the note above); re-show it so a fatal frame error cannot leave the
-        // terminal with the caret hidden after teardown.
+        // On a failed draw `draw_full_core` may have hidden the cursor (first frame or
+        // a composer change); if so, the composer's re-show never ran because the
+        // errored `terminal.draw` aborted before `apply_buffer_with_cursor` restores
+        // the caret. Always re-show it (a no-op on frames that never hid): ensures a
+        // fatal frame error cannot leave the terminal with the caret hidden after
+        // teardown, regardless of which path hid it.
         if result.is_err() {
             let _ = crossterm::execute!(terminal.backend_mut(), Show);
         }
@@ -549,35 +642,55 @@ impl StatusSpinnerRenderer {
         // Painting a frame is progress, including during long streaming turns.
         crate::logging::watchdog::beat("tui.draw");
 
-        // A full frame (and any SoftRepaint the scroll path triggers) clears/invalidates and
-        // then writes the diff through the backend's `MoveTo(x, y)` for every changed cell.
-        // While the cursor is visible, eager terminals (especially ones without synchronized-
-        // update support) let the visible block cursor sweep across the re-emitted cells, which
-        // reads as "cursor jumps to random places" during scroll. Hide it for EVERY full frame,
-        // not only the sentinel-invalidated repaints: streaming and plain-keystroke frames also
-        // come through here with `FullFrameInvalidation::None` (turn.rs and the input loop don't
-        // set the repaint flags), yet still `MoveTo` the cells that shift as content grows —
-        // including the composer row the caret sits in — so gating the hide on
-        // `invalidation != None` would let the caret sweep on those paths again. `terminal.draw`
-        // then either restores the caret (the normal composer path, where `draw_input` sets a
-        // cursor position) or leaves it hidden (overlay branches such as the changelog/help/
-        // pickers, where ratatui also hides when no position is set), so the cursor ends exactly
-        // where it belongs in every case. The hide/show is atomic within the synchronized-update
-        // frame (or a sub-frame burst on non-sync terminals), so it is invisible in steady state.
-        // The hide is best-effort: skipping it must not abort the frame (the soft-repaint buffer
+        // A full repaint (any `FullFrameInvalidation` that re-emits cells) writes the diff
+        // through the backend's `MoveTo(x, y)` for every changed cell. While the cursor is
+        // visible, eager terminals (especially ones without synchronized-update support) let
+        // the visible block cursor sweep across the re-emitted cells, which reads as "cursor
+        // jumps to random places" during scroll. Hide the cursor whenever this frame can
+        // rewrite a cell under the caret:
+        //   - any repaint/clear/resync (`force_full_redraw || force_full_repaint`);
+        //   - the very first frame, which emits the whole surface including the composer row
+        //     the caret sits in (`last_frame.is_none()`);
+        //   - any frame where the composer actually changed — the text moved the
+        //     caret column, the caret was moved without the text changing
+        //     (Up/Down across wrapped rows, arrow keys within a draft), or one
+        //     of the low-frequency relocation rows changed (processing/new-session
+        //     hint line, a notification row, or queued-message rows).
+        //
+        // On a plain incremental `FullFrameInvalidation::None` frame where the composer is
+        // byte-identical to the previous frame and the relocation flags are unchanged, the
+        // composer is a fixed-height bottom row that is not part of the diff, so the caret
+        // never sweeps. Hiding it anyway would fire the
+        // terminal's blink-phase reset (`?25l`, then the trailing `?25h`/`MoveTo` that
+        // `terminal.draw` re-emits because `draw_input` sets a cursor position) once per
+        // frame. At the streaming/processing cadence (~30-60fps) that re-arms the blink on
+        // every tick, so the caret strobes back and forth much faster than the terminal's
+        // natural ~1-2Hz blink, and only settles when the fast full-frame source stops. Gating
+        // the hide on "could this frame move the caret" keeps the sweep guard where it matters
+        // (scroll, clears, resync, first frame, typing) without accelerating the steady-state
+        // blink.
+        //
+        // When a position is set, `terminal.draw` re-shows the caret afterwards; when no
+        // position is set (overlay branches such as the changelog/help/pickers) ratatui leaves
+        // it hidden, so the cursor ends where it belongs in every case. The hide is
+        // best-effort: skipping it must not abort the frame (the soft-repaint buffer
         // invalidation has already happened), so the error is deliberately ignored.
-        let _ = terminal.backend_mut().hide_cursor();
-
-        // If the writer dropped output while the pty was wedged, ratatui's
-        // internal previous buffer no longer matches the real terminal. Force a
-        // full re-emit (soft repaint) so the screen and ratatui's model are
-        // realigned once the pty can drain again.
         let resync_requested = crate::tui::terminal_writer::take_resync_requested();
         let invalidation = full_frame_invalidation(
             app.force_full_redraw,
             app.force_full_repaint || resync_requested,
         );
         let force_full_redraw = invalidation != FullFrameInvalidation::None;
+        let hide_cursor_for_sweep = force_full_redraw
+            || self.last_frame.is_none()
+            || self.composer_changed_since_last_full_frame(
+                &app.input,
+                app.cursor_pos(),
+                ComposerRelocationFlags::from_state(app),
+            );
+        if hide_cursor_for_sweep {
+            let _ = terminal.backend_mut().hide_cursor();
+        }
         match invalidation {
             FullFrameInvalidation::HardClear => {
                 terminal.clear()?;
@@ -635,10 +748,18 @@ impl StatusSpinnerRenderer {
         // animation-only repaint to re-seed before it trusts that again.
         self.seeded_animation_area = None;
         // This frame drew the composer as it is now, so the animation-only path
-        // may reuse it again until the input changes.
-        if self.last_full_frame_input != app.input {
+        // may reuse it again until the input, the caret, or the hint flags
+        // change (a processing / next-prompt-new-session transition relocates
+        // the composer via its indicator line).
+        let hint_flags = ComposerRelocationFlags::from_state(app);
+        if self.last_full_frame_input != app.input
+            || self.last_full_cursor_pos != app.cursor_pos()
+            || self.last_full_relocation_flags != hint_flags
+        {
             self.last_full_frame_input.clear();
             self.last_full_frame_input.push_str(&app.input);
+            self.last_full_cursor_pos = app.cursor_pos();
+            self.last_full_relocation_flags = hint_flags;
         }
         // Close the key-to-paint clock here rather than at render time: the user
         // sees the keystroke when the frame reaches the terminal, so anything
@@ -1236,14 +1357,79 @@ mod tests {
         // Same input: the guard must not object (other predicates may still
         // block, which is why this asserts the reason rather than the outcome).
         assert!(
-            !renderer.composer_changed_since_last_full_frame(""),
+            !renderer.composer_changed_since_last_full_frame(
+                "",
+                0,
+                ComposerRelocationFlags::default(),
+            ),
             "an unchanged composer must not block the cheap path"
         );
 
         // A keystroke landed. The path cannot render it, so it must be blocked.
         assert!(
-            renderer.composer_changed_since_last_full_frame("/"),
+            renderer.composer_changed_since_last_full_frame(
+                "/",
+                1,
+                ComposerRelocationFlags::default(),
+            ),
             "a typed character must force a full frame"
+        );
+
+        // The caret moved without the text changing (Up/Down across wrapped
+        // rows, arrow keys inside a draft). The composer row and its caret
+        // column both shift, so this must also force a full frame.
+        assert!(
+            renderer.composer_changed_since_last_full_frame(
+                "",
+                2,
+                ComposerRelocationFlags::default(),
+            ),
+            "a caret-only move must force a full frame"
+        );
+
+        // A turn started (in-flight flag toggled). Entering processing inserts
+        // the hint line, relocating the composer row, so this must also force a
+        // full frame even though the text and caret are unchanged.
+        assert!(
+            renderer.composer_changed_since_last_full_frame(
+                "",
+                0,
+                ComposerRelocationFlags { processing: true, new_session_armed: false, notification: false, pending_rows: 0 },
+            ),
+            "a processing transition must force a full frame"
+        );
+
+        // The "next prompt → new session" arm toggled alone. It also inserts a
+        // hint line relocating the composer, so this must force a full frame.
+        assert!(
+            renderer.composer_changed_since_last_full_frame(
+                "",
+                0,
+                ComposerRelocationFlags { processing: false, new_session_armed: true, notification: false, pending_rows: 0 },
+            ),
+            "a next-prompt-new-session arm must force a full frame"
+        );
+
+        // A notification row toggled alone. It appears above the composer,
+        // relocating it, so this must force a full frame.
+        assert!(
+            renderer.composer_changed_since_last_full_frame(
+                "",
+                0,
+                ComposerRelocationFlags { processing: false, new_session_armed: false, notification: true, pending_rows: 0 },
+            ),
+            "a notification row must force a full frame"
+        );
+
+        // A queued message / soft-interrupt is consumed mid-stream (pending row
+        // count changes), relocating the composer without an input/caret change.
+        assert!(
+            renderer.composer_changed_since_last_full_frame(
+                "",
+                0,
+                ComposerRelocationFlags { processing: false, new_session_armed: false, notification: false, pending_rows: 2 },
+            ),
+            "a pending-row count change must force a full frame"
         );
     }
 
@@ -1257,7 +1443,11 @@ mod tests {
         };
         renderer.invalidate();
         assert!(
-            renderer.composer_changed_since_last_full_frame("draft"),
+            renderer.composer_changed_since_last_full_frame(
+                "draft",
+                0,
+                ComposerRelocationFlags::default(),
+            ),
             "after invalidation nothing is known to be drawn, so any composer \
              contents must force a full frame"
         );

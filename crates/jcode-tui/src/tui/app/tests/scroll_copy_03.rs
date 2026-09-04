@@ -2008,3 +2008,295 @@ fn full_frame_wrapper_opens_and_closes_sync_window_around_cursor_hidden_draw() {
         first_moveto.start()
     );
 }
+
+/// Regression guard for the "caret blinks very fast during streaming" bug.
+///
+/// `draw_full_core` hides the terminal cursor before the diff flush so the caret
+/// does not sweep across cells that a repaint rewrites. That hide is only needed
+/// on frames that can actually rewrite a cell under the caret (a repaint/scroll,
+/// a clear, a resync, or the very first frame that emits the whole surface). On a
+/// plain incremental `FullFrameInvalidation::None` frame once a previous frame
+/// exists, the composer is a fixed bottom row and is not part of the diff, so the
+/// caret never sweeps; hiding it there would fire a `?25l` + `?25h` blink-phase
+/// reset on every streaming tick and make the caret strobe much faster than the
+/// terminal's natural blink.
+///
+/// This drives the real production path twice on the same renderer:
+///   - the first full frame (no previous frame) must still `Hide`;
+///   - a subsequent `None` frame (previous frame in hand) must NOT `Hide`, proving
+///     steady-state streaming no longer resets the caret blink on every tick.
+#[test]
+fn incremental_none_frame_does_not_reset_caret_blink_once_frame_exists() {
+    use regex::Regex;
+    let _render_lock = scroll_render_test_lock();
+    let hide = "\u{1b}[?25l";
+    let show = "\u{1b}[?25h";
+    let move_re = Regex::new(r"\x1b\[[0-9]+;[0-9]+H").expect("static move-regex");
+
+    let mut app = create_test_app();
+    app.force_full_redraw = false;
+    app.force_full_repaint = false;
+
+    let mut stream_combined: Vec<u8> = Vec::new();
+    let mut renderer = crate::tui::app::run_shell::StatusSpinnerRenderer::default();
+    {
+        let backend = ratatui::backend::CrosstermBackend::new(&mut stream_combined);
+        let mut terminal = ratatui::Terminal::new(backend).expect("capture terminal");
+
+        // First full frame: no previous frame, so the whole surface is emitted and
+        // the caret (composer row) is part of it. The cursor hide must be present.
+        renderer
+            .draw_full_core(&mut app, &mut terminal)
+            .expect("first draw_full_core");
+
+        // A second plain incremental frame: `last_frame` now exists, and nothing
+        // flags a repaint. The composer row is unchanged, so no caret sweep is
+        // possible and the cursor must NOT toggle visibility.
+        renderer
+            .draw_full_core(&mut app, &mut terminal)
+            .expect("second draw_full_core");
+
+        // A third frame where the composer text changed mid-streaming: the caret
+        // column shifts and the diff crosses the caret row, so the sweep guard
+        // must still hide. This proves typing/editing never lose the cursor-hide
+        // protection.
+        app.set_input_for_test("hello");
+        renderer
+            .draw_full_core(&mut app, &mut terminal)
+            .expect("third draw_full_core");
+
+        // A fourth frame where only the caret moved (Up/Down across wrapped rows,
+        // arrow keys inside the draft): the text is unchanged but the caret column
+        // shifted, so the sweep guard must still hide.
+        app.cursor_pos = 1;
+        renderer
+            .draw_full_core(&mut app, &mut terminal)
+            .expect("fourth draw_full_core");
+
+        // A fifth plain incremental frame: the caret it just moved to is now the
+        // already-drawn one, so nothing about the composer differs. This must NOT
+        // hide again. Without a snapshot that actually advances, every later frame
+        // would keep hiding (the fast blink would return after every caret move).
+        renderer
+            .draw_full_core(&mut app, &mut terminal)
+            .expect("fifth draw_full_core");
+
+        // A sixth frame where a turn starts (in-flight flag set): the composer
+        // gains the processing hint line, relocating its caret row even though the
+        // text and caret are unchanged. The sweep guard must still hide.
+        app.is_processing = true;
+        renderer
+            .draw_full_core(&mut app, &mut terminal)
+            .expect("sixth draw_full_core");
+
+        // A seventh frame where only the "next prompt → new session" arm toggles.
+        // It also inserts a hint line (relocating the composer) without touching
+        // text or caret, so the sweep guard must still hide.
+        app.toggle_next_prompt_new_session_routing();
+        renderer
+            .draw_full_core(&mut app, &mut terminal)
+            .expect("seventh draw_full_core");
+
+        drop(terminal);
+    }
+    let stream = String::from_utf8_lossy(&stream_combined).into_owned();
+
+    // Frames are [frame1..frame7], each ending when the caret is shown again
+    // (`Show`). We verify each independently:
+    //   frame1: first draw, whole surface emitted -> must Hide.
+    //   frame2: unchanged composer -> must NOT Hide (the fast-blink fix).
+    //   frame3: text changed -> must Hide (sweep guard).
+    //   frame4: caret-only move -> must Hide (sweep guard).
+    //   frame5: no composer change after frame4's caret move -> must NOT Hide.
+    //   frame6: processing transition (hint line) -> must Hide (sweep guard).
+    //   frame7: next-prompt-new-session arm (hint line) -> must Hide (sweep guard).
+    let mut show_starts: Vec<usize> = Vec::new();
+    let mut search_from = 0;
+    while let Some(rel) = stream[search_from..].find(show) {
+        let abs = search_from + rel;
+        show_starts.push(abs);
+        search_from = abs + show.len();
+    }
+    assert!(
+        show_starts.len() >= 7,
+        "expected seven frames each re-showing the caret; shows: {show_starts:?}"
+    );
+    // Frame 2 spans from frame 1's `Show` to frame 2's `Show`.
+    let frame2 = &stream[show_starts[0] + show.len()..show_starts[1]];
+    assert!(
+        !frame2.contains(hide),
+        "unchanged incremental frame must not Hide the caret (fast-blink); frame2: {frame2:?}"
+    );
+    assert!(
+        move_re.is_match(frame2),
+        "the unchanged incremental frame should still emit a MoveTo; got: {frame2:?}"
+    );
+
+    // Frame 3 starts after frame 2's `Show` and runs to frame 3's `Show`.
+    let frame3 = &stream[show_starts[1] + show.len()..show_starts[2]];
+    assert!(
+        frame3.contains(hide),
+        "composer-changed incremental frame must still hide the caret (sweep guard); \
+         frame3: {frame3:?}"
+    );
+
+    // Frame 4 starts after frame 3's `Show` and runs to frame 4's `Show`.
+    let frame4 = &stream[show_starts[2] + show.len()..show_starts[3]];
+    assert!(
+        frame4.contains(hide),
+        "caret-only-move incremental frame must still hide the caret (sweep guard); \
+         frame4: {frame4:?}"
+    );
+
+    // Frame 5 starts after frame 4's `Show` and runs to frame 5's `Show`. With the
+    // composer text and caret both equal to what frame4 drew, nothing changed, so
+    // the caret must not be hidden again (the "sticky snapshot" fast-blink guard).
+    let frame5 = &stream[show_starts[3] + show.len()..show_starts[4]];
+    assert!(
+        !frame5.contains(hide),
+        "unchanged frame after a caret move must NOT hide again (sticky-snapshot guard); \
+         frame5: {frame5:?}"
+    );
+
+    // Frame 6 spans from frame 5's `Show` to frame 6's `Show`: in-flight flag
+    // flipped (hint line relocates the composer), so the sweep guard must fire.
+    let frame6 = &stream[show_starts[4] + show.len()..show_starts[5]];
+    assert!(
+        frame6.contains(hide),
+        "processing-transition frame must still hide the caret (sweep guard); \
+         frame6: {frame6:?}"
+    );
+
+    // Frame 7 spans from frame 6's `Show` to frame 7's `Show`: the next-prompt
+    // new-session arm flipped (hint line relocates the composer), so the sweep
+    // guard must fire.
+    let frame7 = &stream[show_starts[5] + show.len()..show_starts[6]];
+    assert!(
+        frame7.contains(hide),
+        "next-prompt-new-session arm frame must still hide the caret (sweep guard); \
+         frame7: {frame7:?}"
+    );
+}
+
+
+/// A notification row appearing above the composer relocates the caret without
+/// changing the text or hint flags (`has_notification` -> `notification_height`).
+/// The sweep guard must hide the caret on that None frame, and a later unchanged
+/// frame must not hide again.
+#[test]
+fn notification_row_relocating_composer_still_hides_caret_once() {
+    let _render_lock = scroll_render_test_lock();
+    let hide = "\u{1b}[?25l";
+    let show = "\u{1b}[?25h";
+    let mut app = create_test_app();
+    app.force_full_redraw = false;
+    app.force_full_repaint = false;
+
+    let mut stream_combined: Vec<u8> = Vec::new();
+    let mut renderer = crate::tui::app::run_shell::StatusSpinnerRenderer::default();
+    {
+        let backend = ratatui::backend::CrosstermBackend::new(&mut stream_combined);
+        let mut terminal = ratatui::Terminal::new(backend).expect("capture terminal");
+
+        renderer.draw_full_core(&mut app, &mut terminal).expect("f1 no notification");
+        // A notification row appears; the composer relocates.
+        app.set_status_notice("a transient status notice");
+        renderer.draw_full_core(&mut app, &mut terminal).expect("f2 notification");
+        // Nothing changed since f2; must not hide again.
+        renderer.draw_full_core(&mut app, &mut terminal).expect("f3 unchanged");
+        drop(terminal);
+    }
+    let stream = String::from_utf8_lossy(&stream_combined).into_owned();
+
+    // Each frame ends with a caret `Show`. Split on it.
+    let parts: Vec<&str> = stream.split(show).collect();
+    assert!(parts.len() >= 4, "expected >=3 frames, got {}: {stream:?}", parts.len() - 1);
+    // f1 = before first Show; f2 = between first and second Show; f3 = between
+    // second and third Show.
+    let f1 = parts[0];
+    let f2 = &parts[1];
+    let f3 = &parts[2];
+    assert!(f1.contains(hide), "first frame must hide; f1: {f1:?}");
+    assert!(f2.contains(hide), "notification-relocation frame must hide; f2: {f2:?}");
+    assert!(!f3.contains(hide), "unchanged frame after relocation must not hide; f3: {f3:?}");
+}
+
+
+/// A queued-message row appearing above the composer relocates it without an
+/// input/caret change (`queued_messages` -> `pending_rows` -> `queued_height`).
+/// The sweep guard must hide on that None frame, and a later unchanged frame
+/// must not hide again.
+#[test]
+fn queued_message_row_relocating_composer_still_hides_caret_once() {
+    let _render_lock = scroll_render_test_lock();
+    let hide = "\u{1b}[?25l";
+    let show = "\u{1b}[?25h";
+    let mut app = create_test_app();
+    app.force_full_redraw = false;
+    app.force_full_repaint = false;
+
+    let mut stream_combined: Vec<u8> = Vec::new();
+    let mut renderer = crate::tui::app::run_shell::StatusSpinnerRenderer::default();
+    {
+        let backend = ratatui::backend::CrosstermBackend::new(&mut stream_combined);
+        let mut terminal = ratatui::Terminal::new(backend).expect("capture terminal");
+
+        renderer.draw_full_core(&mut app, &mut terminal).expect("f1 no queue");
+        // A queued prompt row appears; the composer relocates.
+        app.queued_messages.push("a queued prompt".to_string());
+        renderer.draw_full_core(&mut app, &mut terminal).expect("f2 queued");
+        // Nothing changed since f2; must not hide again.
+        renderer.draw_full_core(&mut app, &mut terminal).expect("f3 unchanged");
+        drop(terminal);
+    }
+    let stream = String::from_utf8_lossy(&stream_combined).into_owned();
+
+    let parts: Vec<&str> = stream.split(show).collect();
+    assert!(parts.len() >= 4, "expected >=3 frames, got {}: {stream:?}", parts.len() - 1);
+    let f1 = parts[0];
+    let f2 = &parts[1];
+    let f3 = &parts[2];
+    assert!(f1.contains(hide), "first frame must hide; f1: {f1:?}");
+    assert!(f2.contains(hide), "queued-row relocation frame must hide; f2: {f2:?}");
+    assert!(!f3.contains(hide), "unchanged frame after relocation must not hide; f3: {f3:?}");
+}
+
+/// A queued-message row appearing while a turn is in flight (the real mid-stream
+/// case) relocates the composer without an input/caret change. The sweep guard
+/// must hide on that frame, and a later unchanged frame must not hide again.
+#[test]
+fn queued_row_change_during_processing_still_hides_caret_once() {
+    let _render_lock = scroll_render_test_lock();
+    let hide = "\u{1b}[?25l";
+    let show = "\u{1b}[?25h";
+    let mut app = create_test_app();
+    app.force_full_redraw = false;
+    app.force_full_repaint = false;
+
+    let mut stream_combined: Vec<u8> = Vec::new();
+    let mut renderer = crate::tui::app::run_shell::StatusSpinnerRenderer::default();
+    {
+        let backend = ratatui::backend::CrosstermBackend::new(&mut stream_combined);
+        let mut terminal = ratatui::Terminal::new(backend).expect("capture terminal");
+
+        // Enter processing: the processing hint row appears (hide).
+        app.is_processing = true;
+        renderer.draw_full_core(&mut app, &mut terminal).expect("f1 processing");
+        // A queued message appears mid-flight; pending_rows changes (hide).
+        app.queued_messages.push("interleaved prompt".to_string());
+        renderer.draw_full_core(&mut app, &mut terminal).expect("f2 queued mid-stream");
+        // Nothing changed since f2; must not hide again.
+        renderer.draw_full_core(&mut app, &mut terminal).expect("f3 unchanged");
+        drop(terminal);
+    }
+    let stream = String::from_utf8_lossy(&stream_combined).into_owned();
+
+    let parts: Vec<&str> = stream.split(show).collect();
+    assert!(parts.len() >= 4, "expected >=3 frames, got {}: {stream:?}", parts.len() - 1);
+    let f1 = parts[0];
+    let f2 = &parts[1];
+    let f3 = &parts[2];
+    assert!(f1.contains(hide), "processing-entry frame must hide; f1: {f1:?}");
+    assert!(f2.contains(hide), "mid-stream queued-row change must hide; f2: {f2:?}");
+    assert!(!f3.contains(hide), "unchanged frame after mid-stream change must not hide; f3: {f3:?}");
+}
