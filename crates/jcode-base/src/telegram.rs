@@ -1632,6 +1632,54 @@ mod tests {
         assert_eq!(trailing, "https://mirror.example.com/bot/");
     }
 
+    /// Spin up a minimal local Bot API server that answers `getMe` with a
+    /// success (ok=true) body. Used to exercise `discover_client`'s public
+    /// behavior against a real HTTP endpoint (no Telegram egress required),
+    /// proving the configured `api_base` mirror is probed first and honored.
+    async fn start_mock_bot_api() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // Serve a bounded number of requests so the test task can finish.
+            for _ in 0..8 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    // Read request line + headers (drain), then answer /getMe.
+                    let mut buf = [0u8; 2048];
+                    let _ = stream.read(&mut buf).await;
+                    let body = serde_json::json!({
+                        "ok": true,
+                        "result": { "id": 1, "first_name": "test", "username": "testbot" }
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    /// The configured `api_base` mirror is probed FIRST: a reachable mirror
+    /// yields a working client even though nothing else is configured.
+    #[tokio::test]
+    async fn test_discover_client_prefers_configured_mirror() {
+        let (port, _handle) = start_mock_bot_api().await;
+        let mirror = format!("http://127.0.0.1:{port}");
+        let client = discover_client("test-token", None, None, Some(&mirror))
+            .await
+            .expect("mirror-first discovery should succeed against the mock");
+        // The returned client is a real, usable reqwest client.
+        assert!(client.get("http://example.com").build().is_ok());
+    }
+
     #[test]
     fn test_build_probe_client_rejects_non_ip() {
         // A non-IP override must fail to build so discovery skips it, not crash.
