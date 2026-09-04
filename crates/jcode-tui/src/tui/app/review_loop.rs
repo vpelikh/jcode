@@ -19,6 +19,10 @@
 //!      final pass counts as convergence.
 //!   5. `can't-fix` findings never count as a stall; they stay open and surface
 //!      in the digest.
+//!   6. On convergence, if the review touched files (so the work changed after
+//!      the completion gates first passed), set `needs_gate_recheck` so the
+//!      harness re-runs the completion gates once against the post-fix state
+//!      (N2) before declaring the session done.
 
 use jcode_session_types::{
     findings_stalled, Finding, ReviewLens, ReviewLoopPhase, ReviewLoopState, ReviewRecord,

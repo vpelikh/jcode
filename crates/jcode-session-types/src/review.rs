@@ -703,4 +703,29 @@ mod review_tests {
         assert!(back.last_fix_touched_files);
         assert_eq!(back.fix_baseline_tree.as_deref(), Some(" M src/foo.rs"));
     }
+
+    #[test]
+    fn gate_recheck_field_defaults_when_absent_from_persisted_json() {
+        // Sessions persisted by an older jcode predate `needs_gate_recheck`.
+        // They must load cleanly with the field defaulting to `false` so a
+        // resumed loop never spuriously re-runs the completion gates on upgrade.
+        // (Default `false` also means a clean/no-fix loop never re-checks.)
+        assert!(!ReviewLoopState::default().needs_gate_recheck);
+        let json = r#"{
+            "stall_turns": 0,
+            "finished": false,
+            "phase": "lenses",
+            "awaiting_postfix_recheck": false,
+            "last_fix_touched_files": false
+        }"#;
+        let back: ReviewLoopState = serde_json::from_str(json).unwrap();
+        assert!(!back.needs_gate_recheck);
+
+        // The flag round-trips through serialization when actually set.
+        let mut set = ReviewLoopState::default();
+        set.needs_gate_recheck = true;
+        let json = serde_json::to_string(&set).unwrap();
+        let back: ReviewLoopState = serde_json::from_str(&json).unwrap();
+        assert!(back.needs_gate_recheck);
+    }
 }
