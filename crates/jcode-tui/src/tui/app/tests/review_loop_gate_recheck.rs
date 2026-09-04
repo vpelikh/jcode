@@ -400,6 +400,17 @@ fn step_review_loop_converges_with_fix_and_gate_recheck_surfaces_on_failure() {
             }),
             "expected the failure to be surfaced through the real turn-end path"
         );
+        // The end-of-loop digest must also reflect the disagreement in its
+        // "Finish reason" line, not just the one-off surface message. A record
+        // is present (drive_to_final_confirmation_lens seeds one), so the full
+        // digest is rendered with the failed reason.
+        assert!(
+            app.display_messages().iter().any(|msg| {
+                msg.content
+                    .contains("Finish reason: converged_gate_recheck_failed")
+            }),
+            "expected the digest to record the gate-recheck failure reason"
+        );
     });
 }
 
