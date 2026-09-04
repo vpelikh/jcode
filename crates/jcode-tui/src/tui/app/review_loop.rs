@@ -19,10 +19,10 @@
 //!      final pass counts as convergence.
 //!   5. `can't-fix` findings never count as a stall; they stay open and surface
 //!      in the digest.
-//!   6. On convergence, if the review touched files (so the work changed after
-//!      the completion gates first passed), set `needs_gate_recheck` so the
-//!      harness re-runs the completion gates once against the post-fix state
-//!      (N2) before declaring the session done.
+//!   6. On convergence, the glue re-runs the completion gates once against the
+//!      post-fix state whenever the review changed files (`record.files_touched`
+//!      is non-empty), so the gates reflect the final tree (N2). A stalled loop
+//!      never re-runs them (no convergence), avoiding gates↔review ping-pong.
 
 use jcode_session_types::{
     findings_stalled, Finding, ReviewLens, ReviewLoopPhase, ReviewLoopState, ReviewRecord,
@@ -224,15 +224,6 @@ fn advance_lens(state: &mut ReviewLoopState) -> ReviewLoopAction {
             None => {
                 state.finished = true;
                 state.finish_reason = Some("converged".to_string());
-                // The completion gates first passed before the loop started.
-                // If the review fixed files, the work changed after that, so the
-                // harness must re-run the gates once against the post-fix state
-                // (N2). This flag tells step_review_loop to do the single gate
-                // re-check before declaring the session done. If no files were
-                // touched the review made no change, so the original gate pass
-                // still holds and we skip the re-check.
-                state.needs_gate_recheck =
-                    state.record.as_ref().is_some_and(|r| !r.files_touched.is_empty());
                 ReviewLoopAction::Converged
             }
         }
@@ -388,61 +379,6 @@ mod review_loop_tests {
         }
         assert!(s.finished);
         assert_eq!(s.finish_reason.as_deref(), Some("converged"));
-    }
-
-    #[test]
-    fn convergence_without_fix_does_not_request_gate_recheck() {
-        // N2: only a review that *fixed files* (so the work changed after the
-        // completion gates passed) re-runs the gates once. A clean review that
-        // touched nothing leaves the original gate pass valid.
-        let mut s = clean_state();
-        // Drive all 6 first-pass + 6 confirmation lenses to clean convergence.
-        for _ in 0..12 {
-            let lens = s.current_lens.unwrap();
-            assert_eq!(
-                next_action(&mut s),
-                ReviewLoopAction::SpawnReviewer(lens)
-            );
-            match apply_verdict(&mut s, &ReviewReport::Clean, 3) {
-                ReviewLoopAction::SpawnReviewer(_) => {}
-                ReviewLoopAction::Converged => break,
-                other => panic!("unexpected: {other:?}"),
-            }
-        }
-        assert!(s.finished);
-        assert_eq!(s.finish_reason.as_deref(), Some("converged"));
-        assert!(
-            !s.needs_gate_recheck,
-            "clean review with no files touched must not request a gate re-check"
-        );
-    }
-
-    #[test]
-    fn convergence_with_fix_requests_one_gate_recheck() {
-        // N2: if the review fixed files, the gates must be re-run once against
-        // the post-fix state before the session is declared done.
-        let mut s = clean_state();
-        // Simulate a review that produced a fix (files touched on a round).
-        record_fix_files(&mut s, vec!["fixed.rs".to_string()]);
-        // Drive the remaining lenses + confirmation pass to clean convergence.
-        for _ in 0..12 {
-            let lens = s.current_lens.unwrap();
-            match next_action(&mut s) {
-                ReviewLoopAction::SpawnReviewer(l) => assert_eq!(l, lens),
-                other => panic!("expected spawn, got {other:?}"),
-            }
-            match apply_verdict(&mut s, &ReviewReport::Clean, 3) {
-                ReviewLoopAction::SpawnReviewer(_) => {}
-                ReviewLoopAction::Converged => break,
-                other => panic!("unexpected: {other:?}"),
-            }
-        }
-        assert!(s.finished);
-        assert!(s.needs_gate_recheck);
-        assert!(
-            s.record.as_ref().is_some_and(|r| !r.files_touched.is_empty()),
-            "record must retain the touched files for the digest"
-        );
     }
 
     #[test]

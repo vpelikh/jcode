@@ -26,10 +26,9 @@ fn gate_recheck_that_fails_surfaces_and_finishes_closed() {
         // A converged loop that also fixed files must request the re-check.
         let mut state = jcode_session_types::ReviewLoopState::new();
         state.finished = true;
-        state.needs_gate_recheck = true;
         state.current_lens = Some(jcode_session_types::ReviewLens::Correctness);
 
-        super::commands_review::finish_review_loop(&mut app, &mut state);
+        super::commands_review::finish_review_loop(&mut app, &mut state, true);
 
         // The loop is left finished (never re-enters review), with the reason
         // recording that the post-review gate re-check disagreed.
@@ -78,10 +77,9 @@ fn gate_recheck_that_fails_on_ownership_surfaces_ownership_reason() {
 
         let mut state = jcode_session_types::ReviewLoopState::new();
         state.finished = true;
-        state.needs_gate_recheck = true;
         state.current_lens = Some(jcode_session_types::ReviewLens::Correctness);
 
-        super::commands_review::finish_review_loop(&mut app, &mut state);
+        super::commands_review::finish_review_loop(&mut app, &mut state, true);
 
         assert!(state.finished);
         let reason = state.finish_reason.as_deref().unwrap_or_default();
@@ -118,10 +116,9 @@ fn gate_recheck_that_fails_on_confidence_spike_surfaces() {
 
         let mut state = jcode_session_types::ReviewLoopState::new();
         state.finished = true;
-        state.needs_gate_recheck = true;
         state.current_lens = Some(jcode_session_types::ReviewLens::Correctness);
 
-        super::commands_review::finish_review_loop(&mut app, &mut state);
+        super::commands_review::finish_review_loop(&mut app, &mut state, true);
 
         assert!(state.finished);
         let reason = state.finish_reason.as_deref().unwrap_or_default();
@@ -165,10 +162,9 @@ fn gate_recheck_that_passes_finishes_cleanly() {
 
         let mut state = jcode_session_types::ReviewLoopState::new();
         state.finished = true;
-        state.needs_gate_recheck = true;
         state.current_lens = Some(jcode_session_types::ReviewLens::Correctness);
 
-        super::commands_review::finish_review_loop(&mut app, &mut state);
+        super::commands_review::finish_review_loop(&mut app, &mut state, true);
 
         assert!(state.finished);
         assert_eq!(state.finish_reason.as_deref(), Some("converged"));
@@ -194,13 +190,11 @@ fn finish_without_gate_recheck_emits_digest_and_does_not_touch_gates() {
         // the loop done.
         let mut state = jcode_session_types::ReviewLoopState::new();
         state.finished = true;
-        state.needs_gate_recheck = false;
         state.current_lens = Some(jcode_session_types::ReviewLens::Correctness);
 
-        super::commands_review::finish_review_loop(&mut app, &mut state);
+        super::commands_review::finish_review_loop(&mut app, &mut state, false);
 
         assert!(state.finished);
-        assert!(!state.needs_gate_recheck);
         // No failure-surfacing message and no spurious gate evaluation.
         assert!(
             !app.display_messages().iter().any(|msg| {
@@ -308,9 +302,9 @@ fn passing_goal() -> crate::todo::TodoGoal {
 // the *producer*: `step_review_loop`, which is what `schedule_turn_end_followups`
 // invokes every turn while the loop is active. They exercise the real path —
 // poll the persisted reviewer child session, parse its `VERDICT`, run the engine
-// through `apply_verdict`/`advance_lens`, converge, set `needs_gate_recheck`,
-// and then evaluate the completion gates — rather than handing a finished state
-// straight to the digest/emit stage.
+// through `apply_verdict`/`advance_lens`, converge, derive whether the review
+// changed files, and then evaluate the completion gates — rather than handing a
+// finished state straight to the digest/emit stage.
 
 /// Drive the review engine to one step short of convergence: all lenses clean on
 /// the first pass, then all but the last lens clean on the confirmation pass,
@@ -398,10 +392,7 @@ fn step_review_loop_converges_with_fix_and_gate_recheck_surfaces_on_failure() {
             reason.ends_with("completion confidence needs re-validation"),
             "expected the confidence gate reason through step_review_loop, got {reason:?}"
         );
-        assert!(
-            !state.needs_gate_recheck,
-            "the one-shot gate re-check flag must be consumed"
-        );
+        // The loop is finished above, so the one-shot re-check cannot re-trigger.
         assert!(
             app.display_messages().iter().any(|msg| {
                 msg.content
@@ -446,10 +437,6 @@ fn step_review_loop_converges_with_fix_and_gate_recheck_passes_cleanly() {
         let state = app.session.review_loop.as_ref().unwrap();
         assert!(state.finished);
         assert_eq!(state.finish_reason.as_deref(), Some("converged"));
-        assert!(
-            !state.needs_gate_recheck,
-            "the one-shot gate re-check flag must be consumed"
-        );
         assert!(
             !app.display_messages().iter().any(|msg| {
                 msg.content

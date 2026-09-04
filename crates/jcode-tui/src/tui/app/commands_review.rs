@@ -1507,9 +1507,16 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
                         super::commands_improve::start_synthetic_user_turn(app, prompt);
                         true
                     }
-                    review_loop::ReviewLoopAction::Converged
-                    | review_loop::ReviewLoopAction::Stalled => {
-                        finish_review_loop(app, &mut state);
+                    review_loop::ReviewLoopAction::Converged => {
+                        let recheck = state
+                            .record
+                            .as_ref()
+                            .is_some_and(|r| !r.files_touched.is_empty());
+                        finish_review_loop(app, &mut state, recheck);
+                        false
+                    }
+                    review_loop::ReviewLoopAction::Stalled => {
+                        finish_review_loop(app, &mut state, false);
                         false
                     }
                     review_loop::ReviewLoopAction::SpawnReviewer(lens) => {
@@ -1528,9 +1535,16 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
             review_loop::ReviewLoopAction::SpawnReviewer(lens) => {
                 spawn_review_loop_reviewer(app, &mut state, lens)
             }
-            review_loop::ReviewLoopAction::Converged
-            | review_loop::ReviewLoopAction::Stalled => {
-                finish_review_loop(app, &mut state);
+            review_loop::ReviewLoopAction::Converged => {
+                let recheck = state
+                    .record
+                    .as_ref()
+                    .is_some_and(|r| !r.files_touched.is_empty());
+                finish_review_loop(app, &mut state, recheck);
+                false
+            }
+            review_loop::ReviewLoopAction::Stalled => {
+                finish_review_loop(app, &mut state, false);
                 false
             }
             _ => {
@@ -1547,13 +1561,20 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
 /// gates once against the post-fix state (N2). A failing gate in that one
 /// re-run surfaces and stops; it never re-enters the review loop, so there is
 /// no gates↔review ping-pong. The loop is left finished either way.
-pub(super) fn finish_review_loop(app: &mut App, state: &mut jcode_session_types::ReviewLoopState) {
+///
+/// `recheck_gates` is true only on a *file-touching convergence* (derived by
+/// the caller from `record.files_touched`); a stall never re-runs the gates.
+pub(super) fn finish_review_loop(
+    app: &mut App,
+    state: &mut jcode_session_types::ReviewLoopState,
+    recheck_gates: bool,
+) {
     // The N2 gate re-check: if the review touched files, evaluate the completion
     // gates once against the post-fix state and fold the result into the loop's
     // finish reason *before* the digest is built, so the digest reports what
-    // actually happened. We clear the flag as we read it so a later pass can
-    // never re-trigger the re-check.
-    if std::mem::take(&mut state.needs_gate_recheck) {
+    // actually happened. It runs exactly once here; the loop is finished
+    // afterward, so it can never re-trigger.
+    if recheck_gates {
         let session_id = active_session_id(app);
         let todos = crate::todo::load_todos(&session_id).unwrap_or_default();
         let goals = crate::todo::load_goals(&session_id).unwrap_or_default();

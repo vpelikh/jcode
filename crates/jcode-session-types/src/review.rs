@@ -345,14 +345,6 @@ pub struct ReviewLoopState {
     /// to detect whether the fix actually changed files at re-check poll time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fix_baseline_tree: Option<String>,
-    /// Set when the loop converged but the review fixed files, so the work
-    /// changed after the completion gates first passed. When true, the harness
-    /// must re-run the completion gates exactly once against the post-fix state
-    /// before declaring done (N2). A failing gate in that one re-run surfaces
-    /// and stops; it must NOT re-enter the review loop (no gates↔review
-    /// ping-pong).
-    #[serde(default)]
-    pub needs_gate_recheck: bool,
 }
 
 impl Default for ReviewLoopState {
@@ -369,7 +361,6 @@ impl Default for ReviewLoopState {
             reviewer_session_id: None,
             last_fix_touched_files: false,
             fix_baseline_tree: None,
-            needs_gate_recheck: false,
         }
     }
 }
@@ -702,30 +693,5 @@ mod review_tests {
         let back: ReviewLoopState = serde_json::from_str(&json).unwrap();
         assert!(back.last_fix_touched_files);
         assert_eq!(back.fix_baseline_tree.as_deref(), Some(" M src/foo.rs"));
-    }
-
-    #[test]
-    fn gate_recheck_field_defaults_when_absent_from_persisted_json() {
-        // Sessions persisted by an older jcode predate `needs_gate_recheck`.
-        // They must load cleanly with the field defaulting to `false` so a
-        // resumed loop never spuriously re-runs the completion gates on upgrade.
-        // (Default `false` also means a clean/no-fix loop never re-checks.)
-        assert!(!ReviewLoopState::default().needs_gate_recheck);
-        let json = r#"{
-            "stall_turns": 0,
-            "finished": false,
-            "phase": "lenses",
-            "awaiting_postfix_recheck": false,
-            "last_fix_touched_files": false
-        }"#;
-        let back: ReviewLoopState = serde_json::from_str(json).unwrap();
-        assert!(!back.needs_gate_recheck);
-
-        // The flag round-trips through serialization when actually set.
-        let mut set = ReviewLoopState::default();
-        set.needs_gate_recheck = true;
-        let json = serde_json::to_string(&set).unwrap();
-        let back: ReviewLoopState = serde_json::from_str(&json).unwrap();
-        assert!(back.needs_gate_recheck);
     }
 }
