@@ -3289,3 +3289,124 @@ fn clear_messages_persists_via_event_consistent_checkpoint() -> Result<()> {
         .expect("cleared reload must keep event log consistent");
     Ok(())
 }
+
+/// A compaction applied to a *running* session via the public `set_compaction`
+/// API, then saved through the journal-append path (after a prior snapshot),
+/// must survive reload: the SetCompaction event is journaled as a log-only
+/// event and the legacy compaction vector is restored from journal meta.
+#[test]
+fn compaction_via_public_api_survives_journal_append_reload() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-compaction-journal-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_compaction_journal_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("compaction".to_string()));
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "before".to_string(),
+            cache_control: None,
+        }],
+    );
+    // First save → snapshot, no journal.
+    session.save()?;
+    let journal_path = session_journal_path(id)?;
+    assert!(!journal_path.exists(), "first save is a snapshot");
+
+    // Compact the running session via the public API, then append a message so
+    // the next save goes through the journal append path.
+    session.set_compaction(StoredCompactionState {
+        summary_text: "compacted".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 1,
+    });
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "after".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+    assert!(journal_path.exists(), "second save must be a journal append");
+
+    // Reload: compaction and the SetCompaction event must both survive.
+    let reloaded = Session::load(id)?;
+    assert_eq!(
+        reloaded.compaction.as_ref().map(|c| &c.summary_text),
+        Some(&"compacted".to_string()),
+        "compaction must survive the journal append + reload"
+    );
+    assert!(
+        reloaded.event_map.events.iter().any(|e| matches!(
+            e.op,
+            crate::session::event_types::SessionEventOp::SetCompaction { .. }
+        )),
+        "SetCompaction must be a durable event after the journal reload"
+    );
+    reloaded
+        .rederive_all_checked()
+        .expect("compaction journal reload must keep event log consistent");
+    Ok(())
+}
+
+/// When load reconciliation must rebuild the event log from divergent vectors,
+/// the freshly-rebuilt log must be persisted by the next save (as a snapshot,
+/// not a journal tail), so a subsequent reload stays consistent and does not
+/// rebuild every time. Exercise the full divergent-load → save → reload cycle.
+#[test]
+fn divergent_load_rebuilds_then_persists_and_stays_consistent() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-rebuild-load-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_rebuild_divergent_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("divergent".to_string()));
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "a".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?; // snapshot with events
+
+    // Make the on-disk vectors diverge from the event log: directly clear the
+    // legacy messages vector without emitting a ClearAll (a buggy producer),
+    // then persist via a fresh snapshot that drops the events.
+    let path = crate::session::storage_paths::session_path(id)?;
+    let mut json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path)?).expect("read snapshot");
+    if let serde_json::Value::Object(map) = &mut json {
+        map["messages"] = serde_json::Value::Array(vec![]);
+        map.remove("event_map");
+    }
+    std::fs::write(&path, serde_json::to_string(&json).expect("rewrite"))?;
+
+    // Load: the empty vectors vs. the (now-removed) event log must reconcile by
+    // rebuilding; the log must agree with the now-empty transcript.
+    let mut loaded = Session::load(id)?;
+    assert!(loaded.messages.is_empty());
+    loaded
+        .rederive_all_checked()
+        .expect("post-rebuild load must be consistent");
+
+    // The next save must persist the rebuilt log (snapshot), and a reload must
+    // not need to rebuild again — it reloads empty and consistent.
+    loaded.save()?;
+    let reloaded = Session::load(id)?;
+    assert!(reloaded.messages.is_empty());
+    reloaded
+        .rederive_all_checked()
+        .expect("post-save reload must be consistent");
+    Ok(())
+}
