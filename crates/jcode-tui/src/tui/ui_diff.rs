@@ -283,20 +283,33 @@ fn has_line_number(line: &ParsedDiffLine) -> bool {
     line.prefix.chars().any(|c| c.is_ascii_digit())
 }
 
-/// Drop unnumbered (prose) lines from a set of parsed diff lines when at least
-/// one numbered line is present.
+/// Whether a line is a config-notice markdown bullet, i.e. a bare `- ` glyph
+/// followed by a backtick-led key (``- `key`: old -> new``). These can appear
+/// even when the edit produced no numbered diff (e.g. a write to config.toml
+/// with unchanged content), so they need removing on their own signature.
+fn is_config_notice_bullet(line: &ParsedDiffLine) -> bool {
+    !has_line_number(line)
+        && line.kind == DiffLineKind::Del
+        && line.content.trim_start().starts_with('`')
+}
+
+/// Drop unnumbered (prose) lines from a set of parsed diff lines.
 ///
 /// In an edit-family tool's output the numbered lines are the real diff; any
 /// unnumbered `- `/`+ ` line alongside them is a markdown bullet or notice
-/// prose and would only blank out a line number in the rendered diff. When no
-/// numbered line is present we keep everything, so plain (legitimately
-/// unnumbered) diffs are unaffected.
+/// prose and would only blank out a line number in the rendered diff. Lines
+/// that look like config-notice bullets are dropped on their own signature too,
+/// so a write to config.toml that produced no numbered diff still excludes
+/// them. All other unnumbered lines are kept when no numbered line is present,
+/// so plain (legitimately unnumbered) diffs are unaffected.
 pub(super) fn filter_unnumbered_prose_lines(lines: Vec<ParsedDiffLine>) -> Vec<ParsedDiffLine> {
-    if lines.iter().any(has_line_number) {
-        lines.into_iter().filter(has_line_number).collect()
-    } else {
-        lines
-    }
+    let has_numbered = lines.iter().any(has_line_number);
+    lines.into_iter().filter(|l| {
+        if is_config_notice_bullet(l) {
+            return false;
+        }
+        !has_numbered || has_line_number(l)
+    }).collect()
 }
 
 fn diff_file_path(raw_line: &str) -> Option<String> {
@@ -549,5 +562,17 @@ mod tests {
         // deletion, which would overstate the diff (here 1 add / 1 del, not 1/2).
         let content = "Edited config.toml\n2- old\n2+ new\n\nConfig changes:\n- `key`: old -> new (live now)\n";
         assert_eq!(diff_change_counts(content), (1, 1), "badge counts leaked bullet");
+    }
+
+    #[test]
+    fn config_notice_bullets_stripped_even_without_numbered_diff() {
+        // A write to config.toml that changed no content emits only the config
+        // notice (no numbered diff). Its bullet must still not surface as a
+        // deletion row.
+        let content =
+            "Updated config.toml (12 lines)\n\nConfig changes:\n- `key`: old -> new (live now)\n";
+        let filtered = filter_unnumbered_prose_lines(collect_diff_lines(content));
+        assert_eq!(filtered.len(), 0, "config-only body leaked a diff row: {:?}", filtered);
+        assert_eq!(diff_change_counts(content), (0, 0), "badge counted config bullet");
     }
 }
