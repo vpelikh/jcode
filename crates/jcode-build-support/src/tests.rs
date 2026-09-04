@@ -610,6 +610,49 @@ fn prune_old_versions_protects_canary_channel_via_symlink() {
     });
 }
 
+// A canary or pending-activation version can exist in the build manifest before
+// its channel symlink is created. `prune_old_versions` must preserve manifest-
+// referenced version dirs even when they are neither current/stable/shared
+// markers nor (yet) the target of a channel symlink.
+#[test]
+fn prune_old_versions_protects_manifest_referenced_versions() {
+    with_temp_jcode_home(|| {
+        let exe = std::env::current_exe().unwrap();
+        // Install a canary version AND several plain versions so pruning would
+        // otherwise remove the oldest unprotected ones.
+        let canary = "canary-manifest";
+        install_binary_at_version(&exe, canary).unwrap();
+        for i in 0..(VERSIONS_KEEP_NEWEST + 2) {
+            install_binary_at_version(&exe, &format!("plain-{i}")).unwrap();
+        }
+        // Record the canary in the manifest WITHOUT creating a canary channel
+        // symlink, simulating the "downloaded, not yet promoted" window.
+        let mut manifest = BuildManifest::load().unwrap();
+        manifest.canary = Some(canary.to_string());
+        manifest.save().unwrap();
+
+        prune_old_versions().unwrap();
+
+        let names: std::collections::HashSet<String> =
+            std::fs::read_dir(builds_dir().unwrap().join("versions"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+        assert!(
+            names.contains(canary),
+            "manifest-referenced canary must survive pruning"
+        );
+        // The 4 plain (unprotected) installs are capped to VERSIONS_KEEP_NEWEST.
+        let plain_survivors = (0..(VERSIONS_KEEP_NEWEST + 2))
+            .filter(|i| names.contains(&format!("plain-{i}")))
+            .count();
+        assert_eq!(
+            plain_survivors, VERSIONS_KEEP_NEWEST,
+            "plain unprotected installs must be capped to VERSIONS_KEEP_NEWEST"
+        );
+    });
+}
+
 // The `jcode` home can be reached through a symlink (e.g. a container mount or
 // a relocated install). `prune_old_versions` must still protect the promoted
 // current/stable/shared versions in that case: this exercises the canonical-path
