@@ -192,6 +192,17 @@ fn diff_lines_for_message(msg: Option<&DisplayMessage>) -> Vec<ParsedDiffLine> {
     }
 }
 
+/// Extract the leading line number from a diff line prefix such as `42- ` or
+/// `42+ `. Returns `None` when the prefix carries no number (e.g. a plain
+/// `- `/`+ ` glyph), so callers can fall back to a reconstructed position.
+fn diff_prefix_line_number(prefix: &str) -> Option<usize> {
+    let digits: String = prefix.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 fn build_file_diff_cache_entry(
     file_path: &str,
     msg: Option<&DisplayMessage>,
@@ -205,13 +216,13 @@ fn build_file_diff_cache_entry(
         .map(str::to_owned);
 
     struct DiffHunk {
-        dels: Vec<String>,
+        dels: Vec<(Option<usize>, String)>,
         adds: Vec<String>,
     }
 
     let mut hunks: Vec<DiffHunk> = Vec::new();
     {
-        let mut current_dels: Vec<String> = Vec::new();
+        let mut current_dels: Vec<(Option<usize>, String)> = Vec::new();
         let mut current_adds: Vec<String> = Vec::new();
         for dl in &diff_lines {
             match dl.kind {
@@ -224,7 +235,7 @@ fn build_file_diff_cache_entry(
                         current_dels = Vec::new();
                         current_adds = Vec::new();
                     }
-                    current_dels.push(dl.content.clone());
+                    current_dels.push((diff_prefix_line_number(&dl.prefix), dl.content.clone()));
                 }
                 DiffLineKind::Add => {
                     current_adds.push(dl.content.clone());
@@ -239,8 +250,8 @@ fn build_file_diff_cache_entry(
         }
     }
 
-    let mut add_to_dels: HashMap<usize, Vec<String>> = HashMap::new();
-    let mut orphan_dels: Vec<String> = Vec::new();
+    let mut add_to_dels: HashMap<usize, Vec<(Option<usize>, String)>> = HashMap::new();
+    let mut orphan_dels: Vec<(Option<usize>, String)> = Vec::new();
     let file_lines_vec: Vec<&str> = file_content.lines().collect();
     let mut used_file_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
@@ -282,19 +293,22 @@ fn build_file_diff_cache_entry(
     let mut add_count = 0usize;
 
     let line_num_width = file_lines_vec.len().to_string().len().max(3);
-    let gutter_pad = " ".repeat(line_num_width);
 
     for (i, line_text) in file_lines_vec.iter().enumerate() {
         let line_num = i + 1;
 
         if let Some(dels) = add_to_dels.get(&i) {
-            for del_text in dels {
+            for (del_line_no, del_text) in dels {
                 if first_change_line == usize::MAX {
                     first_change_line = rows.len();
                 }
                 del_count += 1;
                 rows.push(FileDiffDisplayRow {
-                    prefix: format!("{} │-", gutter_pad),
+                    prefix: format!(
+                        "{:>width$} │-",
+                        del_line_no.unwrap_or(i + 1),
+                        width = line_num_width
+                    ),
                     text: del_text.clone(),
                     kind: FileDiffDisplayRowKind::Del,
                 });
@@ -320,13 +334,17 @@ fn build_file_diff_cache_entry(
         }
     }
 
-    for del_text in &orphan_dels {
+    for (del_line_no, del_text) in &orphan_dels {
         if first_change_line == usize::MAX {
             first_change_line = rows.len();
         }
         del_count += 1;
         rows.push(FileDiffDisplayRow {
-            prefix: format!("{} │-", gutter_pad),
+            prefix: format!(
+                "{:>width$} │-",
+                del_line_no.unwrap_or(file_lines_vec.len() + 1),
+                width = line_num_width
+            ),
             text: del_text.clone(),
             kind: FileDiffDisplayRowKind::Del,
         });
@@ -612,4 +630,74 @@ pub(super) fn draw_file_diff_view(
 
     let paragraph = Paragraph::new(visible_lines);
     frame.render_widget(paragraph, inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        FileDiffDisplayRowKind, build_file_diff_cache_entry, diff_prefix_line_number,
+    };
+    use crate::{message::ToolCall, tui::DisplayMessage, tui::ui_diff::collect_diff_lines};
+    use serde_json::json;
+    use std::io::Write;
+
+    #[test]
+    fn diff_prefix_line_number_extracts_leading_digits() {
+        assert_eq!(diff_prefix_line_number("42- "), Some(42));
+        assert_eq!(diff_prefix_line_number("42+ "), Some(42));
+        assert_eq!(diff_prefix_line_number("7- foo"), Some(7));
+        // Non-numbered glyphs carry no number.
+        assert_eq!(diff_prefix_line_number("- "), None);
+        assert_eq!(diff_prefix_line_number("+"), None);
+        assert_eq!(diff_prefix_line_number(""), None);
+    }
+
+    #[test]
+    fn deleted_rows_keep_their_original_line_number() {
+        // Build a file on disk whose content is the "after" state of the edit.
+        let dir = std::env::temp_dir().join(format!("jcode-file-diff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("demo.txt");
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        f.write_all(b"one\ntwo\nthree\n").unwrap();
+        f.flush().unwrap();
+        let file_path_str = file_path.to_string_lossy().to_string();
+
+        // Simulate an edit that replaced "two" with "TWO" (delete line 2, add line 2).
+        let _from_content = collect_diff_lines("2- two\n2+ TWO");
+        assert_eq!(_from_content.len(), 2);
+
+        // Force the content path so the parsed prefixes are used.
+        let msg = DisplayMessage::tool(
+            "2- two\n2+ TWO".to_string(),
+            ToolCall {
+                id: "t".into(),
+                name: "edit".into(),
+                input: json!({ "file_path": file_path_str }),
+                intent: None,
+                thought_signature: None,
+            },
+        );
+
+        let entry = build_file_diff_cache_entry(&file_path_str, Some(&msg), None);
+
+        let del_row = entry
+            .rows
+            .iter()
+            .find(|r| r.kind == FileDiffDisplayRowKind::Del)
+            .expect("there should be a deletion row");
+        // The deleted line must show its original line number, not a blank gutter.
+        assert!(
+            del_row.prefix.contains("2 │-"),
+            "del prefix was {:?}",
+            del_row.prefix
+        );
+        assert!(
+            !del_row.prefix.trim_start().starts_with('│'),
+            "del prefix must not have a blank gutter, was {:?}",
+            del_row.prefix
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
