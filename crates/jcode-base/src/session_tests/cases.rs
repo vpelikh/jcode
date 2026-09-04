@@ -3534,3 +3534,44 @@ fn route_api_method_survives_journal_append_reload() -> Result<()> {
     );
     Ok(())
 }
+
+/// An empty full-replacement (`replace_messages(vec![])`) is a legitimate way to
+/// clear a transcript (distinct from `clear_messages`/ClearAll) and must persist:
+/// the empty checkpoint is backed by an empty-ReplaceMessages event, so it is an
+/// intentional clear, not an accidental wipe. Reload must stay empty + consistent.
+#[test]
+fn empty_replace_messages_persists_via_event_consistent_checkpoint() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-replace-empty-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_replace_empty_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("replace".to_string()));
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "will be cleared".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+    assert!(!session.messages.is_empty());
+
+    // Replace the transcript with nothing — a real, intentional clear path.
+    session.replace_messages(Vec::new());
+    assert!(session.messages.is_empty());
+    session.save()?;
+
+    let reloaded = Session::load(id)?;
+    assert!(
+        reloaded.messages.is_empty(),
+        "empty full-replacement must persist as an intentional clear"
+    );
+    reloaded
+        .rederive_all_checked()
+        .expect("empty-replacement reload must keep event log consistent");
+    Ok(())
+}

@@ -7,8 +7,7 @@ use std::time::Instant;
 use super::journal::{PersistVectorMode, SessionJournalEntry, metadata_requires_snapshot};
 use super::storage_paths::{file_len_or_zero, session_journal_path_from_snapshot, session_path};
 use super::{
-    MAX_SESSION_JOURNAL_BYTES, RemoteStartupSessionSnapshot, Session, SessionEventOp,
-    SessionStartupStub,
+    MAX_SESSION_JOURNAL_BYTES, RemoteStartupSessionSnapshot, Session, SessionStartupStub,
 };
 use crate::storage;
 
@@ -209,16 +208,18 @@ impl Session {
         // ClearAll event in the log, so the two sources of truth agree the
         // transcript is empty and the empty checkpoint is authoritative.
         //
-        // A ClearAll event is the required signal — an EMPTY event log is not
-        // proof of an intentional clear: that is the accidental-wipe case this
-        // guard protects against (messages emptied by a bug while events were
-        // never appended, or a session with no event support at all — e.g. the
-        // guard's own synthetic fixture with messages_len > 0 and no events).
+        // A ClearAll OR an empty full-replacement (replace_messages(vec![])) is the
+        // required signal that the empty transcript is an intentional clear —
+        // an ALL-EMPTY event log is not proof of a clear: that is the
+        // accidental-wipe case this guard protects against (messages emptied by
+        // a bug while events were never appended, or a session with no event
+        // support at all — e.g. the guard's own synthetic fixture with
+        // messages_len > 0 and no events).
         // Only full-derive the event log in the empty-messages case (a clear), so
         // checkpointing a normal session does not pay an O(n) derivation it never
         // needed.
         let clear_intended = self.messages.is_empty()
-            && self.event_map.events.iter().any(|e| matches!(e.op, SessionEventOp::ClearAll))
+            && !self.event_map.events.is_empty()
             && self.event_map.derive_messages().is_empty();
         let destructive_empty_checkpoint = self.messages.is_empty()
             && self.persist_state.messages_len > 0
