@@ -432,21 +432,25 @@ fn looks_like_sha(name: &str) -> bool {
 /// the very worktree currently uses.
 fn prune_stale_sha_outputs(project_root: &Path, working_dir: &Path, current_sha: &str) {
     // Never prune the shared AST cache, the non-git workspace, or any lock file.
-    let Some(reachable) = git_reachable_shas(working_dir) else {
-        return;
-    };
     let now = std::time::SystemTime::now();
     let Ok(entries) = std::fs::read_dir(project_root) else {
         return;
     };
+    // Reachable-set is optional: when git is unavailable `git_reachable_shas`
+    // returns None, and we then cannot TTL-age-out unreachable dirs safely, but we
+    // MUST still enforce the hard cap below — otherwise a git-less environment
+    // never bounds `~/.jcode/compass/` at all.
+    let reachable_opt = git_reachable_shas(working_dir);
 
     // Collect all per-SHA dirs, then apply two GC rules:
-    //   1. Unreachable dirs older than SHA_RETENTION_TTL are removed outright.
+    //   1. When we know reachability: unreachable dirs older than SHA_RETENTION_TTL
+    //      are removed outright.
     //   2. If the number of surviving per-SHA dirs still exceeds SHA_INDEX_MAX_KEPT,
     //      keep only the newest SHA_INDEX_MAX_KEPT (plus current_sha) and remove the
     //      rest — even if they are reachable from some (e.g. backup) ref. Otherwise
     //      reachable per-commit graphs accumulate forever (~0.9 GB each on a large
-    //      repo) and `~/.jcode/compass/<project>/` grows unbounded.
+    //      repo) and `~/.jcode/compass/<project>/` grows unbounded. Rule 2 runs
+    //      regardless of reachability, so the count cap always bounds growth.
     let mut candidates: Vec<(SystemTime, PathBuf, String)> = Vec::new();
     // Scan all per-SHA dirs (no truncation): the hard cap below prunes the
     // oldest survivors. Limiting the scan could hide old dirs from the cap in
@@ -464,6 +468,13 @@ fn prune_stale_sha_outputs(project_root: &Path, working_dir: &Path, current_sha:
         if name == current_sha {
             continue;
         }
+        // If git reachability is unknown (None), conservatively treat every dir as
+        // reachable for TTL purposes (never TTL-prune), but still count it toward
+        // the cap so the cache stays bounded.
+        let reachable = match &reachable_opt {
+            Some(set) => set.contains(name),
+            None => true,
+        };
         let Some(age) = entry
             .metadata()
             .ok()
@@ -474,7 +485,7 @@ fn prune_stale_sha_outputs(project_root: &Path, working_dir: &Path, current_sha:
         };
         // Reachable commits (any branch/tag) are kept regardless of age, but their dir
         // still counts toward the max-kept cap below.
-        if reachable.contains(name) {
+        if reachable {
             candidates.push((now - age, entry.path(), name.to_string()));
             continue;
         }
@@ -2505,6 +2516,47 @@ mod tests {
         assert!(
             !project_root.join(&stale_sha).exists(),
             "unreachable TTL-expired dir must still be pruned"
+        );
+    }
+
+    // When git is unavailable (git_reachable_shas → None), the hard cap must
+    // still bound the cache. Without reachability info we conservatively never
+    // TTL-prune, but the count cap (keep newest SHA_INDEX_MAX_KEPT + current)
+    // must still apply — otherwise a git-less environment never bounds the dir.
+    #[test]
+    fn prune_caps_even_when_git_unavailable() {
+        let _ = HomeGuard::set();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        // working_dir is a NON-git dir: `git rev-list --all` in it fails, so
+        // git_reachable_shas returns None.
+        std::fs::create_dir_all(&root).unwrap();
+
+        let project_root = root.join("compass/proj");
+        // Create more per-SHA dirs than the cap, plus a "current" sha string that
+        // does not need to exist as a real git object (prune only string-compares
+        // it against dir names).
+        let current_sha = "a".repeat(40);
+        for i in 0..(SHA_INDEX_MAX_KEPT + 3) {
+            // Distinct hex names (0..n zero-padded).
+            let name = format!("{i:040x}");
+            std::fs::create_dir_all(project_root.join(&name)).unwrap();
+        }
+
+        prune_stale_sha_outputs(&project_root, &root, &current_sha);
+
+        // The cap must have left at most SHA_INDEX_MAX_KEPT non-current dirs.
+        let surviving: Vec<_> = std::fs::read_dir(&project_root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| looks_like_sha(n) && n != &current_sha)
+            .collect();
+        assert!(
+            surviving.len() <= SHA_INDEX_MAX_KEPT,
+            "cap must still apply when git is unavailable: {} survivors > {}",
+            surviving.len(),
+            SHA_INDEX_MAX_KEPT
         );
     }
 
