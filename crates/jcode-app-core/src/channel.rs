@@ -192,10 +192,11 @@ pub struct TelegramChannel {
     /// triggers a discovery sweep so a blocked default DC is worked around at
     /// first use rather than only after a failed call.
     discovered_once: tokio::sync::Mutex<bool>,
-    /// Serializes `run_discovery` so concurrent callers (the poll loop, a send,
-    /// a `/status`) never trigger overlapping, redundant discovery sweeps. Each
-    /// takes the lock and runs one sweep; the network round-trips are serialized
-    /// rather than duplicated in parallel.
+    /// Serializes discovery (in `client_or_default` and `invalidate_cache`) so
+    /// concurrent callers — the poll loop, a send, a `/status`, or a recovery
+    /// burst — never run overlapping or redundant discovery sweeps. Callers
+    /// acquire it, re-check state, and call `run_discovery_body` while holding
+    /// it; the network round-trips are serialized rather than duplicated.
     discovery_lock: tokio::sync::Mutex<()>,
     /// Serializes inbound message handling for this chat. Because each message
     /// is handled in its own task (so the poll loop stays responsive), this
@@ -266,15 +267,6 @@ impl TelegramChannel {
     /// Run (or re-run) the discovery sweep, replacing the cached client with the
     /// first reachable DC (or the default client if all candidates fail). Marks
     /// discovery as done and records the attempt time for backoff.
-    async fn run_discovery(&self) {
-        let _guard = self.discovery_lock.lock().await;
-        self.run_discovery_body().await;
-    }
-
-    /// Run the discovery sweep, replacing the cached client. Callers must hold
-    /// `self.discovery_lock` (via `run_discovery` or `client_or_default`) to
-    /// avoid concurrent redundant sweeps. Marks discovery as done and records
-    /// the attempt time for backoff.
     async fn run_discovery_body(&self) {
         let replacement = match crate::telegram::discover_client(
             &self.token,
@@ -328,13 +320,19 @@ impl TelegramChannel {
     /// throttled by `DISCOVERY_BACKOFF_SECS` (unless `force`) so a persistently
     /// blocked network does not trigger a slow candidate sweep on every poll.
     async fn invalidate_cache(&self, force: bool) {
+        // Hold the discovery lock across the backoff check AND the sweep so a
+        // burst of concurrent invalidations right at the backoff boundary don't
+        // each run a full sweep: the first runs discovery (refreshing
+        // last_discovery), and the rest, once they acquire the lock, observe the
+        // fresh timestamp and return early.
+        let _guard = self.discovery_lock.lock().await;
         if !force {
             let last = *self.last_discovery.lock().await;
             if last.elapsed().as_secs() < crate::telegram::DISCOVERY_BACKOFF_SECS {
                 return;
             }
         }
-        self.run_discovery().await;
+        self.run_discovery_body().await;
     }
 
     /// Handle a slash command received over Telegram, returning the reply text.
