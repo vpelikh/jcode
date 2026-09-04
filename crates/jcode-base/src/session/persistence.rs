@@ -6,7 +6,10 @@ use std::time::Instant;
 
 use super::journal::{PersistVectorMode, SessionJournalEntry, metadata_requires_snapshot};
 use super::storage_paths::{file_len_or_zero, session_journal_path_from_snapshot, session_path};
-use super::{MAX_SESSION_JOURNAL_BYTES, RemoteStartupSessionSnapshot, Session, SessionStartupStub};
+use super::{
+    MAX_SESSION_JOURNAL_BYTES, RemoteStartupSessionSnapshot, Session, SessionEventOp,
+    SessionStartupStub,
+};
 use crate::storage;
 
 /// Outcome of replaying one session journal file.
@@ -200,9 +203,25 @@ impl Session {
     }
 
     fn checkpoint_snapshot(&mut self, snapshot_path: &Path, journal_path: &Path) -> Result<()> {
+        // A checkpoint with an empty transcript is *destructive* only if it would
+        // throw away messages the event log still implies exist. An intentional
+        // `clear_messages()` empties the legacy vectors AND durably records a
+        // ClearAll event in the log, so the two sources of truth agree the
+        // transcript is empty and the empty checkpoint is authoritative.
+        //
+        // A ClearAll event is the required signal — an EMPTY event log is not
+        // proof of an intentional clear: that is the accidental-wipe case this
+        // guard protects against (messages emptied by a bug while events were
+        // never appended, or a session with no event support at all — e.g. the
+        // guard's own synthetic fixture with messages_len > 0 and no events).
+        let clear_intended = self.event_map.events.iter().any(|e| {
+            matches!(e.op, SessionEventOp::ClearAll)
+        }) && self.messages.is_empty()
+            && self.event_map.derive_messages().is_empty();
         let destructive_empty_checkpoint = self.messages.is_empty()
             && self.persist_state.messages_len > 0
-            && snapshot_path.exists();
+            && snapshot_path.exists()
+            && !clear_intended;
         if destructive_empty_checkpoint {
             self.guard_snapshot_shrink(snapshot_path, journal_path);
             bail!(

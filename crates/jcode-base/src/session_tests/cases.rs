@@ -3244,3 +3244,48 @@ fn fork_keeping_all_events_still_writes_a_loadable_snapshot() -> Result<()> {
         .expect("fork keeping all events must reload consistently");
     Ok(())
 }
+
+/// Clearing a non-empty session must persist (unrecoverable data-loss guard
+/// notwithstanding). `clear_messages()` emits a ClearAll event AND empties the
+/// legacy vectors; the next save must checkpoint this cleared state. If the
+/// unchecked shrink-guard treats every empty checkpoint as an accidental wipe,
+/// the clear is never persisted and a reload resurrects the old transcripts —
+/// the event-sourced log (which durably has the ClearAll) then diverges from the
+/// legacy vectors it reconciles against.
+#[test]
+fn clear_messages_persists_via_event_consistent_checkpoint() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-clear-persist-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_clear_persist_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("clear".to_string()));
+    session.add_message(
+        Role::User,
+        vec![crate::message::ContentBlock::Text {
+            text: "keep me".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+    assert!(!session.messages.is_empty());
+
+    // Clear the transcript (intentional user action, not a crash-wipe).
+    session.clear_messages();
+    assert!(session.messages.is_empty());
+    // The clear must persist; if the shrink-guard blocks it, this errors.
+    session.save()?;
+
+    let reloaded = Session::load(id)?;
+    assert!(
+        reloaded.messages.is_empty(),
+        "cleared session must reload empty (the ClearAll is the durable record)"
+    );
+    reloaded
+        .rederive_all_checked()
+        .expect("cleared reload must keep event log consistent");
+    Ok(())
+}
