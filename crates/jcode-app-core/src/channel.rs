@@ -192,6 +192,11 @@ pub struct TelegramChannel {
     /// triggers a discovery sweep so a blocked default DC is worked around at
     /// first use rather than only after a failed call.
     discovered_once: tokio::sync::Mutex<bool>,
+    /// Serializes `run_discovery` so concurrent callers (the poll loop, a send,
+    /// a `/status`) never trigger overlapping, redundant discovery sweeps. Each
+    /// takes the lock and runs one sweep; the network round-trips are serialized
+    /// rather than duplicated in parallel.
+    discovery_lock: tokio::sync::Mutex<()>,
     /// Serializes inbound message handling for this chat. Because each message
     /// is handled in its own task (so the poll loop stays responsive), this
     /// lock ensures the replies to messages from one chat arrive in arrival
@@ -250,6 +255,7 @@ impl TelegramChannel {
             api_ip,
             last_discovery: tokio::sync::Mutex::new(std::time::Instant::now()),
             discovered_once: tokio::sync::Mutex::new(false),
+            discovery_lock: tokio::sync::Mutex::new(()),
             process_lock: tokio::sync::Mutex::new(()),
             consecutive_discovery_failures: tokio::sync::Mutex::new(0),
             auth_warning_tracker: tokio::sync::Mutex::new(AuthWarningTracker::default()),
@@ -261,6 +267,15 @@ impl TelegramChannel {
     /// first reachable DC (or the default client if all candidates fail). Marks
     /// discovery as done and records the attempt time for backoff.
     async fn run_discovery(&self) {
+        let _guard = self.discovery_lock.lock().await;
+        self.run_discovery_body().await;
+    }
+
+    /// Run the discovery sweep, replacing the cached client. Callers must hold
+    /// `self.discovery_lock` (via `run_discovery` or `client_or_default`) to
+    /// avoid concurrent redundant sweeps. Marks discovery as done and records
+    /// the attempt time for backoff.
+    async fn run_discovery_body(&self) {
         let replacement = match crate::telegram::discover_client(
             &self.token,
             self.proxy.as_deref(),
@@ -297,7 +312,14 @@ impl TelegramChannel {
     /// returned so the calling operation still attempts to run.
     async fn client_or_default(&self) -> reqwest::Client {
         if !*self.discovered_once.lock().await {
-            self.run_discovery().await;
+            // Take the discovery lock so the check-set of discovered_once is
+            // atomic: a concurrent caller that sees the flag still false after we
+            // start will block here, then observe it true (set by the first
+            // discovery) and skip its own redundant sweep.
+            let _guard = self.discovery_lock.lock().await;
+            if !*self.discovered_once.lock().await {
+                self.run_discovery_body().await;
+            }
         }
         self.client.lock().await.clone()
     }
