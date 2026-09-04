@@ -2449,6 +2449,65 @@ mod tests {
         );
     }
 
+    // Reachable per-SHA dirs must never be pruned by the 14-day TTL, and must not
+    // be pruned by the hard cap when the total is at or below SHA_INDEX_MAX_KEPT.
+    // This pins the guarantee that the cap only removes *excess* reachable dirs,
+    // never everything just because they are old — otherwise long-lived stable
+    // branches would be re-extracted needlessly after a 14-day idle window.
+    #[test]
+    fn prune_keeps_reachable_shas_when_within_cap_even_if_old() {
+        let (_home, _home_path) = HomeGuard::set();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        let git = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init", "-q"]) {
+            return;
+        }
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(root.join("main.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "."]);
+        if !git(&["commit", "-qm", "init"]) {
+            return;
+        }
+        // One reachable commit is enough; the fresh HEAD is protected by the
+        // current_sha guard. Create the project root and a per-SHA dir for HEAD.
+        let head_sha = current_git_sha(&root).expect("HEAD sha");
+        let project_root = root.join("compass/proj");
+        std::fs::create_dir_all(project_root.join(&head_sha)).unwrap();
+        // Also add one old unreachable SHA dir past the TTL: it must be pruned
+        // even though it is only one dir (TTL applies regardless of count).
+        let stale_sha = "f".repeat(40);
+        std::fs::create_dir_all(project_root.join(&stale_sha)).unwrap();
+        let old = std::time::SystemTime::now()
+            .checked_sub(SHA_RETENTION_TTL + std::time::Duration::from_secs(1))
+            .unwrap();
+        filetime::set_file_mtime(
+            project_root.join(&stale_sha),
+            filetime::FileTime::from_system_time(old),
+        )
+        .unwrap();
+
+        prune_stale_sha_outputs(&project_root, &root, &head_sha);
+
+        assert!(
+            project_root.join(&head_sha).exists(),
+            "reachable current dir must be kept even though it is old"
+        );
+        assert!(
+            !project_root.join(&stale_sha).exists(),
+            "unreachable TTL-expired dir must still be pruned"
+        );
+    }
+
     // Pre-warm is the session-subscribe hook that kicks the cold build off the
     // query path. It must (a) return true and schedule a build for a git dir
     // with no index, (b) not build again once the index exists, and (c) swallow
