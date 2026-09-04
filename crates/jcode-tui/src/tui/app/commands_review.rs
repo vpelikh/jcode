@@ -1567,12 +1567,21 @@ pub(super) fn finish_review_loop(app: &mut App, state: &mut jcode_session_types:
         if !(ownership_ok && confidence_ok) {
             // The completion assessment now disagrees with the reviewed + fixed
             // result. Surface it and stop; do not run another review round (no
-            // gates↔review ping-pong).
+            // gates↔review ping-pong). Record the specific gate that failed so
+            // it shows up in the same telemetry the primary auto-poke gate uses.
+            let kind = if !ownership_ok {
+                crate::telemetry::TodoGateKind::Ownership
+            } else if confidence.confidence_spike_detected {
+                crate::telemetry::TodoGateKind::ConfidenceSpike
+            } else {
+                crate::telemetry::TodoGateKind::Completion
+            };
             let reason = if !ownership_ok {
                 "end-to-end delivery assessment no longer holds"
             } else {
                 "completion confidence needs re-validation"
             };
+            crate::telemetry::record_todo_gate(kind);
             state.finish_reason = Some(format!("converged_gate_recheck_failed: {reason}"));
             app.push_display_message(DisplayMessage::system(format!(
                 "⚠️ Review fixed files, but the completion assessment now disagrees ({reason}). Please review the result yourself."

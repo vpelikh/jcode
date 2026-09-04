@@ -253,8 +253,9 @@ This re-run is implemented: when the loop converges and its `record.files_touche
 is non-empty (the review changed files after the gates first passed), it re-runs the
 ownership and completion-confidence gates once against the post-fix state. A failing
 gate in that one re-run surfaces a "review fixed files, but the completion assessment
-now disagrees" message and stops; it never re-enters the review loop, so there is no
-gates↔review ping-pong.
+now disagrees" message, records the same todo-gate telemetry the primary gate path
+uses (Ownership / Completion / ConfidenceSpike), and stops; it never re-enters the
+review loop, so there is no gates↔review ping-pong.
 
 ## Config (on `AutoReviewConfig`)
 
