@@ -2954,3 +2954,73 @@ fn unknown_plugin_event_survives_public_api_journal_append_reload() -> Result<()
         .expect("event log must stay consistent after plugin-event journal reload");
     Ok(())
 }
+
+/// Upgrade/migration failure mode: a session snapshot written *before* the
+/// event log was persisted (no `event_map` field in the JSON) must still load
+/// through the public API. The load path (`reconcile_event_map_after_load`)
+/// should rebuild the log from the legacy vectors so the two sources of truth
+/// agree. This is exactly how pre-upgrade sessions are read after installing a
+/// newer build that persists `event_map`.
+#[test]
+fn session_without_persisted_event_map_loads_via_rebuild() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-migration-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_pre_persistence_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("legacy".to_string()));
+    session.add_message(
+        Role::User,
+        vec![crate::message::ContentBlock::Text {
+            text: "legacy hello".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.add_message(
+        Role::Assistant,
+        vec![crate::message::ContentBlock::Text {
+            text: "legacy world".to_string(),
+            cache_control: None,
+        }],
+    );
+
+    // Simulate a pre-persistence snapshot: serialize, then strip any persisted
+    // event log so the on-disk file is the historical format.
+    let json = serde_json::to_string(&session).expect("serialize session");
+    let mut obj: serde_json::Value = serde_json::from_str(&json).expect("parse session json");
+    if let serde_json::Value::Object(ref mut map) = obj {
+        map.remove("event_map");
+    }
+    let path = crate::session::storage_paths::session_path(id)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, serde_json::to_string(&obj).expect("re-serialize legacy snapshot"))?;
+
+    // Public load path: must rebuild the event log from the legacy vectors.
+    let loaded = Session::load(id)?;
+    assert_eq!(loaded.messages.len(), 2, "legacy messages must load");
+    assert!(
+        !loaded.event_map.events.is_empty(),
+        "old-format snapshot must hydrate a rebuilt event log"
+    );
+    // The rebuilt log agrees with the legacy vectors.
+    loaded
+        .rederive_all_checked()
+        .expect("rebuilt event log must agree with legacy vectors after migration");
+    // Invariant registry must be green on the migrated session.
+    let inv = InvariantRegistry::builtin();
+    let log = inv.check(&loaded.event_map);
+    assert!(
+        log.is_green(),
+        "migrated snapshot must satisfy the invariant registry, got: {:?}",
+        log.violations
+            .iter()
+            .map(|v| format!("{}: {}", v.invariant, v.message))
+            .collect::<Vec<_>>()
+    );
+    Ok(())
+}
