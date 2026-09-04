@@ -92,10 +92,9 @@ fn gate_recheck_that_fails_on_ownership_surfaces_ownership_reason() {
             "expected the ownership gate reason, got {reason:?}"
         );
         assert!(
-            app.display_messages().iter().any(|msg| {
-                msg.content
-                    .contains("completion assessment now disagrees")
-            }),
+            app.display_messages()
+                .iter()
+                .any(|msg| { msg.content.contains("completion assessment now disagrees") }),
             "expected the failure to be surfaced for the ownership gate"
         );
     });
@@ -131,10 +130,9 @@ fn gate_recheck_that_fails_on_confidence_spike_surfaces() {
             "expected the confidence gate reason for a spike, got {reason:?}"
         );
         assert!(
-            app.display_messages().iter().any(|msg| {
-                msg.content
-                    .contains("completion assessment now disagrees")
-            }),
+            app.display_messages()
+                .iter()
+                .any(|msg| { msg.content.contains("completion assessment now disagrees") }),
             "expected the spike failure to be surfaced"
         );
     });
@@ -170,10 +168,9 @@ fn gate_recheck_that_passes_finishes_cleanly() {
         assert_eq!(state.finish_reason.as_deref(), Some("converged"));
         // No failure-surfacing message.
         assert!(
-            !app.display_messages().iter().any(|msg| {
-                msg.content
-                    .contains("completion assessment now disagrees")
-            }),
+            !app.display_messages()
+                .iter()
+                .any(|msg| { msg.content.contains("completion assessment now disagrees") }),
             "a passing gate re-check must not surface a failure"
         );
     });
@@ -197,10 +194,9 @@ fn finish_without_gate_recheck_emits_digest_and_does_not_touch_gates() {
         assert!(state.finished);
         // No failure-surfacing message and no spurious gate evaluation.
         assert!(
-            !app.display_messages().iter().any(|msg| {
-                msg.content
-                    .contains("completion assessment now disagrees")
-            }),
+            !app.display_messages()
+                .iter()
+                .any(|msg| { msg.content.contains("completion assessment now disagrees") }),
             "a no-re-check finish must not surface a gate failure"
         );
         assert!(
@@ -239,9 +235,8 @@ fn save_completed_todo(session_id: &str, completion_confidence: Option<u8>) {
             blocked_by: Vec::new(),
             assigned_to: None,
             confidence: None,
-            completion_confidence: completion_confidence.map(|score| {
-                crate::todo::ConfidenceState::from_legacy_score(score)
-            }),
+            completion_confidence: completion_confidence
+                .map(|score| crate::todo::ConfidenceState::from_legacy_score(score)),
             confidence_history: match completion_confidence {
                 // Validated -> Verified: a single-level step, no spike.
                 Some(_) => vec![
@@ -449,10 +444,9 @@ fn step_review_loop_converges_with_fix_and_gate_recheck_passes_cleanly() {
         assert!(state.finished);
         assert_eq!(state.finish_reason.as_deref(), Some("converged"));
         assert!(
-            !app.display_messages().iter().any(|msg| {
-                msg.content
-                    .contains("completion assessment now disagrees")
-            }),
+            !app.display_messages()
+                .iter()
+                .any(|msg| { msg.content.contains("completion assessment now disagrees") }),
             "a passing gate re-check must not surface a failure through step_review_loop"
         );
     });
@@ -492,10 +486,9 @@ fn step_review_loop_converged_without_fix_never_runs_gate_recheck() {
         assert_eq!(state.finish_reason.as_deref(), Some("converged"));
         // No gate re-check ran, so no failure surfaced and the digest is present.
         assert!(
-            !app.display_messages().iter().any(|msg| {
-                msg.content
-                    .contains("completion assessment now disagrees")
-            }),
+            !app.display_messages()
+                .iter()
+                .any(|msg| { msg.content.contains("completion assessment now disagrees") }),
             "a converged-without-fix review must not run the gate re-check"
         );
     });
