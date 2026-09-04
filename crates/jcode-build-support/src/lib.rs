@@ -249,7 +249,7 @@ pub fn prune_old_versions() -> Result<()> {
 /// manifest-referenced, or channel-symlinked. Used by the self-dev publish path
 /// to preserve the *previous* current version, which is recorded as a rollback
 /// target only after publish returns — it must not be deleted in the interim.
-pub fn prune_old_versions_protecting(extra_protected: &[String]) -> Result<()> {
+fn prune_old_versions_protecting(extra_protected: &[String]) -> Result<()> {
     let versions_dir = builds_dir()?.join("versions");
     let Ok(entries) = std::fs::read_dir(&versions_dir) else {
         return Ok(());
