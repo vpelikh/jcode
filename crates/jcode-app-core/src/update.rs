@@ -313,6 +313,10 @@ fn install_main_source_update_blocking(latest_sha: &str) -> Result<PathBuf> {
     build::update_current_symlink(&channel_version)?;
     build::update_launcher_symlink_to_current()?;
 
+    // Reclaim space: this install also added an immutable version dir (~611 MB).
+    // Prune after promoting so current/stable/shared stay protected.
+    let _ = build::prune_old_versions();
+
     metadata.installed_version = Some(channel_version.clone());
     metadata.installed_from = Some("source".to_string());
     metadata.last_check = SystemTime::now();
@@ -1080,6 +1084,10 @@ pub fn download_and_install_blocking_with_progress(
     build::update_stable_symlink(version)?;
     build::update_current_symlink(version)?;
     build::update_launcher_symlink_to_current()?;
+
+    // Immutable `versions/<version>/` installs accumulate (~611 MB each) across
+    // release updates. Reclaim space while current/stable/shared stay protected.
+    let _ = build::prune_old_versions();
 
     metadata.installed_version = Some(release.tag_name.clone());
     metadata.installed_from = Some(asset.browser_download_url.clone());

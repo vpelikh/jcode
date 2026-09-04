@@ -229,6 +229,106 @@ pub fn install_binary_at_version(source: &std::path::Path, version: &str) -> Res
     Ok(dest)
 }
 
+/// Maximum number of immutable `builds/versions/<version>/` installs retained,
+/// excluding the currently-promoted channels. Older installs are deleted after a
+/// new install so `~/.jcode/builds/versions/` stays bounded instead of growing
+/// by ~611 MB on every self-dev build or release install.
+const VERSIONS_KEEP_NEWEST: usize = 2;
+
+/// Best-effort cleanup of `builds/versions/`. Keeps the versions referenced by
+/// any channel symlink (`builds/<channel>/`) — current, stable, shared-server,
+/// and canary — plus the newest `VERSIONS_KEEP_NEWEST` other installs, and
+/// deletes the rest. Any failure is swallowed so a prune problem never fails an
+/// install.
+pub fn prune_old_versions() -> Result<()> {
+    let versions_dir = builds_dir()?.join("versions");
+    let Ok(entries) = std::fs::read_dir(&versions_dir) else {
+        return Ok(());
+    };
+
+    // Always-protected channels; these singletons must never be deleted even if
+    // they are not among the newest installs.
+    let mut protected: Vec<PathBuf> = Vec::new();
+    // 1) Versions explicitly promoted via `*-version` marker files (current,
+    //    stable, shared-server). Canonicalize the versioned binary's parent so
+    //    it matches the canonicalized candidate paths below even when the jcode
+    //    home path itself traverses a symlink.
+    for read in [
+        storage_helpers::read_current_version(),
+        storage_helpers::read_stable_version(),
+        storage_helpers::read_shared_server_version(),
+    ] {
+        if let Ok(Some(version)) = read
+            && let Ok(bin) = storage_helpers::version_binary_path(&version)
+            && let Some(parent) = bin.parent()
+        {
+            protected.push(
+                parent
+                    .canonicalize()
+                    .unwrap_or_else(|_| parent.to_path_buf()),
+            );
+        }
+    }
+    // 2) Any channel symlink under `builds/<channel>/` that resolves into
+    //    `versions/`. This covers canary (which has no `-version` marker) and
+    //    any future channel, so a smoke-testing/promoted binary is never pruned.
+    let versions_canon =
+        versions_dir.canonicalize().unwrap_or_else(|_| versions_dir.clone());
+    if let Ok(builds) = std::fs::read_dir(builds_dir()?) {
+        for dir in builds.flatten() {
+            if !dir.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                || !dir.path().is_dir()
+            {
+                continue;
+            }
+            let Ok(links) = std::fs::read_dir(dir.path()) else {
+                continue;
+            };
+            for link in links.flatten() {
+                let link_path = link.path();
+                if let Ok(target) = std::fs::read_link(&link_path)
+                    && let Ok(target) = target.canonicalize()
+                    && target.starts_with(&versions_canon)
+                {
+                    if let Some(parent) = target.parent() {
+                        protected.push(parent.to_path_buf());
+                    }
+                }
+            }
+        }
+    }
+
+    // Collect install dirs (each holds a valid binary name) with their mtime.
+    let mut installs: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        // Canonicalize both the candidate and the protected set so protection
+        // holds even when the jcode home path traverses a symlink.
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        // Exclude protected channels from the "remove oldest" pool.
+        if protected.iter().any(|p| *p == canonical) {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata()
+            && let Ok(mtime) = meta.modified()
+        {
+            installs.push((mtime, path));
+        }
+    }
+
+    // Newest first; delete everything beyond the newest `VERSIONS_KEEP_NEWEST`.
+    if installs.len() > VERSIONS_KEEP_NEWEST {
+        installs.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_mtime, path) in installs.into_iter().skip(VERSIONS_KEEP_NEWEST) {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+    Ok(())
+}
+
 fn binary_source_metadata_path(binary: &Path) -> PathBuf {
     let file_name = binary
         .file_name()
@@ -705,6 +805,11 @@ pub fn publish_local_current_build_for_source(
     let current_link = update_current_symlink(&source.version_label)?;
     let launcher_link = update_launcher_symlink_to_current()?;
 
+    // Reclaim space: self-dev builds install an immutable version dir (~611 MB
+    // each) that would otherwise accumulate on every build. The current channel
+    // is promoted above, so it (and stable/shared-server) are protected; prune.
+    let _ = prune_old_versions();
+
     Ok(PublishedBuild {
         version: source.version_label.clone(),
         source_fingerprint: source.fingerprint.clone(),
@@ -919,6 +1024,10 @@ pub fn install_local_release(repo_dir: &std::path::Path) -> Result<PathBuf> {
     update_current_symlink(&version)?;
     update_shared_server_symlink(&version)?;
     update_launcher_symlink_to_current()?;
+
+    // Reclaim space: immutably-installed versions accumulate (~611 MB each).
+    // Promote first (so current/stable/shared are protected), then prune.
+    let _ = prune_old_versions();
 
     Ok(versioned)
 }
