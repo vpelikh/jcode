@@ -2036,3 +2036,122 @@ fn test_compact_transcript_with_bracket_produces_balanced_durable_bracket() {
     back.rederive_all_checked()
         .expect("reloaded bracket producer log must stay consistent");
 }
+
+/// The `Unknown` escape hatch must round-trip **stably** even when the remaining
+/// payload is not a flat JSON object (e.g. `{"op":"x","data":123}`). Such a
+/// value is preserved as an object wrapper (`data: { "data": 123 }`) so it
+/// carries an `op` alongside the payload; a second serialize→deserialize must
+/// reproduce the exact same in-memory value (no unbounded nesting growth). This
+/// pins the documented behavior of the non-object branch of `Serialize`.
+#[test]
+fn test_unknown_op_non_object_payload_round_trips_losslessly() {
+    // Serialize a non-object data directly (matches the on-disk `{"op","data"}`)
+    // and confirm Deserialize recovers the same value WITHOUT re-nesting.
+    let raw = r#"{"op":"plugin_scalar","data":123}"#;
+    let op: SessionEventOp = serde_json::from_str(raw).expect("deserialize scalar unknown");
+    match &op {
+        SessionEventOp::Unknown { event_type, data } => {
+            assert_eq!(event_type, "plugin_scalar");
+            // Round-trip once. A non-object payload must stay a scalar, not
+            // collapse into `{"data":123}`.
+            let json = serde_json::to_string(&op).expect("serialize");
+            let again: SessionEventOp = serde_json::from_str(&json).expect("round-trip");
+            match &again {
+                SessionEventOp::Unknown { data: d2, .. } => {
+                    assert_eq!(
+                        d2,
+                        data,
+                        "non-object Unknown payload must round-trip without shape change"
+                    );
+                }
+                other => panic!("changed kind: {other:?}"),
+            }
+        }
+        other => panic!("expected Unknown, got {other:?}"),
+    }
+}
+
+/// A retried compaction after a crash must not double-open the bracket. If a
+/// `CompactionStart` is already orphaned (a previous run crashed mid-bracket),
+/// `compact_transcript_with_bracket` should complete it rather than start a
+/// second, nested bracket — which would leave a depth-2 malformed bracket the
+/// `CompactionBracket` invariant flags as silent corruption. After the retry the
+/// log must contain exactly one balanced bracket.
+#[test]
+fn test_compact_transcript_retry_recovers_orphaned_bracket() {
+    let mut session = Session::create_with_id(
+        "bracket_retry".to_string(),
+        None,
+        Some("Bracket retry".to_string()),
+    );
+    session.append_stored_message(StoredMessage {
+        id: "m1".to_string(),
+        role: Role::User,
+        content: vec![text_block("msg 1")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+
+    // Simulate a crashed in-flight compaction: an orphaned CompactionStart.
+    session.event_map.start_compaction("crashed_1", 1);
+    assert!(session.event_map.orphaned_compaction().is_some());
+    let orphaned_before = session
+        .event_map
+        .events
+        .iter()
+        .filter(|e| matches!(e.op, SessionEventOp::CompactionStart { .. }))
+        .count();
+
+    // Retry completes the in-flight bracket instead of double-opening.
+    let tail = vec![StoredMessage {
+        id: "tail".to_string(),
+        role: Role::User,
+        content: vec![text_block("[summary]")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    }];
+    let compaction = StoredCompactionState {
+        summary_text: "summarized".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 1,
+    };
+    session.compact_transcript_with_bracket("retry_1", tail, compaction.clone(), 1);
+
+    // Exactly one start and one end (no depth-2 double bracket).
+    let starts = session
+        .event_map
+        .events
+        .iter()
+        .filter(|e| matches!(e.op, SessionEventOp::CompactionStart { .. }))
+        .count();
+    let ends = session
+        .event_map
+        .events
+        .iter()
+        .filter(|e| matches!(e.op, SessionEventOp::CompactionEnd { .. }))
+        .count();
+    assert_eq!(
+        starts, orphaned_before,
+        "retry must not add another CompactionStart (no nesting)"
+    );
+    assert_eq!(starts, ends, "bracket must be balanced after retry");
+    assert!(
+        session.event_map.orphaned_compaction().is_none(),
+        "retry must close the orphaned bracket"
+    );
+    // The recovered bracket is accepted by the invariant registry.
+    let inv = crate::session::InvariantRegistry::builtin();
+    assert!(
+        inv.check(&session.event_map).is_green(),
+        "retried bracket must satisfy the CompactionBracket invariant"
+    );
+    session
+        .rederive_all_checked()
+        .expect("retried bracket producer must stay consistent");
+}

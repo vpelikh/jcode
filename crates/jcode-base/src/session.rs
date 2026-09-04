@@ -1792,11 +1792,14 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
     /// bracket around a single surface mutation and keeps the legacy
     /// `self.compaction` vector in sync with what the log derives.
     ///
-    /// Returns the compaction id of the bracket so a caller can correlate a
-    /// later crash-recovery report back to the specific span being summarized.
-    /// Callers should snap `messages` (and `covers_up_to_turn`) to tool-pairing
-    /// boundaries so no open tool/call pair crosses the cut (the
-    /// `ToolPairingBalanced` invariant enforces this on replay).
+    /// Returns the compaction id of the (new) bracket, so a caller can correlate
+    /// a later crash-recovery report back to the span being summarized. When an
+    /// orphaned bracket is already open (a prior run crashed mid-bracket) the
+    /// orphan is completed rather than re-opened, so the returned id is the
+    /// retry's, not the original crashed run's. Callers should snap `messages`
+    /// (and `covers_up_to_turn`) to tool-pairing boundaries so no open
+    /// tool/call pair crosses the cut (the `ToolPairingBalanced` invariant
+    /// enforces this on replay).
     pub fn compact_transcript_with_bracket(
         &mut self,
         compaction_id: impl Into<String>,
@@ -1805,8 +1808,16 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         covers_up_to_turn: usize,
     ) -> String {
         let compaction_id = compaction_id.into();
-        self.event_map
-            .start_compaction(compaction_id.clone(), covers_up_to_turn);
+        // Crash-safety against a *retried* compaction: if a previous run crashed
+        // mid-bracket (an orphaned `CompactionStart` is still open), do not
+        // start a second, nested bracket — that would create a depth-2 malformed
+        // bracket the invariant flags as silent corruption. Instead, complete the
+        // in-flight bracket: the surface mutation and `CompactionEnd` below close
+        // the orphan, so retry is idempotent with respect to the bracket shape.
+        if self.event_map.orphaned_compaction().is_none() {
+            self.event_map
+                .start_compaction(compaction_id.clone(), covers_up_to_turn);
+        }
         // One surface mutation inside the bracket: replace the transcript with
         // the summarized tail. This is the only change replay needs to apply.
         self.replace_messages(messages);

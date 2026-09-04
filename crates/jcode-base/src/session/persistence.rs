@@ -186,8 +186,15 @@ impl Session {
         // events (compaction brackets, plugin `Unknown`) survive a crash that is
         // recovered from the journal, and the replayed log agrees with the
         // replayed legacy vectors when `reconcile_event_map_after_load` runs.
+        //
+        // Use `push_event` (trusting), not `append_event` (validating): these
+        // events were already validated when originally appended before the
+        // journal write. Re-validating on reload could silently drop a
+        // legitimate long-lived event (e.g. the `MAX_EVENT_AGE_SECS` timestamp
+        // window on an aged session) and desync the event log from the journal,
+        // exactly why the fork path also uses `push_event`.
         for event in entry.append_events {
-            self.event_map.append_event(event);
+            self.event_map.push_event(event);
         }
         self.mark_memory_profile_dirty();
     }
