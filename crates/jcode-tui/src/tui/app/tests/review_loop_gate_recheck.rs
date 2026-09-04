@@ -104,6 +104,46 @@ fn gate_recheck_that_fails_on_ownership_surfaces_ownership_reason() {
 }
 
 #[test]
+fn gate_recheck_that_fails_on_confidence_spike_surfaces() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        let session_id = app.session_id().to_string();
+
+        // A completed todo with a valid completion confidence but a two-level
+        // confidence *spike* in its history. `todo_confidence_summary` reports
+        // this when `completion_confidence_needs_validation` is false, and the
+        // re-check must still treat it as a confidence gate failure.
+        save_spiking_completed_todo(&session_id);
+        crate::todo::save_goals(&session_id, &[passing_goal()]).expect("save goal");
+
+        let mut state = jcode_session_types::ReviewLoopState::new();
+        state.finished = true;
+        state.needs_gate_recheck = true;
+        state.current_lens = Some(jcode_session_types::ReviewLens::Correctness);
+
+        super::commands_review::finish_review_loop(&mut app, &mut state);
+
+        assert!(state.finished);
+        let reason = state.finish_reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.starts_with("converged_gate_recheck_failed"),
+            "expected gate-recheck-failed reason, got {reason:?}"
+        );
+        assert!(
+            reason.ends_with("completion confidence needs re-validation"),
+            "expected the confidence gate reason for a spike, got {reason:?}"
+        );
+        assert!(
+            app.display_messages().iter().any(|msg| {
+                msg.content
+                    .contains("completion assessment now disagrees")
+            }),
+            "expected the spike failure to be surfaced"
+        );
+    });
+}
+
+#[test]
 fn gate_recheck_that_passes_finishes_cleanly() {
     with_temp_jcode_home(|| {
         let mut app = create_test_app();
@@ -144,6 +184,10 @@ fn gate_recheck_that_passes_finishes_cleanly() {
 }
 
 /// Persist a single completed todo for the given session.
+///
+/// When completion confidence is present, the recorded history climbs one level
+/// per step (`Validated` -> `Verified`), which is *not* a confidence spike, so
+/// the confidence gate alone decides the outcome.
 fn save_completed_todo(session_id: &str, completion_confidence: Option<u8>) {
     crate::todo::save_todos(
         session_id,
@@ -160,12 +204,37 @@ fn save_completed_todo(session_id: &str, completion_confidence: Option<u8>) {
                 crate::todo::ConfidenceState::from_legacy_score(score)
             }),
             confidence_history: match completion_confidence {
+                // Validated -> Verified: a single-level step, no spike.
                 Some(_) => vec![
-                    crate::todo::ConfidenceState::from_legacy_score(90),
+                    crate::todo::ConfidenceState::from_legacy_score(96),
                     crate::todo::ConfidenceState::from_legacy_score(100),
                 ],
                 None => Vec::new(),
             },
+        }],
+    )
+    .expect("save todos");
+}
+
+/// A completed todo whose recorded confidence history jumps two levels
+/// (`Plausible` -> `Verified`), which the spike detector flags.
+fn save_spiking_completed_todo(session_id: &str) {
+    crate::todo::save_todos(
+        session_id,
+        &[crate::todo::TodoItem {
+            group: None,
+            id: "todo-1".to_string(),
+            content: "Reviewed work".to_string(),
+            status: "completed".to_string(),
+            priority: "high".to_string(),
+            blocked_by: Vec::new(),
+            assigned_to: None,
+            confidence: None,
+            completion_confidence: Some(crate::todo::ConfidenceState::from_legacy_score(100)),
+            confidence_history: vec![
+                crate::todo::ConfidenceState::from_legacy_score(90), // Plausible
+                crate::todo::ConfidenceState::from_legacy_score(100), // Verified (2-level jump)
+            ],
         }],
     )
     .expect("save todos");
