@@ -262,6 +262,27 @@ impl Session {
                 e
             );
         }
+        // Structural invariant registry (takeaway #3): run the built-in checks
+        // (tool-pairing balance, non-empty ids, parent-edge resolution, replay
+        // determinism) over the freshly rehydrated log. Unlike a deliberate
+        // hard opt-in call site (see `InvariantLog::enforce`), the load path is
+        // a *diagnostic* seam: a session can legitimately carry an open tool
+        // call after an interrupt/crash, so we report violations rather than
+        // abort loading. This lets tests and operators observe the invariant
+        // without turning a benign mid-turn state into a hard failure.
+        if cfg!(debug_assertions) && !session.event_map.events.is_empty() {
+            let inv = super::invariants::InvariantRegistry::builtin();
+            let log = inv.check(&session.event_map);
+            if !log.is_green() {
+                eprintln!(
+                    "session_event: invariant report after load ({} violation(s)):",
+                    log.violations.len()
+                );
+                for v in &log.violations {
+                    eprintln!("  - {}: {}", v.invariant, v.message);
+                }
+            }
+        }
         if replay_stats.is_corrupt() {
             session.schedule_checkpoint_after_corrupt_journal(&journal_path);
         }
