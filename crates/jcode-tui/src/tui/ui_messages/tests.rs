@@ -3923,3 +3923,75 @@ fn bash_long_command_and_output_render_fully_wrapped_untrimmed() {
     crate::tui::ui::tools_ui::tests_tool_call_details_override::set(false);
     crate::tui::ui::tools_ui::tests_show_bash_output_override::set(false);
 }
+
+#[test]
+fn render_edit_inline_shows_line_number_gutters_from_embedded_diff() {
+    // An edit tool whose body embeds a numbered diff (the real tool format:
+    // "N- old" / "N+ new" from edit.rs generate_diff). The inline diff must
+    // surface those numbers in the rendered gutter.
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "Edited demo.txt\n2- two\n2+ TWO\n\nContext after edit (lines 2-2):\n    2│ TWO".to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: Some("demo.txt".to_string()),
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_edit_gutter".to_string(),
+            name: "edit".to_string(),
+            input: serde_json::json!({
+                "file_path": "demo.txt",
+            }),
+            intent: None,
+            thought_signature: None,
+        }),
+    };
+
+    let lines = render_tool_message(&msg, 100, crate::config::DiffDisplayMode::Inline);
+    let plain = lines
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Both the deletion and addition rows carry a numeric gutter with the
+    // original line number (2).
+    assert!(lines.iter().any(|l| extract_line_text(l).contains("2- two")), "plain={plain}");
+    assert!(lines.iter().any(|l| extract_line_text(l).contains("2+ TWO")), "plain={plain}");
+}
+
+#[test]
+fn render_edit_inline_strips_config_notice_bullets() {
+    // Editing ~/.jcode/config.toml appends a config-change notice whose
+    // markdown bullets ("- `key`: old -> new") must not leak into the diff as
+    // unnumbered deletion rows.
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "Edited config.toml\n2- old\n2+ new\n\nConfig changes:\n- `key`: old -> new (live now)\n".to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: Some("config.toml".to_string()),
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_edit_config".to_string(),
+            name: "edit".to_string(),
+            input: serde_json::json!({
+                "file_path": "config.toml",
+            }),
+            intent: None,
+            thought_signature: None,
+        }),
+    };
+
+    let lines = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Inline);
+    let plain = lines
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // The real diff rows keep their numbered gutters.
+    assert!(plain.contains("2- old"), "plain={plain}");
+    assert!(plain.contains("2+ new"), "plain={plain}");
+    // The config notice bullet is not shown as an unnumbered deletion.
+    assert!(!plain.contains("key"), "config notice leaked into diff: plain={plain}");
+    assert!(!plain.contains("Config changes"), "config notice leaked: plain={plain}");
+}
