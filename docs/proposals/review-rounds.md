@@ -1,10 +1,10 @@
 # Review Rounds After Work Is Complete
 
-Status: implemented (branch `jc/review-rounds`, worktree `.worktrees/review-rounds`)
+Status: implemented (branch `jc/gate-recheck`, worktree `jcode-gate-recheck`)
 
 ## Implementation notes
 
-Phases 1–6 are implemented and unit-tested on branch `jc/review-rounds`.
+Phases 1–6 are implemented and unit-tested on branch `jc/gate-recheck`.
 
 - Report-contract parser, lens definitions, fingerprint/stall helpers, and persisted
   state live in `crates/jcode-session-types/src/review.rs` (engine types) and the
