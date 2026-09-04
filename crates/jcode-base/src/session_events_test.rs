@@ -2361,6 +2361,80 @@ fn test_compact_transcript_rejected_start_falls_back_to_set_compaction() {
         .expect("rejected-start bracket producer must stay consistent");
 }
 
+/// A `compact_transcript_with_bracket` whose `compaction` state is invalid (e.g.
+/// `covers_up_to_turn` exceeding `original_turn_count`) must not open a bracket.
+/// Such a state cannot be represented in any event — both a `CompactionEnd` and a
+/// `SetCompaction` would be rejected by validation — so opening a
+/// `CompactionStart` would leave a permanent orphaned bracket (the append-only
+/// log could never close it with a valid End). The method must instead apply only
+/// the message replacement and leave `self.compaction` unset, keeping the log
+/// balanced and the invariant green.
+#[test]
+fn test_compact_transcript_invalid_compaction_state_opens_no_bracket() {
+    let mut session = Session::create_with_id(
+        "bracket_invalid_state".to_string(),
+        None,
+        Some("Invalid state".to_string()),
+    );
+    session.append_stored_message(StoredMessage {
+        id: "m1".to_string(),
+        role: Role::User,
+        content: vec![text_block("msg 1")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    let tail = vec![StoredMessage {
+        id: "tail".to_string(),
+        role: Role::User,
+        content: vec![text_block("[summary]")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    }];
+    // Invalid compaction: covers_up_to_turn (5) > original_turn_count (1).
+    let bad = StoredCompactionState {
+        summary_text: "bad".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 5,
+        original_turn_count: 1,
+        compacted_count: 1,
+    };
+    session.compact_transcript_with_bracket("bad_state", tail, bad.clone(), 1);
+
+    // No bracket opened, no orphan, invalid compaction not persisted.
+    let starts = session
+        .event_map
+        .events
+        .iter()
+        .filter(|e| matches!(e.op, SessionEventOp::CompactionStart { .. }))
+        .count();
+    let ends = session
+        .event_map
+        .events
+        .iter()
+        .filter(|e| matches!(e.op, SessionEventOp::CompactionEnd { .. }))
+        .count();
+    assert_eq!(starts, 0, "no bracket opened with invalid compaction");
+    assert_eq!(ends, 0, "no dangling CompactionEnd");
+    assert!(session.event_map.orphaned_compaction().is_none(), "no orphaned bracket");
+    assert!(
+        session.compaction.is_none(),
+        "invalid compaction state must not be persisted"
+    );
+    assert!(
+        crate::session::InvariantRegistry::builtin()
+            .check(&session.event_map)
+            .is_green(),
+        "bracket invariant must stay green"
+    );
+    session
+        .rederive_all_checked()
+        .expect("invalid-compaction producer must stay consistent");
+}
+
 /// The `Unknown` escape hatch must not corrupt a plugin payload that happens to
 /// contain an `op` field of its own: `op` is the **reserved** wire discriminator,
 /// so a top-level payload field named `op` is dropped deterministically (exactly
