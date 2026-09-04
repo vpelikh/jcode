@@ -93,6 +93,28 @@ pub enum SessionEventOp {
     SetCompaction {
         compaction: StoredCompactionState,
     },
+    /// Open a compaction bracket (a log marker / lock). Compaction is a
+    /// **log-bracketed, replayable operation** (takeaway #5): a run appends
+    /// `CompactionStart`, performs the span replace + summary, then appends
+    /// `CompactionEnd`. A crash between `CompactionStart` and `CompactionEnd`
+    /// leaves a *detectable orphaned lock* rather than a half-applied summary,
+    /// so replay can stop at the orphan marker and surface an explicit
+    /// "incomplete compaction" state instead of silently corrupting the surface.
+    ///
+    /// Carries the compaction id / boundary being consolidated so a crash that
+    /// happens mid-run can be tied back to which span was being summarized.
+    CompactionStart {
+        compaction_id: String,
+        /// Number of turns being summarized in this bracket (diagnostic).
+        covers_up_to_turn: usize,
+    },
+    /// Close a compaction bracket, persisting the resulting compaction state.
+    /// Only a matching open [`SessionEventOp::CompactionStart`] may be closed;
+    /// appending `CompactionEnd` without a preceding open marker is an orphan
+    /// and must be detected (see [`SessionEventMap::orphaned_compaction`]).
+    CompactionEnd {
+        compaction: StoredCompactionState,
+    },
     /// Clear all messages (full replacement)
     ClearAll,
     /// An event op the core enum does not know about.
@@ -126,6 +148,8 @@ impl SessionEventOp {
             SessionEventOp::MemoryInjection { .. } => Some("memory_injection"),
             SessionEventOp::ReplayEvent { .. } => Some("replay_event"),
             SessionEventOp::SetCompaction { .. } => Some("set_compaction"),
+            SessionEventOp::CompactionStart { .. } => Some("compaction_start"),
+            SessionEventOp::CompactionEnd { .. } => Some("compaction_end"),
             SessionEventOp::ClearAll => Some("clear_all"),
             SessionEventOp::Unknown { .. } => None,
         }
@@ -196,6 +220,15 @@ impl Serialize for SessionEventOp {
                 obj.len()
             }
             SessionEventOp::SetCompaction { compaction } => {
+                obj.insert("compaction".into(), serde_json::to_value(compaction).map_err(serde::ser::Error::custom)?);
+                obj.len()
+            }
+            SessionEventOp::CompactionStart { compaction_id, covers_up_to_turn } => {
+                obj.insert("compaction_id".into(), serde_json::to_value(compaction_id).map_err(serde::ser::Error::custom)?);
+                obj.insert("covers_up_to_turn".into(), serde_json::to_value(covers_up_to_turn).map_err(serde::ser::Error::custom)?);
+                obj.len()
+            }
+            SessionEventOp::CompactionEnd { compaction } => {
                 obj.insert("compaction".into(), serde_json::to_value(compaction).map_err(serde::ser::Error::custom)?);
                 obj.len()
             }
@@ -281,6 +314,21 @@ impl<'de> Deserialize<'de> for SessionEventOp {
                     compaction: fields.compaction,
                 })
             }
+            "compaction_start" => {
+                let fields = serde_json::from_value::<CompactionStartFields>(serde_json::Value::Object(clone))
+                    .map_err(serde::de::Error::custom)?;
+                Ok(SessionEventOp::CompactionStart {
+                    compaction_id: fields.compaction_id,
+                    covers_up_to_turn: fields.covers_up_to_turn,
+                })
+            }
+            "compaction_end" => {
+                let fields = serde_json::from_value::<CompactionEndFields>(serde_json::Value::Object(clone))
+                    .map_err(serde::de::Error::custom)?;
+                Ok(SessionEventOp::CompactionEnd {
+                    compaction: fields.compaction,
+                })
+            }
             "clear_all" => {
                 // The derived unit variant serialized as just `{"op":"clear_all"}`.
                 // It carries no fields; tolerate stray extra fields defensively.
@@ -329,6 +377,15 @@ struct ReplayEventFields {
 struct SetCompactionFields {
     compaction: StoredCompactionState,
 }
+#[derive(Deserialize)]
+struct CompactionStartFields {
+    compaction_id: String,
+    covers_up_to_turn: usize,
+}
+#[derive(Deserialize)]
+struct CompactionEndFields {
+    compaction: StoredCompactionState,
+}
 
 /// A single event in the session event log
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -357,7 +414,8 @@ impl SessionEventMap {
     /// Update caches when appending an event (SetCompaction / ClearAll).
     fn update_caches(&mut self, event: &SessionEvent) {
         match &event.op {
-            SessionEventOp::SetCompaction { .. } => {
+            SessionEventOp::SetCompaction { .. }
+            | SessionEventOp::CompactionEnd { .. } => {
                 self.compaction_event_index = Some(event.clone());
             }
             SessionEventOp::ClearAll => {
@@ -432,26 +490,28 @@ impl SessionEventMap {
     pub fn current_compaction(&self) -> Option<StoredCompactionState> {
         match &self.compaction_event_index {
             Some(event) => {
-                if let SessionEventOp::SetCompaction { compaction } = &event.op {
-                    Some(compaction.clone())
-                } else {
-                    None
+                match &event.op {
+                    SessionEventOp::SetCompaction { compaction }
+                    | SessionEventOp::CompactionEnd { compaction } => Some(compaction.clone()),
+                    _ => None,
                 }
             }
             None => {
                 // Fallback: cache may be empty after deserialization (serde(skip)).
-                // Scan events in reverse to find the most recent SetCompaction.
-                // If a ClearAll appears after that SetCompaction, the compaction
-                // is considered cleared and we return None.
+                // Scan events in reverse to find the most recent SetCompaction or
+                // CompactionEnd (the persisting op of a bracketed compaction).
+                // If a ClearAll appears after that, the compaction is considered
+                // cleared and we return None.
                 let mut found_compaction = None;
                 for event in self.events.iter().rev() {
                     match &event.op {
-                        SessionEventOp::SetCompaction { compaction } => {
+                        SessionEventOp::SetCompaction { compaction }
+                        | SessionEventOp::CompactionEnd { compaction } => {
                             found_compaction = Some(compaction.clone());
                             break;
                         }
                         SessionEventOp::ClearAll => {
-                            // ClearAll after the latest SetCompaction clears it
+                            // ClearAll after the latest compaction clears it
                             return None;
                         }
                         _ => {}
@@ -513,6 +573,73 @@ impl SessionEventMap {
         let compaction = self.current_compaction();
         (messages, compaction)
     }
+
+    /// Detect an **orphaned compaction lock**.
+    ///
+    /// Compaction is a log-bracketed operation (`CompactionStart` … `CompactionEnd`).
+    /// If the log ends with an open `CompactionStart` that was never closed, a
+    /// crash happened mid-summarize: the surface may be half-applied. This
+    /// returns that open bracket so replay can stop there and surface an
+    /// explicit "incomplete compaction" state (takeaway #5) instead of silently
+    /// treating the partial result as complete.
+    ///
+    /// An orphan is any `CompactionStart` whose `CompactionEnd` never appears
+    /// later in the log. The **latest** such open bracket is what a resumed
+    /// session needs to resolve.
+    pub fn orphaned_compaction(&self) -> Option<&SessionEvent> {
+        // Track the most recent start that has not been matched by a later end.
+        let mut open_depth = 0usize;
+        let mut open: Option<&SessionEvent> = None;
+        for event in &self.events {
+            match &event.op {
+                SessionEventOp::CompactionStart { .. } => {
+                    open_depth += 1;
+                    open = Some(event);
+                }
+                SessionEventOp::CompactionEnd { .. } => {
+                    open_depth = open_depth.saturating_sub(1);
+                    if open_depth == 0 {
+                        open = None;
+                    }
+                }
+                _ => {}
+            }
+        }
+        open
+    }
+
+    /// Open a compaction bracket by appending a `CompactionStart` marker.
+    pub fn start_compaction(&mut self, compaction_id: impl Into<String>, covers_up_to_turn: usize) {
+        let event = SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: crate::id::new_id("compaction_start"),
+            op: SessionEventOp::CompactionStart {
+                compaction_id: compaction_id.into(),
+                covers_up_to_turn,
+            },
+            parent_id: None,
+            version: 1,
+        };
+        self.append_event(event);
+    }
+
+    /// Close a compaction bracket by appending a `CompactionEnd` that persists
+    /// the resulting state. `Self::append_event` validation catches a malformed
+    /// state; callers should also verify `orphaned_compaction` was open before
+    /// closing (a closing `CompactionEnd` without an open start is itself an
+    /// orphan the invariant registry flags).
+    pub fn end_compaction(&mut self, compaction: StoredCompactionState) {
+        let event = SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: crate::id::new_id("compaction_end"),
+            op: SessionEventOp::CompactionEnd {
+                compaction: compaction.clone(),
+            },
+            parent_id: None,
+            version: 1,
+        };
+        self.append_event(event);
+    }
     
     /// Validate an event before adding to the map
     ///
@@ -547,6 +674,16 @@ impl SessionEventMap {
                 Self::validate_message(message, &event.event_id)?;
             }
             SessionEventOp::SetCompaction { compaction } => {
+                Self::validate_compaction(compaction)?;
+            }
+            SessionEventOp::CompactionStart { covers_up_to_turn, .. } => {
+                if *covers_up_to_turn == 0 {
+                    return Err(SessionEventError::InvalidCompactionState {
+                        reason: "compaction bracket covers zero turns".to_string(),
+                    });
+                }
+            }
+            SessionEventOp::CompactionEnd { compaction } => {
                 Self::validate_compaction(compaction)?;
             }
             SessionEventOp::MemoryInjection { memory_injection } => {
