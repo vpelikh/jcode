@@ -665,6 +665,67 @@ fn prune_old_versions_protects_promoted_channels_when_home_is_symlinked() {
     }
 }
 
+// Failure/edge modes of `prune_old_versions`. The common production paths run
+// this after every install, so it must be a safe no-op (never error) when the
+// versions dir is missing or empty, and must never delete installs when the
+// count is at or below `VERSIONS_KEEP_NEWEST`.
+#[test]
+fn prune_old_versions_is_safe_noop_on_edge_cases() {
+    // Missing versions dir: must not error and must not create anything.
+    with_temp_jcode_home(|| {
+        std::fs::create_dir_all(builds_dir().unwrap()).expect("create builds dir");
+        assert_eq!(prune_old_versions().unwrap(), ());
+        assert!(
+            !builds_dir().unwrap().join("versions").exists(),
+            "must not create versions dir"
+        );
+    });
+
+    // Empty versions dir: must not error.
+    with_temp_jcode_home(|| {
+        std::fs::create_dir_all(builds_dir().unwrap().join("versions"))
+            .expect("create versions");
+        assert_eq!(prune_old_versions().unwrap(), ());
+    });
+
+    // Below-cap installs (fewer than VERSIONS_KEEP_NEWEST): must keep all.
+    with_temp_jcode_home(|| {
+        let exe = std::env::current_exe().unwrap();
+        install_binary_at_version(&exe, "below-cap-a").unwrap();
+        install_binary_at_version(&exe, "below-cap-b").unwrap();
+        prune_old_versions().unwrap();
+        let names: std::collections::HashSet<String> =
+            std::fs::read_dir(builds_dir().unwrap().join("versions"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+        assert!(names.contains("below-cap-a"), "below-cap install must be kept");
+        assert!(names.contains("below-cap-b"), "below-cap install must be kept");
+    });
+
+    // Strictly above the cap: keep exactly VERSIONS_KEEP_NEWEST, prune the rest.
+    with_temp_jcode_home(|| {
+        let exe = std::env::current_exe().unwrap();
+        for i in 0..(VERSIONS_KEEP_NEWEST + 2) {
+            install_binary_at_version(&exe, &format!("above-cap-{i}")).unwrap();
+        }
+        prune_old_versions().unwrap();
+        let count = std::fs::read_dir(builds_dir().unwrap().join("versions"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("above-cap-")
+            })
+            .count();
+        assert_eq!(
+            count, VERSIONS_KEEP_NEWEST,
+            "must retain exactly VERSIONS_KEEP_NEWEST above-cap installs"
+        );
+    });
+}
+
 #[test]
 fn shared_server_tracks_stable_when_equal_to_stable() {
     with_temp_jcode_home(|| {
