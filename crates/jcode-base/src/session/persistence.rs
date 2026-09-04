@@ -467,6 +467,16 @@ impl Session {
         // or a save label. The `pre_spawn_session` swarm path, restart-recovery
         // fixtures, and persisted soft-interrupt/restore flows all rely on such
         // sessions being written to disk immediately.
+        //
+        // Note: `event_map` is deliberately NOT part of `has_configured_state`.
+        // A fresh session's `ensure_initial_session_context_message()` produces an
+        // AppendMessage event, so counting `!event_map.is_empty()` would force a
+        // first save for every untouched panel and defeat the lazy-save gate. The
+        // realistic producers of log-only events (compaction brackets, plugin
+        // `Unknown`) always persist a real message/compaction alongside, so they
+        // are not gated out; only a hypothetical session carrying *exclusively*
+        // log-only events and no message/configured-state and never saved would
+        // be skipped, which is accepted to preserve lazy-save semantics.
         let has_configured_state = self.title.is_some()
             || self.model.is_some()
             || self.provider_key.is_some()
