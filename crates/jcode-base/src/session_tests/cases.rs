@@ -3734,3 +3734,58 @@ fn compaction_across_multiple_journal_appends_replays_last_wins() -> Result<()> 
         .expect("multi-compaction journal replay must be consistent");
     Ok(())
 }
+
+/// Upgrade/backward-compat: a journal written by an OLDER build (before the
+/// `append_events` field existed) must still load. The old journal carries only
+/// the legacy vectors; `append_events` deserializes empty (`#[serde(default)]`).
+/// On reload, the persisted event log (from the snapshot) must reconcile with the
+/// journal-appended messages without error.
+#[test]
+fn old_format_journal_without_append_events_still_loads() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-old-journal-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_old_journal_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("old".to_string()));
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "first".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?; // snapshot with event_log
+
+    // Add a message and save via journal (carries events).
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "second".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+    let journal_path = session_journal_path(id)?;
+    assert!(journal_path.exists());
+
+    // Simulate an OLD journal: rewrite the journal line, stripping `append_events`.
+    let line = std::fs::read_to_string(&journal_path)?;
+    let mut entry: serde_json::Value = serde_json::from_str(&line.trim_end())?;
+    if let serde_json::Value::Object(map) = &mut entry {
+        map.remove("append_events");
+    }
+    std::fs::write(&journal_path, format!("{}\n", serde_json::to_string(&entry)?))?;
+
+    // Load: must not error; reconcile rebuilds from vectors since the journal has
+    // no events for "second", so both sources agree on the transcript.
+    let loaded = Session::load(id)?;
+    assert_eq!(loaded.messages.len(), 2, "both messages must load from message vectors");
+    loaded
+        .rederive_all_checked()
+        .expect("old-format journal load must stay consistent");
+    Ok(())
+}
