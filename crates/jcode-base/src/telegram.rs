@@ -1645,20 +1645,41 @@ mod tests {
     /// public behavior against a real HTTP endpoint (no Telegram egress required):
     /// a successful mirror is probed first and honored, while a mirror that
     /// returns a permanent error bails with the mirror-specific message.
-    async fn start_mock_bot_api(success: bool) -> (u16, tokio::task::JoinHandle<()>) {
+    async fn start_mock_bot_api(
+        success: bool,
+    ) -> (u16, std::sync::Arc<tokio::sync::Mutex<Option<String>>>, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        // Captures the first request line so tests can assert the exact path the
+        // client requested (e.g. `/bot/<token>/getMe`), validating URL construction
+        // rather than only "some reachable endpoint answered".
+        let captured: std::sync::Arc<tokio::sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let captured_for_task = std::sync::Arc::clone(&captured);
         let handle = tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
             // Serve a bounded number of requests so the test task can finish.
             for _ in 0..8 {
-                let Ok((mut stream, _)) = listener.accept().await else {
+                let Ok((stream, _)) = listener.accept().await else {
                     break;
                 };
+                let captured = std::sync::Arc::clone(&captured_for_task);
                 tokio::spawn(async move {
-                    // Read request line + headers (drain), then answer /getMe.
-                    let mut buf = [0u8; 2048];
-                    let _ = stream.read(&mut buf).await;
+                    // Read the request line, then drain headers/body, then answer.
+                    let (reader, mut writer) = stream.into_split();
+                    let mut reader = BufReader::new(reader);
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).await.is_ok() {
+                        if let Ok(mut c) = captured.try_lock() {
+                            if c.is_none() {
+                                *c = Some(request_line.trim().to_string());
+                            }
+                        }
+                    }
+                    // Drain remaining request headers + body so the client sees the
+                    // response cleanly.
+                    let mut buf = [0u8; 4096];
+                    let _ = reader.read(&mut buf).await;
                     if success {
                         let body = serde_json::json!({
                             "ok": true,
@@ -1670,7 +1691,7 @@ mod tests {
                             body.len(),
                             body
                         );
-                        let _ = stream.write_all(response.as_bytes()).await;
+                        let _ = writer.write_all(response.as_bytes()).await;
                     } else {
                         let body = r#"{"ok":false,"error_code":401,"description":"Unauthorized"}"#;
                         let response = format!(
@@ -1678,25 +1699,34 @@ mod tests {
                             body.len(),
                             body
                         );
-                        let _ = stream.write_all(response.as_bytes()).await;
+                        let _ = writer.write_all(response.as_bytes()).await;
                     }
                 });
             }
         });
-        (port, handle)
+        (port, captured, handle)
     }
 
     /// The configured `api_base` mirror is probed FIRST: a reachable mirror
     /// yields a working client even though nothing else is configured.
     #[tokio::test]
     async fn test_discover_client_prefers_configured_mirror() {
-        let (port, _handle) = start_mock_bot_api(true).await;
+        let (port, captured, _handle) = start_mock_bot_api(true).await;
         let mirror = format!("http://127.0.0.1:{port}");
         let client = discover_client("test-token", None, None, Some(&mirror))
             .await
             .expect("mirror-first discovery should succeed against the mock");
         // The returned client is a real, usable reqwest client.
         assert!(client.get("http://example.com").build().is_ok());
+        // Prove the probe actually round-tripped to the MIRROR with the correct
+        // path: normalization appends `/bot`, and the token is spliced before the
+        // method. This validates URL construction, not just "some endpoint answered".
+        let req_line = captured
+            .lock()
+            .await
+            .clone()
+            .expect("mock must have received a request");
+        assert_eq!(req_line, "POST /bot/test-token/getMe HTTP/1.1");
     }
 
     /// A configured mirror that returns a PERMANENT error (401 bad token) must
@@ -1706,7 +1736,7 @@ mod tests {
     /// sweep candidate is tried.
     #[tokio::test]
     async fn test_discover_client_mirror_permanent_error_bails() {
-        let (port, _handle) = start_mock_bot_api(false).await;
+        let (port, _captured, _handle) = start_mock_bot_api(false).await;
         let mirror = format!("http://127.0.0.1:{port}");
         let err = discover_client("bad-token", None, None, Some(&mirror))
             .await
