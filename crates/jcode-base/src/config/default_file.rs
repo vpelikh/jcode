@@ -705,15 +705,18 @@ desktop_notifications = true
 # telegram_chat_id = ""    # Your user/chat ID
 # telegram_reply_enabled = false  # Reply to bot messages to send directives
 # telegram_api_base = ""  # Optional Bot API override (default https://api.telegram.org/bot);
-#                         # e.g. a reverse-proxy mirror or alternate data-center IP.
-#                         # Env override: JCODE_TELEGRAM_API_BASE
+#                         # RECOMMENDED anti-censorship lever: set to a reverse-proxy Bot API
+#                         # mirror that is reachable from your network when api.telegram.org is
+#                         # blocked. During startup jcode probes this mirror first (before IP
+#                         # sweeping) and uses it for all calls. Env override: JCODE_TELEGRAM_API_BASE
 # telegram_proxy = ""     # Optional proxy for Telegram traffic, e.g. socks5://127.0.0.1:1080
 #                         # or http://user:pass@host:3128. Env override: JCODE_TELEGRAM_PROXY
 # telegram_api_ip = ""    # Optional LAST-RESORT override: pin api.telegram.org to a specific
 #                         # DC IP (e.g. 149.154.167.220) keeping its name for TLS. Usually leave
 #                         # empty: when the default endpoint is blocked, jcode auto-discovers a
-#                         # reachable DC from a built-in candidate list. Set this only if that
-#                         # list is stale or you have a known-good IP. Env: JCODE_TELEGRAM_API_IP
+#                         # reachable DC from a built-in candidate list (led by the current
+#                         # api.telegram.org edge). Set this only if that list is stale or you
+#                         # have a known-good IP. Env: JCODE_TELEGRAM_API_IP
 # telegram_allowed_user_id = ""  # Optional numeric user-ID whitelist for the bot.
 #                                # When set, only that Telegram user can drive/command it.
 #                                # Env override: JCODE_TELEGRAM_ALLOWED_USER_ID

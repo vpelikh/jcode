@@ -265,6 +265,7 @@ impl TelegramChannel {
             &self.token,
             self.proxy.as_deref(),
             self.api_ip.as_deref(),
+            self.api_base.as_deref(),
         )
         .await
         {

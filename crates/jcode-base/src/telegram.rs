@@ -88,18 +88,26 @@ fn non_empty(value: &str) -> Option<&str> {
 
 /// Curated list of known Telegram data-center IPs, tried in order when the
 /// DNS-resolved default is blocked. These come from Telegram's published DC
-/// ranges (149.154.167.x / 149.154.175.x and their IPv6 counterparts). The
-/// hostname is always kept for TLS/SNI, so this only redirects the TCP
-/// connection; it does not bypass certificate verification. TLS verification
-/// still uses the hostname, so the server certificate is validated as usual.
-/// We deliberately do not scan arbitrary ranges: discovery is bounded to this list.
+/// ranges (149.154.160.0/20 and 91.108.0.0/16 for IPv4, 2001:67c:4e8::/48 for
+/// IPv6). The hostname is always kept for TLS/SNI, so this only redirects the
+/// TCP connection; it does not bypass certificate verification. TLS
+/// verification still uses the hostname, so the server certificate is validated
+/// as usual.
+///
+/// The list deliberately leads with the current HTTP API edge (`api.telegram.org`
+/// resolves to `149.154.166.110` / `2001:67c:4e8:f004::9`), which is the one a
+/// censor's SNI/DNS filter usually blocks first; if that specific edge is
+/// unreachable the other well-known DC IPs follow. We deliberately do not scan
+/// arbitrary ranges: discovery is bounded to this list.
 pub const TELEGRAM_DC_CANDIDATES: &[&str] = &[
+    "149.154.166.110", // api.telegram.org (current edge, DNS-verified)
     "149.154.167.220",
     "149.154.167.40",
     "149.154.167.50",
     "149.154.175.50",
     "149.154.175.100",
     "149.154.175.53",
+    "2001:67c:4e8:f004::9", // api.telegram.org IPv6 (current edge, DNS-verified)
     "2001:67c:4e8::1",
     "2001:67c:4e8::2",
     "2001:67c:4e8::3",
@@ -117,9 +125,10 @@ pub const TELEGRAM_DC_CANDIDATES: &[&str] = &[
 pub const DISCOVERY_BACKOFF_SECS: u64 = 60;
 
 /// Per-candidate connect timeout during discovery. Kept short so an offline
-/// network does not make the full sweep block for minutes (18 candidates × the
-/// normal 15s is far too long for a single poll). A working candidate is well
-/// within this; the long-poll path reuses the same resolved client afterward.
+/// network does not make the full sweep block for minutes (the whole candidate
+/// list × the normal 15s would be far too long for a single poll). A working
+/// candidate is well within this; the long-poll path reuses the same resolved
+/// client afterward.
 const DISCOVERY_PROBE_TIMEOUT_SECS: u64 = 8;
 
 /// True if the error is a network-level failure (DNS poisoned, IP blocked,
@@ -232,19 +241,89 @@ fn build_probe_client(proxy: Option<&str>, api_ip: Option<&str>) -> anyhow::Resu
 /// Build a working client for the Telegram Bot API, auto-discovering a
 /// reachable data-center IP when the DNS-resolved default is blocked.
 ///
-/// Precedence: if `override_ip` (from `[safety] telegram_api_ip`) is set, it is
-/// tried first as an explicit escape hatch. Then the default DNS resolution is
-/// tried, followed by the curated list of known DC IPs (`TELEGRAM_DC_CANDIDATES`).
+/// Precedence:
+/// - If `api_base` (from `[safety] telegram_api_base`, e.g. a reverse-proxy
+///   Bot API mirror that itself bypasses censorship) is set, it is probed
+///   first. Since it is an explicit user override pointing at an alternate
+///   endpoint, it is the strongest anti-censorship lever and the most likely
+///   to work, so discovery starts there rather than at the blocked default.
+/// - Then `override_ip` (from `[safety] telegram_api_ip`) is tried as an
+///   explicit escape hatch that pins `api.telegram.org` to a given IP.
+/// - Then the default DNS resolution is tried, followed by the curated list of
+///   known DC IPs (`TELEGRAM_DC_CANDIDATES`).
+///
 /// Each candidate is probed with a short-timeout client; the first whose
 /// `verify_bot_auth` probe succeeds is returned (and reused for the real path).
 /// A permanent error (e.g. a bad bot token) stops discovery immediately, since
-/// no IP will help; transient failures (network, TLS, or a 429 rate-limit) move
-/// on to the next candidate.
+/// no endpoint will help; transient failures (network, TLS, or a 429
+/// rate-limit) move on to the next candidate.
 pub async fn discover_client(
     bot_token: &str,
     proxy: Option<&str>,
     override_ip: Option<&str>,
+    api_base: Option<&str>,
 ) -> anyhow::Result<reqwest::Client> {
+    let api_base = api_base
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    // When an explicit API base mirror is configured it takes first precedence:
+    // it is the user's stated anti-censorship path and may itself resolve to a
+    // host we cannot reach through IP pinning (`api.telegram.org`). Probe it
+    // with a plain (default-DNS, optionally proxy-routed) client; if it lacks a
+    // `/bot` path segment we still probe the host root so a reachable mirror is
+    // detected, and the real callers normalize the base themselves.
+    let mut last_err: Option<anyhow::Error> = None;
+    if let Some(api_base) = &api_base {
+        match build_probe_client(proxy, None) {
+            Ok(client) => {
+                let probe = tokio::time::timeout(
+                    std::time::Duration::from_secs(DISCOVERY_PROBE_TIMEOUT_SECS + 5),
+                    verify_bot_auth(&client, bot_token, Some(api_base)),
+                )
+                .await;
+                match probe {
+                    Ok(Ok(_)) => {
+                        logging::info(&format!(
+                            "telegram reachable via configured API base mirror {api_base}"
+                        ));
+                        return Ok(client);
+                    }
+                    Ok(Err(e)) => {
+                        if !is_transient_api_error(&e) {
+                            anyhow::bail!(
+                                "Telegram auth failed via API base mirror {api_base} \
+                                 (bad token?): {e}. Stopping discovery."
+                            );
+                        }
+                        logging::debug(&format!(
+                            "telegram API base mirror {api_base} unreachable: {e}"
+                        ));
+                        last_err = Some(e);
+                    }
+                    Err(elapsed) => {
+                        logging::debug(&format!(
+                            "telegram API base mirror {api_base} timed out: {elapsed}"
+                        ));
+                        last_err = Some(anyhow::anyhow!("probe timed out: {elapsed}"));
+                    }
+                }
+            }
+            Err(e) => {
+                last_err = Some(e);
+            }
+        }
+    }
+
+    // The DC sweep below targets the DEFAULT Bot API endpoint (`api.telegram.org`)
+    // reached via a pinned data-center IP. When a mirror (`api_base`) is
+    // configured we already tried it above and it failed transiently, so this is
+    // a fallback that attempts the real endpoint over an alternate IP. It must
+    // therefore probe with base_override = None: the IP pin redirects
+    // `api.telegram.org` resolution, which is meaningless if the URL still points
+    // at the mirror host. Passing `api_base` here would ignore the pin and merely
+    // re-probe the already-failed mirror.
     let mut candidates: Vec<Option<String>> = Vec::new();
     if let Some(ip) = override_ip.filter(|ip| !ip.trim().is_empty()) {
         candidates.push(Some(ip.trim().to_string()));
@@ -254,7 +333,6 @@ pub async fn discover_client(
         candidates.push(Some((*ip).to_string()));
     }
 
-    let mut last_err: Option<anyhow::Error> = None;
     for (i, maybe_ip) in candidates.iter().enumerate() {
         let client = match build_probe_client(proxy, maybe_ip.as_deref()) {
             Ok(c) => c,
@@ -306,6 +384,15 @@ pub async fn discover_client(
         }
     }
 
+    if let Some(api_base) = &api_base {
+        anyhow::bail!(
+            "Telegram unreachable: configured API base mirror `{api_base}` failed, and \
+             the default endpoint was unreachable over the DNS candidate and {} DC IPs. \
+             Last error: {}",
+            TELEGRAM_DC_CANDIDATES.len(),
+            last_err.map(|e| e.to_string()).unwrap_or_default()
+        )
+    }
     anyhow::bail!(
         "Telegram unreachable: tried default DNS and {} DC IPs. Last error: {}",
         TELEGRAM_DC_CANDIDATES.len(),
@@ -1497,8 +1584,9 @@ mod tests {
 
     #[test]
     fn test_discovery_candidate_ordering() {
-        // Simulate the ordering used in discover_client: override first, then
-        // default DNS, then the curated list.
+        // Simulate the ordering used in discover_client: override_ip first, then
+        // default DNS, then the curated list. (api_base is probed even earlier,
+        // before any IP pinning — see test_telegram_api_base_preference.)
         let override_ip = Some("10.0.0.1");
         let mut candidates: Vec<Option<String>> = Vec::new();
         if let Some(ip) = override_ip.filter(|ip| !ip.trim().is_empty()) {
@@ -1511,10 +1599,37 @@ mod tests {
         // candidates.first() returns Option<&Option<String>>, need Some(&Option...)
         assert_eq!(candidates.first(), Some(&Some("10.0.0.1".to_string())));
         assert_eq!(candidates.get(1), Some(&None));
-        assert_eq!(candidates.get(2), Some(&Some("149.154.167.220".to_string())));
+        // The curated list is led by the current api.telegram.org edge IP.
+        assert_eq!(candidates.get(2), Some(&Some("149.154.166.110".to_string())));
         // The curated list must be tried before any arbitrary scan: total is
         // override + default-DNS + every candidate, and never a wider sweep.
         assert_eq!(candidates.len(), 2 + TELEGRAM_DC_CANDIDATES.len());
+    }
+
+    #[test]
+    fn test_telegram_api_base_preference_and_normalization() {
+        // The api_base mirror override is trimmed and dropped when blank.
+        let is_empty = |b: Option<&str>| {
+            b.map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .is_none()
+        };
+        assert!(is_empty(None));
+        assert!(is_empty(Some("")));
+        assert!(is_empty(Some("   ")));
+        assert!(!is_empty(Some("https://mirror.example.com/bot")));
+
+        // api_base() normalizes a mirror WITHOUT a /bot path by appending it,
+        // so a bare host name configured by the user still points at a real
+        // Bot API endpoint.
+        let bare = api_base(Some("https://mirror.example.com"));
+        assert_eq!(bare, "https://mirror.example.com/bot/");
+        let with_bot = api_base(Some("https://mirror.example.com/bot"));
+        assert_eq!(with_bot, "https://mirror.example.com/bot/");
+        // A trailing-slash mirror is normalized too.
+        let trailing = api_base(Some("https://mirror.example.com/bot/"));
+        assert_eq!(trailing, "https://mirror.example.com/bot/");
     }
 
     #[test]
