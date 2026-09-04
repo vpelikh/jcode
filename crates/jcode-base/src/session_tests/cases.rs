@@ -2779,3 +2779,94 @@ fn test_orphaned_compaction_bracket_survives_journal_reload() -> Result<()> {
         .expect("event log must agree with legacy vectors after orphan reload");
     Ok(())
 }
+
+/// End-to-end acceptance through the **public** session API: a user creates a
+/// session, adds messages, saves, reloads, grows the journal, and reloads
+/// again. This is the real persistence path the TUI/server use
+/// (`Session::create_with_id` + `add_message`/`save`/`load`). After each
+/// reload we run the invariant + projection registry (takeaways #3/#4) and
+/// require it green: the event log must always agree with the legacy vectors,
+/// tool-pairing must be balanced, and the projected message count must match
+/// the transcript.
+#[test]
+fn event_sourced_log_survives_public_api_session_lifecycle() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-integration-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "integration_public_api_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("lifecycle".to_string()));
+    // Real user messages through the public API.
+    session.add_message(
+        Role::User,
+        vec![crate::message::ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.add_message(
+        Role::Assistant,
+        vec![crate::message::ContentBlock::Text {
+            text: "hi there".to_string(),
+            cache_control: None,
+        }],
+    );
+    // First save → snapshot.
+    session.save()?;
+    let journal_path = session_journal_path(id)?;
+    assert!(!journal_path.exists());
+
+    fn assert_invariants_green(session: &Session, label: &str) {
+        let inv = InvariantRegistry::builtin();
+        let log = inv.check(&session.event_map);
+        assert!(
+            log.is_green(),
+            "{label}: invariant registry must be green, got {} violation(s): {:?}",
+            log.violations.len(),
+            log.violations
+                .iter()
+                .map(|v| format!("{}: {}", v.invariant, v.message))
+                .collect::<Vec<_>>()
+        );
+        // Projection (takeaway #4): one fold, typed state, matches transcript.
+        let count = crate::session::project_map::<crate::session::MessageCountProjection>(
+            &session.event_map,
+        )
+        .expect("projection must fold");
+        assert_eq!(
+            count,
+            session.messages.len(),
+            "{label}: projected message count must match the transcript",
+        );
+    }
+
+    // Reload 1: pure snapshot.
+    let reloaded = Session::load(id)?;
+    assert_eq!(reloaded.messages.len(), 2);
+    assert_invariants_green(&reloaded, "after snapshot reload");
+
+    // Grow the log through the journal append path (real public API again).
+    let mut live = Session::load(id)?;
+    live.add_message(
+        Role::User,
+        vec![crate::message::ContentBlock::Text {
+            text: "world".to_string(),
+            cache_control: None,
+        }],
+    );
+    live.save()?;
+    assert!(journal_path.exists(), "second save must be a journal append");
+
+    // Reload 2: snapshot + journal replay.
+    let reloaded2 = Session::load(id)?;
+    assert_eq!(reloaded2.messages.len(), 3);
+    assert_invariants_green(&reloaded2, "after journal reload");
+    // Derived state agrees with the legacy vectors (the loaded server state).
+    reloaded2
+        .rederive_all_checked()
+        .expect("public lifecycle must keep the event log consistent");
+    Ok(())
+}
