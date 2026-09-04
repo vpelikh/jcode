@@ -241,22 +241,26 @@ fn build_probe_client(proxy: Option<&str>, api_ip: Option<&str>) -> anyhow::Resu
 /// Build a working client for the Telegram Bot API, auto-discovering a
 /// reachable data-center IP when the DNS-resolved default is blocked.
 ///
-/// Precedence:
-/// - If `api_base` (from `[safety] telegram_api_base`, e.g. a reverse-proxy
-///   Bot API mirror that itself bypasses censorship) is set, it is probed
-///   first. Since it is an explicit user override pointing at an alternate
-///   endpoint, it is the strongest anti-censorship lever and the most likely
-///   to work, so discovery starts there rather than at the blocked default.
-/// - Then `override_ip` (from `[safety] telegram_api_ip`) is tried as an
-///   explicit escape hatch that pins `api.telegram.org` to a given IP.
-/// - Then the default DNS resolution is tried, followed by the curated list of
-///   known DC IPs (`TELEGRAM_DC_CANDIDATES`).
+/// There are two mutually exclusive routing modes:
 ///
-/// Each candidate is probed with a short-timeout client; the first whose
-/// `verify_bot_auth` probe succeeds is returned (and reused for the real path).
-/// A permanent error (e.g. a bad bot token) stops discovery immediately, since
-/// no endpoint will help; transient failures (network, TLS, or a 429
-/// rate-limit) move on to the next candidate.
+/// **With a mirror (`api_base`, from `[safety] telegram_api_base`) configured**
+/// — e.g. a reverse-proxy Bot API mirror that itself bypasses censorship. Real
+/// flows target this host exclusively. Discovery probes it with a short-timeout
+/// client; on success that client is reused for the real path. On failure it
+/// bails immediately, distinguishing a transient failure (network, TLS,
+/// timeout — the error says it will retry on the next discovery pass, matching
+/// the caller's `invalidate_cache` re-discovery) from a permanent one (bad
+/// token). No `api.telegram.org` sweep runs here, because the real path never
+/// contacts that host when a mirror is set.
+///
+/// **Without a mirror** — the target is the default `api.telegram.org`. An
+/// explicit `override_ip` (from `[safety] telegram_api_ip`) is tried first as
+/// an escape hatch, then the default DNS resolution, then the curated DC IP
+/// list (`TELEGRAM_DC_CANDIDATES`). Each candidate is probed with a
+/// short-timeout client; the first whose `verify_bot_auth` probe succeeds is
+/// returned (and reused for the real path). A permanent error (e.g. a bad bot
+/// token) stops discovery immediately, since no endpoint will help; transient
+/// failures (network, TLS, or a 429 rate-limit) move on to the next candidate.
 pub async fn discover_client(
     bot_token: &str,
     proxy: Option<&str>,
