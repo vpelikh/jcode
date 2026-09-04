@@ -1559,13 +1559,10 @@ pub(super) fn finish_review_loop(app: &mut App, state: &mut jcode_session_types:
         let goals = crate::todo::load_goals(&session_id).unwrap_or_default();
         let ownership_ok = crate::todo::completed_groups_have_sufficient_delivery(&todos, &goals);
         let confidence = todo_confidence_summary(&todos);
-        // Match the auto-poke completion gate: the confidence signal that needs
-        // work is `completion_confidence_needs_validation || confidence_spike_detected`
-        // (a confidence spike also demands one re-validation). Using only
-        // `needs_validation` here would silently pass a spike that the regular
-        // gate would flag.
-        let confidence_ok = !(confidence.completion_confidence_needs_validation
-            || confidence.confidence_spike_detected);
+        // Match the completion-gate signal the auto-poke path uses. `needs_more_work`
+        // is the consolidated completion-confidence + spike check; a confidence spike
+        // also demands one re-validation and must not silently pass.
+        let confidence_ok = !confidence.needs_more_work;
 
         if !(ownership_ok && confidence_ok) {
             // The completion assessment now disagrees with the reviewed + fixed
