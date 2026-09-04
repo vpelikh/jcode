@@ -1314,6 +1314,19 @@ pub(super) fn maybe_enter_review_loop(app: &mut App) {
 
 /// Spawn the independent per-lens reviewer for the loop's current lens.
 fn spawn_loop_reviewer(app: &mut App, lens: jcode_session_types::ReviewLens) -> anyhow::Result<String> {
+    // Each lens gets its own fresh reviewer session + client process. This is
+    // the per-lens independence the proposal requires (see
+    // `docs/proposals/review-rounds.md`): a lens review runs on a clean slate,
+    // untainted by an earlier lens's prompt or verdict.
+    //
+    // Reusing a single `reviewer_session_id` across lenses does NOT work: the
+    // startup prompt is delivered via the one-shot `client-input-<id>` handoff
+    // file, which a headed client process consumes only once at launch
+    // (`--fresh-spawn --resume <id>`, see `tui_lifecycle_runtime.rs`). On the
+    // second lens we do not launch a new process, so the already-running
+    // reviewer never receives the new lens prompt and `poll_loop_reviewer`
+    // would wait forever (or mis-read a stale verdict still in the reused
+    // session's history). We deliberately spawn fresh per lens.
     let parent_session_id = current_feedback_target_session_id(app);
     let lens_prompt = build_lens_review_startup_message(
         &parent_session_id,
@@ -1326,29 +1339,8 @@ fn spawn_loop_reviewer(app: &mut App, lens: jcode_session_types::ReviewLens) -> 
         .clone()
         .unwrap_or_else(|| current_autoreview_model_summary(app));
 
-    // Reuse a single reviewer session across all lens reviews when one already
-    // exists, otherwise spawn a fresh one and remember its id for reuse. This
-    // gives the post-completion review loop a single, persistent reviewer
-    // window instead of opening a new terminal per lens.
-    let reviewer_session_id = app
-        .session
-        .review_loop
-        .as_ref()
-        .and_then(|s| s.reviewer_session_id.clone());
-
-    let reuse_existing = reviewer_session_id.is_some();
-    let session_id = match reviewer_session_id {
-        Some(reused_id) => reused_id,
-        None => {
-            let (id, _name) =
-                clone_session_for_review(app, "review-loop", initial_model, None)?;
-            // Persist the id so subsequent lens reviews reuse this same window.
-            if let Some(state) = app.session.review_loop.as_mut() {
-                state.reviewer_session_id = Some(id.clone());
-            }
-            id
-        }
-    };
+    let (session_id, _name) =
+        clone_session_for_review(app, "review-loop", initial_model, None)?;
 
     prepare_review_spawned_session(
         &session_id,
@@ -1359,19 +1351,13 @@ fn spawn_loop_reviewer(app: &mut App, lens: jcode_session_types::ReviewLens) -> 
         None,
     );
 
-    // Only open a terminal the first time. A reused reviewer session already
-    // has its window open; re-injecting the prompt into the existing session
-    // re-points it at the current lens.
-    if !reuse_existing {
-        let exe = super::launch_client_executable();
-        let cwd = active_working_dir(app)
-            .filter(|path| path.is_dir())
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-        let socket = std::env::var("JCODE_SOCKET").ok();
-        super::spawn_in_new_terminal(&exe, &session_id, &cwd, socket.as_deref())?;
-    }
-
+    let exe = super::launch_client_executable();
+    let cwd = active_working_dir(app)
+        .filter(|path| path.is_dir())
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let socket = std::env::var("JCODE_SOCKET").ok();
+    super::spawn_in_new_terminal(&exe, &session_id, &cwd, socket.as_deref())?;
     Ok(session_id)
 }
 
