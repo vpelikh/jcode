@@ -1510,6 +1510,62 @@ fn test_replace_messages_clamps_out_of_range_bounds() {
 }
 
 #[test]
+fn test_replace_messages_reversed_bounds_do_not_panic() {
+    // Regression: a ReplaceMessages whose `start_index > end_index` (reversed
+    // span) must not panic inside `Vec::splice` during replay. The event log is
+    // corruption-tolerant by design, so a malformed event must degrade to a no-op
+    // rather than crash `derive_messages`. (Producers never emit reversed bounds
+    // through the current API; this guards the replay path against a bad event.)
+    use crate::session::event_types::SessionEventMap;
+
+    let mk = |id: &str| StoredMessage {
+        id: id.to_string(),
+        role: Role::User,
+        content: vec![text_block(id)],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    };
+    let mut map = SessionEventMap::default();
+    for id in ["a", "b", "c"] {
+        map.append_event(SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: format!("append_{}", id),
+            op: SessionEventOp::AppendMessage {
+                message_id: id.to_string(),
+                message: mk(id),
+            },
+            parent_id: None,
+            version: 1,
+        });
+    }
+    // Reversed span: start_index 2 > end_index 1.
+    map.append_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "reversed".into(),
+        op: SessionEventOp::ReplaceMessages {
+            start_index: 2,
+            end_index: 1,
+            messages: vec![mk("X")],
+        },
+        parent_id: None,
+        version: 1,
+    });
+    // Must not panic; the reversed span degrades to a point-insertion at `start`
+    // (end is clamped up to start, matching equal-bounds semantics), never a
+    // crash. This keeps replay corruption-tolerant.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| map.derive_messages()));
+    let messages = result.expect("derive_messages must not panic on reversed bounds");
+    let ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
+    assert_eq!(
+        ids,
+        vec!["a", "b", "X", "c"],
+        "reversed span degrades to an insertion at start (no panic)"
+    );
+}
+
+#[test]
 fn test_memory_injection_and_replay_event_derived_order_matches_legacy() {
     // Round B: at the public Session API boundary, derived memory injections and
     // replay events must come back in the same submission order as the legacy

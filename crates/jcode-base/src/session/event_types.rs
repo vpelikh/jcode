@@ -488,8 +488,20 @@ impl SessionEventMap {
                     // transcript was cleared/truncated to empty must append
                     // rather than be silently dropped), and `end_index` may be
                     // usize::MAX for a full replacement.
+                    //
+                    // Protect against a *reversed* span where `start_index >
+                    // end_index`: `Vec::splice(start..end, ..)` panics when
+                    // `start > end`. Each bound is clamped independently to the
+                    // live length first, then `end` is forced to be >= `start`
+                    // so a reversed span degrades to `start == end` — a
+                    // point-insertion at `start` (matching equal-bounds
+                    // semantics), never a crash. Producers never emit reversed
+                    // bounds through the current API, but the log is
+                    // corruption-tolerant by design and must not panic on a
+                    // malformed event.
                     let start = (*start_index).min(messages.len());
-                    let end = (*end_index).min(messages.len());
+                    let raw_end = (*end_index).min(messages.len());
+                    let end = raw_end.max(start);
                     messages.splice(start..end, replace_with.clone());
                 }
                 SessionEventOp::ClearAll => {
