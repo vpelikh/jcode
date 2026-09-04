@@ -1508,10 +1508,7 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
                         true
                     }
                     review_loop::ReviewLoopAction::Converged => {
-                        let recheck = state
-                            .record
-                            .as_ref()
-                            .is_some_and(|r| !r.files_touched.is_empty());
+                        let recheck = review_touched_files(&state);
                         finish_review_loop(app, &mut state, recheck);
                         false
                     }
@@ -1536,10 +1533,7 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
                 spawn_review_loop_reviewer(app, &mut state, lens)
             }
             review_loop::ReviewLoopAction::Converged => {
-                let recheck = state
-                    .record
-                    .as_ref()
-                    .is_some_and(|r| !r.files_touched.is_empty());
+                let recheck = review_touched_files(&state);
                 finish_review_loop(app, &mut state, recheck);
                 false
             }
@@ -1556,14 +1550,25 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
     result
 }
 
+/// Whether the review loop changed files during any fix round. Only a
+/// file-touching convergence re-runs the completion gates; a clean/no-op review
+/// leaves the original gate pass valid. (Stall is handled separately: a stalled
+/// loop has not converged and never re-runs the gates.)
+fn review_touched_files(state: &jcode_session_types::ReviewLoopState) -> bool {
+    state
+        .record
+        .as_ref()
+        .is_some_and(|r| !r.files_touched.is_empty())
+}
+
 /// Emit the end-of-loop digest and, when the review fixed files (so the work
 /// changed after the completion gates first passed), re-run the completion
 /// gates once against the post-fix state (N2). A failing gate in that one
 /// re-run surfaces and stops; it never re-enters the review loop, so there is
 /// no gates↔review ping-pong. The loop is left finished either way.
 ///
-/// `recheck_gates` is true only on a *file-touching convergence* (derived by
-/// the caller from `record.files_touched`); a stall never re-runs the gates.
+/// `recheck_gates` is true only on a *file-touching convergence* (`Converged`
+/// with `review_touched_files`); a stall never re-runs the gates.
 pub(super) fn finish_review_loop(
     app: &mut App,
     state: &mut jcode_session_types::ReviewLoopState,

@@ -446,3 +446,46 @@ fn step_review_loop_converges_with_fix_and_gate_recheck_passes_cleanly() {
         );
     });
 }
+
+#[test]
+fn step_review_loop_converged_without_fix_never_runs_gate_recheck() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        let parent_session_id = app.session_id().to_string();
+
+        // No todos persisted at all. The review converges WITHOUT touching any
+        // files (empty touched_files), so `review_touched_files` is false and
+        // the completion gates must NOT be re-run.
+        let mut state = drive_to_final_confirmation_lens(vec![]);
+
+        let mut reviewer = crate::session::Session::create(None, None);
+        let reviewer_id = reviewer.id.clone();
+        reviewer.add_message_with_display_role(
+            crate::message::Role::User,
+            vec![crate::message::ContentBlock::Text {
+                text: "VERDICT: CLEAN".to_string(),
+                cache_control: None,
+            }],
+            None,
+        );
+        reviewer.save().expect("save reviewer session");
+
+        state.active_reviewer_id = Some(reviewer_id);
+        app.session.review_loop = Some(state);
+
+        let followup = super::commands_review::step_review_loop(&mut app);
+
+        assert!(!followup);
+        let state = app.session.review_loop.as_ref().unwrap();
+        assert!(state.finished);
+        assert_eq!(state.finish_reason.as_deref(), Some("converged"));
+        // No gate re-check ran, so no failure surfaced and the digest is present.
+        assert!(
+            !app.display_messages().iter().any(|msg| {
+                msg.content
+                    .contains("completion assessment now disagrees")
+            }),
+            "a converged-without-fix review must not run the gate re-check"
+        );
+    });
+}
