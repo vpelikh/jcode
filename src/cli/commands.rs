@@ -3463,9 +3463,16 @@ fn filter_cli_model_routes_for_choice(
             route.api_method_kind(),
             crate::provider::ModelRouteApiMethod::OpenAIApiKey
         ),
-        ProviderChoice::Openrouter | ProviderChoice::Azure | ProviderChoice::OrcaRouter => {
+        ProviderChoice::Openrouter | ProviderChoice::Azure => {
             route.api_method_kind().is_openrouter()
         }
+        // OpenAI-compatible providers (OrcaRouter, Opencode, DeepSeek, Groq,
+        // ...) intentionally fall through to `_ => true`: the CLI scopes their
+        // model list via `available_models_display()`, and narrowing here by
+        // `is_openai_compatible()` proves nothing (the route set from a bound
+        // compatible runtime is already just that profile). Keeping them with
+        // the catch-all matches every other compatible provider and avoids
+        // dropping routes for multi-profile setups.
         ProviderChoice::Copilot => route.api_method_kind().is_copilot(),
         _ => true,
     };

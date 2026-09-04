@@ -727,6 +727,7 @@ fn cli_provider_choice_filter_uses_typed_api_methods() {
         test_route("gpt-5.6-pro[web]", "OpenAI", "chatgpt-web"),
         test_route("deepseek/deepseek-v4-pro", "auto", "openrouter"),
         test_route("grok-code-fast-1", "Copilot", "copilot"),
+        test_route("orca/orca-1", "OrcaRouter", "openai-compatible:orcarouter"),
     ];
 
     let openai = filter_cli_model_routes_for_choice(
@@ -755,6 +756,24 @@ fn cli_provider_choice_filter_uses_typed_api_methods() {
             .iter()
             .all(|route| route.api_method_kind().is_anthropic_credential_route())
     );
+
+    // OrcaRouter is an OpenAI-compatible provider. Like every other compatible
+    // provider it falls through to the `_ => true` catch-all (the CLI scopes
+    // models via `available_models_display()`), so no routes are dropped and
+    // the provider's `openai-compatible:orcarouter` route is always preserved.
+    // Regression guard: it must NOT be filtered as native OpenRouter only.
+    let orcarouter = filter_cli_model_routes_for_choice(
+        &super::super::provider_init::ProviderChoice::OrcaRouter,
+        &routes,
+    );
+    assert_eq!(orcarouter.len(), routes.len(), "no routes dropped for OrcaRouter");
+    assert!(orcarouter.iter().any(|route| {
+        matches!(
+            route.api_method_kind(),
+            crate::provider::ModelRouteApiMethod::OpenAiCompatible { ref profile_id }
+                if profile_id.as_deref() == Some("orcarouter")
+        )
+    }));
 }
 
 #[test]
