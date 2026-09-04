@@ -3424,7 +3424,7 @@ pub(crate) fn render_swarm_message(
 fn edit_tool_inline_diff_lines(tc: &ToolCall, content: &str) -> Option<Vec<ParsedDiffLine>> {
     let from_content = collect_diff_lines(content);
     let change_lines = if !from_content.is_empty() {
-        from_content
+        filter_unnumbered_prose_lines(from_content)
     } else {
         generate_diff_lines_from_tool_input(tc)
     };

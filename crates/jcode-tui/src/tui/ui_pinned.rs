@@ -809,7 +809,7 @@ fn collect_pinned_content(
         let change_lines = {
             let from_content = collect_diff_lines(&msg.content);
             if !from_content.is_empty() {
-                from_content
+                filter_unnumbered_prose_lines(from_content)
             } else {
                 generate_diff_lines_from_tool_input(tc)
             }
