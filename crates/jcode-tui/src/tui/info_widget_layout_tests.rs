@@ -121,6 +121,7 @@ fn contended_data() -> InfoWidgetData {
         }),
         git_info: Some(GitInfo {
             branch: "master".to_string(),
+            worktree: None,
             modified: 2,
             staged: 1,
             untracked: 1,

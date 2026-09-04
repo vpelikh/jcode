@@ -636,6 +636,7 @@ fn git_cache_seed_gather_and_invalidate_are_per_dir() {
     let mk = |branch: &str| {
         Some(crate::tui::info_widget::GitInfo {
             branch: branch.to_string(),
+            worktree: None,
             modified: 0,
             staged: 0,
             untracked: 0,
@@ -747,9 +748,24 @@ fn gather_git_info_resolves_real_worktree_branch() {
         Some("feat/panel"),
         "worktree session must report its own branch, not master"
     );
+    // The linked worktree must be flagged as a worktree (not the main checkout)
+    // so the info widget can surface which worktree the user is editing in.
+    let linked_name = linked_info
+        .as_ref()
+        .and_then(|i| i.worktree.as_deref())
+        .expect("linked worktree must set GitInfo.worktree");
+    assert_eq!(
+        linked_name,
+        linked.file_name().unwrap().to_string_lossy(),
+        "worktree name must match the linked worktree's directory basename"
+    );
     // Scoping to the main checkout yields master.
     let main_info = super::gather_git_info_inner(Some(&main));
     assert_eq!(main_info.as_ref().map(|i| i.branch.as_str()), Some("master"));
+    assert!(
+        main_info.as_ref().and_then(|i| i.worktree.as_deref()).is_none(),
+        "main checkout must not be flagged as a linked worktree"
+    );
 
     let _ = git_ok(
         &main,
@@ -757,4 +773,49 @@ fn gather_git_info_resolves_real_worktree_branch() {
     );
     let _ = std::fs::remove_dir_all(&linked);
     let _ = std::fs::remove_dir_all(&main);
+}
+
+/// A linked worktree under a *parent repository path that contains spaces* must
+/// still surface its correct worktree name. `git rev-parse --git-dir` returns
+/// absolute paths in that case, so detection must read by line rather than by
+/// whitespace (which would split the space-bearing path and yield a bogus name).
+#[test]
+fn gather_git_info_surfaces_worktree_name_for_space_path() {
+    use std::process::Command;
+
+    fn git_ok(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = Command::new("git").args(args).current_dir(dir).output().unwrap();
+        assert!(out.status.success(), "git {args:?} failed in {dir:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    let base = std::env::temp_dir().join(format!("jcode space main {}", std::process::id()));
+    let linked = base.join("linked worktree");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    git_ok(&base, &["init", "-b", "main"]);
+    std::fs::write(base.join("README.md"), "# repo\n").unwrap();
+    git_ok(&base, &["add", "."]);
+    git_ok(&base, &["commit", "-m", "init", "--no-gpg-sign"]);
+    git_ok(
+        &base,
+        &["worktree", "add", linked.to_str().unwrap(), "-b", "feat"],
+    );
+
+    let info = super::gather_git_info_inner(Some(&linked));
+    // git registers the worktree name for a space-bearing path with the spaces
+    // replaced by dashes, and detection surfaces that registered name.
+    assert_eq!(
+        info.as_ref().and_then(|i| i.worktree.as_deref()),
+        Some("linked-worktree"),
+        "space-bearing worktree must yield git's registered name, got {:?}",
+        info.as_ref().and_then(|i| i.worktree.as_deref())
+    );
+
+    let _ = git_ok(
+        &base,
+        &["worktree", "remove", "--force", linked.to_str().unwrap()],
+    );
+    let _ = std::fs::remove_dir_all(&base);
 }

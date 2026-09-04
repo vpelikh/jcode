@@ -716,6 +716,7 @@ fn onboarding_import_happy_path_images() {
         crate::tui::app::helpers::seed_git_info_cache_for_tests(
             Some(crate::tui::info_widget::GitInfo {
                 branch: "main".to_string(),
+                worktree: None,
                 modified: 0,
                 staged: 0,
                 untracked: 0,

@@ -1386,6 +1386,31 @@ fn gather_git_info_inner(work_dir: Option<&Path>) -> Option<GitInfo> {
         return None;
     }
 
+    // A linked worktree has a private git dir at `<common>/.git/worktrees/<name>`
+    // while the main checkout's git dir is `<common>/.git`, so a git-dir that
+    // differs from the common dir means we are in a linked worktree and its
+    // basename is the registered worktree name.
+    let worktree = git_cmd(work_dir)
+        .args(["rev-parse", "--git-dir", "--git-common-dir"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            // Each of `--git-dir` and `--git-common-dir` is on its own line.
+            // Read by line (not whitespace) so a repo path that itself contains
+            // spaces (e.g. `/Users/me/my repo/.git`) cannot corrupt the parse.
+            let mut lines = stdout.lines().map(str::trim);
+            let (git_dir, common_dir) = (lines.next()?, lines.next()?);
+            if git_dir != common_dir {
+                std::path::Path::new(git_dir)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            } else {
+                None
+            }
+        });
+
     let branch = git_cmd(work_dir)
         .args(["branch", "--show-current"])
         .output()
@@ -1459,6 +1484,7 @@ fn gather_git_info_inner(work_dir: Option<&Path>) -> Option<GitInfo> {
 
     Some(GitInfo {
         branch,
+        worktree,
         modified,
         staged,
         untracked,
