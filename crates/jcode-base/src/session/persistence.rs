@@ -214,9 +214,11 @@ impl Session {
         // guard protects against (messages emptied by a bug while events were
         // never appended, or a session with no event support at all — e.g. the
         // guard's own synthetic fixture with messages_len > 0 and no events).
-        let clear_intended = self.event_map.events.iter().any(|e| {
-            matches!(e.op, SessionEventOp::ClearAll)
-        }) && self.messages.is_empty()
+        // Only full-derive the event log in the empty-messages case (a clear), so
+        // checkpointing a normal session does not pay an O(n) derivation it never
+        // needed.
+        let clear_intended = self.messages.is_empty()
+            && self.event_map.events.iter().any(|e| matches!(e.op, SessionEventOp::ClearAll))
             && self.event_map.derive_messages().is_empty();
         let destructive_empty_checkpoint = self.messages.is_empty()
             && self.persist_state.messages_len > 0

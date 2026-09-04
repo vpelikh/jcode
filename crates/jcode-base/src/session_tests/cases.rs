@@ -3486,3 +3486,51 @@ fn full_session_state_round_trips_through_public_persistence() -> Result<()> {
     );
     Ok(())
 }
+
+/// Fields persisted in the snapshot but not carried in the journal meta must
+/// survive a journal-append + reload. `route_api_method` is one such field: it
+/// is set once per session and saved in the first snapshot, then a subsequent
+/// journal append must not silently drop it on reload.
+#[test]
+fn route_api_method_survives_journal_append_reload() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-route-journal-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_route_journal_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("route".to_string()));
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "m1".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.route_api_method = Some("POST".to_string());
+    // First save → snapshot carries route_api_method.
+    session.save()?;
+    let journal_path = session_journal_path(id)?;
+    assert!(!journal_path.exists());
+
+    // Journal-append (another message) after the snapshot.
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "m2".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+    assert!(journal_path.exists(), "second save must be a journal append");
+
+    let reloaded = Session::load(id)?;
+    assert_eq!(
+        reloaded.route_api_method.as_deref(),
+        Some("POST"),
+        "route_api_method must survive a journal-append reload (it lives in the snapshot)"
+    );
+    Ok(())
+}
