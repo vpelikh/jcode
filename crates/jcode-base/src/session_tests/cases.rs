@@ -2870,3 +2870,87 @@ fn event_sourced_log_survives_public_api_session_lifecycle() -> Result<()> {
         .expect("public lifecycle must keep the event log consistent");
     Ok(())
 }
+
+/// Edge case for takeaway #13: a plugin `Unknown` event appended through the
+/// public `Session::append_session_event` API must survive the real persistence
+/// path — not just a map round-trip. Here it is recorded after a snapshot save
+/// (so it is journal-appended, not in the snapshot), then the session is
+/// reloaded through the public `load` API and the plugin event must still be in
+/// the log alongside the journal-replayed message.
+#[test]
+fn unknown_plugin_event_survives_public_api_journal_append_reload() -> Result<()> {
+    use crate::session::event_types::{SessionEvent, SessionEventOp};
+
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-unknown-journal-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_unknown_journal_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("unknown".to_string()));
+    session.add_message(
+        Role::User,
+        vec![crate::message::ContentBlock::Text {
+            text: "m1".to_string(),
+            cache_control: None,
+        }],
+    );
+    // First save → snapshot.
+    session.save()?;
+    let journal_path = session_journal_path(id)?;
+    assert!(!journal_path.exists(), "first save is a snapshot");
+
+    // Append the plugin event through the public API, then another real message,
+    // then save → journal append path.
+    let appended = session.append_session_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "plugin_checkpoint_1".to_string(),
+        op: SessionEventOp::Unknown {
+            event_type: "plugin/checkpoint".to_string(),
+            data: serde_json::json!({ "turns": 42, "sha": "abc" }),
+        },
+        parent_id: None,
+        version: 1,
+    });
+    assert!(appended, "append_session_event must record the plugin event");
+    session.add_message(
+        Role::User,
+        vec![crate::message::ContentBlock::Text {
+            text: "m2".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+    assert!(journal_path.exists(), "second save must be a journal append");
+
+    // Reload through the public API: both the journal message and the plugin
+    // event must survive, and the event log must stay consistent.
+    let reloaded = Session::load(id)?;
+    assert_eq!(reloaded.messages.len(), 2);
+    assert!(
+        reloaded.event_map.events.iter().any(|e| matches!(
+            e.op,
+            SessionEventOp::Unknown { .. }
+        )),
+        "plugin Unknown event must survive the journal append + reload (takeaway #13)"
+    );
+    match reloaded
+        .event_map
+        .events
+        .iter()
+        .find(|e| matches!(e.op, SessionEventOp::Unknown { .. }))
+        .map(|e| &e.op)
+    {
+        Some(SessionEventOp::Unknown { event_type, data }) => {
+            assert_eq!(event_type, "plugin/checkpoint");
+            assert_eq!(data.get("turns").and_then(|v| v.as_u64()), Some(42));
+        }
+        other => panic!("plugin event payload not preserved: {other:?}"),
+    }
+    reloaded
+        .rederive_all_checked()
+        .expect("event log must stay consistent after plugin-event journal reload");
+    Ok(())
+}
