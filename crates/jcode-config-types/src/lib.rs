@@ -1432,17 +1432,22 @@ pub struct SafetyConfig {
     /// Enable Telegram reply → agent directive feature (default: false)
     pub telegram_reply_enabled: bool,
     /// Telegram Bot API base URL with a trailing `/bot`, e.g. a reverse proxy
-    /// mirror or an alternate data-center IP. Defaults to the official
-    /// `https://api.telegram.org/bot`. Env override: `JCODE_TELEGRAM_API_BASE`.
+    /// mirror that bypasses a blocked regional Telegram endpoint. Defaults to the
+    /// official `https://api.telegram.org/bot`. When set, this mirror is the
+    /// ONLY host jcode talks to (startup probes it and every call targets it),
+    /// taking precedence over `telegram_api_ip`. Env override:
+    /// `JCODE_TELEGRAM_API_BASE`.
     pub telegram_api_base: Option<String>,
     /// Optional proxy for Telegram Bot API traffic (e.g. `socks5://127.0.0.1:1080`
-    /// or `http://user:pass@host:3128`). Env override: `JCODE_TELEGRAM_PROXY`.
+    /// or `http://user:pass@host:3128`). Applies whether or not a mirror is set.
+    /// Env override: `JCODE_TELEGRAM_PROXY`.
     pub telegram_proxy: Option<String>,
     /// Optional alternate Telegram data-center IP to connect to instead of the
-    /// DNS-resolved one (e.g. `149.154.167.220`). Pins the `api.telegram.org`
-    /// hostname to this IP while keeping its real name for TLS/SNI, so no
-    /// proxy is needed even when the default DC IP is blocked. Env override:
-    /// `JCODE_TELEGRAM_API_IP`.
+    /// DNS-resolved one (e.g. `149.154.167.220`). Only relevant when no
+    /// `telegram_api_base` mirror is set (the mirror takes precedence and ignores
+    /// this). Pins the `api.telegram.org` hostname to this IP while keeping its
+    /// real name for TLS/SNI, so a blocked default DC IP can be bypassed without
+    /// a proxy. Env override: `JCODE_TELEGRAM_API_IP`.
     pub telegram_api_ip: Option<String>,
     /// Optional Telegram user ID whitelist (numeric). When set, only a message
     /// whose sender id matches is acted upon (permission replies, commands, and

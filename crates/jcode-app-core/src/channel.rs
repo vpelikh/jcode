@@ -276,7 +276,14 @@ impl TelegramChannel {
             Err(_) => {
                 let mut failures = self.consecutive_discovery_failures.lock().await;
                 *failures = failures.saturating_add(1);
-                crate::provider::shared_http_client()
+                // Discovery failed. Still hand back a usable client so the caller
+                // can keep trying. Prefer a proxy/IP-aware client (built from the
+                // same configured overrides) over the bare shared client, so a
+                // configured `telegram_proxy` is not silently dropped on the
+                // recovery path. Fall back to the shared client only if even that
+                // build fails.
+                crate::telegram::build_client(self.proxy.as_deref(), self.api_ip.as_deref())
+                    .unwrap_or_else(|_| crate::provider::shared_http_client())
             }
         };
         *self.client.lock().await = replacement;

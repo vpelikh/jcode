@@ -88,11 +88,13 @@ fn non_empty(value: &str) -> Option<&str> {
 
 /// Curated list of known Telegram data-center IPs, tried in order when the
 /// DNS-resolved default is blocked. These come from Telegram's published DC
-/// ranges (149.154.160.0/20 and 91.108.0.0/16 for IPv4, 2001:67c:4e8::/48 for
-/// IPv6). The hostname is always kept for TLS/SNI, so this only redirects the
-/// TCP connection; it does not bypass certificate verification. TLS
-/// verification still uses the hostname, so the server certificate is validated
-/// as usual.
+/// IPv4 ranges (149.154.160.0/20) and IPv6 range (2001:67c:4e8::/48). The
+/// 91.108.0.0/16 MTProto DC range is deliberately excluded: those addresses
+/// serve the MTProto client protocol, not the HTTP Bot API, so they cannot be
+/// used as a Bot API endpoint. The hostname is always kept for TLS/SNI, so this
+/// only redirects the TCP connection; it does not bypass certificate
+/// verification. TLS verification still uses the hostname, so the server
+/// certificate is validated as usual.
 ///
 /// The list deliberately leads with the current HTTP API edge (`api.telegram.org`
 /// resolves to `149.154.166.110` / `2001:67c:4e8:f004::9`), which is the one a
@@ -211,6 +213,27 @@ pub fn is_transient_api_error(e: &anyhow::Error) -> bool {
         || s.contains("retry after")
 }
 
+/// Build the discovery-bail error for a configured `api_base` mirror that
+/// failed to probe. A mirror is the ONLY host the real flows target, so any
+/// failure is terminal for this discovery pass (the caller's re-discovery
+/// retries it). The message distinguishes a transient failure (connectivity
+/// / 429 / timeout — retryable) from a permanent one (bad token), so users get
+/// an accurate diagnosis instead of a misleading "bad token?" on a temporary
+/// outage.
+fn mirror_probe_error(api_base: &str, e: &anyhow::Error) -> anyhow::Error {
+    if is_transient_api_error(e) {
+        anyhow::anyhow!(
+            "Telegram unreachable via configured API base mirror `{api_base}` \
+             ({e}). Will retry on the next discovery pass."
+        )
+    } else {
+        anyhow::anyhow!(
+            "Telegram auth failed via API base mirror `{api_base}` \
+             (bad token?): {e}. Stopping discovery."
+        )
+    }
+}
+
 /// Build a short-timeout client used only for the discovery probe (`getMe`).
 /// A fast *connect* timeout keeps an unreachable candidate from stalling the
 /// sweep. Crucially this client has NO overall request timeout: `discover_client`
@@ -273,28 +296,21 @@ pub async fn discover_client(
         .map(str::to_string);
 
     // When an explicit API base mirror is configured it takes first precedence:
-    // it is the user's stated anti-censorship path and may itself resolve to a
-    // host we cannot reach through IP pinning (`api.telegram.org`). Probe it
-    // with a plain (default-DNS, optionally proxy-routed) client; if it lacks a
-    // `/bot` path segment we still probe the host root so a reachable mirror is
-    // detected, and the real callers normalize the base themselves.
+    // it is the user's stated anti-censorship path, and the real flows target it
+    // exclusively. Probe it with a plain (default-DNS, optionally proxy-routed)
+    // client; `verify_bot_auth` normalizes the base (appending `/bot` if the
+    // mirror lacks it), and the returned client is reused for the real path if
+    // the probe succeeds.
     if let Some(api_base) = &api_base {
-        // Probe the mirror with a plain (default-DNS, optionally proxy-routed)
-        // client. Reuse build_probe_client for a consistent short probe timeout;
-        // the returned client is reused for the real path if the probe succeeds.
         let client = match build_probe_client(proxy, None) {
             Ok(c) => c,
             Err(e) => {
-                if is_transient_api_error(&e) {
-                    anyhow::bail!(
-                        "Telegram unreachable via configured API base mirror `{api_base}` \
-                         ({e}). Will retry on the next discovery pass."
-                    );
-                }
-                anyhow::bail!(
-                    "Telegram auth failed via API base mirror `{api_base}` \
-                     (bad token?): {e}. Stopping discovery."
-                );
+                // A client-build failure is a configuration error (e.g. an
+                // unparseable proxy URL), not a transient connectivity or auth
+                // problem. Surface it as-is rather than mislabeling it "bad token".
+                return Err(e.context(format!(
+                    "failed to build probe client for configured API base mirror `{api_base}`"
+                )));
             }
         };
         match tokio::time::timeout(
@@ -309,31 +325,12 @@ pub async fn discover_client(
                 ));
                 return Ok(client);
             }
-            Ok(Err(e)) => {
-                // A mirror is the ONLY host the real calls target. When it fails,
-                // whether the error is permanent (bad token) or transient
-                // (network, TLS, timeout), there is no alternate host to sweep:
-                // the `api.telegram.org` DC sweep would talk to a host the real
-                // path never uses, so a sweep "success" would be a false positive.
-                // Transient failures are retried later by the caller's re-discovery
-                // (invalidate_cache -> run_discovery). Distinguish them in the
-                // message so a bad token vs a down mirror is clear.
-                if is_transient_api_error(&e) {
-                    anyhow::bail!(
-                        "Telegram unreachable via configured API base mirror `{api_base}` \
-                         ({e}). Will retry on the next discovery pass."
-                    );
-                }
-                anyhow::bail!(
-                    "Telegram auth failed via API base mirror `{api_base}` \
-                     (bad token?): {e}. Stopping discovery."
-                );
-            }
+            Ok(Err(e)) => return Err(mirror_probe_error(api_base, &e)),
             Err(elapsed) => {
-                anyhow::bail!(
-                    "Telegram unreachable via configured API base mirror `{api_base}` \
-                     (probe timed out: {elapsed}). Will retry on the next discovery pass."
-                );
+                return Err(mirror_probe_error(
+                    api_base,
+                    &anyhow::anyhow!("probe timed out: {elapsed}"),
+                ));
             }
         }
     }
@@ -1735,8 +1732,11 @@ mod tests {
     /// Deterministic: refuses a local connection, never touches Telegram.
     #[tokio::test]
     async fn test_discover_client_mirror_transient_failure_bails() {
-        // Port 1 is never listening on any interface; connect is refused, which
-        // is_connectivity_error classifies as transient.
+        // Use port 1 (IANA "tcpmux"). It is reliably refused: on unprivileged
+        // systems (the test's usual environment) any bind to a port < 1024 is
+        // denied, so nothing else can be listening there and connect is refused;
+        // even running as root, no normal service occupies it. That refusal is
+        // classified as a connectivity (transient) error by is_connectivity_error.
         let mirror = "http://127.0.0.1:1";
         let err = discover_client("test-token", None, None, Some(mirror))
             .await
@@ -1753,6 +1753,32 @@ mod tests {
                 && !text.contains("auth failed via API base mirror")
                 && !text.contains("tried default DNS and"),
             "transient mirror failure must not be misreported: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_discover_client_mirror_build_client_failure_is_config_error_not_bad_token() {
+        // A client-build failure (e.g. an unparseable proxy URL) must be surfaced as
+        // a configuration error, never mislabeled as a "bad token". An invalid proxy
+        // URL makes build_probe_client fail before any request is attempted.
+        let mirror = "https://mirror.example.com/bot";
+        let err = discover_client(
+            "test-token",
+            Some("not a valid proxy url ://"),
+            None,
+            Some(mirror),
+        )
+        .await
+        .expect_err("an unparseable proxy should fail to build the probe client");
+        let text = err.to_string();
+        assert!(
+            text.contains("failed to build probe client")
+                && text.contains("configured API base mirror"),
+            "client-build failure must be reported as a config error, not bad token: {text}"
+        );
+        assert!(
+            !text.contains("bad token"),
+            "client-build failure must not be mislabeled as a bad token: {text}"
         );
     }
 
