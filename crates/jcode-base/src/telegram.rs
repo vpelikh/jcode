@@ -274,56 +274,70 @@ pub async fn discover_client(
     // with a plain (default-DNS, optionally proxy-routed) client; if it lacks a
     // `/bot` path segment we still probe the host root so a reachable mirror is
     // detected, and the real callers normalize the base themselves.
-    let mut last_err: Option<anyhow::Error> = None;
     if let Some(api_base) = &api_base {
-        match build_probe_client(proxy, None) {
-            Ok(client) => {
-                let probe = tokio::time::timeout(
-                    std::time::Duration::from_secs(DISCOVERY_PROBE_TIMEOUT_SECS + 5),
-                    verify_bot_auth(&client, bot_token, Some(api_base)),
-                )
-                .await;
-                match probe {
-                    Ok(Ok(_)) => {
-                        logging::info(&format!(
-                            "telegram reachable via configured API base mirror {api_base}"
-                        ));
-                        return Ok(client);
-                    }
-                    Ok(Err(e)) => {
-                        if !is_transient_api_error(&e) {
-                            anyhow::bail!(
-                                "Telegram auth failed via API base mirror {api_base} \
-                                 (bad token?): {e}. Stopping discovery."
-                            );
-                        }
-                        logging::debug(&format!(
-                            "telegram API base mirror {api_base} unreachable: {e}"
-                        ));
-                        last_err = Some(e);
-                    }
-                    Err(elapsed) => {
-                        logging::debug(&format!(
-                            "telegram API base mirror {api_base} timed out: {elapsed}"
-                        ));
-                        last_err = Some(anyhow::anyhow!("probe timed out: {elapsed}"));
-                    }
-                }
-            }
+        // Probe the mirror with a plain (default-DNS, optionally proxy-routed)
+        // client. Reuse build_probe_client for a consistent short probe timeout;
+        // the returned client is reused for the real path if the probe succeeds.
+        let client = match build_probe_client(proxy, None) {
+            Ok(c) => c,
             Err(e) => {
-                last_err = Some(e);
+                if is_transient_api_error(&e) {
+                    anyhow::bail!(
+                        "Telegram unreachable via configured API base mirror `{api_base}` \
+                         ({e}). Will retry on the next discovery pass."
+                    );
+                }
+                anyhow::bail!(
+                    "Telegram auth failed via API base mirror `{api_base}` \
+                     (bad token?): {e}. Stopping discovery."
+                );
+            }
+        };
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(DISCOVERY_PROBE_TIMEOUT_SECS + 5),
+            verify_bot_auth(&client, bot_token, Some(api_base)),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {
+                logging::info(&format!(
+                    "telegram reachable via configured API base mirror {api_base}"
+                ));
+                return Ok(client);
+            }
+            Ok(Err(e)) => {
+                // A mirror is the ONLY host the real calls target. When it fails,
+                // whether the error is permanent (bad token) or transient
+                // (network, TLS, timeout), there is no alternate host to sweep:
+                // the `api.telegram.org` DC sweep would talk to a host the real
+                // path never uses, so a sweep "success" would be a false positive.
+                // Transient failures are retried later by the caller's re-discovery
+                // (invalidate_cache -> run_discovery). Distinguish them in the
+                // message so a bad token vs a down mirror is clear.
+                if is_transient_api_error(&e) {
+                    anyhow::bail!(
+                        "Telegram unreachable via configured API base mirror `{api_base}` \
+                         ({e}). Will retry on the next discovery pass."
+                    );
+                }
+                anyhow::bail!(
+                    "Telegram auth failed via API base mirror `{api_base}` \
+                     (bad token?): {e}. Stopping discovery."
+                );
+            }
+            Err(elapsed) => {
+                anyhow::bail!(
+                    "Telegram unreachable via configured API base mirror `{api_base}` \
+                     (probe timed out: {elapsed}). Will retry on the next discovery pass."
+                );
             }
         }
     }
 
-    // The DC sweep below targets the DEFAULT Bot API endpoint (`api.telegram.org`)
-    // reached via a pinned data-center IP. When a mirror (`api_base`) is
-    // configured we already tried it above and it failed transiently, so this is
-    // a fallback that attempts the real endpoint over an alternate IP. It must
-    // therefore probe with base_override = None: the IP pin redirects
-    // `api.telegram.org` resolution, which is meaningless if the URL still points
-    // at the mirror host. Passing `api_base` here would ignore the pin and merely
-    // re-probe the already-failed mirror.
+    // No mirror configured: the target is the DEFAULT Bot API endpoint
+    // (`api.telegram.org`). Try an explicit pinned `override_ip` first, then
+    // default DNS, then the curated DC IP list. Each candidate is probed with
+    // the default base (None) — IP pinning redirects `api.telegram.org`.
     let mut candidates: Vec<Option<String>> = Vec::new();
     if let Some(ip) = override_ip.filter(|ip| !ip.trim().is_empty()) {
         candidates.push(Some(ip.trim().to_string()));
@@ -333,6 +347,7 @@ pub async fn discover_client(
         candidates.push(Some((*ip).to_string()));
     }
 
+    let mut last_err: Option<anyhow::Error> = None;
     for (i, maybe_ip) in candidates.iter().enumerate() {
         let client = match build_probe_client(proxy, maybe_ip.as_deref()) {
             Ok(c) => c,
@@ -384,15 +399,6 @@ pub async fn discover_client(
         }
     }
 
-    if let Some(api_base) = &api_base {
-        anyhow::bail!(
-            "Telegram unreachable: configured API base mirror `{api_base}` failed, and \
-             the default endpoint was unreachable over the DNS candidate and {} DC IPs. \
-             Last error: {}",
-            TELEGRAM_DC_CANDIDATES.len(),
-            last_err.map(|e| e.to_string()).unwrap_or_default()
-        )
-    }
     anyhow::bail!(
         "Telegram unreachable: tried default DNS and {} DC IPs. Last error: {}",
         TELEGRAM_DC_CANDIDATES.len(),
@@ -1714,6 +1720,35 @@ mod tests {
         assert!(
             !text.contains("tried default DNS and"),
             "permanent mirror failure must not confuse the user with the DC-sweep message: {text}"
+        );
+    }
+
+    /// A configured mirror that fails TRANSIENTLY (connection refused to a
+    /// non-listening port) must also bail immediately with the retryable message,
+    /// and must NOT fall through to an `api.telegram.org` DC sweep: the real
+    /// calls target the mirror host, so sweeping the default endpoint would be a
+    /// useless (and misleading) false-positive. Retry is the caller's job.
+    /// Deterministic: refuses a local connection, never touches Telegram.
+    #[tokio::test]
+    async fn test_discover_client_mirror_transient_failure_bails() {
+        // Port 1 is never listening on any interface; connect is refused, which
+        // is_connectivity_error classifies as transient.
+        let mirror = "http://127.0.0.1:1";
+        let err = discover_client("test-token", None, None, Some(mirror))
+            .await
+            .expect_err("a transiently-failing mirror should bail, not sweep the wrong host");
+        let text = err.to_string();
+        assert!(
+            text.contains("unreachable via configured API base mirror")
+                && text.contains("Will retry on the next discovery pass"),
+            "transient mirror failure must surface a retryable mirror message: {text}"
+        );
+        // It must NOT appear to be a bad token, nor sweep the default endpoint.
+        assert!(
+            !text.contains("bad token")
+                && !text.contains("auth failed via API base mirror")
+                && !text.contains("tried default DNS and"),
+            "transient mirror failure must not be misreported: {text}"
         );
     }
 
