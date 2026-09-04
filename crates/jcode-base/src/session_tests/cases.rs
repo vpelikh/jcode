@@ -3410,3 +3410,79 @@ fn divergent_load_rebuilds_then_persists_and_stays_consistent() -> Result<()> {
         .expect("post-save reload must be consistent");
     Ok(())
 }
+
+/// Full-snapshot serialization contract: a Session carrying every kind of state
+/// (messages, compaction, memory injections, replay events, env snapshots, and
+/// an event log with a bracket + plugin Unknown) must round-trip through the
+/// public save/load unchanged and stay internally consistent.
+#[test]
+fn full_session_state_round_trips_through_public_persistence() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-full-rt-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_full_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("full".to_string()));
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.record_memory_injection("mem".to_string(), "content".to_string(), 1, 5, Vec::new());
+    session.record_replay_display_message("system", Some("title".to_string()), "boot");
+    session.record_env_snapshot(EnvSnapshot {
+        captured_at: Utc::now(),
+        reason: "roundtrip".to_string(),
+        session_id: id.to_string(),
+        working_dir: Some(temp_home.path().to_string_lossy().to_string()),
+        provider: "openai".to_string(),
+        model: "gpt-5.4".to_string(),
+        jcode_version: "test".to_string(),
+        jcode_git_hash: None,
+        jcode_git_dirty: None,
+        os: "linux".to_string(),
+        arch: "x86_64".to_string(),
+        pid: 42,
+        is_selfdev: false,
+        is_debug: false,
+        is_canary: false,
+        testing_build: None,
+        working_git: None,
+    });
+    // Compaction via the seam emits a balanced bracket.
+    session.set_compaction(StoredCompactionState {
+        summary_text: "compacted".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 1,
+    });
+
+    session.save()?;
+    let loaded = Session::load(id)?;
+
+    // Every legacy vector survives.
+    assert_eq!(loaded.messages.len(), 1);
+    assert_eq!(loaded.memory_injections.len(), 1);
+    assert_eq!(loaded.replay_events.len(), 1);
+    assert_eq!(loaded.env_snapshots.len(), 1);
+    assert_eq!(
+        loaded.compaction.as_ref().map(|c| &c.summary_text),
+        Some(&"compacted".to_string())
+    );
+    // The event log agrees with all of it.
+    loaded
+        .rederive_all_checked()
+        .expect("full session must reload internally consistent");
+    let inv = InvariantRegistry::builtin();
+    assert!(
+        inv.check(&loaded.event_map).is_green(),
+        "full session reload must satisfy the invariant registry"
+    );
+    Ok(())
+}
