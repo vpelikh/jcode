@@ -3661,3 +3661,76 @@ fn fork_mid_bracket_is_consistent_and_resolvable() -> Result<()> {
         .expect("resolved fork must be consistent");
     Ok(())
 }
+
+/// Multiple compaction changes across several journal appends must replay with
+/// LAST-WINS semantics: each journal entry's compaction meta and SetCompaction
+/// event are applied in order, and the reloaded session reflects only the final
+/// compaction while keeping the event log consistent.
+#[test]
+fn compaction_across_multiple_journal_appends_replays_last_wins() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-multi-compaction-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_multi_compaction_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("mc".to_string()));
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "m0".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?; // snapshot
+    let journal_path = session_journal_path(id)?;
+    assert!(!journal_path.exists());
+
+    // Compaction A via journal append.
+    session.set_compaction(StoredCompactionState {
+        summary_text: "compacted_a".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 1,
+    });
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "m1".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+    assert!(journal_path.exists());
+
+    // Compaction B via another journal append (overrides A).
+    session.set_compaction(StoredCompactionState {
+        summary_text: "compacted_b".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 2,
+        original_turn_count: 2,
+        compacted_count: 2,
+    });
+    session.save()?; // pure event-append: journals only append_events
+
+    let reloaded = Session::load(id)?;
+    assert_eq!(
+        reloaded.compaction.as_ref().map(|c| &c.summary_text),
+        Some(&"compacted_b".to_string()),
+        "last compaction must win across multi-entry replay"
+    );
+    // Both messages plus both compactions' events must be in the log; the last
+    // one derives as current.
+    assert_eq!(
+        reloaded.event_map.current_compaction().map(|c| c.summary_text).as_deref(),
+        Some("compacted_b"),
+        "event-derived current_compaction must reflect the last compaction"
+    );
+    reloaded
+        .rederive_all_checked()
+        .expect("multi-compaction journal replay must be consistent");
+    Ok(())
+}
