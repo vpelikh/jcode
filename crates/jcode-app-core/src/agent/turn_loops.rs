@@ -1596,6 +1596,26 @@ mod tests {
     }
 
     #[test]
+    fn compact_unfulfilled_tool_request_ignores_possessive_target_reference() {
+        // A POSSESSIVE form of a tool target ("the tool's", "the command's")
+        // is a reference to the tool, not a commitment to invoke it now. A
+        // naive substring match would catch "i'll call the tool" inside "i'll
+        // call the tool's documentation", falsely flagging a genuine answer
+        // that merely plans to read/review. The detector must require a real
+        // word boundary after the target (an apostrophe signals a possessive).
+        let legitimate = [
+            "I'll call the tool's documentation when reviewing the next step.",
+            "I'll call the command's output below for your reference.",
+        ];
+        for turn in legitimate {
+            assert!(
+                !Agent::is_stalled_promise_text(turn),
+                "a possessive tool-target reference must not be flagged as a stall: {turn:?}"
+            );
+        }
+    }
+
+    #[test]
     fn compact_unfulfilled_tool_request_is_stalled() {
         // The exact compact degradation observed in a real long-context session
         // (DeepSeek via OpenRouter): a SHORT turn explicitly says it will invoke a

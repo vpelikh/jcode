@@ -547,8 +547,31 @@ impl Agent {
         FIRST_PERSON_INVOKE.iter().any(|starter| {
             TOOL_TARGETS
                 .iter()
-                .any(|target| low.contains(&format!("{starter} {target}")))
+                .any(|target| Self::contains_phrase_boundary(low, &format!("{starter} {target}")))
         })
+    }
+
+    /// True when `haystack` contains `needle` and the character immediately
+    /// following it is a word boundary (space, a punctuation mark other than an
+    /// apostrophe, or end-of-string). This rejects POSSESSIVE and word-joined
+    /// forms of a tool target: "the tool's docs" or "the command_line" contain
+    /// "the tool" / "the command" as substrings, but they are *references* to a
+    /// tool, not a first-person commitment to invoke it now. Requiring a real
+    /// boundary after the target keeps the compact stall detector from flagging
+    /// genuine answers like "I'll call the tool's documentation when reviewing".
+    fn contains_phrase_boundary(haystack: &str, needle: &str) -> bool {
+        let Some(start) = haystack.find(needle) else {
+            return false;
+        };
+        let end = start + needle.len();
+        let next = haystack.as_bytes().get(end);
+        // End-of-string, whitespace, or punctuation that is NOT an apostrophe
+        // (which signals a possessive, e.g. "tool's"). Also reject a digit or
+        // letter continuing the word (e.g. "tool2").
+        match next {
+            None => true,
+            Some(b) => !(b.is_ascii_alphanumeric() || *b == b'\''),
+        }
     }
 
     /// Request a single bounded continuation when the model stopped after
