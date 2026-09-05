@@ -836,8 +836,9 @@ impl RemoteConnection {
     }
 
     /// Change the active session's working directory on the server (e.g. move
-    /// into a linked git worktree). The daemon re-scopes tools, skills, AGENTS.md,
-    /// and the git info widget to the new directory.
+    /// into a linked git worktree). The daemon re-scopes the session's tools,
+    /// skills, and AGENTS.md overlay to the new directory; the client re-scopes
+    /// its local git-info widget when it receives SessionWorkingDirChanged.
     pub async fn set_working_dir(&mut self, dir: String) -> Result<()> {
         let request = Request::SetWorkingDir {
             id: self.next_request_id,
