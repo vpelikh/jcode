@@ -446,6 +446,12 @@ impl Session {
             self.memory_injections.iter().map(estimate_json_bytes).sum();
         let replay_events_json_bytes: usize =
             self.replay_events.iter().map(estimate_json_bytes).sum();
+        let event_log_json_bytes: usize = self
+            .event_map
+            .events
+            .iter()
+            .map(estimate_json_bytes)
+            .sum();
         let compaction_json_bytes = self
             .compaction
             .as_ref()
@@ -503,6 +509,10 @@ impl Session {
                 "count": self.replay_events.len(),
                 "json_bytes": replay_events_json_bytes,
             },
+            "event_log": {
+                "count": self.event_map.events.len(),
+                "json_bytes": event_log_json_bytes,
+            },
             "provider_messages_cache": {
                 "count": self.provider_messages_cache.len(),
                 "source_len": self.provider_messages_cache_len,
@@ -517,6 +527,7 @@ impl Session {
                     + env_snapshots_json_bytes
                     + memory_injections_json_bytes
                     + replay_events_json_bytes
+                    + event_log_json_bytes
                     + compaction_json_bytes,
                 "canonical_transcript_json_bytes": session_message_json_bytes,
                 "provider_cache_json_bytes": provider_messages_cache_json_bytes,

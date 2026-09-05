@@ -167,6 +167,23 @@ fn test_debug_memory_profile_reports_messages_and_provider_cache() {
             .unwrap_or(0)
             > 0
     );
+    // The event-sourced log is a distinct memory consumer (every message is
+    // duplicated as an AppendMessage event plus metadata), so the memory profile
+    // must surface it and fold it into the totals.
+    assert_eq!(
+        profile["event_log"]["count"],
+        session.event_map.events.len()
+    );
+    let event_log_bytes = profile["event_log"]["json_bytes"].as_u64().unwrap_or(0);
+    assert!(
+        event_log_bytes > 0,
+        "event_log.json_bytes must be > 0 once events exist"
+    );
+    let total_bytes = profile["totals"]["json_bytes"].as_u64().unwrap_or(0);
+    assert!(
+        total_bytes >= event_log_bytes,
+        "totals.json_bytes must include the event log footprint"
+    );
 }
 
 #[test]
