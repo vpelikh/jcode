@@ -922,4 +922,26 @@ mod semantic_state_tests {
         let field: TodoGoalField = serde_json::from_str("\"end_to_end_ownership\"").unwrap();
         assert_eq!(field, TodoGoalField::DeliveryState);
     }
+
+    /// `explored_alternative` is a distinct three-valued Option: true, false,
+    /// and None. `false` must round-trip as false (not be skipped or read as
+    /// None), since a false value and an absent value mean different things.
+    #[test]
+    fn explored_alternative_round_trips_true_false_and_none() {
+        for value in [Some(true), Some(false), None] {
+            let goal = TodoGoal {
+                explored_alternative: value,
+                ..Default::default()
+            };
+            let json = serde_json::to_value(&goal).unwrap();
+            assert_eq!(
+                serde_json::from_value::<TodoGoal>(json.clone()).unwrap().explored_alternative,
+                value,
+                "explored_alternative must round-trip as {value:?}"
+            );
+            if let Some(v) = value {
+                assert_eq!(json["explored_alternative"], v);
+            }
+        }
+    }
 }
