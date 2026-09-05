@@ -1531,6 +1531,7 @@ mod tests {
             "I keep failing to actually invoke the tool. Let me directly grep and view `rename_session_title`.\n\nI'll invoke bash now.",
             "Let me grep and view `rename_session_title`.\n\n<system-warning>Run the grep command.</system-warning>\n\nI'll invoke bash.",
             "Let me invoke bash now.",
+            "Let me call bash to run the check now.",
         ];
         for turn in turns {
             assert!(
@@ -1570,6 +1571,10 @@ mod tests {
             // third-person/descriptive "will invoke" is not a promise by the agent
             "This setup will invoke shell hooks on commit; review the config when ready.",
             "The plugin will invoke run mode automatically. That is the summary.",
+            // bare non-first-person invoke frames describe tooling, not the
+            // agent promising to act NOW; these must not be flagged.
+            "The cron job will invoke bash now each night before committing. Summary is above.",
+            "This harness will invoke the tool now when tests run. That's the whole report.",
         ];
         for turn in legitimate {
             assert!(

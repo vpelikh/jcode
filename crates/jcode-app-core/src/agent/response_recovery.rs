@@ -459,20 +459,21 @@ impl Agent {
         if low.len() > Self::COMPACT_STALLED_TOOL_REQUEST_MAX_LEN {
             return false;
         }
-        // Reciprocal contractions ("i'm", "i've") are hard to match with a
-        // fixed token in flattened text; handle the common future/volitional
-        // forms explicitly and leave the pure "memorize"/digress cases alone.
+        // Require a first-person, present tense promise to invoke a tool. Only
+        // these reliably signal that the AGENT intends to act right now; bare
+        // non-first-person forms ("the harness will invoke bash now", "the cron
+        // job invokes the tool") describe tooling or a dependency and are NOT a
+        // promise by the agent, so they must not be treated as a stall. All real
+        // observed stalls (giraffe 5/5, sabertooth) use a first-person frame, so
+        // this tightening loses no coverage.
         let has_future_invoke = [
             "let me invoke",
             "i'll invoke",
             "i will invoke",
             "i'm going to invoke",
             "i am going to invoke",
-            "invoke the bash tool now",
-            "invoke bash now",
-            "invoke the tool now",
-            "call the bash tool",
-            "call bash",
+            "let me call bash",
+            "let me call the bash tool",
         ]
         .iter()
         .any(|p| low.contains(p));
@@ -544,7 +545,7 @@ impl Agent {
         self.add_message(
             Role::User,
             vec![ContentBlock::Text {
-                text: "<system-reminder>Your previous response repeatedly said you would perform an action (e.g. \"Let me...\") but ended without making the promised tool call. If a further step is needed, emit the tool call now and continue the task instead of restating your intent. If the task is genuinely complete, give the final answer directly. Do not repeat the same preparatory filler.</system-reminder>"
+                text: "<system-reminder>Your previous response said you would perform an action (e.g. \"Let me...\" or \"I'll invoke...\") but ended without making the tool call. If a further step is needed, emit the tool call now and continue the task instead of restating your intent. If the task is genuinely complete, give the final answer directly.</system-reminder>"
                     .to_string(),
                 cache_control: None,
             }],
