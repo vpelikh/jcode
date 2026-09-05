@@ -1735,6 +1735,23 @@ fn streaming_stopped_message(short: &str) -> String {
     format!("💬 \\[{short}] ⏹ _stopped — no output produced_")
 }
 
+/// Cap a MarkdownV2 message body so it never exceeds Telegram's per-message
+/// limit. `editMessageText` over the limit fails silently (the message freezes
+/// at the last accepted length with no user indication), so a long streamed
+/// reply must be clipped. A trailing backslash is dropped so a truncation
+/// cannot leave an incomplete escape sequence.
+fn clip_to_telegram_max(text: String) -> String {
+    let mut out = text;
+    if out.chars().count() > crate::telegram::MAX_MESSAGE_CHARS {
+        out = out.chars().take(crate::telegram::MAX_MESSAGE_CHARS).collect();
+    }
+    // An escape immediately before the cut would dangle a lone backslash.
+    if out.ends_with('\\') {
+        out.pop();
+    }
+    out
+}
+
 impl TelegramChannel {
     /// Run a prompt against `session_id` and stream partial assistant text into a
 /// single Telegram message (so the user sees live progress), then leave the
@@ -1819,7 +1836,7 @@ async fn stream_reply_to_session(
                 &token,
                 chat_id.parse::<i64>().unwrap_or(0),
                 sent_id,
-                &body,
+                &clip_to_telegram_max(body),
                 api_base.as_deref(),
             )
             .await;
@@ -1870,10 +1887,43 @@ async fn stream_reply_to_session(
             )
             .await;
         }
-        Ok(_reply) => {
-            // Normal completion: the on_progress closure already streamed the
-            // final text into the message, and Stop was cleared above. Nothing
-            // further to do.
+        Ok(reply) => {
+            // Normal completion. The on_progress closure streamed a clipped
+            // version of the reply into the message (aligned to Telegram's 4096
+            // limit) and Stop was cleared above. If the full reply was clipped,
+            // mark it so the user knows the live preview is not the whole
+            // answer and can open `/history` for the rest.
+            let full = format!(
+                "💬 \\[{}] {}",
+                short_id(session_id),
+                escape_markdown_v2(&reply)
+            );
+            if full.chars().count() > crate::telegram::MAX_MESSAGE_CHARS {
+                let note = "\n\n✂️ _clipped — /history shows the full reply_";
+                let budget = crate::telegram::MAX_MESSAGE_CHARS
+                    .saturating_sub(note.chars().count());
+                let mut clipped_body_text = escape_markdown_v2(&reply)
+                    .chars()
+                    .take(budget)
+                    .collect::<String>();
+                if clipped_body_text.ends_with('\\') {
+                    clipped_body_text.pop();
+                }
+                let clipped_body = format!(
+                    "💬 \\[{}] {}{note}",
+                    short_id(session_id),
+                    clipped_body_text
+                );
+                let _ = crate::telegram::edit_message_text(
+                    &client,
+                    &self.token,
+                    self.chat_id.parse::<i64>().unwrap_or(0),
+                    sent_id,
+                    &clipped_body,
+                    self.api_base.as_deref(),
+                )
+                .await;
+            }
         }
     }
 }
@@ -3560,5 +3610,19 @@ mod tests {
             streaming_stopped_message(&crate::telegram::escape_markdown_v2("fox")),
             streaming_stopped_message("fox")
         );
+    }
+
+    #[test]
+    fn test_clip_to_telegram_max() {
+        // Short text is left untouched.
+        assert_eq!(clip_to_telegram_max("hello".to_string()), "hello");
+        // Over-limit text is capped at Telegram's per-message limit.
+        let long = "x".repeat(crate::telegram::MAX_MESSAGE_CHARS + 100);
+        let clipped = clip_to_telegram_max(long);
+        assert_eq!(clipped.chars().count(), crate::telegram::MAX_MESSAGE_CHARS);
+        assert!(!clipped.ends_with('\\'), "no dangling escape after clip");
+        // A cap that would end in an escape is trimmed so no lone backslash.
+        assert!(!clip_to_telegram_max("abc\\".to_string()).ends_with('\\'));
+        assert_eq!(clip_to_telegram_max("abc\\".to_string()), "abc");
     }
 }
