@@ -2862,3 +2862,143 @@ fn test_current_compaction_ignores_open_bracket_and_keeps_last_completed() {
     );
     assert!(back.orphaned_compaction().is_some());
 }
+
+/// The in-memory `compaction_event_index` cache and the post-deserialization
+/// reverse-scan fallback must always return the SAME `current_compaction`. The
+/// cache is `#[serde(skip)]`, so after a JSON round trip it is gone and the
+/// reverse-scan becomes authoritative; if the two ever diverged, a live session
+/// and a reloaded session would see different compaction state. Pin equivalence
+/// across SetCompaction, ClearAll, balanced-bracket, orphaned-bracket, and
+/// bracket-after-Set sequences.
+#[test]
+fn test_current_compaction_cache_matches_reverse_scan_after_reload() {
+    let comp = |turn: usize| StoredCompactionState {
+        summary_text: "s".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: turn,
+        original_turn_count: 10,
+        compacted_count: turn,
+    };
+
+    let cases: Vec<Vec<SessionEvent>> = vec![
+        // 1: plain SetCompaction.
+        vec![SessionEvent {
+            timestamp: Utc::now(),
+            event_id: "set".to_string(),
+            op: SessionEventOp::SetCompaction { compaction: comp(1) },
+            parent_id: None,
+            version: 1,
+        }],
+        // 2: SetCompaction then ClearAll -> cleared.
+        vec![
+            SessionEvent {
+                timestamp: Utc::now(),
+                event_id: "set".to_string(),
+                op: SessionEventOp::SetCompaction { compaction: comp(1) },
+                parent_id: None,
+                version: 1,
+            },
+            SessionEvent {
+                timestamp: Utc::now(),
+                event_id: "clear".to_string(),
+                op: SessionEventOp::ClearAll,
+                parent_id: None,
+                version: 1,
+            },
+        ],
+        // 3: balanced bracket -> the completed compaction.
+        vec![
+            SessionEvent {
+                timestamp: Utc::now(),
+                event_id: "start".to_string(),
+                op: SessionEventOp::CompactionStart {
+                    compaction_id: "c".to_string(),
+                    covers_up_to_turn: 1,
+                },
+                parent_id: None,
+                version: 1,
+            },
+            SessionEvent {
+                timestamp: Utc::now(),
+                event_id: "end".to_string(),
+                op: SessionEventOp::CompactionEnd { compaction: comp(1) },
+                parent_id: None,
+                version: 1,
+            },
+        ],
+        // 4: orphaned bracket (no End) -> no completed compaction.
+        vec![SessionEvent {
+            timestamp: Utc::now(),
+            event_id: "start".to_string(),
+            op: SessionEventOp::CompactionStart {
+                compaction_id: "c".to_string(),
+                covers_up_to_turn: 1,
+            },
+            parent_id: None,
+            version: 1,
+        }],
+        // 5: SetCompaction then an orphaned Start -> keeps the SetCompaction.
+        vec![
+            SessionEvent {
+                timestamp: Utc::now(),
+                event_id: "set".to_string(),
+                op: SessionEventOp::SetCompaction { compaction: comp(1) },
+                parent_id: None,
+                version: 1,
+            },
+            SessionEvent {
+                timestamp: Utc::now(),
+                event_id: "start".to_string(),
+                op: SessionEventOp::CompactionStart {
+                    compaction_id: "c".to_string(),
+                    covers_up_to_turn: 1,
+                },
+                parent_id: None,
+                version: 1,
+            },
+        ],
+    ];
+
+    for (i, events) in cases.iter().enumerate() {
+        let mut live = SessionEventMap::default();
+        for e in events {
+            live.append_event(e.clone());
+        }
+        let live_compaction = live.current_compaction();
+
+        // Reload drops the in-memory cache (serde(skip)) -> reverse-scan is the
+        // authority. Both paths must report identical compaction state.
+        let json = serde_json::to_string(&live).expect("serialize");
+        let reloaded: SessionEventMap = serde_json::from_str(&json).expect("deserialize");
+        let reloaded_compaction = reloaded.current_compaction();
+        assert_eq!(
+            live_compaction, reloaded_compaction,
+            "case {i}: live cache and reloaded reverse-scan must agree on current_compaction"
+        );
+
+        // The truth is the last persisting op: cross-check with the raw scan too.
+        assert_eq!(
+            reloaded_compaction,
+            expected_last_compaction(events),
+            "case {i}: reverse-scan must match the expected last persisting op"
+        );
+    }
+}
+
+/// Reference implementation of what the reverse-scan should report: the state of
+/// the last `SetCompaction`/`CompactionEnd`, unless a later `ClearAll` clears it.
+fn expected_last_compaction(events: &[SessionEvent]) -> Option<StoredCompactionState> {
+    let mut found = None;
+    for event in events.iter().rev() {
+        match &event.op {
+            SessionEventOp::SetCompaction { compaction }
+            | SessionEventOp::CompactionEnd { compaction } => {
+                found = Some(compaction.clone());
+                break;
+            }
+            SessionEventOp::ClearAll => return None,
+            _ => {}
+        }
+    }
+    found
+}
