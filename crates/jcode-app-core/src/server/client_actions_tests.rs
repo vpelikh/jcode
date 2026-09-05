@@ -2,7 +2,7 @@
 
 use super::{
     NotifySessionContext, clone_split_session, handle_notify_session, handle_rename_session,
-    handle_resume_all_sessions, handle_set_feature,
+    handle_resume_all_sessions, handle_set_feature, handle_set_working_dir,
 };
 use crate::agent::Agent;
 use crate::message::{ContentBlock, Message, Role, StreamEvent, ToolDefinition};
@@ -804,4 +804,102 @@ async fn resume_all_skips_session_with_completed_turn() {
     } else {
         crate::env::remove_var("JCODE_HOME");
     }
+}
+
+#[tokio::test]
+async fn set_working_dir_updates_agent_and_fans_out_event() -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    let old_dir = tempfile::tempdir().expect("old dir").into_path();
+    let new_dir = tempfile::tempdir().expect("new dir").into_path();
+
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
+    {
+        let mut guard = agent.lock().await;
+        guard.set_working_dir(old_dir.to_str().expect("utf8"));
+    }
+    let agent_session_id = agent.lock().await.session_id().to_string();
+    let (member_event_tx, mut member_event_rx) = mpsc::unbounded_channel();
+    let now = Instant::now();
+    let swarm_members = Arc::new(RwLock::new(HashMap::from([(
+        agent_session_id.clone(),
+        SwarmMember {
+            session_id: agent_session_id.clone(),
+            event_tx: member_event_tx,
+            event_txs: HashMap::new(),
+            working_dir: None,
+            swarm_id: None,
+            swarm_enabled: false,
+            status: "ready".to_string(),
+            detail: None,
+            task_label: None,
+            friendly_name: None,
+            report_back_to_session_id: None,
+            latest_completion_report: None,
+            role: "agent".to_string(),
+            joined_at: now,
+            last_status_change: now,
+            is_headless: false,
+            output_tail: None,
+            todo_progress: None,
+            todo_items: Vec::new(),
+            runtime: crate::protocol::SwarmMemberRuntime::default(),
+        },
+    )])));
+    let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
+
+    handle_set_working_dir(
+        88,
+        new_dir.to_str().expect("utf8").to_string(),
+        &agent,
+        &agent_session_id,
+        &swarm_members,
+        &client_event_tx,
+    )
+    .await;
+
+    let changed_event = timeout(Duration::from_secs(2), member_event_rx.recv())
+        .await
+        .expect("working dir change event should arrive")
+        .expect("member event channel should stay open");
+    match changed_event {
+        ServerEvent::SessionWorkingDirChanged {
+            session_id,
+            working_dir,
+        } => {
+            assert_eq!(session_id, agent_session_id);
+            assert_eq!(
+                PathBuf::from(working_dir),
+                new_dir.canonicalize().expect("canonical"),
+                "event must carry the resolved (canonical) new working dir"
+            );
+        }
+        other => panic!("expected SessionWorkingDirChanged, got {other:?}"),
+    }
+
+    let client_events: Vec<_> = std::iter::from_fn(|| client_event_rx.try_recv().ok()).collect();
+    assert!(
+        client_events
+            .iter()
+            .any(|event| matches!(event, ServerEvent::Done { id } if *id == 88))
+    );
+
+    let guard = agent.lock().await;
+    assert_eq!(
+        guard.working_dir().map(PathBuf::from),
+        Some(new_dir.canonicalize().expect("canonical")),
+        "agent working dir must be updated"
+    );
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    Ok(())
 }
