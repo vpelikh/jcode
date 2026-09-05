@@ -1006,3 +1006,49 @@ async fn set_working_dir_noop_detects_canonically_equivalent_dir() -> Result<()>
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn set_working_dir_persists_resolved_dir_for_fresh_session() -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    let target = tempfile::tempdir().expect("target dir").into_path();
+
+    // Fresh agent/session (no visible conversation yet). A /cd here must be
+    // persisted to disk: the agent binds a model/provider route at creation, so
+    // the session carries configured state and save() writes it even before the
+    // first real message.
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
+    let agent_session_id = agent.lock().await.session_id().to_string();
+    let swarm_members = Arc::new(RwLock::new(HashMap::<String, SwarmMember>::new()));
+    let (client_event_tx, _client_event_rx) = mpsc::unbounded_channel();
+
+    handle_set_working_dir(
+        89,
+        target.to_str().expect("utf8").to_string(),
+        &agent,
+        &agent_session_id,
+        &swarm_members,
+        &client_event_tx,
+    )
+    .await;
+
+    let persisted = crate::session::Session::load(&agent_session_id)
+        .expect("a /cd on a fresh session must be persisted to disk");
+    assert_eq!(
+        persisted.working_dir.map(PathBuf::from),
+        target.canonicalize().ok(),
+        "the resolved /cd working dir must survive on disk for a fresh session"
+    );
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    Ok(())
+}
