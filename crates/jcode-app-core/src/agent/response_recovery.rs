@@ -445,11 +445,18 @@ impl Agent {
     /// Count matched action-promise phrases, subtracting the "let me know"
     /// closing/sign-off phrasing which is not an action promise.
     fn count_action_promise_phrases(low: &str) -> usize {
+        // NOTE: `let's` is deliberately NOT counted. "Let's X" is inherently
+        // collaborative/suggestive ("let's assume", "let's look at the log",
+        // "let's verify") rather than a first-person promise by the agent to
+        // perform an action it then fails to complete. Counting it lets a
+        // genuine explanatory final answer that walks the reader through
+        // reasoning with several "let's" phrases cross the stalled-promise
+        // density threshold and be falsely flagged. Observed stalls never
+        // depend on "let's"; they use "let me"/"i'll"/"i will".
         let phrases = [
             "let me",
             "i'll",
             "i will",
-            "let's",
             "i am going to",
             "i'm going to",
         ];

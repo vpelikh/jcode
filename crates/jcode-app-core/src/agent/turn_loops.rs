@@ -1537,6 +1537,22 @@ mod tests {
     }
 
     #[test]
+    fn stalled_promise_lets_is_not_an_action_promise() {
+        // "Let's X" is collaborative/suggestive, not a first-person promise the
+        // agent then fails to complete. A genuine explanatory final answer that
+        // walks the reader through reasoning with several "let's" phrases must
+        // not be flagged as a stall.
+        let diag = "Let's assume the failure is in the harness. Let's look at the log. \
+                    Let's check the env. Let's compare the diff. Let's review the config. \
+                    Let's confirm the import. Let's verify the schema. Let's run the linter. \
+                    That is the whole picture.";
+        assert!(
+            !Agent::is_stalled_promise_text(diag),
+            "an explanatory answer using 'let's' must not be flagged as a stall"
+        );
+    }
+
+    #[test]
     fn stalled_promise_density_threshold_is_bracketed() {
         // Exactly MIN_PHRASE=8 occurrences, but the density must still decide:
         // padded short => dense (above 2.0) must flag; padded long => sparse
