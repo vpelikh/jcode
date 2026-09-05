@@ -1312,6 +1312,19 @@ const REVIEW_LOOP_IDLE_POLL_DEBOUNCE: std::time::Duration =
 /// loop forever on a persistently-broken environment, so the budget is capped.
 const REVIEW_LOOP_MAX_REVIEWER_RESPAWNS: u32 = 2;
 
+/// How long a reviewer session may go without writing anything (no verdict, no
+/// messages) before it is treated as stale/dead. A reviewer whose process died
+/// (e.g. its terminal was killed, or it was orphaned by a reload) leaves its
+/// session file on disk with no verdict and a frozen `updated_at`, so polling it
+/// would return "Pending" forever and the loop would stall on that lens. We use
+/// `Session.updated_at` (refreshed on every save) as the liveness signal: if a
+/// no-verdict reviewer has been QUIET for this long, its process is gone, so we
+/// treat it as Gone and let the bounded respawn (then finalize) take over. The
+/// window is deliberately generous to never misclassify a slow-but-live reviewer
+/// that simply has not written yet or is reasoning across a long tool call.
+const REVIEW_LOOP_STALE_REVIEWER_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30 * 60);
+
 /// Poll the review loop from an idle tick if the debounce window has elapsed.
 ///
 /// Returns `true` only when a poll actually ran. Callers do not fold this into
@@ -1491,7 +1504,38 @@ fn poll_loop_reviewer(reviewer_id: &str) -> PollResult {
             return PollResult::Report(report);
         }
     }
+    // No verdict yet. Before declaring "Pending", rule out a DEAD reviewer: if
+    // the session has not written anything (updated_at frozen) for a long time,
+    // its process is gone (terminal killed / orphaned by a reload) even though
+    // the session file still exists. Polling it would otherwise return Pending
+    // forever and the loop would stall on this lens. The timeout is generous so
+    // a slow-but-live reviewer (which writes messages and refreshes updated_at)
+    // is never misclassified.
+    if reviewer_session_stale(
+        session.updated_at,
+        chrono::Utc::now(),
+        REVIEW_LOOP_STALE_REVIEWER_TIMEOUT,
+    ) {
+        return PollResult::Gone;
+    }
     PollResult::Pending
+}
+
+/// True when a no-verdict reviewer session has been silent (updated_at frozen)
+/// for at least `timeout`. Used to detect a reviewer whose process died but
+/// whose session file persists, so the loop does not poll it as Pending forever.
+/// `updated_at` is treated as the activity clock (refreshed on each save); a
+/// live reviewer writing messages stays "fresh" and is never misclassified.
+pub(super) fn reviewer_session_stale(
+    updated_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+    timeout: std::time::Duration,
+) -> bool {
+    let idle = now
+        .signed_duration_since(updated_at)
+        .to_std()
+        .unwrap_or(std::time::Duration::ZERO);
+    idle >= timeout
 }
 
 /// Step the review loop from the turn-end followups hook. Returns true when a

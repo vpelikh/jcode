@@ -1507,3 +1507,34 @@ fn autoreview_now_suppressed_while_review_loop_active() {
         );
     });
 }
+
+// Regression (dead reviewer stale detection): a reviewer whose process died but
+// whose session file persists (frozen updated_at, no verdict) must be treated as
+// Gone so the loop respawns within budget instead of polling Pending forever.
+// A live reviewer (recent updated_at) is never misclassified.
+#[test]
+fn stale_reviewer_session_detected_but_fresh_is_not() {
+    let now = chrono::Utc::now();
+    let timeout = std::time::Duration::from_secs(30 * 60);
+
+    // Dead/stale: last write more than the timeout ago.
+    let stale_at = now - chrono::Duration::minutes(40);
+    assert!(
+        super::commands_review::reviewer_session_stale(stale_at, now, timeout),
+        "a reviewer silent for over the timeout must be flagged stale"
+    );
+
+    // Fresh/live: wrote recently (< timeout), so still alive.
+    let fresh_at = now - chrono::Duration::minutes(1);
+    assert!(
+        !super::commands_review::reviewer_session_stale(fresh_at, now, timeout),
+        "a recently-active reviewer must not be flagged stale"
+    );
+
+    // Boundary: exactly at the timeout is stale.
+    let boundary = now - chrono::Duration::from_std(timeout).expect("convert");
+    assert!(
+        super::commands_review::reviewer_session_stale(boundary, now, timeout),
+        "a reviewer idle exactly the timeout length is stale"
+    );
+}
