@@ -1670,6 +1670,25 @@ mod tests {
     }
 
     #[test]
+    fn compact_unfulfilled_tool_request_ignores_future_form_completed_step() {
+        // Full future/conditional spellings ("I will invoke bash", "I'm going
+        // to invoke") usually DESCRIBE a completed step or a conditional offer,
+        // not an imminent promise to act now. These must not be flagged as a
+        // stall; every observed real stall uses the contraction "i'll invoke".
+        let legitimate = [
+            "I will invoke bash to run the test suite; the green results are above.",
+            "I'm going to invoke the command only if you want a rerun.",
+            "I am going to invoke the script during the next deploy.",
+        ];
+        for turn in legitimate {
+            assert!(
+                !Agent::is_stalled_promise_text(turn),
+                "a full future/conditional invoke form must not be flagged as a stare stall: {turn:?}"
+            );
+        }
+    }
+
+    #[test]
     fn compact_unfulfilled_tool_request_is_stalled() {
         // The exact compact degradation observed in a real long-context session
         // (DeepSeek via OpenRouter): a SHORT turn explicitly says it will invoke a

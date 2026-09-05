@@ -474,12 +474,17 @@ impl Agent {
     ///    stripped), so long legitimate prose that recounts an earlier
     ///    "I'll invoke..." does not match—even if it hides part of its length
     ///    inside a fenced code block.
-    ///  - It must contain a first-person future/volitional invoke frame ("let me
-    ///    invoke", "i'll invoke", "i will invoke", "i'm going to invoke", "i am
-    ///    going to invoke", "let me call", "i'll call"). A bare
-    ///    third-person/descriptive "will invoke" (e.g. "this setup will
-    ///    invoke shell hooks") is NOT a promise by the agent to act, so it must
-    ///    not match.
+    ///  - It must contain a first-person present/contraction invoke frame ("let me
+    ///    invoke", "i'll invoke", "let me call", "i'll call"). Full future or
+    ///    conditional spellings ("I will invoke bash", "I'm going to invoke
+    ///    bash") are NOT treated as a stall: they more often describe a
+    ///    completed step or a conditional offer ("I will invoke the command
+    ///    only if you want a rerun") than an imminent promise to act now. Every
+    ///    observed stall (giraffe 5/5, sabertooth) uses a contraction/present
+    ///    form, so dropping the future spellings loses no measured coverage. A
+    ///    bare third-person/descriptive "will invoke" (e.g. "this setup will
+    ///    invoke shell hooks") is likewise NOT a promise by the agent to act,
+    ///    so it must not match.
     ///  - The first-person verb must be immediately bound to an actual tool
     ///    target in the SAME phrase (e.g. "i'll invoke bash", "let me call the
     ///    bash tool"). This rejects a genuine answer like "I'll invoke the
@@ -525,12 +530,9 @@ impl Agent {
         // Requiring them in the same phrase (verb then target) rejects that
         // false positive while keeping every observed stall, which always names
         // the tool right after the verb.
-        const FIRST_PERSON_INVOKE: [&str; 7] = [
+        const FIRST_PERSON_INVOKE: [&str; 4] = [
             "let me invoke",
             "i'll invoke",
-            "i will invoke",
-            "i'm going to invoke",
-            "i am going to invoke",
             "let me call",
             "i'll call",
         ];
