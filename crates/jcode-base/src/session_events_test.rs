@@ -3119,3 +3119,30 @@ fn test_memory_profile_snapshot_includes_event_log() {
         "snapshot total_json_bytes must include the event log footprint"
     );
 }
+
+/// Forward-compat of the escape hatch: a FUTURE core build may promote an
+/// `Unknown` op to a known variant whose payload shape differs from what this
+/// build expects. Deserializing such an event must degrade to `Unknown`
+/// (preserving the full payload) rather than failing to load the whole log.
+#[test]
+fn test_known_tag_with_mismatched_shape_degrades_to_unknown() {
+    // `append_message` normally requires {message_id, message}. A payload with a
+    // different shape (here `message_id` only) must NOT hard-error; it degrades.
+    let raw = r#"{"op":"append_message","message_id":"m_x"}"#;
+    let back: SessionEventOp = serde_json::from_str(raw).expect("must not error");
+    match &back {
+        SessionEventOp::Unknown { event_type, data } => {
+            assert_eq!(event_type, "append_message");
+            assert_eq!(
+                data.get("message_id").and_then(|v| v.as_str()),
+                Some("m_x"),
+                "mismatched known-tag payload must be preserved as Unknown"
+            );
+        }
+        other => panic!("expected degradation to Unknown, got {other:?}"),
+    }
+    // Reserialize: the degraded Unknown must round-trip stably.
+    let re = serde_json::to_string(&back).expect("reserialize");
+    let again: SessionEventOp = serde_json::from_str(&re).expect("re-deserialize");
+    assert!(matches!(again, SessionEventOp::Unknown { .. }));
+}
