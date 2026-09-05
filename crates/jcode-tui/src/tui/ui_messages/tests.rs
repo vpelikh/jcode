@@ -1094,6 +1094,76 @@ fn render_goal_update_size_is_bounded_when_narrative_evidence_is_long() {
     assert!(!plain.contains("verbose evidence"), "{plain}");
 }
 
+/// A trade-off revision that only moves the rationale (state unchanged) must
+/// render as a compact text note rather than a misleading before→after state
+/// arrow, so the revision is visible without pretending the state changed.
+#[test]
+fn render_trade_off_rationale_only_change_shows_text_note() {
+    let before = crate::todo::TodoGoal {
+        group: Some("decision".to_string()),
+        trade_off: Some(crate::todo::TradeOffState::SomeConsidered),
+        trade_offs: Some("weighed X vs Y".to_string()),
+        ..Default::default()
+    };
+    let after = crate::todo::TodoGoal {
+        trade_offs: Some("weighed X vs Z".to_string()),
+        ..before.clone()
+    };
+    let update = crate::todo::TodoGoalChange {
+        before: Some(before),
+        after: Some(after),
+        fields: vec![crate::todo::TodoGoalField::TradeOff],
+    };
+
+    let lines = render_todo_goal_updates(&[update], 95);
+    let plain = lines
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(plain.contains("Trade-off"), "{plain}");
+    // The unchanged state must not render as a self-arrow; instead the new
+    // rationale text is shown.
+    assert!(
+        !plain.contains("some_considered → some_considered"),
+        "unchanged state must not render as a misleading arrow:\n{plain}"
+    );
+    assert!(plain.contains("weighed X vs Z"), "{plain}");
+    assert!(!plain.contains("weighed X vs Y"), "{plain}");
+}
+
+/// A trade-off state change still renders the before→after arrow.
+#[test]
+fn render_trade_off_state_change_shows_arrow() {
+    let before = crate::todo::TodoGoal {
+        group: Some("decision".to_string()),
+        trade_off: Some(crate::todo::TradeOffState::SomeConsidered),
+        trade_offs: Some("weighed X vs Y".to_string()),
+        ..Default::default()
+    };
+    let after = crate::todo::TodoGoal {
+        trade_off: Some(crate::todo::TradeOffState::Diligent),
+        ..before.clone()
+    };
+    let update = crate::todo::TodoGoalChange {
+        before: Some(before),
+        after: Some(after),
+        fields: vec![crate::todo::TodoGoalField::TradeOff],
+    };
+
+    let lines = render_todo_goal_updates(&[update], 95);
+    let plain = lines
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plain.contains("some_considered → diligent"),
+        "state change must render an arrow:\n{plain}"
+    );
+}
+
 #[test]
 fn render_todo_plan_update_card_shows_only_changed_intent_fields() {
     let todos = vec![crate::todo::TodoItem {

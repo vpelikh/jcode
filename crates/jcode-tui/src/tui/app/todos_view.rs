@@ -553,6 +553,11 @@ fn hash_todos_payload(
         goal.delivery_state.hash(&mut hasher);
         goal.difficulty.hash(&mut hasher);
         goal.autonomy.hash(&mut hasher);
+        goal.iteration_maturity.hash(&mut hasher);
+        goal.stopping_evidence.hash(&mut hasher);
+        goal.trade_off.hash(&mut hasher);
+        goal.trade_offs.hash(&mut hasher);
+        goal.explored_alternative.hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -743,6 +748,30 @@ mod tests {
         goals[0].feedback_loop = Some("run test B".to_string());
         let after = hash_todos_payload(Some("session_test"), &todos, &plan(), &goals);
         assert_ne!(before, after);
+    }
+
+    #[test]
+    fn todos_view_hash_changes_when_trade_off_changes() {
+        let todos = vec![todo("g", "Goal hash", "pending", "high", Some(80), None)];
+        let mut goals = vec![crate::todo::TodoGoal {
+            trade_off: Some(crate::todo::TradeOffState::SomeConsidered),
+            ..Default::default()
+        }];
+        let before = hash_todos_payload(Some("session_test"), &todos, &plan(), &goals);
+        goals[0].trade_off = Some(crate::todo::TradeOffState::Diligent);
+        let after = hash_todos_payload(Some("session_test"), &todos, &plan(), &goals);
+        assert_ne!(before, after);
+
+        // A rationale-only revision must also refresh the view.
+        let mut text_goals = vec![crate::todo::TodoGoal {
+            trade_offs: Some("weighed X vs Y".to_string()),
+            ..Default::default()
+        }];
+        let text_before =
+            hash_todos_payload(Some("session_test"), &todos, &plan(), &text_goals);
+        text_goals[0].trade_offs = Some("weighed X vs Z".to_string());
+        let text_after = hash_todos_payload(Some("session_test"), &todos, &plan(), &text_goals);
+        assert_ne!(text_before, text_after);
     }
 
     #[test]

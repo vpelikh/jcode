@@ -399,6 +399,14 @@ fn changed_goal_fields(before: Option<&TodoGoal>, after: Option<&TodoGoal>) -> V
     }
     if before.and_then(|goal| goal.trade_off) != after.and_then(|goal| goal.trade_off) {
         fields.push(TodoGoalField::TradeOff);
+    } else if before.and_then(|goal| goal.trade_offs.as_ref())
+        != after.and_then(|goal| goal.trade_offs.as_ref())
+        || before.and_then(|goal| goal.explored_alternative)
+            != after.and_then(|goal| goal.explored_alternative)
+    {
+        // A revision to the rationale or the explored-alternative flag is a
+        // trade-off assessment change even when the state itself is unchanged.
+        fields.push(TodoGoalField::TradeOff);
     }
     fields
 }
@@ -2098,6 +2106,44 @@ mod tests {
                 TodoGoalField::FeedbackLoopCoverage,
             ]
         );
+    }
+
+    /// A trade-off revision counts as a goal update even when only the
+    /// rationale or explored-alternative flag changed, not just the state.
+    #[test]
+    fn goal_changes_detect_trade_off_sub_field_revisions() {
+        let base = TodoGoal {
+            group: Some("decision".to_string()),
+            trade_off: Some(crate::todo::TradeOffState::SomeConsidered),
+            trade_offs: Some("weighed X vs Y".to_string()),
+            explored_alternative: Some(true),
+            ..Default::default()
+        };
+
+        // State change fires TradeOff.
+        let mut state_changed = base.clone();
+        state_changed.trade_off = Some(crate::todo::TradeOffState::Diligent);
+        let changes = goal_changes(&[base.clone()], &[state_changed]);
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].fields.contains(&TodoGoalField::TradeOff));
+
+        // Rationale-only change fires TradeOff.
+        let mut rationale_changed = base.clone();
+        rationale_changed.trade_offs = Some("weighed X vs Z".to_string());
+        let changes = goal_changes(&[base.clone()], &[rationale_changed]);
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].fields.contains(&TodoGoalField::TradeOff));
+
+        // Explored-alternative-flag-only change fires TradeOff.
+        let mut flag_changed = base.clone();
+        flag_changed.explored_alternative = Some(false);
+        let changes = goal_changes(&[base.clone()], &[flag_changed]);
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].fields.contains(&TodoGoalField::TradeOff));
+
+        // No trade-off change at all produces no goal change.
+        let changes = goal_changes(&[base.clone()], &[base.clone()]);
+        assert!(changes.is_empty());
     }
 
     /// The core behavior change: a low score records an observation for the

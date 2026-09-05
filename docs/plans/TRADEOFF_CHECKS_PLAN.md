@@ -100,10 +100,18 @@ new subsystem. It requires no storage migration (fields are all `Option` with
 `skip_serializing_if` and default `None`), so existing sessions and goals stay
 valid.
 
+## UI / change tracking
+
+A trade-off revision surfaces even when only the summary text or the
+`explored_alternative` flag moves, not just the state: `changed_goal_fields`
+fires `TodoGoalField::TradeOff` for any of the three, and the inline todo card
+shows a compact text note when the state itself is unchanged. The todos-view
+payload hash includes all three fields so the view refreshes on a trade-off
+revision.
+
 ## Out of scope
 
 - Not changing the feedback-loop, relevance, coverage, or traceability gates.
-- No UI/UX changes beyond the existing gate digest and ownership continuation.
 - No persistence schema version bump.
 
 ## Testing
@@ -113,3 +121,6 @@ valid.
 - Test that `build_todo_ownership_continuation_message` adds the trade-off line.
 - Gate-digest test that a weak trade-off observation is surfaced.
 - Telemetry counter test for `TodoGateKind::TradeOff`.
+- `changed_goal_fields` detects state, rationale, and flag-only trade-off
+  revisions (app-core), and `hash_todos_payload` refreshes on a trade-off change
+  (TUI todos view).

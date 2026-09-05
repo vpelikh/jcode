@@ -1946,22 +1946,40 @@ fn render_todo_goal_updates(
                     base_indent,
                     inner_width,
                 ),
-                crate::todo::TodoGoalField::TradeOff => push_todo_score_update(
-                    &mut lines,
-                    "Trade-off",
-                    update
+                crate::todo::TodoGoalField::TradeOff => {
+                    let before_state = update
                         .before
                         .as_ref()
                         .and_then(|goal| goal.trade_off)
-                        .map(|state| state.as_str().to_string()),
-                    update
+                        .map(|state| state.as_str().to_string());
+                    let after_state = update
                         .after
                         .as_ref()
                         .and_then(|goal| goal.trade_off)
-                        .map(|state| state.as_str().to_string()),
-                    base_indent,
-                    inner_width,
-                ),
+                        .map(|state| state.as_str().to_string());
+                    if before_state != after_state {
+                        push_todo_score_update(
+                            &mut lines,
+                            "Trade-off",
+                            before_state,
+                            after_state,
+                            base_indent,
+                            inner_width,
+                        );
+                    } else if let Some(text) = update
+                        .after
+                        .as_ref()
+                        .and_then(|goal| goal.trade_offs.as_deref())
+                        .or_else(|| update.before.as_ref().and_then(|goal| goal.trade_offs.as_deref()))
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                    {
+                        // The trade-off state is unchanged but the rationale or
+                        // explored-alternative flag moved; surface the text note
+                        // so the revision is not silently swallowed.
+                        push_todo_text_update(&mut lines, "Trade-off", Some(text), base_indent, inner_width);
+                    }
+                }
                 crate::todo::TodoGoalField::FeedbackLoop
                 | crate::todo::TodoGoalField::StoppingEvidence => unreachable!(),
             }
