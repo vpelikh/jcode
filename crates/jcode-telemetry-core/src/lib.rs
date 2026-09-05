@@ -103,6 +103,7 @@ pub struct TodoTelemetryUpdate {
     pub closed_feedback_loop: TelemetryScoreSummary,
     pub feedback_loop_relevance: TelemetryScoreSummary,
     pub feedback_loop_coverage: TelemetryScoreSummary,
+    pub trade_off: TelemetryScoreSummary,
     pub end_to_end_ownership: TelemetryScoreSummary,
 }
 
@@ -122,6 +123,7 @@ struct TodoSessionTelemetry {
     closed_feedback_loop: TelemetryScoreSummary,
     feedback_loop_relevance: TelemetryScoreSummary,
     feedback_loop_coverage: TelemetryScoreSummary,
+    trade_off: TelemetryScoreSummary,
     end_to_end_ownership: TelemetryScoreSummary,
 }
 
@@ -142,6 +144,7 @@ impl TodoSessionTelemetry {
         self.closed_feedback_loop = update.closed_feedback_loop;
         self.feedback_loop_relevance = update.feedback_loop_relevance;
         self.feedback_loop_coverage = update.feedback_loop_coverage;
+        self.trade_off = update.trade_off;
         self.end_to_end_ownership = update.end_to_end_ownership;
     }
 

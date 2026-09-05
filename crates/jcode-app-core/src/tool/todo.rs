@@ -187,6 +187,11 @@ fn todo_telemetry_update(
                     .map(|state| state.legacy_score())
             }),
         ),
+        trade_off: crate::telemetry::TelemetryScoreSummary::from_scores(
+            goals
+                .iter()
+                .filter_map(|goal| goal.trade_off.map(|state| state.legacy_score())),
+        ),
         end_to_end_ownership: crate::telemetry::TelemetryScoreSummary::from_scores(
             goals
                 .iter()

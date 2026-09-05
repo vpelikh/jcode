@@ -985,6 +985,7 @@ fn todo_session_aggregates_transitions_abandonment_and_high_water_mark() {
         closed_feedback_loop: TelemetryScoreSummary::from_scores([85, 95]),
         feedback_loop_relevance: TelemetryScoreSummary::from_scores([75, 98]),
         feedback_loop_coverage: TelemetryScoreSummary::from_scores([75, 98]),
+        trade_off: TelemetryScoreSummary::from_scores([88, 96]),
         end_to_end_ownership: TelemetryScoreSummary::from_scores([96, 100]),
     });
     {
@@ -1009,6 +1010,8 @@ fn todo_session_aggregates_transitions_abandonment_and_high_water_mark() {
     assert_eq!(payload["feedback_loop_relevance_count"], 2);
     assert_eq!(payload["feedback_loop_coverage_min"], 75);
     assert_eq!(payload["feedback_loop_coverage_count"], 2);
+    assert_eq!(payload["trade_off_min"], 88);
+    assert_eq!(payload["trade_off_count"], 2);
     *SESSION_STATE.lock().unwrap() = None;
 }
 
