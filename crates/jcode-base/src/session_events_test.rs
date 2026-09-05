@@ -2214,10 +2214,10 @@ fn test_memory_injection_and_replay_event_derived_order_matches_legacy() {
 
 #[test]
 fn test_compaction_cache_tracks_clear_and_reset_order() {
-    // Round H: the compaction_event_index cache must reflect the physical event
-    // order across mixed streams (SetCompaction -> ClearAll -> re-set). At the
-    // public Session API boundary, derive_compaction must agree with the
-    // current_compaction cache and the legacy compaction field.
+    // The `cached_compaction` cache must reflect the physical event order across
+    // mixed streams (SetCompaction -> ClearAll -> re-set). At the public Session
+    // API boundary, derive_compaction must agree with the current_compaction
+    // cache and the legacy compaction field.
     let mk_comp = |summary: &str| StoredCompactionState {
         summary_text: summary.to_string(),
         openai_encrypted_content: None,
@@ -3179,7 +3179,7 @@ fn test_current_compaction_ignores_open_bracket_and_keeps_last_completed() {
     assert!(back.orphaned_compaction().is_some());
 }
 
-/// The in-memory `compaction_event_index` cache and the post-deserialization
+/// The in-memory `cached_compaction` cache and the post-deserialization
 /// reverse-scan fallback must always return the SAME `current_compaction`. The
 /// cache is `#[serde(skip)]`, so after a JSON round trip it is gone and the
 /// reverse-scan becomes authoritative; if the two ever diverged, a live session
