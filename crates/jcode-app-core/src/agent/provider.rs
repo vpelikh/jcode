@@ -345,21 +345,23 @@ fn resolve_working_dir(base: &std::path::Path, dir: &str) -> anyhow::Result<Stri
     if dir.is_empty() {
         anyhow::bail!("working directory must not be empty");
     }
-    let expanded = if let Some(rest) = dir.strip_prefix("~/") {
-        match dirs::home_dir() {
-            Some(home) => home.join(rest),
-            None => std::path::PathBuf::from(dir),
-        }
+    let mapped = if let Some(rest) = dir.strip_prefix("~/") {
+        let home = dirs::home_dir().ok_or_else(|| {
+            anyhow::anyhow!("cannot expand `~/` because the home directory is not resolvable")
+        })?;
+        home.join(rest)
     } else if dir == "~" {
-        dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from(dir))
+        dirs::home_dir().ok_or_else(|| {
+            anyhow::anyhow!("cannot expand `~` because the home directory is not resolvable")
+        })?
     } else {
         std::path::PathBuf::from(dir)
     };
 
-    let candidate = if expanded.is_absolute() {
-        expanded
+    let candidate = if mapped.is_absolute() {
+        mapped
     } else {
-        base.join(expanded)
+        base.join(mapped)
     };
 
     if !candidate.exists() || !candidate.is_dir() {

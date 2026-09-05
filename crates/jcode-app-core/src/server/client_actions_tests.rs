@@ -938,8 +938,16 @@ async fn set_working_dir_to_current_dir_is_noop() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(50)).await;
     let events: Vec<_> = std::iter::from_fn(|| client_event_rx.try_recv().ok()).collect();
     assert!(
-        events.is_empty(),
-        "a no-op /cd to the current dir must not emit events, got {events:?}"
+        events
+            .iter()
+            .any(|event| matches!(event, ServerEvent::Done { id } if *id == 77)),
+        "a no-op /cd must still resolve the request with a Done, got {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ServerEvent::SessionWorkingDirChanged { .. })),
+        "a no-op /cd to the current dir must not emit a change event, got {events:?}"
     );
     let guard = agent.lock().await;
     assert_eq!(guard.working_dir().map(PathBuf::from), Some(current));
@@ -995,8 +1003,16 @@ async fn set_working_dir_noop_detects_canonically_equivalent_dir() -> Result<()>
     tokio::time::sleep(Duration::from_millis(50)).await;
     let events: Vec<_> = std::iter::from_fn(|| client_event_rx.try_recv().ok()).collect();
     assert!(
-        events.is_empty(),
-        "a /cd to a canonically-equivalent dir must be a no-op, got {events:?}"
+        events
+            .iter()
+            .any(|event| matches!(event, ServerEvent::Done { id } if *id == 78)),
+        "a /cd to a canonically-equivalent dir must still resolve the request with a Done, got {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ServerEvent::SessionWorkingDirChanged { .. })),
+        "a /cd to a canonically-equivalent dir must not emit a change event, got {events:?}"
     );
 
     if let Some(prev_home) = prev_home {

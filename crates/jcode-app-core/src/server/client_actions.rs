@@ -683,11 +683,13 @@ pub(super) async fn handle_set_working_dir(
             );
         }
         // The request resolved to the already-bound directory; treat it as a
-        // silent no-op. Neither a change event nor a Done is emitted so the
-        // client does not spam a redundant "working directory changed" notice
-        // for a `/cd` to the current dir. Log server-side so a repeated /cd is
-        // still observable when debugging.
+        // no-op. No change event is emitted (so the client does not spam a
+        // redundant "working directory changed" notice for a `/cd` to the
+        // current dir), but a Done still resolves the request so any client
+        // waiting on the request id does not hang. Log server-side so a
+        // repeated /cd is still observable when debugging.
         Ok(None) => {
+            let _ = client_event_tx.send(ServerEvent::Done { id });
             crate::logging::event_info(
                 "SESSION_LIFECYCLE",
                 vec![
