@@ -710,6 +710,28 @@ mod review_tests {
         assert_eq!(back, ReviewLoopState::default());
     }
 
+    // Forward-safety: ReviewLoopState must deserialize JSON that contains an
+    // unknown field (e.g. a key introduced by a newer build, or one removed from
+    // this struct). This pins that the struct does NOT use deny_unknown_fields;
+    // if that is ever added, persisted sessions would fail to load and this test
+    // would catch it.
+    #[test]
+    fn loop_state_ignores_unknown_fields() {
+        let json = r#"{
+            "current_lens": "Correctness",
+            "stall_turns": 0,
+            "finished": false,
+            "phase": "lenses",
+            "awaiting_postfix_recheck": false,
+            "active_reviewer_id": "session_reviewer_abc",
+            "some_future_field": {"nested": true},
+            "last_fix_touched_files": false
+        }"#;
+        let back: ReviewLoopState = serde_json::from_str(json).expect("unknown fields must be ignored");
+        assert_eq!(back.current_lens, Some(ReviewLens::Correctness));
+        assert_eq!(back.active_reviewer_id.as_deref(), Some("session_reviewer_abc"));
+    }
+
     #[test]
     fn productive_fix_fields_roundtrip() {
         let mut state = ReviewLoopState::default();

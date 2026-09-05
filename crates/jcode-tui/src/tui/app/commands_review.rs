@@ -1312,18 +1312,16 @@ const REVIEW_LOOP_IDLE_POLL_DEBOUNCE: std::time::Duration =
 /// loop forever on a persistently-broken environment, so the budget is capped.
 const REVIEW_LOOP_MAX_REVIEWER_RESPAWNS: u32 = 2;
 
-/// How long a reviewer session may go without writing anything (no verdict, no
-/// messages) before it is treated as stale/dead. A reviewer whose process died
-/// (e.g. its terminal was killed, or it was orphaned by a reload) leaves its
-/// session file on disk with no verdict and a frozen `updated_at`, so polling it
-/// would return "Pending" forever and the loop would stall on that lens. We use
-/// `Session.updated_at` (refreshed on every save) as the liveness signal: if a
-/// no-verdict reviewer has been QUIET for this long, its process is gone, so we
-/// treat it as Gone and let the bounded respawn (then finalize) take over. The
-/// window is deliberately generous to never misclassify a slow-but-live reviewer
-/// that simply has not written yet or is reasoning across a long tool call.
-const REVIEW_LOOP_STALE_REVIEWER_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(30 * 60);
+/// Resolve the stale-reviewer timeout from config. `None` disables stale
+/// detection (the loop will wait on a dead-but-persisted reviewer indefinitely).
+fn stale_reviewer_timeout() -> Option<std::time::Duration> {
+    let secs = crate::config::config().autoreview.stale_reviewer_timeout_secs;
+    if secs == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_secs(secs))
+    }
+}
 
 /// Poll the review loop from an idle tick if the debounce window has elapsed.
 ///
@@ -1480,7 +1478,10 @@ enum PollResult {
     Report(jcode_session_types::ReviewReport),
 }
 
-fn poll_loop_reviewer(reviewer_id: &str) -> PollResult {
+fn poll_loop_reviewer(
+    reviewer_id: &str,
+    stale_timeout: Option<std::time::Duration>,
+) -> PollResult {
     let session = match crate::session::Session::load(reviewer_id) {
         Ok(s) => s,
         // The reviewer session vanished (deleted or unloadable). Treat as a
@@ -1505,17 +1506,15 @@ fn poll_loop_reviewer(reviewer_id: &str) -> PollResult {
         }
     }
     // No verdict yet. Before declaring "Pending", rule out a DEAD reviewer: if
-    // the session has not written anything (updated_at frozen) for a long time,
-    // its process is gone (terminal killed / orphaned by a reload) even though
-    // the session file still exists. Polling it would otherwise return Pending
-    // forever and the loop would stall on this lens. The timeout is generous so
-    // a slow-but-live reviewer (which writes messages and refreshes updated_at)
-    // is never misclassified.
-    if reviewer_session_stale(
-        session.updated_at,
-        chrono::Utc::now(),
-        REVIEW_LOOP_STALE_REVIEWER_TIMEOUT,
-    ) {
+    // the session has not written anything (updated_at frozen) for the configured
+    // timeout, its process is gone (terminal killed / orphaned by a reload) even
+    // though the session file still exists. Polling it would otherwise return
+    // Pending forever and the loop would stall on this lens. The timeout is
+    // generous so a slow-but-live reviewer (which writes messages and refreshes
+    // updated_at) is never misclassified; `None` disables this recovery.
+    if stale_timeout.is_some_and(|timeout| {
+        reviewer_session_stale(session.updated_at, chrono::Utc::now(), timeout)
+    }) {
         return PollResult::Gone;
     }
     PollResult::Pending
@@ -1554,7 +1553,7 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
     // spawning a duplicate.
     let result = if state.active_reviewer_id.is_some() {
         let reviewer_id = state.active_reviewer_id.clone().unwrap();
-        match poll_loop_reviewer(&reviewer_id) {
+        match poll_loop_reviewer(&reviewer_id, stale_reviewer_timeout()) {
             PollResult::Gone => {
                 // The reviewer child session disappeared (deleted/unloadable).
                 // Retry a bounded number of times before giving up: a single

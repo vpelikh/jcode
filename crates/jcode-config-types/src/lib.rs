@@ -918,6 +918,12 @@ pub struct AutoReviewConfig {
     /// findings but do not converge before force-stop. Default 3. `0` means
     /// unlimited (rely on convergence + the finding-fingerprint guard).
     pub max_stalled_turns: u32,
+    /// How long a no-verdict reviewer may be silent (session `updated_at` frozen)
+    /// before it is treated as dead and respawned (recover from a reviewer whose
+    /// process died but whose session file persists). Default 1800s (30 min),
+    /// generous so a slow-but-live reviewer is never misclassified. `0` disables
+    /// stale detection (loop will wait on a dead reviewer indefinitely).
+    pub stale_reviewer_timeout_secs: u64,
 }
 
 impl Default for AutoReviewConfig {
@@ -930,6 +936,8 @@ impl Default for AutoReviewConfig {
             loop_mode: true,
             // Mirror the proposal's documented default churn cap.
             max_stalled_turns: 3,
+            // 30 minutes; recover a dead reviewer without misclassifying a slow one.
+            stale_reviewer_timeout_secs: 1800,
         }
     }
 }
