@@ -1664,6 +1664,11 @@ fn spawn_review_loop_reviewer(
             state.active_reviewer_id = Some(id);
             app.session.review_loop = Some(state.clone());
             let _ = app.session.save();
+            // Surface the lens actually being reviewed so the parent status bar
+            // tracks loop progress. The spawned reviewer runs in its own window;
+            // this is the parent-side signal that the loop advanced (and it makes
+            // the next idle redraw show the current lens rather than a stale one).
+            app.set_status_notice(format!("Review loop: reviewing {}", lens.label()));
             true
         }
         Err(error) => {

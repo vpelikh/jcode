@@ -872,3 +872,69 @@ fn remote_findings_fix_then_recheck_advances() {
         );
     });
 }
+
+// Regression (Round-E, dispatch-failure gap): when a review fix turn is queued
+// for remote dispatch but the queued send FAILED and restored the message to
+// `queued_messages` (see begin_remote_send error path in
+// process_remote_followups), `pending_queued_dispatch` is false yet the fix is
+// still unborn. An idle tick must NOT then spawn the post-fix re-check reviewer
+// against the pre-fix tree. This pins that the tick self-drive refuses to poll
+// the loop while any follow-up message is queued-but-undispatched, leaving the
+// fix to be redelivered instead.
+#[test]
+fn remote_tick_does_not_spawn_premature_recheck_while_fix_queued_after_failed_dispatch() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+        app.is_remote = true;
+        app.is_replay = false;
+        app.runtime_mode = super::AppRuntimeMode::RemoteClient;
+
+        // A live loop mid post-fix re-check for the first lens (findings were
+        // reported, a fix was queued, but the dispatch failed and restored the
+        // fix prompt to queued_messages).
+        let mut state = jcode_session_types::ReviewLoopState::new();
+        super::review_loop::enter_review_loop(&mut state);
+        state.awaiting_postfix_recheck = true;
+        state.active_reviewer_id = None;
+        app.session.review_loop = Some(state);
+
+        // Mimic the failed-dispatch-restore state: the fix is still in the
+        // queue, pending_queued_dispatch has been consumed (false), and the
+        // client is idle.
+        app.queued_messages.push("The reviewer found the following issues. Fix them:\n\n[HIGH] a.rs: bug".to_string());
+        app.pending_queued_dispatch = false;
+        app.is_processing = false;
+
+        // The idle tick must NOT spawn a premature re-check reviewer: a fix is
+        // still waiting in the queue to be dispatched.
+        let _ = rt.block_on(crate::tui::app::remote::handle_tick(&mut app, &mut remote));
+
+        let state = app.session.review_loop.as_ref().unwrap();
+        assert!(!state.finished, "loop must not finalize while a fix is pending");
+        assert!(
+            state.active_reviewer_id.is_none(),
+            "must NOT spawn the post-fix re-check reviewer against the pre-fix tree while the fix is still queued"
+        );
+        assert_eq!(
+            state.current_lens,
+            Some(jcode_session_types::ReviewLens::Correctness),
+            "the loop must stay on the fixing lens; the fix has not been dispatched yet"
+        );
+        // The tick's own queued-message dispatch (remote handle_tick) delivers
+        // the restored fix instead of the review-poll spawning a premature
+        // re-check: the fix turn is now in flight (is_processing true), so it
+        // will complete and only then re-poll the re-check reviewer.
+        assert!(
+            app.is_processing,
+            "the restored fix must be dispatched (turn in flight), not dropped"
+        );
+        assert!(
+            app.queued_messages.is_empty(),
+            "the fix prompt must have been dispatched, not left stranded in the queue"
+        );
+    });
+}
