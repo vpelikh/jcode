@@ -2821,6 +2821,15 @@ async fn compact_stall_recovered_via_streaming_loop() {
         text.contains("resolved path is returned by rename_session_title"),
         "the recovered turn must deliver the real completion, got {text:?}"
     );
+    // The recovery <system-reminder> is a user-role internal message, so it can
+    // never appear in the assistant delta stream a client sees. (The stalled
+    // first-turn text itself IS streamed as normal live output, exactly as the
+    // dense-filler path does; the correct contract is that the real completion
+    // is surfaced after it, which is asserted above.)
+    assert!(
+        !text.contains("repeatedly said you would perform an action"),
+        "client stream must not leak the recovery reminder, got {text:?}"
+    );
 
     // The injected reminder must be hidden behind a <system-reminder> marker.
     let injected = agent
