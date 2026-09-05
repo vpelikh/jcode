@@ -15,22 +15,22 @@
 //! `compass_query` call, whether it returns a warm result or a "building, try
 //! again" hint, so the model is never stuck if Compass itself fails.
 //!
-//! State is scoped to the owning session id and is never persisted. Entries are
-//! reference-counted so nothing leaks if the same session id is torn down and
-//! re-used by the daemon.
+//! State is scoped to the owning session id and is never persisted. The set is
+//! bounded in practice by the small overlap between a redirect and the compass
+//! query that clears it, and the flag is also dropped when a session is switched
+//! away, so a stale id cannot linger for a session the daemon has stopped using.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::{LazyLock, Mutex};
 
-/// Map of session_id -> count of outstanding unsatisified compass redirects.
-/// The window is intentionally narrow: a redirect sets the count, any
-/// `compass_query` execution clears it. Because redirects happen at most one
-/// per logical agent turn and are satisfied by the next compass query, the
-/// count only ever briefly exceeds zero; it is kept as a counter so a spurious
-/// double-redirect cannot leave the session permanently wedged by a stale
-/// decrement on the wrong occurence.
-static PENDING_REDIRECT: LazyLock<Mutex<HashMap<String, usize>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Sessions with an outstanding, unsatisfied `compass_query` redirect.
+///
+/// The window is intentionally narrow: a redirect adds the session, any
+/// `compass_query` execution (or a session switch-away) removes it. A set is
+/// the right shape because there is at most one logical pending redirect per
+/// session at a time, and the only transition that matters is absent/present.
+static PENDING_REDIRECT: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Record that an `agentgrep` call for `session_id` was redirected to
 /// `compass_query`. The mark is cleared by the next `compass_query` execution
@@ -42,16 +42,12 @@ pub fn mark_redirect_pending(session_id: &str) {
         return;
     }
     if let Ok(mut map) = PENDING_REDIRECT.lock() {
-        *map.entry(session_id.to_string()).or_insert(0) = map
-            .get(session_id)
-            .copied()
-            .unwrap_or(0)
-            .saturating_add(1);
+        map.insert(session_id.to_string());
     }
 }
 
 /// Clear the pending-redirect mark for `session_id`. Called when the session
-/// executes any `compass_query` call.
+/// executes any `compass_query` call or is switched away.
 pub fn clear_redirect_pending(session_id: &str) {
     if session_id.is_empty() {
         return;
@@ -69,7 +65,7 @@ pub fn redirect_pending(session_id: &str) -> bool {
     }
     PENDING_REDIRECT
         .lock()
-        .map(|map| map.get(session_id).copied().unwrap_or(0) > 0)
+        .map(|map| map.contains(session_id))
         .unwrap_or(false)
 }
 
@@ -124,5 +120,17 @@ mod tests {
         assert!(!redirect_pending(b));
         clear_redirect_pending(a);
         assert!(!redirect_pending(a));
+    }
+
+    #[test]
+    fn double_mark_is_idempotent_and_one_clear_releases() {
+        // A set (not a counter): marking twice is the same as once, and a single
+        // clear fully releases the session regardless of how many marks fired.
+        let sid = "session_test_compass_enforce_2";
+        mark_redirect_pending(sid);
+        mark_redirect_pending(sid);
+        assert!(redirect_pending(sid));
+        clear_redirect_pending(sid);
+        assert!(!redirect_pending(sid), "one clear must release a double-mark");
     }
 }
