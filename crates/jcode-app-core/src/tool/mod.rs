@@ -882,7 +882,6 @@ impl Registry {
             if let compass_enforcement::EnforcementDecision::Intercept { redirect, output: intercept } =
                 compass_enforcement::decide_enforcement(
                     &input,
-                    true,
                     availability,
                     &ctx.session_id,
                 )

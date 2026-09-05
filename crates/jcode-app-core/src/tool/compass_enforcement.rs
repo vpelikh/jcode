@@ -135,17 +135,13 @@ impl CompassAvailability {
 /// clearing the pending flag, telemetry, post-tool hooks).
 pub fn decide_enforcement(
     input: &serde_json::Value,
-    resolved_is_agentgrep: bool,
     availability: CompassAvailability,
     session_id: &str,
 ) -> EnforcementDecision {
     use super::agentgrep_call_is_grep_mode;
     use super::agentgrep_requests_raw_fallback;
 
-    if !resolved_is_agentgrep
-        || !availability.prefer_compass_query
-        || !availability.compass_invokable()
-    {
+    if !availability.prefer_compass_query || !availability.compass_invokable() {
         return EnforcementDecision::PassThrough;
     }
 
@@ -235,7 +231,7 @@ mod decide_enforcement_tests {
 
     #[test]
     fn redirects_a_plain_grep_when_compass_available() {
-        let d = decide_enforcement(&serde_json::json!({"query": "fn main"}), true, avail(true), "s");
+        let d = decide_enforcement(&serde_json::json!({"query": "fn main"}), avail(true), "s");
         match d {
             EnforcementDecision::Intercept { redirect: true, .. } => {}
             other => panic!("expected redirect, got {other:?}"),
@@ -244,13 +240,13 @@ mod decide_enforcement_tests {
 
     #[test]
     fn passes_through_when_enforcement_off() {
-        let d = decide_enforcement(&serde_json::json!({"query": "x"}), true, avail(false), "s");
+        let d = decide_enforcement(&serde_json::json!({"query": "x"}), avail(false), "s");
         assert!(matches!(d, EnforcementDecision::PassThrough));
     }
 
     #[test]
     fn passes_through_non_grep_mode() {
-        let d = decide_enforcement(&serde_json::json!({"mode": "find", "query": "x"}), true, avail(true), "s");
+        let d = decide_enforcement(&serde_json::json!({"mode": "find", "query": "x"}), avail(true), "s");
         assert!(matches!(d, EnforcementDecision::PassThrough), "find must not be redirected");
     }
 
@@ -260,7 +256,6 @@ mod decide_enforcement_tests {
         clear_redirect_pending(sid);
         let d = decide_enforcement(
             &serde_json::json!({"query": "x", "allow_raw_fallback": true}),
-            true,
             avail(true),
             sid,
         );
@@ -273,7 +268,6 @@ mod decide_enforcement_tests {
         mark_redirect_pending(sid);
         let d = decide_enforcement(
             &serde_json::json!({"query": "x", "allow_raw_fallback": true}),
-            true,
             avail(true),
             sid,
         );
@@ -285,8 +279,13 @@ mod decide_enforcement_tests {
     }
 
     #[test]
-    fn not_agentgrep_is_passthrough() {
-        let d = decide_enforcement(&serde_json::json!({}), false, avail(true), "s");
-        assert!(matches!(d, EnforcementDecision::PassThrough));
+    fn empty_input_redirects_as_grep_when_compass_available() {
+        // Omitted `mode` defaults to grep, so an otherwise-empty agentgrep input
+        // is a full-text grep and is redirected to compass.
+        let d = decide_enforcement(&serde_json::json!({}), avail(true), "s");
+        match d {
+            EnforcementDecision::Intercept { redirect: true, .. } => {}
+            other => panic!("expected redirect for empty grep input, got {other:?}"),
+        }
     }
 }
