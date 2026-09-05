@@ -777,6 +777,7 @@ impl Session {
         self.reasoning_effort = meta.reasoning_effort;
         self.subagent_model = meta.subagent_model;
         self.improve_mode = meta.improve_mode;
+        self.review_loop = meta.review_loop;
         self.autoreview_enabled = meta.autoreview_enabled;
         self.autojudge_enabled = meta.autojudge_enabled;
         self.is_canary = meta.is_canary;

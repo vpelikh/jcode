@@ -957,6 +957,50 @@ fn test_save_persists_reasoning_effort() -> Result<()> {
     Ok(())
 }
 
+/// `review_loop` is a serialized field in `SessionJournalMeta` and must survive
+/// a save/load round trip. Regression for a gap where `apply_journal_meta`
+/// dropped it (the field was written to the snapshot and tracked by
+/// `metadata_requires_snapshot` but never applied on reload), so a journaled
+/// `review_loop` would be lost if it ever diverged from the snapshot value.
+#[test]
+fn test_save_persists_review_loop_state() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-review-loop-save-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let mut session = Session::create_with_id(
+        "session_review_loop_persist_test".to_string(),
+        None,
+        Some("review loop persistence test".to_string()),
+    );
+    session.review_loop = Some(crate::session::ReviewLoopState {
+            stall_turns: 2,
+            ..Default::default()
+        });
+
+    // Add a message so save() does not early-return (persist guard).
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "placeholder".to_string(),
+            cache_control: None,
+        }],
+    );
+
+    session.save()?;
+
+    let loaded = Session::load("session_review_loop_persist_test")?;
+    assert_eq!(
+        loaded.review_loop.as_ref().map(|r| (r.stall_turns, r.finished)),
+        Some((2, false)),
+        "review_loop must survive a save/load round trip"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_save_appends_journal_and_load_replays_it() -> Result<()> {
     let _env_lock = lock_env();
