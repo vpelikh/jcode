@@ -3314,6 +3314,34 @@ fn test_known_tag_with_mismatched_shape_degrades_to_unknown() {
     assert!(matches!(again, SessionEventOp::Unknown { .. }));
 }
 
+/// Forward-compat: a FUTURE core build may add a NEW field to an existing known
+/// variant (e.g. `append_message` gains a `metadata` field). An older build that
+/// still parses that tag must keep the KNOWN variant and drop the unrecognized
+/// field (serde ignores unknown struct fields by default) — only a MISSING
+/// required field is grounds for degrading to `Unknown`. This pins the two
+/// distinct forward-compat behaviors.
+#[test]
+fn test_known_tag_with_extra_field_stays_known_but_missing_field_degrades() {
+    // Extra field -> the known variant is preserved (future field dropped).
+    let raw_extra = r#"{"op":"append_message","message_id":"m1","message":{"id":"m1","role":"user","content":[{"type":"text","text":"hi"}]},"metadata":"future"}"#;
+    let extra: SessionEventOp = serde_json::from_str(raw_extra).expect("must not error");
+    match &extra {
+        SessionEventOp::AppendMessage { message_id, message } => {
+            assert_eq!(message_id, "m1");
+            assert_eq!(message.id, "m1", "known variant must be preserved, extra field dropped");
+        }
+        other => panic!("expected AppendMessage (extra field dropped), got {other:?}"),
+    }
+
+    // Missing required field -> degrades to Unknown.
+    let raw_missing = r#"{"op":"append_message","message_id":"m1"}"#;
+    let missing: SessionEventOp = serde_json::from_str(raw_missing).expect("must not error");
+    assert!(
+        matches!(missing, SessionEventOp::Unknown { .. }),
+        "missing a required known-variant field must degrade to Unknown"
+    );
+}
+
 /// The public `Session::event_log()` read accessor lets plugins (and callers
 /// outside `jcode-base`) enumerate the append-only event log — including their
 /// own `Unknown` escape-hatch events — without reaching into the crate-private
