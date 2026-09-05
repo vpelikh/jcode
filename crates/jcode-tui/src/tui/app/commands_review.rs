@@ -1080,6 +1080,17 @@ pub(super) fn handle_autoreview_command_local(app: &mut App, trimmed: &str) -> b
             true
         }
         "now" => {
+            // The per-lens review loop already covers this finished work, so a
+            // redundant one-shot autoreview would spawn a second reviewer over
+            // the same session. Suppress it (matching the design intent that
+            // "one-shot is suppressed so both don't fire on the same turn").
+            if is_review_loop_active(app) {
+                app.push_display_message(DisplayMessage::system(
+                    "Review loop is already active; /autoreview now suppressed to avoid double-review (use /review-loop stop first if you want a one-shot).".to_string(),
+                ));
+                app.set_status_notice("Autoreview: suppressed (review loop active)");
+                return true;
+            }
             if let Err(error) = launch_autoreview_window_local(app) {
                 app.push_display_message(DisplayMessage::error(format!(
                     "Failed to launch autoreview: {}",

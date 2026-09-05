@@ -1458,3 +1458,33 @@ fn replay_never_auto_seeds_review_loop() {
         );
     });
 }
+
+// Regression (one-shot suppressed while loop active): with a review loop already
+// reviewing this session, `/autoreview now` must NOT spawn a redundant one-shot
+// reviewer (double-review over the same session). It is suppressed with a notice
+// instead, matching the design intent that the loop replaces one-shot autoreview.
+#[test]
+fn autoreview_now_suppressed_while_review_loop_active() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        app.is_remote = true;
+        app.is_replay = false;
+        app.runtime_mode = super::AppRuntimeMode::RemoteClient;
+        app.autoreview_enabled = true;
+
+        // An active review loop reviewing the finished work.
+        let mut state = jcode_session_types::ReviewLoopState::new();
+        super::review_loop::enter_review_loop(&mut state);
+        state.active_reviewer_id = None;
+        app.session.review_loop = Some(state);
+
+        app.input = "/autoreview now".to_string();
+        app.submit_input();
+
+        assert!(
+            app.status_notice.as_ref().is_some_and(|(n, _)| n.contains("suppressed")),
+            "one-shot autoreview must be suppressed while the review loop is active, got {:?}",
+            app.status_notice.as_ref().map(|(n, _)| n.as_str())
+        );
+    });
+}
