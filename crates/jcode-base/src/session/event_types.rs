@@ -287,9 +287,16 @@ impl<'de> Deserialize<'de> for SessionEventOp {
         // sibling fields). Unwrap that shape back to the bare value so a
         // scalar/array `Unknown` round-trips losslessly instead of collapsing
         // into `{"data": <value>}`. An object payload is emitted flattened, so a
-        // lone `data` field whose value is NOT an object is unambiguous. Resolve
-        // from `obj` (never moved by the per-variant parse) so this stays
-        // usable after `clone` is moved into a known-variant parser.
+        // lone `data` field whose value is NOT an object is unambiguous — EXCEPT
+        // for the narrow case of an object payload whose single field is named
+        // `data` and is itself not an object (e.g. `{"data": 5}`), which on the
+        // wire is indistinguishable from a wrapped non-object. We prefer the
+        // bundled-non-object interpretation since flattened objects that carry a
+        // lone non-`data` field are common while a lone `data`-keyed non-object
+        // field is rare; such a plugin payload should store the value on a
+        // differently-named key. Resolve from `obj` (never moved by the
+        // per-variant parse) so this stays usable after `clone` is moved into a
+        // known-variant parser.
         let make_unknown = |event_type: &str| -> SessionEventOp {
             let mut fields = obj.clone();
             fields.remove(OP_KEY);
