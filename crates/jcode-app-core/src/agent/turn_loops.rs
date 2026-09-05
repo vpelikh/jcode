@@ -1754,6 +1754,9 @@ mod tests {
             "Let me call bash to run the check now.",
             "I'll call bash to run it.",
             "Let me call the bash tool to run.",
+            // "now" with an intervening multi-word target ("bash tool")
+            "I'll call the bash tool now.",
+            "Let me call the bash tool now.",
         ];
         for turn in stalls {
             assert!(

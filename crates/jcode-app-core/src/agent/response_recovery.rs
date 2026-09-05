@@ -646,9 +646,12 @@ impl Agent {
                 start = end;
                 continue;
             }
-            // Invoking signal: " now", or a natural end of the utterance.
+            // Invoking signal: " call X now" (immediate or with the word "tool"
+            // in between, e.g. "call the bash tool now"), or a natural end of
+            // the utterance. The naming rejection above already guards against
+            // "call the tool a/the <label> now".
             let invokes_now_or_end = after.is_empty()
-                || after.starts_with(" now")
+                || after.contains(" now")
                 || after.starts_with('.')
                 || after.starts_with(',')
                 || after.starts_with('!')
