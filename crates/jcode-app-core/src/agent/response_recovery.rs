@@ -568,13 +568,14 @@ impl Agent {
     }
 
     /// True when `haystack` contains `needle` and the character immediately
-    /// following it is a word boundary (space, a punctuation mark other than an
-    /// apostrophe, or end-of-string). This rejects POSSESSIVE and word-joined
-    /// forms of a tool target: "the tool's docs" or "the command_line" contain
-    /// "the tool" / "the command" as substrings, but they are *references* to a
-    /// tool, not a first-person commitment to invoke it now. Requiring a real
-    /// boundary after the target keeps the compact stall detector from flagging
-    /// genuine answers like "I'll call the tool's documentation when reviewing".
+    /// following it is a word boundary (anything EXCEPT a word-continuation
+    /// character). This rejects POSSESSIVE and word-joined forms of a tool
+    /// target: "the tool's docs", "the command_line", "command-line", or
+    /// "tool2" contain the target as a substring but are *references*, not a
+    /// first-person commitment to invoke it now. Everything else (space,
+    /// end-of-string, sentence punctuation, closing quotes/brackets, backticks)
+    /// is a genuine boundary, so a short stall that quotes or brackets the
+    /// target ("I'll invoke [bash]") is still detected.
     fn contains_phrase_boundary(haystack: &str, needle: &str) -> bool {
         // Guard against an empty needle: find() on an empty string would match
         // at every index and never advance, looping forever. Callers always pass
