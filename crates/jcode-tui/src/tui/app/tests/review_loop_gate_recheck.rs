@@ -1270,6 +1270,25 @@ fn review_loop_stop_cancels_queued_fix() {
             !app.pending_queued_dispatch,
             "stopping the loop must clear the pending-dispatch flag"
         );
+        // Stopping must surface a digest of what was reviewed so far (matching
+        // the other terminal paths), and show it as the finish reason.
+        let record = app.session.review_loop.as_ref().unwrap().record.as_ref();
+        assert!(
+            record.is_some(),
+            "stopped loop must retain a record for the digest"
+        );
+        assert!(
+            record.is_some_and(|r| r.digest.is_some()),
+            "stopped loop must build a digest of what was reviewed"
+        );
+        assert!(
+            app.display_messages().iter().any(|m| m.content.contains("Review loop stopped")),
+            "stopping must surface a 'Review loop stopped' message"
+        );
+        assert!(
+            app.display_messages().iter().any(|m| m.content.contains("Finish reason: user_stopped")),
+            "the stop digest must record user_stopped as the finish reason"
+        );
     });
 }
 

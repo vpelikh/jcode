@@ -1864,10 +1864,14 @@ pub(super) fn handle_review_loop_command_local(app: &mut App, trimmed: &str) -> 
                 app.queued_messages.clear();
                 app.hidden_queued_system_messages.clear();
                 app.pending_queued_dispatch = false;
+                // Emit a digest of what was reviewed before the stop, matching
+                // the other terminal paths (converge/stall/gone/spawn_failed) so
+                // `/review-loop status` shows the partial outcome.
+                let digest = super::review_loop::build_and_store_digest(state);
                 let _ = app.session.save();
-                app.push_display_message(DisplayMessage::system(
-                    "Review loop stopped.".to_string(),
-                ));
+                app.push_display_message(DisplayMessage::system(format!(
+                    "Review loop stopped.\n\n{digest}"
+                )));
                 app.set_status_notice("Review loop: stopped");
             } else {
                 app.push_display_message(DisplayMessage::system(
