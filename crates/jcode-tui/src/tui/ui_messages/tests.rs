@@ -4201,3 +4201,109 @@ fn render_edit_inline_strips_config_notice_bullets() {
     assert!(!plain.contains("key"), "config notice leaked into diff: plain={plain}");
     assert!(!plain.contains("Config changes"), "config notice leaked: plain={plain}");
 }
+
+/// A completed `compass_query` tool card renders the query on the row (via the
+/// shared get_tool_summary path), not an empty summary.
+#[test]
+fn render_tool_message_compass_query_row_shows_query() {
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "15 results".to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_compass_card".to_string(),
+            name: "compass_query".to_string(),
+            input: serde_json::json!({
+                "query": "find the config handler",
+                "intent": "search"
+            }),
+            intent: None,
+            thought_signature: None,
+        }),
+    };
+
+    let lines = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off);
+    let rendered: Vec<String> = lines.iter().map(extract_line_text).collect();
+    assert!(
+        rendered.iter().any(|line| line.contains("compass_query")),
+        "completed card must name the tool: {rendered:?}"
+    );
+    assert!(
+        rendered
+            .iter()
+            .any(|line| line.contains("'find the config handler'")),
+        "completed card must show the query: {rendered:?}"
+    );
+}
+
+/// A `batch` that contains a `compass_query` sub-call renders the query on the
+/// sub-call row (it routes through get_tool_summary_with_budget), not an empty
+/// label. Without an intent, the query is the row's summary.
+#[test]
+fn render_tool_message_batch_compass_query_subcall_shows_query() {
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "--- [1] compass_query ---\n12 results\n\nCompleted: 1 succeeded, 0 failed"
+            .to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_batch_compass".to_string(),
+            name: "batch".to_string(),
+            input: serde_json::json!({
+                "tool_calls": [
+                    {
+                        "tool": "compass_query",
+                        "query": "find the config handler"
+                    }
+                ]
+            }),
+            intent: None,
+            thought_signature: None,
+        }),
+    };
+
+    let lines = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off);
+    let rendered: Vec<String> = lines.iter().map(extract_line_text).collect();
+    assert!(
+        rendered
+            .iter()
+            .any(|line| line.contains("'find the config handler'")),
+        "batch compass_query sub-call must show the query: {rendered:?}"
+    );
+}
+
+/// A long `compass_query` on a completed tool card is truncated to fit the
+/// row, never emitting an unbounded query line.
+#[test]
+fn render_tool_message_compass_query_long_query_truncates() {
+    let long_query = format!("find the config handler that owns {}", "x".repeat(200));
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "ok".to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_compass_long".to_string(),
+            name: "compass_query".to_string(),
+            input: serde_json::json!({ "query": long_query }),
+            intent: None,
+            thought_signature: None,
+        }),
+    };
+
+    let lines = render_tool_message(&msg, 40, crate::config::DiffDisplayMode::Off);
+    let rendered = lines
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !rendered.contains(&"x".repeat(200)),
+        "long query must be truncated on a narrow card: {rendered:?}"
+    );
+}
