@@ -4277,7 +4277,7 @@ fn render_tool_message_batch_compass_query_subcall_shows_query() {
 }
 
 /// A long `compass_query` on a completed tool card is truncated to fit the
-/// row, never emitting an unbounded query line.
+/// row, never emitting an unbounded query line or an over-wide row.
 #[test]
 fn render_tool_message_compass_query_long_query_truncates() {
     let long_query = format!("find the config handler that owns {}", "x".repeat(200));
@@ -4300,10 +4300,24 @@ fn render_tool_message_compass_query_long_query_truncates() {
     let rendered = lines
         .iter()
         .map(extract_line_text)
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect::<Vec<_>>();
+    let joined = rendered.join("\n");
     assert!(
-        !rendered.contains(&"x".repeat(200)),
-        "long query must be truncated on a narrow card: {rendered:?}"
+        !joined.contains(&"x".repeat(200)),
+        "long query must be truncated on a narrow card: {joined:?}"
+    );
+    // The row that carries the query must not exceed the narrow render width,
+    // and its truncation should be visibly marked with an ellipsis.
+    for line in &rendered {
+        if line.contains("'") || line.contains('…') {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(line.as_str()) <= 40,
+                "query row exceeds render width 40: {line:?}"
+            );
+        }
+    }
+    assert!(
+        rendered.iter().any(|line| line.contains('…')),
+        "long query truncation must be marked with an ellipsis: {rendered:?}"
     );
 }
