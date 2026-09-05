@@ -2635,6 +2635,78 @@ async fn batch_grep_alias_subcall_is_redirected_and_raw_fallback_runs() {
     clear_session_tool_policy("enforcement-batch-alias-test");
 }
 
+#[tokio::test]
+async fn batch_grep_alias_raw_fallback_is_blocked_while_redirect_pending() {
+    // A batch subcall re-enters Registry::execute, so the pending-redirect block
+    // must also fire through batch: a nested grep/agentgrep raw fallback is
+    // refused while a redirect is outstanding (model never attempted compass).
+    use super::compass_enforcement;
+
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    std::fs::write(temp.path().join("sample.txt"), "batch_block_token eta\n").expect("write");
+
+    let ctx = ToolContext {
+        session_id: "enforcement-batch-block-test".to_string(),
+        message_id: "test".to_string(),
+        tool_call_id: "test".to_string(),
+        working_dir: Some(temp.path().to_path_buf()),
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: ToolExecutionMode::Direct,
+    };
+
+    // A nested `grep` alias is redirected -> arms the session pending flag.
+    let redirect = registry
+        .execute(
+            "batch",
+            serde_json::json!({
+                "tool_calls": [
+                    {"tool": "grep", "parameters": {"pattern": "fn main"}}
+                ]
+            }),
+            ctx.clone(),
+        )
+        .await
+        .expect("batch should succeed");
+    assert!(
+        redirect.output.to_string().contains("compass_query"),
+        "batch grep-alias subcall should be redirected, got: {}",
+        redirect.output.to_string()
+    );
+    assert!(
+        compass_enforcement::redirect_pending("enforcement-batch-block-test"),
+        "batch grep-alias redirect should mark pending"
+    );
+
+    // Nested `grep` with allow_raw_fallback while pending is refused, not run.
+    let blocked = registry
+        .execute(
+            "batch",
+            serde_json::json!({
+                "tool_calls": [
+                    {"tool": "grep", "parameters": {"pattern": "batch_block_token", "allow_raw_fallback": true}}
+                ]
+            }),
+            ctx.clone(),
+        )
+        .await
+        .expect("batch should succeed");
+    let text = blocked.output.to_string();
+    assert!(
+        !text.contains("batch_block_token"),
+        "batch raw-fallback subcall must be blocked while pending, got: {text}"
+    );
+    assert!(
+        text.contains("compass_query"),
+        "blocked batch subcall should direct the model to compass_query, got: {text}"
+    );
+    compass_enforcement::clear_redirect_pending("enforcement-batch-block-test");
+    clear_session_tool_policy("enforcement-batch-block-test");
+}
+
 #[test]
 fn agentgrep_grep_mode_detection_targets_only_full_text_searches() {
     use super::compass_enforcement::agentgrep_call_is_grep_mode;
