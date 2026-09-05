@@ -313,7 +313,7 @@ fn install_main_source_update_blocking(latest_sha: &str) -> Result<PathBuf> {
     build::update_current_symlink(&channel_version)?;
     build::update_launcher_symlink_to_current()?;
 
-    // Reclaim space: this install also added an immutable version dir (~611 MB).
+    // Reclaim space: this install also added an immutable version dir.
     // Prune after promoting so current/stable/shared stay protected.
     let _ = build::prune_old_versions();
 

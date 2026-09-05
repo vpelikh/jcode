@@ -203,10 +203,27 @@ pub fn rollback_pending_activation_for_session(session_id: &str) -> Result<Optio
     Ok(Some(pending.new_version))
 }
 
+/// Validate a version/install label used as a single path component under
+/// `builds/versions/<label>/`. Rejects anything that could escape the versions
+/// dir or collide with the pseudo-directories: empty/whitespace labels, `.` and
+/// `..`, and any path-separator or drive-colon (`/`, `\`, `:`). All real
+/// producers (git SHAs, `${sha}-dirty-<hex>`, semver release tags, `main-<sha>`)
+/// satisfy this. Returns `true` when `label` is safe to join as a path segment.
+fn valid_version_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.trim() == label
+        && label != "."
+        && label != ".."
+        && !label.contains(['/', '\\', ':'])
+}
+
 /// Install a binary at a specific immutable version path.
 pub fn install_binary_at_version(source: &std::path::Path, version: &str) -> Result<PathBuf> {
     if !source.exists() {
         anyhow::bail!("Binary not found at {:?}", source);
+    }
+    if !valid_version_label(version) {
+        anyhow::bail!("Invalid installed version label: {version:?}");
     }
 
     let dest_dir = builds_dir()?.join("versions").join(version);
@@ -226,13 +243,30 @@ pub fn install_binary_at_version(source: &std::path::Path, version: &str) -> Res
     }
     crate::platform_support::set_permissions_executable(&dest)?;
 
+    // Refresh the version dir's mtime so a *reinstalled* version label (the dir
+    // already exists when reinstalling the same immutable version) still counts
+    // as freshly-created to `prune_old_versions`. Otherwise a just-reinstalled
+    // version could keep an old dir mtime, look stale, and be pruned from the
+    // "newest" pool even though it was just refreshed. Best-effort: on Windows
+    // `File::open` cannot open a directory, so this is a no-op there and the
+    // dir keeps the mtime from its original creation.
+    if let Ok(dir) = std::fs::File::open(&dest_dir) {
+        let _ = dir.set_modified(std::time::SystemTime::now());
+    }
+
     Ok(dest)
 }
 
 /// Maximum number of immutable `builds/versions/<version>/` installs retained,
 /// excluding the currently-promoted channels. Older installs are deleted after a
-/// new install so `~/.jcode/builds/versions/` stays bounded instead of growing
-/// by ~611 MB on every self-dev build or release install.
+/// new install so `~/.jcode/builds/versions/` stays bounded instead of growing by
+/// an immutable copy of the binary on every self-dev build or release install.
+///
+/// Note: for source-built installs the versioned binary is a *hard link* to the
+/// build artifact (e.g. `target/selfdev/jcode`), so pruning `versions/<v>/`
+/// reclaims the directory entry and any other links to the same inode, not the
+/// binary's bytes while the source artifact still exists. Release *downloads*
+/// (no local source artifact) are real copies, so pruning those reclaims fully.
 const VERSIONS_KEEP_NEWEST: usize = 2;
 
 /// Best-effort cleanup of `builds/versions/`. Keeps the versions referenced by
@@ -861,8 +895,8 @@ pub fn publish_local_current_build_for_source(
     let current_link = update_current_symlink(&source.version_label)?;
     let launcher_link = update_launcher_symlink_to_current()?;
 
-    // Reclaim space: self-dev builds install an immutable version dir (~611 MB
-    // each) that would otherwise accumulate on every build. The current channel
+    // Reclaim space: self-dev builds install one immutable version dir per
+    // build that would otherwise accumulate on every build. The current channel
     // is promoted above, so it (and stable/shared-server) are protected. Also
     // protect the *previous* current: it is recorded as a rollback target (via
     // pending_activation) only after publish returns, so it must survive here.
@@ -891,12 +925,7 @@ pub fn publish_local_current_build(repo_dir: &std::path::Path) -> Result<PathBuf
 
 /// Promote an already installed immutable version onto the shared server channel.
 pub fn promote_version_to_shared_server(version: &str) -> Result<Option<String>> {
-    if version.is_empty()
-        || version.trim() != version
-        || version == "."
-        || version == ".."
-        || version.contains(['/', '\\', ':'])
-    {
+    if !valid_version_label(version) {
         anyhow::bail!("Invalid installed version label: {version:?}");
     }
     let previous = read_shared_server_version()?;
@@ -1087,17 +1116,27 @@ pub fn install_local_release(repo_dir: &std::path::Path) -> Result<PathBuf> {
     update_shared_server_symlink(&version)?;
     update_launcher_symlink_to_current()?;
 
-    // Reclaim space: immutably-installed versions accumulate (~611 MB each).
-    // Promote first (so current/stable/shared are protected), then prune.
+    // Reclaim space: immutably-installed versions accumulate one binary copy
+    // (and its directory entry) per install. Promote first (so current/stable/
+    // shared are protected), then prune.
     let _ = prune_old_versions();
 
     Ok(versioned)
 }
 
-/// Copy binary to versioned location
+/// Copy binary to the versioned location and reclaim space by pruning old
+/// immutable `versions/<v>/` installs (consistent with the publish/release
+/// installers). The installed version is the newest and so survives the prune,
+/// even if the caller promotes it (e.g. via `update_canary_symlink`) afterward.
 pub fn install_version(repo_dir: &std::path::Path, hash: &str) -> Result<PathBuf> {
     let source = release_binary_path(repo_dir);
-    install_binary_at_version(&source, hash)
+    let versioned = install_binary_at_version(&source, hash)?;
+    // Reclaim space like every other installer: immutable `versions/<v>/`
+    // installs accumulate one binary copy per install. The just-installed
+    // version is the newest so it survives the newest-kept rule even if a
+    // caller promotes it (e.g. via `update_canary_symlink`) immediately after.
+    let _ = prune_old_versions();
+    Ok(versioned)
 }
 
 /// Update canary symlink to point to a version
