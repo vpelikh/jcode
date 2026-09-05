@@ -674,10 +674,11 @@ pub struct ToolConfig {
     /// policy, and the session has a working directory to search. Filename and
     /// file-inspection modes (find/outline/trace) are left to run normally
     /// because compass does not replace them. The model can still force raw grep
-    /// by passing `allow_raw_fallback` (a documented agentgrep input field).
-    /// Default: on, matching the built-in preferred-tools guidance that tells
-    /// agents to try semantic search first and only fall back to grep when no
-    /// index covers the task.
+    /// by passing `allow_raw_fallback` (a documented agentgrep input field),
+    /// though after a redirect the raw fallback is refused until that session
+    /// actually attempts `compass_query` once. Default: on, matching the
+    /// built-in preferred-tools guidance that tells agents to try semantic
+    /// search first and only fall back to grep when no index covers the task.
     #[serde(default = "default_true")]
     pub prefer_compass_query: bool,
     /// Kick off a background Compass knowledge-graph build when a session binds

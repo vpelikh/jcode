@@ -353,7 +353,9 @@ read_dedup = true
 # file-inspection modes (find/outline/trace) are left to run normally because
 # compass does not replace them. This makes the "try semantic search first"
 # guidance enforceable rather than advisory. The model can still force raw grep
-# for a single call by passing allow_raw_fallback:true to agentgrep.
+# for a single call by passing allow_raw_fallback:true to agentgrep, though
+# after a redirect the raw fallback is refused until that session attempts
+# `compass_query` once. Default: on.
 # prefer_compass_query = true
 # When on (default), a background Compass knowledge-graph build is kicked off
 # when a session binds to a working directory whose index is missing, so the
