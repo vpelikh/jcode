@@ -2090,7 +2090,19 @@ impl MessageChannel for TelegramChannel {
                         offset = Some(update.update_id + 1);
 
                         if let Some(cb) = update.callback_query {
-                            let _ = self.handle_callback_query(cb).await;
+                            // Handle callbacks in their own task, mirroring the
+                            // message path below, so a slow callback (or one that
+                            // panics) cannot block `getUpdates` polling or kill
+                            // the reply loop and leave the bot silent. The offset
+                            // advanced above before we spawn, so no update is
+                            // lost. State-mutating callbacks still serialize on
+                            // process_lock inside handle_callback_query; the
+                            // pre-lock stop-button fast-path is lock-free by
+                            // design, so it stays responsive even during a turn.
+                            let callback_channel = Arc::clone(&self);
+                            tokio::spawn(async move {
+                                callback_channel.handle_callback_query(cb).await;
+                            });
                             continue;
                         }
 
