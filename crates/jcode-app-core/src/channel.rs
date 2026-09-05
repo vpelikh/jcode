@@ -740,32 +740,30 @@ impl TelegramChannel {
     /// `/new [prompt]`: create a fresh session, make it the active one for this
     /// chat, and (optionally) run the first turn with `prompt`.
     async fn new_session_reply(&self, arg: &str) -> String {
-        // If an opening prompt is supplied, run the first turn headlessly with
-        // the typing indicator so the user sees the bot working.
-        if arg.is_empty() {
-            return match crate::server::telegram_control::create_session_for_control(None).await {
-                Ok((id, _)) => {
-                    crate::server::telegram_control::set_active_session(&self.chat_id, &id);
-                    format!(
-                        "✅ Created new session `{}`. Send a message to talk to it.",
-                        short_id(&id)
-                    )
-                }
-                Err(e) => format!("⚠️ Could not create a session: {}", escape_markdown_v2(&e.to_string())),
-            };
-        }
-        match self
-            .with_typing(async {
-                crate::server::telegram_control::create_session_for_control(Some(arg)).await
-            })
-            .await
+        // Create the session headlessly. If an opening prompt is supplied, don't
+        // run it under the plain typing indicator (no progress, no way to stop);
+        // instead create the session empty, select it, and stream the prompt so
+        // the user sees live progress and gets the 🛑 Stop button, matching the
+        // quick-start path.
+        let (id, _) = match crate::server::telegram_control::create_session_for_control(None).await
         {
-            Ok((id, reply)) => {
-                crate::server::telegram_control::set_active_session(&self.chat_id, &id);
-                agent_reply_message(&id, &reply)
+            Ok(pair) => pair,
+            Err(e) => {
+                return format!(
+                    "⚠️ Could not create a session: {}",
+                    escape_markdown_v2(&e.to_string())
+                )
             }
-            Err(e) => format!("⚠️ Could not create a session: {}", escape_markdown_v2(&e.to_string())),
+        };
+        crate::server::telegram_control::set_active_session(&self.chat_id, &id);
+        if arg.trim().is_empty() {
+            return format!(
+                "✅ Created new session `{}`. Send a message to talk to it.",
+                short_id(&id)
+            );
         }
+        self.stream_reply_to_session(None, &id, arg.trim()).await;
+        String::new()
     }
 
     /// `/history [n]`: show recent messages of the active session.
@@ -1321,34 +1319,6 @@ impl TelegramChannel {
             reply_to_message_id,
         )
         .await
-    }
-
-    /// Run `fut`, showing a periodic `typing` indicator the whole time and
-    /// cancelling it when the future completes. Returns the future's output.
-    async fn with_typing<Fut, T>(&self, fut: Fut) -> T
-    where
-        Fut: std::future::Future<Output = T>,
-    {
-        let client = self.client_or_default().await;
-        let token = self.token.clone();
-        let chat_id = self.chat_id.clone();
-        let api_base = self.api_base.clone();
-        let typing = tokio::spawn(async move {
-            loop {
-                let _ = crate::telegram::send_chat_action(
-                    &client,
-                    &token,
-                    &chat_id,
-                    "typing",
-                    api_base.as_deref(),
-                )
-                .await;
-                tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-            }
-        });
-        let result = fut.await;
-        typing.abort();
-        result
     }
 
     /// Process one inbound Telegram message. Runs under the per-channel
