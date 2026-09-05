@@ -852,115 +852,68 @@ impl Registry {
         // when a Compass index is available, guaranteeing `compass_query` is
         // attempted before raw grep at the tool level.
         //
-        // Enforcement is deliberately skipped when:
-        //   - the caller passed the explicit `allow_raw_fallback` bypass flag
-        //     (agentgrep's documented escape hatch for building outputs, logs,
-        //     and files outside the indexed tree);
-        //   - the call is not a full-text grep search (find/outline/trace are
-        //     distinct operations compass does not replace);
-        //   - `compass_query` is not authoritative here: it is not registered
-        //     (removed/unknown) or the session tool policy disables it, so
-        //     redirecting the call would dead-end the model against a tool it
-        //     cannot actually invoke; or
-        //   - the session has no working directory to search (compass_query
-        //     requires one and would otherwise only error); or
-        //   - the operator opted out via `tools.prefer_compass_query = false`.
+        // The policy lives in `compass_enforcement::decide_enforcement` (pure),
+        // which returns `PassThrough` or one of two guidance outputs:
+        //   - redirect: a plain full-text grep with compass available.
+        //   - raw-fallback-block: an `allow_raw_fallback` grep retried while a
+        //     redirect is still outstanding for this session (prod-observed
+        //     bypass where the model never attempted compass).
+        // It is skipped when not authoritative: compass is not registered or is
+        // disabled by policy, there is no working dir to search, the operator
+        // opted out, or the call is not a full-text grep (find/outline/trace are
+        // distinct operations compass does not replace).
         //
-        // The interception sits before the `pre_tool` policy hook because a
-        // redirected call executes no tool and so has nothing for the gate to
-        // block; the model's follow-up `compass_query` (or bypassed agentgrep)
-        // is what the hook gates. If enforcement ever needs the pre_tool gate
-        // to observe the original grep intent, move this block to after it.
-        if resolved_name == "agentgrep"
-            && prefer_compass_query
-            && !agentgrep_requests_raw_fallback(&input)
-            // Only full-text grep searches are redirected; find/outline/trace
-            // are distinct operations compass does not replace.
-            && agentgrep_call_is_grep_mode(&input)
-            && tools.contains_key("compass_query")
-            && !session_tool_is_disabled(&ctx.session_id, "compass_query")
-            // `compass_query` needs a real workspace to search (it fails with
-            // "requires a working directory" otherwise). In a session with no
-            // working dir there is nothing to index, so redirecting would send
-            // the model to a tool that can only error; let agentgrep run instead.
-            && ctx.working_dir.is_some()
-        {
-            // Release the tools read lock before running the observer/telemetry
-            // hooks, matching the normal execution path (which drops it before
-            // any post-processing). This keeps the guard scoped to the lookup so
-            // a future hook change that re-enters the registry can't deadlock.
-            drop(tools);
-            let redirect = compass_redirect_output(&input);
-            // Remember, per session, that we just told the model to try
-            // `compass_query`. Until the session actually makes a compass_query
-            // attempt, a retried `agentgrep` with `allow_raw_fallback` is refused
-            // below so the model cannot short-circuit the enforcement the same
-            // turn it was redirected (prod-observed: model retried agentgrep with
-            // `allow_raw_fallback: true` on the turn after a redirect and never
-            // called compass_query at all).
-            compass_enforcement::mark_redirect_pending(&ctx.session_id);
-            // Route the interception through the same observer/telemetry
-            // surfaces as a normal tool outcome so dashboards, hooks, and the
-            // session tool-usage counters all see the redirected call (recorded
-            // as successful, since it resolved to a coherent result), rather
-            // than treating it as a silent short-circuit.
-            crate::telemetry::record_tool_execution(resolved_name, &input, true, 0);
-            Self::fire_post_tool_hook(resolved_name, &ctx, &Ok(redirect.clone()), 0);
-            crate::logging::event_info(
-                "TOOL_LIFECYCLE",
-                Self::tool_lifecycle_fields(
-                    "redirected_to_compass",
-                    name,
-                    resolved_name,
-                    &input,
-                    &ctx,
+        // Both intercepted flows route through the same observer/telemetry
+        // surfaces as a normal tool outcome so dashboards, hooks, and usage
+        // counters all see the interception as a successful, coherent result.
+        // They sit before the `pre_tool` policy hook because they execute no tool;
+        // the model's follow-up `compass_query` (or bypassed agentgrep) is what
+        // the hook gates.
+        if resolved_name == "agentgrep" {
+            let availability = compass_enforcement::CompassAvailability {
+                prefer_compass_query,
+                compass_registered: tools.contains_key("compass_query"),
+                compass_not_disabled: !session_tool_is_disabled(
+                    &ctx.session_id,
+                    "compass_query",
                 ),
-            );
-            return Ok(redirect);
+                has_working_dir: ctx.working_dir.is_some(),
+            };
+            if let compass_enforcement::EnforcementDecision::Intercept { redirect, output: intercept } =
+                compass_enforcement::decide_enforcement(
+                    &input,
+                    true,
+                    availability,
+                    &ctx.session_id,
+                )
+            {
+                // A redirect arms the per-session pending flag so a later
+                // raw-fallback grep (before any compass attempt) is refused by
+                // the block decision; the block leaves the flag as-is (the model
+                // still owes a compass attempt).
+                // Release the tools read lock before running the observer/telemetry
+                // hooks, matching the normal execution path (which drops it before
+                // any post-processing). This keeps the guard scoped to the lookup so
+                // a future hook change that re-enters the registry can't deadlock.
+                drop(tools);
+                if redirect {
+                    compass_enforcement::mark_redirect_pending(&ctx.session_id);
+                }
+                let phase = if redirect {
+                    "redirected_to_compass"
+                } else {
+                    "raw_fallback_blocked_pending_compass"
+                };
+                crate::telemetry::record_tool_execution(resolved_name, &input, true, 0);
+                Self::fire_post_tool_hook(resolved_name, &ctx, &Ok(intercept.clone()), 0);
+                crate::logging::event_info(
+                    "TOOL_LIFECYCLE",
+                    Self::tool_lifecycle_fields(phase, name, resolved_name, &input, &ctx),
+                );
+                return Ok(intercept);
+            }
         }
 
-        // A retried `agentgrep` that already asked for the raw fallback while a
-        // `compass_query` redirect is still outstanding for this session. This
-        // is the prod-observed bypass: after one redirect the model jumped
-        // straight to `allow_raw_fallback: true` and never attempted compass. We
-        // refuse that coercion-free bypass and force a genuine compass attempt
-        // first. Once the session executes any `compass_query`, the pending flag
-        // clears and raw fallback is allowed again (so a genuinely-unindexable
-        // project can still fall back after one compass attempt).
-        if resolved_name == "agentgrep"
-            && prefer_compass_query
-            && agentgrep_requests_raw_fallback(&input)
-            // Only block the full-text grep escape hatch while a redirect is
-            // pending. find/outline/trace are distinct operations the redirect
-            // never targets, so a raw-fallback flag on them must not be held
-            // hostage just because a grep was redirected earlier in the session.
-            && agentgrep_call_is_grep_mode(&input)
-            // Don't block if compass_query is no longer invokable for this
-            // session (tool removed or disabled by policy since the redirect).
-            // Otherwise the model would be pointed at a tool it cannot call,
-            // dead-ending it until a (necessarily failing) compass call clears
-            // the pending flag. This mirrors the redirect tier's own
-            // availability guard.
-            && tools.contains_key("compass_query")
-            && !session_tool_is_disabled(&ctx.session_id, "compass_query")
-            && compass_enforcement::redirect_pending(&ctx.session_id)
-        {
-            drop(tools);
-            let blocked = compass_enforcement::raw_fallback_blocked_output();
-            crate::telemetry::record_tool_execution(resolved_name, &input, true, 0);
-            Self::fire_post_tool_hook(resolved_name, &ctx, &Ok(blocked.clone()), 0);
-            crate::logging::event_info(
-                "TOOL_LIFECYCLE",
-                Self::tool_lifecycle_fields(
-                    "raw_fallback_blocked_pending_compass",
-                    name,
-                    resolved_name,
-                    &input,
-                    &ctx,
-                ),
-            );
-            return Ok(blocked);
-        }
 
         // (Not on the redirect path) drop the lock before executing
         drop(tools);

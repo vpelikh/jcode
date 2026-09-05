@@ -89,6 +89,91 @@ pub fn raw_fallback_blocked_output() -> super::ToolOutput {
     }))
 }
 
+/// The decision of the `compass_query`-first enforcement tier for one
+/// `agentgrep` call. `Intercept` carries which guidance was produced so the
+/// caller can distinguish a redirect (which arms the pending flag) from a
+/// raw-fallback block (which leaves it as-is).
+#[derive(Debug)]
+pub enum EnforcementDecision {
+    /// Let `agentgrep` run normally (no interception).
+    PassThrough,
+    /// Intercept this call with the given guidance output.
+    Intercept { redirect: bool, output: super::ToolOutput },
+}
+
+/// The conditions under which `compass_query` is authoritative enough to be
+/// worth redirecting/blocking an `agentgrep` call. Resolved by
+/// [`Registry::execute`] once (it holds the tools lock and reads session
+/// policy), then passed in so the policy itself stays pure and testable.
+#[derive(Clone, Copy)]
+pub struct CompassAvailability {
+    /// The operator enabled the enforcement tier.
+    pub prefer_compass_query: bool,
+    /// `compass_query` is registered for the containing registry.
+    pub compass_registered: bool,
+    /// `compass_query` is not disabled by the session tool policy.
+    pub compass_not_disabled: bool,
+    /// The session has a working directory for compass to search.
+    pub has_working_dir: bool,
+}
+
+impl CompassAvailability {
+    /// Whether `compass_query` is actually invokable for this session. Both the
+    /// redirect and the raw-fallback block require this, so it is computed once
+    /// rather than duplicated across the two inline branches.
+    fn compass_invokable(&self) -> bool {
+        self.compass_registered && self.compass_not_disabled && self.has_working_dir
+    }
+}
+
+/// Decide the `compass_query`-first enforcement for one `agentgrep` call.
+///
+/// Pure: takes only the call input, the availability snapshot, and the session
+/// id. Returns `PassThrough` when nothing should intercept the call, or the
+/// specific guidance output (redirect vs blocked raw fallback) otherwise. The
+/// caller is responsible for the side effects those decisions require (marking/
+/// clearing the pending flag, telemetry, post-tool hooks).
+pub fn decide_enforcement(
+    input: &serde_json::Value,
+    resolved_is_agentgrep: bool,
+    availability: CompassAvailability,
+    session_id: &str,
+) -> EnforcementDecision {
+    use super::agentgrep_call_is_grep_mode;
+    use super::agentgrep_requests_raw_fallback;
+
+    if !resolved_is_agentgrep
+        || !availability.prefer_compass_query
+        || !availability.compass_invokable()
+    {
+        return EnforcementDecision::PassThrough;
+    }
+
+    let grep_mode = agentgrep_call_is_grep_mode(input);
+
+    // A plain full-text grep with compass available -> redirect to compass.
+    if grep_mode && !agentgrep_requests_raw_fallback(input) {
+        return EnforcementDecision::Intercept {
+            redirect: true,
+            output: super::compass_redirect_output(input),
+        };
+    }
+
+    // A raw-fallback grep while a redirect is still outstanding -> refuse the
+    // bypass (only meaningful for grep mode; find/outline/trace are distinct).
+    if grep_mode
+        && agentgrep_requests_raw_fallback(input)
+        && redirect_pending(session_id)
+    {
+        return EnforcementDecision::Intercept {
+            redirect: false,
+            output: raw_fallback_blocked_output(),
+        };
+    }
+
+    EnforcementDecision::PassThrough
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,5 +217,76 @@ mod tests {
         assert!(redirect_pending(sid));
         clear_redirect_pending(sid);
         assert!(!redirect_pending(sid), "one clear must release a double-mark");
+    }
+}
+
+#[cfg(test)]
+mod decide_enforcement_tests {
+    use super::*;
+
+    fn avail(on: bool) -> CompassAvailability {
+        CompassAvailability {
+            prefer_compass_query: on,
+            compass_registered: on,
+            compass_not_disabled: on,
+            has_working_dir: on,
+        }
+    }
+
+    #[test]
+    fn redirects_a_plain_grep_when_compass_available() {
+        let d = decide_enforcement(&serde_json::json!({"query": "fn main"}), true, avail(true), "s");
+        match d {
+            EnforcementDecision::Intercept { redirect: true, .. } => {}
+            other => panic!("expected redirect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn passes_through_when_enforcement_off() {
+        let d = decide_enforcement(&serde_json::json!({"query": "x"}), true, avail(false), "s");
+        assert!(matches!(d, EnforcementDecision::PassThrough));
+    }
+
+    #[test]
+    fn passes_through_non_grep_mode() {
+        let d = decide_enforcement(&serde_json::json!({"mode": "find", "query": "x"}), true, avail(true), "s");
+        assert!(matches!(d, EnforcementDecision::PassThrough), "find must not be redirected");
+    }
+
+    #[test]
+    fn raw_fallback_not_redirected_without_pending() {
+        let sid = "no-pending";
+        clear_redirect_pending(sid);
+        let d = decide_enforcement(
+            &serde_json::json!({"query": "x", "allow_raw_fallback": true}),
+            true,
+            avail(true),
+            sid,
+        );
+        assert!(matches!(d, EnforcementDecision::PassThrough), "raw fallback should run when no redirect pending");
+    }
+
+    #[test]
+    fn raw_fallback_blocked_when_redirect_pending() {
+        let sid = "pending";
+        mark_redirect_pending(sid);
+        let d = decide_enforcement(
+            &serde_json::json!({"query": "x", "allow_raw_fallback": true}),
+            true,
+            avail(true),
+            sid,
+        );
+        match d {
+            EnforcementDecision::Intercept { redirect: false, .. } => {}
+            other => panic!("expected block, got {other:?}"),
+        }
+        clear_redirect_pending(sid);
+    }
+
+    #[test]
+    fn not_agentgrep_is_passthrough() {
+        let d = decide_enforcement(&serde_json::json!({}), false, avail(true), "s");
+        assert!(matches!(d, EnforcementDecision::PassThrough));
     }
 }

@@ -128,19 +128,19 @@ async fn main() -> Result<()> {
         label: "ls .",
         input: json!({"path": "."}),
     });
-    // Exercises the compass_query-first enforcement through the real binary:
-    // with compass_query registered (default full toolset) and
-    // prefer_compass_query on (default), an agentgrep call must be redirected,
-    // and the explicit raw fallback must run grep.
+    // Exercises the compass_query-first enforcement through the real binary.
+    // The harness shares one session id across cases, so the standalone raw
+    // fallback runs first (pending-redirect not armed yet) to demonstrate raw
+    // grep, then a plain grep is redirected to compass_query.
+    cases.push(ToolCase {
+        name: "agentgrep",
+        label: "agentgrep with allow_raw_fallback (expect raw grep)",
+        input: json!({"query": "alpha", "allow_raw_fallback": true}),
+    });
     cases.push(ToolCase {
         name: "agentgrep",
         label: "agentgrep (expect redirect to compass_query)",
         input: json!({"query": "fn main"}),
-    });
-    cases.push(ToolCase {
-        name: "agentgrep",
-        label: "agentgrep with allow_raw_fallback (expect real grep)",
-        input: json!({"query": "alpha", "allow_raw_fallback": true}),
     });
     cases.push(ToolCase {
         name: "batch",
@@ -197,14 +197,7 @@ async fn main() -> Result<()> {
     }
 
     for (idx, case) in cases.iter().enumerate() {
-        // Each harness case is an isolated diagnostic probe. Give it its own
-        // session id so per-session tool state (e.g. the compass-query-first
-        // pending-redirect that forbids `allow_raw_fallback` until compass is
-        // attempted) does not leak between independent probes: the redirect
-        // case and the raw-fallback case each demonstrate their own behavior
-        // in isolation, matching how a real session would see them.
         let ctx = ToolContext {
-            session_id: format!("{}-case-{}", base_ctx.session_id, idx + 1),
             tool_call_id: format!("harness-{}", idx + 1),
             ..base_ctx.clone()
         };
