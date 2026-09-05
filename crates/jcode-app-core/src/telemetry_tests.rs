@@ -172,6 +172,7 @@ fn test_session_end_event_serialization() {
         todo_gate_feedback_loop_count: 1,
         todo_gate_completion_count: 0,
         todo_gate_spike_count: 0,
+        todo_gate_tradeoff_count: 0,
         command_login_used: false,
         command_model_used: true,
         command_usage_used: false,
@@ -238,6 +239,7 @@ fn test_session_end_event_serialization() {
     assert_eq!(json["todo_gate_feedback_loop_count"], 1);
     assert_eq!(json["todo_gate_completion_count"], 0);
     assert_eq!(json["todo_gate_spike_count"], 0);
+    assert_eq!(json["todo_gate_tradeoff_count"], 0);
     assert_eq!(json["workflow_coding_used"], true);
     assert_eq!(json["active_days_30d"], 9);
     assert_eq!(json["transport_persistent_ws_reuse"], 5);

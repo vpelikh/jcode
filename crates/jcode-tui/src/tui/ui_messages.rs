@@ -1946,6 +1946,22 @@ fn render_todo_goal_updates(
                     base_indent,
                     inner_width,
                 ),
+                crate::todo::TodoGoalField::TradeOff => push_todo_score_update(
+                    &mut lines,
+                    "Trade-off",
+                    update
+                        .before
+                        .as_ref()
+                        .and_then(|goal| goal.trade_off)
+                        .map(|state| state.as_str().to_string()),
+                    update
+                        .after
+                        .as_ref()
+                        .and_then(|goal| goal.trade_off)
+                        .map(|state| state.as_str().to_string()),
+                    base_indent,
+                    inner_width,
+                ),
                 crate::todo::TodoGoalField::FeedbackLoop
                 | crate::todo::TodoGoalField::StoppingEvidence => unreachable!(),
             }

@@ -382,6 +382,20 @@ semantic_state! {
 }
 
 semantic_state! {
+    /// How carefully the agent weighed alternatives and their trade-offs before
+    /// settling on an approach. Like other completion assessments it is
+    /// difficulty-calibrated: simple tasks clear on "some considered", involved
+    /// ones demand diligent comparison of alternatives.
+    TradeOffState {
+        NoneConsidered = "none_considered", legacy: 0..=24, score: 12,
+        Implicit = "implicit", legacy: 25..=49, score: 37,
+        SomeConsidered = "some_considered", legacy: 50..=79, score: 65,
+        Diligent = "diligent", legacy: 80..=95, score: 88,
+        Exhaustive = "exhaustive", legacy: 96..=100, score: 98,
+    }
+}
+
+semantic_state! {
     /// Evidence state behind a todo: from an unexamined guess to a result
     /// verified end to end.
     ConfidenceState {
@@ -610,6 +624,24 @@ pub struct TodoGoal {
     /// research or open-ended goal is marked complete.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stopping_evidence: Option<String>,
+    /// How carefully the agent weighed alternatives and their trade-offs before
+    /// settling on the chosen approach. Gated at completion like the other
+    /// delivery assessments. Tool-maintained history under
+    /// `trade_off_history`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trade_off: Option<TradeOffState>,
+    /// Every distinct `trade_off` state this goal has carried, oldest first.
+    /// Tool-maintained; model-supplied values are ignored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trade_off_history: Vec<TradeOffState>,
+    /// The meaningful decisions the work required and the trade-offs they
+    /// carried (cost, complexity, performance, compatibility, maintenance).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trade_offs: Option<String>,
+    /// Whether a credible alternative to the chosen approach was actually
+    /// explored, and how it lost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explored_alternative: Option<bool>,
 }
 
 /// A goal field changed by a todo-tool update. This lets transcript renderers
@@ -628,6 +660,7 @@ pub enum TodoGoalField {
     Autonomy,
     IterationMaturity,
     StoppingEvidence,
+    TradeOff,
 }
 
 /// Before/after state for one changed todo goal.
@@ -722,6 +755,32 @@ mod semantic_state_tests {
                 Some(state)
             );
         }
+    }
+
+    #[test]
+    fn trade_off_state_round_trips_and_parses() {
+        for state in [
+            TradeOffState::NoneConsidered,
+            TradeOffState::Implicit,
+            TradeOffState::SomeConsidered,
+            TradeOffState::Diligent,
+            TradeOffState::Exhaustive,
+        ] {
+            let json = serde_json::to_string(&state).unwrap();
+            assert_eq!(
+                serde_json::from_str::<TradeOffState>(&json).unwrap(),
+                state
+            );
+            assert_eq!(TradeOffState::parse(state.as_str()), Some(state));
+            assert_eq!(
+                TradeOffState::parse(&state.as_str().to_ascii_uppercase()),
+                Some(state)
+            );
+        }
+        assert_eq!(
+            serde_json::from_str::<TradeOffState>("\"diligent\"").unwrap(),
+            TradeOffState::Diligent
+        );
     }
 
     #[test]

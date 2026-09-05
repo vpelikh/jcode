@@ -161,6 +161,7 @@ fn test_remote_auto_poke_challenges_abrupt_confidence_increase() {
                 feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
                 feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::MainPaths),
                 feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
+                trade_off: Some(crate::todo::TradeOffState::SomeConsidered),
                 ..Default::default()
             }],
         )
@@ -222,6 +223,7 @@ fn test_remote_auto_poke_completion_below_threshold_tells_model_to_keep_working(
                 feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
                 feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::MainPaths),
                 feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
+                trade_off: Some(crate::todo::TradeOffState::SomeConsidered),
                 ..Default::default()
             }],
         )

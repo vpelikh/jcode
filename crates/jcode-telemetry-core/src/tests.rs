@@ -603,6 +603,7 @@ fn test_session_end_event_serialization() {
         todo_gate_intent_count: 0,
         todo_gate_completion_count: 0,
         todo_gate_spike_count: 0,
+        todo_gate_tradeoff_count: 0,
         command_login_used: false,
         command_model_used: true,
         command_usage_used: false,
@@ -731,6 +732,7 @@ fn test_record_todo_tool_and_gates_aggregate_session_and_turn() {
     record_todo_gate(TodoGateKind::ClosedFeedbackLoop);
     record_todo_gate(TodoGateKind::FeedbackLoopRelevance);
     record_todo_gate(TodoGateKind::FeedbackLoopCoverage);
+    record_todo_gate(TodoGateKind::TradeOff);
 
     {
         let guard = SESSION_STATE.lock().unwrap();
@@ -744,6 +746,7 @@ fn test_record_todo_tool_and_gates_aggregate_session_and_turn() {
         assert_eq!(state.todo_gate_intent_count, 1);
         assert_eq!(state.todo_gate_completion_count, 1);
         assert_eq!(state.todo_gate_spike_count, 1);
+        assert_eq!(state.todo_gate_tradeoff_count, 1);
         let turn = state.current_turn.as_ref().expect("current turn");
         assert_eq!(turn.tool_cat_todo, 2);
         assert!(turn.feature_todo_used);
@@ -753,6 +756,7 @@ fn test_record_todo_tool_and_gates_aggregate_session_and_turn() {
         assert_eq!(turn.todo_gate_intent_count, 1);
         assert_eq!(turn.todo_gate_completion_count, 1);
         assert_eq!(turn.todo_gate_spike_count, 1);
+        assert_eq!(turn.todo_gate_tradeoff_count, 1);
     }
     if let Ok(mut session) = SESSION_STATE.lock() {
         *session = None;

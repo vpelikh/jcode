@@ -151,6 +151,7 @@ fn test_reload_preserves_completed_confidence_spike_challenge() {
                 feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
                 feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::MainPaths),
                 feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
+                trade_off: Some(crate::todo::TradeOffState::SomeConsidered),
                 ..Default::default()
             }],
         )
@@ -303,6 +304,7 @@ fn remote_ownership_gate_reads_the_remote_goal_assessment() {
                 feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
                 feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::MainPaths),
                 feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
+                trade_off: Some(crate::todo::TradeOffState::SomeConsidered),
                 ..Default::default()
             }],
         )
@@ -505,6 +507,7 @@ fn test_gate_digest_is_delivered_at_turn_end_and_rearms_next_cycle() {
                 feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
                 feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::MainPaths),
                 feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
+                trade_off: Some(crate::todo::TradeOffState::SomeConsidered),
                 ..Default::default()
             }],
         )
@@ -682,6 +685,7 @@ fn completed_cycle_rearms_auto_poke_only_when_default_on() {
                 feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
                 feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::MainPaths),
                 feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
+                trade_off: Some(crate::todo::TradeOffState::SomeConsidered),
                 ..Default::default()
             }],
         )
@@ -713,6 +717,7 @@ fn completed_cycle_rearms_auto_poke_only_when_default_on() {
                 feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
                 feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::MainPaths),
                 feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
+                trade_off: Some(crate::todo::TradeOffState::SomeConsidered),
                 ..Default::default()
             }],
         )

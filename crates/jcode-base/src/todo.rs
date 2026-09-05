@@ -30,7 +30,7 @@ pub use jcode_task_types::{
     Autonomy, ConfidenceState, DeliveryState, Difficulty, FeedbackLoopCoverage,
     FeedbackLoopRelevance, FeedbackLoopState, FeedbackLoopTraceability, IntentUnderstanding,
     IterationMaturity, TodoGoal, TodoGoalChange, TodoGoalField, TodoItem, TodoPlan, TodoPlanChange,
-    TodoPlanField,
+    TodoPlanField, TradeOffState,
 };
 
 /// Return the canonical todo status for model-written status vocabulary.
@@ -125,6 +125,23 @@ pub fn feedback_loop_traceability_passes(goal: &TodoGoal) -> bool {
         .is_some_and(|state| state >= required_feedback_loop_traceability(goal.difficulty))
 }
 
+/// Minimum alternative-weighing a completion should demonstrate. Simpler tasks
+/// need only some consideration of alternatives; involved ones demand a diligent
+/// comparison because the design decision carries more weight.
+pub fn required_trade_off(difficulty: Option<Difficulty>) -> TradeOffState {
+    if difficulty.is_some_and(|difficulty| difficulty >= Difficulty::Involved) {
+        TradeOffState::Diligent
+    } else {
+        TradeOffState::SomeConsidered
+    }
+}
+
+/// Whether a goal's trade-off assessment clears its difficulty-calibrated bar.
+pub fn trade_off_passes(goal: &TodoGoal) -> bool {
+    goal.trade_off
+        .is_some_and(|state| state >= required_trade_off(goal.difficulty))
+}
+
 /// Whether a completed todo carries enough evidence behind its completion.
 pub fn completion_confidence_passes(state: Option<ConfidenceState>) -> bool {
     state.is_some_and(|state| state >= ConfidenceState::Validated)
@@ -167,6 +184,7 @@ pub fn delivery_state_passes(goal: &TodoGoal) -> bool {
         && feedback_loop_relevance_passes(goal)
         && feedback_loop_coverage_passes(goal)
         && feedback_loop_traceability_passes(goal)
+        && trade_off_passes(goal)
 }
 
 /// Pre-plan-intent-rewrite alignment continuation. Kept only so persisted
@@ -280,6 +298,12 @@ pub fn build_todo_ownership_continuation_message(todos: &[TodoItem], goals: &[To
                 label
             ));
         }
+        if !trade_off_passes(goal) {
+            message.push_str(&format!(
+                "\n- Goal \"{}\": consider at least one credible alternative and weigh its trade-offs (cost, complexity, performance, compatibility, or maintenance) before calling the result done.",
+                label
+            ));
+        }
         if matches!(
             goal.iteration_maturity,
             Some(
@@ -341,6 +365,7 @@ pub enum GateObservationKind {
     FeedbackLoopRelevance,
     FeedbackLoopCoverage,
     FeedbackLoopTraceability,
+    TradeOff,
 }
 
 /// A point during the turn that would previously have interrupted the model
@@ -407,6 +432,10 @@ fn observation_score_later_cleared(
             .iter()
             .find(|goal| normalized_group(goal.group.as_deref()) == observation.group)
             .is_some_and(feedback_loop_traceability_passes),
+        GateObservationKind::TradeOff => goals
+            .iter()
+            .find(|goal| normalized_group(goal.group.as_deref()) == observation.group)
+            .is_some_and(trade_off_passes),
     }
 }
 
@@ -530,6 +559,26 @@ pub fn build_gate_digest(
                     .unwrap_or_default();
                 format!(
                     "complete requirement-to-check traceability{} was identified only after earlier work was done. Run every mapped check over the whole result now and report what each requirement and changed public output actually did.",
+                    label
+                )
+            }
+            (GateObservationKind::TradeOff, false) => {
+                let label = group
+                    .as_deref()
+                    .map(|group| format!(" for \"{}\"", group))
+                    .unwrap_or_default();
+                format!(
+                    "the work{} never weighed a credible alternative to the chosen approach, so it is not clear the design decision survives its trade-offs. Name at least one alternative that was actually considered, why it lost, and what the chosen approach costs in return for what it gains.",
+                    label
+                )
+            }
+            (GateObservationKind::TradeOff, true) => {
+                let label = group
+                    .as_deref()
+                    .map(|group| format!(" for \"{}\"", group))
+                    .unwrap_or_default();
+                format!(
+                    "alternatives{} were weighed only after the work was done. Reconsider the whole result now: was the chosen approach still the best one, and is the trade-off it depends on one the user would accept?",
                     label
                 )
             }
@@ -1245,6 +1294,27 @@ mod tests {
         assert!(!digest.contains("representative+main_paths"));
     }
 
+    /// A turn that finished without weighing an alternative gets a digest point
+    /// pointing at that gap, with no score or threshold leaked.
+    #[test]
+    fn digest_surfaces_a_missing_trade_off_assessment() {
+        let observations = vec![GateObservation {
+            kind: GateObservationKind::TradeOff,
+            group: Some("ship".to_string()),
+            state: Some("none_considered".to_string()),
+        }];
+        let goals = vec![TodoGoal {
+            group: Some("ship".to_string()),
+            ..Default::default()
+        }];
+        let digest = build_gate_digest(&observations, &TodoPlan::default(), &goals)
+            .expect("a missing trade-off assessment should be surfaced");
+        assert!(digest.contains("never weighed a credible alternative"));
+        assert!(digest.contains("chosen approach"));
+        assert!(!digest.to_ascii_lowercase().contains("threshold"));
+        assert!(!digest.contains("none_considered"));
+    }
+
     #[test]
     fn digest_reports_a_point_that_never_resolved() {
         let observations = vec![intent_observation(Some(IntentUnderstanding::Partial))];
@@ -1786,6 +1856,7 @@ mod tests {
             feedback_loop_relevance: Some(FeedbackLoopRelevance::Representative),
             feedback_loop_coverage: Some(FeedbackLoopCoverage::MainPaths),
             feedback_loop_traceability: Some(FeedbackLoopTraceability::Complete),
+            trade_off: Some(TradeOffState::Diligent),
             ..Default::default()
         }
     }
@@ -1900,6 +1971,38 @@ mod tests {
         assert!(delivery_state_passes(&goal));
         goal.feedback_loop_traceability = None;
         assert!(!delivery_state_passes(&goal));
+    }
+
+    /// A completed goal that never weighed an alternative is held at the gate
+    /// under the trade-off check, and involved goals demand diligent comparison.
+    #[test]
+    fn completion_requires_weighing_alternatives() {
+        // The helper's default trade_off (Diligent) clears both bars.
+        let mut ordinary = delivery_goal(None, Some(DeliveryState::WorkflowValidated));
+        ordinary.trade_off = Some(TradeOffState::SomeConsidered);
+        assert!(delivery_state_passes(&ordinary));
+
+        // Clearing at the ordinary bar is not enough once difficulty rises.
+        let mut involved = delivery_goal(None, Some(DeliveryState::WorkflowValidated));
+        involved.difficulty = Some(Difficulty::Involved);
+        involved.feedback_loop_relevance = Some(FeedbackLoopRelevance::AcceptanceAligned);
+        involved.feedback_loop_coverage = Some(FeedbackLoopCoverage::EdgeAndIntegrationPaths);
+        involved.feedback_loop_traceability = Some(FeedbackLoopTraceability::Complete);
+        involved.trade_off = Some(TradeOffState::SomeConsidered);
+        assert!(!delivery_state_passes(&involved));
+        involved.trade_off = Some(TradeOffState::Diligent);
+        assert!(delivery_state_passes(&involved));
+
+        // An involved goal can clear with Exhaustive too.
+        involved.trade_off = Some(TradeOffState::Exhaustive);
+        assert!(delivery_state_passes(&involved));
+
+        // A completed goal with no trade-off assessment is held.
+        let mut none = delivery_goal(None, Some(DeliveryState::WorkflowValidated));
+        none.trade_off = None;
+        assert!(!delivery_state_passes(&none));
+        none.trade_off = Some(TradeOffState::Implicit);
+        assert!(!delivery_state_passes(&none));
     }
 
     #[test]
@@ -2084,6 +2187,22 @@ mod tests {
         let todos = vec![todo("work", "completed", Some("ship"))];
         let message = build_todo_ownership_continuation_message(&todos, &[]);
         assert!(message.contains("Goal \"ship\": clarify the goal and track the work"));
+    }
+
+    /// When a completed goal never weighed an alternative, the ownership nudge
+    /// says so without disclosing a score or threshold.
+    #[test]
+    fn ownership_continuation_asks_for_alternative_weighting_when_missing() {
+        let todos = vec![todo("work", "completed", Some("ship"))];
+        let mut goal = delivery_goal(Some("ship"), Some(DeliveryState::WorkflowValidated));
+        goal.trade_off = None;
+        let message = build_todo_ownership_continuation_message(&todos, &[goal]);
+        assert!(message.contains("Goal \"ship\""));
+        assert!(message.contains("consider at least one credible alternative"));
+        assert!(message.contains("weigh its trade-offs"));
+        assert!(!message.contains("some_considered"));
+        assert!(!message.contains("diligent"));
+        assert!(!message.contains("none_considered"));
     }
 
     #[test]

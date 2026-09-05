@@ -248,6 +248,9 @@ fn merge_goals(stored: &[TodoGoal], incoming: Option<Vec<TodoGoal>>) -> Vec<Todo
         goal.delivery_state_history = previous
             .map(|prev| prev.delivery_state_history.clone())
             .unwrap_or_default();
+        goal.trade_off_history = previous
+            .map(|prev| prev.trade_off_history.clone())
+            .unwrap_or_default();
         // Field-level merge, matching `merge_plan`: a write that revises one
         // assessment must not silently erase the others. Without this the
         // turn-end digest would read a stale `None` and re-raise a point the
@@ -268,6 +271,9 @@ fn merge_goals(stored: &[TodoGoal], incoming: Option<Vec<TodoGoal>>) -> Vec<Todo
             if goal.feedback_loop_traceability.is_none() {
                 goal.feedback_loop_traceability = prev.feedback_loop_traceability;
             }
+            if goal.trade_off.is_none() {
+                goal.trade_off = prev.trade_off;
+            }
             if goal.difficulty.is_none() {
                 goal.difficulty = prev.difficulty;
             }
@@ -282,6 +288,12 @@ fn merge_goals(stored: &[TodoGoal], incoming: Option<Vec<TodoGoal>>) -> Vec<Todo
             }
             if goal.stopping_evidence.is_none() {
                 goal.stopping_evidence = prev.stopping_evidence.clone();
+            }
+            if goal.trade_offs.is_none() {
+                goal.trade_offs = prev.trade_offs.clone();
+            }
+            if goal.explored_alternative.is_none() {
+                goal.explored_alternative = prev.explored_alternative;
             }
         }
         record_score_observation(
@@ -301,6 +313,7 @@ fn merge_goals(stored: &[TodoGoal], incoming: Option<Vec<TodoGoal>>) -> Vec<Todo
             goal.feedback_loop_traceability,
         );
         record_score_observation(&mut goal.delivery_state_history, goal.delivery_state);
+        record_score_observation(&mut goal.trade_off_history, goal.trade_off);
         if let Some(slot) = merged
             .iter_mut()
             .find(|existing| existing.group == goal.group)
@@ -383,6 +396,9 @@ fn changed_goal_fields(before: Option<&TodoGoal>, after: Option<&TodoGoal>) -> V
         != after.and_then(|goal| goal.stopping_evidence.as_ref())
     {
         fields.push(TodoGoalField::StoppingEvidence);
+    }
+    if before.and_then(|goal| goal.trade_off) != after.and_then(|goal| goal.trade_off) {
+        fields.push(TodoGoalField::TradeOff);
     }
     fields
 }
@@ -559,6 +575,13 @@ fn record_reframe_observations(
                     .map(|state| state.as_str().to_string()),
             });
         }
+        if !crate::todo::trade_off_passes(goal) {
+            observations.push(GateObservation {
+                kind: GateObservationKind::TradeOff,
+                group: goal.group.clone(),
+                state: goal.trade_off.map(|state| state.as_str().to_string()),
+            });
+        }
     }
     (observations, immediate)
 }
@@ -693,6 +716,7 @@ fn normalize_todo_input(mut input: Value) -> Value {
                     "feedback_loop_traceability",
                     "difficulty",
                     "autonomy",
+                    "trade_off",
                 ] {
                     if let Some(value) = fields.get_mut(key) {
                         coerce_empty_string_to_null(value);
@@ -850,6 +874,19 @@ impl Tool for TodoTool {
                             "stopping_evidence": {
                                 "type": "string",
                                 "description": "Evidence for the reported iteration_maturity: attempts, observations, or a real budget limit."
+                            },
+                            "trade_off": {
+                                "type": "string",
+                                "enum": ["none_considered", "implicit", "some_considered", "diligent", "exhaustive"],
+                                "description": "How carefully the agent weighed alternatives before choosing an approach."
+                            },
+                            "trade_offs": {
+                                "type": "string",
+                                "description": "Trade-offs of the chosen approach: cost, complexity, performance, compatibility, maintenance."
+                            },
+                            "explored_alternative": {
+                                "type": "boolean",
+                                "description": "Whether a credible alternative was explored and how it lost."
                             }
                         }
                     }
@@ -890,6 +927,9 @@ impl Tool for TodoTool {
                         }
                         GateObservationKind::FeedbackLoopTraceability => {
                             crate::telemetry::TodoGateKind::FeedbackLoopTraceability
+                        }
+                        GateObservationKind::TradeOff => {
+                            crate::telemetry::TodoGateKind::TradeOff
                         }
                     };
                     crate::telemetry::record_todo_gate(kind);
@@ -1033,12 +1073,25 @@ mod tests {
         assert!(goal_props.contains_key("autonomy"));
         assert!(goal_props.contains_key("iteration_maturity"));
         assert!(goal_props.contains_key("stopping_evidence"));
+        assert!(goal_props.contains_key("trade_off"));
+        assert!(goal_props.contains_key("trade_offs"));
+        assert!(goal_props.contains_key("explored_alternative"));
         assert!(!goal_props.contains_key("end_to_end_ownership"));
         // Intent lives on the plan, not per goal.
         assert!(!goal_props.contains_key("user_intention"));
         assert!(!goal_props.contains_key("alignment_score"));
         assert!(!goal_props.contains_key("objective"));
-        assert_eq!(goal_props.len(), 11);
+        assert_eq!(goal_props.len(), 14);
+        assert_eq!(
+            goal_props["trade_off"]["enum"],
+            json!([
+                "none_considered",
+                "implicit",
+                "some_considered",
+                "diligent",
+                "exhaustive"
+            ])
+        );
         assert_eq!(
             goal_props["feedback_loop_relevance"]["enum"],
             json!([
@@ -1393,6 +1446,7 @@ mod tests {
             feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
             feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::MainPaths),
             feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
+            trade_off: Some(crate::todo::TradeOffState::SomeConsidered),
             ..Default::default()
         }
     }
@@ -1866,7 +1920,7 @@ mod tests {
 
         // The points were recorded for the turn-end digest instead.
         let observations = crate::todo::load_gate_observations(session).expect("observations");
-        assert_eq!(observations.len(), 5);
+        assert_eq!(observations.len(), 6);
         assert!(
             observations.iter().any(|observation| {
                 observation.kind == GateObservationKind::FeedbackLoopRelevance
@@ -1880,6 +1934,11 @@ mod tests {
         assert!(observations.iter().any(|observation| {
             observation.kind == GateObservationKind::FeedbackLoopTraceability
         }));
+        assert!(
+            observations.iter().any(|observation| {
+                observation.kind == GateObservationKind::TradeOff
+            })
+        );
 
         // Histories are accumulating, which is what the digest reasons over.
         let plan = load_plan(session).expect("plan");

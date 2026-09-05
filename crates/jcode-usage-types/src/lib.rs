@@ -619,6 +619,8 @@ pub struct SessionLifecycleEvent {
     pub todo_gate_completion_count: u32,
     #[serde(default)]
     pub todo_gate_spike_count: u32,
+    #[serde(default)]
+    pub todo_gate_tradeoff_count: u32,
     pub command_login_used: bool,
     pub command_model_used: bool,
     pub command_usage_used: bool,
@@ -750,6 +752,8 @@ pub struct TurnEndEvent {
     pub todo_gate_completion_count: u32,
     #[serde(default)]
     pub todo_gate_spike_count: u32,
+    #[serde(default)]
+    pub todo_gate_tradeoff_count: u32,
     pub workflow_chat_only: bool,
     pub workflow_coding_used: bool,
     pub workflow_research_used: bool,

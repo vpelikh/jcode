@@ -217,6 +217,7 @@ struct TurnTelemetry {
     todo_gate_intent_count: u32,
     todo_gate_completion_count: u32,
     todo_gate_spike_count: u32,
+    todo_gate_tradeoff_count: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -304,6 +305,7 @@ struct SessionTelemetry {
     todo_gate_intent_count: u32,
     todo_gate_completion_count: u32,
     todo_gate_spike_count: u32,
+    todo_gate_tradeoff_count: u32,
     command_login_used: bool,
     command_model_used: bool,
     command_usage_used: bool,
@@ -400,6 +402,7 @@ impl TurnTelemetry {
             todo_gate_intent_count: 0,
             todo_gate_completion_count: 0,
             todo_gate_spike_count: 0,
+            todo_gate_tradeoff_count: 0,
         }
     }
 }
@@ -1664,6 +1667,7 @@ fn finalize_current_turn(
         todo_gate_intent_count: turn.todo_gate_intent_count,
         todo_gate_completion_count: turn.todo_gate_completion_count,
         todo_gate_spike_count: turn.todo_gate_spike_count,
+        todo_gate_tradeoff_count: turn.todo_gate_tradeoff_count,
         workflow_chat_only,
         workflow_coding_used,
         workflow_research_used,
@@ -2071,6 +2075,7 @@ fn begin_session_with_mode(
         todo_gate_intent_count: 0,
         todo_gate_completion_count: 0,
         todo_gate_spike_count: 0,
+        todo_gate_tradeoff_count: 0,
         command_login_used: false,
         command_model_used: false,
         command_usage_used: false,
@@ -2436,6 +2441,8 @@ pub enum TodoGateKind {
     Completion,
     /// Completion confidence rose too sharply to count as validated.
     ConfidenceSpike,
+    /// The work never weighed a credible alternative and its trade-offs.
+    TradeOff,
 }
 
 /// Record a todo quality-gate firing (session- and turn-scoped counters).
@@ -2454,6 +2461,7 @@ pub fn record_todo_gate(kind: TodoGateKind) {
             TodoGateKind::IntentUnderstanding => &mut state.todo_gate_intent_count,
             TodoGateKind::Completion => &mut state.todo_gate_completion_count,
             TodoGateKind::ConfidenceSpike => &mut state.todo_gate_spike_count,
+            TodoGateKind::TradeOff => &mut state.todo_gate_tradeoff_count,
         };
         *counter = counter.saturating_add(1);
         if let Some(turn) = state.current_turn.as_mut() {
@@ -2467,6 +2475,7 @@ pub fn record_todo_gate(kind: TodoGateKind) {
                 TodoGateKind::IntentUnderstanding => &mut turn.todo_gate_intent_count,
                 TodoGateKind::Completion => &mut turn.todo_gate_completion_count,
                 TodoGateKind::ConfidenceSpike => &mut turn.todo_gate_spike_count,
+                TodoGateKind::TradeOff => &mut turn.todo_gate_tradeoff_count,
             };
             *counter = counter.saturating_add(1);
             update_turn_activity_timestamp(turn, Instant::now());
