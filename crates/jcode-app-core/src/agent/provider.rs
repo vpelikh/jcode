@@ -267,10 +267,11 @@ impl Agent {
     /// Grouped working-directory change invoked from a user `/cd` request.
     ///
     /// Beyond [`Self::set_working_dir`], this persists the session, refreshes
-    /// project-scoped skills, and appends a model-visible notice about the
-    /// change so the agent re-scopes even after a conversation has progressed
-    /// (the plain `refresh_initial_session_context_message` no-ops once visible
-    /// history exists).
+    /// project-scoped skills, and carries the change to the model. For a
+    /// session with no visible conversation yet, the initial session-context
+    /// system-reminder is rewritten with the new directory. For a session that
+    /// has progressed, that reminder is left untouched and a model-visible
+    /// notice is appended instead.
     pub fn set_working_dir_grouped(&mut self, dir: &str) -> anyhow::Result<()> {
         let old_dir = self
             .session
@@ -289,12 +290,12 @@ impl Agent {
         }
         self.session.working_dir = Some(normalized.clone());
         self.refresh_agents_md_snapshot();
-        // Rebuild the initial context system-reminder when there is still no
-        // visible conversation; otherwise the appended notice below carries the
-        // change to the model. Best-effort: both are tolerant of a missing
-        // initial context message.
-        self.session.refresh_initial_session_context_message();
-        self.session.append_working_dir_notice(&old_dir, &normalized);
+        // Rewrite the initial session-context system-reminder when there is
+        // still no visible conversation; otherwise append a one-off notice so
+        // the change reaches the model without rewriting history.
+        if !self.session.refresh_initial_session_context_message() {
+            self.session.append_working_dir_notice(&old_dir, &normalized);
+        }
         self.session.save()?;
         self.log_env_snapshot("working_dir");
         Ok(())
