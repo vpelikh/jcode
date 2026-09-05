@@ -1752,6 +1752,19 @@ fn agent_reply_message(session_id: &str, reply: &str) -> String {
     )
 }
 
+/// MarkdownV2 placeholder shown while a session reply is streaming. The `[` `]`
+/// around the short id are escaped; the `_thinking…_` is literal italic.
+fn streaming_placeholder(short: &str) -> String {
+    format!("💭 \\[{short}] _thinking…_")
+}
+
+/// MarkdownV2 end-state shown when a turn settles with no assistant output
+/// (typically a Stop tapped before any tokens arrived). Replaces the dangling
+/// placeholder/empty prefix with an honest "stopped" note.
+fn streaming_stopped_message(short: &str) -> String {
+    format!("💬 \\[{short}] ⏹ _stopped — no output produced_")
+}
+
 impl TelegramChannel {
     /// Run a prompt against `session_id` and stream partial assistant text into a
 /// single Telegram message (so the user sees live progress), then leave the
@@ -1773,7 +1786,7 @@ async fn stream_reply_to_session(
     // session, so the user can interrupt the run with one tap (the callback
     // fires the lock-free abort). The button is cleared from the final message
     // when the turn settles.
-    let placeholder = format!("💭 \\[{}] _thinking…_", short_id(session_id));
+    let placeholder = streaming_placeholder(&short_id(session_id));
     use crate::telegram::{InlineKeyboardButton, InlineKeyboardRow};
     let stop_button = InlineKeyboardButton {
         text: "🛑 Stop".to_string(),
@@ -1882,10 +1895,7 @@ async fn stream_reply_to_session(
                 &self.token,
                 self.chat_id.parse::<i64>().unwrap_or(0),
                 sent_id,
-                &format!(
-                    "💬 \\[{}] ⏹ _stopped — no output produced_",
-                    short_id(session_id)
-                ),
+                &streaming_stopped_message(&short_id(session_id)),
                 self.api_base.as_deref(),
             )
             .await;
@@ -3558,5 +3568,27 @@ mod tests {
         // A body with no role prefix is escaped wholesale.
         let plain = escape_history_entries("solo _line_");
         assert_eq!(plain, "solo \\_line\\_");
+    }
+
+    #[test]
+    fn test_streaming_message_templates_are_markdown_v2_safe() {
+        // These are sent with parse_mode=MarkdownV2. The `[` around the id is
+        // escaped (`\[`); a bare `]` after the id is tolerated by Telegram the
+        // same way the pre-existing agent_reply_message (`💬 \[sid] …`) works.
+        // Everything else in the templates must be non-reserved (or the `_`
+        // italic delimiters). Pin the exact output so a change to escaping is
+        // caught.
+        assert_eq!(streaming_placeholder("fox"), "💭 \\[fox] _thinking…_");
+        assert_eq!(
+            streaming_stopped_message("fox"),
+            "💬 \\[fox] ⏹ _stopped — no output produced_"
+        );
+        // Round-trip the dynamic short id through the templates: a short id with
+        // no reserved chars must survive unchanged (no accidental double-escape
+        // or injected parsed markup).
+        assert_eq!(
+            streaming_stopped_message(&crate::telegram::escape_markdown_v2("fox")),
+            streaming_stopped_message("fox")
+        );
     }
 }
