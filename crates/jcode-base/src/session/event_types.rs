@@ -459,11 +459,14 @@ impl SessionEventMap {
 
     /// Append a new event to the map.
     ///
-    /// Events are validated before insertion. Invalid events are skipped with a
-    /// stderr diagnostic (the event log must stay append-only and corruption-tolerant).
+    /// Events are validated before insertion. Invalid events are skipped via the
+    /// logging channel (the event log must stay append-only and corruption-tolerant).
     pub fn append_event(&mut self, event: SessionEvent) {
         if let Err(err) = Self::validate_event(&event) {
-            eprintln!("session_event: skipping invalid event {}: {}", event.event_id, err);
+            crate::logging::warn(&format!(
+                "session_event: skipping invalid event {}: {}",
+                event.event_id, err
+            ));
             return;
         }
         self.update_caches(&event);
