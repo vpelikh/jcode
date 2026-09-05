@@ -3146,3 +3146,42 @@ fn test_known_tag_with_mismatched_shape_degrades_to_unknown() {
     let again: SessionEventOp = serde_json::from_str(&re).expect("re-deserialize");
     assert!(matches!(again, SessionEventOp::Unknown { .. }));
 }
+
+/// The public `Session::event_log()` read accessor lets plugins (and callers
+/// outside `jcode-base`) enumerate the append-only event log — including their
+/// own `Unknown` escape-hatch events — without reaching into the crate-private
+/// `event_map`. Pins that the accessor returns the live committed log.
+#[test]
+fn test_public_event_log_accessor_exposes_committed_events() {
+    let mut session = Session::create_with_id("event_log_accessor".to_string(), None, None);
+    session.append_stored_message(StoredMessage {
+        id: "m1".to_string(),
+        role: Role::User,
+        content: vec![text_block("hello")],
+        display_role: None,
+        timestamp: Some(Utc::now()),
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    session.append_session_event(SessionEvent {
+        timestamp: Utc::now(),
+        event_id: "plugin_evt".to_string(),
+        op: SessionEventOp::Unknown {
+            event_type: "plugin/marker".to_string(),
+            data: serde_json::json!({ "k": "v" }),
+        },
+        parent_id: None,
+        version: 1,
+    });
+
+    let log = session.event_log();
+    // The message append + the plugin Unknown event are both committed.
+    assert_eq!(log.len(), session.event_map.events.len());
+    assert!(
+        log.iter().any(|e| matches!(
+            &e.op,
+            SessionEventOp::Unknown { event_type, .. } if event_type == "plugin/marker"
+        )),
+        "the public accessor must expose the plugin Unknown event"
+    );
+}

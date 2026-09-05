@@ -1817,6 +1817,18 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         self.event_map.events.len() > before
     }
 
+    /// Read-only view of the append-only event log.
+    ///
+    /// This is the public inspection seam for the event-sourced log: plugins
+    /// (and callers outside `jcode-base`) can enumerate committed events —
+    /// including their own `Unknown` escape-hatch events — without reaching into
+    /// the crate-private `event_map`. The log is append-only; use the
+    /// mutation API (`append_session_event`, `set_compaction`,
+    /// `compact_transcript_with_bracket`, ...) to change it.
+    pub fn event_log(&self) -> &[SessionEvent] {
+        &self.event_map.events
+    }
+
     /// Fork the event log up to a boundary and return the prefix as a new map.
     pub fn fork_event_log(&self, boundary_index: usize) -> SessionEventMap {
         self.event_map.fork_up_to_boundary(boundary_index)
