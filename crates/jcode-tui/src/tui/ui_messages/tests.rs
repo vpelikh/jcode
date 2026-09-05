@@ -804,6 +804,7 @@ fn render_todos_message_collapses_passing_quality_gates() {
         feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::AcceptanceAligned),
         feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::EdgeAndIntegrationPaths),
         feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
+        trade_off: Some(crate::todo::TradeOffState::SomeConsidered),
         delivery_state: Some(crate::todo::DeliveryState::OutcomeDelivered),
         ..Default::default()
     }];
@@ -830,6 +831,48 @@ fn render_todos_message_collapses_passing_quality_gates() {
         .find(|span| span.content.as_ref() == "✓ All quality gates passing")
         .and_then(|span| span.style.fg);
     assert_eq!(passing, Some(todo_score_color()));
+}
+
+/// The goal scorecard exposes the trade-off gate like any other quality gate:
+/// a missing assessment reads as an explicit failure row on the card, not a
+/// silent gap.
+#[test]
+fn goal_scorecard_shows_missing_trade_off() {
+    let todos = vec![crate::todo::TodoItem {
+        id: "1".to_string(),
+        content: "Render the card".to_string(),
+        status: "completed".to_string(),
+        priority: "high".to_string(),
+        group: Some("quality".to_string()),
+        confidence: Some(crate::todo::ConfidenceState::Validated),
+        completion_confidence: Some(crate::todo::ConfidenceState::Validated),
+        ..Default::default()
+    }];
+    // All other gates pass; only trade_off is absent, so the scorecard must
+    // flag it rather than claiming all quality gates pass.
+    let goals = vec![crate::todo::TodoGoal {
+        group: Some("quality".to_string()),
+        closed_feedback_loop: Some(crate::todo::FeedbackLoopState::Closed),
+        feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::AcceptanceAligned),
+        feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::EdgeAndIntegrationPaths),
+        feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
+        delivery_state: Some(crate::todo::DeliveryState::OutcomeDelivered),
+        ..Default::default()
+    }];
+    let msg =
+        DisplayMessage::todos(serde_json::json!({ "todos": todos, "goals": goals }).to_string());
+    let lines = render_todos_message(&msg, 100, crate::config::DiffDisplayMode::Off);
+    let plain = lines
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(plain.contains("Trade-off missing"), "{plain}");
+    assert!(
+        !plain.contains("✓ All quality gates passing"),
+        "a missing trade_off must not read as all quality gates passing:\n{plain}"
+    );
 }
 
 #[test]
@@ -1381,6 +1424,7 @@ fn unbiased_visual_prompt_retry_renders_complete_feedback_change() {
             group: Some("pelican-bike-animation".to_string()),
             closed_feedback_loop: Some(crate::todo::FeedbackLoopState::from_legacy_score(98)),
             feedback_loop: Some(REVISED_FEEDBACK.to_string()),
+            trade_off: Some(crate::todo::TradeOffState::SomeConsidered),
             ..Default::default()
         },
         REVISED_OBJECTIVE,
@@ -1427,6 +1471,7 @@ fn visually_appealing_prompt_batched_retry_renders_complete_todo_card() {
         closed_feedback_loop: Some(crate::todo::FeedbackLoopState::from_legacy_score(98)),
         feedback_loop: Some(FEEDBACK.to_string()),
         feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
+        trade_off: Some(crate::todo::TradeOffState::SomeConsidered),
         ..Default::default()
     }];
     let plan = crate::todo::TodoPlan {
@@ -1518,6 +1563,7 @@ fn render_ownership_gated_todo_result_keeps_the_full_card() {
         feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
         feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::MainPaths),
         feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
+        trade_off: Some(crate::todo::TradeOffState::SomeConsidered),
         delivery_state: Some(crate::todo::DeliveryState::from_legacy_score(80)),
         ..Default::default()
     }];
