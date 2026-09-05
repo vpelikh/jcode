@@ -2156,11 +2156,14 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
             }
         }
 
-        // Memory injections must also agree (by count; the type lacks PartialEq).
+        // Memory injections must also agree. `StoredMemoryInjection` derives
+        // `PartialEq`, so this is an exact (order + content) comparison — a
+        // divergence in which injections were recorded, or in what order they
+        // appear, is caught rather than only a count mismatch.
         let derived_inj = self.derive_memory_injections();
-        if derived_inj.len() != self.memory_injections.len() {
+        if derived_inj != self.memory_injections {
             return Err(format!(
-                "event_map derived {} memory injections but session.memory_injections has {}",
+                "event_map memory injections diverge from session.memory_injections (derived {} vs {} legacy)",
                 derived_inj.len(),
                 self.memory_injections.len()
             ));

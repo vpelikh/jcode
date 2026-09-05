@@ -209,7 +209,7 @@ pub struct EnvSnapshot {
 }
 
 /// A memory injection event, stored for replay visualization
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredMemoryInjection {
     /// Human-readable summary (e.g., "🧠 auto-recalled 3 memories")
     pub summary: String,

@@ -2212,6 +2212,35 @@ fn test_memory_injection_and_replay_event_derived_order_matches_legacy() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `rederive_all_checked` compares memory injections EXACTLY (order + content),
+/// not just by count. A legacy `memory_injections` vector reordered relative to
+/// the derived event log must be flagged as a divergence — this is the check
+/// that would have silently passed under the old count-only comparison, hiding
+/// a real dual-source desync.
+#[test]
+fn test_rederive_all_checked_flags_reordered_injection() {
+    let mut session = Session::create_with_id("inject_order_divergence".to_string(), None, None);
+    session.record_memory_injection("first".to_string(), "A".to_string(), 1, 0, vec![]);
+    session.record_memory_injection("second".to_string(), "B".to_string(), 2, 0, vec![]);
+
+    // Sanity: before divergence, the checked re-derive passes and order matches.
+    assert_eq!(session.derive_memory_injections().len(), 2);
+    session.rederive_all_checked().expect("consistent session must pass");
+
+    // Introduce a divergence: reverse the legacy injection order relative to the
+    // derived log. The exact comparison must catch it (count is unchanged, so a
+    // count-only check would have hidden it).
+    let replayed = session.derive_memory_injections();
+    session.memory_injections = replayed.into_iter().rev().collect();
+
+    let err = session
+        .rederive_all_checked()
+        .expect_err("reordered injections must be flagged as a divergence");
+    assert!(
+        err.contains("memory injections diverge"),
+        "expected the injection-divergence message, got: {err}"
+    );
+}
 #[test]
 fn test_compaction_cache_tracks_clear_and_reset_order() {
     // The `cached_compaction` cache must reflect the physical event order across
