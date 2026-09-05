@@ -581,8 +581,18 @@ impl Agent {
         // something ("call the tool the 'verifier'", "call it a success"). They
         // count as a tool-invocation only when clearly followed by an intent to
         // act ("call bash to run...", "call bash now") or the end of the turn,
-        // never when the target is being given a name.
-        const FIRST_PERSON_CALL: [&str; 2] = ["let me call", "i'll call"];
+        // never when the target is being given a name. Mirror the invoke branch
+        // by also covering common interposed-adverb degenerate phrasings.
+        const FIRST_PERSON_CALL: [&str; 8] = [
+            "let me call",
+            "i'll call",
+            "let me now call",
+            "i'll now call",
+            "let me just call",
+            "i'll just call",
+            "let me go ahead and call",
+            "i'll go ahead and call",
+        ];
         const TOOL_TARGETS: [&str; 20] = [
             "bash",
             "the bash",

@@ -1820,6 +1820,11 @@ mod tests {
             "I'll just invoke the tool.",
             "Let me go ahead and invoke the script.",
             "I'll go ahead and invoke bash now.",
+            // interposed-adverb "call" forms (symmetrical coverage)
+            "Let me now call bash.",
+            "I'll now call bash.",
+            "I'll just call the command.",
+            "Let me go ahead and call bash.",
         ];
         for turn in stalls {
             assert!(
