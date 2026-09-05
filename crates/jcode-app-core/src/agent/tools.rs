@@ -138,21 +138,20 @@ fn tool_summary_line(tool: &ToolCall) -> Option<String> {
         "compass_query" | "agentgrep" => {
             // Show the query that was given, matching `grep` which prints the
             // pattern. Queries are free-form so this surfaces in the live tool
-            // summary exactly what was searched.
+            // summary exactly what was searched. The quoted style mirrors the
+            // TUI summary (`get_tool_summary_with_budget`) so both rendering
+            // layers present the same tool identically.
             tool.input
                 .get("query")
                 .and_then(|v| v.as_str())
+                .filter(|query| !query.trim().is_empty())
                 .map(|query| {
                     let label = if query.len() > 60 {
                         format!("{}...", crate::util::truncate_str(query, 60))
                     } else {
                         query.to_string()
                     };
-                    if tool.name == "compass_query" {
-                        format!("compass: {}", label)
-                    } else {
-                        format!("'{}'", label)
-                    }
+                    format!("'{}'", label)
                 })
         }
         "ls" => Some(
@@ -181,7 +180,7 @@ mod tests {
     #[test]
     fn tool_summary_shows_compass_query() {
         let line = tool_summary_line(&tool_call("compass_query", "search for the config"));
-        assert_eq!(line.as_deref(), Some("compass: search for the config"));
+        assert_eq!(line.as_deref(), Some("'search for the config'"));
     }
 
     #[test]
@@ -191,13 +190,19 @@ mod tests {
     }
 
     #[test]
+    fn tool_summary_blank_query_is_empty() {
+        let line = tool_summary_line(&tool_call("compass_query", "   "));
+        assert_eq!(line, None);
+    }
+
+    #[test]
     fn tool_summary_truncates_long_query() {
         let long = "x".repeat(100);
         let line = tool_summary_line(&tool_call("compass_query", &long)).unwrap();
-        assert!(line.starts_with("compass: xxx"));
-        assert!(line.ends_with("..."));
-        // "compass: " (9 chars) + up to 60 chars + "..."
-        assert!(line.chars().count() <= 9 + 60 + 3);
+        assert!(line.starts_with("'xxxx"));
+        assert!(line.ends_with("...'"));
+        // 2 quotes + up to 60 chars + "..."
+        assert!(line.chars().count() <= 2 + 60 + 3);
     }
 
     #[test]
