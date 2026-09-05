@@ -349,6 +349,11 @@ fn resolve_working_dir(base: &std::path::Path, dir: &str) -> anyhow::Result<Stri
         let home = dirs::home_dir().ok_or_else(|| {
             anyhow::anyhow!("cannot expand `~/` because the home directory is not resolvable")
         })?;
+        // `PathBuf::join` with an absolute path resets to that path, so a
+        // leading slash in `rest` (e.g. `~//etc` from a doubled slash) would
+        // escape the home dir and resolve against the filesystem root. Trim all
+        // leading slashes so `~/...` stays relative to home.
+        let rest = rest.trim_start_matches('/');
         home.join(rest)
     } else if dir == "~" {
         dirs::home_dir().ok_or_else(|| {
@@ -449,6 +454,16 @@ mod resolve_working_dir_tests {
             std::path::Path::new(&bare),
             home.canonicalize().unwrap().as_path(),
             "bare ~ must resolve to the home directory"
+        );
+
+        // `~//subdir` (a doubled slash) must NOT escape home to the filesystem
+        // root; it must stay relative to home. PathBuf::join would reset to the
+        // absolute `/subdir` if the leading slash were not trimmed.
+        let double = resolve_working_dir(std::path::Path::new("/tmp"), "~//subdir").unwrap();
+        assert_eq!(
+            std::path::Path::new(&double),
+            sub.canonicalize().unwrap().as_path(),
+            "~//... must remain relative to home, not escape to the filesystem root"
         );
 
         if let Some(prev) = prev_home {
