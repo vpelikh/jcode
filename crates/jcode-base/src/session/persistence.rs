@@ -472,12 +472,12 @@ impl Session {
         // Note: `event_map` is deliberately NOT part of `has_configured_state`.
         // A fresh session's `ensure_initial_session_context_message()` produces an
         // AppendMessage event, so counting `!event_map.is_empty()` would force a
-        // first save for every untouched panel and defeat the lazy-save gate. The
-        // realistic producers of log-only events (compaction brackets, plugin
-        // `Unknown`) always persist a real message/compaction alongside, so they
-        // are not gated out; only a hypothetical session carrying *exclusively*
-        // log-only events and no message/configured-state and never saved would
-        // be skipped, which is accepted to preserve lazy-save semantics.
+        // first save for every untouched panel and defeat the lazy-save gate.
+        // Log-only events (compaction brackets, plugin `Unknown`) ARE persisted
+        // via the dedicated last gate clause below: when they exist without any
+        // message/configured-state, the skip condition is false and the session
+        // is written. Only a fresh session whose sole event is the auto-added
+        // session-context placeholder is still skipped, preserving lazy-save.
         let has_configured_state = self.title.is_some()
             || self.model.is_some()
             || self.provider_key.is_some()
@@ -493,22 +493,6 @@ impl Session {
             // dropped, so persist it even without a visible conversation line.
             || !self.replay_events.is_empty()
             || !self.memory_injections.is_empty()
-            // Log-only event-log signals (plugin `Unknown` escape-hatch events,
-            // bare compaction-bracket markers) carry durable meaning even when
-            // they are not accompanied by a message/compaction/configured state.
-            // Unlike a blanket `!event_map.is_empty()`, this deliberately
-            // EXCLUDES the placeholder session-context AppendMessage event (and
-            // every ordinary message event), so the untouched-panel lazy-save
-            // gate still holds: a fresh session whose only event is the auto-added
-            // context stub is still skipped until a real conversation starts.
-            || self.event_map.events.iter().any(|e| {
-                matches!(
-                    e.op,
-                    SessionEventOp::Unknown { .. }
-                        | SessionEventOp::CompactionStart { .. }
-                        | SessionEventOp::CompactionEnd { .. }
-                )
-            })
             // An actively-run session (a PID marker was registered via
             // `mark_active`/`mark_active_with_pid`) must persist even before a
             // conversation message exists so restart/crash recovery can find it.
@@ -517,11 +501,33 @@ impl Session {
         // session-context placeholder (e.g. system-reminder lines, display-role
         // notices) must be persisted so tools like session_search can read it.
         let has_non_placeholder_message = self.has_message_beyond_session_context();
+        //
+        // Log-only event-log signals (plugin `Unknown` escape-hatch events, bare
+        // compaction-bracket markers) carry durable meaning even when they are
+        // not accompanied by a message/compaction/configured state, and must be
+        // persisted rather than dropped by the lazy-save gate. This is checked
+        // as the LAST clause of the skip condition (not OR'd into
+        // `has_configured_state`) so the full event-log scan only runs when every
+        // cheap earlier clause says "this fresh session might be skipped": a real
+        // session (already saved, has a snapshot, or has a non-placeholder
+        // message) short-circuits the `&&` chain before reaching this scan, so a
+        // hot save path does not pay an O(n) walk over a large event log. Because
+        // it sits *after* `has_configured_state`, it never defeats lazy-save for a
+        // fresh session whose only event is the auto-added session-context
+        // placeholder.
         if !self.persist_state.snapshot_exists
             && !has_non_placeholder_message
             && !self.saved
             && self.custom_title.is_none()
             && !has_configured_state
+            && !self.event_map.events.iter().any(|e| {
+                matches!(
+                    e.op,
+                    SessionEventOp::Unknown { .. }
+                        | SessionEventOp::CompactionStart { .. }
+                        | SessionEventOp::CompactionEnd { .. }
+                )
+            })
         {
             return Ok(());
         }
