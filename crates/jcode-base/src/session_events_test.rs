@@ -3846,3 +3846,131 @@ fn test_public_event_log_accessor_exposes_committed_events() {
         "the public accessor must expose the plugin Unknown event"
     );
 }
+
+/// Deterministic, seeded property test: feed a pseudo-random sequence of
+/// message ops (append/insert/clear/replace) into a `SessionEventMap` and
+/// assert `derive_messages` always matches a directly-maintained reference
+/// `Vec<StoredMessage>` — on every prefix AND the full sequence. This exercises
+/// adversarial interleavings (out-of-range inserts, full/partial replaces,
+/// clears mid-stream) that hand-written cases omit, catching any latent
+/// divergance between the event log fold and the reference transcript.
+#[test]
+fn test_derive_messages_fuzz_matches_reference() {
+    let mut map = SessionEventMap::default();
+    let mut reference: Vec<StoredMessage> = Vec::new();
+    let mut next_id = 0u64;
+    let mut seed: u64 = 0x9E37_79B9_7F4A_7C15; // deterministic
+    let next = |seed: &mut u64| {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (*seed >> 33) as u64
+    };
+    let mut message = |next_id: &mut u64| {
+        let id = format!("m{}", *next_id);
+        *next_id += 1;
+        StoredMessage {
+            id,
+            role: Role::User,
+            content: vec![text_block(if *next_id % 2 == 0 { "even" } else { "odd" })],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        }
+    };
+
+    for step in 0..400u64 {
+        let op = (next(&mut seed) % 5) as u8;
+        let n = (next(&mut seed) % 9) as usize; // steps often small
+        match op {
+            // Append
+            0 => {
+                let m = message(&mut next_id);
+                let id = m.id.clone();
+                map.events.push(SessionEvent {
+                    timestamp: Utc::now(),
+                    event_id: id.clone(),
+                    op: SessionEventOp::AppendMessage {
+                        message_id: id,
+                        message: m.clone(),
+                    },
+                    parent_id: None,
+                    version: 1,
+                });
+                reference.push(m);
+            }
+            // Insert at index (possibly out-of-range or end)
+            1 => {
+                let m = message(&mut next_id);
+                let idx = n.min(reference.len());
+                // Mirror derive_messages clamping.
+                map.events.push(SessionEvent {
+                    timestamp: Utc::now(),
+                    event_id: format!("ins_{step}"),
+                    op: SessionEventOp::InsertMessage {
+                        index: n,
+                        message: m.clone(),
+                    },
+                    parent_id: None,
+                    version: 1,
+                });
+                reference.insert(idx, m);
+            }
+            // Replace messages in [start,end)
+            2 => {
+                let replace_with: Vec<StoredMessage> =
+                    (0..n).map(|_| message(&mut next_id)).collect();
+                let start = (next(&mut seed) % (reference.len() as u64 + 1)) as usize;
+                let end = (next(&mut seed) % (reference.len() as u64 + 1)) as usize;
+                let (a, b) = (start.min(end), start.max(end).min(reference.len()));
+                map.events.push(SessionEvent {
+                    timestamp: Utc::now(),
+                    event_id: format!("repl_{step}"),
+                    op: SessionEventOp::ReplaceMessages {
+                        start_index: a,
+                        end_index: b,
+                        messages: replace_with.clone(),
+                    },
+                    parent_id: None,
+                    version: 1,
+                });
+                reference.splice(a..b, replace_with);
+            }
+            // Insert at end (position == len)
+            3 => {
+                let m = message(&mut next_id);
+                map.events.push(SessionEvent {
+                    timestamp: Utc::now(),
+                    event_id: format!("end_{step}"),
+                    op: SessionEventOp::InsertMessage {
+                        index: reference.len(),
+                        message: m.clone(),
+                    },
+                    parent_id: None,
+                    version: 1,
+                });
+                reference.push(m);
+            }
+            // ClearAll
+            4 => {
+                map.events.push(SessionEvent {
+                    timestamp: Utc::now(),
+                    event_id: format!("clr_{step}"),
+                    op: SessionEventOp::ClearAll,
+                    parent_id: None,
+                    version: 1,
+                });
+                reference.clear();
+            }
+            _ => unreachable!(),
+        }
+
+        // At every prefix, the derived ids must match the reference.
+        let derived: Vec<String> =
+            map.derive_messages().iter().map(|m| m.id.clone()).collect();
+        let expect: Vec<String> = reference.iter().map(|m| m.id.clone()).collect();
+        assert_eq!(
+            derived, expect,
+            "fuzz mismatch at step {step} (op kind {op})"
+        );
+    }
+}
