@@ -645,7 +645,7 @@ pub async fn send_message_with_base(
                 // blindly sending the (misaligned) second chunk.
                 return Err(e);
             }
-            (Err(e), n) if is_connectivity_error(&e) => {
+            (Err(e), _) if is_connectivity_error(&e) => {
                 // A connectivity failure on a later chunk means the transport
                 // (or the discovered DC IP) has gone down, so the remaining
                 // chunks will fail too. Keep surfacing the error so callers

@@ -210,7 +210,7 @@ pub struct TelegramChannel {
     /// Wrapped in a Mutex because `reply_loop` runs on `Arc<Self>` and needs
     /// `&mut` access to flip the `warned` flag across an `.await`.
     auth_warning_tracker: tokio::sync::Mutex<AuthWarningTracker>,
-    /// Tracks pending confirmation state for destructive operations (/free, /abort).
+    /// Tracks pending confirmation state for destructive operations (/free).
     /// Wrapped in a Mutex for the same reason as `auth_warning_tracker`.
     confirmation_tracker: tokio::sync::Mutex<ConfirmationTracker>,
 }
@@ -563,6 +563,49 @@ impl TelegramChannel {
         // state (confirmation_tracker, active session) and reply ordering stay
         // consistent: text messages are handled under process_lock in spawned
         // tasks, so callbacks must take the same lock or they can interleave.
+        //
+        // EXCEPT the "🛑 Stop" callback: it MUST be handled before taking
+        // process_lock, because that lock is held for the entire duration of a
+        // streaming turn (handle_inbound_message holds it across
+        // stream_reply_to_session). Waiting for the lock here would mean the
+        // stop only takes effect after the very turn the user is trying to
+        // interrupt finishes - defeating the feature. Firing the abort signal
+        // is itself atomic/lock-free, so it is safe to do outside the lock.
+        if let Some(id) = cb.data.as_deref().and_then(|d| d.strip_prefix("__abort__")) {
+            let id = id.trim();
+            if id.is_empty() {
+                let _ = crate::telegram::answer_callback_query(
+                    &client,
+                    &self.token,
+                    &cb.id,
+                    "No session id to stop.",
+                    self.api_base.as_deref(),
+                )
+                .await;
+                return;
+            }
+            crate::logging::info(&format!(
+                "telegram stop-button tap session={id} (pre-lock fast path)"
+            ));
+            let signaled =
+                crate::server::telegram_control::request_graceful_shutdown_for_control(id)
+                    .await;
+            let ack = if signaled {
+                format!("🛑 Stopping `{}`…", short_id(id))
+            } else {
+                format!("No running turn for `{}`.", short_id(id))
+            };
+            let _ = crate::telegram::answer_callback_query(
+                &client,
+                &self.token,
+                &cb.id,
+                &ack,
+                self.api_base.as_deref(),
+            )
+            .await;
+            return;
+        }
+
         let _guard = self.process_lock.lock().await;
         let Some(data) = cb.data.as_deref() else {
             let _ = crate::telegram::answer_callback_query(
@@ -627,44 +670,6 @@ impl TelegramChannel {
                 )
                 .await;
             }
-            return;
-        }
-
-        // A tap on the "🛑 Stop" button attached to a streaming reply carries a
-        // `__abort__<session_id>` payload: fire a lock-free graceful shutdown of
-        // that session's in-flight turn so the model stops generating. This is
-        // intentionally *not* gated behind /confirm: the streamed output up to
-        // this point is preserved and the turn can be re-run, so stopping is
-        // reversible (unlike /free, which drops the session from memory).
-        if let Some(id) = data.strip_prefix("__abort__") {
-            let id = id.trim().to_string();
-            if id.is_empty() {
-                let _ = crate::telegram::answer_callback_query(
-                    &client,
-                    &self.token,
-                    &cb.id,
-                    "No session id to stop.",
-                    self.api_base.as_deref(),
-                )
-                .await;
-                return;
-            }
-            let signaled =
-                crate::server::telegram_control::request_graceful_shutdown_for_control(&id)
-                    .await;
-            let ack = if signaled {
-                format!("🛑 Stopping `{}`…", short_id(&id))
-            } else {
-                format!("No running turn for `{}`.", short_id(&id))
-            };
-            let _ = crate::telegram::answer_callback_query(
-                &client,
-                &self.token,
-                &cb.id,
-                &ack,
-                self.api_base.as_deref(),
-            )
-            .await;
             return;
         }
 
@@ -996,8 +1001,11 @@ impl TelegramChannel {
                 short_id(&session_id)
             )
         } else {
+            // A live-but-idle session (or a session with a turn that is already
+            // settling) has nothing running to stop; say so accurately rather
+            // than blaming the configuration or session existence.
             format!(
-                "⚠️ `{}` is not a live session, or Telegram control is not wired to a server runtime.",
+                "ℹ️ No running turn on `{}` to stop.",
                 short_id(&session_id)
             )
         }
@@ -1026,7 +1034,7 @@ impl TelegramChannel {
                     )
                 } else {
                     format!(
-                        "⚠️ `{}` is not a live session, or Telegram control is not wired to a server runtime.",
+                        "ℹ️ No running turn on `{}` to stop.",
                         short_id(&session_id)
                     )
                 }
@@ -1049,7 +1057,7 @@ impl TelegramChannel {
         }
     }
 
-    /// `/cancel`: cancel a pending `/free` or `/abort` confirmation.
+    /// `/cancel`: cancel a pending `/free` confirmation.
     async fn cancel_reply(&self) -> String {
         let mut tracker = self.confirmation_tracker.lock().await;
         if tracker.clear() {
@@ -1638,7 +1646,7 @@ impl AuthWarningTracker {
 }
 
 
-/// Tracks confirmation state for destructive operations (/free, /abort).
+/// Tracks confirmation state for destructive operations (/free).
 /// Holds at most one pending confirmation per channel at a time, with a TTL
 /// so a stale prompt cannot be confirmed long after it was issued.
 #[derive(Default)]
@@ -1769,6 +1777,12 @@ async fn stream_reply_to_session(
     use crate::telegram::{InlineKeyboardButton, InlineKeyboardRow};
     let stop_button = InlineKeyboardButton {
         text: "🛑 Stop".to_string(),
+        // The full session id is encoded in callback_data so the callback can
+        // resolve and abort the exact turn. Telegram caps callback_data at 64
+        // bytes; memorable session ids are `session_<word>_<millis>_<hex>` where
+        // word is at most 11 chars (50 bytes) plus the 9-byte `__abort__` prefix
+        // (59 total), so this fits today. If the id format ever lengthens past
+        // ~54 chars this would be rejected by Telegram, so keep it in mind.
         callback_data: format!("__abort__{}", session_id),
     };
     let keyboard: Vec<InlineKeyboardRow> = vec![vec![stop_button]];
@@ -3006,6 +3020,71 @@ mod tests {
                 !text.contains("/confirm")
             }),
             "stopping must not post a /confirm prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stop_callback_fires_even_while_process_lock_is_held() {
+        // Regression guard for the Round-3 deadlock fix: a streaming turn holds
+        // process_lock for its entire duration, so the Stop callback MUST be
+        // handled before taking that lock. If it regresses to waiting on
+        // process_lock, this test hangs and, with the timeout, fails.
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::TempDir::new().expect("temp home");
+        crate::env::set_var("JCODE_HOME", home.path());
+        let mock = MockTelegram::start().await;
+        let ch = TelegramChannel::with_connectivity(
+            "tok".into(),
+            "77".into(),
+            true,
+            Some(mock.base()),
+            None,
+            None,
+            None,
+        );
+
+        // Simulate an in-flight streaming turn by holding the process lock.
+        let _held = ch.process_lock.lock().await;
+
+        let cb = crate::telegram::CallbackQuery {
+            id: "cb_stop_locked".into(),
+            from: Some(crate::telegram::TelegramFrom { id: 1 }),
+            data: Some("__abort__session_stop_1_aabbccddeeff".into()),
+            message: Some(crate::telegram::CallbackMessage {
+                chat: Some(crate::telegram::Chat { id: 77 }),
+                message_id: Some(44),
+            }),
+        };
+
+        // Must complete even though process_lock is held (abort is pre-lock).
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ch.handle_callback_query(cb),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "Stop callback must not block on process_lock held by a streaming turn"
+        );
+
+        let (methods, bodies) = (mock.methods().await, mock.bodies().await);
+        assert!(
+            methods.iter().any(|m| m == "answerCallbackQuery"),
+            "a Stop-button tap while stream-locked must still be answered, got {methods:?}"
+        );
+        // No free confirmation should be queued by an abort.
+        let free_confirmed_msgs = bodies
+            .iter()
+            .zip(methods.iter())
+            .filter(|(_, m)| m.as_str() == "sendMessage")
+            .filter(|(b, _)| {
+                let text = b["text"].as_str().unwrap_or("");
+                text.contains("/confirm")
+            })
+            .count();
+        assert_eq!(
+            free_confirmed_msgs, 0,
+            "stop must not post a /confirm prompt while stream-locked"
         );
     }
 
