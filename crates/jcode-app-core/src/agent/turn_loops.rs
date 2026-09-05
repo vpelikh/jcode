@@ -1557,6 +1557,26 @@ mod tests {
     }
 
     #[test]
+    fn compact_unfulfilled_tool_request_ignores_cross_clause_disjoint() {
+        // The first-person invoke frame and the bound-to-verb tool target must
+        // come from the SAME clause. A merely-disjoint conjunction lets "i'll
+        // invoke" (abstract, sentence 1) combine with "invoke the shell"
+        // (third-person, sentence 2), falsely flagging a genuine answer. The
+        // detector must require the first-person verb to be immediately bound
+        // to the tool target.
+        let legitimate = [
+            "I'll invoke the policy. The harness will invoke the shell hook on deploy.",
+            "Let me invoke the review. This setup invokes the tool on every commit.",
+        ];
+        for turn in legitimate {
+            assert!(
+                !Agent::is_stalled_promise_text(turn),
+                "a first-person abstract 'invoke' must not pair with a third-person tool description: {turn:?}"
+            );
+        }
+    }
+
+    #[test]
     fn compact_unfulfilled_tool_request_is_stalled() {
         // The exact compact degradation observed in a real long-context session
         // (DeepSeek via OpenRouter): a SHORT turn explicitly says it will invoke a

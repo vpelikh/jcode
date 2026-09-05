@@ -466,17 +466,20 @@ impl Agent {
     ///    match.
     ///  - It must contain a first-person future/volitional invoke frame ("let me
     ///    invoke", "i'll invoke", "i will invoke", "i'm going to invoke", "i am
-    ///    going to invoke", "let me call bash", "let me call the bash tool"). A
-    ///    bare third-person/descriptive "will invoke" (e.g. "this setup will
+    ///    going to invoke", "let me call", "i'll call"). A bare
+    ///    third-person/descriptive "will invoke" (e.g. "this setup will
     ///    invoke shell hooks") is NOT a promise by the agent to act, so it must
     ///    not match.
-    ///  - It must reference an actual tool target directly bound to the
-    ///    invoke/call verb (e.g. "invoke bash", "invoke the tool", "call bash"),
-    ///    not merely present anywhere in the turn. This rejects a genuine answer
-    ///    like "I'll invoke the policy; the release pipeline will run after CI
-    ///    passes", where the first-person "i'll invoke" is abstract and the
-    ///    common word "run" belongs to a different clause. All observed stalls
-    ///    name the tool right after the verb, so this coupling loses no coverage.
+    ///  - The first-person verb must be immediately bound to an actual tool
+    ///    target in the SAME phrase (e.g. "i'll invoke bash", "let me call the
+    ///    bash tool"). This rejects a genuine answer like "I'll invoke the
+    ///    policy; the release pipeline will run after CI", where the first-person
+    ///    "i'll invoke" is abstract and the common word "run" belongs to a
+    ///    different clause. It also rejects pairing a first-person abstract
+    ///    "invoke" with a third-person tool description elsewhere ("I'll invoke
+    ///    the policy. The harness will invoke the shell hook."). All observed
+    ///    stalls name the tool right after the first-person verb, so this
+    ///    same-clause coupling loses no coverage.
     ///
     /// NOTE: this uses EXACT multi-word phrase matching by design. On real
     /// archived sessions it yields zero false positives (only the true
@@ -489,66 +492,45 @@ impl Agent {
         if low.len() > Self::COMPACT_STALLED_TOOL_REQUEST_MAX_LEN {
             return false;
         }
-        // Require a first-person, present tense promise to invoke a tool. Only
+        // Detect a first-person, present-tense promise to invoke a tool. Only
         // these reliably signal that the AGENT intends to act right now; bare
         // non-first-person forms ("the harness will invoke bash now", "the cron
         // job invokes the tool") describe tooling or a dependency and are NOT a
         // promise by the agent, so they must not be treated as a stall. All real
         // observed stalls (giraffe 5/5, sabertooth) use a first-person frame, so
         // this tightening loses no coverage.
-        let has_future_invoke = [
+        //
+        // The first-person verb must be IMMEDIATELY bound to a concrete
+        // tool/command target (e.g. "i'll invoke bash", "let me call the bash
+        // tool"). Coupling them into a single conjunct is essential: a check
+        // that merely ANDs "a first-person frame somewhere" with "a tool word
+        // somewhere" lets the two come from DIFFERENT clauses, falsely flagging
+        // a genuine answer like "I'll invoke the policy. The harness will invoke
+        // the shell hook on deploy." Here the first-person "i'll invoke" is
+        // abstract and the "invoke the shell" is a third-person description.
+        // Requiring them in the same phrase (verb then target) rejects that
+        // false positive while keeping every observed stall, which always names
+        // the tool right after the verb.
+        const FIRST_PERSON_INVOKE: [&str; 7] = [
             "let me invoke",
             "i'll invoke",
             "i will invoke",
             "i'm going to invoke",
             "i am going to invoke",
-            "let me call bash",
-            "let me call the bash tool",
-        ]
-        .iter()
-        .any(|p| low.contains(p));
-        if !has_future_invoke {
-            return false;
-        }
-        // Must reference a concrete tool/command target directly bound to the
-        // invoke/call verb, so "invoke" in an abstract/past context is not a
-        // stall. This is deliberately coupled (verb immediately followed by a
-        // tool target) rather than "any target word anywhere in the turn":
-        // the target list includes common words ("run", "tool", "cmd"), so a
-        // disjoint check would let a final answer like "I'll invoke the policy.
-        // The release pipeline will run after CI passes." match on the unrelated
-        // "run" and be falsely flagged. All observed real stalls bind a concrete
-        // tool to the verb ("invoke bash", "invoke the bash tool", "call bash"),
-        // so requiring the adjacency loses no coverage.
-        let invoke_bound_to_target = [
-            "invoke bash",
-            "invoke the bash",
-            "invoke tool",
-            "invoke the tool",
-            "invoke command",
-            "invoke the command",
-            "invoke grep",
-            "invoke the grep",
-            "invoke sed",
-            "invoke run",
-            "invoke the run",
-            "invoke shell",
-            "invoke the shell",
-            "invoke script",
-            "invoke the script",
-            "invoke cmd",
-            "call bash",
-            "call the bash",
-            "call tool",
-            "call the tool",
-            "call command",
-            "call grep",
-            "call sed",
-            "call shell",
-            "call script",
-            "call cmd",
+            "let me call",
+            "i'll call",
         ];
-        invoke_bound_to_target.iter().any(|p| low.contains(p))
+        const TOOL_TARGETS: [&str; 11] = [
+            "bash", "the bash", "tool", "the tool", "command", "the command", "grep", "sed",
+            "shell", "the shell", "cmd",
+        ];
+        // The detector runs on one short (<=700 char) turn per recovery check,
+        // so building the few candidate phrases here is negligible.
+        FIRST_PERSON_INVOKE.iter().any(|starter| {
+            TOOL_TARGETS
+                .iter()
+                .any(|target| low.contains(&format!("{starter} {target}")))
+        })
     }
 
     /// Request a single bounded continuation when the model stopped after
