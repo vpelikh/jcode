@@ -16,13 +16,16 @@ impl Agent {
     pub(crate) const MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS: u32 = 5;
     /// Minimum density (action-promise phrases per 100 chars) that classifies
     /// an assistant turn as stalled behind "Let me..." filler rather than a
-    /// legitimate answer. Bounded retries ensure a genuinely finished agent
-    /// still exits promptly.
+    /// legitimate answer.
     pub(crate) const STALLED_PROMISE_DENSITY_THRESHOLD: f64 = 2.0;
     /// Minimum number of action-promise phrases before a turn can be
     /// classified as stalled filler. Guards short, legitimate answers that say
     /// "let me" once in passing.
     pub(crate) const MIN_STALLED_PROMISE_PHRASE_COUNT: usize = 8;
+    /// Retries allowed when the model stops after promising an action without
+    /// performing it. Bounded per turn-loop so a genuinely finished agent still
+    /// exits promptly while a pathological always-stalled model never loops
+    /// forever.
     pub(crate) const MAX_STALLED_PROMISE_CONTINUATION_ATTEMPTS: u32 = 3;
     const SEQUENTIAL_TOOL_ROUNDS_BEFORE_BATCH_NUDGE: u32 = 3;
     const BATCH_NUDGE: &str = "<system-reminder>Several tool calls have been made one at a time. If the next independent operations can run concurrently, use the batch tool instead of making more sequential calls. Keep sequential calls when one result is required to decide the next operation.</system-reminder>";
