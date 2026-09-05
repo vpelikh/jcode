@@ -217,6 +217,34 @@ mod tests {
         clear_redirect_pending(sid);
         assert!(!redirect_pending(sid), "one clear must release a double-mark");
     }
+
+    #[test]
+    fn raw_fallback_blocked_output_guides_toward_compass() {
+        // Pin the model-visible guidance for a blocked raw fallback: it must
+        // name compass_query, state that the block clears after an attempt, and
+        // carry the distinguishing title/metadata so callers can tell it from a
+        // redirect.
+        let out = raw_fallback_blocked_output();
+        assert_eq!(
+            out.title.as_deref(),
+            Some("agentgrep raw fallback refused until compass_query attempted")
+        );
+        assert!(
+            out.output.contains("compass_query"),
+            "block must direct the model to compass_query, got: {}",
+            out.output
+        );
+        assert!(
+            out.output.contains("Once `compass_query` has been attempted"),
+            "block must state the restriction clears after a compass attempt, got: {}",
+            out.output
+        );
+        assert_eq!(
+            out.metadata.as_ref().and_then(|m| m.get("reason")),
+            Some(&serde_json::json!("compass-redirect-pending")),
+            "block must carry the compass-redirect-pending reason"
+        );
+    }
 }
 
 #[cfg(test)]
