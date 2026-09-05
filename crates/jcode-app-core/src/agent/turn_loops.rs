@@ -1514,6 +1514,29 @@ mod tests {
     }
 
     #[test]
+    fn stalled_promise_stray_fence_mid_turn_never_hides_stall() {
+        // A stray unclosed "```" can appear in the MIDDLE of a turn (a streamed
+        // or degenerate model), not only at the end. When the fence count is odd
+        // the stripper is deliberately all-or-nothing (recall-first): it cannot
+        // know which marker is the stray one, so ANY greedy pairing could strip
+        // a block that actually contains the stall. It must therefore NOT strip
+        // at all, leaving the stall visible regardless of where the stray marker
+        // landed (before, inside, or after the promise).
+        let cases = [
+            // stray marker BEFORE the stall
+            "```\n(unfinished)\nI'll invoke bash now.",
+            // genuine stall then a stray marker AFTER it
+            "I'll invoke bash now.\n```\n(stream cut off)",
+        ];
+        for turn in cases {
+            assert!(
+                Agent::is_stalled_promise_text(turn),
+                "a stall must remain detectable when a stray unclosed fence is present: {turn:?}"
+            );
+        }
+    }
+
+    #[test]
     fn stalled_promise_density_threshold_is_bracketed() {
         // Exactly MIN_PHRASE=8 occurrences, but the density must still decide:
         // padded short => dense (above 2.0) must flag; padded long => sparse
@@ -1595,6 +1618,26 @@ mod tests {
             assert!(
                 !Agent::is_stalled_promise_text(turn),
                 "legitimate short final answer must not be flagged as stalled: {turn:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_unfulfilled_tool_request_ignores_disjoint_abstraction() {
+        // The invoke frame and an unrelated common tool word must not combine
+        // into a false positive. Here "I'll invoke the policy" is abstract and
+        // the "run" refers to the release pipeline, not a tool the agent
+        // promised to call now. A naively DISJOINT target check (any common
+        // tool word anywhere in the short turn) would flag this; the detector
+        // must require the target to be bound to the invoke verb.
+        let legitimate = [
+            "I'll invoke the team's policy on this. The release pipeline will run after CI passes.",
+            "Let me invoke our review process. The build tool runs for every commit.",
+        ];
+        for turn in legitimate {
+            assert!(
+                !Agent::is_stalled_promise_text(turn),
+                "an abstract 'invoke' with an unrelated tool word must not be flagged: {turn:?}"
             );
         }
     }

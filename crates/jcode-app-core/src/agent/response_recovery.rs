@@ -334,30 +334,31 @@ impl Agent {
     /// fenced blocks only removes quoting false-positives. Returns a new
     /// String only when a fence was found; otherwise returns the input slice.
     fn without_fenced_code_blocks(text: &str) -> std::borrow::Cow<'_, str> {
-        if !text.contains("```") {
+        let is_fence = |line: &str| line.trim_start().starts_with("```");
+        if !text.lines().any(is_fence) {
             return std::borrow::Cow::Borrowed(text);
         }
-        let lines: Vec<_> = text.split('\n').collect();
         // Only strip fenced blocks when they are BALANCED (each opening has a
         // closing delimiter). A stray unclosed "```" (common from a streamed or
         // degenerate model) must not swallow the rest of the turn: that would
         // hide a genuine "I'll invoke..." stall behind an accidental fence.
-        let mut depth = 0usize;
-        for line in &lines {
-            if line.trim_start().starts_with("```") {
-                depth += 1;
-            }
-        }
-        if !depth.is_multiple_of(2) {
+        //
+        // This is deliberately all-or-nothing (recall-first): when the marker
+        // count is ODD, we cannot know which marker is the stray one, so ANY
+        // greedy pairing could strip a block that actually contains the stall.
+        // Returning the whole text as prose guarantees a stall is never hidden.
+        // Each real observed stall streams filler as visible prose (never inside
+        // a balanced code fence), so this loses no genuine coverage.
+        let total = text.lines().filter(|line| is_fence(line)).count();
+        if total % 2 != 0 {
             // Unbalanced fence delimiters: treat the whole text as prose so a
             // stall embedded around/after the stray marker stays detectable.
             return std::borrow::Cow::Borrowed(text);
         }
         let mut out = String::with_capacity(text.len());
         let mut in_fence = false;
-        for line in lines {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("```") {
+        for line in text.lines() {
+            if is_fence(line) {
                 in_fence = !in_fence;
                 continue;
             }
@@ -469,9 +470,13 @@ impl Agent {
     ///    bare third-person/descriptive "will invoke" (e.g. "this setup will
     ///    invoke shell hooks") is NOT a promise by the agent to act, so it must
     ///    not match.
-    ///  - It must reference an actual tool target (bash / tool / command / run /
-    ///    grep / sed / a specific action verb), so philosophical or past-tense
-    ///    uses of "invoke" do not match.
+    ///  - It must reference an actual tool target directly bound to the
+    ///    invoke/call verb (e.g. "invoke bash", "invoke the tool", "call bash"),
+    ///    not merely present anywhere in the turn. This rejects a genuine answer
+    ///    like "I'll invoke the policy; the release pipeline will run after CI
+    ///    passes", where the first-person "i'll invoke" is abstract and the
+    ///    common word "run" belongs to a different clause. All observed stalls
+    ///    name the tool right after the verb, so this coupling loses no coverage.
     ///
     /// NOTE: this uses EXACT multi-word phrase matching by design. On real
     /// archived sessions it yields zero false positives (only the true
@@ -505,20 +510,45 @@ impl Agent {
         if !has_future_invoke {
             return false;
         }
-        // Must reference a concrete tool/command target so "invoke" in an
-        // abstract/past context is not a stall.
-        let tool_target = [
-            "bash",
-            "tool",
-            "command",
-            "grep",
-            "sed",
-            "run",
-            "shell",
-            "script",
-            "cmd",
+        // Must reference a concrete tool/command target directly bound to the
+        // invoke/call verb, so "invoke" in an abstract/past context is not a
+        // stall. This is deliberately coupled (verb immediately followed by a
+        // tool target) rather than "any target word anywhere in the turn":
+        // the target list includes common words ("run", "tool", "cmd"), so a
+        // disjoint check would let a final answer like "I'll invoke the policy.
+        // The release pipeline will run after CI passes." match on the unrelated
+        // "run" and be falsely flagged. All observed real stalls bind a concrete
+        // tool to the verb ("invoke bash", "invoke the bash tool", "call bash"),
+        // so requiring the adjacency loses no coverage.
+        let invoke_bound_to_target = [
+            "invoke bash",
+            "invoke the bash",
+            "invoke tool",
+            "invoke the tool",
+            "invoke command",
+            "invoke the command",
+            "invoke grep",
+            "invoke the grep",
+            "invoke sed",
+            "invoke run",
+            "invoke the run",
+            "invoke shell",
+            "invoke the shell",
+            "invoke script",
+            "invoke the script",
+            "invoke cmd",
+            "call bash",
+            "call the bash",
+            "call tool",
+            "call the tool",
+            "call command",
+            "call grep",
+            "call sed",
+            "call shell",
+            "call script",
+            "call cmd",
         ];
-        tool_target.iter().any(|t| low.contains(t))
+        invoke_bound_to_target.iter().any(|p| low.contains(p))
     }
 
     /// Request a single bounded continuation when the model stopped after
