@@ -1538,3 +1538,43 @@ fn stale_reviewer_session_detected_but_fresh_is_not() {
         "a reviewer idle exactly the timeout length is stale"
     );
 }
+
+// Regression (file-touch recording): changed_files_from_signature parses
+// `git status --porcelain` output into the set of touched file paths, which the
+// review loop records in the digest and uses (via review_touched_files) to
+// decide whether to re-run the completion gates. Pin the common porcelain states.
+#[test]
+fn changed_files_from_signature_parses_porcelain_states() {
+    use super::commands_review::changed_files_from_signature;
+
+    // Modified / added / deleted / untracked, plus a rename and an unchanged line.
+    let sig = "\
+ M src/foo.rs
+?? new_dir/
+ D src/gone.rs
+R  old.rs -> new.rs
+ M src/foo.rs
+";
+    let files = changed_files_from_signature(sig);
+    // Dedup (BTreeSet), reduced to a deterministic list.
+    assert_eq!(
+        files,
+        vec![
+            "new.rs".to_string(),
+            "new_dir/".to_string(),
+            "src/foo.rs".to_string(),
+            "src/gone.rs".to_string()
+        ],
+        "must parse modified/untracked/deleted/rename and dedup"
+    );
+}
+
+#[test]
+fn changed_files_from_signature_handles_empty() {
+    use super::commands_review::changed_files_from_signature;
+    assert!(changed_files_from_signature("").is_empty(), "empty signature yields no files");
+    assert!(
+        changed_files_from_signature("  \n  \n").is_empty(),
+        "whitespace-only lines yield no files"
+    );
+}

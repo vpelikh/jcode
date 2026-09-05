@@ -37,7 +37,7 @@ fn working_tree_signature(cwd: &std::path::Path) -> Option<String> {
 /// signature, used to record which files a review-loop fix turn actually
 /// touched. Handles the common states (` M`, `A `, `??`, ` D`) and renames
 /// (`R100 old -> new`).
-fn changed_files_from_signature(sig: &str) -> Vec<String> {
+pub(super) fn changed_files_from_signature(sig: &str) -> Vec<String> {
     use std::collections::BTreeSet;
     let mut files = BTreeSet::new();
     for line in sig.lines() {
