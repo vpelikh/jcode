@@ -1429,4 +1429,18 @@ mod tests {
         let concise = "Let me confirm the worktree state.";
         assert!(!Agent::is_stalled_promise_text(concise));
     }
+
+    #[test]
+    fn stalled_promise_text_ignores_let_me_know_signoff() {
+        // "let me know" is a feedback/closing phrase, not an action promise.
+        // A final answer that repeatedly asks for confirmation must not be
+        // treated as stalled.
+        let signoff = "Let me know. Let me know if anything needs changing. \
+                       Let me know your thoughts. Let me know. Let me know if you want more. \
+                       Let me know when to continue. Let me know. Let me know. Let me know.";
+        assert!(
+            !Agent::is_stalled_promise_text(signoff),
+            "'let me know' sign-off must not be treated as action-promise stalling"
+        );
+    }
 }

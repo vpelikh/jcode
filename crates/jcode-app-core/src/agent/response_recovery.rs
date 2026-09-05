@@ -343,6 +343,12 @@ impl Agent {
         for p in phrases {
             count += low.matches(p).count();
         }
+        // "let me know" is a closing/feedback phrasing (e.g. "let me know if you
+        // want changes"), not a promise to perform an action the model then
+        // fails to take. Subtracting it out of the "let me" count keeps the
+        // heuristic focused on action-promise stalling and avoids flagging a
+        // genuine final answer that merely asks for confirmation.
+        count -= low.matches("let me know").count();
         // Require a non-trivial number of promise phrases: a single "let me"
         // in a short answer is normal and must not be treated as stalling.
         if count < Self::MIN_STALLED_PROMISE_PHRASE_COUNT {
