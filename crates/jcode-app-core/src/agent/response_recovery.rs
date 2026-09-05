@@ -716,10 +716,37 @@ impl Agent {
     /// place ("to your attention", "in to the meeting"), which is not a promise
     /// to act on the tool.
     fn call_followed_by_action_infinitive(after: &str) -> bool {
-        const ACTION_VERBS: [&str; 19] = [
-            "run", "execute", "check", "grep", "view", "verify", "inspect", "read", "show",
-            "display", "print", "list", "search", "test", "parse", "review", "look", "fetch",
+        const ACTION_VERBS: [&str; 30] = [
+            "run",
+            "execute",
+            "check",
+            "grep",
+            "view",
+            "verify",
+            "inspect",
+            "read",
+            "show",
+            "display",
+            "print",
+            "list",
+            "search",
+            "test",
+            "parse",
+            "review",
+            "look",
+            "fetch",
             "generate",
+            "start",
+            "stop",
+            "build",
+            "compile",
+            "apply",
+            "create",
+            "update",
+            "write",
+            "use",
+            "compare",
+            "diff",
         ];
         let mut rest = after;
         while let Some(idx) = rest.find(" to ") {

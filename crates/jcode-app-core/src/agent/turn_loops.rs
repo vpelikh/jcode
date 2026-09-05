@@ -1760,6 +1760,9 @@ mod tests {
             // bare multi-word target ending ("call the bash tool.")
             "I'll call the bash tool.",
             "I'll call the run command.",
+            // broader action verbs after " to "
+            "I'll call the script to build the project.",
+            "Let me call bash to start the server now.",
         ];
         for turn in stalls {
             assert!(
