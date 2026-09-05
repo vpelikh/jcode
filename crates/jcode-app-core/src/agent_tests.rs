@@ -2121,3 +2121,188 @@ async fn fable_guardrail_reconsideration_recovers_the_streaming_turn() {
         "{text:?}"
     );
 }
+
+/// Provider that reproduces the Duckling stall: the first response is dense
+/// "Let me..." filler with no tool call and a normal `stop` reason. A correct
+/// agent must not treat that as a finished answer; it asks for a continuation,
+/// which the second response satisfies with a real, concise completion.
+#[derive(Clone, Default)]
+struct StalledPromiseProvider {
+    calls: Arc<std::sync::Mutex<usize>>,
+}
+
+#[async_trait]
+impl Provider for StalledPromiseProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        let call = {
+            let mut guard = self.calls.lock().unwrap();
+            *guard += 1;
+            *guard
+        };
+        let (tx, rx) = tokio_mpsc::channel::<Result<StreamEvent>>(8);
+        tokio::spawn(async move {
+            if call == 1 {
+                // Dense action-promise filler, no tool use, normal stop.
+                let _ = tx
+                    .send(Ok(StreamEvent::TextDelta(
+                        "Let me read the method. Let me run the shell read. Let me look. \
+                         Let me view it. Let me grep. Let me run the command. Let me check. \
+                         Let me execute. Let me do it."
+                            .to_string(),
+                    )))
+                    .await;
+                let _ = tx
+                    .send(Ok(StreamEvent::MessageEnd {
+                        stop_reason: Some("stop".to_string()),
+                    }))
+                    .await;
+            } else {
+                // A real, concise completion that must be surfaced.
+                let _ = tx
+                    .send(Ok(StreamEvent::TextDelta(
+                        "The append_stored_message self-heal path is verified.".to_string(),
+                    )))
+                    .await;
+                let _ = tx
+                    .send(Ok(StreamEvent::MessageEnd {
+                        stop_reason: Some("end_turn".to_string()),
+                    }))
+                    .await;
+            }
+        });
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    fn name(&self) -> &str {
+        "stalled-promise"
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+}
+
+/// End-to-end guard: dense "Let me..." filler with no tool call must trigger
+/// a single continuation request (second provider call) and surface the real
+/// completion, rather than ending the turn on the stalled filler.
+#[tokio::test]
+async fn stalled_promise_turn_requests_continuation_via_streaming_loop() {
+    let _guard = crate::storage::lock_test_env();
+    let stalled = StalledPromiseProvider::default();
+    let calls = stalled.calls.clone();
+    let provider: Arc<dyn Provider> = Arc::new(stalled);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent
+        .run_once_streaming_mpsc("review append_stored_message", Vec::new(), None, tx)
+        .await
+        .expect("turn should complete");
+
+    let mut text = String::new();
+    while let Ok(event) = rx.try_recv() {
+        if let ServerEvent::TextDelta { text: delta } = event {
+            text.push_str(&delta);
+        }
+    }
+
+    assert_eq!(
+        *calls.lock().unwrap(),
+        2,
+        "stalled 'Let me...' filler must trigger exactly one continuation request"
+    );
+    assert!(
+        text.contains("append_stored_message self-heal path is verified"),
+        "the recovered turn must deliver the real completion, got {text:?}"
+    );
+}
+
+/// End-to-end bv watchdog: if the model keeps stalling on every continuation,
+/// the agent must give up after the bounded number of attempts and surface the
+/// partial output rather than re-invoking forever.
+#[tokio::test]
+async fn stalled_promise_turn_gives_up_after_bounded_continuations() {
+    let _guard = crate::storage::lock_test_env();
+    // A provider that always returns stalled filler with no tool call.
+    let stuck = AlwaysStalledProvider::default();
+    let calls = stuck.calls.clone();
+    let provider: Arc<dyn Provider> = Arc::new(stuck);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent
+        .run_once_streaming_mpsc("do the task", Vec::new(), None, tx)
+        .await
+        .expect("turn should complete");
+
+    let mut text = String::new();
+    while let Ok(event) = rx.try_recv() {
+        if let ServerEvent::TextDelta { text: delta } = event {
+            text.push_str(&delta);
+        }
+    }
+
+    // 1 original call + MAX_STALLED_PROMISE_CONTINUATION_ATTEMPTS retries.
+    // Next attempt starts by checking the counter, so call count is bounded.
+    assert!(
+        *calls.lock().unwrap() <= 1 + Agent::MAX_STALLED_PROMISE_CONTINUATION_ATTEMPTS as usize,
+        "agent must not re-invoke in an unbounded loop, made {} calls",
+        *calls.lock().unwrap()
+    );
+}
+
+/// A provider that always returns dense "Let me..." filler with no tool call.
+#[derive(Clone, Default)]
+struct AlwaysStalledProvider {
+    calls: Arc<std::sync::Mutex<usize>>,
+}
+
+#[async_trait]
+impl Provider for AlwaysStalledProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        let _ = {
+            let mut guard = self.calls.lock().unwrap();
+            *guard += 1;
+            *guard
+        };
+        let (tx, rx) = tokio_mpsc::channel::<Result<StreamEvent>>(8);
+        tokio::spawn(async move {
+            let _ = tx
+                .send(Ok(StreamEvent::TextDelta(
+                    "Let me read it. Let me run it. Let me view it. Let me check. \
+                     Let me grep it. Let me find it. Let me look at it. Let me do it. \
+                     Let me examine it. Let me parse it. Let me print it. Let me search it."
+                        .to_string(),
+                )))
+                .await;
+            let _ = tx
+                .send(Ok(StreamEvent::MessageEnd {
+                    stop_reason: Some("stop".to_string()),
+                }))
+                .await;
+        });
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    fn name(&self) -> &str {
+        "always-stalled"
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+}
