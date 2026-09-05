@@ -811,6 +811,59 @@ fn test_rebuild_event_map_preserves_orphaned_compaction_start() {
         .expect("rebuilt log with preserved orphan must stay consistent");
 }
 
+/// `rebuild_event_map` must preserve a COMPLETED bracket run (Start…End) whose
+/// `CompactionEnd` carries the current authoritative compaction, not just orphan
+/// starts and `Unknown` events. Previously a divergent-load rebuild collapsed the
+/// compaction narrative into a single `SetCompaction`, losing the bracket run.
+#[test]
+fn test_rebuild_event_map_preserves_completed_bracket_run() {
+    let mut session = Session::create_with_id("rebuild_bracket_pair".to_string(), None, None);
+    session.append_stored_message(StoredMessage {
+        id: "m1".to_string(),
+        role: Role::User,
+        content: vec![text_block("hello")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    let comp = StoredCompactionState {
+        summary_text: "brief".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 1,
+    };
+    // A balanced bracket: Start -> replace -> End.
+    session.compact_transcript_with_bracket("run", session.messages.clone(), comp.clone(), 1);
+    assert!(
+        session.event_map.orphaned_compaction().is_none(),
+        "precondition: the bracket is closed"
+    );
+
+    // Rebuild from the legacy vectors (simulating reconcile / sanitize-clear).
+    session.rebuild_event_map();
+
+    // The full bracket run (Start and End, not just a SetCompaction) is preserved.
+    let has_start = session
+        .event_map
+        .events
+        .iter()
+        .any(|e| matches!(e.op, SessionEventOp::CompactionStart { .. }));
+    let has_end = session
+        .event_map
+        .events
+        .iter()
+        .any(|e| matches!(e.op, SessionEventOp::CompactionEnd { .. }));
+    assert!(has_start, "completed bracket Start must survive the rebuild");
+    assert!(has_end, "completed bracket End must survive the rebuild");
+    // Balanced + consistent with legacy.
+    assert!(session.event_map.orphaned_compaction().is_none());
+    session
+        .rederive_all_checked()
+        .expect("rebuilt log with preserved bracket run must stay consistent");
+}
+
 /// Unknown ops must still be rejected by validation if their event id is empty,
 /// and accepted when the payload is well formed, so plugin events do not
 /// silently corrupt the log invariants.

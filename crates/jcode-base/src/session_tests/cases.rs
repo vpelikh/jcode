@@ -648,6 +648,65 @@ fn load_for_remote_startup_preserves_messages_and_replay_but_skips_heavy_vectors
     Ok(())
 }
 
+/// A log-only plugin `Unknown` event appended AFTER the first save is carried
+/// in the journal's `append_events`. `load_for_remote_startup` must replay it so
+/// the stub's event log is not lossy for log-only events (regression for the
+/// previous behavior that dropped journal `append_events`).
+#[test]
+fn load_for_remote_startup_preserves_journaled_log_only_events() -> Result<()> {
+    use crate::session::event_types::{SessionEvent, SessionEventOp};
+
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-remote-startup-logonly-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let session_id = "session_remote_startup_logonly";
+    let mut session = Session::create_with_id(session_id.to_string(), None, None);
+    session.append_stored_message(StoredMessage {
+        id: "m1".to_string(),
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+        display_role: None,
+        timestamp: Some(Utc::now()),
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    session.save()?; // first save -> snapshot
+
+    // Append a log-only plugin event; the next save goes to the journal.
+    assert!(
+        session.append_session_event(SessionEvent {
+            timestamp: Utc::now(),
+            event_id: "plugin_remote_1".to_string(),
+            op: SessionEventOp::Unknown {
+                event_type: "plugin/remote".to_string(),
+                data: serde_json::json!({ "k": "v" }),
+            },
+            parent_id: None,
+            version: 1,
+        }),
+        "plugin event must be recorded"
+    );
+    session.save()?;
+
+    // The remote-startup stub must preserve the journaled log-only event.
+    let loaded = Session::load_for_remote_startup(session_id)?;
+    assert!(
+        loaded.event_map.events.iter().any(|e| matches!(
+            &e.op,
+            SessionEventOp::Unknown { event_type, .. } if event_type == "plugin/remote"
+        )),
+        "load_for_remote_startup must preserve the journaled plugin Unknown event"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_create_marks_debug_when_test_session_env_enabled() {
     let _env_lock = lock_env();

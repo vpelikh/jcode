@@ -408,15 +408,18 @@ impl Session {
             session.apply_journal_meta(entry.meta);
             session.messages.extend(entry.append_messages);
             session.replay_events.extend(entry.append_replay_events);
-            // NOTE: unlike `load_from_path` (which uses `apply_journal_entry`
-            // and replays `append_memory_injections` + `append_events`), this
-            // remote-startup path deliberately replays only the structural
-            // vectors. `session_from_remote_startup_snapshot` clears
-            // memory_injections/replay_events and rebuilds the event log from
-            // the (limited) remote snapshot, so journal-carried log-only events
-            // (compaction brackets, plugin `Unknown`) and memory injections are
-            // intentionally not preserved here — this is a minimal stub
-            // hydration, distinct from the full event-sourced `load_from_path`.
+            // Replay journal-carried log-only events and memory injections so
+            // the remote-startup stub carries the same event-log contents as
+            // the authoritative `load_from_path`. Previously only the structural
+            // vectors (meta, messages, replay events) were replayed, which
+            // silently dropped log-only events (compaction brackets, plugin
+            // `Unknown`) and memory injections if the journal held them before
+            // the next snapshot. Pushing into `event_map` preserves them, and
+            // `reconcile_event_map_after_load` below validates consistency.
+            session.memory_injections.extend(entry.append_memory_injections);
+            for event in entry.append_events {
+                session.event_map.push_event(event);
+            }
         })?;
         let journal_ms = journal_start.elapsed().as_millis();
         let finalize_start = Instant::now();

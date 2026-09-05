@@ -1829,9 +1829,7 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         // skips invalid events internally).
         let before = self.event_map.events.len();
         // Capture the op before `append_event` moves it (needed for the
-        // debug-only self-check below). Only computed in debug builds so release
-        // does not pay the clone.
-        #[cfg(debug_assertions)]
+        // dual-source self-check below).
         let op_kind = event.op.clone();
         self.event_map.append_event(event);
         let recorded = self.event_map.events.len() > before;
@@ -1841,36 +1839,44 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
             // `append_stored_message`). Cheap flag-only; the profile rebuilds
             // lazily on the next snapshot.
             self.mark_memory_profile_dirty();
-            // Debug-only self-check for the dual-source-of-truth contract. The
-            // API warns that a state-carrying op (`AppendMessage`/`InsertMessage`/
-            // `ReplaceMessages`/`ClearAll`) requires the caller to keep the legacy
-            // `messages` vector in sync. Verify that contract here so a forgetful
-            // caller is caught in dev instead of silently desyncing the two
-            // sources (which would otherwise force a divergent-load rebuild that
-            // drops log-only markers). Log-only events (`Unknown`, brackets,
-            // `SetCompaction`, `ReplayEvent`, `MemoryInjection`) do not count into
-            // `messages`, so they never trip the check.
-            #[cfg(debug_assertions)]
-            {
-                let message_ops = matches!(
-                    op_kind,
-                    SessionEventOp::AppendMessage { .. }
-                        | SessionEventOp::InsertMessage { .. }
-                        | SessionEventOp::ReplaceMessages { .. }
-                        | SessionEventOp::ClearAll
-                );
-                if message_ops {
-                    // Compare only lengths to keep the check cheap and avoid
-                    // requiring `PartialEq` (which `StoredMessage` deliberately
-                    // lacks). A caller that synced the legacy vector exactly (or
-                    // used the dedicated Session methods) matches here.
-                    let derived = self.event_map.derive_messages().len();
-                    assert!(
-                        derived == self.messages.len(),
+            // Dual-source-of-truth self-check. The API contract says a state-carrying
+            // op (`AppendMessage`/`InsertMessage`/`ReplaceMessages`/`ClearAll`)
+            // requires the caller to keep the legacy `messages` vector in sync.
+            // Verify here so a forgetful caller is caught: in debug builds this
+            // is a hard assert; in release it logs a warning (without crashing,
+            // since a release-shipped caller's mismatch must not take down the
+            // process) so the desync is surfaced instead of silently forcing a
+            // later divergent-load rebuild that drops log-only markers.
+            // Log-only events (`Unknown`, brackets, `SetCompaction`,
+            // `ReplayEvent`, `MemoryInjection`) do not count into `messages`,
+            // so they never trip the check.
+            let message_ops = matches!(
+                op_kind,
+                SessionEventOp::AppendMessage { .. }
+                    | SessionEventOp::InsertMessage { .. }
+                    | SessionEventOp::ReplaceMessages { .. }
+                    | SessionEventOp::ClearAll
+            );
+            if message_ops {
+                // Compare only lengths to keep the check cheap and avoid
+                // requiring `PartialEq` (which `StoredMessage` deliberately
+                // lacks). A caller that synced the legacy vector exactly (or
+                // used the dedicated Session methods) matches here.
+                let derived = self.event_map.derive_messages().len();
+                if derived != self.messages.len() {
+                    let msg = format!(
                         "session event-log/legacy desync after append_session_event: \
                          log derives {derived} messages but session.messages has {}",
                         self.messages.len()
                     );
+                    #[cfg(debug_assertions)]
+                    {
+                        panic!("{msg}");
+                    }
+                    #[cfg(not(debug_assertions))]
+                    {
+                        crate::logging::warn(&msg);
+                    }
                 }
             }
         }
@@ -2282,6 +2288,51 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
             .into_iter()
             .cloned()
             .collect();
+        // Also preserve MATCHED (closed) bracket pairs whose final
+        // `CompactionEnd` carries the CURRENT authoritative compaction. A
+        // divergent-load rebuild would otherwise collapse the compaction
+        // *narrative* (Start…End) into a single `SetCompaction`, losing the
+        // bracket run. Preserve the full matched pair (all events from the
+        // first Start through the matching End), but ONLY when its persisting
+        // End agrees with `self.compaction` — preserving a stale/mismatched End
+        // would make `rederive_all_checked` diverge from the legacy vector and
+        // trigger a second rebuild. The preserved pair is re-appended AFTER the
+        // reconstructed `SetCompaction` (same compaction), so `current_compaction`
+        // stays correct and `rederive_all_checked` stays green.
+        let preserved_bracket_pairs: Vec<SessionEvent> = {
+            let events = &self.event_map.events;
+            let current = self.compaction.clone();
+            let mut depth = 0usize;
+            let mut run_start = usize::MAX;
+            let mut pairs: Vec<SessionEvent> = Vec::new();
+            for (i, e) in events.iter().enumerate() {
+                match &e.op {
+                    SessionEventOp::CompactionStart { .. } => {
+                        if depth == 0 {
+                            run_start = i;
+                        }
+                        depth += 1;
+                    }
+                    SessionEventOp::CompactionEnd { compaction } => {
+                        if depth == 0 {
+                            // Dangling End; not part of a matched pair.
+                            continue;
+                        }
+                        depth -= 1;
+                        if depth == 0 && Some(compaction.clone()) == current {
+                            // A fully-closed pair whose End matches the current
+                            // authoritative compaction: preserve the whole run.
+                            for ev in &events[run_start..=i] {
+                                pairs.push(ev.clone());
+                            }
+                            run_start = usize::MAX;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            pairs
+        };
 
         for (i, message) in self.messages.iter().enumerate() {
             map.push_event(SessionEvent {
@@ -2332,12 +2383,17 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
             });
         }
 
-        // Re-append the preserved log-only events: plugin `Unknown` events and
-        // orphaned `CompactionStart` markers. They are appended LAST so their
-        // relative order is unchanged and they sit after any reconstructed state
-        // events (their position in the log never matters to derivation, but
-        // keeping them contiguous at the tail preserves the append-only narrative
-        // for any downstream reader).
+        // Re-append the preserved log-only events: matched bracket pairs, plugin
+        // `Unknown` events, and orphaned `CompactionStart` markers. They are
+        // appended LAST so their relative order is unchanged and they sit after
+        // any reconstructed state events (their position in the log never matters
+        // to derivation, but keeping them contiguous at the tail preserves the
+        // append-only narrative for any downstream reader). Matched pairs come
+        // first so their `CompactionEnd` remains the last persisting compaction
+        // op (agreeing with the reconstructed `SetCompaction` and `self.compaction`).
+        for event in preserved_bracket_pairs {
+            map.push_event(event);
+        }
         for event in preserved_orphan_starts {
             map.push_event(event);
         }

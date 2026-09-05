@@ -426,7 +426,9 @@ pub struct SessionEventMap {
     /// exactly the dual-source hazard this event log exists to avoid.
     /// `current_compaction` therefore reverse-scans `events` when the cache is
     /// empty (e.g. after deserialization). This bounds the cost to O(n) on a
-    /// fresh load rather than risking a stale cache.
+    /// fresh load rather than risking a stale cache or an interior-mutable type
+    /// (which would make `SessionEventMap` non-`Send`, breaking app-core's async
+    /// boundaries).
     #[serde(skip)]
     cached_compaction: Option<StoredCompactionState>,
 }
@@ -541,12 +543,12 @@ impl SessionEventMap {
         // (the persisting op of a bracketed compaction). If a ClearAll appears
         // after that, the compaction is considered cleared and we return None.
         // `events` is the sole authority, so this scan is always correct.
-        let mut found_compaction = None;
+        let mut found = None;
         for event in self.events.iter().rev() {
             match &event.op {
                 SessionEventOp::SetCompaction { compaction }
                 | SessionEventOp::CompactionEnd { compaction } => {
-                    found_compaction = Some(compaction.clone());
+                    found = Some(compaction.clone());
                     break;
                 }
                 SessionEventOp::ClearAll => {
@@ -556,7 +558,7 @@ impl SessionEventMap {
                 _ => {}
             }
         }
-        found_compaction
+        found
     }
     
     /// Get memory injections from events
