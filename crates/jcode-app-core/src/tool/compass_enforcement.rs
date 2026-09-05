@@ -231,6 +231,13 @@ pub(crate) fn truncate_middle(s: &str, max: usize) -> String {
     out
 }
 
+/// TOOL_LIFECYCLE `phase` value recorded when an `agentgrep` grep is redirected
+/// to `compass_query`.
+pub(crate) const REDIRECT_PHASE: &str = "redirected_to_compass";
+/// TOOL_LIFECYCLE `phase` value recorded when a raw-fallback grep is refused
+/// because a `compass_query` redirect is still outstanding for the session.
+pub(crate) const BLOCKED_PHASE: &str = "raw_fallback_blocked_pending_compass";
+
 /// Decide the `compass_query`-first enforcement for one `agentgrep` call.
 ///
 /// Takes the call input, the availability snapshot, and the session id, and
