@@ -1755,6 +1755,10 @@ mod tests {
             // presentational/prepositional "to", not an action infinitive
             "I'll call the shell script to your attention.",
             "I'll call bash in to the meeting.",
+            // interposed-adverb call forms must ALSO preserve the naming guard
+            "I'll just call the tool a success.",
+            "Let me now call the command the 'final' one.",
+            "I'll just call the tool the helper now.",
         ];
         for turn in legitimate {
             assert!(
