@@ -326,6 +326,34 @@ impl Agent {
         Ok(true)
     }
 
+    /// Remove fenced code blocks (``` ... ```) from a turn's text. A genuinely
+    /// complete answer can *quote* the very "Let me..." filler it is reporting
+    /// or fixing (e.g. a diagnosis that reproduces a stalled excerpt, or a code
+    /// example), which would otherwise be misclassified as a stall. Real stalled
+    /// turns stream filler as prose (not inside a code fence), so stripping
+    /// fenced blocks only removes quoting false-positives. Returns a new
+    /// String only when a fence was found; otherwise returns the input slice.
+    fn without_fenced_code_blocks(text: &str) -> std::borrow::Cow<'_, str> {
+        if !text.contains("```") {
+            return std::borrow::Cow::Borrowed(text);
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut lines = text.split('\n').peekable();
+        let mut in_fence = false;
+        while let Some(line) = lines.next() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("```") {
+                in_fence = !in_fence;
+                continue;
+            }
+            if !in_fence {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        std::borrow::Cow::Owned(out)
+    }
+
     /// Detect an assistant turn that *promises* a concrete next action
     /// ("Let me read...", "Let me run...", "Let me grep...", "I'll ...") but
     /// stopped with a normal end-of-turn and no tool call. Some providers
@@ -337,6 +365,11 @@ impl Agent {
     /// with them ("Let me ... Let me ... Let me run ..."). A single "let me"
     /// in a normal answer is not treated as stalling.
     pub(crate) fn is_stalled_promise_text(text: &str) -> bool {
+        // Drop fenced code blocks first so quoting/reproducing a stalled
+        // excerpt (common in review/diagnosis answers) does not count as a
+        // stall. This runs on every check; without_fenced_code_blocks is a
+        // cheap no-op when there is no "```".
+        let text = Self::without_fenced_code_blocks(text);
         // Collapse runs of whitespace to a single space before matching so a
         // stall is still detected if streamed/degenerate output introduces
         // extra spaces, tabs, or newlines inside the phrase ("let  me run",

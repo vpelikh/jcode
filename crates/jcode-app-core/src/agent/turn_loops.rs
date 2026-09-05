@@ -1475,4 +1475,20 @@ mod tests {
             "dense 'Let me...' with whitespace variance must still be flagged"
         );
     }
+
+    #[test]
+    fn stalled_promise_text_ignores_fenced_quoting() {
+        // A complete diagnosis/review answer can QUOTE the stalled excerpt
+        // (often inside a fenced code block). That must not be misclassified as
+        // the model itself stalling.
+        let quoting = "Here is the problematic transcript from the session:\n```\n\
+                       Let me read it. Let me run it. Let me check it. Let me parse it. \
+                       Let me grep it. Let me verify it. Let me inspect it. Let me print it. \
+                       Let me search it. Let me review it. Let me test it.\n```\n\nThe fix is \
+                       complete and the tests pass.";
+        assert!(
+            !Agent::is_stalled_promise_text(quoting),
+            "quoting a stalled excerpt inside a code fence must not be flagged as a stall"
+        );
+    }
 }
