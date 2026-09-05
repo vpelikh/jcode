@@ -27,6 +27,12 @@ impl Agent {
     /// exits promptly while a pathological always-stalled model never loops
     /// forever.
     pub(crate) const MAX_STALLED_PROMISE_CONTINUATION_ATTEMPTS: u32 = 3;
+    /// Maximum flattened length (after code fences are stripped) for the compact
+    /// unfulfilled-tool-request detector. Long legitimate prose that merely
+    /// recounts an earlier "I'll invoke..." (e.g. a review summarizing the whole
+    /// run) must not be confused with the stall, which is a SHORT turn that
+    /// announces it will invoke a tool and then stops without doing so.
+    pub(crate) const COMPACT_STALLED_TOOL_REQUEST_MAX_LEN: usize = 700;
     const SEQUENTIAL_TOOL_ROUNDS_BEFORE_BATCH_NUDGE: u32 = 3;
     const BATCH_NUDGE: &str = "<system-reminder>Several tool calls have been made one at a time. If the next independent operations can run concurrently, use the batch tool instead of making more sequential calls. Keep sequential calls when one result is required to decide the next operation.</system-reminder>";
 
@@ -1509,6 +1515,81 @@ mod tests {
         assert!(
             !Agent::is_stalled_promise_text(&sparse_same),
             "sparse same-phrase turn must be excluded by the density gate ({sparse_same})"
+        );
+    }
+
+    #[test]
+    fn compact_unfulfilled_tool_request_is_stalled() {
+        // The exact compact degradation observed in a real long-context session
+        // (DeepSeek via OpenRouter): a SHORT turn explicitly says it will invoke a
+        // tool but stops with a normal end-of-turn and no tool call. Each of these
+        // has only ~1-2 promise phrases, so the dense-rambling detector's 8-phrase
+        // minimum would miss them. The compact detector must catch them.
+        let turns = [
+            "Let me invoke the bash tool to grep and view rename_session_title.\n\n<system-warning>Grep and view rename_session_title.</system-warning>\n\nI'll invoke bash now.",
+            "Let me grep for `rename_session_title`.\n\n<system-warning>Run grep for rename_session_title.</system-warning>\n\nI'll invoke bash now.",
+            "I keep failing to actually invoke the tool. Let me directly grep and view `rename_session_title`.\n\nI'll invoke bash now.",
+            "Let me grep and view `rename_session_title`.\n\n<system-warning>Run the grep command.</system-warning>\n\nI'll invoke bash.",
+            "Let me invoke bash now.",
+        ];
+        for turn in turns {
+            assert!(
+                Agent::is_stalled_promise_text(turn),
+                "compact unfulfilled tool-request must be flagged as stalled: {turn:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_unfulfilled_tool_request_ignores_phrase_density_only() {
+        // A short turn with many "let me"s but no explicit "invoke a tool" frame is
+        // the DENSE-rambling case, already handled above by the density gate. Make
+        // sure the compact detector is strictly future-"invoke a tool" and does not
+        // broaden the net.
+        let dense_only = "Let me read. Let me run. Let me grep. Let me check. Let me view.";
+        // Only 5 < MIN_PHRASE=8, and no invoke frame => not flagged by either.
+        assert!(
+            !Agent::is_stalled_promise_text(dense_only),
+            "dense but tool-targetless short turn must not match the compact detector"
+        );
+    }
+
+    #[test]
+    fn compact_unfulfilled_tool_request_ignores_legitimate_short_answers() {
+        // Genuine short final answers that mention a tool or "invoke" in the past
+        // tense / abstractly must not be flagged.
+        let legitimate = [
+            // final answer, no future-invoke frame
+            "Done. The fix is committed and the test passes.",
+            // "let me know" is a sign-off, not an action promise
+            "Let me know if you want me to continue with more rounds.",
+            // invokes an ABSTRACT concept, not a tool/command target
+            "I'll invoke the review and report back when it's ready.",
+            // past-tense recap, not a promise
+            "I invoked the tool earlier and have the result here.",
+            // third-person/descriptive "will invoke" is not a promise by the agent
+            "This setup will invoke shell hooks on commit; review the config when ready.",
+            "The plugin will invoke run mode automatically. That is the summary.",
+        ];
+        for turn in legitimate {
+            assert!(
+                !Agent::is_stalled_promise_text(turn),
+                "legitimate short final answer must not be flagged as stalled: {turn:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_unfulfilled_tool_request_ignores_long_prose() {
+        // A long legitimate turn that RECOUNTS an earlier "I'll invoke..." (e.g. a
+        // review summarizing the whole run) must not be mistaken for a stall
+        // because of its length. The compact detector is length-bounded.
+        let recap = "Let me recap what I did. I'll invoke the bash tool, then run the grep, \
+                     then view the file, then update the todo, then commit. \
+                     ".repeat(60);
+        assert!(
+            !Agent::is_stalled_promise_text(&recap),
+            "long legitimate recap must not be flagged by the length-bounded compact detector"
         );
     }
 }

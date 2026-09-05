@@ -1952,6 +1952,58 @@ async fn stalled_promise_turn_gets_bounded_continuation() {
     );
 }
 
+#[tokio::test]
+async fn compact_unfulfilled_tool_request_triggers_recovery() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // The exact compact degradation reported on a real long-context session: a
+    // single explicit "I'll invoke bash now" with no tool call. Unlike the
+    // dense-rambling filler, this has only one or two promise phrases, so it
+    // relies on the compact unfulfilled-tool-request detector.
+    let compact = "Let me invoke the bash tool to grep and view rename_session_title.\n\n\
+                   <system-warning>Grep and view rename_session_title.</system-warning>\n\n\
+                   I'll invoke bash now.";
+    let mut attempts = 0u32;
+    let retried = agent
+        .maybe_continue_stalled_promise(Some("stop"), compact, &mut attempts)
+        .expect("helper must not error");
+    assert!(retried, "compact unfulfilled tool-request must trigger recovery");
+    assert_eq!(attempts, 1);
+    let recovery = agent
+        .session
+        .messages
+        .last()
+        .expect("recovery instruction must be persisted");
+    assert_eq!(recovery.role, Role::User);
+    assert!(
+        recovery
+            .content
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .is_some_and(|text| text.starts_with("<system-reminder>")),
+        "compact recovery instruction must be hidden from the transcript"
+    );
+
+    // A short but genuine final answer that invokes an abstract concept (not a
+    // tool/command target) must not trigger recovery.
+    assert!(
+        !agent
+            .maybe_continue_stalled_promise(
+                Some("stop"),
+                "I'll invoke the review and report back when it's ready.",
+                &mut attempts,
+            )
+            .unwrap(),
+        "a short abstract 'invoke' must not be treated as a stalled tool request"
+    );
+}
+
 include!("agent_tests/retention_readiness.rs");
 
 /// Provider that reproduces the DeepSWE Opus 5 incident: the first response

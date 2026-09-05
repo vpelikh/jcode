@@ -369,15 +369,51 @@ impl Agent {
         // stall. This runs on every check; without_fenced_code_blocks is a
         // cheap no-op when there is no "```".
         let text = Self::without_fenced_code_blocks(text);
-        // Collapse runs of whitespace to a single space before matching so a
-        // stall is still detected if streamed/degenerate output introduces
-        // extra spaces, tabs, or newlines inside the phrase ("let  me run",
-        // "let\tme run"). This mirrors inline_tail's whitespace flattening.
-        let low = text
-            .split_whitespace()
+        let low = Self::flatten_whitespace(&text);
+        // Two independent failure modes produce "it promises an action but does
+        // nothing". Each gets its own detector so one heuristic can't miss what
+        // the other catches:
+        //
+        // 1. Dense rambling: the turn is full of matched action-promise phrases
+        //    ("Let me ... Let me run ...") with no tool call. Detected by phrase
+        //    density below.
+        // 2. Compact explicit tool-request: a SHORT turn explicitly says it will
+        //    invoke/call a tool (bash/command) "now" but ends without making the
+        //    call (observed: DeepSeek via OpenRouter on long contexts, e.g.
+        //    "I'll invoke bash now."). Such turns have only one or two promise
+        //    phrases and would fall under the dense-rambling minimum count below,
+        //    so we need a separate, much more specific signal.
+        if Self::is_compact_unfulfilled_tool_request(&low) {
+            return true;
+        }
+        let count = Self::count_action_promise_phrases(&low);
+        // Require a non-trivial number of promise phrases: a single "let me"
+        // in a short answer is normal and must not be treated as stalling.
+        if count < Self::MIN_STALLED_PROMISE_PHRASE_COUNT {
+            return false;
+        }
+        // Density: number of promise phrases per 100 chars. Measured failing
+        // turns sit at ~4.4+ (224/4948, 107/2482). Legitimate turns, even huge
+        // ones with a few "let me"s, stay below ~1. Require a healthy margin
+        // above that.
+        let density = count as f64 / text.len().max(1) as f64 * 100.0;
+        density >= Self::STALLED_PROMISE_DENSITY_THRESHOLD
+    }
+
+    /// Collapse runs of whitespace to a single space and lowercase, so a stall
+    /// is still detected if streamed/degenerate output introduces extra spaces,
+    /// tabs, or newlines inside a phrase ("let  me run", "let\tme run"). This
+    /// mirrors inline_tail's whitespace flattening.
+    fn flatten_whitespace(text: &str) -> String {
+        text.split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")
-            .to_ascii_lowercase();
+            .to_ascii_lowercase()
+    }
+
+    /// Count matched action-promise phrases, subtracting the "let me know"
+    /// closing/sign-off phrasing which is not an action promise.
+    fn count_action_promise_phrases(low: &str) -> usize {
         let phrases = [
             "let me",
             "i'll",
@@ -396,17 +432,67 @@ impl Agent {
         // heuristic focused on action-promise stalling and avoids flagging a
         // genuine final answer that merely asks for confirmation.
         count -= low.matches("let me know").count();
-        // Require a non-trivial number of promise phrases: a single "let me"
-        // in a short answer is normal and must not be treated as stalling.
-        if count < Self::MIN_STALLED_PROMISE_PHRASE_COUNT {
+        count
+    }
+
+    /// Detect the *compact* unfulfilled-tool-request stall: a short assistant
+    /// turn that explicitly says it will invoke/call a tool (bash, a command, a
+    /// tool) "now" but ends with a normal stop and no tool call. Unlike the
+    /// dense-rambling mode, such turns state a single, explicit future intent to
+    /// act, so the presence of that explicit tool-invocation frame is the reliable
+    /// signal rather than phrase density.
+    ///
+    /// This is deliberately strict to avoid flagging a genuine short final answer
+    /// that happens to mention a tool in passing or in the past tense:
+    ///  - The turn must be short (bounded length, after fences are stripped), so
+    ///    long legitimate prose that recounts an earlier "I'll invoke..." does not
+    ///    match.
+    ///  - It must contain a first-person future/volitional invoke frame ("let me
+    ///    invoke", "i'll invoke", "i will invoke", "i'm going to invoke", or an
+    ///    imperative "invoke <tool> now"). A bare third-person/descriptive "will
+    ///    invoke" (e.g. "this setup will invoke shell hooks") is NOT a promise by
+    ///    the agent to act, so it must not match.
+    ///  - It must reference an actual tool target (bash / tool / command / run /
+    ///    grep / sed / a specific action verb), so philosophical or past-tense
+    ///    uses of "invoke" do not match.
+    fn is_compact_unfulfilled_tool_request(low: &str) -> bool {
+        if low.len() > Self::COMPACT_STALLED_TOOL_REQUEST_MAX_LEN {
             return false;
         }
-        // Density: number of promise phrases per 100 chars. Measured failing
-        // turns sit at ~4.4+ (224/4948, 107/2482). Legitimate turns, even huge
-        // ones with a few "let me"s, stay below ~1. Require a healthy margin
-        // above that.
-        let density = count as f64 / text.len().max(1) as f64 * 100.0;
-        density >= Self::STALLED_PROMISE_DENSITY_THRESHOLD
+        // Reciprocal contractions ("i'm", "i've") are hard to match with a
+        // fixed token in flattened text; handle the common future/volitional
+        // forms explicitly and leave the pure "memorize"/digress cases alone.
+        let has_future_invoke = [
+            "let me invoke",
+            "i'll invoke",
+            "i will invoke",
+            "i'm going to invoke",
+            "i am going to invoke",
+            "invoke the bash tool now",
+            "invoke bash now",
+            "invoke the tool now",
+            "call the bash tool",
+            "call bash",
+        ]
+        .iter()
+        .any(|p| low.contains(p));
+        if !has_future_invoke {
+            return false;
+        }
+        // Must reference a concrete tool/command target so "invoke" in an
+        // abstract/past context is not a stall.
+        let tool_target = [
+            "bash",
+            "tool",
+            "command",
+            "grep",
+            "sed",
+            "run",
+            "shell",
+            "script",
+            "cmd",
+        ];
+        tool_target.iter().any(|t| low.contains(t))
     }
 
     /// Request a single bounded continuation when the model stopped after
