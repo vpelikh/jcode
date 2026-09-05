@@ -1553,6 +1553,23 @@ mod tests {
     }
 
     #[test]
+    fn stalled_promise_i_will_explanation_is_not_a_stall() {
+        // Formal spelled-out "I will" is PREDICTIVE/EXPLANATORY ("I will note
+        // that...", "I will say the import is the cause"), not a first-person
+        // promise the agent then fails to complete. A genuine diagnosis that
+        // walks through reasoning with several "I will" constructions must not
+        // cross the stalled-promise density threshold and be flagged.
+        let diag = "I will assume the failure is in the harness. I will note the log shows \
+                    an error. I will say the import is the cause. I will observe the env is \
+                    fine. I will remark the diff is small. I will mention the schema mismatch. \
+                    I will point out the config. I will conclude it is env-related.";
+        assert!(
+            !Agent::is_stalled_promise_text(diag),
+            "an explanatory answer using 'I will' must not be flagged as a stall"
+        );
+    }
+
+    #[test]
     fn stalled_promise_density_threshold_is_bracketed() {
         // Exactly MIN_PHRASE=8 occurrences, but the density must still decide:
         // padded short => dense (above 2.0) must flag; padded long => sparse
