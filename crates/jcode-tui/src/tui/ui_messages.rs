@@ -1970,13 +1970,14 @@ fn render_todo_goal_updates(
                         .after
                         .as_ref()
                         .and_then(|goal| goal.trade_offs.as_deref())
-                        .or_else(|| update.before.as_ref().and_then(|goal| goal.trade_offs.as_deref()))
                         .map(str::trim)
                         .filter(|text| !text.is_empty())
                     {
-                        // The trade-off state is unchanged but the rationale or
-                        // explored-alternative flag moved; surface the text note
-                        // so the revision is not silently swallowed.
+                        // The trade-off state is unchanged and the current
+                        // rationale carries the change; surface the text note so
+                        // the revision is not silently swallowed. If the
+                        // rationale was cleared (after has none), render nothing
+                        // rather than a stale pre-clear value.
                         push_todo_text_update(&mut lines, "Trade-off", Some(text), base_indent, inner_width);
                     }
                 }

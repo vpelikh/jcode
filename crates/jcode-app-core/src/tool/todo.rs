@@ -894,7 +894,7 @@ impl Tool for TodoTool {
                             },
                             "explored_alternative": {
                                 "type": "boolean",
-                                "description": "Whether a credible alternative was explored and how it lost."
+                                "description": "Whether a credible alternative was explored before committing to the approach."
                             }
                         }
                     }

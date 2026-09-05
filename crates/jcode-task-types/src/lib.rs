@@ -639,7 +639,7 @@ pub struct TodoGoal {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trade_offs: Option<String>,
     /// Whether a credible alternative to the chosen approach was actually
-    /// explored, and how it lost.
+    /// explored before committing to the approach.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explored_alternative: Option<bool>,
 }

@@ -20,11 +20,12 @@ solution that fails the user's actual constraints.
 A new, difficulty-calibrated gate, applied at completion time, that asks the
 agent to record:
 
+- **trade_off** — the difficulty-calibrated state for how carefully alternatives
+  were weighed (`none_considered` … `exhaustive`), gated at completion,
 - **trade_offs** — the meaningful decisions the work required and their
   trade-offs (cost, complexity, performance, compatibility, maintenance),
-- **explored_alternative** — whether a credible alternative was actually
-  considered and why it lost,
-- **considered** — a summary of the alternatives weighed.
+- **explored_alternative** — a boolean for whether a credible alternative was
+  actually explored before committing to the approach.
 
 Like every existing assessment, these are reported by the model through the
 `todo` tool's per-goal `goals` block and checked against a private threshold.
@@ -52,12 +53,13 @@ I keep the full `legacy`/`score` surface only for consistency with the macro.
 ### New `TodoGoal` fields (`jcode-task-types`)
 
 ```rust
-pub trade_off: Option<TradeOffState>,           // how carefully alternatives were weighed
-pub trade_offs: Option<String>,                 // what decisions + trade-offs were considered
-pub trade_off_explored_alternative: Option<bool>, // whether a credible alternative was actually explored
+pub trade_off: Option<TradeOffState>,        // how carefully alternatives were weighed
+pub trade_off_history: Vec<TradeOffState>,   // tool-maintained history of states
+pub trade_offs: Option<String>,              // what decisions + trade-offs were considered
+pub explored_alternative: Option<bool>,      // whether a credible alternative was explored
 ```
 
-- `trade_off` + `trade_offs_history` are tool-maintained like the other score
+- `trade_off` + `trade_off_history` are tool-maintained like the other score
   histories.
 - `trade_offs` and `explored_alternative` are descriptive, not gated directly;
   they feed the continuation wording.
@@ -65,8 +67,13 @@ pub trade_off_explored_alternative: Option<bool>, // whether a credible alternat
 ### Pass predicates (`jcode-base/src/todo.rs`)
 
 ```rust
-pub fn trade_off_passes(state: Option<TradeOffState>) -> bool {
-    state.is_some_and(|state| state >= TradeOffState::SomeConsidered)
+pub fn required_trade_off(difficulty: Option<Difficulty>) -> TradeOffState {
+    // SomeConsidered for ordinary work, Diligent for involved goals.
+    ...
+}
+pub fn trade_off_passes(goal: &TodoGoal) -> bool {
+    goal.trade_off
+        .is_some_and(|state| state >= required_trade_off(goal.difficulty))
 }
 ```
 

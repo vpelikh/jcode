@@ -1164,6 +1164,45 @@ fn render_trade_off_state_change_shows_arrow() {
     );
 }
 
+/// Clearing the trade-off rationale (state unchanged) must not backfill stale
+/// text from the pre-clear value; the card should not claim an obsolete rationale.
+#[test]
+fn render_trade_off_cleared_rationale_does_not_backfill_stale_text() {
+    let before = crate::todo::TodoGoal {
+        group: Some("decision".to_string()),
+        trade_off: Some(crate::todo::TradeOffState::SomeConsidered),
+        trade_offs: Some("weighed X vs Y".to_string()),
+        ..Default::default()
+    };
+    let after = crate::todo::TodoGoal {
+        // trade_offs omitted => cleared to None.
+        ..before.clone()
+    };
+    // Keep after.trade_offs None explicitly for clarity.
+    let mut after = after;
+    after.trade_offs = None;
+    let update = crate::todo::TodoGoalChange {
+        before: Some(before),
+        after: Some(after),
+        fields: vec![crate::todo::TodoGoalField::TradeOff],
+    };
+
+    let lines = render_todo_goal_updates(&[update], 95);
+    let plain = lines
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !plain.contains("weighed X vs Y"),
+        "must not render stale cleared rationale:\n{plain}"
+    );
+    assert!(
+        !plain.contains("weighed X vs"),
+        "must not backfill any stale rationale text:\n{plain}"
+    );
+}
+
 #[test]
 fn render_todo_plan_update_card_shows_only_changed_intent_fields() {
     let todos = vec![crate::todo::TodoItem {
