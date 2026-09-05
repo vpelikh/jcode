@@ -1865,6 +1865,62 @@ async fn empty_post_tool_response_is_retried_in_shared_helper() {
     );
 }
 
+#[tokio::test]
+async fn stalled_promise_turn_gets_bounded_continuation() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // Dense "Let me..." filler with no tool call must trigger a single,
+    // bounded recovery continuation.
+    let spam = "Let me read the method. Let me run the shell read. Let me look. \
+                Let me view it. Let me grep. Let me run the command. Let me check. \
+                Let me execute. Let me do it. Let me read the body. Let me find it.";
+    let mut attempts = 0u32;
+    let retried = agent
+        .maybe_continue_stalled_promise(spam, &mut attempts)
+        .expect("helper must not error");
+    assert!(retried, "dense stalled-promise filler must be recovered");
+    assert_eq!(attempts, 1);
+    let recovery = agent
+        .session
+        .messages
+        .last()
+        .expect("recovery instruction must be persisted");
+    assert_eq!(recovery.role, Role::User);
+    assert!(
+        recovery
+            .content
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .is_some_and(|text| text.starts_with("<system-reminder>")),
+        "synthetic recovery instruction must be hidden from the transcript"
+    );
+
+    // A normal answer with a single "let me" must not trigger recovery.
+    assert!(
+        !agent
+            .maybe_continue_stalled_promise(
+                "Here is the completed review. Let me know if you want more rounds.",
+                &mut attempts,
+            )
+            .unwrap(),
+        "a normal answer must not be treated as stalled"
+    );
+
+    // Budget is bounded: no unbounded re-invocation loop.
+    attempts = Agent::MAX_STALLED_PROMISE_CONTINUATION_ATTEMPTS;
+    assert!(
+        !agent
+            .maybe_continue_stalled_promise(spam, &mut attempts)
+            .unwrap()
+    );
+}
+
 include!("agent_tests/retention_readiness.rs");
 
 /// Provider that reproduces the DeepSWE Opus 5 incident: the first response
