@@ -663,6 +663,13 @@ impl Agent {
         self.session = session;
         self.refresh_agents_md_snapshot();
         crate::tool::clear_session_tool_policy(&previous_session_id);
+        // A session being switched away from may carry an outstanding
+        // compass-query-first redirect (set when an `agentgrep` call was
+        // redirected). Clearing it here mirrors `clear_session_tool_policy` and
+        // prevents the pending state from leaking onto a later session that
+        // reuses the id (which would otherwise block `allow_raw_fallback` until
+        // that new session happened to call compass_query).
+        crate::tool::compass_enforcement::clear_redirect_pending(&previous_session_id);
         crate::tool::set_session_tool_policy(
             &self.session.id,
             self.allowed_tools.clone(),

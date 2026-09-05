@@ -3,7 +3,7 @@ pub(crate) mod compass_query;
 pub mod ambient;
 mod apply_patch;
 mod bash;
-mod compass_enforcement;
+pub(crate) mod compass_enforcement;
 mod batch;
 mod bg;
 mod browser;
