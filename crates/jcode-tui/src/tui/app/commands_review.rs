@@ -1828,6 +1828,14 @@ pub(super) fn handle_review_loop_command_local(app: &mut App, trimmed: &str) -> 
         "stop" => {
             if let Some(state) = app.session.review_loop.as_mut() {
                 state.finish_with("user_stopped");
+                // Cancel any review fix turn that is queued-but-not-yet-dispatched
+                // (remote path stages the fix into queued_messages). After stop
+                // the loop is finished, but the queued "fix them" prompt would
+                // still be dispatched by the run loop as if it were a user
+                // message, which is exactly what "stop the review" should prevent.
+                app.queued_messages.clear();
+                app.hidden_queued_system_messages.clear();
+                app.pending_queued_dispatch = false;
                 let _ = app.session.save();
                 app.push_display_message(DisplayMessage::system(
                     "Review loop stopped.".to_string(),
@@ -1883,6 +1891,12 @@ pub(super) fn handle_review_loop_command_local(app: &mut App, trimmed: &str) -> 
 pub(super) fn clear_review_loop_on_improve(app: &mut App) {
     if app.session.review_loop.as_ref().map(|s| !s.finished).unwrap_or(false) {
         app.session.review_loop = None;
+        // Cancel any review fix turn that is queued-but-undispatched, mirroring
+        // `/review-loop stop`: the loop is being replaced by improve/refactor,
+        // so a stranded "fix them" prompt must not be dispatched later.
+        app.queued_messages.clear();
+        app.hidden_queued_system_messages.clear();
+        app.pending_queued_dispatch = false;
         let _ = app.session.save();
     }
 }

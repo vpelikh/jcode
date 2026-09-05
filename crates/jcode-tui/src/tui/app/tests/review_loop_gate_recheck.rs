@@ -1232,3 +1232,80 @@ fn turn_end_followups_does_not_spawn_premature_recheck_while_fix_queued() {
         );
     });
 }
+
+// Regression (stop cancels pending fix): stopping a review loop must cancel any
+// review fix turn that is queued-but-undispatched (the remote path stages the
+// fix into queued_messages). Otherwise the "fix them" prompt would still be
+// dispatched after the loop was stopped.
+#[test]
+fn review_loop_stop_cancels_queued_fix() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        app.is_remote = true;
+        app.is_replay = false;
+        app.runtime_mode = super::AppRuntimeMode::RemoteClient;
+
+        // Start a loop, then simulate a queued-but-undispatched fix as the remote
+        // path would leave it (awaiting_postfix_recheck + a fix prompt staged).
+        let mut state = jcode_session_types::ReviewLoopState::new();
+        super::review_loop::enter_review_loop(&mut state);
+        state.awaiting_postfix_recheck = true;
+        state.active_reviewer_id = None;
+        app.session.review_loop = Some(state);
+        app.queued_messages.push("The reviewer found the following issues. Fix them:\n\n[HIGH] a.rs: bug".to_string());
+        app.pending_queued_dispatch = true;
+
+        // Stop the loop.
+        app.input = "/review-loop stop".to_string();
+        app.submit_input();
+
+        let state = app.session.review_loop.as_ref().unwrap();
+        assert!(state.finished, "loop must be stopped");
+        assert_eq!(state.finish_reason.as_deref(), Some("user_stopped"));
+        assert!(
+            app.queued_messages.is_empty(),
+            "stopping the loop must cancel its queued fix, not dispatch it later"
+        );
+        assert!(
+            !app.pending_queued_dispatch,
+            "stopping the loop must clear the pending-dispatch flag"
+        );
+    });
+}
+
+// Regression (improve clears pending review fix): starting improve/refactor must
+// clear an active review loop AND cancel any review fix queued-but-undispatched
+// (mirroring /review-loop stop), so a stranded "fix them" prompt from the review
+// loop is not dispatched after the loop is replaced.
+#[test]
+fn clear_review_loop_on_improve_cancels_queued_fix() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        app.is_remote = true;
+        app.is_replay = false;
+        app.runtime_mode = super::AppRuntimeMode::RemoteClient;
+
+        let mut state = jcode_session_types::ReviewLoopState::new();
+        super::review_loop::enter_review_loop(&mut state);
+        state.awaiting_postfix_recheck = true;
+        state.active_reviewer_id = None;
+        app.session.review_loop = Some(state);
+        app.queued_messages.push("The reviewer found the following issues. Fix them:\n\n[HIGH] a.rs: bug".to_string());
+        app.pending_queued_dispatch = true;
+
+        super::commands_review::clear_review_loop_on_improve(&mut app);
+
+        assert!(
+            app.session.review_loop.is_none(),
+            "improve must clear the active review loop"
+        );
+        assert!(
+            app.queued_messages.is_empty(),
+            "improve must cancel the review's queued fix, not dispatch it later"
+        );
+        assert!(
+            !app.pending_queued_dispatch,
+            "improve must clear the pending-dispatch flag"
+        );
+    });
+}
