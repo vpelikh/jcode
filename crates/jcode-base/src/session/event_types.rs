@@ -56,13 +56,16 @@ impl Error for SessionEventError {}
 /// definition time. Rust has no declaration-merging counterpart to
 /// deepseek-harness's derived-union events, so unknown `op` tags deserialize
 /// into [`SessionEventOp::Unknown`] with their full payload preserved, matching
-/// how a future plugin event type would be carried through the log. Known
-/// variants (de)serialize with the same `op` tag names and field names the
-/// previous derived form used, so existing on-disk journals and wire payloads
-/// load correctly (deserialization is key-based). Note the emitted *field
-/// order* is alphabetical (serde_json builds `Map` without `preserve_order`),
-/// so the raw bytes are not guaranteed byte-identical to the derived form —
-/// but the wire/on-disk format is semantically compatible.
+/// how a future plugin event type would be carried through the log.
+///
+/// **Wire format (uniform envelope).** Every event serializes as
+/// `{"op": <tag>, "data": <payload>}`. For a known variant `<payload>` holds
+/// its field set (as a JSON object); for [`SessionEventOp::Unknown`] `<payload>`
+/// is the plugin's verbatim payload and may be any JSON value (object, scalar,
+/// or array). Because the payload always lives under `data` — nested, never at
+/// the tag level — there is **no reserved-key collision**: a plugin payload may
+/// safely contain a top-level field named `op`, and a non-object payload needs
+/// no bundling heuristic. Both earlier `Unknown` trade-offs are eliminated.
 ///
 /// The extension rule: **add an event, don't edit the loop** — a plugin that
 /// needs a custom event appends an `Unknown { event_type, data }` event rather
@@ -126,13 +129,14 @@ pub enum SessionEventOp {
     /// This is the escape hatch (takeaway #13): unknown `op` tags deserialize
     /// here instead of erroring, so a future plugin can add an event kind
     /// without a breaking change to this enum. `event_type` is the raw `op`
-    /// string; `data` is the remaining payload (the `op` key itself is pulled
-    /// out so it is not duplicated). Serialization round-trips the original
-    /// object, re-emitting `op` and the preserved fields.
+    /// string; `data` is the plugin's verbatim payload, carried under the
+    /// envelope's `data` field so it never collides with the tag. Serialization
+    /// re-emits `{"op": <event_type>, "data": <data>}` losslessly for any JSON
+    /// payload (object, scalar, or array).
     Unknown {
         /// The raw `op` tag as it appeared on the wire.
         event_type: String,
-        /// The remaining payload fields (everything except `op`).
+        /// The plugin payload, stored verbatim under the envelope's `data` key.
         data: serde_json::Value,
     },
 }
@@ -167,104 +171,65 @@ impl Serialize for SessionEventOp {
     {
         use serde::ser::SerializeMap;
 
-        // Unknown round-trips by re-emitting `op` plus the preserved payload.
-        // Size hint = emitted entries: fields+op for an object payload, or
-        // `data`+op for a non-object (scalar/array) payload.
-        if let SessionEventOp::Unknown { event_type, data } = self {
-            let entry_hint = match data {
-                serde_json::Value::Object(fields) => fields.len() + 1,
-                _ => 2,
-            };
-            let mut map = serializer.serialize_map(Some(entry_hint))?;
-            match data {
-                serde_json::Value::Object(fields) => {
-                    for (k, v) in fields {
-                        // `op` is the reserved wire discriminator. Emitting a
-                        // payload field also named `op` alongside the tag would
-                        // produce duplicate `op` keys (invalid/ambiguous JSON),
-                        // silently corrupting the round trip. Skip it: the tag is
-                        // emitted exactly once below. A plugin payload that needs
-                        // `op` must use a different key (the tag is reserved).
-                        if k == OP_KEY {
-                            continue;
-                        }
-                        map.serialize_entry(k, v)?;
-                    }
-                }
-                // Non-object payloads cannot carry an `op` alongside other
-                // fields; emit the payload under `data`. `op` is emitted exactly
-                // once below (after the match), same as the object branch, so the
-                // output never carries duplicate `op` keys.
-                other => {
-                    map.serialize_entry("data", other)?;
-                }
-            }
-            map.serialize_entry(OP_KEY, event_type)?;
-            return map.end();
-        }
-
-        // Build the flattened field set per variant (the infer-tagged derive
-        // output was `{"op": tag, ...fields}`). We construct the payload as a
-        // serde_json map and emit `op` plus each field at the same level so
-        // on-disk journals and wire payloads load compatibly with the previous
-        // derived form (deserialization is key-based). The fields are emitted in
-        // the map's iteration order (alphabetical, as serde_json has no
-        // `preserve_order`), which is stable and semantically equivalent but not
-        // byte-identical to the derived declaration order. `to_value` on an
-        // *individual field* is safe because fields are plain data types (no
-        // recursive `SessionEventOp`).
-        let tag = self
-            .known_op_tag()
-            .expect("known variants always have a tag");
-        let mut obj = serde_json::Map::new();
-        let known_count = match self {
-            SessionEventOp::AppendMessage { message_id, message } => {
-                obj.insert("message_id".into(), serde_json::to_value(message_id).map_err(serde::ser::Error::custom)?);
-                obj.insert("message".into(), serde_json::to_value(message).map_err(serde::ser::Error::custom)?);
-                obj.len()
-            }
-            SessionEventOp::ReplaceMessages { start_index, end_index, messages } => {
-                obj.insert("start_index".into(), serde_json::to_value(start_index).map_err(serde::ser::Error::custom)?);
-                obj.insert("end_index".into(), serde_json::to_value(end_index).map_err(serde::ser::Error::custom)?);
-                obj.insert("messages".into(), serde_json::to_value(messages).map_err(serde::ser::Error::custom)?);
-                obj.len()
-            }
-            SessionEventOp::InsertMessage { index, message } => {
-                obj.insert("index".into(), serde_json::to_value(index).map_err(serde::ser::Error::custom)?);
-                obj.insert("message".into(), serde_json::to_value(message).map_err(serde::ser::Error::custom)?);
-                obj.len()
-            }
-            SessionEventOp::MemoryInjection { memory_injection } => {
-                obj.insert("memory_injection".into(), serde_json::to_value(memory_injection).map_err(serde::ser::Error::custom)?);
-                obj.len()
-            }
-            SessionEventOp::ReplayEvent { replay_event } => {
-                obj.insert("replay_event".into(), serde_json::to_value(replay_event).map_err(serde::ser::Error::custom)?);
-                obj.len()
-            }
-            SessionEventOp::SetCompaction { compaction } => {
-                obj.insert("compaction".into(), serde_json::to_value(compaction).map_err(serde::ser::Error::custom)?);
-                obj.len()
-            }
-            SessionEventOp::CompactionStart { compaction_id, covers_up_to_turn } => {
-                obj.insert("compaction_id".into(), serde_json::to_value(compaction_id).map_err(serde::ser::Error::custom)?);
-                obj.insert("covers_up_to_turn".into(), serde_json::to_value(covers_up_to_turn).map_err(serde::ser::Error::custom)?);
-                obj.len()
-            }
-            SessionEventOp::CompactionEnd { compaction } => {
-                obj.insert("compaction".into(), serde_json::to_value(compaction).map_err(serde::ser::Error::custom)?);
-                obj.len()
-            }
-            SessionEventOp::ClearAll => 0,
-            SessionEventOp::Unknown { .. } => 0, // handled above
+        // Uniform envelope: `{"op": <tag>, "data": <payload>}`. The payload is
+        // always nested under `data`, so a payload field named `op` never
+        // collides with the tag (no reserved-key dropping) and a non-object
+        // payload needs no bundling heuristic.
+        let tag = match self {
+            SessionEventOp::Unknown { event_type, .. } => event_type.clone(),
+            _ => self
+                .known_op_tag()
+                .expect("known variants always have a tag")
+                .to_string(),
         };
-        // `clear_all`/`Unknown` have no fields but a length accounting of 1
-        // (just the op tag) is still correct via the +1 on the container size.
-        let mut map = serializer.serialize_map(Some(known_count + 1))?;
-        map.serialize_entry(OP_KEY, tag)?;
-        for (k, v) in obj {
-            map.serialize_entry(&k, &v)?;
-        }
+        let payload: serde_json::Value = match self {
+            SessionEventOp::Unknown { data, .. } => data.clone(),
+            other => {
+                // Build the field set for a known variant as a JSON object. The
+                // fields are emitted in the map's iteration order (alphabetical,
+                // as serde_json has no `preserve_order`). `to_value` on an
+                // *individual field* is safe because fields are plain data types
+                // (no recursive `SessionEventOp`).
+                let mut obj = serde_json::Map::new();
+                match other {
+                    SessionEventOp::AppendMessage { message_id, message } => {
+                        obj.insert("message_id".into(), serde_json::to_value(message_id).map_err(serde::ser::Error::custom)?);
+                        obj.insert("message".into(), serde_json::to_value(message).map_err(serde::ser::Error::custom)?);
+                    }
+                    SessionEventOp::ReplaceMessages { start_index, end_index, messages } => {
+                        obj.insert("start_index".into(), serde_json::to_value(start_index).map_err(serde::ser::Error::custom)?);
+                        obj.insert("end_index".into(), serde_json::to_value(end_index).map_err(serde::ser::Error::custom)?);
+                        obj.insert("messages".into(), serde_json::to_value(messages).map_err(serde::ser::Error::custom)?);
+                    }
+                    SessionEventOp::InsertMessage { index, message } => {
+                        obj.insert("index".into(), serde_json::to_value(index).map_err(serde::ser::Error::custom)?);
+                        obj.insert("message".into(), serde_json::to_value(message).map_err(serde::ser::Error::custom)?);
+                    }
+                    SessionEventOp::MemoryInjection { memory_injection } => {
+                        obj.insert("memory_injection".into(), serde_json::to_value(memory_injection).map_err(serde::ser::Error::custom)?);
+                    }
+                    SessionEventOp::ReplayEvent { replay_event } => {
+                        obj.insert("replay_event".into(), serde_json::to_value(replay_event).map_err(serde::ser::Error::custom)?);
+                    }
+                    SessionEventOp::SetCompaction { compaction } => {
+                        obj.insert("compaction".into(), serde_json::to_value(compaction).map_err(serde::ser::Error::custom)?);
+                    }
+                    SessionEventOp::CompactionStart { compaction_id, covers_up_to_turn } => {
+                        obj.insert("compaction_id".into(), serde_json::to_value(compaction_id).map_err(serde::ser::Error::custom)?);
+                        obj.insert("covers_up_to_turn".into(), serde_json::to_value(covers_up_to_turn).map_err(serde::ser::Error::custom)?);
+                    }
+                    SessionEventOp::CompactionEnd { compaction } => {
+                        obj.insert("compaction".into(), serde_json::to_value(compaction).map_err(serde::ser::Error::custom)?);
+                    }
+                    SessionEventOp::ClearAll => {}
+                    SessionEventOp::Unknown { .. } => unreachable!("Unknown handled above"),
+                }
+                serde_json::Value::Object(obj)
+            }
+        };
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry(OP_KEY, &tag)?;
+        map.serialize_entry("data", &payload)?;
         map.end()
     }
 }
@@ -274,9 +239,8 @@ impl<'de> Deserialize<'de> for SessionEventOp {
     where
         D: serde::Deserializer<'de>,
     {
-        // Parse into an untagged map first so we can inspect the `op` key,
-        // pull it out, and hand the remainder to the derived per-variant
-        // deserializer (which expects the struct WITHOUT the `op` tag).
+        // Parse into an untagged map first so we can inspect the `op` tag and
+        // read the nested `data` payload.
         let value = serde_json::Value::deserialize(deserializer)?;
         let obj = value
             .as_object()
@@ -287,50 +251,31 @@ impl<'de> Deserialize<'de> for SessionEventOp {
             .and_then(|v| v.as_str())
             .ok_or_else(|| serde::de::Error::custom(format!("SessionEventOp is missing a string '{OP_KEY}' tag")))?;
 
-        let mut clone = obj.clone();
-        clone.remove(OP_KEY);
+        // The payload is always nested under `data`. For a known variant it is
+        // the variant's field object; for an `Unknown` it is the verbatim plugin
+        // value (any JSON). Because the payload lives under `data`, a payload
+        // field named `op` never collides with the tag and a non-object payload
+        // is unambiguous — no unwrapping heuristic needed.
+        let data = obj
+            .get("data")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+
         // Forward-compat fallback for the escape hatch: a known `op` tag may be a
-        // FUTURE core variant that was promoted from an `Unknown`, whose payload
-        // shape differs from what this build expects. If the per-variant parse
-        // fails, degrade to `Unknown` (preserving the full payload) rather than
-        // erroring — otherwise a single shape mismatch on one event would fail to
-        // load the whole journal.
-        //
-        // Non-object payloads (a scalar/array) are emission-encoded by the
-        // serializer as a lone `data` field (they cannot carry an `op` alongside
-        // sibling fields). Unwrap that shape back to the bare value so a
-        // scalar/array `Unknown` round-trips losslessly instead of collapsing
-        // into `{"data": <value>}`. An object payload is emitted flattened, so a
-        // lone `data` field whose value is NOT an object is unambiguous — EXCEPT
-        // for the narrow case of an object payload whose single field is named
-        // `data` and is itself not an object (e.g. `{"data": 5}`), which on the
-        // wire is indistinguishable from a wrapped non-object. We prefer the
-        // bundled-non-object interpretation since flattened objects that carry a
-        // lone non-`data` field are common while a lone `data`-keyed non-object
-        // field is rare; such a plugin payload should store the value on a
-        // differently-named key. Resolve from `obj` (never moved by the
-        // per-variant parse) so this stays usable after `clone` is moved into a
-        // known-variant parser.
+        // FUTURE core variant whose payload shape differs from what this build
+        // expects. If the per-variant parse fails, degrade to `Unknown`
+        // (preserving the full payload) rather than erroring — otherwise a single
+        // shape mismatch on one event would fail to load the whole journal.
         let make_unknown = |event_type: &str| -> SessionEventOp {
-            let mut fields = obj.clone();
-            fields.remove(OP_KEY);
-            let data = if fields.len() == 1
-                && let Some(v) = fields.get("data")
-                && !v.is_object()
-            {
-                v.clone()
-            } else {
-                serde_json::Value::Object(fields)
-            };
             SessionEventOp::Unknown {
                 event_type: event_type.to_string(),
-                data,
+                data: data.clone(),
             }
         };
 
         match op {
             "append_message" => {
-                match serde_json::from_value::<AppendMessageFields>(serde_json::Value::Object(clone)) {
+                match serde_json::from_value::<AppendMessageFields>(data.clone()) {
                     Ok(fields) => Ok(SessionEventOp::AppendMessage {
                         message_id: fields.message_id,
                         message: fields.message,
@@ -339,7 +284,7 @@ impl<'de> Deserialize<'de> for SessionEventOp {
                 }
             }
             "replace_messages" => {
-                match serde_json::from_value::<ReplaceMessagesFields>(serde_json::Value::Object(clone)) {
+                match serde_json::from_value::<ReplaceMessagesFields>(data.clone()) {
                     Ok(fields) => Ok(SessionEventOp::ReplaceMessages {
                         start_index: fields.start_index,
                         end_index: fields.end_index,
@@ -349,7 +294,7 @@ impl<'de> Deserialize<'de> for SessionEventOp {
                 }
             }
             "insert_message" => {
-                match serde_json::from_value::<InsertMessageFields>(serde_json::Value::Object(clone)) {
+                match serde_json::from_value::<InsertMessageFields>(data.clone()) {
                     Ok(fields) => Ok(SessionEventOp::InsertMessage {
                         index: fields.index,
                         message: fields.message,
@@ -358,7 +303,7 @@ impl<'de> Deserialize<'de> for SessionEventOp {
                 }
             }
             "memory_injection" => {
-                match serde_json::from_value::<MemoryInjectionFields>(serde_json::Value::Object(clone)) {
+                match serde_json::from_value::<MemoryInjectionFields>(data.clone()) {
                     Ok(fields) => Ok(SessionEventOp::MemoryInjection {
                         memory_injection: fields.memory_injection,
                     }),
@@ -366,7 +311,7 @@ impl<'de> Deserialize<'de> for SessionEventOp {
                 }
             }
             "replay_event" => {
-                match serde_json::from_value::<ReplayEventFields>(serde_json::Value::Object(clone)) {
+                match serde_json::from_value::<ReplayEventFields>(data.clone()) {
                     Ok(fields) => Ok(SessionEventOp::ReplayEvent {
                         replay_event: fields.replay_event,
                     }),
@@ -374,7 +319,7 @@ impl<'de> Deserialize<'de> for SessionEventOp {
                 }
             }
             "set_compaction" => {
-                match serde_json::from_value::<SetCompactionFields>(serde_json::Value::Object(clone)) {
+                match serde_json::from_value::<SetCompactionFields>(data.clone()) {
                     Ok(fields) => Ok(SessionEventOp::SetCompaction {
                         compaction: fields.compaction,
                     }),
@@ -382,7 +327,7 @@ impl<'de> Deserialize<'de> for SessionEventOp {
                 }
             }
             "compaction_start" => {
-                match serde_json::from_value::<CompactionStartFields>(serde_json::Value::Object(clone)) {
+                match serde_json::from_value::<CompactionStartFields>(data.clone()) {
                     Ok(fields) => Ok(SessionEventOp::CompactionStart {
                         compaction_id: fields.compaction_id,
                         covers_up_to_turn: fields.covers_up_to_turn,
@@ -391,7 +336,7 @@ impl<'de> Deserialize<'de> for SessionEventOp {
                 }
             }
             "compaction_end" => {
-                match serde_json::from_value::<CompactionEndFields>(serde_json::Value::Object(clone)) {
+                match serde_json::from_value::<CompactionEndFields>(data.clone()) {
                     Ok(fields) => Ok(SessionEventOp::CompactionEnd {
                         compaction: fields.compaction,
                     }),
@@ -399,24 +344,22 @@ impl<'de> Deserialize<'de> for SessionEventOp {
                 }
             }
             "clear_all" => {
-                // The derived unit variant serialized as just `{"op":"clear_all"}`.
-                // It carries no fields; tolerate stray extra fields defensively.
+                // The unit variant serializes as `{"op":"clear_all","data":{}}`.
+                // It carries no fields; tolerate any payload defensively.
                 Ok(SessionEventOp::ClearAll)
             }
-            // Unknown `op`: this is the escape hatch. Preserve the type tag and
-            // every remaining field so a plugin event round-trips through the
-            // log losslessly and future core releases can promote it to a
-            // first-class variant without losing already-logged data. Non-object
-            // payloads are unwrapped from their serialization-encoded `data` form
-            // (see `make_unknown`).
+            // Unknown `op`: escape hatch. Preserve the type tag and every piece
+            // of payload verbatim so a plugin event round-trips losslessly and
+            // future core releases can promote it without losing logged data.
             other => Ok(make_unknown(other)),
         }
     }
 }
 
 /// Transient helper structs used by the manual `Deserialize` impl to reuse the
-/// derived per-field deserialization for each known variant (the derived enum
-/// hand-off path expects the flattened field set without `op`).
+/// derived per-field deserialization for each known variant (the field object
+/// lives under the envelope's `data` key, so these structs describe the payload
+/// with no `op` tag).
 #[derive(Deserialize)]
 struct AppendMessageFields {
     message_id: String,

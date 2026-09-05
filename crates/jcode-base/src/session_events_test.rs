@@ -598,7 +598,8 @@ fn test_event_op_serialization() {
 /// plugin can add event kinds without editing the core enum.
 #[test]
 fn test_unknown_op_escape_hatch_preserves_payload() {
-    let raw = r#"{"op":"plugin_custom_note","note":"hello","count":3,"nested":{"a":[1,2]}}"#;
+    // Envelope wire format: the plugin payload lives verbatim under `data`.
+    let raw = r#"{"op":"plugin_custom_note","data":{"note":"hello","count":3,"nested":{"a":[1,2]}}}"#;
     let op: SessionEventOp = serde_json::from_str(raw).expect("unknown op must deserialize");
     match &op {
         SessionEventOp::Unknown { event_type, data } => {
@@ -607,8 +608,6 @@ fn test_unknown_op_escape_hatch_preserves_payload() {
             assert_eq!(data.get("note").and_then(|v| v.as_str()), Some("hello"));
             assert_eq!(data.get("count").and_then(|v| v.as_u64()), Some(3));
             assert!(data.contains_key("nested"));
-            // The `op` key itself must not be duplicated inside the payload.
-            assert!(data.get("op").is_none());
         }
         other => panic!("expected Unknown, got {other:?}"),
     }
@@ -2461,20 +2460,18 @@ fn test_compact_transcript_with_bracket_produces_balanced_durable_bracket() {
         .expect("reloaded bracket producer log must stay consistent");
 }
 
-/// An `Unknown` event constructed in-memory with a **non-object** `data` payload
-/// (e.g. `data: json!(123)`) must serialize to exactly one top-level `op` key.
-/// Regression for a bug where the non-object branch emitted `op` inside the
-/// match *and* again after it, producing invalid JSON with duplicate keys:
-/// `{"op":"x","data":123,"op":"x"}`. The serialized form is also shape-stable
-/// after the first round-trip (a scalar becomes the object-wrapped form, matching
-/// the on-wire shape, and stays stable on subsequent round-trips).
+/// An `Unknown` whose payload is a non-object value (e.g. `data: json!(123)`)
+/// serializes to exactly one top-level `op` key, with the bare value under
+/// `data`. The envelope encoding makes a scalar/array payload unambiguous: it
+/// lives verbatim under `data`, so no object-wrapping heuristic is needed and
+/// the shape is stable across round-trips.
 #[test]
 fn test_unknown_op_in_memory_non_object_serializes_single_op() {
     let op = SessionEventOp::Unknown {
         event_type: "plugin_scalar".to_string(),
         data: serde_json::json!(123),
     };
-    // The RAW serialized string must contain exactly one `op` key (no duplicates).
+    // The RAW serialized string must contain exactly one `op` key.
     let json = serde_json::to_string(&op).expect("serialize in-memory non-object");
     let raw_op_count = json.matches("\"op\":").count();
     assert_eq!(
@@ -2482,8 +2479,12 @@ fn test_unknown_op_in_memory_non_object_serializes_single_op() {
         1,
         "in-memory non-object Unknown must serialize exactly one op key; got: {json}"
     );
-    // The round-trip must be lossless AND stable: the scalar/bare payload is
-    // preserved (not object-wrapped) and stays unchanged on further round-trips.
+    // The bare scalar must be preserved verbatim under `data`.
+    assert!(
+        json.contains("\"data\":123"),
+        "scalar payload must be emitted verbatim under data; got: {json}"
+    );
+    // The round-trip must be lossless AND stable.
     let back: SessionEventOp = serde_json::from_str(&json).expect("deserialize");
     let json2 = serde_json::to_string(&back).expect("re-serialize");
     assert_eq!(
@@ -2496,17 +2497,12 @@ fn test_unknown_op_in_memory_non_object_serializes_single_op() {
     assert_eq!(json2.matches("\"op\":").count(), 1);
 }
 
-/// The `Unknown` escape hatch must round-trip **stably** even when the remaining
-/// payload is not a flat JSON object (e.g. `{"op":"x","data":123}`). The
-/// serializer emission-encodes a non-object payload as a lone `data` field, and
-/// the deserializer unwraps it back to the bare value, so a scalar/array payload
-/// round-trips losslessly (no unbounded nesting growth, no spurious object
-/// wrapper). This pins the documented behavior of the non-object branch.
+/// The `Unknown` escape hatch must round-trip **stably** when the payload is not
+/// a flat JSON object (a scalar or array). With the envelope encoding the bare
+/// value lives verbatim under `data`, so it round-trips losslessly with no
+/// object-wrapping and no ambiguity.
 #[test]
 fn test_unknown_op_non_object_payload_round_trips_losslessly() {
-    // A non-object payload (scalar or array) must deserialize to the bare value,
-    // NOT collapse into `{"data":123}` (the serializer's emission shape), and
-    // round-trip losslessly.
     for (raw_tag, payload) in [
         (r#"{"op":"plugin_scalar","data":123}"#, serde_json::json!(123)),
         (
@@ -2520,7 +2516,7 @@ fn test_unknown_op_non_object_payload_round_trips_losslessly() {
             SessionEventOp::Unknown { event_type, data } => {
                 assert_eq!(
                     data, &payload,
-                    "raw non-object payload must not be wrapped under `data`"
+                    "raw non-object payload must be preserved verbatim under data"
                 );
                 // Round-trip: the bare value must serialize back to the same
                 // wire form and deserialize to the identical value.
@@ -2780,10 +2776,10 @@ fn test_compact_transcript_invalid_compaction_state_opens_no_bracket() {
 }
 
 /// The `Unknown` escape hatch must not corrupt a plugin payload that happens to
-/// contain an `op` field of its own: `op` is the **reserved** wire discriminator,
-/// so a top-level payload field named `op` is dropped deterministically (exactly
-/// one `op` = the tag) rather than producing duplicate `op` keys — which would be
-/// invalid/ambiguous JSON on the wire. Other payload fields survive.
+/// contain an `op` field of its own. With the envelope encoding the payload lives
+/// verbatim under `data`, so a payload field named `op` no longer collides with
+/// the tag — it is preserved losslessly instead of being dropped (the earlier
+/// reserved-key contract is eliminated).
 #[test]
 fn test_unknown_op_with_reserved_op_key_in_payload() {
     let op = SessionEventOp::Unknown {
@@ -2793,9 +2789,6 @@ fn test_unknown_op_with_reserved_op_key_in_payload() {
             "x": 1,
         }),
     };
-    // Serialize should produce ONE top-level `op` (the tag) and keep the payload's
-    // `op` intact under the same object (it collides on the wire, so we assert the
-    // round-trip preserves the payload value rather than hard-failing).
     let json = serde_json::to_string(&op).expect("serialize");
     let back: SessionEventOp = serde_json::from_str(&json).expect("round-trip");
     match back {
@@ -2806,20 +2799,12 @@ fn test_unknown_op_with_reserved_op_key_in_payload() {
                 Some(1),
                 "non-reserved payload field must survive"
             );
-            // `op` is the reserved wire discriminator, so a payload field named
-            // `op` is not representable at the top level. The serializer must
-            // drop it deterministically (one `op` = the tag) rather than emit
-            // duplicate `op` keys (invalid/ambiguous JSON). This is the documented
-            // reserved-key contract, not silent corruption.
+            // `op` lives nested under `data`, so it does not collide with the tag
+            // and is preserved verbatim.
             assert_eq!(
-                event_type.as_str(),
-                "plugin_complex",
-                "the tag stays the discriminator (payload op is reserved)"
-            );
-            assert_eq!(
-                data.get("op"),
-                None,
-                "reserved payload 'op' is dropped deterministically (avoid duplicate keys)"
+                data.get("op").and_then(|v| v.as_str()),
+                Some("not-the-discriminator"),
+                "payload 'op' field must be preserved under the envelope's data (no longer dropped)"
             );
         }
         other => panic!("expected Unknown, got {other:?}"),
@@ -3295,7 +3280,7 @@ fn test_memory_profile_event_log_refresh_after_injection_and_replay() {
 fn test_known_tag_with_mismatched_shape_degrades_to_unknown() {
     // `append_message` normally requires {message_id, message}. A payload with a
     // different shape (here `message_id` only) must NOT hard-error; it degrades.
-    let raw = r#"{"op":"append_message","message_id":"m_x"}"#;
+    let raw = r#"{"op":"append_message","data":{"message_id":"m_x"}}"#;
     let back: SessionEventOp = serde_json::from_str(raw).expect("must not error");
     match &back {
         SessionEventOp::Unknown { event_type, data } => {
@@ -3323,7 +3308,7 @@ fn test_known_tag_with_mismatched_shape_degrades_to_unknown() {
 #[test]
 fn test_known_tag_with_extra_field_stays_known_but_missing_field_degrades() {
     // Extra field -> the known variant is preserved (future field dropped).
-    let raw_extra = r#"{"op":"append_message","message_id":"m1","message":{"id":"m1","role":"user","content":[{"type":"text","text":"hi"}]},"metadata":"future"}"#;
+    let raw_extra = r#"{"op":"append_message","data":{"message_id":"m1","message":{"id":"m1","role":"user","content":[{"type":"text","text":"hi"}]},"metadata":"future"}}"#;
     let extra: SessionEventOp = serde_json::from_str(raw_extra).expect("must not error");
     match &extra {
         SessionEventOp::AppendMessage { message_id, message } => {
@@ -3334,7 +3319,7 @@ fn test_known_tag_with_extra_field_stays_known_but_missing_field_degrades() {
     }
 
     // Missing required field -> degrades to Unknown.
-    let raw_missing = r#"{"op":"append_message","message_id":"m1"}"#;
+    let raw_missing = r#"{"op":"append_message","data":{"message_id":"m1"}}"#;
     let missing: SessionEventOp = serde_json::from_str(raw_missing).expect("must not error");
     assert!(
         matches!(missing, SessionEventOp::Unknown { .. }),
