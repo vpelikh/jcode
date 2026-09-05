@@ -459,8 +459,9 @@ impl Agent {
         s
     }
 
-    /// Count matched action-promise phrases, subtracting the "let me know"
-    /// closing/sign-off phrasing which is not an action promise.
+    /// Count matched action-promise phrases, subtracting non-promise phrasing:
+    /// the "let me know" sign-off, and analytical/explanatory frames like
+    /// "I'll note..." or "let me assume..." which are discourse, not actions.
     fn count_action_promise_phrases(low: &str) -> usize {
         // NOTE: `let's` and full-form `i will` are deliberately NOT counted.
         // "Let's X" is collaborative/suggestive, and "I will note/assume/observe
@@ -488,6 +489,40 @@ impl Agent {
         // heuristic focused on action-promise stalling and avoids flagging a
         // genuine final answer that merely asks for confirmation.
         count -= low.matches("let me know").count();
+        // A first-person frame followed by an EXPLANATORY/ANALYTICAL verb
+        // ("I'll note the log shows an error", "let me assume the cause", "let
+        // me say the fix is the import") is discourse/reasoning, not an action
+        // the agent promises to take and then fails to complete. These cross
+        // frames are the same false-positive class that motivated dropping the
+        // full-form "i will" (predictive/explanation), so they must be
+        // symmetric: "I'll note..." must not count any more than "I will
+        // note...". Without this, a genuine diagnosis phrased with contractions
+        // ("I'll note... I'll assume... I'll say...") crosses the density
+        // threshold and is falsely flagged as a stall. Real stalls always use
+        // acting verbs (invoke/run/grep/view/check), never these, so subtracting
+        // them loses no measured coverage.
+        const EXPLANATORY_VERBS: [&str; 12] = [
+            "note",
+            "assume",
+            "observe",
+            "remark",
+            "say",
+            "mention",
+            "point out",
+            "conclude",
+            "suggest",
+            "believe",
+            "explain",
+            "recall",
+        ];
+        // Count each explanatory-frame occurrence ("i'll note", "let me assume",
+        // "i'm going to explain", ...) and remove them from the tally so only
+        // acting-promise phrases remain.
+        for v in EXPLANATORY_VERBS {
+            for f in phrases {
+                count = count.saturating_sub(low.matches(&format!("{f} {v}")).count());
+            }
+        }
         count
     }
 

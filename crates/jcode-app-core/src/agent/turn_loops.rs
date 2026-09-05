@@ -1954,4 +1954,45 @@ mod tests {
             "long legitimate recap must not be flagged by the length-bounded compact detector"
         );
     }
+
+    #[test]
+    fn stalled_promise_i_contract_explanation_is_not_a_stall() {
+        // Mirror stalled_promise_i_will_explanation_is_not_a_stall but with
+        // CONTRACTIONS: "I'll note... I'll assume... I'll say..." is predictive/
+        // explanatory discourse, not a first-person action promise. The dense
+        // detector must not count explanatory-frame verbs under ANY first-person
+        // frame (i'll / let me / i'm going to), or a genuine diagnosis phrased
+        // with contractions would cross the density threshold and be falsely
+        // flagged.
+
+        let contracted = "I'll note the log shows an error. I'll assume the cause is the \
+                          import. I'll say the fix is small. I'll point out the schema. \
+                          I'll conclude it is env-related. I'll mention the config. \
+                          I'll observe the diff. I'll recall the prior step.";
+        assert!(
+            !Agent::is_stalled_promise_text(contracted),
+            "an explanatory answer using contracted 'I'll' must not be flagged as a stall"
+        );
+
+        // "let me" in an explanatory/analytic reading is equally discourse, not
+        // an action promise.
+        let let_me_explanatory = "Let me note the log shows an error. Let me assume the \
+                                  cause is the import. Let me say the fix is small. \
+                                  Let me observe the env is fine. Let me remark the diff. \
+                                  Let me mention the schema. Let me point out the config. \
+                                  Let me conclude it is env.";
+        assert!(
+            !Agent::is_stalled_promise_text(let_me_explanatory),
+            "an explanatory answer using 'let me <analytical verb>' must not be flagged"
+        );
+
+        // Real action-promise stalling with contractions must still be caught.
+        let contracted_stall = "I'll run the check. I'll grep the symbol. I'll view the file. \
+                                I'll read the body. I'll execute the test. I'll compare the env. \
+                                I'll verify the output. I'll write the fix.";
+        assert!(
+            Agent::is_stalled_promise_text(contracted_stall),
+            "a genuine contracted action-promise stall must still be flagged"
+        );
+    }
 }
