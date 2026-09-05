@@ -555,6 +555,25 @@ fn test_unknown_op_validation() {
         version: 1,
     });
     assert_eq!(map.events.len(), 1);
+
+    // A degenerate unknown op with an EMPTY type discriminator is rejected even
+    // with a valid id: it matches no known variant and names no future plugin,
+    // so the append-only log must not be polluted with an unroutable event.
+    map.append_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "unknown_empty_type".to_string(),
+        op: SessionEventOp::Unknown {
+            event_type: String::new(),
+            data: serde_json::json!({ "k": "v" }),
+        },
+        parent_id: None,
+        version: 1,
+    });
+    assert_eq!(
+        map.events.len(),
+        1,
+        "empty event_type must be rejected for an Unknown op"
+    );
 }
 
 #[test]

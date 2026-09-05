@@ -720,6 +720,17 @@ impl SessionEventMap {
             SessionEventOp::ReplayEvent { replay_event } => {
                 Self::validate_replay_event(replay_event)?;
             }
+            // The escape hatch must still carry a meaningful discriminator. An
+            // empty `op` tag would produce an event the log cannot later promote
+            // or route (it matches no known variant and names no future plugin),
+            // so reject it like an empty event_id.
+            SessionEventOp::Unknown { event_type, .. } => {
+                if event_type.is_empty() {
+                    return Err(SessionEventError::InvalidEventId {
+                        event_id: "<unknown op>".to_string(),
+                    });
+                }
+            }
             _ => {} // Other operations don't need additional validation
         }
         
