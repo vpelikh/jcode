@@ -2734,7 +2734,7 @@ fn test_journal_append_reload_keeps_sources_consistent() -> Result<()> {
 /// summary.
 #[test]
 fn test_orphaned_compaction_bracket_survives_journal_reload() -> Result<()> {
-    use crate::session::event_types::{SessionEvent, SessionEventOp};
+    use crate::session::event_types::SessionEventOp;
 
     let _env_lock = lock_env();
     let temp_home = tempfile::Builder::new()

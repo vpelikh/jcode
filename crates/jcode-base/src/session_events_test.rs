@@ -2220,7 +2220,7 @@ fn test_multi_insert_repair_pattern_stays_consistent() {
     // advances per assistant message (by this message's missing count), while
     // `offset` indexes within the message's missing items.
     let missing_for_message = vec!["t1", "t2"];
-    let mut inserted = 0usize;
+    let inserted = 0usize;
     for (offset, tid) in missing_for_message.iter().enumerate() {
         let stored = StoredMessage {
             id: format!("result_{tid}"),
@@ -2233,7 +2233,6 @@ fn test_multi_insert_repair_pattern_stays_consistent() {
         };
         session.insert_message(1 + 1 + inserted + offset, stored);
     }
-    inserted += missing_for_message.len();
 
     session.rederive_all_checked().expect("multi-insert repair must stay consistent");
     let ids: Vec<String> = session.messages.iter().map(|m| m.id.clone()).collect();
@@ -3118,6 +3117,49 @@ fn test_memory_profile_snapshot_includes_event_log() {
         snapshot.total_json_bytes >= snapshot.event_log_json_bytes,
         "snapshot total_json_bytes must include the event log footprint"
     );
+}
+
+/// Regression: recording a memory injection or replay event must refresh the
+/// cached memory profile's `event_log_count`/`event_log_json_bytes`. These
+/// event-log fields are derived from `event_map.events` only on a full profile
+/// rebuild, so after the cache is warm a subsequent injection/replay must mark
+/// the profile dirty (mirroring `append_stored_message`) — otherwise a snapshot
+/// taken right after would report a stale event-log count.
+#[test]
+fn test_memory_profile_event_log_refresh_after_injection_and_replay() {
+    use crate::session::{StoredReplayEvent, StoredReplayEventKind};
+
+    let mut session = Session::create_with_id("mp_evt_refresh".to_string(), None, None);
+    // Warm the cache (messages only; event_log_count = 0 so far is fine by
+    // itself, but the fields must reflect the *live* log after later events).
+    let s0 = session.memory_profile_snapshot();
+    assert_eq!(s0.event_log_count, session.event_map.events.len());
+
+    session.record_memory_injection("inj".to_string(), "content".to_string(), 1, 0, vec![]);
+    let s1 = session.memory_profile_snapshot();
+    assert_eq!(
+        s1.event_log_count,
+        session.event_map.events.len(),
+        "event_log_count must include the newly recorded MemoryInjection event"
+    );
+
+    session.record_replay_event(&StoredReplayEvent {
+        timestamp: Utc::now(),
+        kind: StoredReplayEventKind::DisplayMessage {
+            role: "system".to_string(),
+            title: None,
+            content: "notice".to_string(),
+        },
+    });
+    let s2 = session.memory_profile_snapshot();
+    assert_eq!(
+        s2.event_log_count,
+        session.event_map.events.len(),
+        "event_log_count must include the newly recorded ReplayEvent"
+    );
+    // The in-place injection/replay counts stay correct too.
+    assert_eq!(s2.memory_injection_count, 1);
+    assert_eq!(s2.replay_event_count, 1);
 }
 
 /// Forward-compat of the escape hatch: a FUTURE core build may promote an

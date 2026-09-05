@@ -1722,6 +1722,12 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
             self.memory_profile_cache.memory_injections_json_bytes += estimate_json_bytes(&injection);
             self.memory_injections.push(injection);
             self.mark_memory_injections_append_dirty();
+            // The event log grew with the new event. The in-place injection
+            // count is already updated, but the profile's `event_log_count` /
+            // `event_log_json_bytes` fields (derived from `event_map.events`)
+            // must reflect the appended event too. Mark the profile dirty so an
+            // exact rebuild happens, mirroring `append_stored_message`.
+            self.mark_memory_profile_dirty();
         }
     }
 
@@ -1772,6 +1778,10 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
             self.memory_profile_cache.replay_events_json_bytes += estimate_json_bytes(replay_event);
             self.replay_events.push(replay_event.clone());
             self.mark_replay_events_append_dirty();
+            // The event log grew with the new event; keep the profile's
+            // `event_log_count`/`event_log_json_bytes` in sync (see
+            // `append_stored_message`).
+            self.mark_memory_profile_dirty();
         }
     }
 
