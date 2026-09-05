@@ -2361,3 +2361,51 @@ impl Provider for AlwaysStalledProvider {
         Arc::new(self.clone())
     }
 }
+
+/// The non-streaming turn loop (run_once -> run_turn) must recover identically:
+/// an always-stalled provider is bounded to 1 original call + exactly
+/// MAX_STALLED_PROMISE_CONTINUATION_ATTEMPTS retries, and each retry persists
+/// one hidden stalled-promise reminder. This closes the parity gap so the
+/// guard is verified through the sync path, not just the streaming one.
+#[tokio::test]
+async fn stalled_promise_turn_bounded_in_non_streaming_loop() {
+    let _guard = crate::storage::lock_test_env();
+    let stuck = AlwaysStalledProvider::default();
+    let calls = stuck.calls.clone();
+    let provider: Arc<dyn Provider> = Arc::new(stuck);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    agent
+        .run_once("do the task")
+        .await
+        .expect("non-streaming turn should complete");
+
+    assert_eq!(
+        *calls.lock().unwrap(),
+        1 + Agent::MAX_STALLED_PROMISE_CONTINUATION_ATTEMPTS as usize,
+        "non-streaming loop must bound the stalled-promise retries identically (made {} calls)",
+        *calls.lock().unwrap()
+    );
+
+    let injected_reminders = agent
+        .session
+        .messages
+        .iter()
+        .filter(|m| {
+            m.role == Role::User
+                && m.content.iter().any(|block| match block {
+                    ContentBlock::Text { text, .. } => {
+                        text.starts_with("<system-reminder>")
+                            && text.contains("repeatedly said you would perform an action")
+                    }
+                    _ => false,
+                })
+        })
+        .count();
+    assert_eq!(
+        injected_reminders,
+        Agent::MAX_STALLED_PROMISE_CONTINUATION_ATTEMPTS as usize,
+        "non-streaming loop must inject one stalled-promise reminder per retry"
+    );
+}
