@@ -296,7 +296,7 @@ impl super::Registry {
     /// hook, lifecycle log) and returns `Some(result)` for `execute` to
     /// short-circuit with. Returns `None` to run the tool normally. Takes the
     /// tools read guard by value so it can drop it before observable work.
-    pub(crate) async fn enforce_compass_first(
+    pub(crate) fn enforce_compass_first(
         &self,
         tools_guard: tokio::sync::RwLockReadGuard<
             '_,

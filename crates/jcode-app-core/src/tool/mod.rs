@@ -749,17 +749,14 @@ impl Registry {
         // run the tool normally. An interception sits before the `pre_tool`
         // policy hook because it executes no tool; the model's follow-up
         // `compass_query` (or bypassed agentgrep) is what the hook gates.
-        if let Some(intercept) = self
-            .enforce_compass_first(
-                tools,
-                name,
-                resolved_name,
-                &input,
-                prefer_compass_query,
-                &ctx,
-            )
-            .await
-        {
+        if let Some(intercept) = self.enforce_compass_first(
+            tools,
+            name,
+            resolved_name,
+            &input,
+            prefer_compass_query,
+            &ctx,
+        ) {
             return intercept;
         }
 
