@@ -1476,10 +1476,9 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         if *role == Role::User
             && display_role.is_none()
             && !content_has_injected_marker(content)
+            && let Some(title) = generated_title_from_content(content)
         {
-            if let Some(title) = generated_title_from_content(content) {
-                self.title = Some(title);
-            }
+            self.title = Some(title);
         }
     }
 
