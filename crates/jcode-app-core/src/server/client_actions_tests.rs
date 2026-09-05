@@ -951,3 +951,58 @@ async fn set_working_dir_to_current_dir_is_noop() -> Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn set_working_dir_noop_detects_canonically_equivalent_dir() -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    // Store a *non-canonical* working dir (a `sub/..` round trip) so the
+    // stored string differs lexically from the canonical target, exercising the
+    // canonicalization fallback in the no-op comparison rather than the trivial
+    // exact-string match.
+    let root = tempfile::tempdir().expect("root dir");
+    let sub = root.path().join("sub");
+    std::fs::create_dir_all(&sub).expect("create sub");
+    let stored_non_canonical = root.path().join("sub/..");
+
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
+    {
+        let mut guard = agent.lock().await;
+        guard.set_working_dir(stored_non_canonical.to_str().expect("utf8"));
+    }
+    let agent_session_id = agent.lock().await.session_id().to_string();
+    let swarm_members = Arc::new(RwLock::new(HashMap::<String, SwarmMember>::new()));
+    let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
+
+    // /cd to the canonical form of the *same* directory: a no-op because the
+    // stored form canonicalizes to the same tree, so no event is emitted.
+    let canonical = root.path().canonicalize().expect("canonical");
+    handle_set_working_dir(
+        78,
+        canonical.to_str().expect("utf8").to_string(),
+        &agent,
+        &agent_session_id,
+        &swarm_members,
+        &client_event_tx,
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let events: Vec<_> = std::iter::from_fn(|| client_event_rx.try_recv().ok()).collect();
+    assert!(
+        events.is_empty(),
+        "a /cd to a canonically-equivalent dir must be a no-op, got {events:?}"
+    );
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    Ok(())
+}
