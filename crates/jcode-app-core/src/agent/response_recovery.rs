@@ -520,9 +520,27 @@ impl Agent {
             "let me call",
             "i'll call",
         ];
-        const TOOL_TARGETS: [&str; 11] = [
-            "bash", "the bash", "tool", "the tool", "command", "the command", "grep", "sed",
-            "shell", "the shell", "cmd",
+        const TOOL_TARGETS: [&str; 20] = [
+            "bash",
+            "the bash",
+            "tool",
+            "the tool",
+            "a tool",
+            "command",
+            "the command",
+            "a command",
+            "grep",
+            "sed",
+            "run",
+            "the run",
+            "shell",
+            "the shell",
+            "a shell",
+            "script",
+            "the script",
+            "a script",
+            "cmd",
+            "a cmd",
         ];
         // The detector runs on one short (<=700 char) turn per recovery check,
         // so building the few candidate phrases here is negligible.

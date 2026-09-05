@@ -1577,6 +1577,25 @@ mod tests {
     }
 
     #[test]
+    fn compact_unfulfilled_tool_request_detects_run_and_script_targets() {
+        // The tool-target list must keep `run` and `script` (beyond
+        // bash/tool/command), because a short turn can promise to "invoke the
+        // run command" or "call the script" and stop without doing so. These
+        // are the same stall with a synonym target and must be detected.
+        let stalls = [
+            "Let me invoke the run command to check the pipeline now.",
+            "I'll call the script to verify the output now.",
+            "Let me invoke a script to finish this step now.",
+        ];
+        for turn in stalls {
+            assert!(
+                Agent::is_stalled_promise_text(turn),
+                "compact stall with a run/script target must be flagged: {turn:?}"
+            );
+        }
+    }
+
+    #[test]
     fn compact_unfulfilled_tool_request_is_stalled() {
         // The exact compact degradation observed in a real long-context session
         // (DeepSeek via OpenRouter): a SHORT turn explicitly says it will invoke a
