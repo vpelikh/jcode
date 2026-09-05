@@ -2303,6 +2303,26 @@ fn test_old_timestamp_replay_event_is_accepted() {
         "a non-replay event older than the age window must still be rejected"
     );
 }
+
+/// A genuinely empty session (no events AND no legacy state) is trivially
+/// "preserved" by `reconcile_event_map_after_load` — it must return `true` so a
+/// loader does not emit a spurious "event log was not preserved; rebuilt from
+/// legacy vectors" warning for a session that has nothing to rebuild or lose.
+#[test]
+fn test_reconcile_empty_clean_session_is_preserved() {
+    let mut session = Session::create_with_id("reconcile_empty".to_string(), None, None);
+    assert!(session.messages.is_empty());
+    assert!(session.event_map.is_empty());
+    // Must return true (trivially preserved) without rebuilding or warning.
+    assert!(
+        session.reconcile_event_map_after_load(),
+        "an empty-clean session must be reported as preserved (no spurious rebuild warning)"
+    );
+    assert!(
+        session.event_map.is_empty(),
+        "reconcile must not fabricate events for an empty-clean session"
+    );
+}
 #[test]
 fn test_compaction_cache_tracks_clear_and_reset_order() {
     // The `cached_compaction` cache must reflect the physical event order across

@@ -2203,14 +2203,21 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
     /// when it was rebuilt from the legacy vectors.
     pub fn reconcile_event_map_after_load(&mut self) -> bool {
         if self.event_map.is_empty() {
-            if !self.messages.is_empty()
+            let has_legacy_state = !self.messages.is_empty()
                 || !self.memory_injections.is_empty()
                 || !self.replay_events.is_empty()
-                || self.compaction.is_some()
-            {
+                || self.compaction.is_some();
+            if has_legacy_state {
+                // A pre-persistence snapshot migrates by rebuilding the log from
+                // the legacy vectors.
                 self.rebuild_event_map();
+                return false;
             }
-            return false;
+            // The log is empty AND the legacy state is empty: there is nothing
+            // to rebuild or lose, so the (trivially empty) log is "preserved".
+            // Returning true here avoids a spurious "event log was not preserved"
+            // warning when loading a genuinely empty session.
+            return true;
         }
         match self.rederive_all_checked() {
             Ok(_) => true,
