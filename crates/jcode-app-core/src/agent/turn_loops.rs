@@ -1785,6 +1785,28 @@ mod tests {
     }
 
     #[test]
+    fn compact_unfulfilled_tool_request_ignores_non_tool_nouns() {
+        // A non-tool NOUN is not a tool/command target: "invoke the memory",
+        // "call the app", "invoke a plan", "call the team" are abstract or
+        // animate subjects, not a tool the agent promised to invoke now. The
+        // target list must not broaden to common nouns or future over-tuning
+        // regresses here.
+        let legitimate = [
+            "I'll invoke the memory now.",
+            "I'll call the app to run.",
+            "Let me invoke a plan.",
+            "I'll call the team to review.",
+            "Let me invoke the meeting.",
+        ];
+        for turn in legitimate {
+            assert!(
+                !Agent::is_stalled_promise_text(turn),
+                "a non-tool noun target must not be flagged as a stall: {turn:?}"
+            );
+        }
+    }
+
+    #[test]
     fn compact_unfulfilled_tool_request_is_stalled() {
         // The exact compact degradation observed in a real long-context session
         // (DeepSeek via OpenRouter): a SHORT turn explicitly says it will invoke a
