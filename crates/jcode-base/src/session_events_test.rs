@@ -582,6 +582,67 @@ fn test_unknown_op_flows_through_event_log() {
     }
 }
 
+/// `rebuild_event_map` must NOT drop log-only plugin `Unknown` events. It is
+/// used as a "reconcile from the legacy vectors" tool by several callers (load
+/// self-heal, the app-core sanitize-clear path), and dropping `Unknown` events
+/// there would silently lose durable plugin data — defeating the escape hatch.
+#[test]
+fn test_rebuild_event_map_preserves_plugin_unknown_events() {
+    let mut session = Session::create_with_id("rebuild_unknown".to_string(), None, None);
+    // A real message plus a plugin `Unknown` event.
+    let message = StoredMessage {
+        id: "m1".to_string(),
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    };
+    session.append_stored_message(message);
+    session.append_session_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "plugin_kept".to_string(),
+        op: SessionEventOp::Unknown {
+            event_type: "plugin/keep".to_string(),
+            data: serde_json::json!({ "k": "v" }),
+        },
+        parent_id: None,
+        version: 1,
+    });
+    assert!(
+        session
+            .event_map
+            .events
+            .iter()
+            .any(|e| matches!(e.op, SessionEventOp::Unknown { .. })),
+        "precondition: plugin event present"
+    );
+
+    // Rebuild from the legacy vectors (simulating reconcile / sanitize-clear).
+    session.rebuild_event_map();
+
+    // The plugin `Unknown` event must survive the rebuild.
+    assert!(
+        session
+            .event_map
+            .events
+            .iter()
+            .any(|e| matches!(
+                &e.op,
+                SessionEventOp::Unknown { event_type, .. } if event_type == "plugin/keep"
+            )),
+        "rebuild_event_map must preserve plugin Unknown events"
+    );
+    // Derived state still agrees with the legacy vectors.
+    session
+        .rederive_all_checked()
+        .expect("rebuilt log must stay consistent");
+}
+
 /// Unknown ops must still be rejected by validation if their event id is empty,
 /// and accepted when the payload is well formed, so plugin events do not
 /// silently corrupt the log invariants.

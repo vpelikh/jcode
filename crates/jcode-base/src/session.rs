@@ -2098,6 +2098,23 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         let mut map = SessionEventMap::default();
         let now = chrono::Utc::now();
 
+        // Plugin `Unknown` events are purely additive: they affect no derive
+        // path (messages, compaction, memory injections, replay events), so a
+        // rebuild must PRESERVE them rather than drop them. Otherwise any caller
+        // that rebuilds the log from the legacy vectors (reconcile-on-divergence,
+        // the app-core sanitize-clear path) would silently lose durable plugin
+        // data, defeating the escape hatch (takeaway #13). Compaction brackets
+        // and ordinary state-carrying events are NOT preserved here: they are
+        // reconstructed (or deliberately omitted) from the legacy vectors so the
+        // rebuilt log agrees with `self.compaction`/`self.messages`.
+        let preserved_unknown: Vec<SessionEvent> = self
+            .event_map
+            .events
+            .iter()
+            .filter(|e| matches!(e.op, SessionEventOp::Unknown { .. }))
+            .cloned()
+            .collect();
+
         for (i, message) in self.messages.iter().enumerate() {
             map.push_event(SessionEvent {
                 timestamp: message.timestamp.unwrap_or(now),
@@ -2145,6 +2162,15 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
                 parent_id: None,
                 version: 1,
             });
+        }
+
+        // Re-append the plugin `Unknown` events that were preserved above. They
+        // are appended LAST so their relative order is unchanged and they sit
+        // after any reconstructed state events (their position in the log never
+        // matters to derivation, but keeping them contiguous tail preserves the
+        // append-only narrative for any downstream reader).
+        for event in preserved_unknown {
+            map.push_event(event);
         }
 
         self.event_map = map;
