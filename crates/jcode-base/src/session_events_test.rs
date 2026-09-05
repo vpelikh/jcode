@@ -2809,6 +2809,59 @@ fn test_compact_transcript_retry_recovers_orphaned_bracket() {
         .expect("retried bracket producer must stay consistent");
 }
 
+/// Completing a pre-existing orphan MUST NOT enforce strict bracket balance. If
+/// the log was corrupted with MULTIPLE unclosed brackets (e.g. two crashes
+/// without an intervening resolve), a retry completes only the innermost orphan;
+/// a shallower one legitimately remains as a real "incomplete compaction" signal
+/// a resumed session resolves on a later call. Before this fix, the strict
+/// `CompactionBracket` enforce wired into `compact_transcript_with_bracket`
+/// would hard-panic (in debug) on this valid recovery, blocking the session from
+/// ever resolving the remaining orphan.
+#[test]
+fn test_compact_transcript_retry_on_multi_orphan_does_not_panic() {
+    let mut session = Session::create_with_id("multi_orphan_retry".to_string(), None, None);
+    session.append_stored_message(StoredMessage {
+        id: "m1".to_string(),
+        role: Role::User,
+        content: vec![text_block("hello")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+
+    // Two crashed runs: [Start A, Start B] with no closes. B is the innermost.
+    session.event_map.start_compaction("run_a", 1);
+    session.event_map.start_compaction("run_b", 1);
+    assert_eq!(
+        session.event_map.orphaned_compactions().len(),
+        2,
+        "precondition: two orphaned brackets"
+    );
+
+    let comp = StoredCompactionState {
+        summary_text: "retry".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 1,
+    };
+    // The retry completes the innermost orphan (B). It must NOT panic, even in
+    // debug builds, because fresh_bracket is false (we inherited an orphan).
+    session.compact_transcript_with_bracket("retry_b", session.messages.clone(), comp.clone(), 1);
+
+    // The innermost orphan is resolved; the shallower (A) remains as a real,
+    // pre-existing signal — not a bug introduced by this call.
+    assert_eq!(
+        session.event_map.orphaned_compactions().len(),
+        1,
+        "retry closes the innermost orphan; the shallower one remains resolvable"
+    );
+    session
+        .rederive_all_checked()
+        .expect("multi-orphan retry must stay consistent");
+}
+
 /// A `compact_transcript_with_bracket` whose `CompactionStart` is rejected by
 /// validation (e.g. `covers_up_to_turn == 0`) must NOT emit a dangling
 /// `CompactionEnd`. `append_event` silently skips an invalid `CompactionStart`,

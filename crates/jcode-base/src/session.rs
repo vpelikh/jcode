@@ -1983,7 +1983,14 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         // bracket the invariant flags as silent corruption. Instead, complete the
         // in-flight bracket: the surface mutation and `CompactionEnd` below close
         // the orphan, so retry is idempotent with respect to the bracket shape.
-        let started = if self.event_map.orphaned_compaction().is_none() {
+        //
+        // `fresh_bracket` distinguishes a bracket WE opened and closed in this
+        // call (so it must end balanced) from one that simply completes a
+        // PRE-EXISTING orphaned bracket (where a shallower orphan may legitimately
+        // remain if the log was corrupted with multiple unclosed brackets). See
+        // the enforce call below.
+        let had_orphan_before = self.event_map.orphaned_compaction().is_some();
+        let started = if !had_orphan_before {
             let before = self.event_map.events.len();
             self.event_map
                 .start_compaction(compaction_id.clone(), covers_up_to_turn);
@@ -1998,6 +2005,11 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
             // already in the log, so closing it is valid.
             true
         };
+        // A bracket is "fresh" when WE opened it above (no pre-existing orphan)
+        // AND we are about to close it. Completing a pre-existing orphan is not
+        // fresh. This determines whether the bracket-balance enforce below is a
+        // strict assertion (fresh) or a tolerant check (completing an orphan).
+        let fresh_bracket = !had_orphan_before && started;
         // One surface mutation inside the bracket: replace the transcript with
         // the summarized tail. This is the only change replay needs to apply.
         self.replace_messages(messages);
@@ -2005,19 +2017,25 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
             self.event_map.end_compaction(compaction.clone());
             self.compaction = Some(compaction);
             // Enforce the compaction-bracket invariant at the completion point.
-            // This is a SAFE, deliberately narrow call site for `enforce()`: at
-            // the moment a balanced bracket has just been closed and persisted,
-            // an open/duplicated bracket is provably a bug — a compaction that
-            // claims completion while leaving the bracket malformed. Enforce ONLY
-            // `CompactionBracket` here (not the full builtin registry) because
-            // `ToolPairingBalanced` legitimately fires on compactions that do not
-            // snap to a tool-pairing boundary (a valid, documented call pattern),
-            // so enforcing it here would hard-fail a correct run.
-            let mut bracket_registry = invariants::InvariantRegistry::default();
-            bracket_registry.add(invariants::CompactionBracket);
-            let log = bracket_registry.check(&self.event_map);
-            // `enforce` panics in debug builds on a violation; release logs.
-            invariants::InvariantLog::enforce(&log, "compact_transcript_with_bracket");
+            // This is a SAFE, deliberately narrow call site for `enforce()`: a
+            // bracket we just opened is closed, so an open/duplicated bracket
+            // here is provably a bug. Enforce ONLY `CompactionBracket` (not the
+            // full builtin registry) because `ToolPairingBalanced` legitimately
+            // fires on compactions that do not snap to a tool-pairing boundary.
+            //
+            // When we are merely COMPLETING a pre-existing orphaned bracket
+            // (fresh_bracket == false), we do not strict-enforce balance: a
+            // shallower orphan may legitimately remain (e.g. the log was never
+            // resolved twice and holds multiple unclosed brackets). That state is
+            // a real, pre-existing "incomplete compaction" signal a resumed
+            // session handles on a subsequent call, not a bug introduced here.
+            if fresh_bracket {
+                let mut bracket_registry = invariants::InvariantRegistry::default();
+                bracket_registry.add(invariants::CompactionBracket);
+                let log = bracket_registry.check(&self.event_map);
+                // `enforce` panics in debug builds on a violation; release logs.
+                invariants::InvariantLog::enforce(&log, "compact_transcript_with_bracket");
+            }
         } else {
             // The `CompactionStart` was rejected by validation (e.g. an invalid
             // `covers_up_to_turn`), so no bracket is open. Persist the compaction
