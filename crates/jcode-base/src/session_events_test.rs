@@ -2348,13 +2348,9 @@ fn test_persisted_event_log_survives_snapshot_round_trip_with_bracket_and_unknow
     drop(f);
 
     let loaded = Session::load_from_path(&path).expect("load_from_path");
-    let kept = {
-        // reconcile already ran inside load; assert the authoritative log kept.
-        loaded.event_map.events.iter().any(|e| {
-            matches!(e.op, SessionEventOp::CompactionStart { .. })
-                && matches!(&e.op, SessionEventOp::CompactionStart { .. })
-        })
-    };
+    let kept = loaded.event_map.events.iter().any(|e| {
+        matches!(e.op, SessionEventOp::CompactionStart { .. })
+    });
     assert!(
         kept,
         "persisted bracket (CompactionStart) must survive the snapshot round-trip"
