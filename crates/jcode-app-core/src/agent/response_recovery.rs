@@ -444,10 +444,17 @@ impl Agent {
     /// looks like an ordinary "the agent stopped early" failure and silently
     /// discards all of its uncommitted work. Treat it like any other
     /// incomplete response and ask for a continuation instead.
+    ///
+    /// Some providers spell this stop reason differently: Anthropic/Claude use
+    /// `tool_use`, while OpenAI/OpenRouter (and DeepSeek via OpenRouter) use
+    /// `tool_calls`. Both mean the model intended to call a tool, so both are
+    /// stranded-tool stops when no tool call was parsed.
     pub(crate) fn is_stranded_tool_use_stop(stop_reason: Option<&str>) -> bool {
         stop_reason
             .map(str::trim)
-            .map(|reason| reason.eq_ignore_ascii_case("tool_use"))
+            .map(|reason| {
+                reason.eq_ignore_ascii_case("tool_use") || reason.eq_ignore_ascii_case("tool_calls")
+            })
             .unwrap_or(false)
     }
 

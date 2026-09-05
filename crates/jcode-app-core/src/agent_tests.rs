@@ -1915,11 +1915,14 @@ async fn stalled_promise_turn_gets_bounded_continuation() {
 
     // A tool_use stop without a parsed tool call belongs to the stranded
     // recovery, not this guard: it must be passed through untouched.
+    assert!(!agent.maybe_continue_stalled_promise(Some("tool_use"), spam, &mut attempts).unwrap());
+    // OpenAI/OpenRouter spell this stop reason "tool_calls"; it is the same
+    // stranded-tool-intent signal and must also be deferred, not misfiled as a
+    // filler stall.
+    assert!(!agent.maybe_continue_stalled_promise(Some("tool_calls"), spam, &mut attempts).unwrap());
     assert!(
-        !agent
-            .maybe_continue_stalled_promise(Some("tool_use"), spam, &mut attempts)
-            .unwrap(),
-        "a tool_use stop must be deferred to stranded-tool-use recovery"
+        Agent::is_stranded_tool_use_stop(Some("tool_calls")),
+        "tool_calls must be recognized as a stranded-tool stop"
     );
 
     // Truncation stops belong to maybe_continue_incomplete_response; a dense
