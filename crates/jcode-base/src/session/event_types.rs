@@ -8,7 +8,10 @@ use std::fmt;
 /// Maximum acceptable skew between an event's timestamp and "now" when
 /// validating an event at insert time. Generous enough for normal sessions,
 /// but rejects wildly improbable clocks. (Forking and rehydration use
-/// unvalidated `push_event`, so this never drops already-trusted history.)
+/// unvalidated `push_event`, so this never drops already-trusted history.
+/// Additionally, `ReplayEvent`s are exempt from the PAST window because their
+/// event timestamp mirrors the replay event's historical timestamp; only their
+/// future bound is enforced.)
 const MAX_EVENT_AGE_SECS: i64 = 86400 * 365; // ~1 year
 
 /// Errors that can occur when working with session events
