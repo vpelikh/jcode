@@ -57,8 +57,12 @@ impl Error for SessionEventError {}
 /// deepseek-harness's derived-union events, so unknown `op` tags deserialize
 /// into [`SessionEventOp::Unknown`] with their full payload preserved, matching
 /// how a future plugin event type would be carried through the log. Known
-/// variants (de)serialize byte-identically to the previous derived form so
-/// existing on-disk journals and wire payloads keep working.
+/// variants (de)serialize with the same `op` tag names and field names the
+/// previous derived form used, so existing on-disk journals and wire payloads
+/// load correctly (deserialization is key-based). Note the emitted *field
+/// order* is alphabetical (serde_json builds `Map` without `preserve_order`),
+/// so the raw bytes are not guaranteed byte-identical to the derived form —
+/// but the wire/on-disk format is semantically compatible.
 ///
 /// The extension rule: **add an event, don't edit the loop** — a plugin that
 /// needs a custom event appends an `Unknown { event_type, data }` event rather
@@ -202,9 +206,13 @@ impl Serialize for SessionEventOp {
         // Build the flattened field set per variant (the infer-tagged derive
         // output was `{"op": tag, ...fields}`). We construct the payload as a
         // serde_json map and emit `op` plus each field at the same level so
-        // on-disk journals and wire payloads stay byte-compatible with the
-        // previous derived form. `to_value` on an *individual field* is safe
-        // because fields are plain data types (no recursive `SessionEventOp`).
+        // on-disk journals and wire payloads load compatibly with the previous
+        // derived form (deserialization is key-based). The fields are emitted in
+        // the map's iteration order (alphabetical, as serde_json has no
+        // `preserve_order`), which is stable and semantically equivalent but not
+        // byte-identical to the derived declaration order. `to_value` on an
+        // *individual field* is safe because fields are plain data types (no
+        // recursive `SessionEventOp`).
         let tag = self
             .known_op_tag()
             .expect("known variants always have a tag");
