@@ -503,12 +503,6 @@ impl Session {
             || self.parent_id.is_some()
             || self.is_canary
             || self.save_label.is_some()
-            // A session given a real name (title) is intentionally configured:
-            // an explicit `Session::create_with_id(_, _, Some(title))` names the
-            // session and must be findable by id even before a visible message
-            // exists (regression for #1144 where a titled session was skipped by
-            // the lazy-save gate). `custom_title` is separately honored below.
-            || self.title.as_deref().is_some_and(|t| !t.trim().is_empty())
             || self.compaction.is_some()
             // Structured transcript state (swarm status/plan events, memory
             // injections, compaction markers) is meaningful and must not be
