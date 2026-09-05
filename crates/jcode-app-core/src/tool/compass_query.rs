@@ -1103,7 +1103,7 @@ async fn wait_for_prewarm(graph_path: &Path, output_dir: &Path, timeout: std::ti
     // depend on the signal, always re-check the ready graph afterwards: either
     // the wait was interrupted by completion, or it timed out, and in both cases
     // the graph having appeared is the ground truth that the index is warm.
-    tokio::time::timeout(timeout, done.notified()).await;
+    let _ = tokio::time::timeout(timeout, done.notified()).await;
     graph_path.is_file()
 }
 
