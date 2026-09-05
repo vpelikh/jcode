@@ -3132,6 +3132,63 @@ fn test_memory_profile_snapshot_includes_event_log() {
     );
 }
 
+/// The cached `memory_profile_snapshot` total and the live `debug_memory_profile`
+/// total must agree on a session carrying every footprint component (messages,
+/// injection, replay event, compaction, plus an appended plugin `Unknown`). This
+/// pins that the two observability surfaces are consistent and that the snapshot
+/// cache is not stale after the various event-appending paths.
+#[test]
+fn test_memory_profile_snapshot_total_matches_debug_total() {
+    use crate::session::{StoredReplayEvent, StoredReplayEventKind};
+
+    let mut session = Session::create_with_id("mp_total_equiv".to_string(), None, None);
+    session.append_stored_message(StoredMessage {
+        id: "m0".to_string(),
+        role: Role::User,
+        content: vec![text_block("hello")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    session.record_memory_injection("inj".to_string(), "content".to_string(), 1, 0, vec![]);
+    session.record_replay_event(&StoredReplayEvent {
+        timestamp: Utc::now(),
+        kind: StoredReplayEventKind::DisplayMessage {
+            role: "system".to_string(),
+            title: None,
+            content: "notice".to_string(),
+        },
+    });
+    session.set_compaction(StoredCompactionState {
+        summary_text: "s".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 1,
+    });
+    session.append_session_event(SessionEvent {
+        timestamp: Utc::now(),
+        event_id: "plugin".to_string(),
+        op: SessionEventOp::Unknown {
+            event_type: "plugin/probe".to_string(),
+            data: serde_json::json!({ "n": 1 }),
+        },
+        parent_id: None,
+        version: 1,
+    });
+
+    let snapshot_total = session.memory_profile_snapshot().total_json_bytes;
+    let debug_total = session
+        .debug_memory_profile()["totals"]["json_bytes"]
+        .as_u64()
+        .expect("debug totals.json_bytes is a number");
+    assert_eq!(
+        snapshot_total as u64, debug_total,
+        "cached snapshot total must match the live debug total (event log + all components)"
+    );
+}
+
 /// Regression: recording a memory injection or replay event must refresh the
 /// cached memory profile's `event_log_count`/`event_log_json_bytes`. These
 /// event-log fields are derived from `event_map.events` only on a full profile
