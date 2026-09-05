@@ -996,3 +996,51 @@ fn local_tick_does_not_spawn_premature_recheck_while_fix_queued() {
         );
     });
 }
+
+// Failure mode (reviewer gone): if the in-flight reviewer child session
+// vanishes or becomes unloadable (deleted, corrupt on disk), step_review_loop
+// must NOT poll forever or spawn a duplicate. It finalizes the loop cleanly
+// with a terminal reason so it cannot be mistaken for still-active work.
+#[test]
+fn step_review_loop_finalizes_when_reviewer_session_is_gone() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+
+        // Seed a live loop at the first lens whose active reviewer does not
+        // exist as a loadable session (simulates the reviewer being deleted or
+        // unloadable). Polling it yields PollResult::Gone.
+        let mut state = jcode_session_types::ReviewLoopState::new();
+        super::review_loop::enter_review_loop(&mut state);
+        state.active_reviewer_id = Some("session_reviewer_definitely_missing".to_string());
+        app.session.review_loop = Some(state);
+        app.is_processing = false;
+        app.pending_queued_dispatch = false;
+
+        let followup = super::commands_review::step_review_loop(&mut app);
+
+        // The loop finalizes instead of stalling; no follow-up is scheduled.
+        assert!(!followup, "a gone reviewer must not schedule further work");
+        let state = app.session.review_loop.as_ref().unwrap();
+        assert!(state.finished, "loop must finalize when the reviewer is gone");
+        assert_eq!(
+            state.finish_reason.as_deref(),
+            Some("reviewer_unavailable"),
+            "the terminal reason must identify the unavailable reviewer"
+        );
+        assert!(
+            state.active_reviewer_id.is_none(),
+            "the stale reviewer id must be cleared"
+        );
+        assert!(
+            app.display_messages().iter().any(|msg| {
+                msg.content
+                    .contains("the in-flight reviewer session is gone")
+            }),
+            "expected the gone-reviewer notice to be surfaced"
+        );
+        assert!(
+            app.status_notice.as_ref().is_some_and(|(n, _)| n.contains("reviewer gone")),
+            "expected the reviewer-gone status notice"
+        );
+    });
+}

@@ -688,4 +688,30 @@ mod review_tests {
         assert!(back.last_fix_touched_files);
         assert_eq!(back.fix_baseline_tree.as_deref(), Some(" M src/foo.rs"));
     }
+
+    // Backward compatibility: a persisted ReviewLoopState written by a build
+    // that still had the now-removed `reviewer_session_id` field (see the
+    // per-lens reviewer spawn change) must deserialize cleanly. `ReviewLoopState`
+    // does not use deny_unknown_fields, so serde ignores the unknown key. This
+    // pins that loading an old session json does not fail after the field was
+    // dropped from the struct.
+    #[test]
+    fn loop_state_old_session_with_reviewer_session_id_still_loads() {
+        let json = r#"{
+            "current_lens": "Correctness",
+            "stall_turns": 0,
+            "finished": false,
+            "phase": "lenses",
+            "awaiting_postfix_recheck": false,
+            "active_reviewer_id": "session_reviewer_abc",
+            "reviewer_session_id": "session_reviewer_single_window_xyz",
+            "last_fix_touched_files": false
+        }"#;
+        let back: ReviewLoopState = serde_json::from_str(json).expect("old session json must load");
+        assert!(!back.finished);
+        assert_eq!(back.current_lens, Some(ReviewLens::Correctness));
+        // The removed field is ignored; the `active_reviewer_id` that IS still
+        // used is preserved exactly.
+        assert_eq!(back.active_reviewer_id.as_deref(), Some("session_reviewer_abc"));
+    }
 }
