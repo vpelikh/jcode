@@ -1931,6 +1931,12 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         // provider_messages()/messages_for_provider() recomputes from the fork's
         // truncated transcript rather than returning the parent's cache.
         fork.reset_provider_messages_cache();
+        // The cloned `memory_profile_cache` still describes the PARENT's (larger)
+        // transcript, injections and replay events, while the fork's derived
+        // vectors are truncated to the boundary. Mark the profile dirty so the
+        // next ensure_memory_profile_cache/debug_memory_profile rebuilds from the
+        // fork's actual state instead of reporting the parent's counts.
+        fork.mark_memory_profile_dirty();
         
         // Generate new ID for the fork
         fork.id = new_id("fork");
