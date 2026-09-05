@@ -3173,6 +3173,61 @@ fn test_memory_profile_event_log_refresh_after_injection_and_replay() {
     // The in-place injection/replay counts stay correct too.
     assert_eq!(s2.memory_injection_count, 1);
     assert_eq!(s2.replay_event_count, 1);
+
+    // set_compaction appends a SetCompaction event; the cached event-log count
+    // must refresh (regression for the standalone set_compaction path).
+    session.set_compaction(StoredCompactionState {
+        summary_text: "s".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 1,
+    });
+    let s3 = session.memory_profile_snapshot();
+    assert_eq!(
+        s3.event_log_count,
+        session.event_map.events.len(),
+        "event_log_count must include the SetCompaction event"
+    );
+
+    // Public append_session_event must also refresh the cached event-log count.
+    let appended = session.append_session_event(SessionEvent {
+        timestamp: Utc::now(),
+        event_id: "plugin_evt".to_string(),
+        op: SessionEventOp::Unknown {
+            event_type: "plugin/probe".to_string(),
+            data: serde_json::json!({ "n": 1 }),
+        },
+        parent_id: None,
+        version: 1,
+    });
+    assert!(appended, "append_session_event must record the plugin event");
+    let s4 = session.memory_profile_snapshot();
+    assert_eq!(
+        s4.event_log_count,
+        session.event_map.events.len(),
+        "event_log_count must include the appended plugin Unknown event"
+    );
+
+    // The rejected (invalid) append_session_event must NOT refresh the count
+    // (no event was added), and the profile must still agree with the map.
+    let rejected = session.append_session_event(SessionEvent {
+        timestamp: Utc::now(),
+        event_id: "".to_string(), // empty id -> rejected by validation
+        op: SessionEventOp::Unknown {
+            event_type: "plugin/bad".to_string(),
+            data: serde_json::json!({}),
+        },
+        parent_id: None,
+        version: 1,
+    });
+    assert!(!rejected, "empty event_id must be rejected");
+    let s5 = session.memory_profile_snapshot();
+    assert_eq!(
+        s5.event_log_count,
+        session.event_map.events.len(),
+        "event_log_count must stay correct when an event is rejected"
+    );
 }
 
 /// Forward-compat of the escape hatch: a FUTURE core build may promote an

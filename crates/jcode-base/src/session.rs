@@ -1828,7 +1828,15 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         // skips invalid events internally).
         let before = self.event_map.events.len();
         self.event_map.append_event(event);
-        self.event_map.events.len() > before
+        let recorded = self.event_map.events.len() > before;
+        if recorded {
+            // The event log grew by one event; keep the profile's
+            // `event_log_count`/`event_log_json_bytes` in sync (see
+            // `append_stored_message`). Cheap flag-only; the profile rebuilds
+            // lazily on the next snapshot.
+            self.mark_memory_profile_dirty();
+        }
+        recorded
     }
 
     /// Read-only view of the append-only event log.
@@ -1870,6 +1878,10 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
             // diverging from the derived log and fail `rederive_all_checked`.
             self.compaction = Some(compaction);
             self.mark_messages_append_dirty();
+            // The event log grew with the new SetCompaction event; keep the
+            // profile's `event_log_count`/`event_log_json_bytes` in sync (see
+            // `append_stored_message`).
+            self.mark_memory_profile_dirty();
         }
     }
 
