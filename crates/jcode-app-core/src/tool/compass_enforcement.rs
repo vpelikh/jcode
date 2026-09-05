@@ -39,7 +39,7 @@ static PENDING_REDIRECT: LazyLock<Mutex<HashSet<String>>> =
 /// for the session, whether that query succeeds or fails (see
 /// [`Registry::execute`]); a redirect is also cleared when the session is
 /// switched away (see `crate::agent` turn restore).
-pub fn mark_redirect_pending(session_id: &str) {
+pub(crate) fn mark_redirect_pending(session_id: &str) {
     if session_id.is_empty() {
         return;
     }
@@ -50,7 +50,7 @@ pub fn mark_redirect_pending(session_id: &str) {
 
 /// Clear the pending-redirect mark for `session_id`. Called when the session
 /// executes any `compass_query` call or is switched away.
-pub fn clear_redirect_pending(session_id: &str) {
+pub(crate) fn clear_redirect_pending(session_id: &str) {
     if session_id.is_empty() {
         return;
     }
@@ -61,7 +61,7 @@ pub fn clear_redirect_pending(session_id: &str) {
 
 /// Whether `session_id` has an outstanding redirect to `compass_query` that has
 /// not yet been satisfied by a `compass_query` attempt.
-pub fn redirect_pending(session_id: &str) -> bool {
+pub(crate) fn redirect_pending(session_id: &str) -> bool {
     if session_id.is_empty() {
         return false;
     }
@@ -77,7 +77,7 @@ pub fn redirect_pending(session_id: &str) -> bool {
 /// `compass_query` before falling back, closing the prod-observed hole where a
 /// model retried `agentgrep` with `allow_raw_fallback` on the turn after a
 /// redirect and never called `compass_query` at all.
-pub fn raw_fallback_blocked_output() -> super::ToolOutput {
+pub(crate) fn raw_fallback_blocked_output() -> super::ToolOutput {
     super::ToolOutput::new(concat!(
         "✋ `agentgrep` with `allow_raw_fallback` was refused: you were just ",
         "directed to `compass_query` but have not attempted it yet.\n\n",
@@ -96,7 +96,7 @@ pub fn raw_fallback_blocked_output() -> super::ToolOutput {
 /// caller can distinguish a redirect (which arms the pending flag) from a
 /// raw-fallback block (which leaves it as-is).
 #[derive(Debug)]
-pub enum EnforcementDecision {
+pub(crate) enum EnforcementDecision {
     /// Let `agentgrep` run normally (no interception).
     PassThrough,
     /// Intercept this call with the given guidance output.
@@ -110,7 +110,7 @@ pub enum EnforcementDecision {
 /// preconditions are computed in one place rather than duplicated across
 /// decision branches.
 #[derive(Clone, Copy)]
-pub struct CompassAvailability {
+pub(crate) struct CompassAvailability {
     /// The operator enabled the enforcement tier.
     pub prefer_compass_query: bool,
     /// `compass_query` is registered for the containing registry.
@@ -264,7 +264,7 @@ pub(crate) const BLOCKED_PHASE: &str = "raw_fallback_blocked_pending_compass";
 /// guidance output (redirect vs blocked raw fallback) otherwise. The caller is
 /// responsible for the side effects those decisions require (marking/clearing
 /// the pending flag, telemetry, post-tool hooks).
-pub fn decide_enforcement(
+pub(crate) fn decide_enforcement(
     input: &serde_json::Value,
     availability: CompassAvailability,
     session_id: &str,
