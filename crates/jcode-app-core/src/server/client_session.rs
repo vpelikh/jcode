@@ -594,6 +594,7 @@ pub(super) async fn handle_subscribe(
     subscribe_working_dir: Option<String>,
     selfdev: Option<bool>,
     register_mcp_tools: bool,
+    client_has_local_history: bool,
     client_selfdev: &mut bool,
     client_session_id: &str,
     client_connection_id: &str,
@@ -644,7 +645,9 @@ pub(super) async fn handle_subscribe(
     )
     .await;
 
-    if let Some(ref dir) = subscribe_working_dir {
+    if !client_has_local_history
+        && let Some(ref dir) = subscribe_working_dir
+    {
         apply_or_defer_subscribe_working_dir(agent, dir, client_session_id);
 
         // Swarm grouping must use the *bound* directory, not the raw report, or

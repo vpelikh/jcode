@@ -149,6 +149,7 @@ async fn handle_resume_session_allows_live_attach_when_existing_agent_is_busy() 
             Some("/tmp/jcode-busy-desktop-attach".to_string()),
             Some(true),
             false,
+            true,
             &mut client_selfdev,
             target_session_id,
             "conn_new",
@@ -224,5 +225,104 @@ async fn handle_resume_session_allows_live_attach_when_existing_agent_is_busy() 
     }
 
     restore_runtime_dir(prev_runtime);
+    Ok(())
+}
+
+
+#[tokio::test]
+async fn subscribe_preserves_working_dir_when_client_has_local_history() -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+
+    let session_id = "session_repin_gate_test";
+    let pinned_dir = "/project/my-worktree";
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Arc::new(Mutex::new(build_test_agent_with_id(
+        provider.clone(),
+        registry.clone(),
+        session_id,
+        Vec::new(),
+    )));
+    {
+        let mut guard = agent.lock().await;
+        guard.set_working_dir(pinned_dir);
+    }
+    let sessions = Arc::new(RwLock::new(HashMap::from([(
+        session_id.to_string(),
+        Arc::clone(&agent),
+    )])));
+    let shutdown_signals = Arc::new(RwLock::new(HashMap::<String, InterruptSignal>::new()));
+    let soft_interrupt_queues: SessionInterruptQueues = Arc::new(RwLock::new(HashMap::new()));
+    let now = Instant::now();
+    let client_connections = Arc::new(RwLock::new(HashMap::from([(
+        "conn".to_string(),
+        ClientConnectionInfo {
+            client_id: "conn".to_string(),
+            session_id: session_id.to_string(),
+            client_instance_id: None,
+            debug_client_id: Some("debug".to_string()),
+            connected_at: now,
+            last_seen: now,
+            is_processing: false,
+            current_tool_name: None,
+            terminal_env: Vec::new(),
+            disconnect_tx: mpsc::unbounded_channel().0,
+        },
+    )])));
+    let swarm_members = Arc::new(RwLock::new(HashMap::<String, SwarmMember>::new()));
+    let swarms_by_id = Arc::new(RwLock::new(HashMap::<String, HashSet<String>>::new()));
+    let _file_touch = FileTouchService::new();
+    let channel_subscriptions = Arc::new(RwLock::new(HashMap::new()));
+    let channel_subscriptions_by_session = Arc::new(RwLock::new(HashMap::new()));
+    let swarm_plans = Arc::new(RwLock::new(HashMap::<String, VersionedPlan>::new()));
+    let swarm_coordinators = Arc::new(RwLock::new(HashMap::<String, String>::new()));
+    let (client_event_tx, _client_event_rx) = mpsc::unbounded_channel::<ServerEvent>();
+    let event_history = Arc::new(RwLock::new(VecDeque::<SwarmEvent>::new()));
+    let event_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (swarm_event_tx, _swarm_event_rx) = broadcast::channel::<SwarmEvent>(8);
+    let mcp_pool = Arc::new(crate::mcp::SharedMcpPool::from_default_config());
+
+    let mut client_selfdev = false;
+    handle_subscribe(
+        55,
+        Some("/a/different/dir".to_string()),
+        None,
+        false,
+        true, // client_has_local_history: reconnect, so do NOT re-pin
+        &mut client_selfdev,
+        session_id,
+        "conn",
+        &None,
+        &agent,
+        &registry,
+        false,
+        &swarm_members,
+        &swarms_by_id,
+        &channel_subscriptions,
+        &channel_subscriptions_by_session,
+        &swarm_plans,
+        &swarm_coordinators,
+        &client_event_tx,
+        &mcp_pool,
+        &event_history,
+        &event_counter,
+        &swarm_event_tx,
+    )
+    .await;
+
+    // Allow any deferred working-dir re-bind to settle before asserting.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let guard = agent.lock().await;
+    assert_eq!(
+        guard.working_dir(),
+        Some(pinned_dir),
+        "a subscribe with local history must preserve the session working dir,          not re-pin it to the client's reported cwd"
+    );
+    let _ = &sessions;
+    let _ = &shutdown_signals;
+    let _ = &soft_interrupt_queues;
+    let _ = &client_connections;
+    drop(guard);
     Ok(())
 }
