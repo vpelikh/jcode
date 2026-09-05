@@ -176,6 +176,45 @@ fn gate_recheck_that_passes_finishes_cleanly() {
     });
 }
 
+/// A goal that passes every ownership sub-check except trade_off must fail the
+/// review-loop gate re-check (not silently pass), since trade_off is folded
+/// into delivery_state_passes.
+#[test]
+fn gate_recheck_fails_when_only_trade_off_is_missing() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        let session_id = app.session_id().to_string();
+
+        // A completed todo with valid confidence; the goal is complete on every
+        // dimension except trade_off (explicitly None).
+        save_completed_todo(&session_id, Some(100));
+        let mut goal = passing_goal();
+        goal.trade_off = None;
+        crate::todo::save_goals(&session_id, &[goal]).expect("save goal");
+
+        let mut state = jcode_session_types::ReviewLoopState::new();
+        state.finished = true;
+        state.current_lens = Some(jcode_session_types::ReviewLens::Correctness);
+
+        super::commands_review::finish_review_loop(&mut app, &mut state, true);
+
+        // The loop stays finished (no gates<->review ping-pong) but the missed
+        // trade-off assessment must surface as a gate re-check failure.
+        assert!(state.finished);
+        let reason = state.finish_reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.starts_with("converged_gate_recheck_failed"),
+            "missing trade_off alone must fail the gate re-check, got {reason:?}"
+        );
+        assert!(
+            app.display_messages()
+                .iter()
+                .any(|msg| msg.content.contains("completion assessment now disagrees")),
+            "a trade-off-only failure must be surfaced to the user"
+        );
+    });
+}
+
 #[test]
 fn finish_without_gate_recheck_emits_digest_and_does_not_touch_gates() {
     with_temp_jcode_home(|| {
