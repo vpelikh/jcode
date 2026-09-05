@@ -1656,6 +1656,20 @@ mod tests {
     }
 
     #[test]
+    fn compact_unfulfilled_tool_request_finds_later_valid_invocation() {
+        // A real stall can mention the target possessively first, then commit
+        // to invoking it bare later in the same short turn. The boundary check
+        // must scan ALL occurrences: the FIRST "i'll call the tool" here is
+        // followed by an apostrophe (possessive), but the SECOND is a clear
+        // invocation ("call the tool.") and must be honored.
+        let stall = "I'll call the tool's help if needed, then I'll call the tool.";
+        assert!(
+            Agent::is_stalled_promise_text(stall),
+            "a later valid 'call the tool' invocation must be detected even if an earlier possessive occurs"
+        );
+    }
+
+    #[test]
     fn compact_unfulfilled_tool_request_is_stalled() {
         // The exact compact degradation observed in a real long-context session
         // (DeepSeek via OpenRouter): a SHORT turn explicitly says it will invoke a

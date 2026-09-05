@@ -574,23 +574,33 @@ impl Agent {
     /// boundary after the target keeps the compact stall detector from flagging
     /// genuine answers like "I'll call the tool's documentation when reviewing".
     fn contains_phrase_boundary(haystack: &str, needle: &str) -> bool {
-        let Some(start) = haystack.find(needle) else {
-            return false;
-        };
-        let end = start + needle.len();
-        let next = haystack.as_bytes().get(end);
-        // Accept only end-of-string, whitespace, or clearly-sentence-final
-        // punctuation. Reject anything that continues the word, which signals
-        // a reference rather than a bare target: an apostrophe (possessive,
-        // "tool's"), an alphanumeric (letter/digit, "tool2"), or a join
-        // character ('_' or '-', "tool_x", "command-line").
-        match next {
-            None => true,
-            Some(b) => matches!(
-                b,
-                b' ' | b'\t' | b'\n' | b'\r' | b'.' | b',' | b'!' | b'?' | b';' | b':' | b')'
-            ),
+        let mut start = 0;
+        // Iterate ALL occurrences: the FIRST match may have a poor boundary
+        // (e.g. a possessive "the tool's"), while a LATER occurrence is a bare
+        // invocation ("then i'll call the tool."). Return true if ANY occurrence
+        // has a valid boundary so a real stall is never missed.
+        while let Some(rel) = haystack[start..].find(needle) {
+            let at = start + rel;
+            let end = at + needle.len();
+            let next = haystack.as_bytes().get(end);
+            // Accept only end-of-string, whitespace, or clearly-sentence-final
+            // punctuation. Reject anything that continues the word, which
+            // signals a reference rather than a bare target: an apostrophe
+            // (possessive, "tool's"), an alphanumeric (letter/digit, "tool2"),
+            // or a join character ('_' or '-', "tool_x", "command-line").
+            let ok = match next {
+                None => true,
+                Some(b) => matches!(
+                    b,
+                    b' ' | b'\t' | b'\n' | b'\r' | b'.' | b',' | b'!' | b'?' | b';' | b':' | b')'
+                ),
+            };
+            if ok {
+                return true;
+            }
+            start = end;
         }
+        false
     }
 
     /// Request a single bounded continuation when the model stopped after
