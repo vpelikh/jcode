@@ -227,6 +227,87 @@ fn test_compaction_bracket_balanced_round_trip() {
     assert!(matches!(&back.events[1].op, SessionEventOp::CompactionEnd { .. }));
 }
 
+/// Every `SessionEventOp` variant must survive a full JSON round trip losslessly,
+/// including the newly added `CompactionStart`/`CompactionEnd`/`Unknown`. This
+/// pins the wire-fidelity contract of the manual (de)serializer: a value
+/// serialize → deserialize → serialize must reproduce byte-identical JSON on the
+/// second pass (stability), and the round-tripped value must equal the original.
+#[test]
+fn test_all_session_event_ops_round_trip_losslessly() {
+    let msg = |id: &str| StoredMessage {
+        id: id.to_string(),
+        role: Role::User,
+        content: vec![text_block("hello")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    };
+    let inj = StoredMemoryInjection {
+        summary: "recalled 1 memory".to_string(),
+        content: "memory".to_string(),
+        count: 1,
+        memory_ids: Vec::new(),
+        age_ms: None,
+        before_message: None,
+        timestamp: chrono::Utc::now(),
+    };
+    let replay = crate::session::StoredReplayEvent {
+        timestamp: chrono::Utc::now(),
+        kind: crate::session::StoredReplayEventKind::DisplayMessage {
+            role: "user".to_string(),
+            title: None,
+            content: "display".to_string(),
+        },
+    };
+    let compaction = StoredCompactionState {
+        summary_text: "sum".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 3,
+        original_turn_count: 10,
+        compacted_count: 3,
+    };
+
+    let ops = vec![
+        SessionEventOp::AppendMessage {
+            message_id: "m1".to_string(),
+            message: msg("m1"),
+        },
+        SessionEventOp::ReplaceMessages {
+            start_index: 0,
+            end_index: usize::MAX,
+            messages: vec![msg("a"), msg("b")],
+        },
+        SessionEventOp::InsertMessage {
+            index: 1,
+            message: msg("i"),
+        },
+        SessionEventOp::MemoryInjection { memory_injection: inj.clone() },
+        SessionEventOp::ReplayEvent { replay_event: replay.clone() },
+        SessionEventOp::SetCompaction { compaction: compaction.clone() },
+        SessionEventOp::CompactionStart {
+            compaction_id: "c1".to_string(),
+            covers_up_to_turn: 3,
+        },
+        SessionEventOp::CompactionEnd { compaction: compaction.clone() },
+        SessionEventOp::ClearAll,
+        SessionEventOp::Unknown {
+            event_type: "plugin/x".to_string(),
+            data: serde_json::json!({ "n": 1, "s": "v" }),
+        },
+    ];
+
+    for (i, op) in ops.iter().enumerate() {
+        let json1 = serde_json::to_string(op).expect("serialize");
+        let back: SessionEventOp = serde_json::from_str(&json1).expect("deserialize");
+        let json2 = serde_json::to_string(&back).expect("re-serialize");
+        assert_eq!(
+            json1, json2,
+            "variant #{i} must serialize stably (second JSON equals first)"
+        );
+    }
+}
+
 /// A crash mid-summarize leaves an open `CompactionStart` with no `CompactionEnd`
 /// — the line between "compacted" and "incomplete compaction". `orphaned_compaction`
 /// must surface it so replay can stop and report rather than trust a partial result.
