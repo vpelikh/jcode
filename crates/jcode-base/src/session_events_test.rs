@@ -2486,10 +2486,14 @@ fn test_unknown_op_in_memory_non_object_serializes_single_op() {
         1,
         "in-memory non-object Unknown must serialize exactly one op key; got: {json}"
     );
-    // The round-trip must be stable: after the first deserialize the value settles
-    // into the object-wrapped wire form and stays unchanged on further round-trips.
+    // The round-trip must be lossless AND stable: the scalar/bare payload is
+    // preserved (not object-wrapped) and stays unchanged on further round-trips.
     let back: SessionEventOp = serde_json::from_str(&json).expect("deserialize");
     let json2 = serde_json::to_string(&back).expect("re-serialize");
+    assert_eq!(
+        json2, json,
+        "in-memory non-object Unknown must round-trip to the identical wire form (lossless)"
+    );
     let again: SessionEventOp = serde_json::from_str(&json2).expect("re-deserialize");
     let json3 = serde_json::to_string(&again).expect("re-serialize 2");
     assert_eq!(json2, json3, "shape must stabilize after first round-trip");
@@ -2497,11 +2501,11 @@ fn test_unknown_op_in_memory_non_object_serializes_single_op() {
 }
 
 /// The `Unknown` escape hatch must round-trip **stably** even when the remaining
-/// payload is not a flat JSON object (e.g. `{"op":"x","data":123}`). Such a
-/// value is preserved as an object wrapper (`data: { "data": 123 }`) so it
-/// carries an `op` alongside the payload; a second serialize→deserialize must
-/// reproduce the exact same in-memory value (no unbounded nesting growth). This
-/// pins the documented behavior of the non-object branch of `Serialize`.
+/// payload is not a flat JSON object (e.g. `{"op":"x","data":123}`). The
+/// serializer emission-encodes a non-object payload as a lone `data` field, and
+/// the deserializer unwraps it back to the bare value, so a scalar/array payload
+/// round-trips losslessly (no unbounded nesting growth, no spurious object
+/// wrapper). This pins the documented behavior of the non-object branch.
 #[test]
 fn test_unknown_op_non_object_payload_round_trips_losslessly() {
     // Serialize a non-object data directly (matches the on-disk `{"op","data"}`)
