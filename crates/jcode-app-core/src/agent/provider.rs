@@ -369,8 +369,11 @@ fn resolve_working_dir(base: &std::path::Path, dir: &str) -> anyhow::Result<Stri
         base.join(mapped)
     };
 
-    if !candidate.exists() || !candidate.is_dir() {
+    if !candidate.exists() {
         anyhow::bail!("directory does not exist: {}", candidate.display());
+    }
+    if !candidate.is_dir() {
+        anyhow::bail!("not a directory: {}", candidate.display());
     }
 
     // Canonicalize to collapse `.`/`..` and resolve symlinks, matching how the
@@ -412,6 +415,20 @@ mod resolve_working_dir_tests {
         std::fs::create_dir_all(&base).unwrap();
         let err = resolve_working_dir(&base, "does-not-exist").unwrap_err();
         assert!(err.to_string().contains("does not exist"));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn file_is_rejected_as_not_a_directory() {
+        let base = std::env::temp_dir().join("jcode-wd-file-base");
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("a-file");
+        std::fs::write(&file, b"x").unwrap();
+        let err = resolve_working_dir(&base, "a-file").unwrap_err();
+        assert!(
+            err.to_string().contains("not a directory"),
+            "a path that exists as a file must be rejected with an accurate error, got: {err}"
+        );
         std::fs::remove_dir_all(&base).unwrap();
     }
 
