@@ -1033,6 +1033,9 @@ fn todo_session_with_zero_todos_emits_zero_numeric_state() {
         "completion_confidence_count",
         "understands_user_intent_count",
         "closed_feedback_loop_count",
+        "feedback_loop_relevance_count",
+        "feedback_loop_coverage_count",
+        "trade_off_count",
         "end_to_end_ownership_count",
     ] {
         assert_eq!(payload[field], 0, "{field}");
