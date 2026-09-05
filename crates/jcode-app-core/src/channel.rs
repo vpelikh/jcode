@@ -630,6 +630,44 @@ impl TelegramChannel {
             return;
         }
 
+        // A tap on the "🛑 Stop" button attached to a streaming reply carries a
+        // `__abort__<session_id>` payload: fire a lock-free graceful shutdown of
+        // that session's in-flight turn so the model stops generating. This is
+        // intentionally *not* gated behind /confirm: the streamed output up to
+        // this point is preserved and the turn can be re-run, so stopping is
+        // reversible (unlike /free, which drops the session from memory).
+        if let Some(id) = data.strip_prefix("__abort__") {
+            let id = id.trim().to_string();
+            if id.is_empty() {
+                let _ = crate::telegram::answer_callback_query(
+                    &client,
+                    &self.token,
+                    &cb.id,
+                    "No session id to stop.",
+                    self.api_base.as_deref(),
+                )
+                .await;
+                return;
+            }
+            let signaled =
+                crate::server::telegram_control::request_graceful_shutdown_for_control(&id)
+                    .await;
+            let ack = if signaled {
+                format!("🛑 Stopping `{}`…", short_id(&id))
+            } else {
+                format!("No running turn for `{}`.", short_id(&id))
+            };
+            let _ = crate::telegram::answer_callback_query(
+                &client,
+                &self.token,
+                &cb.id,
+                &ack,
+                self.api_base.as_deref(),
+            )
+            .await;
+            return;
+        }
+
         let session_id = data.trim().to_string();
         crate::server::telegram_control::set_active_session(&self.chat_id, &session_id);
         let short_id = short_id(&session_id);
@@ -936,25 +974,39 @@ impl TelegramChannel {
         }
     }
 
-    /// `/abort`: request a graceful stop of the active session's in-flight
-    /// turn. Shows a confirmation prompt first so the user must type
-    /// `/confirm` to actually trigger the abort (or `/cancel` to decline).
+    /// `/abort`: stop the active session's in-flight turn. Unlike `/free`
+    /// (which drops a session from memory), stopping a running turn is
+    /// non-destructive and trivially reversible (re-send the prompt), so it
+    /// fires immediately rather than requiring a `/confirm` step. Stopping is
+    /// lock-free: the turn-cancel registry signal is fired while the stream task
+    /// holds the agent mutex, so the model stops generating right away instead
+    /// of waiting for the (blocked) agent lock.
     async fn abort_reply(&self) -> String {
         let Some(session_id) =
             crate::server::telegram_control::active_session_for(&self.chat_id)
         else {
             return format!("No active session to abort. Use `/use <n>` first{}", help_footer());
         };
-        let mut tracker = self.confirmation_tracker.lock().await;
-        let prompt = tracker.request("abort", session_id.clone());
-        drop(tracker);
-        // Send the confirmation prompt as a reply so the user can type /confirm.
-        let _ = self.send_reply(&prompt, None).await;
-        String::new()
+        let signaled =
+            crate::server::telegram_control::request_graceful_shutdown_for_control(&session_id)
+                .await;
+        if signaled {
+            format!(
+                "🛑 Stopping the active turn on `{}`. Partial output is kept so far.",
+                short_id(&session_id)
+            )
+        } else {
+            format!(
+                "⚠️ `{}` is not a live session, or Telegram control is not wired to a server runtime.",
+                short_id(&session_id)
+            )
+        }
     }
 
-    /// `/confirm`: execute the pending destructive action (`/free` or `/abort`)
-    /// stored in the confirmation tracker.
+    /// `/confirm`: execute the pending destructive action (`/free`) stored in
+    /// the confirmation tracker. `/abort` no longer uses confirmation (stopping
+    /// a turn is non-destructive), so only `/free` produces a pending
+    /// confirmation to consume here.
     async fn confirm_reply(&self) -> String {
         let mut tracker = self.confirmation_tracker.lock().await;
         let Some((action, session_id)) = tracker.verify("__confirm__") else {
@@ -963,11 +1015,13 @@ impl TelegramChannel {
         drop(tracker);
         match action {
             "abort" => {
+                // Backwards compatibility for a prompt issued before this build
+                // made /abort immediate: honor it directly.
                 let signaled =
                     crate::server::telegram_control::request_graceful_shutdown_for_control(&session_id).await;
                 if signaled {
                     format!(
-                        "🛑 Abort confirmed for `{}`. The agent will stop at the next safe point.",
+                        "🛑 Stopped the active turn on `{}`.",
                         short_id(&session_id)
                     )
                 } else {
@@ -1201,7 +1255,7 @@ impl TelegramChannel {
              📊 *Sessions:* {} total, {} saved, {} live\n\
              🛡️ *Safety:* {}\n\n\
              📋 *Commands:* /list [--saved|--today] /find /use /new /peek /history /resume /live /free /abort /clear /whoami /status /help\n\
-             💡 Tip: send any message to talk to a session, or `/list` to browse.",
+             💡 Tip: send any message to auto-start a session, or `/list` to browse.",
             ambient, active_line, discovery_line, health_line, auth_hint,
             total_recent, total_saved, live_count, confirm_line
         )
@@ -1393,12 +1447,31 @@ impl TelegramChannel {
             };
             let _ = self.send_reply(&ack, reply_to).await;
         } else {
-            let _ = self
-                .send_reply(
-                    "ℹ️ Select a session first: use `/list` then `/use <n>`, or run `/help`.",
-                    reply_to,
-                )
-                .await;
+            // Quick-start: no active session and no ambient runner. Instead of a
+            // dead-end "select a session first" hint, auto-create a fresh session,
+            // select it for this chat, and stream the reply so the first message
+            // "just works" (a common first-use expectation on a messaging client).
+            let (session_id, _) =
+                match crate::server::telegram_control::create_session_for_control(None).await {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        let _ = self
+                            .send_reply(
+                                &format!(
+                                    "⚠️ Could not start a session: {}",
+                                    escape_markdown_v2(&e.to_string())
+                                ),
+                                reply_to,
+                            )
+                            .await;
+                        return Ok(());
+                    }
+                };
+            crate::server::telegram_control::set_active_session(&self.chat_id, &session_id);
+            logging::info(&format!(
+                "telegram quick-started new session {session_id} from message"
+            ));
+            self.stream_reply_to_session(reply_to, &session_id, trimmed).await;
         }
         Ok(())
     }
@@ -1683,18 +1756,29 @@ async fn stream_reply_to_session(
     text: &str,
 ) {
     // Post one placeholder message that we will edit with streamed progress.
-    // `send_message_raw` returns the created message id (or None if the text
-    // needed chunking), which we then target with `edit_message_text`. The
-    // placeholder is sent with `parse_mode=MarkdownV2`, so the `[` `]` around
-    // the session id must be escaped (otherwise Telegram rejects the message
-    // and the whole turn is skipped).
+    // `send_message_raw_with_keyboard` returns the created message id (or None
+    // if the text needed chunking), which we then target with
+    // `edit_message_text`. The placeholder is sent with `parse_mode=MarkdownV2`,
+    // so the `[` `]` around the session id must be escaped (otherwise Telegram
+    // rejects the message and the whole turn is skipped). The placeholder also
+    // carries an inline "🛑 Stop" button whose callback payload encodes the
+    // session, so the user can interrupt the run with one tap (the callback
+    // fires the lock-free abort). The button is cleared from the final message
+    // when the turn settles.
     let placeholder = format!("💭 \\[{}] _thinking…_", short_id(session_id));
+    use crate::telegram::{InlineKeyboardButton, InlineKeyboardRow};
+    let stop_button = InlineKeyboardButton {
+        text: "🛑 Stop".to_string(),
+        callback_data: format!("__abort__{}", session_id),
+    };
+    let keyboard: Vec<InlineKeyboardRow> = vec![vec![stop_button]];
     let client = self.client_or_default().await;
-    let sent_id = match crate::telegram::send_message_raw(
+    let sent_id = match crate::telegram::send_message_raw_with_keyboard(
         &client,
         &self.token,
         &self.chat_id,
         &placeholder,
+        &keyboard,
         self.api_base.as_deref(),
         reply_to,
     )
@@ -1744,7 +1828,19 @@ async fn stream_reply_to_session(
             .await;
         }
     };
-    if let Err(e) = stream_turn(session_id, text, on_progress).await {
+    let stream_result = stream_turn(session_id, text, on_progress).await;
+    // Always clear the Stop button once the turn settles (success, error, or
+    // abort) so a stale non-actionable button does not linger on the final
+    // message and mislead the user.
+    let _ = crate::telegram::edit_message_reply_markup(
+        &client,
+        &self.token,
+        self.chat_id.parse::<i64>().unwrap_or(0),
+        sent_id,
+        self.api_base.as_deref(),
+    )
+    .await;
+    if let Err(e) = stream_result {
         let _ = crate::telegram::edit_message_text(
             &client,
             &self.token,
@@ -1796,21 +1892,20 @@ const HELP_TEXT: &str = "\
 /resume (id) (prompt) — ask a session directly
 /live — list live sessions (tap 🗑️ to request freeing one)
 /free (id) — drop a live headless session (requires /confirm)
-/abort — stop the active session's running turn (requires /confirm)
-/confirm — execute a pending destructive action
-/cancel — cancel a pending destructive action
+/abort — stop the active session's running turn now
+/confirm — execute a pending free
+/cancel — cancel a pending confirmation
 /clear — stop talking to the selected session
 /status — show ambient & control status
 /whoami — show this chat's id for config
 /help — this help
 
 *Tips:*
-• Send any plain message after /use or /new to talk to a session.
-• /list shows an inline picker: tap a row to select that session.
-• /list --saved shows only saved sessions; /list --today shows today's activity.
+• Just send any message — a new session is created automatically and the reply streams in.
+• A 🛑 Stop button sits under each streaming reply: tap it to halt the turn and keep partial output.
 • /use 2 selects the 2nd session; /use abc123… matches by id prefix; /use fox selects by memorable name.
 • A ✅ marks the active session in the picker.
-• /free and /abort now require /confirm for safety.";
+• /free is the only command that requires /confirm; /abort stops immediately.";
 
 // ---------------------------------------------------------------------------
 // Discord channel
@@ -2846,6 +2941,105 @@ mod tests {
     /// "no pending confirmation" or an "is not a live session" message).
     fn free_confirmed(msg: &str) -> bool {
         msg.contains("freed") || msg.contains("Abort confirmed")
+    }
+
+    #[tokio::test]
+    async fn test_stop_button_callback_does_not_require_confirm() {
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::TempDir::new().expect("temp home");
+        crate::env::set_var("JCODE_HOME", home.path());
+        let mock = MockTelegram::start().await;
+        let ch = TelegramChannel::with_connectivity(
+            "tok".into(),
+            "77".into(),
+            true,
+            Some(mock.base()),
+            None,
+            None,
+            None,
+        );
+
+        // Tap the 🛑 Stop button under a streaming reply: it carries
+        // `__abort__<session_id>`. No live registry is wired in the test, so no
+        // active turn can be found — the handler must still answer the callback
+        // with a clear "no running turn" notice and must NOT post a /confirm
+        // prompt (stopping is not gated behind confirmation).
+        ch.handle_callback_query(crate::telegram::CallbackQuery {
+            id: "cb_stop".into(),
+            from: Some(crate::telegram::TelegramFrom { id: 1 }),
+            data: Some("__abort__session_stop_1_aabbccddeeff".into()),
+            message: Some(crate::telegram::CallbackMessage {
+                chat: Some(crate::telegram::Chat { id: 77 }),
+                message_id: Some(43),
+            }),
+        })
+        .await;
+
+        let (methods, bodies) = (mock.methods().await, mock.bodies().await);
+        assert!(
+            methods.iter().any(|m| m == "answerCallbackQuery"),
+            "a Stop-button tap must be answered, got {methods:?}"
+        );
+        // The callback answer should carry a stop/notice message.
+        let ack_body = bodies
+            .iter()
+            .zip(methods.iter())
+            .find(|(_, m)| m.as_str() == "answerCallbackQuery")
+            .map(|(b, _)| b["text"].as_str().unwrap_or("").to_string())
+            .expect("a callback answer body should be sent");
+        assert!(
+            ack_body.contains("running turn") || ack_body.contains("Stopping"),
+            "stop callback should acknowledge a stop/notice, got {ack_body:?}"
+        );
+        // No confirmation prompt should be posted for stopping.
+        let sent_messages: Vec<&serde_json::Value> = bodies
+            .iter()
+            .zip(methods.iter())
+            .filter(|(_, m)| m.as_str() == "sendMessage")
+            .map(|(b, _)| b)
+            .collect();
+        assert!(
+            sent_messages.iter().all(|b| {
+                let text = b["text"].as_str().unwrap_or("");
+                !text.contains("/confirm")
+            }),
+            "stopping must not post a /confirm prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_abort_command_is_immediate_and_not_confirm_gated() {
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::TempDir::new().expect("temp home");
+        crate::env::set_var("JCODE_HOME", home.path());
+        let mock = MockTelegram::start().await;
+        let ch = TelegramChannel::with_connectivity(
+            "tok".into(),
+            "77".into(),
+            true,
+            Some(mock.base()),
+            None,
+            None,
+            None,
+        );
+        // No active session selected, so /abort can only report no active
+        // session — but crucially it must NOT create a pending confirmation
+        // (immediate, not gated).
+        let msg = ch.abort_reply().await;
+        assert!(
+            msg.contains("No active session"),
+            "/abort with no active session should say so, got {msg:?}"
+        );
+        assert!(
+            !msg.contains("/confirm"),
+            "/abort must not ask for /confirm, got {msg:?}"
+        );
+        // A subsequent /confirm must find nothing pending (abort never queued).
+        let confirm = ch.confirm_reply().await;
+        assert!(
+            confirm.contains("No pending confirmation"),
+            "abort must never queue a confirmation, got {confirm:?}"
+        );
     }
 
     #[test]

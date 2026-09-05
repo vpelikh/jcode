@@ -698,6 +698,58 @@ pub async fn send_message_raw(
     Ok(id)
 }
 
+/// Send a single-chunk message with an optional inline keyboard, returning the
+/// created message id. Unlike [`send_message_with_keyboard`] (which returns
+/// only `()`), this exposes the id so callers can later target the sent message
+/// with `editMessageText` / `editMessageReplyMarkup` (e.g. streaming a reply
+/// into a placeholder that also carries a "Stop" button). Returns `None` when
+/// the text needs chunking, mirroring [`send_message_raw`].
+pub async fn send_message_raw_with_keyboard(
+    client: &reqwest::Client,
+    bot_token: &str,
+    chat_id: &str,
+    text: &str,
+    keyboard: &[InlineKeyboardRow],
+    base_override: Option<&str>,
+    reply_to_message_id: Option<i64>,
+) -> anyhow::Result<Option<i64>> {
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    let chunks = chunk_message(text, MAX_MESSAGE_CHARS);
+    if chunks.len() != 1 {
+        return Ok(None);
+    }
+    let url = format!("{}{}/sendMessage", api_base(base_override), bot_token);
+    let mut body = serde_json::json!({
+        "chat_id": chat_id,
+        "text": chunks[0],
+        "parse_mode": "MarkdownV2",
+        "disable_web_page_preview": true,
+    });
+    if let Some(rt) = reply_to_message_id {
+        body["reply_to_message_id"] = serde_json::json!(rt);
+    }
+    if !keyboard.is_empty() {
+        let rows: Vec<serde_json::Value> = keyboard.iter().map(|row| json_row(row)).collect();
+        body["reply_markup"] = serde_json::json!({ "inline_keyboard": rows });
+    }
+    let resp = client.post(&url).json(&body).send().await?;
+    let status = resp.status();
+    let parsed: TelegramResponse<serde_json::Value> = resp.json().await?;
+    if !parsed.ok {
+        anyhow::bail!(
+            "Telegram API error ({}): {}",
+            telegram_api_error_scope(status, parsed.error_code),
+            parsed.description.unwrap_or_default()
+        );
+    }
+    let id = parsed
+        .result
+        .and_then(|r| r.get("message_id").and_then(|v| v.as_i64()));
+    Ok(id)
+}
+
 /// Send one Telegram message, handling transient HTTP 429 rate limits (with
 /// backoff) and, when `allow_plain_fallback` is set, resending without
 /// `parse_mode` if Telegram rejects the Markdown (so dynamic agent output is
@@ -862,8 +914,8 @@ pub async fn set_my_commands(
         { "command": "live", "description": "List live sessions" },
         { "command": "ls", "description": "Alias for /live" },
         { "command": "free", "description": "Drop a live headless session (requires /confirm)" },
-        { "command": "abort", "description": "Stop the active turn (requires /confirm)" },
-        { "command": "confirm", "description": "Confirm a pending free or abort" },
+        { "command": "abort", "description": "Stop the active turn now" },
+        { "command": "confirm", "description": "Confirm a pending free" },
         { "command": "cancel", "description": "Cancel a pending confirmation" },
         { "command": "whoami", "description": "Show this chat's id for config" },
         { "command": "clear", "description": "Stop talking to the active session" },
