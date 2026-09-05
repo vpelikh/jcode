@@ -291,7 +291,17 @@ impl Session {
         // it agrees with the legacy vectors; otherwise rebuild/self-heal. This
         // also serves as the migration path for sessions written before
         // `event_map` was persisted (those load with an empty log).
-        session.reconcile_event_map_after_load();
+        let preserved_log = session.reconcile_event_map_after_load();
+        if !preserved_log {
+            // The persisted log was rebuilt (either it was empty/migrated, or
+            // it diverged from the legacy vectors and was self-healed). Surface
+            // this so a divergence caused by a prior save bug or corruption is
+            // observable rather than silently overwritten.
+            crate::logging::warn(&format!(
+                "session {}: event log was not preserved on load (empty or divergent); rebuilt from legacy vectors",
+                session.id
+            ));
+        }
         // Structural invariant registry (takeaway #3): run the built-in checks
         // (tool-pairing balance, non-empty ids, parent-edge resolution, replay
         // determinism) over the freshly rehydrated log. Unlike a deliberate
@@ -416,7 +426,13 @@ impl Session {
         // Reconcile the event-sourced log with the legacy vectors (keep the
         // persisted authoritative log when it agrees, rebuild/self-heal
         // otherwise; also migrates pre-persistence snapshots).
-        session.reconcile_event_map_after_load();
+        let preserved_log = session.reconcile_event_map_after_load();
+        if !preserved_log {
+            crate::logging::warn(&format!(
+                "session {}: event log was not preserved on remote-startup load (empty or divergent); rebuilt from legacy vectors",
+                session.id
+            ));
+        }
         let finalize_ms = finalize_start.elapsed().as_millis();
         crate::logging::info(&format!(
             "[TIMING] remote_startup_load: session={}, snapshot={}ms, journal={}ms, finalize={}ms, snapshot_bytes={}, journal_bytes={}, journal_entries={}, messages={}, total={}ms",

@@ -940,7 +940,9 @@ fn test_event_map_hydrated_on_disk_round_trip() {
     drop(f);
 
     let loaded = Session::load_from_path(&path).expect("load_from_path");
-    // event_map is #[serde(skip)], so without hydration it would be empty.
+    // event_map is now persisted in the snapshot, so a serialize + reload round
+    // trip carries it through. The load path keeps the persisted log when it
+    // agrees with the legacy vectors, so the events must equal the messages.
     assert_eq!(
         loaded.event_map.events.len(),
         loaded.messages.len(),
