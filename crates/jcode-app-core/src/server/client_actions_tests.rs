@@ -895,6 +895,16 @@ async fn set_working_dir_updates_agent_and_fans_out_event() -> Result<()> {
         Some(new_dir.canonicalize().expect("canonical")),
         "agent working dir must be updated"
     );
+    drop(guard);
+
+    // The swarm member record must be kept coherent with the new bound dir.
+    let member_dir = swarm_members.read().await;
+    let member = member_dir.get(&agent_session_id).expect("swarm member exists");
+    assert_eq!(
+        member.working_dir.as_ref(),
+        Some(&new_dir.canonicalize().expect("canonical")),
+        "swarm member working_dir must be synced to the /cd target"
+    );
 
     if let Some(prev_home) = prev_home {
         crate::env::set_var("JCODE_HOME", prev_home);

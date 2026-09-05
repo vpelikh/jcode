@@ -661,6 +661,15 @@ pub(super) async fn handle_set_working_dir(
         // server and gather_git_info derive.
         Ok(Some(resolved)) => {
             crate::session_list_cache::invalidate();
+            // Keep the swarm member's recorded working dir coherent with the
+            // agent's new bound directory. Consumers (e.g. comm_session) prefer
+            // the live agent dir, but fall back to member.working_dir, so a
+            // stale value would mis-direct spawns to the pre-/cd path.
+            let mut members = swarm_members.write().await;
+            if let Some(member) = members.get_mut(&session_id) {
+                member.working_dir = Some(std::path::PathBuf::from(&resolved));
+            }
+            drop(members);
             let event = ServerEvent::SessionWorkingDirChanged {
                 session_id: session_id.clone(),
                 working_dir: resolved.clone(),
