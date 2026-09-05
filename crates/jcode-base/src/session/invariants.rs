@@ -656,6 +656,31 @@ mod tests {
             parent_id: None,
             version: 1,
         });
+        // A ClearAll MID-SEQUENCE (not just as a final op) must reset the
+        // projection to zero, after which subsequent appends/inserts/replaces
+        // rebuild from an empty base. This is the reset-then-append edge that a
+        // per-prefix consistency check must not diverge on.
+        map.events.push(SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: "clear_mid".to_string(),
+            op: SessionEventOp::ClearAll,
+            parent_id: None,
+            version: 1,
+        });
+        // Post-clear append (rebuilds from empty).
+        append(&mut map, "post0", text_msg("p0"));
+        // Post-clear replace (start == end when empty must append, not no-op).
+        map.events.push(SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: "post_repl".to_string(),
+            op: SessionEventOp::ReplaceMessages {
+                start_index: 0,
+                end_index: usize::MAX,
+                messages: vec![text_msg("x"), text_msg("y")],
+            },
+            parent_id: None,
+            version: 1,
+        });
 
         // Verify on the FULL set and on every prefix, the projection never panics
         // and always matches the real derived length.
