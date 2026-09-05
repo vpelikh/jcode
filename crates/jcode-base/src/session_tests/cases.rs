@@ -3048,6 +3048,78 @@ fn session_without_persisted_event_map_loads_via_rebuild() -> Result<()> {
     Ok(())
 }
 
+/// Lazy-save gate: a session whose ONLY signal is a log-only plugin `Unknown`
+/// event (escape hatch, takeaway #13) appended through the public API must be
+/// persisted even though it has no conversation message, no compaction, and no
+/// configured state — otherwise the durable plugin marker is silently dropped
+/// and lost. This pins the narrow exception added to the save gate: a log-only
+/// event forces persistence, while a fresh session whose only event is the
+/// auto-added session-context placeholder is still skipped (lazy save holds).
+#[test]
+fn log_only_plugin_event_forces_persistence_without_message() -> Result<()> {
+    use crate::session::event_types::{SessionEvent, SessionEventOp};
+
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-logonly-plugin-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    // --- Control: a fresh session with only the placeholder context message is
+    // NOT persisted (lazy-save gate still holds). ---
+    let control_id = "logonly_control_untouched";
+    let mut control = Session::create_with_id(control_id.to_string(), None, None);
+    assert!(control.ensure_initial_session_context_message());
+    control.save()?;
+    assert!(
+        !session_path(control_id)?.exists(),
+        "a fresh session whose only event is the placeholder context must stay lazy-saved"
+    );
+
+    // --- Subject: the same untouched session, but a plugin appends a log-only
+    // Unknown event. It must now be persisted even with no message. ---
+    let id = "logonly_plugin_saved";
+    let mut session = Session::create_with_id(id.to_string(), None, None);
+    assert!(session.ensure_initial_session_context_message());
+    let appended = session.append_session_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "plugin_marker".to_string(),
+        op: SessionEventOp::Unknown {
+            event_type: "plugin/marker".to_string(),
+            data: serde_json::json!({ "submission": true }),
+        },
+        parent_id: None,
+        version: 1,
+    });
+    assert!(appended, "log-only plugin event must be recorded");
+    session.save()?;
+    assert!(
+        session_path(id)?.exists(),
+        "a log-only plugin Unknown event must force persistence even without a message"
+    );
+
+    // Reload: the plugin marker must survive.
+    let reloaded = Session::load(id)?;
+    assert!(
+        reloaded
+            .event_map
+            .events
+            .iter()
+            .any(|e| matches!(&e.op, SessionEventOp::Unknown { event_type, .. }
+                if event_type == "plugin/marker")),
+        "log-only plugin marker must survive save + reload"
+    );
+    assert!(
+        reloaded.messages.is_empty() || reloaded.has_message_beyond_session_context() == false,
+        "the session still has no real conversation"
+    );
+    reloaded
+        .rederive_all_checked()
+        .expect("event log must stay consistent after log-only event persistence");
+    Ok(())
+}
+
 /// Failure mode: a torn journal append (dead-writer crash mid-append) followed
 /// by a glued complete entry is salvaged by re-parsing the recoverable entry.
 /// The salvaged entry must preserve **log-only events** (here a plugin `Unknown`
