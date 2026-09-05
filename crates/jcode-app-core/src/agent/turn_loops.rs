@@ -1735,6 +1735,9 @@ mod tests {
             "Let me call the tool the 'verifier' for short.",
             "I'll call the command a success.",
             "Let me call the bash script 'nightly'.",
+            // presentational/prepositional "to", not an action infinitive
+            "I'll call the shell script to your attention.",
+            "I'll call bash in to the meeting.",
         ];
         for turn in legitimate {
             assert!(

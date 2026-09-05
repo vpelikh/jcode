@@ -629,25 +629,55 @@ impl Agent {
                 start = end;
                 continue;
             }
-            // Invoking signal: an infinitive ("call bash to run", "call the
-            // bash tool to run"), " now", or a natural end of the utterance.
-            let invokes_short = after.is_empty()
-                || after.starts_with(" to ")
+            // Invoking signal: " now", or a natural end of the utterance.
+            let invokes_now_or_end = after.is_empty()
                 || after.starts_with(" now")
                 || after.starts_with('.')
                 || after.starts_with(',')
                 || after.starts_with('!')
                 || after.starts_with('?');
-            if invokes_short {
+            if invokes_now_or_end {
                 return true;
             }
-            // For a multi-word target ("the bash tool"), the infinitive may
-            // appear a word later (after "... tool to run"). This turn is short,
-            // so accept when " to " appears anywhere in the remainder.
-            if after.contains(" to ") {
+            // Infinitive intent: "call bash to RUN/CHECK/...". The action verb
+            // may come a word after the needle (multi-word targets like "the
+            // bash tool to run"), so scan the remainder. Crucially require an
+            // ACTION verb afterwards and reject prepositional/presentational
+            // "to" ("to your attention", "in to the meeting"), which are not a
+            // promise to act on the tool.
+            if Self::call_followed_by_action_infinitive(after) {
                 return true;
             }
             start = end;
+        }
+        false
+    }
+
+    /// After the matched "call <target>" phrase, accept a " to <action-verb>"
+    /// infinitive intent (e.g. "to run", "to check"), the observed stall shape.
+    /// Reject a prepositional/presentational "to" that refers to a person or
+    /// place ("to your attention", "in to the meeting"), which is not a promise
+    /// to act on the tool.
+    fn call_followed_by_action_infinitive(after: &str) -> bool {
+        const ACTION_VERBS: [&str; 19] = [
+            "run", "execute", "check", "grep", "view", "verify", "inspect", "read", "show",
+            "display", "print", "list", "search", "test", "parse", "review", "look", "fetch",
+            "generate",
+        ];
+        let mut rest = after;
+        while let Some(idx) = rest.find(" to ") {
+            let tail = &rest[idx + " to ".len()..];
+            // The very next token must be an action verb (allowing a trailing
+            // period/punctuation, e.g. "to run."), for this to be an infinitive
+            // intent. "to the ..." / "to your ..." are not.
+            let first_word = tail
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .next()
+                .unwrap_or("");
+            if ACTION_VERBS.contains(&first_word) {
+                return true;
+            }
+            rest = tail;
         }
         false
     }
