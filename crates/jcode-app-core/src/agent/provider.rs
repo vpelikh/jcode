@@ -377,17 +377,66 @@ fn resolve_working_dir(base: &std::path::Path, dir: &str) -> anyhow::Result<Stri
     }
 
     // Canonicalize to collapse `.`/`..` and resolve symlinks, matching how the
-    // git info cache and compass derive their keys. Fall back to a lexical
-    // cleanup when canonicalization fails so the path stays usable.
+    // git info cache and compass derive their keys. If canonicalization fails
+    // (rare, e.g. a permissions hiccup), fall back to a lexical normalization
+    // that still collapses `.`/`..` so the stored path stays clean and stable.
     match std::fs::canonicalize(&candidate) {
         Ok(canonical) => Ok(canonical.to_string_lossy().into_owned()),
-        Err(_) => Ok(candidate.to_string_lossy().into_owned()),
+        Err(_) => Ok(lexically_normalize(&candidate).to_string_lossy().into_owned()),
+    }
+}
+
+/// Collapse `.` and `..` path components lexically without touching the
+/// filesystem, used as a graceful fallback when `std::fs::canonicalize` fails.
+fn lexically_normalize(path: &std::path::Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                // A `..` at the root stays at the root; otherwise drop the last
+                // component if present, else keep the `..`.
+                if out.as_os_str().is_empty() || out == std::path::Path::new("/") {
+                    // stay put at root/empty
+                } else if !out.pop() {
+                    out.push(component.as_os_str());
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        std::path::PathBuf::from(".")
+    } else {
+        out
     }
 }
 
 #[cfg(test)]
 mod resolve_working_dir_tests {
     use super::resolve_working_dir;
+
+    use super::lexically_normalize;
+
+    #[test]
+    fn lexical_normalize_collapses_dotdot_and_curdir() {
+        assert_eq!(
+            lexically_normalize(std::path::Path::new("/a/./b/../c")).to_str().unwrap(),
+            "/a/c"
+        );
+        assert_eq!(
+            lexically_normalize(std::path::Path::new("a/../b")).to_str().unwrap(),
+            "b"
+        );
+        assert_eq!(
+            lexically_normalize(std::path::Path::new("/..")).to_str().unwrap(),
+            "/"
+        );
+        assert_eq!(
+            lexically_normalize(std::path::Path::new(".")).to_str().unwrap(),
+            "."
+        );
+    }
 
     #[test]
     fn absolute_path_is_normalized() {
