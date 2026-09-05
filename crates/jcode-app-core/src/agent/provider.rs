@@ -272,7 +272,11 @@ impl Agent {
     /// system-reminder is rewritten with the new directory. For a session that
     /// has progressed, that reminder is left untouched and a model-visible
     /// notice is appended instead.
-    pub fn set_working_dir_grouped(&mut self, dir: &str) -> anyhow::Result<()> {
+    ///
+    /// Returns `Ok(true)` when the working directory actually changed (and
+    /// events should be fanned out), or `Ok(false)` when the request resolved
+    /// to the directory already bound (a no-op that should not spam the UI).
+    pub fn set_working_dir_grouped(&mut self, dir: &str) -> anyhow::Result<bool> {
         let old_dir = self
             .session
             .working_dir
@@ -285,8 +289,21 @@ impl Agent {
             .map(std::path::Path::new)
             .unwrap_or_else(|| std::path::Path::new("."));
         let normalized = resolve_working_dir(base, dir)?;
-        if self.session.working_dir.as_deref() == Some(normalized.as_str()) {
-            return Ok(());
+        // Idempotent: treat a change to a directory that is already the
+        // session's working dir (in either its stored or canonical form) as a
+        // no-op, so repeated `/cd` to the same tree never appends a redundant
+        // notice. The stored form can be non-canonical (set by the subscribe
+        // re-bind), so compare against the canonicalized current path too.
+        let current_is_target = self.session.working_dir.as_deref() == Some(normalized.as_str())
+            || self
+                .session
+                .working_dir
+                .as_deref()
+                .and_then(|p| std::fs::canonicalize(p).ok())
+                .map(|p| p.to_string_lossy() == normalized)
+                .unwrap_or(false);
+        if current_is_target {
+            return Ok(false);
         }
         self.session.working_dir = Some(normalized.clone());
         self.refresh_agents_md_snapshot();
@@ -298,7 +315,7 @@ impl Agent {
         }
         self.session.save()?;
         self.log_env_snapshot("working_dir");
-        Ok(())
+        Ok(true)
     }
 
     /// Get the working directory for this session

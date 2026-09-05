@@ -903,3 +903,51 @@ async fn set_working_dir_updates_agent_and_fans_out_event() -> Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn set_working_dir_to_current_dir_is_noop() -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    let current = tempfile::tempdir().expect("dir").into_path();
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
+    {
+        let mut guard = agent.lock().await;
+        guard.set_working_dir(current.to_str().expect("utf8"));
+    }
+    let agent_session_id = agent.lock().await.session_id().to_string();
+    let swarm_members = Arc::new(RwLock::new(HashMap::<String, SwarmMember>::new()));
+    let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
+
+    // Same directory (canonicalizes to the current working dir): no-op, so
+    // neither a change event nor a Done is emitted.
+    handle_set_working_dir(
+        77,
+        current.to_str().expect("utf8").to_string(),
+        &agent,
+        &agent_session_id,
+        &swarm_members,
+        &client_event_tx,
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let events: Vec<_> = std::iter::from_fn(|| client_event_rx.try_recv().ok()).collect();
+    assert!(
+        events.is_empty(),
+        "a no-op /cd to the current dir must not emit events, got {events:?}"
+    );
+    let guard = agent.lock().await;
+    assert_eq!(guard.working_dir().map(PathBuf::from), Some(current));
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    Ok(())
+}

@@ -655,7 +655,14 @@ pub(super) async fn handle_set_working_dir(
 
     let (session_id, result) = result;
     match result {
-        Ok(()) => {
+        Ok(changed) => {
+            if !changed {
+                // The request resolved to the already-bound directory; treat it
+                // as a silent no-op. Neither a change event nor a Done is
+                // emitted so the client does not spam a redundant "working
+                // directory changed" notice for a `/cd` to the current dir.
+                return;
+            }
             crate::session_list_cache::invalidate();
             let event = ServerEvent::SessionWorkingDirChanged {
                 session_id: session_id.clone(),
