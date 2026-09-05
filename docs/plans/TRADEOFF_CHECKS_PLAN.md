@@ -82,6 +82,14 @@ Difficulty calibration reuses the existing approach: involved goals require
 folded into `delivery_state_passes` so a marked-complete goal that never
 considered alternatives is held at the completion gate.
 
+Within `delivery_state_passes` the trade-off check runs **before** the
+feedback-loop verification checks (relevance, coverage, traceability). The
+rationale: trade-off is an architecture decision that can invalidate the design
+the feedback-loop checks would otherwise verify, so the architecture is settled
+first and verified second. The same ordering is mirrored in the ownership
+continuation message, the goal scorecard rows, and the recorded gate
+observations.
+
 ### Gate continuation message
 
 `build_todo_ownership_continuation_message` gains a per-goal line when the
