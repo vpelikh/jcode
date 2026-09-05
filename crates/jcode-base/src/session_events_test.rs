@@ -2511,6 +2511,13 @@ fn test_unknown_op_non_object_payload_round_trips_losslessly() {
     match &op {
         SessionEventOp::Unknown { event_type, data } => {
             assert_eq!(event_type, "plugin_scalar");
+            // The raw scalar must deserialize to the bare value, not collapse
+            // into `{"data":123}` (the serializer's emission shape).
+            assert_eq!(
+                data,
+                &serde_json::json!(123),
+                "raw scalar Unknown payload must not be wrapped under `data`"
+            );
             // Round-trip once. A non-object payload must stay a scalar, not
             // collapse into `{"data":123}`.
             let json = serde_json::to_string(&op).expect("serialize");
