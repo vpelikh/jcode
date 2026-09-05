@@ -475,7 +475,8 @@ impl Agent {
         // action it then fails to complete. Counting them lets a genuine
         // explanatory final answer that walks the reader through reasoning cross
         // the stalled-promise density threshold and be falsely flagged. Observed
-        // stalls never depend on them; they use "let me"/"i'll"/"i'm going to".
+        // stalls never depend on them; they use "let me"/"i'll"/"i'm going to"/"i'm
+        // gonna".
         // The contraction "i'll" (e.g. "I'll run/check/verify") is kept because
         // it is far more action-committal than the formal spelled-out "I will".
         let phrases = [
@@ -483,6 +484,15 @@ impl Agent {
             "i'll",
             "i am going to",
             "i'm going to",
+            // "I'm gonna <action>" is a contraction of "I'm going to <action>"
+            // (already a counted promise) and carries the same imminent-action
+            // intent, so a dense turn of it must be flagged. NOTE: "I'm about
+            // to <verb>" is deliberately NOT added: it is frequently
+            // EXPLANATORY ("I'm about to say/mention/explain...") and counting
+            // it would re-introduce the explanatory-frame false positive on
+            // genuine diagnoses. "gonna" has no such explanatory reading, so
+            // the recall gain is clean.
+            "i'm gonna",
         ];
         let mut count = 0usize;
         for p in phrases {

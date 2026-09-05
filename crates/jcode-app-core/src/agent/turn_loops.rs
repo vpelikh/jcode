@@ -2025,4 +2025,42 @@ mod tests {
             "a long non-ASCII final answer must not be flagged"
         );
     }
+
+
+    #[test]
+    fn stalled_promise_detects_gonna_frame() {
+        // "I'm gonna <action>" is a contraction of "I'm going to <action>" (a
+        // counted action promise) with the same imminent-action intent, so a
+        // dense turn of it must be flagged like "i'm going to".
+        assert!(
+            Agent::is_stalled_promise_text(
+                "I'm gonna run the check. I'm gonna view the file. I'm gonna grep. \
+                 I'm gonna read. I'm gonna execute. I'm gonna verify. I'm gonna inspect. \
+                 I'm gonna list.",
+            ),
+            "a dense 'I'm gonna' stall must be detected"
+        );
+        // "I'm about to <verb>" is NOT an action promise on its own: it is
+        // frequently explanatory ("I'm about to say/mention/explain..."). A
+        // dense turn of explanatory 'about to' must NOT be flagged, and it
+        // must not be counted toward a mixed stall's density.
+        assert!(
+            !Agent::is_stalled_promise_text(
+                "I'm about to mention the cause. I'm about to note the schema. I'm about \
+                 to say the fix. I'm about to explain the flow. I'm about to observe the \
+                 env. I'm about to remark the diff. I'm about to point out the config. \
+                 I'm about to conclude.",
+            ),
+            "explanatory 'I'm about to ...' must not be flagged as a stall"
+        );
+        // Explanatory "I will ..." constructions must also still be excluded.
+        assert!(
+            !Agent::is_stalled_promise_text(
+                "I will note the log. I will assume the cause. I will say the fix. \
+                 I will observe. I will mention. I will point out. I will conclude. \
+                 I will explain.",
+            ),
+            "explanatory 'I will ...' must not be flagged as a stall"
+        );
+    }
 }
