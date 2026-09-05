@@ -725,6 +725,8 @@ fn normalize_todo_input(mut input: Value) -> Value {
                     "difficulty",
                     "autonomy",
                     "trade_off",
+                    "trade_offs",
+                    "explored_alternative",
                 ] {
                     if let Some(value) = fields.get_mut(key) {
                         coerce_empty_string_to_null(value);
@@ -1406,6 +1408,33 @@ mod tests {
         // provider payloads even though the advertised schema requires the field.
         assert_eq!(goals[1].feedback_loop, None);
         assert_eq!(goals[1].group, None);
+    }
+
+    /// An empty-string `trade_offs` and `explored_alternative` must not fail the
+    /// tool call or deserialize as `Some("")`/an invalid bool. These are lenient
+    /// inputs a provider can emit when clearing the field.
+    #[test]
+    fn accepts_empty_string_trade_off_sub_fields_as_none() {
+        let input = json!({
+            "goals": [
+                {
+                    "group": "decision",
+                    "closed_feedback_loop": "closed",
+                    "feedback_loop": "verify",
+                    "trade_off": "diligent",
+                    "trade_offs": "",
+                    "explored_alternative": ""
+                }
+            ]
+        });
+        let parsed = parse(input).expect("empty-string trade-off sub-fields should parse");
+        let goals = parsed.goals.expect("goals present");
+        assert_eq!(goals[0].trade_off, Some(crate::todo::TradeOffState::Diligent));
+        assert_eq!(goals[0].trade_offs, None, "empty trade_offs should read as absent");
+        assert_eq!(
+            goals[0].explored_alternative, None,
+            "empty explored_alternative should read as absent, not a bool error"
+        );
     }
 
     #[test]
