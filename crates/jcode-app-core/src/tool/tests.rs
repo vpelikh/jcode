@@ -2096,6 +2096,7 @@ async fn agentgrep_find_mode_raw_fallback_runs_even_while_grep_redirect_pending(
         "find mode should return the file even while grep redirect pending, got: {}",
         find_out.output
     );
+    compass_enforcement::clear_redirect_pending(session_id);
     clear_session_tool_policy(session_id);
 }
 
@@ -2167,6 +2168,7 @@ async fn agentgrep_raw_fallback_not_blocked_when_compass_disabled_after_redirect
         "raw fallback should return real matches when compass disabled, got: {}",
         run.output
     );
+    super::compass_enforcement::clear_redirect_pending(session_id);
     clear_session_tool_policy(session_id);
 }
 
