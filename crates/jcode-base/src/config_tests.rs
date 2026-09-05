@@ -1567,6 +1567,49 @@ fn test_autoreview_loop_mode_stall_tolerates_missing_fields() {
 }
 
 #[test]
+fn test_autoreview_stale_timeout_default_and_tolerates_missing() {
+    // stale_reviewer_timeout_secs drives dead-but-persisted reviewer recovery.
+    let cfg = Config::default();
+    assert_eq!(
+        cfg.autoreview.stale_reviewer_timeout_secs, 1800,
+        "stale_reviewer_timeout_secs must default to 30 minutes (1800)"
+    );
+
+    // A config without the field must load tolerantly (serde default).
+    let cfg: Config = toml::from_str(
+        r#"
+        [autoreview]
+        enabled = true
+        "#,
+    )
+    .expect("config without stale timeout field must deserialize");
+    assert_eq!(cfg.autoreview.stale_reviewer_timeout_secs, 1800);
+}
+
+#[test]
+fn test_autoreview_stale_timeout_round_trip_and_zero_disables() {
+    // Explicit value survives the config path and reaches the runtime default path.
+    let cfg: Config = toml::from_str(
+        r#"
+        [autoreview]
+        stale_reviewer_timeout_secs = 60
+        "#,
+    )
+    .expect("config with stale timeout must deserialize");
+    assert_eq!(cfg.autoreview.stale_reviewer_timeout_secs, 60);
+
+    // 0 disables stale detection (loop waits on a dead reviewer indefinitely).
+    let cfg0: Config = toml::from_str(
+        r#"
+        [autoreview]
+        stale_reviewer_timeout_secs = 0
+        "#,
+    )
+    .expect("config with 0 stale timeout must deserialize");
+    assert_eq!(cfg0.autoreview.stale_reviewer_timeout_secs, 0);
+}
+
+#[test]
 fn test_telegram_connectivity_fields_round_trip_and_env_override() {
     // The anti-censorship connectivity fields (mirror base, proxy, pinned IP)
     // carry routing semantics, so they must survive a Config serialize/parse
