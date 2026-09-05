@@ -146,7 +146,7 @@ impl Tool for CompassQueryTool {
     }
 
     fn description(&self) -> &str {
-        "Semantic code search and structural analysis via Compass's knowledge graph."
+        "Semantic code search via the code graph; prefer over agentgrep."
     }
 
     fn concurrency_safe_marker(&self) -> bool {

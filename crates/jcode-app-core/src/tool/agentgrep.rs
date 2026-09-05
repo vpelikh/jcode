@@ -188,7 +188,7 @@ impl Tool for AgentGrepTool {
     }
 
     fn description(&self) -> &str {
-        "Search code and file names. Defaults to grep mode when mode is omitted."
+        "Search code and files; raw grep fallback when compass can't."
     }
 
     fn concurrency_safe_marker(&self) -> bool {

@@ -246,17 +246,21 @@ impl Registry {
             let mut m = HashMap::new();
             Self::insert_tool_timed(&mut m, &mut timings, "read", read::ReadTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "write", write::WriteTool::new);
-            Self::insert_tool_timed(
-                &mut m,
-                &mut timings,
-                "agentgrep",
-                agentgrep::AgentGrepTool::new,
-            );
+            // Advertise `compass_query` before `agentgrep` so the model reaches for
+            // the semantic search tool first (models bias toward earlier-listed
+            // tools). The tool-level enforcement redirect is the hard backstop;
+            // ordering nudges the model toward the intended first choice.
             Self::insert_tool_timed(
                 &mut m,
                 &mut timings,
                 "compass_query",
                 compass_query::CompassQueryTool::new,
+            );
+            Self::insert_tool_timed(
+                &mut m,
+                &mut timings,
+                "agentgrep",
+                agentgrep::AgentGrepTool::new,
             );
             Self::insert_tool_timed(
                 &mut m,
