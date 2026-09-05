@@ -133,8 +133,11 @@ fn is_injected_internal_message(message: &StoredMessage) -> bool {
 /// True if a raw text block begins with one of the internal-injection markers.
 fn is_injected_marker_text(text: &str) -> bool {
     let text = text.trim_start();
+    // `[Scheduled task]` matches the prior `is_scheduled_task_message` shape
+    // (requires the newline) so a user prompt that merely begins with those
+    // words is not misclassified as an injected internal message.
     text.starts_with("[NOTIFICATION]")
-        || text.starts_with("[Scheduled task]")
+        || text.starts_with("[Scheduled task]\n")
         || text.starts_with("<system-reminder>")
 }
 
@@ -1442,28 +1445,41 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
     /// as the fallback display title and indexed as `generated_title`) is
     /// inferred from the first real user message. Injected internal messages
     /// (session context, scheduled tasks, cross-agent notifications) never seed
-    /// the title. A no-op once a generated title already exists.
+    /// the title.
+    ///
+    /// First tries to backfill from an existing genuine user prompt in the
+    /// transcript, which covers sessions that predate this behavior (loaded
+    /// with a conversation but no generated title) and avoids letting an
+    /// image-only first message permanently block later text messages. Only if
+    /// there is no usable existing prompt does the incoming message seed the
+    /// title (the fresh-session case). A no-op once a generated title exists.
     fn maybe_generate_title_from_first_user_message(
         &mut self,
         role: &Role,
         content: &[ContentBlock],
         display_role: Option<StoredDisplayRole>,
     ) {
-        if *role != Role::User || display_role.is_some() || self.title.is_some() {
+        if self.title.is_some() {
             return;
         }
-        if content_has_injected_marker(content) {
-            return;
-        }
-        if self
+        // Prefer an existing genuine user prompt already in the transcript.
+        // Skips image-only/candidate messages that yield no text.
+        if let Some(title) = self
             .messages
             .iter()
-            .any(is_generated_title_candidate)
+            .filter(|message| is_generated_title_candidate(message))
+            .find_map(|message| generated_title_from_content(&message.content))
         {
+            self.title = Some(title);
             return;
         }
-        if let Some(title) = generated_title_from_content(content) {
-            self.title = Some(title);
+        if *role == Role::User
+            && display_role.is_none()
+            && !content_has_injected_marker(content)
+        {
+            if let Some(title) = generated_title_from_content(content) {
+                self.title = Some(title);
+            }
         }
     }
 

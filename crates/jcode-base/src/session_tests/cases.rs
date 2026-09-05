@@ -200,6 +200,67 @@ fn generated_title_uses_first_user_message_not_later_ones() {
 }
 
 #[test]
+fn generated_title_backfills_history_session_without_title() {
+    // A session that predates title generation: it has user messages but no
+    // generated title. Adding any message must backfill it from the existing
+    // first genuine user prompt instead of staying empty.
+    let mut session = Session::create_with_id("gen_backfill_123".to_string(), None, None);
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "Original historical prompt".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.add_message(
+        Role::Assistant,
+        vec![ContentBlock::Text {
+            text: "some response".to_string(),
+            cache_control: None,
+        }],
+    );
+    // Simulate a title-less historical session by clearing the auto-derived title.
+    session.title = None;
+
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "a new prompt".to_string(),
+            cache_control: None,
+        }],
+    );
+    // Uses the original prompt from history, not the new one.
+    assert_eq!(
+        session.title.as_deref(),
+        Some("Original historical prompt")
+    );
+}
+
+#[test]
+fn generated_title_skips_image_only_first_message() {
+    let mut session = Session::create_with_id("gen_image_first_123".to_string(), None, None);
+    // An image-only user message has no text, so no title is derived yet.
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Image {
+            media_type: "image/png".to_string(),
+            data: "deadbeef".to_string(),
+        }],
+    );
+    assert!(session.title.is_none());
+
+    // The next real text message seeds the title (image-only did not block it).
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "Analyze this screenshot".to_string(),
+            cache_control: None,
+        }],
+    );
+    assert_eq!(session.title.as_deref(), Some("Analyze this screenshot"));
+}
+
+#[test]
 fn generated_title_is_truncated_to_max_chars() {
     let mut session = Session::create_with_id("session_gen_trunc_123".to_string(), None, None);
     let long_prompt = "x".repeat(200);
