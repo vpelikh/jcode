@@ -338,7 +338,14 @@ impl Agent {
     /// in a normal answer is not treated as stalling.
     pub(crate) fn is_stalled_promise_text(text: &str) -> bool {
         let low = text.to_ascii_lowercase();
-        let phrases = ["let me", "i'll", "i will", "let's", "i am going to"];
+        let phrases = [
+            "let me",
+            "i'll",
+            "i will",
+            "let's",
+            "i am going to",
+            "i'm going to",
+        ];
         let mut count = 0usize;
         for p in phrases {
             count += low.matches(p).count();

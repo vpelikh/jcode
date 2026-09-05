@@ -1443,4 +1443,19 @@ mod tests {
             "'let me know' sign-off must not be treated as action-promise stalling"
         );
     }
+
+    #[test]
+    fn stalled_promise_text_detects_im_going_to_contraction() {
+        // "I'm going to X" is the common contraction of "I am going to X" and
+        // is just as much an action-promise pattern. It must be detected too,
+        // otherwise a stall phrased this way evades the guard.
+        let stall = "I'm going to read the file. I'm going to run the check. \
+                     I'm going to grep. I'm going to verify. I'm going to test. \
+                     I'm going to parse it. I'm going to print it. I'm going to search. \
+                     I'm going to compare. I'm going to inspect it.";
+        assert!(
+            Agent::is_stalled_promise_text(stall),
+            "dense 'I'm going to' filler must be flagged as an action-promise stall"
+        );
+    }
 }
