@@ -701,13 +701,13 @@ impl Agent {
         // The noun must then hit end/punctuation or "now" (a bare invocation),
         // not continue into a name or an action-infinitive we'd handle above.
         let tail = after.trim_start();
-        let rest = &tail[first.len()..];
-        rest.trim_start().is_empty()
-            || rest.trim_start().starts_with(" now")
-            || rest.trim_start().starts_with('.')
-            || rest.trim_start().starts_with(',')
-            || rest.trim_start().starts_with('!')
-            || rest.trim_start().starts_with('?')
+        let rest = tail[first.len()..].trim_start();
+        rest.is_empty()
+            || rest.starts_with("now")
+            || rest.starts_with('.')
+            || rest.starts_with(',')
+            || rest.starts_with('!')
+            || rest.starts_with('?')
     }
 
     /// After the matched "call <target>" phrase, accept a " to <action-verb>"
