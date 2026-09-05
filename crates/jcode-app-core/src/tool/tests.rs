@@ -2100,6 +2100,77 @@ async fn agentgrep_find_mode_raw_fallback_runs_even_while_grep_redirect_pending(
 }
 
 #[tokio::test]
+async fn agentgrep_raw_fallback_not_blocked_when_compass_disabled_after_redirect() {
+    use std::collections::HashSet;
+
+    // A redirect sets the session's pending-compass flag. If compass_query is
+    // then disabled by policy, the raw-fallback must NOT be blocked (blocking
+    // would dead-end the model against an unavailable tool until a failing
+    // compass call cleared the flag). It should run raw grep instead.
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    std::fs::write(
+        temp.path().join("sample.txt"),
+        "postdisable_uniquetoken beta\n",
+    )
+    .expect("write file");
+
+    let session_id = "enforcement-disabled-after-redirect";
+    let ctx = ToolContext {
+        session_id: session_id.to_string(),
+        message_id: "test".to_string(),
+        tool_call_id: "call-postdisable-1".to_string(),
+        working_dir: Some(temp.path().to_path_buf()),
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: ToolExecutionMode::Direct,
+    };
+
+    // 1. Redirect a grep (compass invokable at this point) -> pending set.
+    let _ = registry
+        .execute(
+            "agentgrep",
+            serde_json::json!({ "query": "postdisable_uniquetoken" }),
+            ctx.clone(),
+        )
+        .await
+        .expect("grep should redirect");
+    assert!(
+        super::compass_enforcement::redirect_pending(session_id),
+        "redirect should mark pending"
+    );
+
+    // 2. Disable compass_query by policy.
+    set_session_tool_policy(
+        session_id,
+        None,
+        HashSet::from(["compass_query".to_string()]),
+    );
+
+    // 3. The raw fallback must now run (not be blocked), because blocking would
+    //    dead-end the model against a tool it cannot call.
+    let run = registry
+        .execute(
+            "agentgrep",
+            serde_json::json!({
+                "query": "postdisable_uniquetoken",
+                "allow_raw_fallback": true,
+            }),
+            ctx.clone(),
+        )
+        .await
+        .expect("raw fallback should run when compass is disabled, not be blocked");
+    assert!(
+        run.output.contains("postdisable_uniquetoken"),
+        "raw fallback should return real matches when compass disabled, got: {}",
+        run.output
+    );
+    clear_session_tool_policy(session_id);
+}
+
+#[tokio::test]
 async fn agentgrep_runs_when_compass_is_policy_disabled() {
     use std::collections::HashSet;
 

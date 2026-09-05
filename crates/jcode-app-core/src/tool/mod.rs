@@ -935,6 +935,14 @@ impl Registry {
             // never targets, so a raw-fallback flag on them must not be held
             // hostage just because a grep was redirected earlier in the session.
             && agentgrep_call_is_grep_mode(&input)
+            // Don't block if compass_query is no longer invokable for this
+            // session (tool removed or disabled by policy since the redirect).
+            // Otherwise the model would be pointed at a tool it cannot call,
+            // dead-ending it until a (necessarily failing) compass call clears
+            // the pending flag. This mirrors the redirect tier's own
+            // availability guard.
+            && tools.contains_key("compass_query")
+            && !session_tool_is_disabled(&ctx.session_id, "compass_query")
             && compass_enforcement::redirect_pending(&ctx.session_id)
         {
             drop(tools);
