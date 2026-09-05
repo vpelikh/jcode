@@ -1854,20 +1854,47 @@ async fn stream_reply_to_session(
         self.api_base.as_deref(),
     )
     .await;
-    if let Err(e) = stream_result {
-        let _ = crate::telegram::edit_message_text(
-            &client,
-            &self.token,
-            self.chat_id.parse::<i64>().unwrap_or(0),
-            sent_id,
-            &format!(
-                "⚠️ Could not reach session `{}`: {}",
-                short_id(session_id),
-                escape_markdown_v2(&e.to_string())
-            ),
-            self.api_base.as_deref(),
-        )
-        .await;
+    match stream_result {
+        Err(e) => {
+            let _ = crate::telegram::edit_message_text(
+                &client,
+                &self.token,
+                self.chat_id.parse::<i64>().unwrap_or(0),
+                sent_id,
+                &format!(
+                    "⚠️ Could not reach session `{}`: {}",
+                    short_id(session_id),
+                    escape_markdown_v2(&e.to_string())
+                ),
+                self.api_base.as_deref(),
+            )
+            .await;
+        }
+        Ok(reply) if reply.trim().is_empty()
+            || reply == "Message processed; no assistant text was produced." =>
+        {
+            // The turn settled with no output (typically a Stop tapped before
+            // any tokens arrived). Replace the dangling "thinking…" / empty
+            // prefix with a clear, honest end state so the message reads as
+            // intentionally empty rather than broken.
+            let _ = crate::telegram::edit_message_text(
+                &client,
+                &self.token,
+                self.chat_id.parse::<i64>().unwrap_or(0),
+                sent_id,
+                &format!(
+                    "💬 \\[{}] ⏹ _stopped — no output produced_",
+                    short_id(session_id)
+                ),
+                self.api_base.as_deref(),
+            )
+            .await;
+        }
+        Ok(_reply) => {
+            // Normal completion: the on_progress closure already streamed the
+            // final text into the message, and Stop was cleared above. Nothing
+            // further to do.
+        }
     }
 }
 
