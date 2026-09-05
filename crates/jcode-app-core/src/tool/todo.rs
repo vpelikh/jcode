@@ -2064,6 +2064,9 @@ mod tests {
                         "feedback_loop_relevance": "indirect",
                         "feedback_loop_coverage": "narrow",
                         "end_to_end_ownership": 95,
+                        "trade_off": "diligent",
+                        "trade_offs": "weighed streaming vs batch release",
+                        "explored_alternative": true,
                     }],
                 }),
                 test_ctx(session),
@@ -2088,6 +2091,16 @@ mod tests {
             saved_goal.feedback_loop_coverage,
             Some(crate::todo::FeedbackLoopCoverage::Narrow)
         );
+        assert_eq!(
+            saved_goal.trade_off,
+            Some(crate::todo::TradeOffState::Diligent),
+            "trade_off should survive an end-to-end execute write"
+        );
+        assert_eq!(
+            saved_goal.trade_offs.as_deref(),
+            Some("weighed streaming vs batch release")
+        );
+        assert_eq!(saved_goal.explored_alternative, Some(true));
         assert!(
             !output
                 .output
