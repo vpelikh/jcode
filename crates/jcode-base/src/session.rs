@@ -1827,6 +1827,11 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         // Capture whether the event was recorded before mutating (append_event
         // skips invalid events internally).
         let before = self.event_map.events.len();
+        // Capture the op before `append_event` moves it (needed for the
+        // debug-only self-check below). Only computed in debug builds so release
+        // does not pay the clone.
+        #[cfg(debug_assertions)]
+        let op_kind = event.op.clone();
         self.event_map.append_event(event);
         let recorded = self.event_map.events.len() > before;
         if recorded {
@@ -1835,6 +1840,38 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
             // `append_stored_message`). Cheap flag-only; the profile rebuilds
             // lazily on the next snapshot.
             self.mark_memory_profile_dirty();
+            // Debug-only self-check for the dual-source-of-truth contract. The
+            // API warns that a state-carrying op (`AppendMessage`/`InsertMessage`/
+            // `ReplaceMessages`/`ClearAll`) requires the caller to keep the legacy
+            // `messages` vector in sync. Verify that contract here so a forgetful
+            // caller is caught in dev instead of silently desyncing the two
+            // sources (which would otherwise force a divergent-load rebuild that
+            // drops log-only markers). Log-only events (`Unknown`, brackets,
+            // `SetCompaction`, `ReplayEvent`, `MemoryInjection`) do not count into
+            // `messages`, so they never trip the check.
+            #[cfg(debug_assertions)]
+            {
+                let message_ops = matches!(
+                    op_kind,
+                    SessionEventOp::AppendMessage { .. }
+                        | SessionEventOp::InsertMessage { .. }
+                        | SessionEventOp::ReplaceMessages { .. }
+                        | SessionEventOp::ClearAll
+                );
+                if message_ops {
+                    // Compare only lengths to keep the check cheap and avoid
+                    // requiring `PartialEq` (which `StoredMessage` deliberately
+                    // lacks). A caller that synced the legacy vector exactly (or
+                    // used the dedicated Session methods) matches here.
+                    let derived = self.event_map.derive_messages().len();
+                    assert!(
+                        derived == self.messages.len(),
+                        "session event-log/legacy desync after append_session_event: \
+                         log derives {derived} messages but session.messages has {}",
+                        self.messages.len()
+                    );
+                }
+            }
         }
         recorded
     }
@@ -2175,15 +2212,31 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         // rebuild must PRESERVE them rather than drop them. Otherwise any caller
         // that rebuilds the log from the legacy vectors (reconcile-on-divergence,
         // the app-core sanitize-clear path) would silently lose durable plugin
-        // data, defeating the escape hatch (takeaway #13). Compaction brackets
-        // and ordinary state-carrying events are NOT preserved here: they are
-        // reconstructed (or deliberately omitted) from the legacy vectors so the
-        // rebuilt log agrees with `self.compaction`/`self.messages`.
+        // data, defeating the escape hatch (takeaway #13).
+        //
+        // Orphaned `CompactionStart` markers are likewise preserved: an unmatched
+        // open bracket is the durable "incomplete compaction" signal (takeaway
+        // #5), and a divergent-load rebuild would otherwise erase it. Because an
+        // open `Start` affects neither `derive_messages` nor
+        // `current_compaction` (only a matching `CompactionEnd` or `SetCompaction`
+        // persists compaction), re-appending them keeps the rebuilt log deriving
+        // exactly the same state as the legacy vectors while retaining the orphan
+        // signal. Closed bracket pairs and ordinary state-carrying events are NOT
+        // preserved here: they are reconstructed (or deliberately omitted) from
+        // the legacy vectors so the rebuilt log agrees with
+        // `self.compaction`/`self.messages`.
         let preserved_unknown: Vec<SessionEvent> = self
             .event_map
             .events
             .iter()
             .filter(|e| matches!(e.op, SessionEventOp::Unknown { .. }))
+            .cloned()
+            .collect();
+        // Capture orphans BEFORE the map is replaced below.
+        let preserved_orphan_starts: Vec<SessionEvent> = self
+            .event_map
+            .orphaned_compactions()
+            .into_iter()
             .cloned()
             .collect();
 
@@ -2236,11 +2289,15 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
             });
         }
 
-        // Re-append the plugin `Unknown` events that were preserved above. They
-        // are appended LAST so their relative order is unchanged and they sit
-        // after any reconstructed state events (their position in the log never
-        // matters to derivation, but keeping them contiguous tail preserves the
-        // append-only narrative for any downstream reader).
+        // Re-append the preserved log-only events: plugin `Unknown` events and
+        // orphaned `CompactionStart` markers. They are appended LAST so their
+        // relative order is unchanged and they sit after any reconstructed state
+        // events (their position in the log never matters to derivation, but
+        // keeping them contiguous at the tail preserves the append-only narrative
+        // for any downstream reader).
+        for event in preserved_orphan_starts {
+            map.push_event(event);
+        }
         for event in preserved_unknown {
             map.push_event(event);
         }

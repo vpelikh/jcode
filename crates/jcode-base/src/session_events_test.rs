@@ -413,6 +413,52 @@ fn test_orphaned_compaction_reports_innermost_unmatched_start() {
     }
 }
 
+/// For a malformed log with several unclosed brackets, `orphaned_compactions()`
+/// enumerates ALL unmatched `CompactionStart` markers (not just the innermost,
+/// which is what `orphaned_compaction()` reports for crash-recovery).
+#[test]
+fn test_orphaned_compactions_reports_all_unmatched_starts() {
+    let mut map = SessionEventMap::default();
+    // Two distinct interrupted runs: [Start A] ... [Start B] with no closes.
+    let start_a = SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "a".to_string(),
+        op: SessionEventOp::CompactionStart {
+            compaction_id: "run_a".to_string(),
+            covers_up_to_turn: 5,
+        },
+        parent_id: None,
+        version: 1,
+    };
+    let start_b = SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "b".to_string(),
+        op: SessionEventOp::CompactionStart {
+            compaction_id: "run_b".to_string(),
+            covers_up_to_turn: 5,
+        },
+        parent_id: None,
+        version: 1,
+    };
+    map.push_event(start_a);
+    map.push_event(start_b);
+
+    let orphans = map.orphaned_compactions();
+    assert_eq!(
+        orphans.len(),
+        2,
+        "both unmatched starts must be reported"
+    );
+    let ids: Vec<&str> = orphans
+        .iter()
+        .filter_map(|e| match &e.op {
+            SessionEventOp::CompactionStart { compaction_id, .. } => Some(compaction_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, vec!["run_a", "run_b"], "orphans reported in log order");
+}
+
 /// A `CompactionEnd` without a preceding `CompactionStart` is itself an orphan
 /// (an "unpaired close") and must be flagged by the bracket invariant.
 #[test]
@@ -721,6 +767,48 @@ fn test_rebuild_event_map_preserves_plugin_unknown_events() {
     session
         .rederive_all_checked()
         .expect("rebuilt log must stay consistent");
+}
+
+/// `rebuild_event_map` must preserve an **orphaned `CompactionStart`** marker
+/// through a rebuild from the legacy vectors. An unmatched open bracket is the
+/// durable "incomplete compaction" signal (takeaway #5); erasing it on a
+/// divergent-load rebuild would silently hide an interrupted compaction. An open
+/// `Start` affects neither `derive_messages` nor `current_compaction`, so
+/// preserving it keeps the rebuilt log deriving the same state as the legacy
+/// vectors while retaining the orphan signal.
+#[test]
+fn test_rebuild_event_map_preserves_orphaned_compaction_start() {
+    let mut session = Session::create_with_id("rebuild_orphan".to_string(), None, None);
+    session.append_stored_message(StoredMessage {
+        id: "m1".to_string(),
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    // Simulate a crash mid-compaction: an open `CompactionStart` with no close.
+    session.event_map.start_compaction("orphan_run", 3);
+    assert!(
+        session.event_map.orphaned_compaction().is_some(),
+        "precondition: an orphaned bracket is present"
+    );
+
+    // Rebuild from the legacy vectors (simulating reconcile / sanitize-clear).
+    session.rebuild_event_map();
+
+    assert!(
+        session.event_map.orphaned_compaction().is_some(),
+        "rebuild_event_map must preserve the orphaned CompactionStart marker"
+    );
+    // Derived state still agrees with the legacy vectors (orphan is log-only).
+    session
+        .rederive_all_checked()
+        .expect("rebuilt log with preserved orphan must stay consistent");
 }
 
 /// Unknown ops must still be rejected by validation if their event id is empty,
@@ -1608,6 +1696,61 @@ fn test_append_and_insert_empty_content_message_stay_consistent() {
     session.rederive_all_checked().expect("empty-content mutated session must stay consistent");
     assert_eq!(session.messages.len(), 3);
     assert_eq!(session.derive_messages().len(), session.messages.len());
+}
+
+/// `append_session_event` carries a debug-only self-check: appending a
+/// message-carrying op (`AppendMessage`) that the caller does NOT also push onto
+/// the legacy `messages` vector must trip an assertion in debug builds — the
+/// dual-source-of-truth contract enforced in dev rather than silently desyncing
+/// (which would later force a divergent-load rebuild). Log-only ops (`Unknown`,
+/// brackets) never trip it.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "session event-log/legacy desync")]
+fn test_append_session_event_appends_checks_desync_in_debug() {
+    let mut session = Session::create_with_id("append_desync_debug".to_string(), None, None);
+    // Append a state-carrying AppendMessage WITHOUT updating session.messages.
+    // This violates the documented contract and must be caught by the check.
+    session.append_session_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "m_desync".to_string(),
+        op: SessionEventOp::AppendMessage {
+            message_id: "m_desync".to_string(),
+            message: StoredMessage {
+                id: "m_desync".to_string(),
+                role: Role::User,
+                content: vec![text_block("oops")],
+                display_role: None,
+                timestamp: None,
+                tool_duration_ms: None,
+                token_usage: None,
+            },
+        },
+        parent_id: None,
+        version: 1,
+    });
+}
+
+/// Appending a **log-only** op (`Unknown`) through `append_session_event` must
+/// NOT trip the debug self-check: it does not count into `messages`, so a plugin
+/// event append stays valid even though the caller does not touch `messages`.
+#[test]
+#[cfg(debug_assertions)]
+fn test_append_session_event_log_only_op_does_not_check_desync() {
+    let mut session = Session::create_with_id("append_logonly_debug".to_string(), None, None);
+    let recorded = session.append_session_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "plugin_debug".to_string(),
+        op: SessionEventOp::Unknown {
+            event_type: "plugin/x".to_string(),
+            data: serde_json::json!({}),
+        },
+        parent_id: None,
+        version: 1,
+    });
+    assert!(recorded, "log-only Unknown must be recorded");
+    // messages untouched; no panic.
+    assert!(session.messages.is_empty());
 }
 
 #[test]
@@ -2963,8 +3106,8 @@ fn test_current_compaction_cache_matches_reverse_scan_after_reload() {
         }
         let live_compaction = live.current_compaction();
 
-        // Reload drops the in-memory cache (serde(skip)) -> reverse-scan is the
-        // authority. Both paths must report identical compaction state.
+        // Reload drops the in-memory cache (serde(skip)) -> the reverse-scan fallback
+        // is the authority, and it must agree with the live (warmed) cache.
         let json = serde_json::to_string(&live).expect("serialize");
         let reloaded: SessionEventMap = serde_json::from_str(&json).expect("deserialize");
         let reloaded_compaction = reloaded.current_compaction();

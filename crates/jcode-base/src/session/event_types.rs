@@ -417,8 +417,15 @@ pub struct SessionEventMap {
     /// All events in append-only order
     pub events: Vec<SessionEvent>,
     /// Cache of the most recent SetCompaction event, for O(1) current_compaction.
+    /// Deliberately NOT persisted (`serde(skip)`): `events` is the sole
+    /// authority, and a persisted cache would become a second authoritative
+    /// state that could silently diverge from `events` on direct mutation —
+    /// exactly the dual-source hazard this event log exists to avoid.
+    /// `current_compaction` therefore reverse-scans `events` when the cache is
+    /// empty (e.g. after deserialization). This bounds the cost to O(n) on a
+    /// fresh load rather than risking a stale cache.
     #[serde(skip)]
-    compaction_event_index: Option<SessionEvent>,
+    cached_compaction: Option<StoredCompactionState>,
 }
 
 impl SessionEventMap {
@@ -429,18 +436,19 @@ impl SessionEventMap {
         self.events.is_empty()
     }
 
-    /// Update caches when appending an event (SetCompaction / ClearAll).
+    /// Update the compaction cache when appending an event (SetCompaction /
+    /// CompactionEnd persist compaction; ClearAll clears it).
     fn update_caches(&mut self, event: &SessionEvent) {
         match &event.op {
-            SessionEventOp::SetCompaction { .. }
-            | SessionEventOp::CompactionEnd { .. } => {
-                self.compaction_event_index = Some(event.clone());
+            SessionEventOp::SetCompaction { compaction }
+            | SessionEventOp::CompactionEnd { compaction } => {
+                self.cached_compaction = Some(compaction.clone());
             }
             SessionEventOp::ClearAll => {
                 // Any cached compaction state refers to messages that no longer
                 // exist after a clear; drop it so current_compaction() reflects
                 // the cleared transcript.
-                self.compaction_event_index = None;
+                self.cached_compaction = None;
             }
             _ => {}
         }
@@ -518,38 +526,31 @@ impl SessionEventMap {
     
     /// Get current compaction state
     pub fn current_compaction(&self) -> Option<StoredCompactionState> {
-        match &self.compaction_event_index {
-            Some(event) => {
-                match &event.op {
-                    SessionEventOp::SetCompaction { compaction }
-                    | SessionEventOp::CompactionEnd { compaction } => Some(compaction.clone()),
-                    _ => None,
+        if let Some(cached) = &self.cached_compaction {
+            return Some(cached.clone());
+        }
+        // Fallback: the in-memory cache is empty after deserialization (`serde(skip)`)
+        // or a direct `events` mutation that bypassed `update_caches`. Scan
+        // events in reverse to find the most recent SetCompaction / CompactionEnd
+        // (the persisting op of a bracketed compaction). If a ClearAll appears
+        // after that, the compaction is considered cleared and we return None.
+        // `events` is the sole authority, so this scan is always correct.
+        let mut found_compaction = None;
+        for event in self.events.iter().rev() {
+            match &event.op {
+                SessionEventOp::SetCompaction { compaction }
+                | SessionEventOp::CompactionEnd { compaction } => {
+                    found_compaction = Some(compaction.clone());
+                    break;
                 }
-            }
-            None => {
-                // Fallback: cache may be empty after deserialization (serde(skip)).
-                // Scan events in reverse to find the most recent SetCompaction or
-                // CompactionEnd (the persisting op of a bracketed compaction).
-                // If a ClearAll appears after that, the compaction is considered
-                // cleared and we return None.
-                let mut found_compaction = None;
-                for event in self.events.iter().rev() {
-                    match &event.op {
-                        SessionEventOp::SetCompaction { compaction }
-                        | SessionEventOp::CompactionEnd { compaction } => {
-                            found_compaction = Some(compaction.clone());
-                            break;
-                        }
-                        SessionEventOp::ClearAll => {
-                            // ClearAll after the latest compaction clears it
-                            return None;
-                        }
-                        _ => {}
-                    }
+                SessionEventOp::ClearAll => {
+                    // ClearAll after the latest compaction clears it
+                    return None;
                 }
-                found_compaction
+                _ => {}
             }
         }
+        found_compaction
     }
     
     /// Get memory injections from events
@@ -639,7 +640,34 @@ impl SessionEventMap {
         }
         // The innermost (latest) unmatched Start is what a resumed session needs
         // to resolve. `open` is non-empty exactly when a bracket is orphaned.
+        // Use [`orphaned_compactions`](Self::orphaned_compactions) to enumerate
+        // *all* unmatched open brackets, which is needed when a malformed log has
+        // more than one.
         open.last().copied()
+    }
+
+    /// Enumerate **every** orphaned compaction bracket in the log, not just the
+    /// innermost. Returns the unmatched `CompactionStart` events (in log order).
+    ///
+    /// `orphaned_compaction()` surfaces only the latest unmatched `Start` for
+    /// crash-recovery; this method is the complete view. A log with several
+    /// unclosed brackets (e.g. after a sequence of interrupted runs) has them
+    /// all reported, so a resumed session or the `CompactionBracket` invariant
+    /// can resolve or report every open marker rather than only the last one.
+    pub fn orphaned_compactions(&self) -> Vec<&SessionEvent> {
+        let mut open: Vec<&SessionEvent> = Vec::new();
+        for event in &self.events {
+            match &event.op {
+                SessionEventOp::CompactionStart { .. } => {
+                    open.push(event);
+                }
+                SessionEventOp::CompactionEnd { .. } => {
+                    open.pop();
+                }
+                _ => {}
+            }
+        }
+        open
     }
 
     /// Open a compaction bracket by appending a `CompactionStart` marker.
