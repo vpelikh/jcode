@@ -1710,6 +1710,41 @@ mod tests {
     }
 
     #[test]
+    fn compact_unfulfilled_tool_request_ignores_call_as_naming() {
+        // "call" can mean NAME something rather than invoke it. "Let me call
+        // the tool the 'verifier'" or "I'll call the command a success" assign a
+        // name/label and are NOT a promise to invoke the tool now. The detector
+        // must distinguish the invoking "call bash to run" from these.
+        let legitimate = [
+            "Let me call the tool the 'verifier' for short.",
+            "I'll call the command a success.",
+            "Let me call the bash script 'nightly'.",
+        ];
+        for turn in legitimate {
+            assert!(
+                !Agent::is_stalled_promise_text(turn),
+                "a naming use of 'call' must not be flagged as a stall: {turn:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_unfulfilled_tool_request_detects_call_invocation() {
+        // "call" used to INVOKE must still be detected (observed real phrasing).
+        let stalls = [
+            "Let me call bash to run the check now.",
+            "I'll call bash to run it.",
+            "Let me call the bash tool to run.",
+        ];
+        for turn in stalls {
+            assert!(
+                Agent::is_stalled_promise_text(turn),
+                "a 'call <tool> to run' invocation must be flagged as a stall: {turn:?}"
+            );
+        }
+    }
+
+    #[test]
     fn compact_unfulfilled_tool_request_is_stalled() {
         // The exact compact degradation observed in a real long-context session
         // (DeepSeek via OpenRouter): a SHORT turn explicitly says it will invoke a

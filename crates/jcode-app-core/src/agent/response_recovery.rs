@@ -479,15 +479,17 @@ impl Agent {
     ///    stripped), so long legitimate prose that recounts an earlier
     ///    "I'll invoke..." does not match—even if it hides part of its length
     ///    inside a fenced code block.
-    ///  - It must contain a first-person present/contraction invoke frame ("let me
-    ///    invoke", "i'll invoke", "let me call", "i'll call"). Full future or
-    ///    conditional spellings ("I will invoke bash", "I'm going to invoke
-    ///    bash") are NOT treated as a stall: they more often describe a
-    ///    completed step or a conditional offer ("I will invoke the command
-    ///    only if you want a rerun") than an imminent promise to act now. Every
-    ///    observed stall (giraffe 5/5, sabertooth) uses a contraction/present
-    ///    form, so dropping the future spellings loses no measured coverage. A
-    ///    bare third-person/descriptive "will invoke" (e.g. "this setup will
+    ///  - It must contain a first-person present/contraction invoke frame either
+    ///    "let me invoke"/"i'll invoke" or "let me call"/"i'll call". For the
+    ///    "call" forms the turn must clearly intend to INVOKE a tool ("call bash
+    ///    to run", "call bash now") and not merely NAMING something ("call the
+    ///    tool the 'verifier'", "call it a success") or a completed/conditional
+    ///    step. Full future spellings ("I will invoke bash", "I'm going to
+    ///    invoke bash") are NOT treated as a stall: they more often describe a
+    ///    completed step than an imminent promise to act now. Every observed
+    ///    stall (giraffe 5/5, sabertooth) uses a contraction/present form, so
+    ///    dropping the future spellings loses no measured coverage. A bare
+    ///    third-person/descriptive "will invoke" (e.g. "this setup will
     ///    invoke shell hooks") is likewise NOT a promise by the agent to act,
     ///    so it must not match.
     ///  - The first-person verb must be immediately bound to an actual tool
@@ -535,12 +537,13 @@ impl Agent {
         // Requiring them in the same phrase (verb then target) rejects that
         // false positive while keeping every observed stall, which always names
         // the tool right after the verb.
-        const FIRST_PERSON_INVOKE: [&str; 4] = [
-            "let me invoke",
-            "i'll invoke",
-            "let me call",
-            "i'll call",
-        ];
+        const FIRST_PERSON_INVOKE: [&str; 2] = ["let me invoke", "i'll invoke"];
+        // "call" starters are ambiguous between INVOKING a tool and NAMING
+        // something ("call the tool the 'verifier'", "call it a success"). They
+        // count as a tool-invocation only when clearly followed by an intent to
+        // act ("call bash to run...", "call bash now") or the end of the turn,
+        // never when the target is being given a name.
+        const FIRST_PERSON_CALL: [&str; 2] = ["let me call", "i'll call"];
         const TOOL_TARGETS: [&str; 20] = [
             "bash",
             "the bash",
@@ -568,8 +571,78 @@ impl Agent {
         FIRST_PERSON_INVOKE.iter().any(|starter| {
             TOOL_TARGETS
                 .iter()
-                .any(|target| Self::contains_phrase_boundary(low, &format!("{starter} {target}")))
-        })
+                .any(|target| Self::contains_invoke_boundary(low, &format!("{starter} {target}")))
+        }) // "invoke" forms are unambiguous.
+            || FIRST_PERSON_CALL.iter().any(|starter| {
+                TOOL_TARGETS.iter().any(|target| {
+                    let phrase = format!("{starter} {target}");
+                    // For "call", require a clearly-invoking continuation (" to
+                    // ...", " now", or end-of-turn) so naming ("call the tool the
+                    // X") is never treated as a stall.
+                    Self::contains_call_invoke_boundary(low, &phrase)
+                })
+            })
+    }
+
+    /// Boundaries for a plain "invoke"/"call" tool-invocation phrase: the
+    /// target must not run on into a longer word (apostrophe/letter/digit/
+    /// underscore/hyphen are rejected). Everything else is a boundary.
+    fn contains_invoke_boundary(haystack: &str, needle: &str) -> bool {
+        Self::contains_phrase_boundary(haystack, needle)
+    }
+
+    /// Like `contains_phrase_boundary`, but additionally requires that a "call"
+    /// phrase be followed by a clearly-invoking continuation—an infinitive
+    /// (" call bash to run"), " now", or the end of the turn. This rejects the
+    /// NAMING reading ("call the tool the 'verifier'", "call it a success"),
+    /// which is not a promise to invoke a tool.
+    fn contains_call_invoke_boundary(haystack: &str, needle: &str) -> bool {
+        // Reuse the plain boundary scan (rejects word-continuations).
+        if !Self::contains_phrase_boundary(haystack, needle) {
+            return false;
+        }
+        if needle.is_empty() || haystack.is_empty() {
+            return false;
+        }
+        let mut start = 0;
+        while let Some(rel) = haystack[start..].find(needle) {
+            let at = start + rel;
+            let end = at + needle.len();
+            let after = &haystack[end..];
+            // Naming continuation: the target is being GIVEN a name
+            // ("call the tool the 'verifier'", "call the tool a success"),
+            // which is not a promise to invoke it. A quoted name also signals
+            // naming rather than an imminent invocation.
+            let names_something = after.starts_with(" the ")
+                || after.starts_with(" a ")
+                || after.starts_with(" an ")
+                || after.starts_with('\'')
+                || after.starts_with('"');
+            if names_something {
+                start = end;
+                continue;
+            }
+            // Invoking signal: an infinitive ("call bash to run", "call the
+            // bash tool to run"), " now", or a natural end of the utterance.
+            let invokes_short = after.is_empty()
+                || after.starts_with(" to ")
+                || after.starts_with(" now")
+                || after.starts_with('.')
+                || after.starts_with(',')
+                || after.starts_with('!')
+                || after.starts_with('?');
+            if invokes_short {
+                return true;
+            }
+            // For a multi-word target ("the bash tool"), the infinitive may
+            // appear a word later (after "... tool to run"). This turn is short,
+            // so accept when " to " appears anywhere in the remainder.
+            if after.contains(" to ") {
+                return true;
+            }
+            start = end;
+        }
+        false
     }
 
     /// True when `haystack` contains `needle` and the character immediately
