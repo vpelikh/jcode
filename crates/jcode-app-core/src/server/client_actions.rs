@@ -685,8 +685,19 @@ pub(super) async fn handle_set_working_dir(
         // The request resolved to the already-bound directory; treat it as a
         // silent no-op. Neither a change event nor a Done is emitted so the
         // client does not spam a redundant "working directory changed" notice
-        // for a `/cd` to the current dir.
-        Ok(None) => {}
+        // for a `/cd` to the current dir. Log server-side so a repeated /cd is
+        // still observable when debugging.
+        Ok(None) => {
+            crate::logging::event_info(
+                "SESSION_LIFECYCLE",
+                vec![
+                    ("phase", "working_dir_noop".to_string()),
+                    ("request_id", id.to_string()),
+                    ("session_id", session_id),
+                    ("elapsed_ms", started.elapsed().as_millis().to_string()),
+                ],
+            );
+        }
         Err(error) => {
             crate::logging::event_warn(
                 "SESSION_LIFECYCLE",
