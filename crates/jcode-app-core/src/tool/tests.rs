@@ -2314,6 +2314,66 @@ async fn grep_alias_is_also_redirected_to_compass() {
 }
 
 #[tokio::test]
+async fn grep_alias_raw_fallback_is_blocked_while_compass_redirect_pending() {
+    // The `grep` alias resolves to agentgrep, so the pending-redirect block for
+    // `allow_raw_fallback` must apply to alias calls too, not just literal
+    // `agentgrep`.
+    use super::compass_enforcement;
+
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    std::fs::write(temp.path().join("sample.txt"), "alias_block_token delta\n").expect("write");
+
+    let session_id = "enforcement-grep-alias-block-test";
+    let ctx = ToolContext {
+        session_id: session_id.to_string(),
+        message_id: "test".to_string(),
+        tool_call_id: "call-alias-block-1".to_string(),
+        working_dir: Some(temp.path().to_path_buf()),
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: ToolExecutionMode::Direct,
+    };
+
+    // A `grep` alias call redirects (resolves to agentgrep) and marks pending.
+    let redirect = registry
+        .execute("grep", serde_json::json!({ "pattern": "alias_block_token" }), ctx.clone())
+        .await
+        .expect("grep alias should redirect");
+    assert!(
+        redirect.output.contains("compass_query"),
+        "grep alias should redirect, got: {}",
+        redirect.output
+    );
+    assert!(
+        compass_enforcement::redirect_pending(session_id),
+        "grep alias redirect should mark pending"
+    );
+
+    // The alias raw fallback is refused while pending.
+    let blocked = registry
+        .execute(
+            "grep",
+            serde_json::json!({
+                "pattern": "alias_block_token",
+                "allow_raw_fallback": true,
+            }),
+            ctx.clone(),
+        )
+        .await
+        .expect("grep alias raw fallback should be refused while pending");
+    assert!(
+        !blocked.output.contains("alias_block_token"),
+        "grep alias raw fallback should be blocked while pending, got: {}",
+        blocked.output
+    );
+    compass_enforcement::clear_redirect_pending(session_id);
+    clear_session_tool_policy(session_id);
+}
+
+#[tokio::test]
 async fn batch_subcall_agentgrep_is_redirected_to_compass() {
     // batch sub-calls re-enter Registry::execute, so enforcement must also fire
     // for an agentgrep embedded in a batch. Without this, a model could route
