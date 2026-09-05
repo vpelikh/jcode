@@ -164,8 +164,14 @@ impl Serialize for SessionEventOp {
         use serde::ser::SerializeMap;
 
         // Unknown round-trips by re-emitting `op` plus the preserved payload.
+        // Size hint = emitted entries: fields+op for an object payload, or
+        // `data`+op for a non-object (scalar/array) payload.
         if let SessionEventOp::Unknown { event_type, data } = self {
-            let mut map = serializer.serialize_map(Some(data.as_object().map_or(1, |m| m.len() + 1)))?;
+            let entry_hint = match data {
+                serde_json::Value::Object(fields) => fields.len() + 1,
+                _ => 2,
+            };
+            let mut map = serializer.serialize_map(Some(entry_hint))?;
             match data {
                 serde_json::Value::Object(fields) => {
                     for (k, v) in fields {
