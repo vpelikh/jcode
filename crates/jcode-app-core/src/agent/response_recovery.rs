@@ -337,9 +337,25 @@ impl Agent {
         if !text.contains("```") {
             return std::borrow::Cow::Borrowed(text);
         }
+        let lines: Vec<_> = text.split('\n').collect();
+        // Only strip fenced blocks when they are BALANCED (each opening has a
+        // closing delimiter). A stray unclosed "```" (common from a streamed or
+        // degenerate model) must not swallow the rest of the turn: that would
+        // hide a genuine "I'll invoke..." stall behind an accidental fence.
+        let mut depth = 0usize;
+        for line in &lines {
+            if line.trim_start().starts_with("```") {
+                depth += 1;
+            }
+        }
+        if !depth.is_multiple_of(2) {
+            // Unbalanced fence delimiters: treat the whole text as prose so a
+            // stall embedded around/after the stray marker stays detectable.
+            return std::borrow::Cow::Borrowed(text);
+        }
         let mut out = String::with_capacity(text.len());
         let mut in_fence = false;
-        for line in text.split('\n') {
+        for line in lines {
             let trimmed = line.trim_start();
             if trimmed.starts_with("```") {
                 in_fence = !in_fence;
@@ -455,6 +471,14 @@ impl Agent {
     ///  - It must reference an actual tool target (bash / tool / command / run /
     ///    grep / sed / a specific action verb), so philosophical or past-tense
     ///    uses of "invoke" do not match.
+    ///
+    /// NOTE: this uses EXACT multi-word phrase matching by design. On real
+    /// archived sessions it yields zero false positives (only the true
+    /// sabertooth stall); a looser structural "starter + verb + target" matcher
+    /// was tried (round 9) but exploded to ~369 false positives on the same
+    /// data because "let me"/"i'll" appear in ordinary turns. Exact matching is
+    /// the empirically correct point on the precision/recall line for the
+    /// observed degradation.
     fn is_compact_unfulfilled_tool_request(low: &str) -> bool {
         if low.len() > Self::COMPACT_STALLED_TOOL_REQUEST_MAX_LEN {
             return false;

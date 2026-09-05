@@ -1499,6 +1499,21 @@ mod tests {
     }
 
     #[test]
+    fn stalled_promise_text_survives_stray_unclosed_fence() {
+        // A degenerate/streamed model may emit a stray unclosed "```" before
+        // (or after) the real "I'll invoke..." promise. If the fence-stripper
+        // treated that as swallowing the rest of the turn, it would hide a
+        // genuine stall. The stripper must NOT strip when fences are
+        // unbalanced, so the promise remains detectable.
+        let with_stray_fence = "Here is what I need to do:\n```\n\
+                                I'll invoke bash now.";
+        assert!(
+            Agent::is_stalled_promise_text(with_stray_fence),
+            "a stall after a stray unclosed fence must still be detectable"
+        );
+    }
+
+    #[test]
     fn stalled_promise_density_threshold_is_bracketed() {
         // Exactly MIN_PHRASE=8 occurrences, but the density must still decide:
         // padded short => dense (above 2.0) must flag; padded long => sparse
