@@ -1433,3 +1433,28 @@ fn manual_review_loop_start_cancels_queued_improve_continuation() {
         );
     });
 }
+
+// Regression (replay determinism): a replay session must never auto-seed the
+// review loop (it drives independent reviewer child sessions, which would add
+// non-deterministic state to deterministic playback). maybe_enter_review_loop
+// must be a no-op when is_replay is true.
+#[test]
+fn replay_never_auto_seeds_review_loop() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        app.runtime_mode = super::AppRuntimeMode::RemoteClient;
+        app.is_remote = false;
+        app.is_replay = true;
+        app.autoreview_enabled = true;
+        app.pending_queued_dispatch = false;
+        app.improve_mode = None;
+        app.session.review_loop = None;
+
+        super::commands::maybe_enter_review_loop(&mut app);
+
+        assert!(
+            app.session.review_loop.is_none(),
+            "replay must never auto-seed the review loop (deterministic playback)"
+        );
+    });
+}
