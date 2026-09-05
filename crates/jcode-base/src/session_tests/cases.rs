@@ -1232,6 +1232,17 @@ fn test_corrupt_journal_heals_via_checkpoint_on_next_save() -> Result<()> {
     let reloaded = Session::load(session_id)?;
     assert_eq!(reloaded.messages.len(), 2);
     assert_eq!(reloaded.messages[1].content_preview(), "after heal");
+    // The heal (corrupt journal -> checkpoint) must not desync the event log:
+    // after reload, the derived transcript agrees with the legacy vectors and
+    // the event count matches the message count.
+    reloaded
+        .rederive_all_checked()
+        .expect("corrupt-journal heal must keep the event log consistent");
+    assert_eq!(
+        reloaded.event_map.derive_messages().len(),
+        reloaded.messages.len(),
+        "healed session event log must derive exactly the reloaded messages"
+    );
     Ok(())
 }
 
