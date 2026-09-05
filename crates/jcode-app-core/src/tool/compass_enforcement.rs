@@ -104,7 +104,8 @@ pub enum EnforcementDecision {
 /// The conditions under which `compass_query` is authoritative enough to be
 /// worth redirecting/blocking an `agentgrep` call. Resolved by
 /// [`Registry::execute`] once (it holds the tools lock and reads session
-/// policy), then passed in so the policy itself stays pure and testable.
+/// policy), then passed in so the preconditions are computed in one place
+/// rather than duplicated across decision branches.
 #[derive(Clone, Copy)]
 pub struct CompassAvailability {
     /// The operator enabled the enforcement tier.
@@ -128,11 +129,13 @@ impl CompassAvailability {
 
 /// Decide the `compass_query`-first enforcement for one `agentgrep` call.
 ///
-/// Pure: takes only the call input, the availability snapshot, and the session
-/// id. Returns `PassThrough` when nothing should intercept the call, or the
-/// specific guidance output (redirect vs blocked raw fallback) otherwise. The
-/// caller is responsible for the side effects those decisions require (marking/
-/// clearing the pending flag, telemetry, post-tool hooks).
+/// Takes the call input, the availability snapshot, and the session id, and
+/// consults the session's pending-redirect flag (process-global, keyed by
+/// session) to decide whether a raw-fallback grep is blocked. Returns
+/// `PassThrough` when nothing should intercept the call, or the specific
+/// guidance output (redirect vs blocked raw fallback) otherwise. The caller is
+/// responsible for the side effects those decisions require (marking/clearing
+/// the pending flag, telemetry, post-tool hooks).
 pub fn decide_enforcement(
     input: &serde_json::Value,
     availability: CompassAvailability,
