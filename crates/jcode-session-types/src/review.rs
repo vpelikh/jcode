@@ -691,9 +691,13 @@ mod review_tests {
         let mut state = ReviewLoopState::default();
         state.last_fix_touched_files = true;
         state.fix_baseline_tree = Some(" M src/foo.rs".to_string());
+        // The reviewer-loss respawn budget is part of the round-tripped state so
+        // a session resumed mid-respawn keeps its remaining budget.
+        state.reviewer_respawn_count = 1;
         let json = serde_json::to_string(&state).unwrap();
         let back: ReviewLoopState = serde_json::from_str(&json).unwrap();
         assert!(back.last_fix_touched_files);
         assert_eq!(back.fix_baseline_tree.as_deref(), Some(" M src/foo.rs"));
+        assert_eq!(back.reviewer_respawn_count, 1);
     }
 }

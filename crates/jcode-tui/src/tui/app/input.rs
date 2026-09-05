@@ -1554,6 +1554,15 @@ impl App {
             if self.deliver_deferred_gate_digest_if_needed() {
                 return true;
             }
+            // Round-E guard (same as the idle self-drive): while the review's
+            // own fix turn is queued-but-undispatched, stepping the loop would
+            // spawn the post-fix re-check reviewer against the PRE-fix tree
+            // (awaiting_postfix_recheck is true, active_reviewer_id is None).
+            // The turn-end path must not step in that window either; it just
+            // owns the continuation so poke does not double-fire into it.
+            if super::commands::review_fix_pending(self) {
+                return true;
+            }
             let stepped = super::commands::step_review_loop(self);
             if stepped {
                 // The loop scheduled real work (spawned a reviewer / queued a

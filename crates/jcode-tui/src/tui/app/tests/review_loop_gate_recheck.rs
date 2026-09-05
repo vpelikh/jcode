@@ -1186,3 +1186,49 @@ fn unrelated_interleave_does_not_stall_review_loop_advance() {
         );
     });
 }
+
+// Regression (Round-E, turn-end gap): the premature post-fix re-check guard must
+// also hold on the TURN-END path (schedule_turn_end_followups), not just the
+// idle self-drive. If a review fix is queued-but-undispatched (awaiting_postfix_recheck
+// true, active_reviewer_id None), a turn-end must NOT step the loop and spawn
+// the re-check reviewer against the pre-fix tree.
+#[test]
+fn turn_end_followups_does_not_spawn_premature_recheck_while_fix_queued() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+
+        // Live loop mid post-fix re-check for the first lens, with the fix turn
+        // still queued-but-undispatched.
+        let mut state = jcode_session_types::ReviewLoopState::new();
+        super::review_loop::enter_review_loop(&mut state);
+        state.awaiting_postfix_recheck = true;
+        state.active_reviewer_id = None;
+        app.session.review_loop = Some(state);
+
+        app.queued_messages.push("The reviewer found the following issues. Fix them:\n\n[HIGH] a.rs: bug".to_string());
+        app.pending_queued_dispatch = false;
+        app.is_processing = false;
+
+        // A turn-end fires (e.g. some other event completed).
+        let scheduled = app.schedule_turn_end_followups();
+
+        // The turn-end must NOT spawn a premature re-check reviewer: it owns the
+        // continuation (returns true) while the fix waits to be dispatched.
+        assert!(scheduled, "turn-end should treat the pending fix as owned work");
+        let state = app.session.review_loop.as_ref().unwrap();
+        assert!(!state.finished, "loop must not finalize while the fix is pending");
+        assert!(
+            state.active_reviewer_id.is_none(),
+            "turn-end must NOT spawn the re-check reviewer against the pre-fix tree"
+        );
+        assert_eq!(
+            state.current_lens,
+            Some(jcode_session_types::ReviewLens::Correctness),
+            "the loop must stay on the fixing lens"
+        );
+        assert!(
+            !app.queued_messages.is_empty(),
+            "the queued fix prompt must remain for dispatch"
+        );
+    });
+}

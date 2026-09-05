@@ -1271,7 +1271,7 @@ pub(super) fn is_review_loop_active(app: &App) -> bool {
 /// PRE-fix tree. This is the narrow guard the idle self-drive uses: it blocks
 /// only on the review's own unborn fix — not on an unrelated `interleave_message`
 /// or system reminder, which should not stall lens progress.
-fn review_fix_pending(app: &App) -> bool {
+pub(super) fn review_fix_pending(app: &App) -> bool {
     app.session
         .review_loop
         .as_ref()
@@ -1505,7 +1505,14 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
                         REVIEW_LOOP_MAX_REVIEWER_RESPAWNS,
                     )));
                     let respawned = spawn_review_loop_reviewer(app, &mut state, lens);
-                    app.set_status_notice("Review loop: respawning lost reviewer");
+                    // Only claim the lost reviewer was respawned if the spawn
+                    // actually succeeded. On failure `spawn_review_loop_reviewer`
+                    // sets its own "spawn failed" status + finalized the loop;
+                    // overwriting it here would misreport a failed respawn as
+                    // an in-progress one.
+                    if respawned {
+                        app.set_status_notice("Review loop: respawning lost reviewer");
+                    }
                     respawned
                 } else {
                     state.finished = true;
