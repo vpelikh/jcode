@@ -2937,10 +2937,12 @@ mod tests {
         ch.cancel_reply().await;
     }
 
-    /// Whether a confirm reply actually freed/aborted (i.e. it is not the
-    /// "no pending confirmation" or an "is not a live session" message).
+    /// Whether a confirm reply actually freed the session (i.e. it is not the
+    /// "no pending confirmation" or an "is not a live session" message). The
+    /// abort flow is excluded because `/abort` no longer uses confirmation and
+    /// reports "Stopped", not "Abort confirmed".
     fn free_confirmed(msg: &str) -> bool {
-        msg.contains("freed") || msg.contains("Abort confirmed")
+        msg.contains("freed")
     }
 
     #[tokio::test]
