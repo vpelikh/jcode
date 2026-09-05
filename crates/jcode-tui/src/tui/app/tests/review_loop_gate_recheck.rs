@@ -1012,16 +1012,20 @@ fn step_review_loop_finalizes_when_reviewer_session_is_gone() {
         let mut state = jcode_session_types::ReviewLoopState::new();
         super::review_loop::enter_review_loop(&mut state);
         state.active_reviewer_id = Some("session_reviewer_definitely_missing".to_string());
+        // Exhaust the respawn budget so the very next Gone finalizes instead of
+        // respawning another reviewer (a real spawn would launch a client).
+        state.reviewer_respawn_count = 2;
         app.session.review_loop = Some(state);
         app.is_processing = false;
         app.pending_queued_dispatch = false;
 
         let followup = super::commands_review::step_review_loop(&mut app);
 
-        // The loop finalizes instead of stalling; no follow-up is scheduled.
-        assert!(!followup, "a gone reviewer must not schedule further work");
+        // With the respawn budget exhausted, the loop finalizes; no further
+        // follow-up is scheduled.
+        assert!(!followup, "an exhausted-budget gone reviewer must not schedule work");
         let state = app.session.review_loop.as_ref().unwrap();
-        assert!(state.finished, "loop must finalize when the reviewer is gone");
+        assert!(state.finished, "loop must finalize when the reviewer is gone past the budget");
         assert_eq!(
             state.finish_reason.as_deref(),
             Some("reviewer_unavailable"),
@@ -1034,13 +1038,151 @@ fn step_review_loop_finalizes_when_reviewer_session_is_gone() {
         assert!(
             app.display_messages().iter().any(|msg| {
                 msg.content
-                    .contains("the in-flight reviewer session is gone")
+                    .contains("the reviewer session kept being lost")
             }),
-            "expected the gone-reviewer notice to be surfaced"
+            "expected the exhausted-respawn notice to be surfaced"
         );
         assert!(
             app.status_notice.as_ref().is_some_and(|(n, _)| n.contains("reviewer gone")),
             "expected the reviewer-gone status notice"
+        );
+    });
+}
+
+// Failure mode (reviewer lost, respawn): a single transient reviewer loss must
+// NOT abort the whole lens loop. step_review_loop respawns the same lens up to
+// the bounded budget, clears the stale id, and keeps the loop active.
+#[test]
+fn step_review_loop_respawns_lost_reviewer_within_budget() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+
+        let mut state = jcode_session_types::ReviewLoopState::new();
+        super::review_loop::enter_review_loop(&mut state);
+        state.active_reviewer_id = Some("session_reviewer_definitely_missing".to_string());
+        // The respawn budget still has headroom (0 < 2): the Gone must respawn.
+        state.reviewer_respawn_count = 0;
+        app.session.review_loop = Some(state);
+        app.is_processing = false;
+        app.pending_queued_dispatch = false;
+
+        let followup = super::commands_review::step_review_loop(&mut app);
+
+        // A respawn schedules a fresh reviewer (follow-up true), keeps the loop
+        // active on the same lens, and bumps the budget counter.
+        assert!(followup, "a within-budget gone reviewer must respawn and schedule work");
+        let state = app.session.review_loop.as_ref().unwrap();
+        assert!(!state.finished, "the loop must stay active after respawning");
+        assert_eq!(state.reviewer_respawn_count, 1, "respawn budget must bump");
+        assert_eq!(
+            state.current_lens,
+            Some(jcode_session_types::ReviewLens::Correctness),
+            "respawn must keep the same lens"
+        );
+        assert!(
+            state.active_reviewer_id.is_some(),
+            "a fresh reviewer session must be spawned for the lost lens"
+        );
+        assert!(
+            app.status_notice.as_ref().is_some_and(|(n, _)| n.contains("respawning")),
+            "expected the respawn status notice"
+        );
+    });
+}
+
+// Regression (trade-off #3): the idle self-drive must NOT do a full
+// `Session::load` behind a pending reviewer on every idle tick. The first idle
+// poll runs, but an immediate re-poll is debounced (returns false without
+// stepping the loop). This is exercised twice to cover the per-App debounce.
+#[test]
+fn idle_self_drive_debounces_rapid_repeats() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+
+        // A live loop with a reviewer still pending (no verdict yet).
+        let mut state = jcode_session_types::ReviewLoopState::new();
+        super::review_loop::enter_review_loop(&mut state);
+        state.active_reviewer_id = Some("session_reviewer_pending".to_string());
+        app.session.review_loop = Some(state);
+        app.is_processing = false;
+        app.pending_queued_dispatch = false;
+        app.last_review_loop_idle_poll = None;
+
+        // First idle poll runs (nothing cached yet).
+        let first = super::commands_review::maybe_poll_review_loop_from_idle(&mut app);
+        assert!(first, "first idle poll must run");
+
+        // An immediate second idle poll within the debounce window is suppressed
+        // so we do not reload the reviewer session again this tick burst.
+        let second = super::commands_review::maybe_poll_review_loop_from_idle(&mut app);
+        assert!(!second, "second idle poll within the debounce window must be suppressed");
+
+        // A fresh App (its own debounce clock) polls immediately.
+        let mut app2 = create_test_app();
+        let mut state2 = jcode_session_types::ReviewLoopState::new();
+        super::review_loop::enter_review_loop(&mut state2);
+        state2.active_reviewer_id = Some("creator_reviewer_pending".to_string());
+        app2.session.review_loop = Some(state2);
+        app2.is_processing = false;
+        app2.pending_queued_dispatch = false;
+        app2.last_review_loop_idle_poll = None;
+        assert!(
+            super::commands_review::maybe_poll_review_loop_from_idle(&mut app2),
+            "a fresh App's first poll is independent of app1's debounce clock"
+        );
+    });
+}
+
+// Regression (trade-off #4): the Round-E guard must block only on the review's
+// OWN unborn fix, not on an unrelated interleave message. Setting an unrelated
+// message and a ready CLEAN verdict must still advance the loop (the old
+// `has_queued_followups()` guard would have stalled it).
+#[test]
+fn unrelated_interleave_does_not_stall_review_loop_advance() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+        app.is_remote = true;
+
+        // Live loop at Correctness with a reviewer that already emitted CLEAN.
+        let mut state = jcode_session_types::ReviewLoopState::new();
+        super::review_loop::enter_review_loop(&mut state);
+        let mut reviewer = crate::session::Session::create(None, None);
+        let reviewer_id = reviewer.id.clone();
+        reviewer.add_message_with_display_role(
+            crate::message::Role::User,
+            vec![crate::message::ContentBlock::Text {
+                text: "VERDICT: CLEAN".to_string(),
+                cache_control: None,
+            }],
+            None,
+        );
+        reviewer.save().expect("save reviewer session");
+        state.active_reviewer_id = Some(reviewer_id);
+        app.session.review_loop = Some(state);
+        app.is_processing = false;
+        app.pending_queued_dispatch = false;
+        app.last_review_loop_idle_poll = None;
+
+        // An unrelated interleave message is staged. The old guard
+        // (`has_queued_followups()`) would treat this as "queued work" and block
+        // the loop; the narrow `review_fix_pending` guard does not.
+        app.interleave_message = Some("user background note".to_string());
+
+        let _ = rt.block_on(crate::tui::app::remote::handle_tick(&mut app, &mut remote));
+
+        let state = app.session.review_loop.as_ref().unwrap();
+        assert_eq!(
+            state.current_lens,
+            Some(jcode_session_types::ReviewLens::ALL[1]),
+            "an unrelated interleave message must not stall the review loop advance"
+        );
+        assert!(
+            state.active_reviewer_id.is_some(),
+            "the loop must still spawn the next lens reviewer despite the interleave"
         );
     });
 }

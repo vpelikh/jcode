@@ -154,23 +154,14 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
     // next lens, queuing a fix, converging) pushes display messages / status
     // notices that request redraws on their own.
     //
-    // Round-E guard against a premature post-fix re-check: a review fix turn is
-    // dispatched through `queued_messages` (there is no `pending_turn` handler
-    // on the remote client). `pending_queued_dispatch` is the *first* signal
-    // that one is queued, but it is not the only one: if the queued send fails
-    // (`begin_remote_send` error restores the message to `queued_messages`
-    // without re-arming the flag), `pending_queued_dispatch` is false yet the
-    // fix is still sitting in the queue waiting to be redelivered. Polling
-    // `step_review_loop` then, with `awaiting_postfix_recheck` true and
-    // `active_reviewer_id` None, would spawn the post-fix re-check reviewer
-    // against the PRE-fix tree. So also refuse to self-drive while any
-    // follow-up message is queued-but-undispatched.
-    if crate::tui::app::commands::is_review_loop_active(app)
-        && !app.is_processing
-        && !app.pending_queued_dispatch
-        && !app.has_queued_followups()
-    {
-        let _ = crate::tui::app::commands::step_review_loop(app);
+    // The idle self-drive is debounced and guarded by
+    // `maybe_poll_review_loop_from_idle` (see commands_review.rs): it throttles
+    // how often we do the `Session::load` behind a pending reviewer poll, and it
+    // holds the Round-E guard against spawning a premature post-fix re-check
+    // while the review's own fix turn is still queued-but-undispatched (which
+    // would review the PRE-fix tree).
+    if crate::tui::app::commands::is_review_loop_active(app) && !app.is_processing {
+        let _ = crate::tui::app::commands::maybe_poll_review_loop_from_idle(app);
     }
 
     if !app.is_processing {

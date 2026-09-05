@@ -1548,6 +1548,11 @@ pub struct App {
     // After an interrupt, wait one redraw before auto-dispatching queued followups so
     // the queued preview can render in the interrupted state first.
     pending_queued_dispatch: bool,
+    /// Last wall-clock time the review-loop *idle* self-drive polled the loop
+    /// (see `maybe_poll_review_loop_from_idle`). Debounced per-App so the idle
+    /// tick does not do a `Session::load` behind a pending reviewer on every
+    /// tick, and so parallel tests do not share timing.
+    last_review_loop_idle_poll: Option<Instant>,
     // Tab completion state: (base_input, suggestion_index)
     // base_input is the original input before cycling, suggestion_index is current position
     tab_completion_state: Option<(String, usize)>,

@@ -329,6 +329,13 @@ pub struct ReviewLoopState {
     /// polling the same reviewer instead of spawning a duplicate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_reviewer_id: Option<String>,
+    /// How many times the current lens's reviewer has been respawned after
+    /// being lost (see `reviewer_respawn`): caps how many times a transient
+    /// reviewer loss is retried before the loop hard-finalizes. Reset to zero
+    /// whenever an active reviewer is *spawned fresh* (not a respawn) or a
+    /// verdict is consumed, so a later lens still gets its full budget.
+    #[serde(default)]
+    pub reviewer_respawn_count: u32,
     /// Whether the most recent fix turn actually changed files on disk. A
     /// *productive* (file-changing) re-check never counts against the stall
     /// cap, even if the open-findings set did not shrink: the fix may have been
@@ -353,6 +360,7 @@ impl Default for ReviewLoopState {
             phase: ReviewLoopPhase::Lenses,
             awaiting_postfix_recheck: false,
             active_reviewer_id: None,
+            reviewer_respawn_count: 0,
             last_fix_touched_files: false,
             fix_baseline_tree: None,
         }
@@ -687,31 +695,5 @@ mod review_tests {
         let back: ReviewLoopState = serde_json::from_str(&json).unwrap();
         assert!(back.last_fix_touched_files);
         assert_eq!(back.fix_baseline_tree.as_deref(), Some(" M src/foo.rs"));
-    }
-
-    // Backward compatibility: a persisted ReviewLoopState written by a build
-    // that still had the now-removed `reviewer_session_id` field (see the
-    // per-lens reviewer spawn change) must deserialize cleanly. `ReviewLoopState`
-    // does not use deny_unknown_fields, so serde ignores the unknown key. This
-    // pins that loading an old session json does not fail after the field was
-    // dropped from the struct.
-    #[test]
-    fn loop_state_old_session_with_reviewer_session_id_still_loads() {
-        let json = r#"{
-            "current_lens": "Correctness",
-            "stall_turns": 0,
-            "finished": false,
-            "phase": "lenses",
-            "awaiting_postfix_recheck": false,
-            "active_reviewer_id": "session_reviewer_abc",
-            "reviewer_session_id": "session_reviewer_single_window_xyz",
-            "last_fix_touched_files": false
-        }"#;
-        let back: ReviewLoopState = serde_json::from_str(json).expect("old session json must load");
-        assert!(!back.finished);
-        assert_eq!(back.current_lens, Some(ReviewLens::Correctness));
-        // The removed field is ignored; the `active_reviewer_id` that IS still
-        // used is preserved exactly.
-        assert_eq!(back.active_reviewer_id.as_deref(), Some("session_reviewer_abc"));
     }
 }

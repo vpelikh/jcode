@@ -1260,6 +1260,74 @@ pub(super) fn is_review_loop_active(app: &App) -> bool {
         .unwrap_or(false)
 }
 
+/// True when the review loop has a fix turn queued-but-not-yet-dispatched.
+///
+/// A review fix turn on the remote client is sent through `queued_messages`
+/// (there is no `pending_turn` handler remotely). `pending_queued_dispatch` is
+/// the first signal one is queued, but after a failed send the message is
+/// restored to `queued_messages` without re-arming the flag. While the fix is
+/// unborn, `active_reviewer_id` is None and `awaiting_postfix_recheck` is true,
+/// so polling the loop would spawn the post-fix re-check reviewer against the
+/// PRE-fix tree. This is the narrow guard the idle self-drive uses: it blocks
+/// only on the review's own unborn fix — not on an unrelated `interleave_message`
+/// or system reminder, which should not stall lens progress.
+fn review_fix_pending(app: &App) -> bool {
+    app.session
+        .review_loop
+        .as_ref()
+        .is_some_and(|s| {
+            s.awaiting_postfix_recheck && (app.pending_queued_dispatch || !app.queued_messages.is_empty())
+        })
+}
+
+/// Minimum interval between idle-self-drive polls of an in-flight reviewer.
+///
+/// `step_review_loop` calls `Session::load` (which replays the session journal)
+/// on every idle tick when a reviewer is pending. The idle tick fires many
+/// times per second, so that would put continuous disk reads behind what is
+/// often a long-running reviewer. We poll aggressively on real turn-end events
+/// (not throttled), but the *idle* self-drive — whose only job is to notice
+/// that an async reviewer eventually finished — is debounced to this interval.
+/// A reviewer taking longer than the interval is polled at most once per
+/// interval instead of on every tick, which cuts the load rate by ~an order of
+/// magnitude while keeping latency to noticed-verdict bounded by the interval.
+const REVIEW_LOOP_IDLE_POLL_DEBOUNCE: std::time::Duration =
+    std::time::Duration::from_millis(250);
+
+/// How many times a lens's reviewer may be respawned after being lost before
+/// the loop hard-finalizes with `reviewer_unavailable`. A single transient loss
+/// (terminal killed, OOM'd, window closed) is retried so one bad reviewer does
+/// not silently abort the rest of the 6-lens loop, but an unbounded retry could
+/// loop forever on a persistently-broken environment, so the budget is capped.
+const REVIEW_LOOP_MAX_REVIEWER_RESPAWNS: u32 = 2;
+
+/// Poll the review loop from an idle tick if the debounce window has elapsed.
+///
+/// Returns `true` only when a poll actually ran. Callers do not fold this into
+/// `needs_redraw`; loop progress pushes its own display/status updates.
+pub(super) fn maybe_poll_review_loop_from_idle(app: &mut App) -> bool {
+    // Round-E narrow guard: never self-drive while the review's own fix turn is
+    // queued-but-undispatched (would spawn the re-check reviewer against the
+    // pre-fix tree). This deliberately does NOT use `has_queued_followups()`:
+    // an unrelated interleave message or hidden reminder must not stall lens
+    // progress.
+    if review_fix_pending(app) {
+        return false;
+    }
+    let now = Instant::now();
+    let due = match app.last_review_loop_idle_poll {
+        Some(prev) if now.duration_since(prev) < REVIEW_LOOP_IDLE_POLL_DEBOUNCE => false,
+        _ => {
+            app.last_review_loop_idle_poll = Some(now);
+            true
+        }
+    };
+    if !due {
+        return false;
+    }
+    step_review_loop(app)
+}
+
 /// Enter the review loop after the completion gates pass. Seeded on the session
 /// so it survives reloads; the actual reviewing is driven by turn-end followups.
 pub(super) fn maybe_enter_review_loop(app: &mut App) {
@@ -1421,20 +1489,37 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
         match poll_loop_reviewer(&reviewer_id) {
             PollResult::Gone => {
                 // The reviewer child session disappeared (deleted/unloadable).
-                // Finalize the loop instead of polling forever: signal the user
-                // and stop. The loop is left "finished" so it does not restart
-                // on the next turn-end.
+                // Retry a bounded number of times before giving up: a single
+                // transient loss (terminal killed, OOM, window closed) should
+                // not silently abort the other 5 lenses. Clear the stale id and
+                // respawn the same lens; once the budget is exhausted, finalize
+                // the loop with a terminal reason so it cannot keep spinning.
                 state.active_reviewer_id = None;
-                state.finished = true;
-                state.finish_reason = Some("reviewer_unavailable".to_string());
-                let digest = review_loop::build_and_store_digest(&mut state);
-                app.push_display_message(DisplayMessage::system(format!(
-                    "{digest}\n\n(Review loop stopped: the in-flight reviewer session is gone.)"
-                )));
-                app.session.review_loop = Some(state);
-                let _ = app.session.save();
-                app.set_status_notice("Review loop: reviewer gone");
-                false
+                if state.reviewer_respawn_count < REVIEW_LOOP_MAX_REVIEWER_RESPAWNS {
+                    state.reviewer_respawn_count += 1;
+                    let lens = state.current_lens.unwrap_or(jcode_session_types::ReviewLens::Correctness);
+                    app.push_display_message(DisplayMessage::system(format!(
+                        "↻ Review loop: the '{}' reviewer session was lost; respawning (attempt {} of {}).",
+                        lens.label(),
+                        state.reviewer_respawn_count,
+                        REVIEW_LOOP_MAX_REVIEWER_RESPAWNS,
+                    )));
+                    let respawned = spawn_review_loop_reviewer(app, &mut state, lens);
+                    app.set_status_notice("Review loop: respawning lost reviewer");
+                    respawned
+                } else {
+                    state.finished = true;
+                    state.finish_reason = Some("reviewer_unavailable".to_string());
+                    let digest = review_loop::build_and_store_digest(&mut state);
+                    app.push_display_message(DisplayMessage::system(format!(
+                        "{digest}\n\n(Review loop stopped: the reviewer session kept being lost after {} respawns.)",
+                        REVIEW_LOOP_MAX_REVIEWER_RESPAWNS,
+                    )));
+                    app.session.review_loop = Some(state);
+                    let _ = app.session.save();
+                    app.set_status_notice("Review loop: reviewer gone");
+                    false
+                }
             }
             PollResult::Pending => {
                 // Reviewer still working: wait, don't stall.
@@ -1443,6 +1528,10 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
             }
             PollResult::Report(report) => {
                 state.active_reviewer_id = None;
+                // A verdict was consumed: the loss-budget for this lens's
+                // reviewer is spent, so the next reviewer (a later lens, or the
+                // re-check after a fix) starts with a full respawn budget.
+                state.reviewer_respawn_count = 0;
                 // Determine whether the fix turn actually changed files: compare
                 // the baseline captured at fix-queue time against the current
                 // working tree. A file-touching fix is productive repair work and
