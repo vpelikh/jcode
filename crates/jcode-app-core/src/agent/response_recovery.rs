@@ -418,7 +418,7 @@ impl Agent {
         self.add_message(
             Role::User,
             vec![ContentBlock::Text {
-                text: "<system-reminder>Your previous response repeatedly said you would perform an action (e.g. \"Let me...\") but ended without doing any of it - no tool was called and nothing was executed. If a further step is needed, emit the tool call now and continue the task instead of restating your intent. If the task is genuinely complete, give the final answer directly. Do not repeat the same preparatory filler.</system-reminder>"
+                text: "<system-reminder>Your previous response repeatedly said you would perform an action (e.g. \"Let me...\") but ended without making the promised tool call. If a further step is needed, emit the tool call now and continue the task instead of restating your intent. If the task is genuinely complete, give the final answer directly. Do not repeat the same preparatory filler.</system-reminder>"
                     .to_string(),
                 cache_control: None,
             }],
