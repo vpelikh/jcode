@@ -381,6 +381,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn prefer_compass_query_for_is_false_for_non_agentgrep() {
+        // Enforcement only ever applies to agentgrep; for any other tool the flag
+        // is false regardless of the configured value. The `&&` short-circuit in
+        // the helper also means no config() read happens for non-agentgrep calls
+        // (the hot-path perf guard).
+        assert!(!prefer_compass_query_for("read"));
+        assert!(!prefer_compass_query_for("bash"));
+        assert!(!prefer_compass_query_for(""));
+    }
+
+    #[test]
     fn redirect_pending_lifecycle() {
         let sid = "session_test_compass_enforce_1";
         assert!(!redirect_pending(sid));
