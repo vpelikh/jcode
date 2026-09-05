@@ -574,6 +574,12 @@ impl Agent {
     /// boundary after the target keeps the compact stall detector from flagging
     /// genuine answers like "I'll call the tool's documentation when reviewing".
     fn contains_phrase_boundary(haystack: &str, needle: &str) -> bool {
+        // Guard against an empty needle: find() on an empty string would match
+        // at every index and never advance, looping forever. Callers always pass
+        // a non-empty "{starter} {target}", but never loop on a logical invariant.
+        if needle.is_empty() || haystack.is_empty() {
+            return false;
+        }
         let mut start = 0;
         // Iterate ALL occurrences: the FIRST match may have a poor boundary
         // (e.g. a possessive "the tool's"), while a LATER occurrence is a bare
