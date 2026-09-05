@@ -2241,6 +2241,68 @@ fn test_rederive_all_checked_flags_reordered_injection() {
         "expected the injection-divergence message, got: {err}"
     );
 }
+
+/// A `ReplayEvent` may legitimately carry a HISTORICAL timestamp (it is recorded
+/// for replay visualization, not wall-clock activity; the load/fork paths already
+/// tolerate old timestamps by not re-validating). `validate_event` must NOT drop
+/// such a replay event on the live `record_*` path just because it is older than
+/// the ~1-year wall-clock window. Its FUTURE bound is still enforced by
+/// `validate_replay_event`.
+#[test]
+fn test_old_timestamp_replay_event_is_accepted() {
+    use crate::session::event_types::SessionEventMap;
+
+    let mut map = SessionEventMap::default();
+    let old = chrono::Utc::now() - chrono::Duration::days(400); // > 365d window
+    let op = SessionEventOp::ReplayEvent {
+        replay_event: crate::session::StoredReplayEvent {
+            timestamp: old,
+            kind: crate::session::StoredReplayEventKind::DisplayMessage {
+                role: "user".to_string(),
+                title: None,
+                content: "historical".to_string(),
+            },
+        },
+    };
+    map.append_event(SessionEvent {
+        timestamp: old,
+        event_id: "old_replay".to_string(),
+        op,
+        parent_id: None,
+        version: 1,
+    });
+    assert_eq!(
+        map.events.len(),
+        1,
+        "an old-timestamped replay event must be accepted, not dropped by the age gate"
+    );
+
+    // A non-replay event with the same old timestamp must still be rejected.
+    let mut map2 = SessionEventMap::default();
+    map2.append_event(SessionEvent {
+        timestamp: old,
+        event_id: "old_msg".to_string(),
+        op: SessionEventOp::AppendMessage {
+            message_id: "m1".to_string(),
+            message: StoredMessage {
+                id: "m1".to_string(),
+                role: Role::User,
+                content: vec![text_block("x")],
+                display_role: None,
+                timestamp: None,
+                tool_duration_ms: None,
+                token_usage: None,
+            },
+        },
+        parent_id: None,
+        version: 1,
+    });
+    assert_eq!(
+        map2.events.len(),
+        0,
+        "a non-replay event older than the age window must still be rejected"
+    );
+}
 #[test]
 fn test_compaction_cache_tracks_clear_and_reset_order() {
     // The `cached_compaction` cache must reflect the physical event order across

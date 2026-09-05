@@ -718,10 +718,24 @@ impl SessionEventMap {
             });
         }
         
-        // Validate timestamp (not too far in future or past)
+        // Validate timestamp (not too far in future or past). `ReplayEvent` is
+        // exempt from the PAST window: its event timestamp mirrors the replay
+        // event's timestamp, which may legitimately be historical (an event
+        // recorded for replay visualization, not wall-clock activity). Its
+        // future bound is enforced by `validate_replay_event` below. Exempting
+        // it keeps `record_replay_event` from silently dropping a valid
+        // old-timestamped replay event, which the load/fork paths already
+        // tolerate by not re-validating.
         let now = chrono::Utc::now();
-        let timestamp_diff = (event.timestamp - now).num_seconds().abs();
-        if timestamp_diff > MAX_EVENT_AGE_SECS {
+        let in_past = (now - event.timestamp).num_seconds();
+        if in_past > MAX_EVENT_AGE_SECS && !matches!(event.op, SessionEventOp::ReplayEvent { .. })
+        {
+            return Err(SessionEventError::InvalidTimestamp {
+                timestamp: event.timestamp
+            });
+        }
+        let in_future = (event.timestamp - now).num_seconds();
+        if in_future > MAX_EVENT_AGE_SECS {
             return Err(SessionEventError::InvalidTimestamp {
                 timestamp: event.timestamp
             });
