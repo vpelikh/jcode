@@ -82,10 +82,10 @@ const SHA_RETENTION_TTL: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 /// Maximum number of per-SHA index dirs kept under one project, regardless of
 /// reachability. Beyond this, only the newest `SHA_INDEX_MAX_KEPT` dirs plus the
 /// current HEAD's are retained. Without a cap, per-commit graphs that remain
-/// *reachable* from any ref (e.g. a backup branch) accumulate forever — each is
-/// ~0.9 GB for a large repo — so a repo with many long-lived branches can grow
-/// `~/.jcode/compass/<project>/` unbounded. Each large per-SHA dir is ~0.9 GB,
-/// so the default keeps the per-project Compass cache to a few GB.
+/// *reachable* from any ref (e.g. a backup branch) accumulate forever — each can
+/// be very large on a big repo — so a repo with many long-lived branches can grow
+/// `~/.jcode/compass/<project>/` unbounded. Keeping only a few per-SHA dirs (plus
+/// the current HEAD) bounds the per-project Compass cache irrespective of size.
 const SHA_INDEX_MAX_KEPT: usize = 3;
 
 /// Resolved Compass cache paths for a working directory.
@@ -451,8 +451,8 @@ fn prune_stale_sha_outputs(project_root: &Path, working_dir: &Path, current_sha:
     //   2. If the number of surviving per-SHA dirs still exceeds SHA_INDEX_MAX_KEPT,
     //      keep only the newest SHA_INDEX_MAX_KEPT (plus current_sha) and remove the
     //      rest — even if they are reachable from some (e.g. backup) ref. Otherwise
-    //      reachable per-commit graphs accumulate forever (~0.9 GB each on a large
-    //      repo) and `~/.jcode/compass/<project>/` grows unbounded. Rule 2 runs
+    //      reachable per-commit graphs accumulate forever (each can be very large)
+    //      and `~/.jcode/compass/<project>/` grows unbounded. Rule 2 runs
     //      regardless of reachability, so the count cap always bounds growth.
     let mut candidates: Vec<(SystemTime, PathBuf, String)> = Vec::new();
     // Scan all per-SHA dirs (no truncation): the hard cap below prunes the
@@ -2380,8 +2380,8 @@ mod tests {
     }
 
     // Per-commit graph dirs can remain *reachable* from any ref (e.g. a backup
-    // branch) and would otherwise accumulate forever (~0.9 GB each on a large
-    // repo). The hard cap must still prune the oldest beyond `SHA_INDEX_MAX_KEPT`
+    // branch) and would otherwise accumulate forever (each can be very large).
+    // The hard cap must still prune the oldest beyond `SHA_INDEX_MAX_KEPT`
     // survivors, while always keeping the current HEAD — even when the HEAD is
     // itself unreachable. This is what actually bounds `~/.jcode/compass/` when
     // the 14-day TTL cannot (reachable SHAs never age out of that rule).
