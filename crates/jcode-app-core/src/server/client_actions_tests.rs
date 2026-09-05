@@ -1052,3 +1052,102 @@ async fn set_working_dir_persists_resolved_dir_for_fresh_session() -> Result<()>
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn set_working_dir_to_previously_noncanonical_but_different_dir_is_a_change() -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    // Store a non-canonical path that resolves to dir A, then /cd to a real,
+    // *different* directory B. The canonical-equivalence no-op suppression must
+    // NOT swallow this genuine change: dir A canonicalizes to A (not B), so a
+    // change event must still be emitted and the agent re-scoped to B.
+    let root = tempfile::tempdir().expect("root dir");
+    let dir_a = root.path().join("a");
+    let dir_b = root.path().join("b");
+    std::fs::create_dir_all(&dir_a).expect("create a");
+    std::fs::create_dir_all(&dir_b).expect("create b");
+    let stored_a_noncanonical = root.path().join("a/.").join("..").join("a");
+
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
+    {
+        let mut guard = agent.lock().await;
+        guard.set_working_dir(stored_a_noncanonical.to_str().expect("utf8"));
+    }
+    let agent_session_id = agent.lock().await.session_id().to_string();
+    let (member_event_tx, mut member_event_rx) = mpsc::unbounded_channel();
+    let now = Instant::now();
+    let swarm_members = Arc::new(RwLock::new(HashMap::from([(
+        agent_session_id.clone(),
+        SwarmMember {
+            session_id: agent_session_id.clone(),
+            event_tx: member_event_tx,
+            event_txs: HashMap::new(),
+            working_dir: None,
+            swarm_id: None,
+            swarm_enabled: false,
+            status: "ready".to_string(),
+            detail: None,
+            task_label: None,
+            friendly_name: None,
+            report_back_to_session_id: None,
+            latest_completion_report: None,
+            role: "agent".to_string(),
+            joined_at: now,
+            last_status_change: now,
+            is_headless: false,
+            output_tail: None,
+            todo_progress: None,
+            todo_items: Vec::new(),
+            runtime: crate::protocol::SwarmMemberRuntime::default(),
+        },
+    )])));
+    let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
+
+    handle_set_working_dir(
+        90,
+        dir_b.to_str().expect("utf8").to_string(),
+        &agent,
+        &agent_session_id,
+        &swarm_members,
+        &client_event_tx,
+    )
+    .await;
+
+    let changed_event = timeout(Duration::from_secs(2), member_event_rx.recv())
+        .await
+        .expect("a change to a different dir must emit a change event")
+        .expect("member event channel should stay open");
+    match changed_event {
+        ServerEvent::SessionWorkingDirChanged {
+            session_id,
+            working_dir,
+        } => {
+            assert_eq!(session_id, agent_session_id);
+            assert_eq!(
+                PathBuf::from(working_dir),
+                dir_b.canonicalize().expect("canonical b"),
+                "the change event must carry the new (different) dir"
+            );
+        }
+        other => panic!("expected SessionWorkingDirChanged, got {other:?}"),
+    }
+
+    let client_events: Vec<_> = std::iter::from_fn(|| client_event_rx.try_recv().ok()).collect();
+    assert!(
+        client_events
+            .iter()
+            .any(|event| matches!(event, ServerEvent::Done { id } if *id == 90))
+    );
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    Ok(())
+}
