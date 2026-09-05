@@ -1807,6 +1807,29 @@ mod tests {
     }
 
     #[test]
+    fn compact_unfulfilled_tool_request_detects_interposed_adverb() {
+        // A degenerate/stalling model can insert an adverb or filler before
+        // "invoke" ("let me NOW invoke bash", "let me JUST invoke", "let me GO
+        // AHEAD AND invoke"). These are the same compact stall with different
+        // verb-frame wording and must still be detected so long as a concrete
+        // tool target immediately follows.
+        let stalls = [
+            "Let me now invoke bash.",
+            "I'll now invoke bash.",
+            "Let me just invoke the command.",
+            "I'll just invoke the tool.",
+            "Let me go ahead and invoke the script.",
+            "I'll go ahead and invoke bash now.",
+        ];
+        for turn in stalls {
+            assert!(
+                Agent::is_stalled_promise_text(turn),
+                "a compact stall with an interposed adverb must be detected: {turn:?}"
+            );
+        }
+    }
+
+    #[test]
     fn compact_unfulfilled_tool_request_is_stalled() {
         // The exact compact degradation observed in a real long-context session
         // (DeepSeek via OpenRouter): a SHORT turn explicitly says it will invoke a

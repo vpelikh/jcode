@@ -504,7 +504,9 @@ impl Agent {
     ///    "I'll invoke..." does not match—even if it hides part of its length
     ///    inside a fenced code block.
     ///  - It must contain a first-person present/contraction invoke frame either
-    ///    "let me invoke"/"i'll invoke" or "let me call"/"i'll call". For the
+    ///    "let me invoke"/"i'll invoke" (including common interposed-adverb
+    ///    degenerate phrasings like "let me now invoke", "i'll just invoke",
+    ///    "let me go ahead and invoke") or "let me call"/"i'll call". For the
     ///    "call" forms the turn must clearly intend to INVOKE a tool ("call bash
     ///    to run", "call bash now") and not merely NAMING something ("call the
     ///    tool the 'verifier'", "call it a success") or a completed/conditional
@@ -561,7 +563,20 @@ impl Agent {
         // Requiring them in the same phrase (verb then target) rejects that
         // false positive while keeping every observed stall, which always names
         // the tool right after the verb.
-        const FIRST_PERSON_INVOKE: [&str; 2] = ["let me invoke", "i'll invoke"];
+        const FIRST_PERSON_INVOKE: [&str; 8] = [
+            "let me invoke",
+            "i'll invoke",
+            // degenerate/stalling models often insert an adverb or filler before
+            // the verb ("let me NOW invoke bash", "let me GO AHEAD AND invoke"),
+            // so cover the common interposed forms. All still require a concrete
+            // tool target immediately after, so precision is unchanged.
+            "let me now invoke",
+            "i'll now invoke",
+            "let me just invoke",
+            "i'll just invoke",
+            "let me go ahead and invoke",
+            "i'll go ahead and invoke",
+        ];
         // "call" starters are ambiguous between INVOKING a tool and NAMING
         // something ("call the tool the 'verifier'", "call it a success"). They
         // count as a tool-invocation only when clearly followed by an intent to
