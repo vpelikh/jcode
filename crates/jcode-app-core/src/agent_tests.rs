@@ -2409,3 +2409,140 @@ async fn stalled_promise_turn_bounded_in_non_streaming_loop() {
         "non-streaming loop must inject one stalled-promise reminder per retry"
     );
 }
+
+/// A provider that returns dense "Let me..." filler and ALSO a real tool_use.
+/// The stalled-promise guard must *not* run here: a turn that actually emits a
+/// tool call is not stalled even if it pads itself with filler, and injecting a
+/// reminder between the tool_use and its result would violate the
+/// tool_use -> tool_result adjacency invariant.
+#[derive(Clone, Default)]
+struct FillerWithToolProvider {
+    calls: Arc<std::sync::Mutex<usize>>,
+}
+
+#[async_trait]
+impl Provider for FillerWithToolProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        let call = {
+            let mut guard = self.calls.lock().unwrap();
+            *guard += 1;
+            *guard
+        };
+        let (tx, rx) = tokio_mpsc::channel::<Result<StreamEvent>>(8);
+        tokio::spawn(async move {
+            if call == 1 {
+                let _ = tx
+                    .send(Ok(StreamEvent::TextDelta(
+                        "Let me read the file. Let me run the check. Let me verify the result. \
+                         Let me parse it. Let me grep it. Let me inspect it. Let me print it. \
+                         Let me search it. Let me compare it. Let me review it. Let me test it."
+                            .to_string(),
+                    )))
+                    .await;
+                let _ = tx
+                    .send(Ok(StreamEvent::ToolUseStart {
+                        id: "call_stalled_with_tool".to_string(),
+                        name: "bash".to_string(),
+                    }))
+                    .await;
+                let _ = tx
+                    .send(Ok(StreamEvent::ToolInputDelta(
+                        "{\"cmd\":\"echo hi\"}".to_string(),
+                    )))
+                    .await;
+                let _ = tx
+                    .send(Ok(StreamEvent::ToolUseEnd))
+                    .await;
+                let _ = tx
+                    .send(Ok(StreamEvent::MessageEnd {
+                        stop_reason: Some("tool_calls".to_string()),
+                    }))
+                    .await;
+            } else {
+                // The tool call executes; provide a real completion.
+                let _ = tx
+                    .send(Ok(StreamEvent::TextDelta("done".to_string())))
+                    .await;
+                let _ = tx
+                    .send(Ok(StreamEvent::MessageEnd {
+                        stop_reason: Some("end_turn".to_string()),
+                    }))
+                    .await;
+            }
+        });
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    fn name(&self) -> &str {
+        "filler-with-tool"
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+}
+
+/// A filler turn that ALSO emits a real tool_use must not be treated as a
+/// stalled no-tool turn: the recovery guard only fires when tool_calls is
+/// empty, so this provider completes with the tool executed and no injected
+/// stalled-promise reminders.
+#[tokio::test]
+async fn stalled_promise_skips_turns_that_emit_a_tool_call() {
+    let _guard = crate::storage::lock_test_env();
+    let filler_with_tool = FillerWithToolProvider::default();
+    let calls = filler_with_tool.calls.clone();
+    let provider: Arc<dyn Provider> = Arc::new(filler_with_tool);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent
+        .run_once_streaming_mpsc("do the task", Vec::new(), None, tx)
+        .await
+        .expect("turn should complete");
+
+    let mut text = String::new();
+    while let Ok(event) = rx.try_recv() {
+        if let ServerEvent::TextDelta { text: delta } = event {
+            text.push_str(&delta);
+        }
+    }
+
+    // The tool_use turn is not a stall: no stalled-promise continuation should
+    // have been requested. The single extra call is the tool execution path.
+    assert!(
+        *calls.lock().unwrap() <= 2,
+        "a filler turn WITH a tool call must not trigger stalled-promise recovery, made {} calls",
+        *calls.lock().unwrap()
+    );
+    assert!(
+        text.contains("done"),
+        "the tool-executing turn must complete normally, got {text:?}"
+    );
+
+    // No stalled-promise reminder may have been injected.
+    let reminders = agent
+        .session
+        .messages
+        .iter()
+        .filter(|m| {
+            m.role == Role::User
+                && m.content.iter().any(|block| match block {
+                    ContentBlock::Text { text, .. } => {
+                        text.contains("repeatedly said you would perform an action")
+                    }
+                    _ => false,
+                })
+        })
+        .count();
+    assert_eq!(
+        reminders, 0,
+        "no stalled-promise reminder may be injected for a tool_use turn"
+    );
+}
