@@ -1143,6 +1143,18 @@ pub(super) fn get_tool_summary_with_budget(
                 )
             })
             .unwrap_or_default(),
+        "compass_query" => tool
+            .input
+            .get("query")
+            .and_then(|v| v.as_str())
+            .filter(|q| !q.trim().is_empty())
+            .map(|q| {
+                format!(
+                    "'{}'",
+                    truncate_query_display(q, bounded(40).saturating_sub(2))
+                )
+            })
+            .unwrap_or_default(),
         "browser" => browser_summary(tool, max_width),
         "gmail" => {
             let action = tool

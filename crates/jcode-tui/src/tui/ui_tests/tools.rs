@@ -1352,3 +1352,36 @@ fn test_activity_detail_without_intent_matches_summary() {
     assert_eq!(detail, summary);
     assert!(!detail.is_empty());
 }
+
+/// `compass_query` shows the query that was given in the live tool summary,
+/// so the TUI surfaces what was searched instead of an empty row.
+#[test]
+fn test_tool_summary_compass_query_shows_query() {
+    let tool = ToolCall {
+        id: "compass-1".to_string(),
+        name: "compass_query".to_string(),
+        input: serde_json::json!({
+            "query": "find the config handler",
+            "intent": "search"
+        }),
+        intent: None,
+        thought_signature: None,
+    };
+    let summary = tools_ui::get_tool_summary(&tool);
+    assert_eq!(summary, "'find the config handler'", "summary={summary:?}");
+}
+
+/// A `compass_query` call with a missing or blank query yields an empty
+/// summary rather than a misleading placeholder.
+#[test]
+fn test_tool_summary_compass_query_blank_query_is_empty() {
+    let tool = ToolCall {
+        id: "compass-2".to_string(),
+        name: "compass_query".to_string(),
+        input: serde_json::json!({ "query": "   ", "intent": "search" }),
+        intent: None,
+        thought_signature: None,
+    };
+    let summary = tools_ui::get_tool_summary(&tool);
+    assert!(summary.is_empty(), "summary={summary:?}");
+}
