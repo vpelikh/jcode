@@ -1108,6 +1108,12 @@ fn test_journal_replay_skips_corrupt_line_and_keeps_tail() -> Result<()> {
     assert_eq!(loaded.messages.len(), 2);
     assert_eq!(loaded.messages[0].content_preview(), "first");
     assert_eq!(loaded.messages[1].content_preview(), "third");
+    // The event log (journaled via `append_events`) must survive the torn line
+    // alongside the messages, and derive to the same transcript.
+    let derived = loaded.derive_messages();
+    assert_eq!(derived.len(), 2, "event log must survive the torn line");
+    assert_eq!(derived[1].content_preview(), "third");
+    loaded.rederive_all_checked().expect("event log must stay consistent after torn line");
 
     let remote = Session::load_for_remote_startup(session_id)?;
     assert_eq!(remote.messages.len(), 2);
@@ -1169,6 +1175,11 @@ fn test_journal_replay_salvages_glued_entries_on_torn_line() -> Result<()> {
     assert_eq!(loaded.messages.len(), 2);
     assert_eq!(loaded.messages[0].content_preview(), "first");
     assert_eq!(loaded.messages[1].content_preview(), "third");
+    // The event log (journaled via `append_events`) must also survive the glued
+    // torn line and derive to the same transcript.
+    let derived = loaded.derive_messages();
+    assert_eq!(derived.len(), 2, "event log must survive the glued torn line");
+    loaded.rederive_all_checked().expect("event log must stay consistent after glued torn line");
     Ok(())
 }
 
