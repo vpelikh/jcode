@@ -1097,15 +1097,14 @@ async fn wait_for_prewarm(graph_path: &Path, output_dir: &Path, timeout: std::ti
     let Some(done) = done else {
         return false; // no pre-warm in flight; nothing to wait for
     };
-    tokio::time::timeout(timeout, done.notified())
-        .await
-        .is_ok()
-        // The pre-warm finished (or panicked). Either way the marker was cleared
-        // and the graph either exists (success) or the build failed (the query
-        // reclaim will surface it). Report whether the index is now ready.
-        && {
-            graph_path.is_file()
-        }
+    // Wait (bounded) for the pre-warm's completion signal. `notify_waiters` wakes
+    // all currently-registered waiters but leaves no permit, so a `notified()`
+    // registered *after* the build finished would wait until timeout. Rather than
+    // depend on the signal, always re-check the ready graph afterwards: either
+    // the wait was interrupted by completion, or it timed out, and in both cases
+    // the graph having appeared is the ground truth that the index is warm.
+    tokio::time::timeout(timeout, done.notified()).await;
+    graph_path.is_file()
 }
 
 /// Best-effort, off-the-query-path pre-warm of the Compass knowledge graph for
