@@ -635,7 +635,42 @@ pub async fn send_message_with_base(
         if let Some(rt) = reply_to {
             body["reply_to_message_id"] = serde_json::json!(rt);
         }
-        send_message_once(client, &url, body, true).await?;
+        let result = send_message_once(client, &url, body, true).await;
+        match (result, i) {
+            (Err(e), 0) => {
+                // A failure on the FIRST chunk means nothing was delivered —
+                // almost always a global problem (bad token, network/censorship,
+                // or the whole body being unparseable). Bail with the error so
+                // the caller can re-discover/retry the full text rather than
+                // blindly sending the (misaligned) second chunk.
+                return Err(e);
+            }
+            (Err(e), n) if is_connectivity_error(&e) => {
+                // A connectivity failure on a later chunk means the transport
+                // (or the discovered DC IP) has gone down, so the remaining
+                // chunks will fail too. Keep surfacing the error so callers
+                // (e.g. the notification channel) can re-discover and resend the
+                // full text, rather than returning Ok and leaving the connection
+                // stale for every future send.
+                return Err(e);
+            }
+            (Err(e), n) => {
+                // A later chunk failed with a non-connectivity error (commonly
+                // a transient flood-control / rate limit that `send_message_once`
+                // already retried, or a chunk-local parse quirk). Never drop the
+                // remaining tail: keep delivering the rest so the user still gets
+                // the bulk of a long reply. We surface the dropped chunk in the
+                // logs, but return Ok overall because partial delivery DID happen
+                // and a full resend (triggered by an Err) would duplicate the
+                // chunks that already went out.
+                logging::warn(&format!(
+                    "Telegram chunk {}/{} failed to send; continuing with the rest: {e}",
+                    n + 1,
+                    chunks.len()
+                ));
+            }
+            (Ok(()), _) => {}
+        }
         // Only the first message in a multi-chunk sequence threads under the
         // triggering message; the rest simply follow in the chat.
         reply_to = None;
@@ -1908,5 +1943,131 @@ mod tests {
         assert!(is_markdown_parse_error_v2("can't parse entities"));
         assert!(is_markdown_parse_error_v2("Bad Request: unsupported start tag"));
         assert!(!is_markdown_parse_error_v2("message text is empty"));
+    }
+
+    /// Serve a configurable number of `/sendMessage` requests, failing the
+    /// request at index `fail_index` (0-based) with a permanent HTTP 400 (a
+    /// non-parse, non-retryable API error) so the client's `send_message_once`
+    /// returns immediately without its rate-limit retry loop. Tracks how many
+    /// sendMessage requests actually reached the server so tests can assert the
+    /// "keep delivering the rest" behavior deterministically.
+    async fn start_failing_chunk_api(
+        total_requests: usize,
+        fail_index: Option<usize>,
+    ) -> (u16, std::sync::Arc<tokio::sync::Mutex<Vec<usize>>>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Records the 0-based index of each sendMessage request line, in order.
+        let hit_indexes: std::sync::Arc<tokio::sync::Mutex<Vec<usize>>> =
+            std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let counters_for_task = std::sync::Arc::clone(&hit_indexes);
+        let mut next = 0usize;
+        let handle = tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+            let next_ref = &mut next;
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let idx = *next_ref;
+                *next_ref += 1;
+                let counters = std::sync::Arc::clone(&counters_for_task);
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut reader = BufReader::new(reader);
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).await.is_ok() {
+                        if let Ok(mut c) = counters.try_lock() {
+                            c.push(idx);
+                        }
+                    }
+                    let mut buf = [0u8; 4096];
+                    let _ = reader.read(&mut buf).await;
+                    let response = if Some(idx) == fail_index {
+                        // A permanent API error (not Markdown, not 429) that
+                        // `send_message_once` returns immediately, without retry.
+                        "HTTP/1.1 400 Bad Request\r\n\
+                         Content-Type: application/json\r\n\
+                         Content-Length: 70\r\n\
+                         Connection: close\r\n\r\n\
+                         {\"ok\":false,\"error_code\":400,\"description\":\"chat not found\"}".to_string()
+                    } else {
+                        let body = serde_json::json!({
+                            "ok": true,
+                            "result": { "message_id": 1 }
+                        })
+                        .to_string();
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                    };
+                    let _ = writer.write_all(response.as_bytes()).await;
+                });
+                // Stop after serving the expected number of requests so the test
+                // can't hang waiting for an accept that never comes.
+                if *next_ref >= total_requests {
+                    break;
+                }
+            }
+        });
+        (port, hit_indexes, handle)
+    }
+
+    /// When a LATER chunk of a long message fails, `send_message_with_base`
+    /// must keep delivering the remaining chunks (never drop the tail) and
+    /// return `Ok`, because some content was delivered and a full resend would
+    /// duplicate it.
+    #[tokio::test]
+    async fn test_send_message_with_base_keeps_delivering_after_mid_chunk_failure() {
+        // Build a message long enough to split into 3 chunks. Each chunk is
+        // ~4096 chars; use 'x' chunks separated by padding so no single line
+        // swallows the split (chunk_message splits on char count, not lines).
+        let chunk_len = MAX_MESSAGE_CHARS;
+        let text: String = (0..3)
+            .map(|i| format!("part-{i}-") + &"x".repeat(chunk_len - "part-0-".len()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(chunk_message(&text, MAX_MESSAGE_CHARS).len() >= 3, "test needs 3+ chunks");
+
+        // A 3-chunk send where the 2nd chunk (index 1) fails with 429.
+        let (port, hit_indexes, handle) = start_failing_chunk_api(3, Some(1)).await;
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+        let result = send_message_with_base(&client, "tok", "chat", &text, Some(&base), None)
+            .await;
+        // Partial delivery should still count as success (no Err), so the caller
+        // doesn't duplicate the already-delivered chunks with a full resend.
+        assert!(result.is_ok(), "partial delivery should return Ok, got {:?}", result.err());
+        // All 3 chunks must have been attempted (2nd failed, 1st & 3rd delivered).
+        let hits = hit_indexes.lock().await.clone();
+        assert_eq!(hits, vec![0, 1, 2], "all three chunks should be attempted");
+        handle.abort();
+    }
+
+    /// A failure on the FIRST chunk must still return `Err` (nothing was
+    /// delivered) so callers can re-discover/retry rather than silently send an
+    /// orphaned tail.
+    #[tokio::test]
+    async fn test_send_message_with_base_returns_error_on_first_chunk_failure() {
+        let chunk_len = MAX_MESSAGE_CHARS;
+        let text: String = (0..3)
+            .map(|i| format!("part-{i}-") + &"x".repeat(chunk_len - "part-0-".len()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (port, hit_indexes, handle) = start_failing_chunk_api(1, Some(0)).await;
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+        let result = send_message_with_base(&client, "tok", "chat", &text, Some(&base), None)
+            .await;
+        assert!(
+            result.is_err(),
+            "first-chunk failure should surface as Err, got {result:?}"
+        );
+        // Only the first chunk should have been attempted.
+        let hits = hit_indexes.lock().await.clone();
+        assert_eq!(hits, vec![0], "only the first chunk should be attempted");
+        handle.abort();
     }
 }
