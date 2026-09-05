@@ -1491,4 +1491,24 @@ mod tests {
             "quoting a stalled excerpt inside a code fence must not be flagged as a stall"
         );
     }
+
+    #[test]
+    fn stalled_promise_density_threshold_is_bracketed() {
+        // Exactly MIN_PHRASE=8 occurrences, but the density must still decide:
+        // padded short => dense (above 2.0) must flag; padded long => sparse
+        // (below 2.0) must not. A regression that drifts the density threshold
+        // (or the min-count gate) fails one of these.
+        let dense_near = "Let me read. ".repeat(8) + &"x ".repeat(90); // ~2.8% density
+        assert!(
+            Agent::is_stalled_promise_text(&dense_near),
+            "dense near-threshold turn must be flagged ({dense_near})"
+        );
+
+        // The SAME 8 phrases but far more prose pushes density below 2.0.
+        let sparse_same = "Let me read. ".repeat(8) + &"fill ".repeat(400); // ~0.4% density
+        assert!(
+            !Agent::is_stalled_promise_text(&sparse_same),
+            "sparse same-phrase turn must be excluded by the density gate ({sparse_same})"
+        );
+    }
 }
