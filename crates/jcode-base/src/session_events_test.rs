@@ -3342,6 +3342,57 @@ fn test_known_tag_with_extra_field_stays_known_but_missing_field_degrades() {
     );
 }
 
+/// The merge-extensibility fields on `SessionEvent` — `parent_id` (with
+/// `skip_serializing_if = "Option::is_none"`) and `version` — must round-trip
+/// losslessly. `parent_id` links an event to an earlier one (merge support) and
+/// `version` is the conflict-resolution counter, so neither may be dropped or
+/// altered by a save/load cycle.
+#[test]
+fn test_session_event_parent_id_and_version_round_trip() {
+    let event = SessionEvent {
+        timestamp: Utc::now(),
+        event_id: "e1".to_string(),
+        op: SessionEventOp::ReplaceMessages {
+            start_index: 0,
+            end_index: 1,
+            messages: Vec::new(),
+        },
+        parent_id: Some("parent_event".to_string()),
+        version: 7,
+    };
+
+    let json = serde_json::to_string(&event).expect("serialize with parent_id");
+    assert!(
+        json.contains("parent_event"),
+        "parent_id must be serialized when present: {json}"
+    );
+    let back: SessionEvent = serde_json::from_str(&json).expect("deserialize parent_id");
+    assert_eq!(
+        back.parent_id.as_deref(),
+        Some("parent_event"),
+        "parent_id must round-trip"
+    );
+    assert_eq!(back.version, 7, "version must round-trip");
+    assert_eq!(back.event_id, "e1");
+
+    // When parent_id is None it must be omitted from the wire form.
+    let none_event = SessionEvent {
+        timestamp: Utc::now(),
+        event_id: "e2".to_string(),
+        op: SessionEventOp::ClearAll,
+        parent_id: None,
+        version: 1,
+    };
+    let none_json = serde_json::to_string(&none_event).expect("serialize without parent_id");
+    assert!(
+        !none_json.contains("parent_id"),
+        "parent_id=None must be skipped on the wire: {none_json}"
+    );
+    let none_back: SessionEvent = serde_json::from_str(&none_json).expect("deserialize");
+    assert_eq!(none_back.parent_id, None, "absent parent_id deserializes to None");
+    assert_eq!(none_back.version, 1);
+}
+
 /// The public `Session::event_log()` read accessor lets plugins (and callers
 /// outside `jcode-base`) enumerate the append-only event log — including their
 /// own `Unknown` escape-hatch events — without reaching into the crate-private
