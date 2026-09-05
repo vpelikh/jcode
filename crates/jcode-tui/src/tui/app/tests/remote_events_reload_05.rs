@@ -264,6 +264,14 @@ fn low_ownership_is_gated_after_the_completed_todo_was_saved() {
         assert!(app.pending_queued_dispatch);
         assert_eq!(app.queued_messages.len(), 1);
         assert!(app.queued_messages[0].contains("complete workflow"));
+        // The goal is missing trade_off too, so the same queued ownership
+        // continuation must surface the trade-off nudge through the real
+        // turn-end gate path (not just the base unit test).
+        assert!(
+            app.queued_messages[0]
+                .contains("consider at least one credible alternative"),
+            "trade-off gate should be surfaced in the queued continuation"
+        );
 
         let saved = crate::todo::load_todos(&app.session.id).expect("load saved todo");
         assert_eq!(saved[0].status, "completed");
