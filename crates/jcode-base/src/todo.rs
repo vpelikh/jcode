@@ -181,10 +181,13 @@ pub fn delivery_state_passes(goal: &TodoGoal) -> bool {
         && autonomy_passes
         && iteration_passes
         && stopping_evidence_passes
+        // Settle the architecture before verifying it: the feedback-loop checks
+        // test whether the chosen approach works, so they must not run against a
+        // design a later trade_off assessment would reject.
+        && trade_off_passes(goal)
         && feedback_loop_relevance_passes(goal)
         && feedback_loop_coverage_passes(goal)
         && feedback_loop_traceability_passes(goal)
-        && trade_off_passes(goal)
 }
 
 /// Pre-plan-intent-rewrite alignment continuation. Kept only so persisted
@@ -280,6 +283,14 @@ pub fn build_todo_ownership_continuation_message(todos: &[TodoItem], goals: &[To
                 label
             ));
         }
+        // Surfaced before the feedback-loop checks, matching the gate order:
+        // settle on the architecture (trade_off) before verifying it.
+        if !trade_off_passes(goal) {
+            message.push_str(&format!(
+                "\n- Goal \"{}\": consider at least one credible alternative and weigh its trade-offs (cost, complexity, performance, compatibility, or maintenance) before calling the result done.",
+                label
+            ));
+        }
         if !feedback_loop_relevance_passes(goal) {
             message.push_str(&format!(
                 "\n- Goal \"{}\": validate the result through its public interfaces and acceptance behavior, including its integration boundaries.",
@@ -295,12 +306,6 @@ pub fn build_todo_ownership_continuation_message(todos: &[TodoItem], goals: &[To
         if !feedback_loop_traceability_passes(goal) {
             message.push_str(&format!(
                 "\n- Goal \"{}\": map every explicit requirement and changed public output to a concrete check and report its observed result.",
-                label
-            ));
-        }
-        if !trade_off_passes(goal) {
-            message.push_str(&format!(
-                "\n- Goal \"{}\": consider at least one credible alternative and weigh its trade-offs (cost, complexity, performance, compatibility, or maintenance) before calling the result done.",
                 label
             ));
         }
@@ -2204,6 +2209,35 @@ mod tests {
         let todos = vec![todo("work", "completed", Some("ship"))];
         let message = build_todo_ownership_continuation_message(&todos, &[]);
         assert!(message.contains("Goal \"ship\": clarify the goal and track the work"));
+    }
+
+    /// Trade-off is surfaced before the feedback-loop checks, matching the gate
+    /// order: an architecture can invalidate the design those checks would
+    /// otherwise verify.
+    #[test]
+    fn ownership_continuation_surfaces_trade_off_before_feedback_loop() {
+        let todos = vec![todo("work", "completed", Some("ship"))];
+        let mut goal = delivery_goal(Some("ship"), Some(DeliveryState::WorkflowValidated));
+        goal.trade_off = None;
+        goal.feedback_loop_relevance = Some(FeedbackLoopRelevance::Indirect);
+        // Ensure relevance fails its bar so both a trade-off and a feedback-loop
+        // line are emitted, and pin that trade-off comes first.
+        goal.difficulty = Some(Difficulty::Involved);
+        goal.feedback_loop_relevance = Some(FeedbackLoopRelevance::AcceptanceBlocked);
+        goal.feedback_loop_coverage = Some(FeedbackLoopCoverage::EdgeAndIntegrationPaths);
+        goal.feedback_loop_traceability = Some(FeedbackLoopTraceability::Complete);
+
+        let message = build_todo_ownership_continuation_message(&todos, &[goal]);
+        let trade_off_idx = message
+            .find("consider at least one credible alternative")
+            .expect("trade-off line present");
+        let relevance_idx = message
+            .find("public interfaces")
+            .expect("feedback-loop relevance line present");
+        assert!(
+            trade_off_idx < relevance_idx,
+            "trade_off must be surfaced before feedback-loop checks:\n{message}"
+        );
     }
 
     /// When a completed goal never weighed an alternative, the ownership nudge
