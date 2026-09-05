@@ -381,6 +381,12 @@ impl Agent {
     /// with them ("Let me ... Let me ... Let me run ..."). A single "let me"
     /// in a normal answer is not treated as stalling.
     pub(crate) fn is_stalled_promise_text(text: &str) -> bool {
+        // Drop fenced code blocks first so quoting/reproducing a stalled
+        // excerpt (common in review/diagnosis answers) does not count as a
+        // stall. without_fenced_code_blocks is a cheap no-op (Borrowed) when
+        // there is no "```".
+        let stripped = Self::without_fenced_code_blocks(text);
+        let low = Self::flatten_whitespace(&stripped);
         // Keep the ORIGINAL flattened length for the density denominator. A
         // genuine diagnosis can embed large fenced code blocks (diffs, repros)
         // alongside a handful of prose "let me" phrases. Counting density over
@@ -388,13 +394,12 @@ impl Agent {
         // ratio, falsely flagging a legitimate answer. Measuring against the
         // full original length keeps the ratio honest. Real stalls stream prose
         // with no fences, so for them original == stripped and this is a no-op.
-        let original_low_len = Self::flatten_whitespace(text).len();
-        // Drop fenced code blocks first so quoting/reproducing a stalled
-        // excerpt (common in review/diagnosis answers) does not count as a
-        // stall. This runs on every check; without_fenced_code_blocks is a
-        // cheap no-op when there is no "```".
-        let text = Self::without_fenced_code_blocks(text);
-        let low = Self::flatten_whitespace(&text);
+        // When no fence was present the stripped Cow is Borrowed, so its length
+        // already equals the original and the flatten above is the only one.
+        let original_low_len = match &stripped {
+            std::borrow::Cow::Borrowed(_) => low.len(),
+            std::borrow::Cow::Owned(_) => Self::flatten_whitespace(text).len(),
+        };
         // Two independent failure modes produce "it promises an action but does
         // nothing". Each gets its own detector so one heuristic can't miss what
         // the other catches:
