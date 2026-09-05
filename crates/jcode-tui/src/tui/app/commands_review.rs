@@ -1376,6 +1376,10 @@ pub(super) fn maybe_enter_review_loop(app: &mut App) {
         .get_or_insert_with(crate::session::ReviewLoopState::new);
     review_loop::enter_review_loop(state);
     state.active_reviewer_id = None;
+    // A fresh loop must not inherit the idle-poll debounce clock from a previous
+    // (just-finished) loop; otherwise the first tick would treat it as a recent
+    // poll and delay the first reviewer spawn by up to the debounce interval.
+    app.last_review_loop_idle_poll = None;
     let _ = app.session.save();
     app.push_display_message(DisplayMessage::system(
         "🔁 Review loop started: reviewing the finished work across 6 lenses.".to_string(),
@@ -1811,8 +1815,9 @@ pub(super) fn handle_review_loop_command_local(app: &mut App, trimmed: &str) -> 
             review_loop::enter_review_loop(state);
             // Match the auto-entry path (maybe_enter_review_loop): a manual
             // start must not keep polling a stale in-flight reviewer from a
-            // previous run/lens.
+            // previous run/lens, nor inherit the prior loop's idle-poll debounce.
             state.active_reviewer_id = None;
+            app.last_review_loop_idle_poll = None;
             let _ = app.session.save();
             app.push_display_message(DisplayMessage::system(
                 "🔁 Review loop started (manual). Reviewing across 6 lenses.".to_string(),
