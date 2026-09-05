@@ -656,6 +656,13 @@ impl Session {
                 .sum(),
             replay_events_count: self.replay_events.len(),
             replay_events_json_bytes: self.replay_events.iter().map(estimate_json_bytes).sum(),
+            event_log_count: self.event_map.events.len(),
+            event_log_json_bytes: self
+                .event_map
+                .events
+                .iter()
+                .map(estimate_json_bytes)
+                .sum(),
             provider_cache_count: self.provider_messages_cache.len(),
             provider_cache_json_bytes: self
                 .provider_messages_cache
@@ -687,12 +694,15 @@ impl Session {
             env_snapshot_count: self.memory_profile_cache.env_snapshots_count,
             memory_injection_count: self.memory_profile_cache.memory_injections_count,
             replay_event_count: self.memory_profile_cache.replay_events_count,
+            event_log_count: self.memory_profile_cache.event_log_count,
+            event_log_json_bytes: self.memory_profile_cache.event_log_json_bytes,
             payload_text_bytes: self.memory_profile_cache.message_stats.payload_text_bytes(),
             total_json_bytes: self.memory_profile_cache.messages_json_bytes
                 + self.memory_profile_cache.provider_cache_json_bytes
                 + self.memory_profile_cache.env_snapshots_json_bytes
                 + self.memory_profile_cache.memory_injections_json_bytes
                 + self.memory_profile_cache.replay_events_json_bytes
+                + self.memory_profile_cache.event_log_json_bytes
                 + compaction_json_bytes,
             provider_cache_json_bytes: self.memory_profile_cache.provider_cache_json_bytes,
             canonical_tool_result_bytes: self.memory_profile_cache.message_stats.tool_result_bytes,
@@ -1423,6 +1433,13 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
             .merge_from(&summarize_blocks(&message.content));
         self.messages.push(message);
         self.mark_messages_append_dirty();
+        // The event log grew with the new message. `append_stored_message`
+        // updates the cache's message counts in-place but it must also reflect
+        // the appended event, so mark the memory profile dirty to force an exact
+        // rebuild (including event_log_count/event_log_json_bytes). Keeping the
+        // in-place updates is harmless; the dirty flag guarantees the cache is
+        // never observed with a stale event-log count after appends.
+        self.mark_memory_profile_dirty();
         if !recorded {
             self.rebuild_event_map();
         }

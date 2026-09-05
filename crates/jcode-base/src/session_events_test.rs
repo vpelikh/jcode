@@ -3084,3 +3084,38 @@ fn test_event_validation_rejects_extreme_timestamps_but_accepts_duplicate_ids() 
         "both duplicate-id messages must derive"
     );
 }
+
+/// `memory_profile_snapshot` (used for telemetry/metrics) must account for the
+/// event-sourced log exactly like `debug_memory_profile` does. Without this the
+/// cached `total_json_bytes` undercounts a session's footprint even though the
+/// debug profile reports the event log, so the two observability surfaces would
+/// disagree.
+#[test]
+fn test_memory_profile_snapshot_includes_event_log() {
+    let mut session = Session::create_with_id("mp_snapshot_evt".to_string(), None, None);
+    for i in 0..3 {
+        session.append_stored_message(StoredMessage {
+            id: format!("m{i}"),
+            role: Role::User,
+            content: vec![text_block(&format!("message {i}"))],
+            display_role: None,
+            timestamp: Some(Utc::now()),
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+    let snapshot = session.memory_profile_snapshot();
+    assert_eq!(
+        snapshot.event_log_count,
+        session.event_map.events.len(),
+        "snapshot event_log_count must match the live event map"
+    );
+    assert!(
+        snapshot.event_log_json_bytes > 0,
+        "snapshot event_log_json_bytes must be > 0 once events exist"
+    );
+    assert!(
+        snapshot.total_json_bytes >= snapshot.event_log_json_bytes,
+        "snapshot total_json_bytes must include the event log footprint"
+    );
+}
