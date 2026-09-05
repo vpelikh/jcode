@@ -211,3 +211,44 @@ fn subcall_level_accept_large_output_does_not_override_an_explicit_value() {
         "explicit per-subcall value must win"
     );
 }
+
+#[test]
+fn subcall_level_allow_raw_fallback_is_forwarded_into_parameters() {
+    // The redirect/block enforcement inspects the nested sub-call input via
+    // registry.execute(), so an `allow_raw_fallback` flag placed beside `tool`
+    // (like intent/accept_large_output) must be carried into parameters or it is
+    // silently dropped, making a raw-grep intent look like a plain grep to be
+    // redirected.
+    let input = serde_json::json!({
+        "tool_calls": [{
+            "tool": "agentgrep",
+            "allow_raw_fallback": true,
+            "parameters": { "query": "x" },
+        }]
+    });
+    let out = super::normalize_batch_input(input);
+    assert_eq!(
+        out["tool_calls"][0]["parameters"]["allow_raw_fallback"],
+        serde_json::json!(true),
+        "allow_raw_fallback beside `tool` must reach the sub-call parameters"
+    );
+}
+
+#[test]
+fn subcall_level_allow_raw_fallback_does_not_override_an_explicit_value() {
+    // An explicit `false` inside parameters is a deliberate choice for that one
+    // sub-call and must win over a blanket flag beside `tool`.
+    let input = serde_json::json!({
+        "tool_calls": [{
+            "tool": "agentgrep",
+            "allow_raw_fallback": true,
+            "parameters": { "query": "x", "allow_raw_fallback": false },
+        }]
+    });
+    let out = super::normalize_batch_input(input);
+    assert_eq!(
+        out["tool_calls"][0]["parameters"]["allow_raw_fallback"],
+        serde_json::json!(false),
+        "explicit per-subcall value must win"
+    );
+}

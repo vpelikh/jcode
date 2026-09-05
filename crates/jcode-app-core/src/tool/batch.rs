@@ -179,6 +179,24 @@ fn normalize_batch_input(mut input: Value) -> Value {
                     params.insert(jcode_tool_core::ACCEPT_LARGE_OUTPUT_KEY.to_string(), accept);
                 }
 
+                // Same forwarding for the agentgrep `allow_raw_fallback` flag:
+                // the redirect/block enforcement inspects the nested tool input
+                // inside registry.execute(), so a flag placed beside `parameters`
+                // at the sub-call top level must be carried into the effective
+                // input or it is silently dropped (making a raw-grep intent look
+                // like a plain grep to be redirected). Mirror the intent and
+                // oversized-output forwarding above.
+                let top_level_raw_fallback = obj
+                    .get("allow_raw_fallback")
+                    .filter(|value| !value.is_null())
+                    .cloned();
+                if let Some(raw) = top_level_raw_fallback
+                    && let Some(params) = obj.get_mut("parameters").and_then(Value::as_object_mut)
+                    && !params.contains_key("allow_raw_fallback")
+                {
+                    params.insert("allow_raw_fallback".to_string(), raw);
+                }
+
                 if !obj.contains_key("parameters") && obj.contains_key("tool") {
                     let tool_name = obj.get("tool").cloned();
                     let mut params = serde_json::Map::new();
