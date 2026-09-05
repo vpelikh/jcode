@@ -326,6 +326,72 @@ impl Agent {
         Ok(true)
     }
 
+    /// Detect an assistant turn that *promises* a concrete next action
+    /// ("Let me read...", "Let me run...", "Let me grep...", "I'll ...") but
+    /// stopped with a normal end-of-turn and no tool call. Some providers
+    /// (observed: DeepSeek-V4-Flash via OpenRouter) degrade on very long
+    /// contexts and produce these stalling filler turns repeatedly, which
+    /// reads as "it says it'll do something but does nothing". We key on the
+    /// *density* of action-promise phrases: legitimate turns rarely exceed a
+    /// small fraction of intent words, while stalled filler turns are dense
+    /// with them ("Let me ... Let me ... Let me run ..."). A single "let me"
+    /// in a normal answer is not treated as stalling.
+    pub(crate) fn is_stalled_promise_text(text: &str) -> bool {
+        let low = text.to_ascii_lowercase();
+        let phrases = ["let me", "i'll", "i will", "let's", "i am going to"];
+        let mut count = 0usize;
+        for p in phrases {
+            count += low.matches(p).count();
+        }
+        // Require a non-trivial number of promise phrases: a single "let me"
+        // in a short answer is normal and must not be treated as stalling.
+        if count < Self::MIN_STALLED_PROMISE_PHRASE_COUNT {
+            return false;
+        }
+        // Density: number of promise phrases per 100 chars. Measured failing
+        // turns sit at ~4.4+ (224/4948, 107/2482). Legitimate turns, even huge
+        // ones with a few "let me"s, stay below ~1. Require a healthy margin
+        // above that.
+        let density = count as f64 / text.len().max(1) as f64 * 100.0;
+        density >= Self::STALLED_PROMISE_DENSITY_THRESHOLD
+    }
+
+    /// Request a single bounded continuation when the model stopped after
+    /// promising an action it never performed. If it keeps stalling, we give
+    /// up and surface the partial output rather than looping forever.
+    pub(crate) fn maybe_continue_stalled_promise(
+        &mut self,
+        text_content: &str,
+        attempts: &mut u32,
+    ) -> Result<bool> {
+        if !Self::is_stalled_promise_text(text_content) {
+            return Ok(false);
+        }
+        if *attempts >= Self::MAX_STALLED_PROMISE_CONTINUATION_ATTEMPTS {
+            logging::warn(&format!(
+                "Assistant stalled behind action-promise filler after {} continuation attempts; surfacing partial output",
+                attempts
+            ));
+            return Ok(false);
+        }
+        *attempts += 1;
+        logging::warn(&format!(
+            "Assistant stopped after promising an action without performing it (attempt {}/{}); requesting continuation",
+            attempts,
+            Self::MAX_STALLED_PROMISE_CONTINUATION_ATTEMPTS
+        ));
+        self.add_message(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "<system-reminder>Your previous response repeatedly said you would perform an action (e.g. \"Let me...\") but ended without doing any of it — no tool was called and nothing was executed. If a further step is needed, emit the tool call now and continue the task instead of restating your intent. If the task is genuinely complete, give the final answer directly. Do not repeat the same preparatory filler.</system-reminder>"
+                    .to_string(),
+                cache_control: None,
+            }],
+        );
+        self.session.save()?;
+        Ok(true)
+    }
+
     /// True when the provider said it stopped to call a tool but no tool call
     /// survived parsing.
     ///

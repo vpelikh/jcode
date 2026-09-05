@@ -14,6 +14,16 @@ impl Agent {
     /// task half-done. The counter is per turn-loop, so a genuinely finished
     /// agent still exits promptly.
     pub(crate) const MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS: u32 = 5;
+    /// Minimum density (action-promise phrases per 100 chars) that classifies
+    /// an assistant turn as stalled behind "Let me..." filler rather than a
+    /// legitimate answer. Bounded retries ensure a genuinely finished agent
+    /// still exits promptly.
+    pub(crate) const STALLED_PROMISE_DENSITY_THRESHOLD: f64 = 2.0;
+    /// Minimum number of action-promise phrases before a turn can be
+    /// classified as stalled filler. Guards short, legitimate answers that say
+    /// "let me" once in passing.
+    pub(crate) const MIN_STALLED_PROMISE_PHRASE_COUNT: usize = 8;
+    pub(crate) const MAX_STALLED_PROMISE_CONTINUATION_ATTEMPTS: u32 = 3;
     const SEQUENTIAL_TOOL_ROUNDS_BEFORE_BATCH_NUDGE: u32 = 3;
     const BATCH_NUDGE: &str = "<system-reminder>Several tool calls have been made one at a time. If the next independent operations can run concurrently, use the batch tool instead of making more sequential calls. Keep sequential calls when one result is required to decide the next operation.</system-reminder>";
 
@@ -47,6 +57,7 @@ impl Agent {
         let mut incomplete_continuations = 0u32;
         let mut empty_post_tool_continuations = 0u32;
         let mut fable_guardrail_reconsiderations = 0u32;
+        let mut stalled_promise_continuations = 0u32;
         let mut sequential_single_tool_rounds = 0u32;
         let mut batch_nudge_pending = false;
 
@@ -850,6 +861,12 @@ impl Agent {
                 )? {
                     continue;
                 }
+                if self.maybe_continue_stalled_promise(
+                    &text_content,
+                    &mut stalled_promise_continuations,
+                )? {
+                    continue;
+                }
                 // Surface silent guardrail/refusal stops instead of returning
                 // an empty final answer with no explanation.
                 if let Some(notice) = Self::provider_guardrail_notice(
@@ -1384,5 +1401,31 @@ mod tests {
         assert!(!Agent::should_inject_batch_nudge(true, false));
         assert!(Agent::BATCH_NUDGE.contains("use the batch tool"));
         assert!(Agent::BATCH_NUDGE.contains("result is required"));
+    }
+
+    #[test]
+    fn stalled_promise_text_detects_dense_filler() {
+        // Mirrors the real failing turn: dense "Let me ..." rambling with no
+        // tool call, ~4.4 phrases per 100 chars.
+        let spam = "Let me read the method. Let me run the shell read. Let me look. \
+                    Let me view it. Let me grep. Let me run the command. Let me check. \
+                    Let me execute. Let me do it. Let me read the body. Let me find it.";
+        assert!(Agent::is_stalled_promise_text(spam), "dense let-me spam should be flagged");
+    }
+
+    #[test]
+    fn stalled_promise_text_ignores_normal_answer() {
+        // A genuine final answer uses "let me" sparingly (well under the
+        // density threshold) and must not be treated as stalling.
+        let normal = "Here is the completed review. All rounds are fixed and tests pass. \
+                      Let me know if you want me to continue with more rounds.";
+        assert!(!Agent::is_stalled_promise_text(normal), "a normal answer should not be flagged");
+    }
+
+    #[test]
+    fn stalled_promise_text_ignores_short_leading_let_me() {
+        // Single "let me" in a concise turn is normal.
+        let concise = "Let me confirm the worktree state.";
+        assert!(!Agent::is_stalled_promise_text(concise));
     }
 }

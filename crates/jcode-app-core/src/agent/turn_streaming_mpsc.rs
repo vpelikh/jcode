@@ -97,6 +97,7 @@ impl Agent {
         let mut incomplete_continuations = 0u32;
         let mut empty_post_tool_continuations = 0u32;
         let mut fable_guardrail_reconsiderations = 0u32;
+        let mut stalled_promise_continuations = 0u32;
 
         loop {
             // Never open a new provider request after a cancel. Several paths
@@ -1163,6 +1164,15 @@ impl Agent {
                         prompt_has_recent_tool_result,
                         stop_reason.as_deref(),
                         &mut empty_post_tool_continuations,
+                    )?
+                {
+                    continue;
+                }
+                if saw_message_end
+                    && !self.is_graceful_shutdown()
+                    && self.maybe_continue_stalled_promise(
+                        &text_content,
+                        &mut stalled_promise_continuations,
                     )?
                 {
                     continue;
