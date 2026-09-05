@@ -670,6 +670,13 @@ impl Agent {
         // reuses the id (which would otherwise block `allow_raw_fallback` until
         // that new session happened to call compass_query).
         crate::tool::compass_enforcement::clear_redirect_pending(&previous_session_id);
+        // The session being restored is a fresh in-memory activation: its
+        // outstanding-redirect state is tied to the previous in-memory lifetime,
+        // not to this restore. Reset it so a stale in-memory flag (e.g. from a
+        // session that was abandoned without a switch-away clear) cannot block
+        // `allow_raw_fallback` here. The restored conversation still carries the
+        // original redirect guidance if one is relevant.
+        crate::tool::compass_enforcement::clear_redirect_pending(&self.session.id);
         crate::tool::set_session_tool_policy(
             &self.session.id,
             self.allowed_tools.clone(),
