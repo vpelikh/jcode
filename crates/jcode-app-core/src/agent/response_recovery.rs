@@ -337,7 +337,15 @@ impl Agent {
     /// with them ("Let me ... Let me ... Let me run ..."). A single "let me"
     /// in a normal answer is not treated as stalling.
     pub(crate) fn is_stalled_promise_text(text: &str) -> bool {
-        let low = text.to_ascii_lowercase();
+        // Collapse runs of whitespace to a single space before matching so a
+        // stall is still detected if streamed/degenerate output introduces
+        // extra spaces, tabs, or newlines inside the phrase ("let  me run",
+        // "let\tme run"). This mirrors inline_tail's whitespace flattening.
+        let low = text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
         let phrases = [
             "let me",
             "i'll",

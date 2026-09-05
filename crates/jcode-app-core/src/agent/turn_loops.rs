@@ -1458,4 +1458,18 @@ mod tests {
             "dense 'I'm going to' filler must be flagged as an action-promise stall"
         );
     }
+
+    #[test]
+    fn stalled_promise_text_survives_whitespace_variance() {
+        // Streamed/degenerate output can insert extra spaces, tabs, or newlines
+        // inside a phrase ("let  me", "let\tme"). The heuristic collapses
+        // whitespace before matching so these still count as a stall.
+        let stall = "Let  me run it.\n\nLet\tme grep it.\n  Let me verify.\nLet  me check. \
+                               Let\tme parse it. Let  me search. Let me inspect. Let  me print. \
+                               Let\tme compare. Let\nme review.";
+        assert!(
+            Agent::is_stalled_promise_text(stall),
+            "dense 'Let me...' with whitespace variance must still be flagged"
+        );
+    }
 }
