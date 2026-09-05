@@ -3889,3 +3889,62 @@ fn old_format_journal_without_append_events_still_loads() -> Result<()> {
         .expect("old-format journal load must stay consistent");
     Ok(())
 }
+
+/// Clearing a session that already has BOTH a snapshot and a journal must
+/// checkpoint cleanly (the empty checkpoint is the intentional clear, not a
+/// destructive wipe), delete the journal, and reload empty with a consistent
+/// event log. This exercises `clear_intended` with a snapshot + journal present.
+#[test]
+fn clear_with_existing_snapshot_and_journal_checkpoints_cleanly() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-clear-journal-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_clear_journal_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("clear".to_string()));
+    session.add_message(
+        Role::User,
+        vec![crate::message::ContentBlock::Text {
+            text: "first".to_string(),
+            cache_control: None,
+        }],
+    );
+    // First save -> snapshot, no journal.
+    session.save()?;
+    let journal_path = session_journal_path(id)?;
+    assert!(!journal_path.exists(), "first save is a snapshot");
+
+    // Append another message -> the next save is a journal append (snapshot exists).
+    session.add_message(
+        Role::User,
+        vec![crate::message::ContentBlock::Text {
+            text: "second".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+    assert!(journal_path.exists(), "second save must be a journal append");
+
+    // Now clear the transcript. The empty checkpoint must not be refused as a
+    // destructive wipe (the ClearAll is the durable signal), must delete the
+    // journal, and reload empty + consistent.
+    session.clear_messages();
+    session.save()?;
+    assert!(
+        !journal_path.exists(),
+        "clear-then-save must checkpoint and delete the journal"
+    );
+
+    let reloaded = Session::load(id)?;
+    assert!(
+        reloaded.messages.is_empty(),
+        "cleared (snapshot+journal) session must reload empty"
+    );
+    reloaded
+        .rederive_all_checked()
+        .expect("cleared (snapshot+journal) reload must keep the event log consistent");
+    Ok(())
+}
