@@ -1020,23 +1020,6 @@ impl TelegramChannel {
         };
         drop(tracker);
         match action {
-            "abort" => {
-                // Backwards compatibility for a prompt issued before this build
-                // made /abort immediate: honor it directly.
-                let signaled =
-                    crate::server::telegram_control::request_graceful_shutdown_for_control(&session_id).await;
-                if signaled {
-                    format!(
-                        "🛑 Stopped the active turn on `{}`.",
-                        short_id(&session_id)
-                    )
-                } else {
-                    format!(
-                        "ℹ️ No running turn on `{}` to stop.",
-                        short_id(&session_id)
-                    )
-                }
-            }
             "free" => {
                 let removed = crate::server::telegram_control::free_session_for_control(&session_id).await;
                 if removed {
@@ -1051,7 +1034,9 @@ impl TelegramChannel {
                     format!("⚠️ Could not free `{}` (already gone, or Telegram control is not wired).", short_id(&session_id))
                 }
             }
-            _ => unreachable!(),
+            // Only `/free` queues a pending confirmation. `/abort` stopped using
+            // confirmation many builds ago, so no other action can reach here.
+            _ => unreachable!("unexpected confirmed action: {action}"),
         }
     }
 
