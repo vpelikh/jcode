@@ -1954,4 +1954,38 @@ mod tests {
             "long legitimate recap must not be flagged by the length-bounded compact detector"
         );
     }
+
+    #[test]
+    fn compact_unfulfilled_tool_request_now_must_be_leading() {
+        // The invoking " now" signal must be the token IMMEDIATELY after the
+        // matched "call <target>" phrase, not merely somewhere later in the
+        // turn. A bare substring match fired on "now" in an unrelated later
+        // clause ("I'll call the tool for the setup, and now the test
+        // suite will run in CI"), falsely flagging a genuine short answer.
+        // Leading-position matching preserves every genuine stall while
+        // dropping that cross-clause false positive.
+        let genuine = [
+            "I'll call bash now.",
+            "Let me call bash now.",
+            "I'll call bash now then continue.",
+            "Let me call bash.",
+        ];
+        for t in genuine {
+            assert!(
+                Agent::is_stalled_promise_text(t),
+                "a genuine 'call <tool> now' stall must be detected: {t:?}"
+            );
+        }
+        // Cross-clause "now" after an unrelated comma is not an imminent
+        // invocation and must not be flagged.
+        let cross_clause = [
+            "Let me call bash for the setup, and now the test suite will run in CI.",
+        ];
+        for t in cross_clause {
+            assert!(
+                !Agent::is_stalled_promise_text(t),
+                "a 'now' in a later unrelated clause must not be flagged: {t:?}"
+            );
+        }
+    }
 }

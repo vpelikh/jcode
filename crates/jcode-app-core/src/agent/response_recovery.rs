@@ -676,8 +676,29 @@ impl Agent {
             // in between, e.g. "call the bash tool now"), or a natural end of
             // the utterance. The naming rejection above already guards against
             // "call the tool a/the <label> now".
+            //
+            // The "now" must be the token IMMEDIATELY after the matched target,
+            // not merely somewhere later in the turn. A bare substring
+            // " contains(\" now\") " would fire on "now" in an unrelated later
+            // clause ("I'll call the tool, and now we can review..."), flagging
+            // a genuine short answer. The word directly following the target is
+            // the reliable signal ("call bash now."). Multi-word targets whose
+            // tail is a tool-kind noun then "now" ("call the bash tool now")
+            // are handled below by call_tail_is_tool_kind_end, so only the
+            // leading immediate "now" (plus optional punctuation) belongs here.
+            let trimmed_now = after.trim_start();
+            let now_is_leading = trimmed_now == "now"
+                || trimmed_now.strip_prefix("now").is_some_and(|rest| {
+                    // End, or a genuine word boundary after "now" (" now.",
+                    // " now, ", " now !"). Reject continuations like "now2".
+                    rest.as_bytes()
+                        .first()
+                        .is_none_or(|b| {
+                            !(b.is_ascii_alphanumeric() || *b == b'\'' || *b == b'-')
+                        })
+                });
             let invokes_now_or_end = after.is_empty()
-                || after.contains(" now")
+                || now_is_leading
                 || after.starts_with('.')
                 || after.starts_with(',')
                 || after.starts_with('!')
