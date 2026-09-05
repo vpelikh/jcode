@@ -293,6 +293,27 @@ fn generated_title_backfills_skipping_injected_notification() {
 }
 
 #[test]
+fn generated_title_uses_text_block_in_multi_block_message() {
+    let mut session = Session::create_with_id("gen_multiblock_123".to_string(), None, None);
+    // A single user message with image then text: the title must come from the
+    // text block, not be blocked by the leading image.
+    session.add_message(
+        Role::User,
+        vec![
+            ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: "deadbeef".to_string(),
+            },
+            ContentBlock::Text {
+                text: "Explain this diagram".to_string(),
+                cache_control: None,
+            },
+        ],
+    );
+    assert_eq!(session.title.as_deref(), Some("Explain this diagram"));
+}
+
+#[test]
 fn generated_title_is_truncated_to_max_chars() {
     let mut session = Session::create_with_id("session_gen_trunc_123".to_string(), None, None);
     let long_prompt = "x".repeat(200);
@@ -303,8 +324,10 @@ fn generated_title_is_truncated_to_max_chars() {
             cache_control: None,
         }],
     );
-    assert!(session.title.is_some());
-    assert!(session.title.as_deref().unwrap().chars().count() <= 72);
+    let title = session.title.as_deref().expect("title set");
+    // Truncated to 72 chars with a trailing ellipsis, matching importers.
+    assert!(title.chars().count() <= 72);
+    assert!(title.ends_with('…'));
 }
 
 #[test]

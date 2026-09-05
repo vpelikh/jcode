@@ -164,8 +164,10 @@ const GENERATED_TITLE_MAX_CHARS: usize = 72;
 /// Derive a generated session title from a message's content blocks.
 ///
 /// Uses the first non-empty line of the first text block, trimmed and truncated
-/// to `GENERATED_TITLE_MAX_CHARS` characters. Returns `None` when there is no
-/// usable text (e.g. an image-only message).
+/// to `GENERATED_TITLE_MAX_CHARS` characters using the same
+/// `session_search_truncate_title_text` helper as session importers so an
+/// over-long prompt keeps a visible `…` indicator. Returns `None` when there is
+/// no usable text (e.g. an image-only message).
 fn generated_title_from_content(content: &[ContentBlock]) -> Option<String> {
     for block in content {
         if let ContentBlock::Text { text, .. } = block {
@@ -173,10 +175,10 @@ fn generated_title_from_content(content: &[ContentBlock]) -> Option<String> {
             if line.is_empty() {
                 continue;
             }
-            let title = line
-                .chars()
-                .take(GENERATED_TITLE_MAX_CHARS)
-                .collect::<String>();
+            let title = jcode_session_types::session_search_truncate_title_text(
+                line,
+                GENERATED_TITLE_MAX_CHARS,
+            );
             return Some(title);
         }
     }
