@@ -637,3 +637,41 @@ fn test_error_event_retry_after_back_compat_default() -> Result<()> {
     assert_eq!(retry_after_secs, None);
     Ok(())
 }
+
+#[test]
+fn test_set_working_dir_request_roundtrip() -> Result<()> {
+    let req = Request::SetWorkingDir {
+        id: 88,
+        working_dir: "/worktrees/feat-panel".to_string(),
+    };
+    let json = serde_json::to_string(&req)?;
+    assert!(json.contains("\"type\":\"set_working_dir\""));
+    let decoded = parse_request_json(&json)?;
+    assert_eq!(decoded.id(), 88);
+    let Request::SetWorkingDir { working_dir, .. } = decoded else {
+        return Err(anyhow!("expected SetWorkingDir request"));
+    };
+    assert_eq!(working_dir, "/worktrees/feat-panel");
+    Ok(())
+}
+
+#[test]
+fn test_session_working_dir_changed_event_roundtrip() -> Result<()> {
+    let event = ServerEvent::SessionWorkingDirChanged {
+        session_id: "sess_abc".to_string(),
+        working_dir: "/worktrees/feat-panel".to_string(),
+    };
+    let json = encode_event(&event);
+    assert!(json.contains("\"type\":\"session_working_dir_changed\""));
+    let decoded = parse_event_json(json.trim())?;
+    let ServerEvent::SessionWorkingDirChanged {
+        session_id,
+        working_dir,
+    } = decoded
+    else {
+        return Err(anyhow!("expected SessionWorkingDirChanged event"));
+    };
+    assert_eq!(session_id, "sess_abc");
+    assert_eq!(working_dir, "/worktrees/feat-panel");
+    Ok(())
+}

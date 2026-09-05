@@ -1049,6 +1049,32 @@ request in this new forked session, using the inherited conversation only as con
         );
     }
 
+    /// Append a model-visible notice that the session's working directory
+    /// changed (e.g. the user ran `/cd` to move into a linked git worktree).
+    ///
+    /// Unlike `refresh_initial_session_context_message`, this works even after
+    /// a conversation has progressed, because it appends a fresh
+    /// `<system-reminder>` rather than rewriting history. It lets the model
+    /// re-scope AGENTS.md / skills / tool cwd to the new directory on the next
+    /// turn without disturbing the existing transcript.
+    pub fn append_working_dir_notice(&mut self, old_dir: &str, new_dir: &str) {
+        let text = format!(
+            "<system-reminder>\nThe session working directory changed from `{old}` to `{new}` by the user. \
+Re-scope your context to the new directory: AGENTS.md, project skills, and the default cwd for shell/read/write \
+tools all follow it. Do not assume the previous directory still applies.\n</system-reminder>",
+            old = old_dir,
+            new = new_dir,
+        );
+        self.add_message_with_display_role(
+            Role::User,
+            vec![ContentBlock::Text {
+                text,
+                cache_control: None,
+            }],
+            Some(StoredDisplayRole::System),
+        );
+    }
+
     /// Mark this session as a canary tester
     pub fn set_canary(&mut self, build_hash: &str) {
         self.is_canary = true;

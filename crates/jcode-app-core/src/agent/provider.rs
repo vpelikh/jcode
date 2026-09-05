@@ -264,6 +264,42 @@ impl Agent {
         self.log_env_snapshot("working_dir");
     }
 
+    /// Grouped working-directory change invoked from a user `/cd` request.
+    ///
+    /// Beyond [`Self::set_working_dir`], this persists the session, refreshes
+    /// project-scoped skills, and appends a model-visible notice about the
+    /// change so the agent re-scopes even after a conversation has progressed
+    /// (the plain `refresh_initial_session_context_message` no-ops once visible
+    /// history exists).
+    pub fn set_working_dir_grouped(&mut self, dir: &str) -> anyhow::Result<()> {
+        let old_dir = self
+            .session
+            .working_dir
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let base = self
+            .session
+            .working_dir
+            .as_deref()
+            .map(std::path::Path::new)
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let normalized = resolve_working_dir(base, dir)?;
+        if self.session.working_dir.as_deref() == Some(normalized.as_str()) {
+            return Ok(());
+        }
+        self.session.working_dir = Some(normalized.clone());
+        self.refresh_agents_md_snapshot();
+        // Rebuild the initial context system-reminder when there is still no
+        // visible conversation; otherwise the appended notice below carries the
+        // change to the model. Best-effort: both are tolerant of a missing
+        // initial context message.
+        self.session.refresh_initial_session_context_message();
+        self.session.append_working_dir_notice(&old_dir, &normalized);
+        self.session.save()?;
+        self.log_env_snapshot("working_dir");
+        Ok(())
+    }
+
     /// Get the working directory for this session
     pub fn working_dir(&self) -> Option<&str> {
         self.session.working_dir.as_deref()
@@ -272,5 +308,98 @@ impl Agent {
     /// Get the stored messages (for transcript export)
     pub fn messages(&self) -> &[StoredMessage] {
         &self.session.messages
+    }
+}
+
+/// Resolve a user-supplied working directory (from `/cd`) to an absolute path.
+///
+/// Supports `~`/`~user` home expansion and relative paths, which are resolved
+/// against `base` (the session's current working directory, not the daemon's
+/// process cwd so the result is stable regardless of where the server launched).
+fn resolve_working_dir(base: &std::path::Path, dir: &str) -> anyhow::Result<String> {
+    let dir = dir.trim();
+    if dir.is_empty() {
+        anyhow::bail!("working directory must not be empty");
+    }
+    let expanded = if let Some(rest) = dir.strip_prefix("~/") {
+        match dirs::home_dir() {
+            Some(home) => home.join(rest),
+            None => std::path::PathBuf::from(dir),
+        }
+    } else if dir == "~" {
+        dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from(dir))
+    } else {
+        std::path::PathBuf::from(dir)
+    };
+
+    let candidate = if expanded.is_absolute() {
+        expanded
+    } else {
+        base.join(expanded)
+    };
+
+    if !candidate.exists() || !candidate.is_dir() {
+        anyhow::bail!("directory does not exist: {}", candidate.display());
+    }
+
+    // Canonicalize to collapse `.`/`..` and resolve symlinks, matching how the
+    // git info cache and compass derive their keys. Fall back to a lexical
+    // cleanup when canonicalization fails so the path stays usable.
+    match std::fs::canonicalize(&candidate) {
+        Ok(canonical) => Ok(canonical.to_string_lossy().into_owned()),
+        Err(_) => Ok(candidate.to_string_lossy().into_owned()),
+    }
+}
+
+#[cfg(test)]
+mod resolve_working_dir_tests {
+    use super::resolve_working_dir;
+
+    #[test]
+    fn absolute_path_is_normalized() {
+        let dir = std::env::temp_dir().join("jcode-wd-absolute-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let result = resolve_working_dir(std::path::Path::new("/tmp"), dir.to_str().unwrap()).unwrap();
+        assert!(result.ends_with("jcode-wd-absolute-test"));
+        assert!(std::path::Path::new(&result).is_absolute());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn relative_path_resolves_against_base() {
+        let base = std::env::temp_dir().join("jcode-wd-base-test");
+        let sub = base.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let result = resolve_working_dir(&base, "sub").unwrap();
+        assert!(result.ends_with("jcode-wd-base-test/sub"));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn missing_directory_is_rejected() {
+        let base = std::env::temp_dir().join("jcode-wd-missing-base");
+        std::fs::create_dir_all(&base).unwrap();
+        let err = resolve_working_dir(&base, "does-not-exist").unwrap_err();
+        assert!(err.to_string().contains("does not exist"));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn empty_path_is_rejected() {
+        let base = std::env::temp_dir().join("jcode-wd-empty-base");
+        std::fs::create_dir_all(&base).unwrap();
+        let err = resolve_working_dir(&base, "   ").unwrap_err();
+        assert!(err.to_string().contains("must not be empty"));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn dotdot_is_normalized_away() {
+        let base = std::env::temp_dir().join("jcode-wd-dotdot-base").join("nested");
+        std::fs::create_dir_all(&base).unwrap();
+        let result = resolve_working_dir(&base, "../").unwrap();
+        let expected = std::fs::canonicalize(std::env::temp_dir().join("jcode-wd-dotdot-base")).unwrap();
+        assert_eq!(std::path::Path::new(&result), expected.as_path());
+        std::fs::remove_dir_all(std::env::temp_dir().join("jcode-wd-dotdot-base")).unwrap();
     }
 }

@@ -2092,6 +2092,28 @@ async fn handle_remote_key_internal(
                     return Ok(());
                 }
 
+                if trimmed == "/cd" || trimmed.starts_with("/cd ") {
+                    // Move the session's working directory (e.g. into a linked
+                    // git worktree) in place, preserving history. The server
+                    // re-scopes tools/skills/AGENTS.md and replies with
+                    // SessionWorkingDirChanged, which updates the client session
+                    // and the git info widget.
+                    let new_dir = trimmed.strip_prefix("/cd").unwrap_or_default().trim();
+                    if new_dir.is_empty() {
+                        app.push_display_message(DisplayMessage::error(
+                            "Usage: /cd <directory> (e.g. /cd .worktrees/feat-panel)".to_string(),
+                        ));
+                        return Ok(());
+                    }
+                    if app.is_processing {
+                        app.set_status_notice(
+                            "Working directory change will apply after the current turn.".to_string(),
+                        );
+                    }
+                    remote.set_working_dir(new_dir.to_string()).await?;
+                    return Ok(());
+                }
+
                 if app.pending_login.is_some() {
                     app.input = trimmed.to_string();
                     app.cursor_pos = app.input.len();

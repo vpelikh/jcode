@@ -835,6 +835,18 @@ impl RemoteConnection {
         self.send_request(request).await
     }
 
+    /// Change the active session's working directory on the server (e.g. move
+    /// into a linked git worktree). The daemon re-scopes tools, skills, AGENTS.md,
+    /// and the git info widget to the new directory.
+    pub async fn set_working_dir(&mut self, dir: String) -> Result<()> {
+        let request = Request::SetWorkingDir {
+            id: self.next_request_id,
+            working_dir: dir,
+        };
+        self.next_request_id += 1;
+        self.send_request(request).await
+    }
+
     /// Inject externally transcribed text into the active remote TUI session.
     pub async fn send_transcript(
         &mut self,

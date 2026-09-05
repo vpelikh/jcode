@@ -1511,6 +1511,36 @@ pub(in crate::tui::app) fn handle_server_event(
                 false
             }
         }
+        ServerEvent::SessionWorkingDirChanged {
+            session_id: changed_session_id,
+            working_dir,
+        } => {
+            let active_session_id = app
+                .remote_session_id
+                .as_deref()
+                .or(app.resume_session_id.as_deref())
+                .unwrap_or(app.session.id.as_str());
+            if active_session_id == changed_session_id {
+                if app.session.working_dir.as_deref() != Some(working_dir.as_str()) {
+                    app.session.working_dir = Some(working_dir.clone());
+                    // Re-scope the git widget to the new working tree so the
+                    // changed branch/worktree name show up immediately rather
+                    // than after the old dir's cache TTL.
+                    super::super::helpers::invalidate_git_info_cache(Some(std::path::Path::new(
+                        working_dir.as_str(),
+                    )));
+                    crate::tui::session_picker::invalidate_session_list_cache();
+                }
+                app.push_display_message(DisplayMessage::system(format!(
+                    "Changed working directory to {}.",
+                    working_dir
+                )));
+                app.set_status_notice("Working directory changed");
+                true
+            } else {
+                false
+            }
+        }
         ServerEvent::Reloading { .. } => {
             app.append_reload_message("🔄 Server reload initiated...");
             // In-process server reloads (self-dev build-reload) keep the same

@@ -314,6 +314,15 @@ pub enum Request {
         title: Option<String>,
     },
 
+    /// Change the active session's working directory so the agent's tools,
+    /// skills, AGENTS.md overlay, and the git info widget re-scope to a new
+    /// directory (e.g. a linked git worktree) without losing session history.
+    #[serde(rename = "set_working_dir")]
+    SetWorkingDir {
+        id: u64,
+        working_dir: String,
+    },
+
     /// Split the current session — clone conversation into a new session
     #[serde(rename = "split")]
     Split { id: u64 },
@@ -1080,6 +1089,10 @@ pub enum ServerEvent {
         title: Option<String>,
         display_title: String,
     },
+
+    /// Session working directory changed.
+    #[serde(rename = "session_working_dir_changed")]
+    SessionWorkingDirChanged { session_id: String, working_dir: String },
 
     /// Full conversation history (response to GetHistory)
     #[serde(rename = "history")]
