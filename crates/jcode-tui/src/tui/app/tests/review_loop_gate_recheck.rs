@@ -1347,3 +1347,57 @@ fn idle_poll_does_not_step_loop_while_non_fix_dispatch_pending() {
         );
     });
 }
+
+// Regression (respawn then verdict): a lost reviewer is respawned (bounded), and
+// the respawned reviewer's CLEAN verdict is honored — the loop advances to the
+// next lens exactly as if the original had produced it. Pins that respawning does
+// not corrupt the loop's ability to make progress from the respawned reviewer.
+#[test]
+fn loop_advances_after_respawned_reviewer_reports_clean() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+
+        // Live loop at Correctness with a reviewer that is lost.
+        let mut state = jcode_session_types::ReviewLoopState::new();
+        super::review_loop::enter_review_loop(&mut state);
+        state.active_reviewer_id = Some("session_reviewer_definitely_missing".to_string());
+        state.reviewer_respawn_count = 0;
+        app.session.review_loop = Some(state);
+        app.is_processing = false;
+        app.pending_queued_dispatch = false;
+
+        // First step: the lost reviewer triggers a respawn (budget 0 -> 1).
+        let followup = super::commands_review::step_review_loop(&mut app);
+        assert!(followup, "one-shot respawn must schedule a fresh reviewer");
+        let respawned_id = app
+            .session
+            .review_loop
+            .as_ref()
+            .unwrap()
+            .active_reviewer_id
+            .clone()
+            .expect("a respawned reviewer session must be set");
+
+        // The respawned reviewer reports CLEAN.
+        let mut reviewer = crate::session::Session::load(&respawned_id).expect("load respawned");
+        reviewer.add_message_with_display_role(
+            crate::message::Role::User,
+            vec![crate::message::ContentBlock::Text {
+                text: "VERDICT: CLEAN".to_string(),
+                cache_control: None,
+            }],
+            None,
+        );
+        reviewer.save().expect("save respawned verdict");
+
+        // Stepping again consumes the CLEAN verdict and advances to the next lens.
+        super::commands_review::step_review_loop(&mut app);
+        let state = app.session.review_loop.as_ref().unwrap();
+        assert!(!state.finished, "a clean respawned verdict must keep the loop running");
+        assert_eq!(
+            state.current_lens,
+            Some(jcode_session_types::ReviewLens::ALL[1]),
+            "the respawned reviewer's clean verdict must advance to the next lens"
+        );
+    });
+}
