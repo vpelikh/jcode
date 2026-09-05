@@ -930,6 +930,11 @@ impl Registry {
         if resolved_name == "agentgrep"
             && prefer_compass_query
             && agentgrep_requests_raw_fallback(&input)
+            // Only block the full-text grep escape hatch while a redirect is
+            // pending. find/outline/trace are distinct operations the redirect
+            // never targets, so a raw-fallback flag on them must not be held
+            // hostage just because a grep was redirected earlier in the session.
+            && agentgrep_call_is_grep_mode(&input)
             && compass_enforcement::redirect_pending(&ctx.session_id)
         {
             drop(tools);

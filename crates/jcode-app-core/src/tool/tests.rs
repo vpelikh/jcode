@@ -2035,6 +2035,71 @@ async fn agentgrep_raw_fallback_blocked_while_compass_redirect_pending_then_allo
 }
 
 #[tokio::test]
+async fn agentgrep_find_mode_raw_fallback_runs_even_while_grep_redirect_pending() {
+    // A pending redirect (set by a redirected grep) must not hold a non-grep
+    // operation hostage. find/outline/trace are distinct from grep and the
+    // redirect never targets them, so a find-mode call with a raw-fallback flag
+    // must still run even while the session's grep redirect is outstanding.
+    use super::compass_enforcement;
+
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    std::fs::write(temp.path().join("find_target.rs"), "fn gamma() {}\n").expect("write");
+
+    let session_id = "enforcement-pending-find-mode-test";
+    let ctx = ToolContext {
+        session_id: session_id.to_string(),
+        message_id: "test".to_string(),
+        tool_call_id: "call-find-1".to_string(),
+        working_dir: Some(temp.path().to_path_buf()),
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: ToolExecutionMode::Direct,
+    };
+
+    // Redirect a grep to establish an outstanding redirect for the session.
+    let redirect = registry
+        .execute(
+            "agentgrep",
+            serde_json::json!({ "query": "find_target" }),
+            ctx.clone(),
+        )
+        .await
+        .expect("grep should redirect");
+    assert!(
+        redirect.output.contains("intercepted before running"),
+        "grep should redirect, got: {}",
+        redirect.output
+    );
+    assert!(
+        compass_enforcement::redirect_pending(session_id),
+        "redirect should mark pending"
+    );
+
+    // A find-mode call with a raw-fallback flag must NOT be blocked.
+    let find_out = registry
+        .execute(
+            "agentgrep",
+            serde_json::json!({
+                "mode": "find",
+                "query": "find_target",
+                "allow_raw_fallback": true,
+            }),
+            ctx.clone(),
+        )
+        .await
+        .expect("find mode with raw fallback should run, not be blocked");
+    assert!(
+        find_out.output.contains("find_target.rs"),
+        "find mode should return the file even while grep redirect pending, got: {}",
+        find_out.output
+    );
+    clear_session_tool_policy(session_id);
+}
+
+#[tokio::test]
 async fn agentgrep_runs_when_compass_is_policy_disabled() {
     use std::collections::HashSet;
 
