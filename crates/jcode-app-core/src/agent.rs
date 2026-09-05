@@ -338,6 +338,13 @@ impl Agent {
             agent.allowed_tools.clone(),
             agent.disabled_tools.clone(),
         );
+        // A freshly bound session is a new in-memory activation. Clear any stale
+        // compass-query-first redirect flag that may linger on this session id
+        // from an earlier (abandoned) in-memory lifetime in the same daemon, so
+        // re-attaching to it does not wrongly block `allow_raw_fallback` until a
+        // compass_query is attempted. Mirrors the clear performed in
+        // `restore_session`.
+        crate::tool::compass_enforcement::clear_redirect_pending(&agent.session.id);
         agent
     }
 
