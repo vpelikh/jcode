@@ -2111,27 +2111,6 @@ async fn handle_remote_key_internal(
                         ));
                         return Ok(());
                     }
-                    // The server deliberately suppresses the change event on a
-                    // true no-op (so it would otherwise be completely silent).
-                    // Give immediate feedback for the common exact-match case
-                    // here, without the round-trip. This is best-effort: it only
-                    // short-circuits when the requested path literally equals the
-                    // currently-bound working dir, which is always a no-op. Any
-                    // other resolution (symlink aliases, `~`, `..`) still goes to
-                    // the server, which remains authoritative.
-                    let already_here = app
-                        .session
-                        .working_dir
-                        .as_deref()
-                        .map(|current| new_dir == current)
-                        .unwrap_or(false);
-                    if already_here {
-                        app.push_display_message(DisplayMessage::system(format!(
-                            "Already in {}.",
-                            new_dir
-                        )));
-                        return Ok(());
-                    }
                     remote.set_working_dir(new_dir.to_string()).await?;
                     return Ok(());
                 }

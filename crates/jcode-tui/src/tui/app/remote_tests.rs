@@ -1065,40 +1065,6 @@ fn cd_keyhandler_rejects_while_agent_is_processing() {
     );
 }
 
-#[test]
-fn cd_keyhandler_exact_current_dir_is_local_noop_feedback_without_request() {
-    use crossterm::event::{KeyCode, KeyModifiers};
-
-    let rt = tokio::runtime::Runtime::new().expect("runtime");
-    let _guard = rt.enter();
-    let mut app = create_test_app();
-    app.is_remote = true;
-    app.remote_session_id = Some("active_sess".to_string());
-    app.session.working_dir = Some("/worktrees/feat-panel".to_string());
-    let mut remote = crate::tui::backend::RemoteConnection::dummy();
-    let request_id_before = remote.next_request_id_for_test();
-
-    // /cd to the exact currently-bound directory: the server would treat this as
-    // a silent no-op, so the client gives immediate feedback and skips the
-    // network round-trip.
-    app.set_input_for_test("/cd /worktrees/feat-panel".to_string());
-    rt.block_on(app.handle_remote_key(KeyCode::Enter, KeyModifiers::empty(), &mut remote))
-        .expect("/cd to the current dir should be handled");
-
-    assert_eq!(
-        remote.next_request_id_for_test(),
-        request_id_before,
-        "a /cd to the current exact dir must not send a request"
-    );
-    let last = app.display_messages().last().expect("display message");
-    assert_eq!(last.role, "system");
-    assert!(
-        last.content.contains("Already in"),
-        "exact-match /cd should confirm we are already there, got: {}",
-        last.content
-    );
-}
-
 /// Reproduces the "stuck on loading session…" bug and verifies the watchdog
 /// recovers it: a remote connection that never receives the bootstrap History
 /// event (so `has_loaded_history()` stays false) must re-request `GetHistory`
