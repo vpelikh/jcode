@@ -655,18 +655,15 @@ pub(super) async fn handle_set_working_dir(
 
     let (session_id, result) = result;
     match result {
-        Ok(changed) => {
-            if !changed {
-                // The request resolved to the already-bound directory; treat it
-                // as a silent no-op. Neither a change event nor a Done is
-                // emitted so the client does not spam a redundant "working
-                // directory changed" notice for a `/cd` to the current dir.
-                return;
-            }
+        // A change happened: emit the resolved (canonicalized) directory the
+        // agent actually stored, not the raw client-supplied string, so the
+        // client's session and git-info cache use the same canonical key the
+        // server and gather_git_info derive.
+        Ok(Some(resolved)) => {
             crate::session_list_cache::invalidate();
             let event = ServerEvent::SessionWorkingDirChanged {
                 session_id: session_id.clone(),
-                working_dir: working_dir.clone(),
+                working_dir: resolved.clone(),
             };
             let mut delivered =
                 fanout_session_event(swarm_members, &session_id, event.clone()).await;
@@ -680,11 +677,16 @@ pub(super) async fn handle_set_working_dir(
                     ("phase", "working_dir_changed".to_string()),
                     ("request_id", id.to_string()),
                     ("session_id", session_id),
-                    ("working_dir", working_dir),
+                    ("working_dir", resolved),
                     ("elapsed_ms", started.elapsed().as_millis().to_string()),
                 ],
             );
         }
+        // The request resolved to the already-bound directory; treat it as a
+        // silent no-op. Neither a change event nor a Done is emitted so the
+        // client does not spam a redundant "working directory changed" notice
+        // for a `/cd` to the current dir.
+        Ok(None) => {}
         Err(error) => {
             crate::logging::event_warn(
                 "SESSION_LIFECYCLE",

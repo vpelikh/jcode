@@ -273,10 +273,12 @@ impl Agent {
     /// has progressed, that reminder is left untouched and a model-visible
     /// notice is appended instead.
     ///
-    /// Returns `Ok(true)` when the working directory actually changed (and
-    /// events should be fanned out), or `Ok(false)` when the request resolved
-    /// to the directory already bound (a no-op that should not spam the UI).
-    pub fn set_working_dir_grouped(&mut self, dir: &str) -> anyhow::Result<bool> {
+    /// Returns `Ok(Some(resolved))` when the working directory actually changed,
+    /// with the canonicalized path that was stored (so callers can fan out a
+    /// change event carrying the *resolved* directory). Returns `Ok(None)` when
+    /// the request resolved to the directory already bound (a no-op that should
+    /// not spam the UI).
+    pub fn set_working_dir_grouped(&mut self, dir: &str) -> anyhow::Result<Option<String>> {
         let old_dir = self
             .session
             .working_dir
@@ -303,7 +305,7 @@ impl Agent {
                 .map(|p| p.to_string_lossy() == normalized)
                 .unwrap_or(false);
         if current_is_target {
-            return Ok(false);
+            return Ok(None);
         }
         self.session.working_dir = Some(normalized.clone());
         self.refresh_agents_md_snapshot();
@@ -315,7 +317,7 @@ impl Agent {
         }
         self.session.save()?;
         self.log_env_snapshot("working_dir");
-        Ok(true)
+        Ok(Some(normalized))
     }
 
     /// Get the working directory for this session

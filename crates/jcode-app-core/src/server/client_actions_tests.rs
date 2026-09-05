@@ -1208,3 +1208,89 @@ async fn set_working_dir_to_missing_dir_reports_error_not_change() -> Result<()>
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn set_working_dir_event_carries_resolved_not_raw_input() -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    let root = tempfile::tempdir().expect("root dir");
+    let target = root.path().join("target");
+    std::fs::create_dir_all(&target).expect("create target");
+    // A non-canonical-but-coherent input: `target/.` canonicalizes to `target`.
+    let raw_input = target.join(".").to_str().expect("utf8").to_string();
+
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
+    let agent_session_id = agent.lock().await.session_id().to_string();
+    let (member_event_tx, mut member_event_rx) = mpsc::unbounded_channel();
+    let now = Instant::now();
+    let swarm_members = Arc::new(RwLock::new(HashMap::from([(
+        agent_session_id.clone(),
+        SwarmMember {
+            session_id: agent_session_id.clone(),
+            event_tx: member_event_tx,
+            event_txs: HashMap::new(),
+            working_dir: None,
+            swarm_id: None,
+            swarm_enabled: false,
+            status: "ready".to_string(),
+            detail: None,
+            task_label: None,
+            friendly_name: None,
+            report_back_to_session_id: None,
+            latest_completion_report: None,
+            role: "agent".to_string(),
+            joined_at: now,
+            last_status_change: now,
+            is_headless: false,
+            output_tail: None,
+            todo_progress: None,
+            todo_items: Vec::new(),
+            runtime: crate::protocol::SwarmMemberRuntime::default(),
+        },
+    )])));
+    let (client_event_tx, _client_event_rx) = mpsc::unbounded_channel();
+
+    // The raw input is non-canonical (`target/.`), but the event must carry the
+    // resolved canonical directory so the client's session/git-info cache use
+    // the same key the server stores and gather_git_info derives.
+    handle_set_working_dir(
+        92,
+        raw_input,
+        &agent,
+        &agent_session_id,
+        &swarm_members,
+        &client_event_tx,
+    )
+    .await;
+
+    let changed_event = timeout(Duration::from_secs(2), member_event_rx.recv())
+        .await
+        .expect("working dir change event should arrive")
+        .expect("member event channel should stay open");
+    match changed_event {
+        ServerEvent::SessionWorkingDirChanged {
+            session_id,
+            working_dir,
+        } => {
+            assert_eq!(session_id, agent_session_id);
+            assert_eq!(
+                PathBuf::from(&working_dir),
+                target.canonicalize().expect("canonical"),
+                "the change event must carry the canonical resolved dir, not the raw '{working_dir}' input"
+            );
+        }
+        other => panic!("expected SessionWorkingDirChanged, got {other:?}"),
+    }
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    Ok(())
+}
