@@ -408,7 +408,7 @@ impl Agent {
         //    "I'll invoke bash now."). Such turns have only one or two promise
         //    phrases and would fall under the dense-rambling minimum count below,
         //    so we need a separate, much more specific signal.
-        if Self::is_compact_unfulfilled_tool_request(&low) {
+        if Self::is_compact_unfulfilled_tool_request(&low, original_low_len) {
             return true;
         }
         let count = Self::count_action_promise_phrases(&low);
@@ -470,9 +470,10 @@ impl Agent {
     ///
     /// This is deliberately strict to avoid flagging a genuine short final answer
     /// that happens to mention a tool in passing or in the past tense:
-    ///  - The turn must be short (bounded length, after fences are stripped), so
-    ///    long legitimate prose that recounts an earlier "I'll invoke..." does not
-    ///    match.
+    ///  - The turn must be short (bounded ORIGINAL length, before fences are
+    ///    stripped), so long legitimate prose that recounts an earlier
+    ///    "I'll invoke..." does not match—even if it hides part of its length
+    ///    inside a fenced code block.
     ///  - It must contain a first-person future/volitional invoke frame ("let me
     ///    invoke", "i'll invoke", "i will invoke", "i'm going to invoke", "i am
     ///    going to invoke", "let me call", "i'll call"). A bare
@@ -497,8 +498,12 @@ impl Agent {
     /// data because "let me"/"i'll" appear in ordinary turns. Exact matching is
     /// the empirically correct point on the precision/recall line for the
     /// observed degradation.
-    fn is_compact_unfulfilled_tool_request(low: &str) -> bool {
-        if low.len() > Self::COMPACT_STALLED_TOOL_REQUEST_MAX_LEN {
+    fn is_compact_unfulfilled_tool_request(low: &str, original_low_len: usize) -> bool {
+        // The length bound must use the ORIGINAL (un-stripped) turn length. A
+        // genuinely long recount that buries most of its text inside a balanced
+        // fenced code block would otherwise shrink below the bound after fence
+        // stripping and be falsely flagged as a compact stall.
+        if original_low_len > Self::COMPACT_STALLED_TOOL_REQUEST_MAX_LEN {
             return false;
         }
         // Detect a first-person, present-tense promise to invoke a tool. Only

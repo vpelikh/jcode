@@ -1638,6 +1638,24 @@ mod tests {
     }
 
     #[test]
+    fn compact_unfulfilled_tool_request_ignores_long_recount_hidden_in_fence() {
+        // A genuinely long legitimate recount can bury most of its length in a
+        // balanced fenced code block. If the compact detector bounded length on
+        // the fence-STRIPPED text, it would shrink below the max and falsely
+        // flag a recount of past "i'll invoke bash" actions as a stall. The
+        // length bound must use the ORIGINAL turn length.
+        let mut recap = "Let me recap what happened earlier in the session.\n```\n".to_string();
+        for _ in 0..500 {
+            recap.push_str("large diff block content lines here\n");
+        }
+        recap.push_str("```\nEarlier I'll invoke bash to do X, and I'll invoke bash for Y.");
+        assert!(
+            !Agent::is_stalled_promise_text(&recap),
+            "a long recount hidden inside a fenced block must not be flagged as a compact stall"
+        );
+    }
+
+    #[test]
     fn compact_unfulfilled_tool_request_is_stalled() {
         // The exact compact degradation observed in a real long-context session
         // (DeepSeek via OpenRouter): a SHORT turn explicitly says it will invoke a
