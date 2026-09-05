@@ -261,6 +261,38 @@ fn generated_title_skips_image_only_first_message() {
 }
 
 #[test]
+fn generated_title_backfills_skipping_injected_notification() {
+    // A session whose transcript already contains an injected notification
+    // before any real prompt: the backfill must skip it and use the first real
+    // user message instead of the notification text.
+    let mut session = Session::create_with_id("gen_backfill_notif_123".to_string(), None, None);
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "[NOTIFICATION]\nYou received 1 notification(s)".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "The actual request".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.title = None;
+
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "a later prompt".to_string(),
+            cache_control: None,
+        }],
+    );
+    assert_eq!(session.title.as_deref(), Some("The actual request"));
+}
+
+#[test]
 fn generated_title_is_truncated_to_max_chars() {
     let mut session = Session::create_with_id("session_gen_trunc_123".to_string(), None, None);
     let long_prompt = "x".repeat(200);
