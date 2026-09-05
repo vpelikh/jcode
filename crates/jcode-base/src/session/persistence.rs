@@ -401,11 +401,14 @@ impl Session {
         //
         // Persist even without a visible conversation message when the session
         // carries configured state that an explicit save() intends to preserve:
-        // a provider route (model/provider_key/effort), a bound parent, a
-        // self-dev/canary build, or a save label. The `pre_spawn_session` swarm
-        // path, restart-recovery fixtures, and persisted soft-interrupt/restore
-        // flows all rely on such sessions being written to disk immediately.
-        let has_configured_state = self.model.is_some()
+        // a caller-chosen `title` (explicit state just like `custom_title`,
+        // e.g. review/judge and relay sessions), a provider route
+        // (model/provider_key/effort), a bound parent, a self-dev/canary build,
+        // or a save label. The `pre_spawn_session` swarm path, restart-recovery
+        // fixtures, and persisted soft-interrupt/restore flows all rely on such
+        // sessions being written to disk immediately.
+        let has_configured_state = self.title.is_some()
+            || self.model.is_some()
             || self.provider_key.is_some()
             || self.route_api_method.is_some()
             || self.reasoning_effort.is_some()
