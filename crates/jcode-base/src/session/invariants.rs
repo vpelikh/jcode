@@ -344,9 +344,9 @@ impl InvariantRegistry {
     }
 
     /// Register an additional check.
-    pub fn add<I: LogInvariant + 'static>(&mut self, check: I)
+    pub fn add<I>(&mut self, check: I)
     where
-        I: Send + Sync,
+        I: LogInvariant + Send + Sync + 'static,
     {
         self.checks.push(Box::new(check));
     }
@@ -589,5 +589,83 @@ mod tests {
             2,
             "projection must match derive_messages for a full replacement"
         );
+    }
+
+    /// Property-style consistency: the `MessageCountProjection` fold must agree
+    /// with `derive_messages().len()` on every prefix of an arbitrary sequence of
+    /// message ops — including malformed ones (out-of-range inserts, reversed
+    /// `ReplaceMessages` spans, clamped indices). Since chat transcripts are
+    /// corruption-tolerant by design, the projection used for derived-state
+    /// monitoring must never diverge from the real fold even on a torn log.
+    #[test]
+    fn projection_agrees_with_derive_on_malformed_sequence() {
+        let mut map = SessionEventMap::default();
+        // Growing phase.
+        for i in 0..5 {
+            append(&mut map, &format!("a{i}"), text_msg(&format!("m{i}")));
+        }
+        // A replace with a reversed span (start > end) must not crash or diverge.
+        map.events.push(SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: "rev".to_string(),
+            op: SessionEventOp::ReplaceMessages {
+                start_index: 3,
+                end_index: 1,
+                messages: vec![text_msg("zz")],
+            },
+            parent_id: None,
+            version: 1,
+        });
+        // An out-of-range insert (index beyond the live length) must clamp.
+        map.events.push(SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: "oob".to_string(),
+            op: SessionEventOp::InsertMessage {
+                index: 99,
+                message: text_msg("oob"),
+            },
+            parent_id: None,
+            version: 1,
+        });
+        // A full replacement collapse.
+        map.events.push(SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: "full".to_string(),
+            op: SessionEventOp::ReplaceMessages {
+                start_index: 0,
+                end_index: usize::MAX,
+                messages: vec![text_msg("x"), text_msg("y")],
+            },
+            parent_id: None,
+            version: 1,
+        });
+        // A partial splice near the live length boundary.
+        map.events.push(SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: "partial".to_string(),
+            op: SessionEventOp::ReplaceMessages {
+                start_index: 0,
+                end_index: 1,
+                messages: vec![text_msg("only")],
+            },
+            parent_id: None,
+            version: 1,
+        });
+
+        // Verify on the FULL set and on every prefix, the projection never panics
+        // and always matches the real derived length.
+        for cut in 0..=map.events.len() {
+            let prefix: Vec<SessionEvent> = map.events[..cut].to_vec();
+            let projected = fold_projection::<MessageCountProjection>(&prefix).expect("no panic");
+            // Derive from a map holding exactly the same prefix. `events` is the
+            // public storage; `derive_messages` ignores the private cache.
+            let mut m = SessionEventMap::default();
+            m.events = prefix;
+            assert_eq!(
+                projected,
+                m.derive_messages().len(),
+                "projection diverged from derive_messages at prefix {cut}"
+            );
+        }
     }
 }
