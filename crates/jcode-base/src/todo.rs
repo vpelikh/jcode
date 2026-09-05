@@ -2003,6 +2003,23 @@ mod tests {
         assert!(!delivery_state_passes(&none));
         none.trade_off = Some(TradeOffState::Implicit);
         assert!(!delivery_state_passes(&none));
+
+        // Research and OpenEnded difficulties are at/above Involved, so they
+        // demand the same diligent alternative-weighing as any involved goal.
+        for difficulty in [Difficulty::Research, Difficulty::OpenEnded] {
+            let mut hard = delivery_goal(None, Some(DeliveryState::WorkflowValidated));
+            hard.difficulty = Some(difficulty);
+            hard.feedback_loop_relevance = Some(FeedbackLoopRelevance::AcceptanceAligned);
+            hard.feedback_loop_coverage = Some(FeedbackLoopCoverage::EdgeAndIntegrationPaths);
+            hard.feedback_loop_traceability = Some(FeedbackLoopTraceability::Complete);
+            hard.trade_off = Some(TradeOffState::SomeConsidered);
+            assert!(
+                !delivery_state_passes(&hard),
+                "{difficulty:?} must not clear the trade-off bar with some_considered"
+            );
+            hard.trade_off = Some(TradeOffState::Diligent);
+            assert!(delivery_state_passes(&hard), "{difficulty:?} clears with diligent");
+        }
     }
 
     #[test]
