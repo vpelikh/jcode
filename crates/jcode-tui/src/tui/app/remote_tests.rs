@@ -985,9 +985,12 @@ fn cd_keyhandler_submits_set_working_dir_request() {
     let mut remote = crate::tui::backend::RemoteConnection::dummy();
     let request_id_before = remote.next_request_id_for_test();
 
-    // A real directory so the request argument is coherent (the server does
-    // the canonicalization; the client only forwards the raw string).
-    let dir = std::env::current_dir().expect("cwd");
+    // A real directory that differs from the session's current working dir so
+    // the request is genuinely a change (the server does the canonicalization;
+    // the client only forwards the raw string). `/cd` to the exact current dir
+    // is handled as a local no-op by another test.
+    let dir = std::env::temp_dir().join("jcode-cd-submit-target");
+    std::fs::create_dir_all(&dir).expect("create target dir");
     app.set_input_for_test(format!("/cd {}", dir.display()));
 
     rt.block_on(app.handle_remote_key(KeyCode::Enter, KeyModifiers::empty(), &mut remote))
@@ -1058,6 +1061,40 @@ fn cd_keyhandler_rejects_while_agent_is_processing() {
     assert!(
         last.content.contains("currently working"),
         "busy /cd should explain the wait, got: {}",
+        last.content
+    );
+}
+
+#[test]
+fn cd_keyhandler_exact_current_dir_is_local_noop_feedback_without_request() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.remote_session_id = Some("active_sess".to_string());
+    app.session.working_dir = Some("/worktrees/feat-panel".to_string());
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    let request_id_before = remote.next_request_id_for_test();
+
+    // /cd to the exact currently-bound directory: the server would treat this as
+    // a silent no-op, so the client gives immediate feedback and skips the
+    // network round-trip.
+    app.set_input_for_test("/cd /worktrees/feat-panel".to_string());
+    rt.block_on(app.handle_remote_key(KeyCode::Enter, KeyModifiers::empty(), &mut remote))
+        .expect("/cd to the current dir should be handled");
+
+    assert_eq!(
+        remote.next_request_id_for_test(),
+        request_id_before,
+        "a /cd to the current exact dir must not send a request"
+    );
+    let last = app.display_messages().last().expect("display message");
+    assert_eq!(last.role, "system");
+    assert!(
+        last.content.contains("Already in"),
+        "exact-match /cd should confirm we are already there, got: {}",
         last.content
     );
 }
