@@ -565,12 +565,17 @@ impl Agent {
         };
         let end = start + needle.len();
         let next = haystack.as_bytes().get(end);
-        // End-of-string, whitespace, or punctuation that is NOT an apostrophe
-        // (which signals a possessive, e.g. "tool's"). Also reject a digit or
-        // letter continuing the word (e.g. "tool2").
+        // Accept only end-of-string, whitespace, or clearly-sentence-final
+        // punctuation. Reject anything that continues the word, which signals
+        // a reference rather than a bare target: an apostrophe (possessive,
+        // "tool's"), an alphanumeric (letter/digit, "tool2"), or a join
+        // character ('_' or '-', "tool_x", "command-line").
         match next {
             None => true,
-            Some(b) => !(b.is_ascii_alphanumeric() || *b == b'\''),
+            Some(b) => matches!(
+                b,
+                b' ' | b'\t' | b'\n' | b'\r' | b'.' | b',' | b'!' | b'?' | b';' | b':' | b')'
+            ),
         }
     }
 

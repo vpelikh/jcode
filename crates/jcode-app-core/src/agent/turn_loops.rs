@@ -1606,6 +1606,8 @@ mod tests {
         let legitimate = [
             "I'll call the tool's documentation when reviewing the next step.",
             "I'll call the command's output below for your reference.",
+            "I'll call the command_line utility when I get to it.",
+            "I'll call the command-line tool during the review.",
         ];
         for turn in legitimate {
             assert!(
