@@ -1191,6 +1191,85 @@ fn test_session_fork_event_log_prefix() {
     assert_eq!(fork.messages_for_provider().len(), 3);
 }
 
+/// Forks at the hard boundaries must derive a correct `current_compaction`,
+/// not a stale one inherited from the parent. A fork at boundary 0 (only the
+/// first event, before any SetCompaction) must NOT report a compaction, while a
+/// full fork that keeps every event must keep the compaction AND the orphaned
+/// bracket signal. This pins that the fork path (which builds a fresh
+/// `SessionEventMap` via `push_event`) maintains the compaction cache across the
+/// split rather than leaking the parent's state.
+#[test]
+fn test_fork_boundary_compaction_cache_edge_cases() {
+    use crate::session::event_types::SessionEventMap;
+
+    let mut map = SessionEventMap::default();
+    let now = chrono::Utc::now();
+    let msg = |id: &str| StoredMessage {
+        id: id.to_string(),
+        role: Role::User,
+        content: vec![text_block(id)],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    };
+    let comp_state = StoredCompactionState {
+        summary_text: "s_comp".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 2,
+        compacted_count: 1,
+    };
+    // Build a log: [AppendMessage m0, SetCompaction, AppendMessage m1].
+    map.events.push(SessionEvent {
+        timestamp: now,
+        event_id: "e_m0".into(),
+        op: SessionEventOp::AppendMessage {
+            message_id: "m0".into(),
+            message: msg("m0"),
+        },
+        parent_id: None,
+        version: 1,
+    });
+    map.events.push(SessionEvent {
+        timestamp: now,
+        event_id: "set".into(),
+        op: SessionEventOp::SetCompaction {
+            compaction: comp_state.clone(),
+        },
+        parent_id: None,
+        version: 1,
+    });
+    map.events.push(SessionEvent {
+        timestamp: now,
+        event_id: "e_m1".into(),
+        op: SessionEventOp::AppendMessage {
+            message_id: "m1".into(),
+            message: msg("m1"),
+        },
+        parent_id: None,
+        version: 1,
+    });
+
+    // Full fork (boundary == last index) keeps every event and the compaction.
+    let full = map.fork_up_to_boundary(2);
+    assert_eq!(
+        full.current_compaction().as_ref().map(|c| &c.summary_text),
+        Some(&"s_comp".to_string()),
+        "a full fork must retain the SetCompaction"
+    );
+    assert_eq!(full.derive_messages().len(), 2);
+
+    // Fork at boundary 0 (before the compaction, includes only event[0] = m0)
+    // must NOT report a compaction.
+    let prefix = map.fork_up_to_boundary(0);
+    assert!(
+        prefix.current_compaction().is_none(),
+        "a fork before the SetCompaction must not inherit it"
+    );
+    assert_eq!(prefix.derive_messages().len(), 1);
+}
+
 #[test]
 fn test_replace_after_clear_replays_deterministically() {
     use crate::session::event_types::SessionEventMap;
