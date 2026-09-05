@@ -1490,14 +1490,20 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
             return;
         }
         if len < self.messages.len() {
-            // Append to event log
+            // Append to event log. Truncating to `len` keeps the first `len`
+            // messages and drops the tail. This is a *splice-out* of the span
+            // `[len..]`, so the event is `ReplaceMessages { start: len,
+            // end: usize::MAX, messages: vec![] }` — NOT `{ start: 0, end: len,
+            // messages: prefix }`, which would splice `[0..len]` back with the
+            // same prefix and leave the tail `[len..]` intact (a no-op that
+            // desyncs the derived log from the truncated legacy vector).
             let event = SessionEvent {
                 timestamp: chrono::Utc::now(),
                 event_id: crate::id::new_id("truncate"),
                 op: SessionEventOp::ReplaceMessages {
-                    start_index: 0,
-                    end_index: len,
-                    messages: self.messages[..len].to_vec(),
+                    start_index: len,
+                    end_index: usize::MAX,
+                    messages: Vec::new(),
                 },
                 parent_id: None,
                 version: 1,

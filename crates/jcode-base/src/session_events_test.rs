@@ -761,18 +761,26 @@ fn test_replace_after_truncate_replays_deterministically() {
             version: 1,
         });
     }
-    // 2) truncate to first two (partial replace [0..2])
+    // 2) truncate to first two (splice out the tail from index 2)
     map.append_event(SessionEvent {
         timestamp: chrono::Utc::now(),
         event_id: "truncate".to_string(),
         op: SessionEventOp::ReplaceMessages {
-            start_index: 0,
-            end_index: 2,
-            messages: vec![mk("a"), mk("b")],
+            start_index: 2,
+            end_index: usize::MAX,
+            messages: vec![],
         },
         parent_id: None,
         version: 1,
     });
+    // The derived transcript is now truncated to the first two messages.
+    let derived_after_truncate: Vec<String> =
+        map.derive_messages().iter().map(|m| m.id.clone()).collect();
+    assert_eq!(
+        derived_after_truncate,
+        vec!["a".to_string(), "b".to_string()],
+        "truncate must splice out the tail, not leave it intact"
+    );
     // 3) full replacement (end_index::MAX semantics)
     map.append_event(SessionEvent {
         timestamp: chrono::Utc::now(),
@@ -947,6 +955,33 @@ fn test_truncate_to_zero_keeps_event_log_consistent() {
     assert_eq!(session.derive_messages().len(), 0, "event log must also be empty");
 }
 
+#[test]
+fn test_truncate_messages_partial_keeps_log_consistent() {
+    // Regression: a partial `truncate_messages(len)` (len > 0) must truncate the
+    // *derived* event-log transcript too, not just the legacy vector. Previously
+    // the emitted ReplaceMessages spliced `[0..len]` back with the same prefix,
+    // leaving the tail `[len..]` intact, so `derive_messages()` kept the dropped
+    // messages while `self.messages` had been truncated — a hydration mismatch
+    // that failed `rederive_all_checked`.
+    let mut session = Session::create_with_id("truncate_partial".to_string(), None, None);
+    for (i, id) in ["a", "b", "c", "d"].iter().enumerate() {
+        session.append_stored_message(StoredMessage {
+            id: format!("m_{}", i),
+            role: Role::User,
+            content: vec![text_block(id)],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+    session.truncate_messages(2);
+    assert_eq!(session.messages.len(), 2, "legacy transcript truncated");
+    assert_eq!(session.derive_messages().len(), 2, "derived transcript truncated too");
+    let ids: Vec<String> = session.derive_messages().iter().map(|m| m.id.clone()).collect();
+    assert_eq!(ids, vec!["m_0".to_string(), "m_1".to_string()]);
+    session.rederive_all_checked().expect("truncate must keep legacy and derived consistent");
+}
 
 #[test]
 fn test_strip_and_truncate_keep_event_log_consistent() {
