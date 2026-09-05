@@ -1306,6 +1306,15 @@ const REVIEW_LOOP_MAX_REVIEWER_RESPAWNS: u32 = 2;
 /// Returns `true` only when a poll actually ran. Callers do not fold this into
 /// `needs_redraw`; loop progress pushes its own display/status updates.
 pub(super) fn maybe_poll_review_loop_from_idle(app: &mut App) -> bool {
+    // While a queued follow-up is about to be dispatched (pending_queued_dispatch),
+    // do not also step the review loop: the run loop will dispatch that message
+    // (setting is_processing) and the loop would otherwise double-schedule a
+    // reviewer against it. This covers both a review fix (via review_fix_pending)
+    // and a poke/gate continuation queued in a loop gap (which #2's interleave
+    // can now produce while awaiting_postfix_recheck is false).
+    if app.pending_queued_dispatch {
+        return false;
+    }
     // Round-E narrow guard: never self-drive while the review's own fix turn is
     // queued-but-undispatched (would spawn the re-check reviewer against the
     // pre-fix tree). This deliberately does NOT use `has_queued_followups()`:

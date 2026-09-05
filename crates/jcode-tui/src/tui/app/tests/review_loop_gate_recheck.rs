@@ -1309,3 +1309,41 @@ fn clear_review_loop_on_improve_cancels_queued_fix() {
         );
     });
 }
+
+// Regression (pending_queued_dispatch blocks idle loop step): while a queued
+// follow-up (poke / gate continuation) is pending dispatch, the idle self-drive
+// must NOT also step the review loop, or it would spawn a reviewer concurrently
+// with the dispatch (double-scheduling). This is distinct from review_fix_pending:
+// the loop here is NOT awaiting a fix, yet a poke can be queued in a loop gap.
+#[test]
+fn idle_poll_does_not_step_loop_while_non_fix_dispatch_pending() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+
+        // A live loop, first lens, no in-flight reviewer yet, awaiting nothing.
+        let mut state = jcode_session_types::ReviewLoopState::new();
+        super::review_loop::enter_review_loop(&mut state);
+        state.active_reviewer_id = None;
+        state.awaiting_postfix_recheck = false;
+        app.session.review_loop = Some(state);
+        app.is_processing = false;
+        app.last_review_loop_idle_poll = None;
+
+        // A poke/gate continuation is queued and pending dispatch (NOT the fix).
+        app.pending_queued_dispatch = true;
+        app.queued_messages.clear();
+        app.queued_messages.push("Continue working on the todos.".to_string());
+
+        let polled = super::commands_review::maybe_poll_review_loop_from_idle(&mut app);
+
+        assert!(
+            !polled,
+            "idle poll must not step the loop while a non-fix queued dispatch is pending"
+        );
+        let state = app.session.review_loop.as_ref().unwrap();
+        assert!(
+            state.active_reviewer_id.is_none(),
+            "the loop must not have spawned a reviewer while a queued dispatch is pending"
+        );
+    });
+}
