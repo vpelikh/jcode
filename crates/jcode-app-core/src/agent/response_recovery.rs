@@ -591,17 +591,16 @@ impl Agent {
             let at = start + rel;
             let end = at + needle.len();
             let next = haystack.as_bytes().get(end);
-            // Accept only end-of-string, whitespace, or clearly-sentence-final
-            // punctuation. Reject anything that continues the word, which
-            // signals a reference rather than a bare target: an apostrophe
-            // (possessive, "tool's"), an alphanumeric (letter/digit, "tool2"),
-            // or a join character ('_' or '-', "tool_x", "command-line").
+            // Reject only characters that CONTINUE the word, which signal a
+            // reference rather than a bare target: an alphanumeric (letter/
+            // digit, "tool2"), an apostrophe (possessive, "tool's"), or a join
+            // character ('_' or '-', "tool_x", "command-line"). Everything
+            // else is a genuine boundary (space, end-of-string, sentence
+            // punctuation, closing quotes/brackets, backticks, etc.), so a
+            // short stall that quotes or brackets the target still matches.
             let ok = match next {
                 None => true,
-                Some(b) => matches!(
-                    b,
-                    b' ' | b'\t' | b'\n' | b'\r' | b'.' | b',' | b'!' | b'?' | b';' | b':' | b')'
-                ),
+                Some(b) => !(b.is_ascii_alphanumeric() || *b == b'\'' || *b == b'_' || *b == b'-'),
             };
             if ok {
                 return true;

@@ -1689,6 +1689,27 @@ mod tests {
     }
 
     #[test]
+    fn compact_unfulfilled_tool_request_detects_bracketed_or_quoted_target() {
+        // A short real stall can quote or bracket the tool target ("I'll invoke
+        // [bash]", "I'll invoke bash] now"), and the boundary must still treat
+        // the closing bracket as a genuine word boundary. The reject-list only
+        // excludes word-continuation characters (letter/digit/apostrophe/
+        // underscore/hyphen), so these remain detectable.
+        let stalls = [
+            "I'll invoke bash",
+            "I'll invoke bash] now",
+            "I'll invoke bash) and finish",
+            "I'll invoke bash. next",
+        ];
+        for turn in stalls {
+            assert!(
+                Agent::is_stalled_promise_text(turn),
+                "a compact stall with a quoted/bracketed target must be detected: {turn:?}"
+            );
+        }
+    }
+
+    #[test]
     fn compact_unfulfilled_tool_request_is_stalled() {
         // The exact compact degradation observed in a real long-context session
         // (DeepSeek via OpenRouter): a SHORT turn explicitly says it will invoke a
