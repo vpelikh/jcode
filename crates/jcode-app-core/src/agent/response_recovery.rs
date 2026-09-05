@@ -396,9 +396,15 @@ impl Agent {
         // with no fences, so for them original == stripped and this is a no-op.
         // When no fence was present the stripped Cow is Borrowed, so its length
         // already equals the original and the flatten above is the only one.
+        //
+        // Both the density denominator and the compact detector's length bound
+        // are documented in terms of CHARACTERS ("per 100 chars"; "flattened
+        // char length"), so measure chars (not bytes) here. Using bytes would
+        // inflate the two metrics for multi-byte non-ASCII text, hiding a
+        // genuinely short compact stall that happens to contain unicode.
         let original_low_len = match &stripped {
-            std::borrow::Cow::Borrowed(_) => low.len(),
-            std::borrow::Cow::Owned(_) => Self::flatten_whitespace(text).len(),
+            std::borrow::Cow::Borrowed(_) => low.chars().count(),
+            std::borrow::Cow::Owned(_) => Self::flatten_whitespace(text).chars().count(),
         };
         // Two independent failure modes produce "it promises an action but does
         // nothing". Each gets its own detector so one heuristic can't miss what

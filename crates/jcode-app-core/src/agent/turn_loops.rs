@@ -1988,4 +1988,41 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn compact_detector_length_bound_counts_chars_not_bytes() {
+        // The compact detector's length bound and the density denominator must
+        // measure CHARACTERS, not bytes. The comment documents the bound as
+        // "flattened char length", and density is "phrases per 100 chars".
+        // Using .len() (bytes) inflates both for non-ASCII text: a genuinely
+        // short turn (well under 700 chars) that contains multi-byte unicode
+        // could exceed 700 BYTES and be wrongly excluded from the compact
+        // stall detector. Counting chars restores the documented intent and is
+        // a recall gain with no precision cost for ASCII (bytes == chars).
+        let stall = "I'll invoke bash now.".to_string();
+        // ~240 CJK chars (720 bytes) pushes total to 742 bytes but only ~262
+        // chars, so it must still be detected as a compact stall.
+        let padded = format!("{} {}", stall, "\u{52a9}\u{8a00}".repeat(120));
+        assert!(
+            padded.len() > 700,
+            "fixture must actually exceed the byte bound: {} bytes",
+            padded.len()
+        );
+        assert!(
+            padded.chars().count() < 700,
+            "fixture must stay under the char bound: {} chars",
+            padded.chars().count()
+        );
+        assert!(
+            Agent::is_stalled_promise_text(&padded),
+            "a compact stall with non-ASCII text must be measured by char count"
+        );
+        // A genuinely long reply with multi-byte chars is still not a stall.
+        let cjk_long = format!("{}", "\u{52a9}\u{8a00}".repeat(500)); // 1000 chars
+        let legit = format!("Let me know if you need more. {cjk_long}");
+        assert!(
+            !Agent::is_stalled_promise_text(&legit),
+            "a long non-ASCII final answer must not be flagged"
+        );
+    }
 }
