@@ -1618,6 +1618,26 @@ mod tests {
     }
 
     #[test]
+    fn stalled_promise_large_fenced_block_does_not_inflate_density() {
+        // A genuine diagnosis that embeds large fenced code blocks (diffs,
+        // repros) alongside a handful of prose "let me" phrases must not be
+        // flagged. If density were measured against the fence-STRIPPED length,
+        // the collapsed denominator would spike the ratio above the threshold.
+        // It must be measured against the ORIGINAL (un-stripped) length.
+        let mut diag = "Here is the full patch:\n```\n".to_string();
+        for _ in 0..200 {
+            diag.push_str("x y z filler line here\n");
+        }
+        diag.push_str("```\nLet me review. I'll check. I will verify. Let me test. \
+                       I'm going to run. Let me inspect. I will confirm. Let me parse. Let's look.\n");
+        diag.push_str("```\nmore\nbig\nblock\n```\n");
+        assert!(
+            !Agent::is_stalled_promise_text(&diag),
+            "a genuine diagnosis with large fenced blocks and prose must not be flagged"
+        );
+    }
+
+    #[test]
     fn compact_unfulfilled_tool_request_is_stalled() {
         // The exact compact degradation observed in a real long-context session
         // (DeepSeek via OpenRouter): a SHORT turn explicitly says it will invoke a

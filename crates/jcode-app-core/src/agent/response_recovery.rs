@@ -381,6 +381,14 @@ impl Agent {
     /// with them ("Let me ... Let me ... Let me run ..."). A single "let me"
     /// in a normal answer is not treated as stalling.
     pub(crate) fn is_stalled_promise_text(text: &str) -> bool {
+        // Keep the ORIGINAL flattened length for the density denominator. A
+        // genuine diagnosis can embed large fenced code blocks (diffs, repros)
+        // alongside a handful of prose "let me" phrases. Counting density over
+        // the fence-STRIPPED text would collapse the denominator and spike the
+        // ratio, falsely flagging a legitimate answer. Measuring against the
+        // full original length keeps the ratio honest. Real stalls stream prose
+        // with no fences, so for them original == stripped and this is a no-op.
+        let original_low_len = Self::flatten_whitespace(text).len();
         // Drop fenced code blocks first so quoting/reproducing a stalled
         // excerpt (common in review/diagnosis answers) does not count as a
         // stall. This runs on every check; without_fenced_code_blocks is a
@@ -412,8 +420,9 @@ impl Agent {
         // Density: number of promise phrases per 100 chars. Measured failing
         // turns sit at ~4.4+ (224/4948, 107/2482). Legitimate turns, even huge
         // ones with a few "let me"s, stay below ~1. Require a healthy margin
-        // above that.
-        let density = count as f64 / text.len().max(1) as f64 * 100.0;
+        // above that. Uses the ORIGINAL (un-stripped) length so large balanced
+        // fenced code blocks in a genuine answer do not inflate the ratio.
+        let density = count as f64 / original_low_len.max(1) as f64 * 100.0;
         density >= Self::STALLED_PROMISE_DENSITY_THRESHOLD
     }
 
