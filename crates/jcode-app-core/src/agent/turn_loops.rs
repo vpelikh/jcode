@@ -1764,6 +1764,18 @@ mod tests {
     }
 
     #[test]
+    fn compact_unfulfilled_tool_request_detects_curly_apostrophe() {
+        // A localization-aware model can emit a curly apostrophe (U+2019) in
+        // "I'll". flatten_whitespace normalizes it to ASCII so the compact
+        // (and dense) detectors still match.
+        let stall = "I\u{2019}ll invoke bash now.";
+        assert!(
+            Agent::is_stalled_promise_text(stall),
+            "a compact stall with a curly apostrophe must be detected"
+        );
+    }
+
+    #[test]
     fn compact_unfulfilled_tool_request_is_stalled() {
         // The exact compact degradation observed in a real long-context session
         // (DeepSeek via OpenRouter): a SHORT turn explicitly says it will invoke a

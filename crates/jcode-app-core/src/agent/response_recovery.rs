@@ -435,11 +435,28 @@ impl Agent {
     /// is still detected if streamed/degenerate output introduces extra spaces,
     /// tabs, or newlines inside a phrase ("let  me run", "let\tme run"). This
     /// mirrors inline_tail's whitespace flattening.
+    ///
+    /// Also normalizes curly/typographic quotes and apostrophes (U+2018, U+2019,
+    /// U+201C, U+201D) to their ASCII forms. Some localization-aware models or
+    /// text pipelines emit "I\u{2019}ll invoke bash now" with a curly apostrophe,
+    /// which would otherwise evade both detectors that match on the ASCII
+    /// "i'll" / "let's" spellings.
     fn flatten_whitespace(text: &str) -> String {
-        text.split_whitespace()
+        let mut s = text
+            .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")
-            .to_ascii_lowercase()
+            .to_ascii_lowercase();
+        if s.contains('\u{2018}')
+            || s.contains('\u{2019}')
+            || s.contains('\u{201C}')
+            || s.contains('\u{201D}')
+        {
+            s = s
+                .replace(['\u{2018}', '\u{2019}'], "'")
+                .replace(['\u{201C}', '\u{201D}'], "\"");
+        }
+        s
     }
 
     /// Count matched action-promise phrases, subtracting the "let me know"
