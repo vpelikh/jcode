@@ -118,6 +118,68 @@ pub fn is_scheduled_task_message(message: &StoredMessage) -> bool {
         })
 }
 
+/// True for messages that were injected internally (system reminders, scheduled
+/// tasks, or cross-agent notifications) rather than typed by the human, so they
+/// are never used as the session's generated title.
+fn is_injected_internal_message(message: &StoredMessage) -> bool {
+    if is_internal_system_reminder_message(message) || is_scheduled_task_message(message) {
+        return true;
+    }
+    message.content.iter().any(|block| {
+        matches!(block, ContentBlock::Text { text, .. } if text.trim_start().starts_with("[NOTIFICATION]"))
+    })
+}
+
+/// True if a raw text block begins with one of the internal-injection markers.
+fn is_injected_marker_text(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with("[NOTIFICATION]")
+        || text.starts_with("[Scheduled task]")
+        || text.starts_with("<system-reminder>")
+}
+
+/// Content-level variant of `is_injected_internal_message` used when evaluating
+/// an as-yet-unpersisted message against the same exclusion rules.
+fn content_has_injected_marker(content: &[ContentBlock]) -> bool {
+    content.iter().any(|block| {
+        matches!(block, ContentBlock::Text { text, .. } if is_injected_marker_text(text))
+    })
+}
+
+/// A genuine user prompt that is a valid source for a generated session title:
+/// a visible conversation message authored by the human (never an injected
+/// system reminder, scheduled task, or cross-agent notification).
+fn is_generated_title_candidate(message: &StoredMessage) -> bool {
+    message.role == Role::User
+        && message.display_role.is_none()
+        && !is_injected_internal_message(message)
+}
+
+/// Maximum character length for a generated session title.
+const GENERATED_TITLE_MAX_CHARS: usize = 72;
+
+/// Derive a generated session title from a message's content blocks.
+///
+/// Uses the first non-empty line of the first text block, trimmed and truncated
+/// to `GENERATED_TITLE_MAX_CHARS` characters. Returns `None` when there is no
+/// usable text (e.g. an image-only message).
+fn generated_title_from_content(content: &[ContentBlock]) -> Option<String> {
+    for block in content {
+        if let ContentBlock::Text { text, .. } = block {
+            let line = text.lines().next().unwrap_or_default().trim();
+            if line.is_empty() {
+                continue;
+            }
+            let title = line
+                .chars()
+                .take(GENERATED_TITLE_MAX_CHARS)
+                .collect::<String>();
+            return Some(title);
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -1360,6 +1422,7 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         token_usage: Option<StoredTokenUsage>,
         display_role: Option<StoredDisplayRole>,
     ) -> String {
+        self.maybe_generate_title_from_first_user_message(&role, &content, display_role);
         let id = new_id("message");
         self.append_stored_message(StoredMessage {
             id: id.clone(),
@@ -1371,6 +1434,37 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
             token_usage,
         });
         id
+    }
+
+    /// Derive a generated session title from the first genuine user prompt.
+    ///
+    /// Native jcode sessions are created title-less; the generated title (used
+    /// as the fallback display title and indexed as `generated_title`) is
+    /// inferred from the first real user message. Injected internal messages
+    /// (session context, scheduled tasks, cross-agent notifications) never seed
+    /// the title. A no-op once a generated title already exists.
+    fn maybe_generate_title_from_first_user_message(
+        &mut self,
+        role: &Role,
+        content: &[ContentBlock],
+        display_role: Option<StoredDisplayRole>,
+    ) {
+        if *role != Role::User || display_role.is_some() || self.title.is_some() {
+            return;
+        }
+        if content_has_injected_marker(content) {
+            return;
+        }
+        if self
+            .messages
+            .iter()
+            .any(is_generated_title_candidate)
+        {
+            return;
+        }
+        if let Some(title) = generated_title_from_content(content) {
+            self.title = Some(title);
+        }
     }
 
     /// Emit a `ReplaceMessages` event capturing the full current transcript.

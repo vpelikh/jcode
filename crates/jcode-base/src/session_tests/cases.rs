@@ -110,6 +110,142 @@ fn rename_title_preserves_generated_title_for_clear() {
 }
 
 #[test]
+fn generated_title_derives_from_first_user_message() {
+    let mut session = Session::create_with_id("session_gen_title_123".to_string(), None, None);
+    assert!(session.title.is_none());
+
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "Fix the flaky login test".to_string(),
+            cache_control: None,
+        }],
+    );
+    assert_eq!(session.title.as_deref(), Some("Fix the flaky login test"));
+    assert_eq!(session.display_title(), Some("Fix the flaky login test"));
+}
+
+#[test]
+fn generated_title_is_not_set_for_injected_internal_messages() {
+    let mut session = Session::create_with_id("session_gen_title_inj_123".to_string(), None, None);
+    assert!(session.title.is_none());
+
+    // Session-context/system reminder injected as a User message.
+    session.add_message_with_display_role(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "<system-reminder>\ncontext</system-reminder>".to_string(),
+            cache_control: None,
+        }],
+        Some(StoredDisplayRole::System),
+    );
+    assert!(session.title.is_none());
+
+    // Cross-agent notification injection.
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "[NOTIFICATION]\nYou received 1 notification(s)".to_string(),
+            cache_control: None,
+        }],
+    );
+    assert!(session.title.is_none());
+
+    // The first real user message seeds the title.
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "Actual task".to_string(),
+            cache_control: None,
+        }],
+    );
+    assert_eq!(session.title.as_deref(), Some("Actual task"));
+}
+
+#[test]
+fn generated_title_does_not_overwrite_explicit_title() {
+    let mut session = Session::create_with_id(
+        "session_gen_title_exp_123".to_string(),
+        None,
+        Some("Explicit title".to_string()),
+    );
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "First prompt".to_string(),
+            cache_control: None,
+        }],
+    );
+    assert_eq!(session.title.as_deref(), Some("Explicit title"));
+}
+
+#[test]
+fn generated_title_uses_first_user_message_not_later_ones() {
+    let mut session = Session::create_with_id("session_gen_first_123".to_string(), None, None);
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "First real prompt".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "A later prompt".to_string(),
+            cache_control: None,
+        }],
+    );
+    assert_eq!(session.title.as_deref(), Some("First real prompt"));
+}
+
+#[test]
+fn generated_title_is_truncated_to_max_chars() {
+    let mut session = Session::create_with_id("session_gen_trunc_123".to_string(), None, None);
+    let long_prompt = "x".repeat(200);
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: long_prompt.clone(),
+            cache_control: None,
+        }],
+    );
+    assert!(session.title.is_some());
+    assert!(session.title.as_deref().unwrap().chars().count() <= 72);
+}
+
+#[test]
+fn generated_title_persists_through_save_and_load() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-gen-title-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let session_id = "session_gen_title_persist";
+    let mut session = Session::create_with_id(session_id.to_string(), None, None);
+    assert!(session.title.is_none());
+
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "Refactor the config loader".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+
+    let loaded = Session::load(session_id)?;
+    assert_eq!(
+        loaded.title.as_deref(),
+        Some("Refactor the config loader")
+    );
+    assert_eq!(loaded.display_title(), Some("Refactor the config loader"));
+    Ok(())
+}
+
+#[test]
 fn test_debug_memory_profile_reports_messages_and_provider_cache() {
     let mut session = Session::create_with_id(
         "session_memory_profile_test".to_string(),
