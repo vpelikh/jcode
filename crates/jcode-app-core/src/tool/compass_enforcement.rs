@@ -1,19 +1,21 @@
-//! Per-session bookkeeping for the `compass_query`-first enforcement tier.
+//! Compass-query-first enforcement: redirect `agentgrep` grep calls to
+//! `compass_query` and refuse a raw-grep fallback until it is attempted.
 //!
-//! The redirect in [`Registry::execute`] turns a full-text `agentgrep` grep call
-//! into a message telling the model to call `compass_query` first. That message
-//! also documents an escape hatch (`allow_raw_fallback`) for searches raw grep
-//! genuinely needs to serve. As observed in production, a model can take the
-//! escape hatch on the *very next* turn without ever attempting `compass_query`,
-//! effectively bypassing the enforcement the tool tier exists to provide.
+//! This module is the single owner of the whole tier. It contains the pure
+//! decision policy (`decide_enforcement`), the availability preconditions
+//! (`CompassAvailability`), the input classifiers and guidance output builders
+//! (`agentgrep_requests_raw_fallback`, `agentgrep_call_is_grep_mode`,
+//! `compass_redirect_output`), the per-session pending-redirect state, the
+//! lifecycle phase labels, and the `Registry` integration (`enforce_compass_first`
+//! / `clear_compass_redirect_after_run`) so `Registry::execute` in `tool::mod`
+//! stays a thin dispatch loop.
 //!
-//! This module records, per session, the moment a redirect was issued and waits
-//! for that session to make a genuine `compass_query` attempt before allowing the
-//! raw-grep fallback again. Until the redirect is satisfied, a retried `agentgrep`
-//! that asks for the raw fallback is itself refused with a coercive message
-//! pointing back at `compass_query`. The flag is cleared by any executed
-//! `compass_query` call, whether it returns a warm result or a "building, try
-//! again" hint, so the model is never stuck if Compass itself fails.
+//! Why it exists: the redirect tells the model to call `compass_query` first,
+//! but a model can take the documented `allow_raw_fallback` escape hatch on the
+//! *very next* turn without ever attempting compass. This module records, per
+//! session, that a redirect was issued and refuses the raw-fallback bypass until
+//! the session makes a genuine `compass_query` attempt (any execution, even a
+//! "building, try again" fail-fast, clears the flag).
 //!
 //! State is scoped to the owning session id and is never persisted. The set is
 //! bounded in practice by the small overlap between a redirect and the compass
@@ -102,10 +104,11 @@ pub enum EnforcementDecision {
 }
 
 /// The conditions under which `compass_query` is authoritative enough to be
-/// worth redirecting/blocking an `agentgrep` call. Resolved by
-/// [`Registry::execute`] once (it holds the tools lock and reads session
-/// policy), then passed in so the preconditions are computed in one place
-/// rather than duplicated across decision branches.
+/// worth redirecting/blocking an `agentgrep` call. Built once by
+/// [`Registry::enforce_compass_first`] (which holds the tools lock and reads
+/// session policy), then passed into the pure `decide_enforcement` so the
+/// preconditions are computed in one place rather than duplicated across
+/// decision branches.
 #[derive(Clone, Copy)]
 pub struct CompassAvailability {
     /// The operator enabled the enforcement tier.
@@ -293,7 +296,7 @@ impl super::Registry {
     /// (a plain grep with Compass invokable) or refuse a raw-fallback bypass
     /// (retried before any compass attempt). When it intercepts, this applies the
     /// side effects (mark the pending flag for a redirect, telemetry, post-tool
-    /// hook, lifecycle log) and returns `Some(result)` for `execute` to
+    /// hook, lifecycle log) and returns `Some(output)` for `execute` to
     /// short-circuit with. Returns `None` to run the tool normally. Takes the
     /// tools read guard by value so it can drop it before observable work.
     pub(crate) fn enforce_compass_first(
@@ -307,7 +310,7 @@ impl super::Registry {
         input: &serde_json::Value,
         prefer_compass_query: bool,
         ctx: &super::ToolContext,
-    ) -> Option<anyhow::Result<super::ToolOutput>> {
+    ) -> Option<super::ToolOutput> {
         // The short-circuit only applies to agentgrep; other tools run normally.
         if resolved_name != "agentgrep" {
             return None;
@@ -340,7 +343,7 @@ impl super::Registry {
             "TOOL_LIFECYCLE",
             Self::tool_lifecycle_fields(phase, name, resolved_name, input, ctx),
         );
-        Some(Ok(output))
+        Some(output)
     }
 
     /// Release any outstanding compass-redirect after a real `compass_query`

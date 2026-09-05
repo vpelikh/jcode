@@ -757,7 +757,7 @@ impl Registry {
             prefer_compass_query,
             &ctx,
         ) {
-            return intercept;
+            return Ok(intercept);
         }
 
         // User-configured pre_tool gate: external policy hook that can block
