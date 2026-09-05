@@ -896,12 +896,24 @@ mod semantic_state_tests {
             delivery_state: Some(DeliveryState::WorkflowValidated),
             difficulty: Some(Difficulty::Involved),
             autonomy: Some(Autonomy::Proactive),
+            trade_off: Some(TradeOffState::Diligent),
+            trade_off_history: vec![
+                TradeOffState::SomeConsidered,
+                TradeOffState::Diligent,
+            ],
+            trade_offs: Some("weighed X vs Y".to_string()),
+            explored_alternative: Some(true),
             ..Default::default()
         };
         let json = serde_json::to_value(&goal).unwrap();
         assert_eq!(json["delivery_state"], "workflow_validated");
         assert_eq!(json["difficulty"], "involved");
         assert_eq!(json["autonomy"], "proactive");
+        assert_eq!(json["trade_off"], "diligent");
+        assert_eq!(json["trade_off_history"][0], "some_considered");
+        assert_eq!(json["trade_off_history"][1], "diligent");
+        assert_eq!(json["trade_offs"], "weighed X vs Y");
+        assert_eq!(json["explored_alternative"], true);
         assert!(json.get("end_to_end_ownership").is_none());
     }
 
