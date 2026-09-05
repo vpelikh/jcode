@@ -664,6 +664,16 @@ fn idle_tick_self_drives_review_loop_advance() {
             advanced.active_reviewer_id.is_some(),
             "advancing must spawn an active reviewer for the next lens"
         );
+        // The parent status notice reflects the lens now under review (the
+        // spawned reviewer runs in its own window; this is the parent-side
+        // signal that the loop advanced).
+        assert!(
+            app.status_notice
+                .as_ref()
+                .is_some_and(|(n, _)| n.contains("reviewing") && n.contains("Edges/Errors")),
+            "advancing must surface the new lens in the parent status notice, got {:?}",
+            app.status_notice.as_ref().map(|(n, _)| n.as_str())
+        );
     });
 }
 
@@ -785,6 +795,15 @@ fn remote_tick_self_drives_review_loop_advance() {
         assert!(
             advanced.active_reviewer_id.is_some(),
             "advancing must spawn an active reviewer for the next lens"
+        );
+        // Same parent-side progress signal as the local path: the spawned
+        // next-lens reviewer is surfaced in the status notice.
+        assert!(
+            app.status_notice
+                .as_ref()
+                .is_some_and(|(n, _)| n.contains("reviewing") && n.contains("Edges/Errors")),
+            "remote advance must surface the new lens in the parent status notice, got {:?}",
+            app.status_notice.as_ref().map(|(n, _)| n.as_str())
         );
     });
 }
@@ -935,6 +954,45 @@ fn remote_tick_does_not_spawn_premature_recheck_while_fix_queued_after_failed_di
         assert!(
             app.queued_messages.is_empty(),
             "the fix prompt must have been dispatched, not left stranded in the queue"
+        );
+    });
+}
+
+// Regression (Round-E guard, local path): the local idle tick must equally
+// refuse to spawn a post-fix re-check reviewer while a fix continuation is
+// queued-but-undispatched. On local the fix turn is normally started via
+// `start_synthetic_user_turn` (which sets is_processing), so this state is
+// defensive; but if a queued message is present with an idle client
+// (is_processing false, pending_queued_dispatch false, awaiting_postfix_recheck
+// true, active_reviewer_id None), the tick must not spawn the re-check against
+// the pre-fix tree.
+#[test]
+fn local_tick_does_not_spawn_premature_recheck_while_fix_queued() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+
+        let mut state = jcode_session_types::ReviewLoopState::new();
+        super::review_loop::enter_review_loop(&mut state);
+        state.awaiting_postfix_recheck = true;
+        state.active_reviewer_id = None;
+        app.session.review_loop = Some(state);
+
+        app.queued_messages.push("The reviewer found the following issues. Fix them:\n\n[HIGH] a.rs: bug".to_string());
+        app.pending_queued_dispatch = false;
+        app.is_processing = false;
+
+        let _ = crate::tui::app::local::handle_tick(&mut app);
+
+        let state = app.session.review_loop.as_ref().unwrap();
+        assert!(!state.finished, "loop must not finalize while a fix is pending");
+        assert!(
+            state.active_reviewer_id.is_none(),
+            "local tick must NOT spawn a premature re-check reviewer while the fix is still queued"
+        );
+        assert_eq!(
+            state.current_lens,
+            Some(jcode_session_types::ReviewLens::Correctness),
+            "the loop must stay on the fixing lens"
         );
     });
 }
