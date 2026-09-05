@@ -1401,3 +1401,35 @@ fn loop_advances_after_respawned_reviewer_reports_clean() {
         );
     });
 }
+
+// Regression (mutual exclusion, manual start): `/review-loop start` must cancel
+// any improve/refactor continuation that was queued (e.g. during a busy state),
+// mirroring clear_review_loop_on_improve / /review-loop stop. A leftover improve
+// "fix this" prompt must not be dispatched mid-review.
+#[test]
+fn manual_review_loop_start_cancels_queued_improve_continuation() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+
+        // Simulate an improve/refactor that left a queued continuation pending.
+        app.improve_mode = Some(super::ImproveMode::ImproveRun);
+        app.queued_messages.push("Improve: continue fixing the identified issues.".to_string());
+        app.pending_queued_dispatch = true;
+
+        app.input = "/review-loop start".to_string();
+        app.submit_input();
+
+        assert!(
+            app.session.review_loop.as_ref().is_some_and(|s| !s.finished),
+            "review loop must be active after start"
+        );
+        assert!(
+            app.queued_messages.is_empty(),
+            "starting a review loop must cancel a leftover improve continuation"
+        );
+        assert!(
+            !app.pending_queued_dispatch,
+            "starting a review loop must clear the pending-dispatch flag"
+        );
+    });
+}

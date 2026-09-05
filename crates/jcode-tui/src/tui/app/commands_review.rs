@@ -1817,6 +1817,14 @@ pub(super) fn handle_review_loop_command_local(app: &mut App, trimmed: &str) -> 
             // Mutual exclusion: starting a review loop clears improve/refactor.
             app.improve_mode = None;
             app.session.improve_mode = None;
+            // Also cancel any improve/refactor continuation that was queued
+            // (e.g. interrupt_and_queue_synthetic_message during a busy state):
+            // the review loop now owns the turn, and a leftover improve "fix
+            // this" prompt must not be dispatched mid-review. Mirror the
+            // clear_review_loop_on_improve / /review-loop stop semantics.
+            app.queued_messages.clear();
+            app.hidden_queued_system_messages.clear();
+            app.pending_queued_dispatch = false;
             let state = app
                 .session
                 .review_loop
