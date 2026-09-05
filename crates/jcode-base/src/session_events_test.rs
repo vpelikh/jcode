@@ -1741,6 +1741,47 @@ fn test_compaction_cache_tracks_clear_and_reset_order() {
                session.derive_compaction().map(|c| c.summary_text.clone()));
 }
 
+/// `set_compaction` with an invalid compaction state must not leave the legacy
+/// `self.compaction` vector diverging from the derived log. `append_event`
+/// silently skips an invalid `SetCompaction` (e.g. `covers_up_to_turn` exceeding
+/// `original_turn_count`); if the method still set `self.compaction = Some(...)`,
+/// `derive_compaction()` (None) and the legacy vector (Some) would disagree and
+/// `rederive_all_checked` would fail. The method must only publish the legacy
+/// vector when the event was actually recorded.
+#[test]
+fn test_set_compaction_invalid_state_does_not_desync() {
+    let mut session = Session::create_with_id("setc_bad_rt".to_string(), None, Some("bad".to_string()));
+    let bad = StoredCompactionState {
+        summary_text: "bad".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 5,
+        original_turn_count: 1,
+        compacted_count: 1,
+    };
+    session.set_compaction(bad.clone());
+
+    // The invalid SetCompaction event is rejected, so neither the log nor the
+    // legacy vector records it.
+    assert_eq!(
+        session
+            .event_map
+            .events
+            .iter()
+            .filter(|e| matches!(e.op, SessionEventOp::SetCompaction { .. }))
+            .count(),
+        0,
+        "invalid SetCompaction event must be rejected"
+    );
+    assert!(
+        session.compaction.is_none(),
+        "invalid compaction must not be published to the legacy vector"
+    );
+    assert_eq!(session.derive_compaction(), None, "derived compaction must be None too");
+    session
+        .rederive_all_checked()
+        .expect("event log must stay consistent with legacy after rejected set_compaction");
+}
+
 #[test]
 fn test_in_place_mutation_reflects_in_derived_and_provider_view() {
     // Round F: an in-place content mutation (remove_tool_use_blocks) must be

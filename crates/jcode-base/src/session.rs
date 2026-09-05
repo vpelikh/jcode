@@ -1675,13 +1675,20 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
             parent_id: None,
             version: 1,
         };
+        let events_before = self.event_map.events.len();
         self.event_map.append_event(event);
-        
-        // Keep backward compatibility
-        self.memory_profile_cache.memory_injections_count += 1;
-        self.memory_profile_cache.memory_injections_json_bytes += estimate_json_bytes(&injection);
-        self.memory_injections.push(injection);
-        self.mark_memory_injections_append_dirty();
+        // Only publish the legacy vector when the event was actually recorded.
+        // `append_event` silently skips an invalid memory injection (e.g. empty
+        // content), which would otherwise leave `self.memory_injections`
+        // diverging from the derived log.
+        let recorded = self.event_map.events.len() > events_before;
+        if recorded {
+            // Keep backward compatibility
+            self.memory_profile_cache.memory_injections_count += 1;
+            self.memory_profile_cache.memory_injections_json_bytes += estimate_json_bytes(&injection);
+            self.memory_injections.push(injection);
+            self.mark_memory_injections_append_dirty();
+        }
     }
 
     pub fn injected_memory_ids(&self) -> Vec<String> {
@@ -1720,11 +1727,18 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
             parent_id: None,
             version: 1,
         };
+        let events_before = self.event_map.events.len();
         self.event_map.append_event(event);
-        self.memory_profile_cache.replay_events_count += 1;
-        self.memory_profile_cache.replay_events_json_bytes += estimate_json_bytes(replay_event);
-        self.replay_events.push(replay_event.clone());
-        self.mark_replay_events_append_dirty();
+        // Only publish the legacy vector when the event was actually recorded.
+        // `append_event` silently skips an invalid replay event, which would
+        // otherwise leave `self.replay_events` diverging from the derived log.
+        let recorded = self.event_map.events.len() > events_before;
+        if recorded {
+            self.memory_profile_cache.replay_events_count += 1;
+            self.memory_profile_cache.replay_events_json_bytes += estimate_json_bytes(replay_event);
+            self.replay_events.push(replay_event.clone());
+            self.mark_replay_events_append_dirty();
+        }
     }
 
     /// Get current messages from event log (derives pure state)
@@ -1785,9 +1799,18 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
             parent_id: None,
             version: 1,
         };
+        let events_before = self.event_map.events.len();
         self.event_map.append_event(event);
-        self.compaction = Some(compaction);
-        self.mark_messages_append_dirty();
+        let recorded = self.event_map.events.len() > events_before;
+        if recorded {
+            // Only publish the legacy vector when the event was actually recorded.
+            // `append_event` silently skips an invalid compaction (e.g.
+            // `covers_up_to_turn`/`compacted_count` exceeding
+            // `original_turn_count`), which would otherwise leave `self.compaction`
+            // diverging from the derived log and fail `rederive_all_checked`.
+            self.compaction = Some(compaction);
+            self.mark_messages_append_dirty();
+        }
     }
 
     /// Complete a log-bracketed compaction (deepseek-harness takeaway #5).
