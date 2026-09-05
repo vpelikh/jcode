@@ -1757,6 +1757,9 @@ mod tests {
             // "now" with an intervening multi-word target ("bash tool")
             "I'll call the bash tool now.",
             "Let me call the bash tool now.",
+            // bare multi-word target ending ("call the bash tool.")
+            "I'll call the bash tool.",
+            "I'll call the run command.",
         ];
         for turn in stalls {
             assert!(

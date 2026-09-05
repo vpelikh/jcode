@@ -668,9 +668,46 @@ impl Agent {
             if Self::call_followed_by_action_infinitive(after) {
                 return true;
             }
+            // A multi-word TARGET whose tail is a tool-kind noun and then the
+            // turn ends ("call the bash tool.", "call the run command now").
+            // The needle stops at the earlier word ("the bash"/"the run") but
+            // the whole noun phrase still names the tool being invoked, not
+            // something given a label.
+            if Self::call_tail_is_tool_kind_end(after) {
+                return true;
+            }
             start = end;
         }
         false
+    }
+
+    /// True when the text right after the matched "call <target>" phrase is a
+    /// tool-kind noun (tool/command/script/shell/cmd...) that completes the
+    /// multi-word target and then the turn ends (" the bash tool.", " the run
+    /// command now"). The needle matched only the earlier word, but the trailing
+    /// noun is the actual tool being invoked, so reject nothing more.
+    fn call_tail_is_tool_kind_end(after: &str) -> bool {
+        const TOOL_KINDS: [&str; 6] = ["tool", "command", "script", "shell", "cmd", "utility"];
+        let first = after
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .next()
+            .unwrap_or("");
+        if !TOOL_KINDS.contains(&first) {
+            return false;
+        }
+        // The noun must then hit end/punctuation or "now" (a bare invocation),
+        // not continue into a name or an action-infinitive we'd handle above.
+        let tail = after.trim_start();
+        let rest = &tail[first.len()..];
+        rest.trim_start().is_empty()
+            || rest.trim_start().starts_with(" now")
+            || rest.trim_start().starts_with('.')
+            || rest.trim_start().starts_with(',')
+            || rest.trim_start().starts_with('!')
+            || rest.trim_start().starts_with('?')
     }
 
     /// After the matched "call <target>" phrase, accept a " to <action-verb>"
