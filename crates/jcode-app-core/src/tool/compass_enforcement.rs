@@ -127,6 +127,110 @@ impl CompassAvailability {
     }
 }
 
+/// The input key that disables the "redirect agentgrep to compass_query"
+/// enforcement for a single call. Mirrored in the agentgrep schema.
+pub(crate) const AGENTGREP_RAW_FALLBACK_KEY: &str = "allow_raw_fallback";
+
+/// Whether an agentgrep call explicitly opted out of `compass_query`-first
+/// enforcement. This is the caller's documented escape hatch for searches that
+/// Compass cannot serve: building outputs, logs, and files outside the indexed
+/// tree (see the redirected message and the agentgrep schema).
+pub(crate) fn agentgrep_requests_raw_fallback(input: &serde_json::Value) -> bool {
+    match input.get(AGENTGREP_RAW_FALLBACK_KEY) {
+        Some(serde_json::Value::Bool(opted_out)) => *opted_out,
+        Some(serde_json::Value::String(raw)) => raw.trim().eq_ignore_ascii_case("true"),
+        _ => false,
+    }
+}
+
+/// Whether an agentgrep call is a full-text/pattern grep search (mode "grep"
+/// or omitted, which defaults to grep). Filename (`find`), single-file
+/// (`outline`), and relationship (`trace`) lookups are distinct operations that
+/// Compass's semantic search does not replace, so enforcement targets only the
+/// grep mode.
+pub(crate) fn agentgrep_call_is_grep_mode(input: &serde_json::Value) -> bool {
+    match input.get("mode").and_then(|v| v.as_str()) {
+        Some(m) => m.eq_ignore_ascii_case("grep"),
+        None => true,
+    }
+}
+
+/// The redirecting output returned when an `agentgrep` call is intercepted by
+/// the `compass_query`-first code-enforcement tier. It explains why grep did
+/// not run, directs the model to `compass_query`, and gives the explicit,
+/// self-documenting escape hatch (retry with `allow_raw_fallback`) for searches
+/// that genuinely need raw grep.
+pub(crate) fn compass_redirect_output(input: &serde_json::Value) -> super::ToolOutput {
+    let query = input
+        .get("query")
+        .or_else(|| input.get("pattern")) // legacy grep-alias calls pass `pattern`
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let query_text = if query.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" (query: {})", truncate_middle(query, 200))
+    };
+    // Preserve explicit search filters so the follow-up compass_query stays
+    // confined to the same subset the grep call was targeting.
+    //
+    // Only `path` maps cleanly onto `compass_query`'s `path` filter (a file or
+    // directory substring). `glob` is a filename pattern that has no direct
+    // compass_query equivalent, so it is surfaced separately as a narrowing
+    // hint rather than as a `path` value the model would blindly re-use.
+    let path = input
+        .get("path")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+    let glob = input
+        .get("glob")
+        .or_else(|| input.get("include")) // legacy grep-alias calls pass `include`
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+    let path_text = path
+        .map(|s| format!(", keeping the search path `{}`", truncate_middle(s, 120)))
+        .unwrap_or_default();
+    let glob_text = glob
+        .map(|s| format!(", and only files matching `{}`", truncate_middle(s, 120)))
+        .unwrap_or_default();
+    super::ToolOutput::new(format!(
+        "⚠️ `agentgrep` was intercepted before running: `compass_query` is available \
+         for this workspace and must be attempted before raw grep.\n\n\
+         Do not repeat this `agentgrep` call unchanged. Instead call `compass_query` \
+         with the same intent (natural language query + optional `path`{path_text}) to search the \
+         code graph first{query_text}{glob_text}. The first call may build the index for this \
+         workspace; that is expected.\n\n\
+         Only if `compass_query` genuinely cannot answer (for example you need to search \
+         files outside the indexed tree, build outputs, or logs; or the index fails to \
+         build) retry `agentgrep` with `\"allow_raw_fallback\": true` to force raw grep \
+         for this one call."
+    ))
+    .with_title("agentgrep redirected to compass_query")
+    .with_metadata(serde_json::json!({
+        "redirected_to": "compass_query",
+        "reason": "compass-first enforcement",
+    }))
+}
+
+pub(crate) fn truncate_middle(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    // Below 3 chars the ellipsis itself cannot fit, so fall back to a plain
+    // prefix to preserve the invariant that the result is at most `max` chars.
+    if max < 3 {
+        return s.chars().take(max).collect();
+    }
+    let half = (max.saturating_sub(3)) / 2;
+    let mut prefix: Vec<char> = s.chars().take(half).collect();
+    let mut suffix: Vec<char> = s.chars().rev().take(half).collect();
+    suffix.reverse();
+    let mut out: String = prefix.drain(..).collect();
+    out.push_str("...");
+    out.push_str(&suffix.iter().collect::<String>());
+    out
+}
+
 /// Decide the `compass_query`-first enforcement for one `agentgrep` call.
 ///
 /// Takes the call input, the availability snapshot, and the session id, and
@@ -141,9 +245,6 @@ pub fn decide_enforcement(
     availability: CompassAvailability,
     session_id: &str,
 ) -> EnforcementDecision {
-    use super::agentgrep_call_is_grep_mode;
-    use super::agentgrep_requests_raw_fallback;
-
     if !availability.prefer_compass_query || !availability.compass_invokable() {
         return EnforcementDecision::PassThrough;
     }
@@ -154,7 +255,7 @@ pub fn decide_enforcement(
     if grep_mode && !agentgrep_requests_raw_fallback(input) {
         return EnforcementDecision::Intercept {
             redirect: true,
-            output: super::compass_redirect_output(input),
+            output: compass_redirect_output(input),
         };
     }
 

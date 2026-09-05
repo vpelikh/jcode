@@ -1691,7 +1691,7 @@ async fn read_only_tools_are_concurrency_safe() {
 
 #[test]
 fn agentgrep_raw_fallback_flag_is_only_an_unambiguous_yes() {
-    use super::agentgrep_requests_raw_fallback;
+    use super::compass_enforcement::agentgrep_requests_raw_fallback;
 
     assert!(agentgrep_requests_raw_fallback(
         &serde_json::json!({ "allow_raw_fallback": true })
@@ -1718,7 +1718,7 @@ fn agentgrep_raw_fallback_flag_is_only_an_unambiguous_yes() {
 
 #[test]
 fn compass_redirect_output_mentions_escape_hatch_and_query() {
-    use super::compass_redirect_output;
+    use super::compass_enforcement::compass_redirect_output;
 
     let out = compass_redirect_output(&serde_json::json!({ "query": "find init" }));
     assert!(out.output.contains("compass_query"), "must point at compass_query");
@@ -2417,7 +2417,7 @@ async fn batch_subcall_agentgrep_is_redirected_to_compass() {
 
 #[test]
 fn truncate_middle_shortens_long_input_but_keeps_short_input_unchanged() {
-    use super::truncate_middle;
+    use super::compass_enforcement::truncate_middle;
 
     // Short input passes through untouched.
     assert_eq!(truncate_middle("hello", 200), "hello");
@@ -2458,7 +2458,7 @@ fn truncate_middle_shortens_long_input_but_keeps_short_input_unchanged() {
 
 #[test]
 fn compass_redirect_output_handles_very_long_query_gracefully() {
-    use super::compass_redirect_output;
+    use super::compass_enforcement::compass_redirect_output;
 
     // A pathological query must not blow up the message or produce an enormous
     // output; the query is echoed with middle-truncation.
@@ -2637,7 +2637,7 @@ async fn batch_grep_alias_subcall_is_redirected_and_raw_fallback_runs() {
 
 #[test]
 fn agentgrep_grep_mode_detection_targets_only_full_text_searches() {
-    use super::agentgrep_call_is_grep_mode;
+    use super::compass_enforcement::agentgrep_call_is_grep_mode;
 
     // Omitted mode defaults to grep.
     assert!(agentgrep_call_is_grep_mode(&serde_json::json!({})));
