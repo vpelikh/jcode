@@ -743,61 +743,25 @@ impl Registry {
         };
 
         // Code-enforcement tier for the "use `compass_query` before `agentgrep`"
-        // guidance. The prompt tier only *asks* the model to try semantic search
-        // first; this tier makes it impossible for an `agentgrep` call to run grep
-        // when a Compass index is available, guaranteeing `compass_query` is
-        // attempted before raw grep at the tool level.
-        //
-        // The policy lives in `compass_enforcement::decide_enforcement`, which
-        // returns `PassThrough` or one of two guidance outputs:
-        //   - redirect: a plain full-text grep with compass available.
-        //   - raw-fallback-block: an `allow_raw_fallback` grep retried while a
-        //     redirect is still outstanding for this session (prod-observed
-        //     bypass where the model never attempted compass).
-        // It is skipped when not authoritative: compass is not registered or is
-        // disabled by policy, there is no working dir to search, the operator
-        // opted out, or the call is not a full-text grep (find/outline/trace are
-        // distinct operations compass does not replace).
-        //
-        // Both intercepted flows route through the same observer/telemetry
-        // surfaces as a normal tool outcome so dashboards, hooks, and usage
-        // counters all see the interception as a successful, coherent result.
-        // They sit before the `pre_tool` policy hook because they execute no tool;
-        // the model's follow-up `compass_query` (or bypassed agentgrep) is what
-        // the hook gates.
-        if let Some((redirect, intercept)) = self
-            .enforce_compass_first(&tools, resolved_name, &input, prefer_compass_query, &ctx)
+        // guidance. The policy, decision, and side effects live entirely in
+        // `tool::compass_enforcement` (see `Registry::enforce_compass_first`),
+        // which returns a guidance result to short-circuit with, or `None` to
+        // run the tool normally. An interception sits before the `pre_tool`
+        // policy hook because it executes no tool; the model's follow-up
+        // `compass_query` (or bypassed agentgrep) is what the hook gates.
+        if let Some(intercept) = self
+            .enforce_compass_first(
+                tools,
+                name,
+                resolved_name,
+                &input,
+                prefer_compass_query,
+                &ctx,
+            )
             .await
         {
-            // A redirect arms the per-session pending flag so a later
-            // raw-fallback grep (before any compass attempt) is refused by
-            // the block decision; the block leaves the flag as-is (the model
-            // still owes a compass attempt).
-            // Release the tools read lock before running the observer/telemetry
-            // hooks, matching the normal execution path (which drops it before
-            // any post-processing). This keeps the guard scoped to the lookup so
-            // a future hook change that re-enters the registry can't deadlock.
-            drop(tools);
-            if redirect {
-                compass_enforcement::mark_redirect_pending(&ctx.session_id);
-            }
-            let phase = if redirect {
-                compass_enforcement::REDIRECT_PHASE
-            } else {
-                compass_enforcement::BLOCKED_PHASE
-            };
-            crate::telemetry::record_tool_execution(resolved_name, &input, true, 0);
-            Self::fire_post_tool_hook(resolved_name, &ctx, &Ok(intercept.clone()), 0);
-            crate::logging::event_info(
-                "TOOL_LIFECYCLE",
-                Self::tool_lifecycle_fields(phase, name, resolved_name, &input, &ctx),
-            );
-            return Ok(intercept);
+            return intercept;
         }
-
-
-        // (Not on the redirect path) drop the lock before executing
-        drop(tools);
 
         // User-configured pre_tool gate: external policy hook that can block
         // this call (exit 2). Skipped entirely when not configured.
@@ -871,49 +835,6 @@ impl Registry {
         crate::logging::event_info("TOOL_LIFECYCLE", fields);
 
         Ok(output)
-    }
-
-    /// Apply the compass-query-first enforcement tier for one tool call.
-    ///
-    /// For an `agentgrep` call, decides whether to redirect it to `compass_query`
-    /// (a plain grep with Compass invokable) or refuse a raw-fallback bypass
-    /// (retried before any compass attempt). Returns `Some((redirect, output))`
-    /// to short-circuit execution with that guidance, or `None` to run normally.
-    async fn enforce_compass_first(
-        &self,
-        tools_guard: &tokio::sync::RwLockReadGuard<'_, HashMap<String, Arc<dyn Tool>>>,
-        resolved_name: &str,
-        input: &Value,
-        prefer_compass_query: bool,
-        ctx: &ToolContext,
-    ) -> Option<(bool, ToolOutput)> {
-        // The short-circuit only applies to agentgrep; other tools run normally.
-        if resolved_name != "agentgrep" {
-            return None;
-        }
-        let availability = compass_enforcement::CompassAvailability {
-            prefer_compass_query,
-            compass_registered: tools_guard.contains_key("compass_query"),
-            compass_not_disabled: !session_tool_is_disabled(&ctx.session_id, "compass_query"),
-            has_working_dir: ctx.working_dir.is_some(),
-        };
-        match compass_enforcement::decide_enforcement(input, availability, &ctx.session_id) {
-            compass_enforcement::EnforcementDecision::PassThrough => None,
-            compass_enforcement::EnforcementDecision::Intercept { redirect, output } => {
-                Some((redirect, output))
-            }
-        }
-    }
-
-    /// Release any outstanding compass-redirect after a real `compass_query`
-    /// attempt. A genuine attempt satisfies the redirect whether it returned a
-    /// warm result or a "building, try again" hint, letting a
-    /// genuinely-unindexable project fall back to raw grep after one real
-    /// compass call.
-    fn clear_compass_redirect_after_run(&self, resolved_name: &str, ctx: &ToolContext) {
-        if resolved_name == "compass_query" {
-            compass_enforcement::clear_redirect_pending(&ctx.session_id);
-        }
     }
 
     /// Check if a tool output would overflow the context window and truncate if needed.
