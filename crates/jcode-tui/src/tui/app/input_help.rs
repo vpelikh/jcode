@@ -10,6 +10,9 @@ impl App {
             "compact" => {
                 "/compact\nForce context compaction now.\nStarts background summarization and applies it automatically when ready.\n\n/compact mode\nShow current compaction mode for this session.\n\n/compact mode <reactive|proactive|semantic>\nChange compaction mode for this session."
             }
+            "cd" => {
+                "/cd <directory>\nChange the session's working directory (e.g. into a linked git worktree).\n\nParts that follow the directory: AGENTS.md, project skills, the default cwd for shell/read/write tools, and the git info widget. History is preserved.\n\nSupports absolute paths, relative paths (resolved from the current working directory), and ~ for the home directory."
+            }
             "cache" => {
                 "/cache stats\nShow KV cache stats for this session: cache read/write totals, hit ratios, current baseline, and recent miss attributions.\n\n/cache\nToggle Anthropic cache TTL between 5 minutes and 1 hour.\n\n/cache 1h  or  /cache 5m\nSet Anthropic cache TTL explicitly."
             }

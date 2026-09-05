@@ -1874,11 +1874,22 @@ pub(super) async fn handle_client(
             }
 
             Request::SetWorkingDir { id, working_dir } => {
+                if reject_if_agent_busy_for_request(
+                    id,
+                    "set_working_dir",
+                    &client_session_id,
+                    client_is_processing,
+                    &agent,
+                    &client_event_tx,
+                ) {
+                    continue;
+                }
                 handle_set_working_dir(
                     id,
                     working_dir,
                     &agent,
                     &client_session_id,
+                    &swarm_members,
                     &client_event_tx,
                 )
                 .await;

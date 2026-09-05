@@ -313,9 +313,10 @@ impl Agent {
 
 /// Resolve a user-supplied working directory (from `/cd`) to an absolute path.
 ///
-/// Supports `~`/`~user` home expansion and relative paths, which are resolved
-/// against `base` (the session's current working directory, not the daemon's
-/// process cwd so the result is stable regardless of where the server launched).
+/// Supports `~`/`~/...` home expansion (for the *current* user) and relative
+/// paths, which are resolved against `base` (the session's current working
+/// directory, not the daemon's process cwd so the result is stable regardless
+/// of where the server launched).
 fn resolve_working_dir(base: &std::path::Path, dir: &str) -> anyhow::Result<String> {
     let dir = dir.trim();
     if dir.is_empty() {

@@ -2106,9 +2106,10 @@ async fn handle_remote_key_internal(
                         return Ok(());
                     }
                     if app.is_processing {
-                        app.set_status_notice(
-                            "Working directory change will apply after the current turn.".to_string(),
-                        );
+                        app.push_display_message(DisplayMessage::error(
+                            "The agent is currently working. Wait for it to finish, then run /cd again.".to_string(),
+                        ));
+                        return Ok(());
                     }
                     remote.set_working_dir(new_dir.to_string()).await?;
                     return Ok(());
