@@ -267,11 +267,14 @@ impl Agent {
     /// Grouped working-directory change invoked from a user `/cd` request.
     ///
     /// Beyond [`Self::set_working_dir`], this persists the session, refreshes
-    /// project-scoped skills, and carries the change to the model. For a
-    /// session with no visible conversation yet, the initial session-context
-    /// system-reminder is rewritten with the new directory. For a session that
-    /// has progressed, that reminder is left untouched and a model-visible
-    /// notice is appended instead.
+    /// the AGENTS.md snapshot, and carries the change to the model. Project
+    /// skills do not need an eager reload here: they are resolved dynamically
+    /// from the tool context's working_dir on each call, so changing the dir
+    /// re-scopes them automatically. For a session with no visible
+    /// conversation yet, the initial session-context system-reminder is
+    /// rewritten with the new directory. For a session that has progressed,
+    /// that reminder is left untouched and a model-visible notice is appended
+    /// instead.
     ///
     /// Returns `Ok(Some(resolved))` when the working directory actually changed,
     /// with the canonicalized path that was stored (so callers can fan out a
