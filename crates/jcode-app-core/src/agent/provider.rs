@@ -423,4 +423,57 @@ mod resolve_working_dir_tests {
         assert_eq!(std::path::Path::new(&result), expected.as_path());
         std::fs::remove_dir_all(std::env::temp_dir().join("jcode-wd-dotdot-base")).unwrap();
     }
+
+    #[test]
+    fn tilde_expands_to_home() {
+        let home = std::env::temp_dir().join("jcode-wd-home-test");
+        let sub = home.join("subdir");
+        std::fs::create_dir_all(&sub).unwrap();
+        let prev_home = std::env::var_os("HOME");
+        crate::env::set_var("HOME", &home);
+
+        let result = resolve_working_dir(std::path::Path::new("/tmp"), "~/subdir").unwrap();
+        assert_eq!(
+            std::path::Path::new(&result),
+            sub.canonicalize().unwrap().as_path(),
+            "~/... must expand to the user's home directory"
+        );
+        // Bare `~` resolves to home itself.
+        let bare = resolve_working_dir(std::path::Path::new("/tmp"), "~").unwrap();
+        assert_eq!(
+            std::path::Path::new(&bare),
+            home.canonicalize().unwrap().as_path(),
+            "bare ~ must resolve to the home directory"
+        );
+
+        if let Some(prev) = prev_home {
+            crate::env::set_var("HOME", prev);
+        } else {
+            crate::env::remove_var("HOME");
+        }
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn symlink_is_resolved_to_canonical_target() {
+        let root = std::env::temp_dir().join("jcode-wd-symlink-test");
+        let real = root.join("real");
+        let link = root.join("link");
+        std::fs::create_dir_all(&real).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // If symlinks are unavailable (non-unix), the test is a no-op.
+        #[cfg(not(unix))]
+        if true {
+            return;
+        }
+
+        let result = resolve_working_dir(&root, "link").unwrap();
+        assert_eq!(
+            std::path::Path::new(&result),
+            real.canonicalize().unwrap().as_path(),
+            "a symlink arg must resolve to its canonical target"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }
