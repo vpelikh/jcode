@@ -3,6 +3,7 @@ pub(crate) mod compass_query;
 pub mod ambient;
 mod apply_patch;
 mod bash;
+mod compass_enforcement;
 mod batch;
 mod bg;
 mod browser;
@@ -890,6 +891,14 @@ impl Registry {
             // a future hook change that re-enters the registry can't deadlock.
             drop(tools);
             let redirect = compass_redirect_output(&input);
+            // Remember, per session, that we just told the model to try
+            // `compass_query`. Until the session actually makes a compass_query
+            // attempt, a retried `agentgrep` with `allow_raw_fallback` is refused
+            // below so the model cannot short-circuit the enforcement the same
+            // turn it was redirected (prod-observed: model retried agentgrep with
+            // `allow_raw_fallback: true` on the turn after a redirect and never
+            // called compass_query at all).
+            compass_enforcement::mark_redirect_pending(&ctx.session_id);
             // Route the interception through the same observer/telemetry
             // surfaces as a normal tool outcome so dashboards, hooks, and the
             // session tool-usage counters all see the redirected call (recorded
@@ -908,6 +917,36 @@ impl Registry {
                 ),
             );
             return Ok(redirect);
+        }
+
+        // A retried `agentgrep` that already asked for the raw fallback while a
+        // `compass_query` redirect is still outstanding for this session. This
+        // is the prod-observed bypass: after one redirect the model jumped
+        // straight to `allow_raw_fallback: true` and never attempted compass. We
+        // refuse that coercion-free bypass and force a genuine compass attempt
+        // first. Once the session executes any `compass_query`, the pending flag
+        // clears and raw fallback is allowed again (so a genuinely-unindexable
+        // project can still fall back after one compass attempt).
+        if resolved_name == "agentgrep"
+            && prefer_compass_query
+            && agentgrep_requests_raw_fallback(&input)
+            && compass_enforcement::redirect_pending(&ctx.session_id)
+        {
+            drop(tools);
+            let blocked = compass_enforcement::raw_fallback_blocked_output();
+            crate::telemetry::record_tool_execution(resolved_name, &input, true, 0);
+            Self::fire_post_tool_hook(resolved_name, &ctx, &Ok(blocked.clone()), 0);
+            crate::logging::event_info(
+                "TOOL_LIFECYCLE",
+                Self::tool_lifecycle_fields(
+                    "raw_fallback_blocked_pending_compass",
+                    name,
+                    resolved_name,
+                    &input,
+                    &ctx,
+                ),
+            );
+            return Ok(blocked);
         }
 
         // (Not on the redirect path) drop the lock before executing
@@ -947,6 +986,14 @@ impl Registry {
         let started_at = std::time::Instant::now();
         let result = tool.execute(input.clone(), ctx.clone()).await;
         let latency_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+
+        // A genuine `compass_query` attempt satisfies any outstanding redirect
+        // for this session, whether it returned a warm result or a "building,
+        // try again" hint. This lets a genuinely-unindexable project fall back
+        // to raw grep after one real compass attempt.
+        if resolved_name == "compass_query" {
+            compass_enforcement::clear_redirect_pending(&ctx.session_id);
+        }
 
         crate::telemetry::record_tool_execution(resolved_name, &input, result.is_ok(), latency_ms);
         Self::fire_post_tool_hook(resolved_name, &ctx, &result, latency_ms);

@@ -1931,6 +1931,110 @@ async fn agentgrep_runs_when_allow_raw_fallback_is_passed() {
 }
 
 #[tokio::test]
+async fn agentgrep_raw_fallback_blocked_while_compass_redirect_pending_then_allowed_after_compass() {
+    use super::compass_enforcement;
+
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    std::fs::write(
+        temp.path().join("sample.txt"),
+        "redir_uniquetoken beta\n",
+    )
+    .expect("write file");
+
+    let session_id = "enforcement-pending-redirect-test";
+    let ctx = ToolContext {
+        session_id: session_id.to_string(),
+        message_id: "test".to_string(),
+        tool_call_id: "call-pending-1".to_string(),
+        working_dir: Some(temp.path().to_path_buf()),
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: ToolExecutionMode::Direct,
+    };
+
+    // 1. A plain grep call is redirected to compass (enforcement), which marks
+    //    the session's compass redirect pending.
+    let redirect = registry
+        .execute(
+            "agentgrep",
+            serde_json::json!({ "query": "redir_uniquetoken" }),
+            ctx.clone(),
+        )
+        .await
+        .expect("grep should be redirected");
+    assert!(
+        redirect.output.contains("intercepted before running"),
+        "grep should redirect to compass, got: {}",
+        redirect.output
+    );
+    assert!(
+        compass_enforcement::redirect_pending(session_id),
+        "redirect should mark the session's compass redirect pending"
+    );
+
+    // 2. Immediately retrying `agentgrep` with `allow_raw_fallback` is refused
+    //    because the model has not attempted compass_query yet (prod-observed
+    //    bypass).
+    let blocked = registry
+        .execute(
+            "agentgrep",
+            serde_json::json!({
+                "query": "redir_uniquetoken",
+                "allow_raw_fallback": true,
+            }),
+            ctx.clone(),
+        )
+        .await
+        .expect("raw fallback should be refused, not run");
+    assert!(
+        !blocked.output.contains("redir_uniquetoken"),
+        "raw fallback should not return real matches while redirect pending, got: {}",
+        blocked.output
+    );
+    assert!(
+        blocked.output.contains("compass_query"),
+        "refusal should direct the model to compass_query, got: {}",
+        blocked.output
+    );
+
+    // 3. Once a genuine compass_query attempt happens (even an errored one, e.g.
+    //    a non-git temp dir), the pending flag clears and raw fallback is allowed
+    //    again.
+    let _ = registry
+        .execute(
+            "compass_query",
+            serde_json::json!({ "query": "redir_uniquetoken" }),
+            ctx.clone(),
+        )
+        .await;
+    assert!(
+        !compass_enforcement::redirect_pending(session_id),
+        "compass_query attempt should clear the pending redirect"
+    );
+
+    let allowed = registry
+        .execute(
+            "agentgrep",
+            serde_json::json!({
+                "query": "redir_uniquetoken",
+                "allow_raw_fallback": true,
+            }),
+            ctx.clone(),
+        )
+        .await
+        .expect("raw fallback should run after compass attempted");
+    assert!(
+        allowed.output.contains("redir_uniquetoken"),
+        "raw fallback should return real matches after compass attempted, got: {}",
+        allowed.output
+    );
+    clear_session_tool_policy(session_id);
+}
+
+#[tokio::test]
 async fn agentgrep_runs_when_compass_is_policy_disabled() {
     use std::collections::HashSet;
 
@@ -2299,7 +2403,20 @@ async fn batch_grep_alias_subcall_is_redirected_and_raw_fallback_runs() {
         redirected.output.to_string()
     );
 
-    // Nested `grep` with allow_raw_fallback runs real grep.
+    // A genuine compass_query attempt (even an errored one on a non-git temp
+    // dir) clears the session's pending-redirect, so the escape hatch below is
+    // reachable again. This mirrors the intended flow: the model must actually
+    // attempt compass before falling back to raw grep.
+    let _ = registry
+        .execute(
+            "compass_query",
+            serde_json::json!({ "query": "uniquetoken" }),
+            ctx.clone(),
+        )
+        .await;
+
+    // Nested `grep` with allow_raw_fallback runs real grep after compass was
+    // attempted.
     let fallback = registry
         .execute(
             "batch",

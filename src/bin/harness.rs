@@ -197,7 +197,14 @@ async fn main() -> Result<()> {
     }
 
     for (idx, case) in cases.iter().enumerate() {
+        // Each harness case is an isolated diagnostic probe. Give it its own
+        // session id so per-session tool state (e.g. the compass-query-first
+        // pending-redirect that forbids `allow_raw_fallback` until compass is
+        // attempted) does not leak between independent probes: the redirect
+        // case and the raw-fallback case each demonstrate their own behavior
+        // in isolation, matching how a real session would see them.
         let ctx = ToolContext {
+            session_id: format!("{}-case-{}", base_ctx.session_id, idx + 1),
             tool_call_id: format!("harness-{}", idx + 1),
             ..base_ctx.clone()
         };
