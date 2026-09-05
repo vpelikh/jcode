@@ -875,6 +875,53 @@ fn goal_scorecard_shows_missing_trade_off() {
     );
 }
 
+/// The scorecard surfaces the trade-off row before a feedback-loop row when
+/// both fail, matching the gate order (settle the architecture, then verify it).
+#[test]
+fn goal_scorecard_surfaces_trade_off_before_feedback_loop() {
+    let todos = vec![crate::todo::TodoItem {
+        id: "1".to_string(),
+        content: "Render the card".to_string(),
+        status: "completed".to_string(),
+        priority: "high".to_string(),
+        group: Some("quality".to_string()),
+        confidence: Some(crate::todo::ConfidenceState::Validated),
+        completion_confidence: Some(crate::todo::ConfidenceState::Validated),
+        ..Default::default()
+    }];
+    // Both trade_off (None) and feedback-loop relevance (Narrow->fails at
+    // Involved) are failing, so the scorecard must list Trade-off first.
+    let goals = vec![crate::todo::TodoGoal {
+        group: Some("quality".to_string()),
+        difficulty: Some(crate::todo::Difficulty::Involved),
+        closed_feedback_loop: Some(crate::todo::FeedbackLoopState::Closed),
+        feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Synthetic),
+        feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::EdgeAndIntegrationPaths),
+        feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
+        delivery_state: Some(crate::todo::DeliveryState::OutcomeDelivered),
+        ..Default::default()
+    }];
+    let msg =
+        DisplayMessage::todos(serde_json::json!({ "todos": todos, "goals": goals }).to_string());
+    let lines = render_todos_message(&msg, 100, crate::config::DiffDisplayMode::Off);
+    let plain = lines
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let trade_off_idx = plain
+        .find("Trade-off")
+        .expect("trade-off row present in scorecard");
+    let relevance_idx = plain
+        .find("Relevance")
+        .expect("relevance row present in scorecard");
+    assert!(
+        trade_off_idx < relevance_idx,
+        "Trade-off must appear before Relevance in the scorecard:\n{plain}"
+    );
+}
+
 #[test]
 fn render_todos_message_wraps_goal_scores_at_narrow_widths() {
     let todos = vec![crate::todo::TodoItem {
