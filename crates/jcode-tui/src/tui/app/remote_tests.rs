@@ -850,6 +850,106 @@ fn handle_server_event_applies_remote_memory_activity_snapshot() {
     crate::memory::clear_activity();
 }
 
+#[test]
+fn session_working_dir_changed_updates_app_for_active_session() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+    let mut app = create_test_app();
+    app.remote_session_id = Some("active_sess".to_string());
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    let handled = handle_server_event(
+        &mut app,
+        ServerEvent::SessionWorkingDirChanged {
+            session_id: "active_sess".to_string(),
+            working_dir: "/worktrees/feat-panel".to_string(),
+        },
+        &mut remote,
+    );
+
+    assert!(handled, "change for the active session must be consumed");
+    assert_eq!(
+        app.session.working_dir.as_deref(),
+        Some("/worktrees/feat-panel"),
+        "the local app session must re-scope to the new directory"
+    );
+    let last = app.display_messages().last().expect("display message");
+    assert_eq!(last.role, "system");
+    assert!(
+        last.content.contains("worktrees/feat-panel"),
+        "unexpected notice: {}",
+        last.content
+    );
+    assert_eq!(
+        app.status_notice.as_ref().map(|(s, _)| s.as_str()),
+        Some("Working directory changed")
+    );
+}
+
+#[test]
+fn session_working_dir_changed_ignored_for_other_session() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+    let mut app = create_test_app();
+    app.remote_session_id = Some("active_sess".to_string());
+    let original_dir = app.session.working_dir.clone();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    let handled = handle_server_event(
+        &mut app,
+        ServerEvent::SessionWorkingDirChanged {
+            session_id: "other_sess".to_string(),
+            working_dir: "/worktrees/other".to_string(),
+        },
+        &mut remote,
+    );
+
+    assert!(!handled, "a change for a non-active session must be ignored");
+    assert_eq!(
+        app.session.working_dir, original_dir,
+        "an unrelated session's working-dir change must not touch the local session"
+    );
+    assert!(
+        app.display_messages().is_empty(),
+        "no notice should be shown for a non-active session"
+    );
+}
+
+#[test]
+fn session_working_dir_same_value_is_idempotent() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+    let mut app = create_test_app();
+    app.remote_session_id = Some("active_sess".to_string());
+    app.session.working_dir = Some("/worktrees/feat-panel".to_string());
+    app.push_display_message(jcode_tui_messages::DisplayMessage::system(
+        "pre-existing".to_string(),
+    ));
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    let handled = handle_server_event(
+        &mut app,
+        ServerEvent::SessionWorkingDirChanged {
+            session_id: "active_sess".to_string(),
+            working_dir: "/worktrees/feat-panel".to_string(),
+        },
+        &mut remote,
+    );
+
+    // The working dir is unchanged, but a /cd to the same tree still surfaces a
+    // confirmation notice (the server suppresses the change event entirely on a
+    // true no-op, so reaching this handler always reports an actual change).
+    assert!(handled);
+    assert_eq!(
+        app.session.working_dir.as_deref(),
+        Some("/worktrees/feat-panel")
+    );
+    assert_eq!(app.display_messages().len(), 2, "a confirmation is appended");
+    let last = app.display_messages().last().expect("display message");
+    assert_eq!(last.role, "system");
+    assert!(last.content.contains("worktrees/feat-panel"));
+}
+
 /// Reproduces the "stuck on loading session…" bug and verifies the watchdog
 /// recovers it: a remote connection that never receives the bootstrap History
 /// event (so `has_loaded_history()` stays false) must re-request `GetHistory`
