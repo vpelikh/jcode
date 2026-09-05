@@ -1922,6 +1922,24 @@ async fn stalled_promise_turn_gets_bounded_continuation() {
         "a tool_use stop must be deferred to stranded-tool-use recovery"
     );
 
+    // Truncation stops belong to maybe_continue_incomplete_response; a dense
+    // filler turn that happened to be truncated must not be stolen by this
+    // guard, which would inject the wrong continuation message.
+    assert!(
+        !agent
+            .maybe_continue_stalled_promise(Some("max_tokens"), spam, &mut attempts)
+            .unwrap(),
+        "a truncation stop must be deferred to incomplete-response recovery"
+    );
+
+    // Guardrail refusals are owned by the Fable/guardrail handlers.
+    assert!(
+        !agent
+            .maybe_continue_stalled_promise(Some("refusal"), spam, &mut attempts)
+            .unwrap(),
+        "a guardrail stop must be deferred to the guardrail handler"
+    );
+
     // Budget is bounded: no unbounded re-invocation loop.
     attempts = Agent::MAX_STALLED_PROMISE_CONTINUATION_ATTEMPTS;
     assert!(

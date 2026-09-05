@@ -373,6 +373,21 @@ impl Agent {
         if Self::is_stranded_tool_use_stop(stop_reason) {
             return Ok(false);
         }
+        // Truncation/guardrail stops are owned by their own recovery paths
+        // (maybe_continue_incomplete_response / the Fable reconsideration and
+        // guardrail-notice handlers). This guard is specifically for a model
+        // that *stopped normally* but stalled behind action-promise filler. It
+        // must not steal a truncated or refused turn. Checking here (rather
+        // than relying on loop ordering) keeps both loops consistent even if
+        // the call order ever changes.
+        if Self::is_guardrail_stop_reason(stop_reason) {
+            return Ok(false);
+        }
+        if let Some(reason) = stop_reason {
+            if Self::should_continue_after_stop_reason(reason) {
+                return Ok(false);
+            }
+        }
         if !Self::is_stalled_promise_text(text_content) {
             return Ok(false);
         }
