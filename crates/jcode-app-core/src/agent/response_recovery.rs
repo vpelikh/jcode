@@ -464,10 +464,11 @@ impl Agent {
     ///    long legitimate prose that recounts an earlier "I'll invoke..." does not
     ///    match.
     ///  - It must contain a first-person future/volitional invoke frame ("let me
-    ///    invoke", "i'll invoke", "i will invoke", "i'm going to invoke", or an
-    ///    imperative "invoke <tool> now"). A bare third-person/descriptive "will
-    ///    invoke" (e.g. "this setup will invoke shell hooks") is NOT a promise by
-    ///    the agent to act, so it must not match.
+    ///    invoke", "i'll invoke", "i will invoke", "i'm going to invoke", "i am
+    ///    going to invoke", "let me call bash", "let me call the bash tool"). A
+    ///    bare third-person/descriptive "will invoke" (e.g. "this setup will
+    ///    invoke shell hooks") is NOT a promise by the agent to act, so it must
+    ///    not match.
     ///  - It must reference an actual tool target (bash / tool / command / run /
     ///    grep / sed / a specific action verb), so philosophical or past-tense
     ///    uses of "invoke" do not match.
