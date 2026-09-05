@@ -102,42 +102,103 @@ pub(super) fn tool_output_to_content_blocks(
 }
 
 pub(super) fn print_tool_summary(tool: &ToolCall) {
+    if let Some(line) = tool_summary_line(tool) {
+        println!("{}", line);
+    }
+}
+
+/// Compute the single-line live summary for a tool call, or `None` when the
+/// tool has nothing worth surfacing. Kept pure (returns a `String` rather than
+/// printing directly) so the summaries are unit-testable without capturing
+/// stdout.
+fn tool_summary_line(tool: &ToolCall) -> Option<String> {
     match tool.name.as_str() {
-        "bash" => {
-            if let Some(cmd) = tool.input.get("command").and_then(|v| v.as_str()) {
-                let short = if cmd.len() > 60 {
+        "bash" => tool
+            .input
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(|cmd| {
+                if cmd.len() > 60 {
                     format!("{}...", crate::util::truncate_str(cmd, 60))
                 } else {
                     cmd.to_string()
-                };
-                println!("$ {}", short);
-            }
+                }
+            })
+            .map(|short| format!("$ {}", short)),
+        "read" | "write" | "edit" => tool
+            .input
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .map(|path| path.to_string()),
+        "glob" | "grep" => tool
+            .input
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .map(|pattern| format!("'{}'", pattern)),
+        "compass_query" | "agentgrep" => {
+            // Show the query that was given, matching `grep` which prints the
+            // pattern. Queries are free-form so this surfaces in the live tool
+            // summary exactly what was searched.
+            tool.input
+                .get("query")
+                .and_then(|v| v.as_str())
+                .map(|query| {
+                    let label = if query.len() > 60 {
+                        format!("{}...", crate::util::truncate_str(query, 60))
+                    } else {
+                        query.to_string()
+                    };
+                    if tool.name == "compass_query" {
+                        format!("compass: {}", label)
+                    } else {
+                        format!("'{}'", label)
+                    }
+                })
         }
-        "read" | "write" | "edit" => {
-            if let Some(path) = tool.input.get("file_path").and_then(|v| v.as_str()) {
-                println!("{}", path);
-            }
-        }
-        "glob" | "grep" => {
-            if let Some(pattern) = tool.input.get("pattern").and_then(|v| v.as_str()) {
-                println!("'{}'", pattern);
-            }
-        }
-        "ls" => {
-            let path = tool
-                .input
+        "ls" => Some(
+            tool.input
                 .get("path")
                 .and_then(|v| v.as_str())
-                .unwrap_or(".");
-            println!("{}", path);
-        }
-        _ => {}
+                .unwrap_or(".")
+                .to_string(),
+        ),
+        _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tool_call(name: &str, query: &str) -> ToolCall {
+        ToolCall {
+            name: name.to_string(),
+            input: serde_json::json!({ "query": query }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn tool_summary_shows_compass_query() {
+        let line = tool_summary_line(&tool_call("compass_query", "search for the config"));
+        assert_eq!(line.as_deref(), Some("compass: search for the config"));
+    }
+
+    #[test]
+    fn tool_summary_shows_agentgrep_query() {
+        let line = tool_summary_line(&tool_call("agentgrep", "fn config"));
+        assert_eq!(line.as_deref(), Some("'fn config'"));
+    }
+
+    #[test]
+    fn tool_summary_truncates_long_query() {
+        let long = "x".repeat(100);
+        let line = tool_summary_line(&tool_call("compass_query", &long)).unwrap();
+        assert!(line.starts_with("compass: xxx"));
+        assert!(line.ends_with("..."));
+        // "compass: " (9 chars) + up to 60 chars + "..."
+        assert!(line.chars().count() <= 9 + 60 + 3);
+    }
 
     #[test]
     fn cap_tool_output_leaves_small_output_unchanged() {
