@@ -2260,12 +2260,39 @@ async fn stalled_promise_turn_gives_up_after_bounded_continuations() {
         }
     }
 
-    // 1 original call + MAX_STALLED_PROMISE_CONTINUATION_ATTEMPTS retries.
-    // Next attempt starts by checking the counter, so call count is bounded.
-    assert!(
-        *calls.lock().unwrap() <= 1 + Agent::MAX_STALLED_PROMISE_CONTINUATION_ATTEMPTS as usize,
-        "agent must not re-invoke in an unbounded loop, made {} calls",
+    // 1 original call, then exactly MAX_STALLED_PROMISE_CONTINUATION_ATTEMPTS
+    // recovery injects before the budget is exhausted. Assert the exact count
+    // so the bound is pinned to this guard's budget, not some incidental loop
+    // limit.
+    assert_eq!(
+        *calls.lock().unwrap(),
+        1 + Agent::MAX_STALLED_PROMISE_CONTINUATION_ATTEMPTS as usize,
+        "the agent must make exactly one original call plus one continuation per stalled reply (made {} calls)",
         *calls.lock().unwrap()
+    );
+
+    // Each recovery inject appends one hidden <system-reminder> user message.
+    // Counting them proves the stalled-promise guard (and only it) drove the
+    // bounded retries — not an unrelated recovery path.
+    let injected_reminders = agent
+        .session
+        .messages
+        .iter()
+        .filter(|m| {
+            m.role == Role::User
+                && m.content.iter().any(|block| match block {
+                    ContentBlock::Text { text, .. } => {
+                        text.starts_with("<system-reminder>")
+                            && text.contains("repeatedly said you would perform an action")
+                    }
+                    _ => false,
+                })
+        })
+        .count();
+    assert_eq!(
+        injected_reminders,
+        Agent::MAX_STALLED_PROMISE_CONTINUATION_ATTEMPTS as usize,
+        "each stalled reply must inject exactly one stalled-promise reminder"
     );
 }
 
