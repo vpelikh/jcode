@@ -2508,36 +2508,40 @@ fn test_unknown_op_in_memory_non_object_serializes_single_op() {
 /// wrapper). This pins the documented behavior of the non-object branch.
 #[test]
 fn test_unknown_op_non_object_payload_round_trips_losslessly() {
-    // Serialize a non-object data directly (matches the on-disk `{"op","data"}`)
-    // and confirm Deserialize recovers the same value WITHOUT re-nesting.
-    let raw = r#"{"op":"plugin_scalar","data":123}"#;
-    let op: SessionEventOp = serde_json::from_str(raw).expect("deserialize scalar unknown");
-    match &op {
-        SessionEventOp::Unknown { event_type, data } => {
-            assert_eq!(event_type, "plugin_scalar");
-            // The raw scalar must deserialize to the bare value, not collapse
-            // into `{"data":123}` (the serializer's emission shape).
-            assert_eq!(
-                data,
-                &serde_json::json!(123),
-                "raw scalar Unknown payload must not be wrapped under `data`"
-            );
-            // Round-trip once. A non-object payload must stay a scalar, not
-            // collapse into `{"data":123}`.
-            let json = serde_json::to_string(&op).expect("serialize");
-            let again: SessionEventOp = serde_json::from_str(&json).expect("round-trip");
-            match &again {
-                SessionEventOp::Unknown { data: d2, .. } => {
-                    assert_eq!(
-                        d2,
-                        data,
-                        "non-object Unknown payload must round-trip without shape change"
-                    );
+    // A non-object payload (scalar or array) must deserialize to the bare value,
+    // NOT collapse into `{"data":123}` (the serializer's emission shape), and
+    // round-trip losslessly.
+    for (raw_tag, payload) in [
+        (r#"{"op":"plugin_scalar","data":123}"#, serde_json::json!(123)),
+        (
+            r#"{"op":"plugin_array","data":[1,"two",null]}"#,
+            serde_json::json!([1, "two", null]),
+        ),
+    ] {
+        let op: SessionEventOp =
+            serde_json::from_str(raw_tag).expect("deserialize non-object unknown");
+        match &op {
+            SessionEventOp::Unknown { event_type, data } => {
+                assert_eq!(
+                    data, &payload,
+                    "raw non-object payload must not be wrapped under `data`"
+                );
+                // Round-trip: the bare value must serialize back to the same
+                // wire form and deserialize to the identical value.
+                let json = serde_json::to_string(&op).expect("serialize");
+                let again: SessionEventOp = serde_json::from_str(&json).expect("round-trip");
+                match &again {
+                    SessionEventOp::Unknown { data: d2, .. } => {
+                        assert_eq!(
+                            d2, data,
+                            "non-object Unknown payload must round-trip without shape change"
+                        );
+                    }
+                    other => panic!("changed kind: {other:?}"),
                 }
-                other => panic!("changed kind: {other:?}"),
             }
+            other => panic!("expected Unknown, got {other:?}"),
         }
-        other => panic!("expected Unknown, got {other:?}"),
     }
 }
 
