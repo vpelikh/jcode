@@ -862,6 +862,7 @@ impl Agent {
                     continue;
                 }
                 if self.maybe_continue_stalled_promise(
+                    stop_reason.as_deref(),
                     &text_content,
                     &mut stalled_promise_continuations,
                 )? {

@@ -1879,7 +1879,7 @@ async fn stalled_promise_turn_gets_bounded_continuation() {
                 Let me execute. Let me do it. Let me read the body. Let me find it.";
     let mut attempts = 0u32;
     let retried = agent
-        .maybe_continue_stalled_promise(spam, &mut attempts)
+        .maybe_continue_stalled_promise(Some("stop"), spam, &mut attempts)
         .expect("helper must not error");
     assert!(retried, "dense stalled-promise filler must be recovered");
     assert_eq!(attempts, 1);
@@ -1905,6 +1905,7 @@ async fn stalled_promise_turn_gets_bounded_continuation() {
     assert!(
         !agent
             .maybe_continue_stalled_promise(
+                Some("stop"),
                 "Here is the completed review. Let me know if you want more rounds.",
                 &mut attempts,
             )
@@ -1912,11 +1913,20 @@ async fn stalled_promise_turn_gets_bounded_continuation() {
         "a normal answer must not be treated as stalled"
     );
 
+    // A tool_use stop without a parsed tool call belongs to the stranded
+    // recovery, not this guard: it must be passed through untouched.
+    assert!(
+        !agent
+            .maybe_continue_stalled_promise(Some("tool_use"), spam, &mut attempts)
+            .unwrap(),
+        "a tool_use stop must be deferred to stranded-tool-use recovery"
+    );
+
     // Budget is bounded: no unbounded re-invocation loop.
     attempts = Agent::MAX_STALLED_PROMISE_CONTINUATION_ATTEMPTS;
     assert!(
         !agent
-            .maybe_continue_stalled_promise(spam, &mut attempts)
+            .maybe_continue_stalled_promise(Some("stop"), spam, &mut attempts)
             .unwrap()
     );
 }

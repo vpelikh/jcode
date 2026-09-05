@@ -361,9 +361,18 @@ impl Agent {
     /// up and surface the partial output rather than looping forever.
     pub(crate) fn maybe_continue_stalled_promise(
         &mut self,
+        stop_reason: Option<&str>,
         text_content: &str,
         attempts: &mut u32,
     ) -> Result<bool> {
+        // A tool_use stop with no parsed tool call is the stranded-tool-use
+        // recovery's job (targeted message + its own budget). Don't preempt it
+        // here with the generic "you promised an action" reminder, and don't
+        // let two independent recovery counters both consume turns on the same
+        // incident.
+        if Self::is_stranded_tool_use_stop(stop_reason) {
+            return Ok(false);
+        }
         if !Self::is_stalled_promise_text(text_content) {
             return Ok(false);
         }
