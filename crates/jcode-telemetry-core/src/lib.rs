@@ -2487,6 +2487,30 @@ pub fn record_todo_gate(kind: TodoGateKind) {
     maybe_emit_session_start();
 }
 
+/// Read the session-scoped count for a given todo quality-gate kind. Returns
+/// `0` when no session telemetry state exists. Primarily for observability and
+/// tests that verify a code path really recorded a gate firing (not just that
+/// it ran through the `record_todo_gate` unit tests).
+pub fn todo_gate_count(kind: TodoGateKind) -> u32 {
+    if let Ok(guard) = SESSION_STATE.lock()
+        && let Some(state) = guard.as_ref()
+    {
+        match kind {
+            TodoGateKind::Ownership => state.todo_gate_ownership_count,
+            TodoGateKind::ClosedFeedbackLoop
+            | TodoGateKind::FeedbackLoopRelevance
+            | TodoGateKind::FeedbackLoopCoverage
+            | TodoGateKind::FeedbackLoopTraceability => state.todo_gate_feedback_loop_count,
+            TodoGateKind::Alignment => state.todo_gate_alignment_count,
+            TodoGateKind::IntentUnderstanding => state.todo_gate_intent_count,
+            TodoGateKind::Completion => state.todo_gate_completion_count,
+            TodoGateKind::ConfidenceSpike => state.todo_gate_spike_count,
+        }
+    } else {
+        0
+    }
+}
+
 pub fn record_tool_execution(name: &str, input: &Value, succeeded: bool, latency_ms: u64) {
     if let Ok(mut guard) = SESSION_STATE.lock()
         && let Some(ref mut state) = *guard

@@ -764,6 +764,38 @@ fn test_record_todo_tool_and_gates_aggregate_session_and_turn() {
 }
 
 #[test]
+fn test_todo_gate_count_getter_reads_back() {
+    let _guard = lock_telemetry_test_state();
+    if let Ok(mut session) = SESSION_STATE.lock() {
+        *session = None;
+    }
+    begin_session_with_mode("openai", "gpt-5.4", None, false);
+    record_turn();
+    // No gates recorded yet -> 0.
+    assert_eq!(super::todo_gate_count(TodoGateKind::Completion), 0);
+    assert_eq!(super::todo_gate_count(TodoGateKind::Ownership), 0);
+
+    // Fire a couple of gates and confirm the public getter reads them back.
+    record_todo_gate(TodoGateKind::Completion);
+    record_todo_gate(TodoGateKind::Ownership);
+    record_todo_gate(TodoGateKind::ConfidenceSpike);
+    record_todo_gate(TodoGateKind::ClosedFeedbackLoop);
+
+    assert_eq!(super::todo_gate_count(TodoGateKind::Completion), 1);
+    assert_eq!(super::todo_gate_count(TodoGateKind::Ownership), 1);
+    assert_eq!(super::todo_gate_count(TodoGateKind::ConfidenceSpike), 1);
+    // ClosedFeedbackLoop collapses into the feedback-loop counter, so the other
+    // feedback-loop kinds read it back too.
+    assert_eq!(super::todo_gate_count(TodoGateKind::ClosedFeedbackLoop), 1);
+    assert_eq!(super::todo_gate_count(TodoGateKind::FeedbackLoopRelevance), 1);
+    assert_eq!(super::todo_gate_count(TodoGateKind::Alignment), 0);
+
+    if let Ok(mut session) = SESSION_STATE.lock() {
+        *session = None;
+    }
+}
+
+#[test]
 fn test_record_connection_type_buckets_transport() {
     let _guard = lock_telemetry_test_state();
     if let Ok(mut session) = SESSION_STATE.lock() {
