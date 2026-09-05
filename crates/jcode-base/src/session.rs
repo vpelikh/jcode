@@ -37,8 +37,8 @@ use std::collections::HashSet;
 use std::path::Path;
 pub mod event_types;
 pub use invariants::{
-    InvariantLog, InvariantRegistry, InvariantViolation, LogInvariant, LogProjection,
-    MessageCountProjection, fold_projection, project_map,
+    CompactionBracket, InvariantLog, InvariantRegistry, InvariantViolation, LogInvariant,
+    LogProjection, MessageCountProjection, fold_projection, project_map,
 };
 mod crash;
 mod invariants;
@@ -2004,6 +2004,20 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         if started {
             self.event_map.end_compaction(compaction.clone());
             self.compaction = Some(compaction);
+            // Enforce the compaction-bracket invariant at the completion point.
+            // This is a SAFE, deliberately narrow call site for `enforce()`: at
+            // the moment a balanced bracket has just been closed and persisted,
+            // an open/duplicated bracket is provably a bug — a compaction that
+            // claims completion while leaving the bracket malformed. Enforce ONLY
+            // `CompactionBracket` here (not the full builtin registry) because
+            // `ToolPairingBalanced` legitimately fires on compactions that do not
+            // snap to a tool-pairing boundary (a valid, documented call pattern),
+            // so enforcing it here would hard-fail a correct run.
+            let mut bracket_registry = invariants::InvariantRegistry::default();
+            bracket_registry.add(invariants::CompactionBracket);
+            let log = bracket_registry.check(&self.event_map);
+            // `enforce` panics in debug builds on a violation; release logs.
+            invariants::InvariantLog::enforce(&log, "compact_transcript_with_bracket");
         } else {
             // The `CompactionStart` was rejected by validation (e.g. an invalid
             // `covers_up_to_turn`), so no bracket is open. Persist the compaction
