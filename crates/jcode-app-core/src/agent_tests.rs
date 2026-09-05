@@ -2052,6 +2052,125 @@ async fn stranded_tool_use_stop_continues_instead_of_ending_the_turn() {
     );
 }
 
+/// Same as `StrandedToolUseProvider`, but the provider reports the OpenAI /
+/// OpenRouter spelling of the tool-intent stop reason: `"tool_calls"`. A
+/// correct agent must still route this through the stranded-tool recovery and
+/// NOT through the stalled-promise guard (which checks for clean end-of-turn
+/// stops). The second response is a normal completion.
+#[derive(Clone, Default)]
+struct ToolCallsStrandedProvider {
+    calls: Arc<std::sync::Mutex<usize>>,
+}
+
+#[async_trait]
+impl Provider for ToolCallsStrandedProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        let call = {
+            let mut guard = self.calls.lock().unwrap();
+            *guard += 1;
+            *guard
+        };
+        let (tx, rx) = tokio_mpsc::channel::<Result<StreamEvent>>(8);
+        tokio::spawn(async move {
+            if call == 1 {
+                let _ = tx
+                    .send(Ok(StreamEvent::TextDelta(
+                        "Let me work on it. Let me proceed. Let me continue. ".to_string(),
+                    )))
+                    .await;
+                // Stop intent is tool_calls but no tool call block was parsed.
+                let _ = tx
+                    .send(Ok(StreamEvent::MessageEnd {
+                        stop_reason: Some("tool_calls".to_string()),
+                    }))
+                    .await;
+            } else {
+                let _ = tx
+                    .send(Ok(StreamEvent::TextDelta("completed via tool_calls".to_string())))
+                    .await;
+                let _ = tx
+                    .send(Ok(StreamEvent::MessageEnd {
+                        stop_reason: Some("end_turn".to_string()),
+                    }))
+                    .await;
+            }
+        });
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    fn name(&self) -> &str {
+        "stranded-tool-calls"
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+}
+
+/// An OpenAI/OpenRouter `tool_calls` stop with no parsed tool call is the same
+/// stranded-tool incident as Anthropic's `tool_use` stop. The agent must
+/// recover via continuation (second provider call) and must not misfile it as
+/// a stalled-promise filler turn.
+#[tokio::test]
+async fn tool_calls_stranded_stop_routes_to_continuation() {
+    let _guard = crate::storage::lock_test_env();
+    let stranded = ToolCallsStrandedProvider::default();
+    let calls = stranded.calls.clone();
+    let provider: Arc<dyn Provider> = Arc::new(stranded);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent
+        .run_once_streaming_mpsc("do the task", Vec::new(), None, tx)
+        .await
+        .expect("turn should complete");
+
+    let mut text = String::new();
+    while let Ok(event) = rx.try_recv() {
+        if let ServerEvent::TextDelta { text: delta } = event {
+            text.push_str(&delta);
+        }
+    }
+
+    assert_eq!(
+        *calls.lock().unwrap(),
+        2,
+        "a tool_calls stop with no tool call must trigger exactly one continuation request"
+    );
+    // The stalled-promise guard must NOT have fired (its reminder would have
+    // injected a 'promise to act' prompt); the stranded recovery's continuation
+    // surfaced the real completion instead.
+    assert!(
+        text.contains("completed via tool_calls"),
+        "the recovered turn must deliver the completion, got {text:?}"
+    );
+    let reminders = agent
+        .session
+        .messages
+        .iter()
+        .filter(|m| {
+            m.role == Role::User
+                && m.content.iter().any(|block| match block {
+                    ContentBlock::Text { text, .. } => {
+                        text.contains("repeatedly said you would perform an action")
+                    }
+                    _ => false,
+                })
+        })
+        .count();
+    assert_eq!(
+        reminders, 0,
+        "a stranded tool_calls stop must not be misfiled as a stalled-promise turn"
+    );
+}
+
 #[derive(Clone, Default)]
 struct FableGuardrailProvider {
     calls: Arc<std::sync::Mutex<usize>>,
