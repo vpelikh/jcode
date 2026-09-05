@@ -705,15 +705,12 @@ impl Registry {
         let _in_flight = inflight::mark_tool_in_flight(&ctx.tool_call_id);
         // Resolve the canonical tool name up front (pure, no lock needed) so we
         // can snapshot the compass-first enforcement flag for agentgrep calls
-        // before taking the tools lock. `config()` can trigger a reload (disk
-        // read + listener dispatch) on a cold or stale cache, and doing that
-        // while holding the read lock would risk a deadlock if a reload listener
-        // ever re-entered the tool registry. Keeping this snapshot to the
-        // agentgrep path also avoids paying a config read on every unrelated
-        // tool call.
+        // Confirmed what the snapshot is for: it must be read before taking the tools
+        // lock so a config reload cannot deadlock a re-entrant registry lookup.
+        // The `resolved_name == "agentgrep"` gate and the config read live in
+        // `compass_enforcement::prefer_compass_query_for` (see its doc).
         let resolved_name = Self::resolve_tool_name(name);
-        let prefer_compass_query = resolved_name == "agentgrep"
-            && crate::config::config().tools.prefer_compass_query;
+        let prefer_compass_query = compass_enforcement::prefer_compass_query_for(resolved_name);
         let tools = self.tools.read().await;
         if let Some(policy) = session_tool_policy(&ctx.session_id) {
             if let Some(allowed) = policy.allowed_tools.as_ref()
