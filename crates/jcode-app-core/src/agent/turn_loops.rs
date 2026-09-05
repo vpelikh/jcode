@@ -1683,7 +1683,7 @@ mod tests {
         for turn in legitimate {
             assert!(
                 !Agent::is_stalled_promise_text(turn),
-                "a full future/conditional invoke form must not be flagged as a stare stall: {turn:?}"
+                "a full future/conditional invoke form must not be flagged as a stall: {turn:?}"
             );
         }
     }
