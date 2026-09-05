@@ -113,6 +113,23 @@ pub(super) fn handle_tick(app: &mut App) -> bool {
     needs_redraw |= app.check_stable_version();
     needs_redraw |= app.refresh_keybindings_if_config_reloaded();
     needs_redraw |= app.maybe_finish_background_client_reload();
+    // Self-drive the review loop from the idle tick. After a lens reviewer is
+    // spawned there is no further turn-end event to re-poll it (a spawned
+    // reviewer runs asynchronously in its own window, and a CLEAN verdict does
+    // not create a synthetic fix turn), so without this the loop stalls right
+    // after the first spawn and review rounds never actually execute. Guarded
+    // so we only poll when a loop is active and no turn/dispatch is in flight.
+    // We deliberately do NOT fold its return into `needs_redraw`: a reviewer
+    // still in flight returns "pending" on every tick and forcing a redraw
+    // there would defeat idle-redraw throttling. Loop progress (spawning the
+    // next lens, queuing a fix, converging) pushes display messages / status
+    // notices that request redraws on their own.
+    if super::commands::is_review_loop_active(app)
+        && !app.is_processing
+        && !app.pending_queued_dispatch
+    {
+        let _ = super::commands::step_review_loop(app);
+    }
     if app.pending_migration.is_some() && !app.is_processing {
         app.execute_migration();
         needs_redraw = true;

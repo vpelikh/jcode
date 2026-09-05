@@ -1191,6 +1191,15 @@ pub(in crate::tui::app) fn handle_server_event(
                     "client_turn_completed",
                     std::time::Duration::from_secs(30),
                 );
+                // This is the remote client's *normal* turn-completion point (a
+                // real ServerEvent::Done for the current turn, not an interrupt
+                // or a failed-retry path). The auto review loop is only seeded
+                // here, mirroring the local path (finish_turn -> turn.rs, which
+                // seeds at the end of a completed turn). Seeding is deliberately
+                // NOT done inside schedule_turn_end_followups because that is also
+                // reached on interrupt/error paths where the work is incomplete
+                // and the completion gates have not passed.
+                crate::tui::app::commands::maybe_enter_review_loop(app);
                 auto_poked = app.schedule_turn_end_followups();
                 if !auto_poked {
                     app.clear_visible_turn_started();

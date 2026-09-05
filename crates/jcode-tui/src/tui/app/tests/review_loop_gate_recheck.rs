@@ -534,3 +534,341 @@ fn step_review_loop_converged_without_fix_never_runs_gate_recheck() {
         );
     });
 }
+
+// Regression: the auto review loop must also be *seeded* on the remote product
+// TUI turn-completion path. The remote TUI (App::new_for_remote -> run_remote)
+// completes turns through server_events.rs's `ServerEvent::Done` handler, which
+// is the exact analogue of the local `finish_turn` completion path but previously
+// never called `maybe_enter_review_loop` (the local path seeded it at the end of
+// `run_turn_interactive` instead). Without seeding here the loop is never created
+// and review rounds silently never run. The seed must live on the normal-completion
+// (Done) arm only, NOT inside `schedule_turn_end_followups`, because that helper
+// is also reached on interrupt and failed-retry paths where the work is incomplete.
+// This pins that a remote, non-harness, non-replay app seeding happens exactly once
+// when its current turn's ServerEvent::Done arrives.
+#[test]
+fn remote_done_seeds_review_loop_on_remote_product_path() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+        // Model the real product TUI: a remote server-client (not the harness),
+        // so the auto review loop is allowed to seed. Under the ordinary
+        // TestHarness this would be skipped for determinism.
+        app.is_remote = true;
+        app.is_replay = false;
+        app.runtime_mode = super::AppRuntimeMode::RemoteClient;
+        app.autoreview_enabled = true;
+        app.pending_queued_dispatch = false;
+        app.improve_mode = None;
+        app.session.review_loop = None;
+
+        // A normal in-progress remote turn whose current message is the one
+        // finishing. This is exactly the state the remote client is in when
+        // ServerEvent::Done for the current message arrives.
+        app.is_processing = true;
+        app.status = crate::tui::app::ProcessingStatus::RunningTool("x".to_string());
+        app.current_message_id = Some(42);
+        app.stream_message_ended = true;
+
+        assert!(
+            app.session.review_loop.is_none(),
+            "precondition: no review loop before the turn completes"
+        );
+
+        // The real remote turn-completion handler. It must seed the loop here,
+        // exactly once (ServerEvent::Done for the normal completed turn), and
+        // NOT on interrupts or failed-retry paths (which never reach Done).
+        let _ = app.handle_server_event(
+            crate::protocol::ServerEvent::Done { id: 42 },
+            &mut remote,
+        );
+
+        assert!(
+            app.session.review_loop.as_ref().is_some_and(|s| {
+                s.current_lens.is_some() && s.record.is_some() && !s.finished
+            }),
+            "remote normal turn completion must seed (and keep alive) the review loop",
+        );
+        // Seeding happened for THIS completion only: a fresh session must not
+        // pre-seed, and the guard prohibits restarting a finished loop later.
+        let review_loop_count = app
+            .session
+            .review_loop
+            .as_ref()
+            .map(|s| s.record.as_ref().map(|r| r.rounds.len()).unwrap_or(0))
+            .unwrap_or(0);
+        assert_eq!(review_loop_count, 0, "seeded review loop must have no rounds yet");
+    });
+}
+
+// Regression (R-A1): the review loop must SELF-DRIVE from the idle tick, not
+// rely only on turn-end events. After a lens reviewer is spawned there is no
+// further ServerEvent::Done (a spawned reviewer runs asynchronously in its own
+// window; a CLEAN verdict produces no synthetic fix turn), so the loop used to
+// stall right after the first spawn and the review rounds never actually ran. The
+// local idle tick handler now polls the loop; this pins that a ready verdict is
+// consumed and the loop advances to the next lens just from a tick.
+#[test]
+fn idle_tick_self_drives_review_loop_advance() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        let parent_session_id = app.session_id().to_string();
+
+        // Seed a live review loop at the first lens (Correctness).
+        let mut state = jcode_session_types::ReviewLoopState::new();
+        super::review_loop::enter_review_loop(&mut state);
+        assert_eq!(
+            state.current_lens,
+            Some(jcode_session_types::ReviewLens::Correctness)
+        );
+
+        // A real reviewer child session whose last message is a CLEAN verdict,
+        // exactly as a completed lens reviewer leaves behind.
+        let mut reviewer = crate::session::Session::create(None, None);
+        let reviewer_id = reviewer.id.clone();
+        reviewer.add_message_with_display_role(
+            crate::message::Role::User,
+            vec![crate::message::ContentBlock::Text {
+                text: "VERDICT: CLEAN".to_string(),
+                cache_control: None,
+            }],
+            None,
+        );
+        reviewer.save().expect("save reviewer session");
+
+        state.active_reviewer_id = Some(reviewer_id);
+        app.session.review_loop = Some(state);
+        // Ensure it is not considered "started" yet by the tick's polling guard.
+        app.is_processing = false;
+        app.pending_queued_dispatch = false;
+
+        // The idle tick (local run loop) must poll the reviewer and advance to
+        // the next lens without any turn-end event.
+        let _redraw = crate::tui::app::local::handle_tick(&mut app);
+
+        let advanced = app.session.review_loop.as_ref();
+        assert!(advanced.is_some(), "review loop must remain present");
+        // The CLEAN verdict for Correctness was consumed: the loop advanced to
+        // EdgesErrors AND spawned (and set an active reviewer for) that lens.
+        let advanced = advanced.unwrap();
+        assert_eq!(
+            advanced.current_lens,
+            Some(jcode_session_types::ReviewLens::ALL[1]),
+            "idle tick must consume the CLEAN verdict and advance to the next lens"
+        );
+        // The next lens reviewer was spawned (active_reviewer_id set for it).
+        assert!(
+            advanced.active_reviewer_id.is_some(),
+            "advancing must spawn an active reviewer for the next lens"
+        );
+    });
+}
+
+// Regression (R-G1): on the REMOTE product TUI the review fix-turn (findings ->
+// "fix them" prompt) must be *dispatched*, not just staged. The remote client
+// does not consume `pending_turn` (only the local run() loop does), so the
+// previous start_synthetic_user_turn path left the fix prompt unsent and the
+// loop stalled after the first findings. This pins that, when a remote reviewer
+// returns FINDINGS, the fix prompt is enqueued to `queued_messages`, which the
+// remote run loop dispatches via process_remote_followups.
+#[test]
+fn remote_findings_enqueue_fix_turn_for_dispatch() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        // The real product TUI is a remote server-client.
+        app.is_remote = true;
+        app.is_replay = false;
+        app.runtime_mode = super::AppRuntimeMode::RemoteClient;
+
+        // Seed a live review loop at the first lens with an in-flight reviewer
+        // whose session reports a FINDINGS verdict.
+        let mut state = jcode_session_types::ReviewLoopState::new();
+        super::review_loop::enter_review_loop(&mut state);
+        let mut reviewer = crate::session::Session::create(None, None);
+        let reviewer_id = reviewer.id.clone();
+        reviewer.add_message_with_display_role(
+            crate::message::Role::User,
+            vec![crate::message::ContentBlock::Text {
+                text: "VERDICT: FINDINGS\nFINDING: HIGH|a.rs|Off-by-one bug".to_string(),
+                cache_control: None,
+            }],
+            None,
+        );
+        reviewer.save().expect("save reviewer session");
+        state.active_reviewer_id = Some(reviewer_id);
+        app.session.review_loop = Some(state);
+
+        let _followup = super::commands_review::step_review_loop(&mut app);
+
+        // The fix prompt must be queued for the remote dispatch loop (NOT behind
+        // the local-only pending_turn path).
+        assert!(
+            !app.queued_messages.is_empty(),
+            "remote findings must enqueue the fix prompt for dispatch"
+        );
+        assert!(
+            app.queued_messages.iter().any(|q| q.contains("Fix them")),
+            "the queued fix prompt must ask to fix the findings, got {:?}",
+            app.queued_messages
+        );
+        // The loop is still active and awaiting its post-fix re-check.
+        let state = app.session.review_loop.as_ref().unwrap();
+        assert!(!state.finished);
+        assert!(
+            state.awaiting_postfix_recheck,
+            "must be awaiting the post-fix re-check"
+        );
+        // Round-E guard: the fix is flagged for immediate dispatch, so the idle
+        // tick must NOT prematurely spawn the post-fix re-check reviewer (which
+        // would review the pre-fix tree before the fix runs).
+        assert!(
+            app.pending_queued_dispatch,
+            "remote fix turn must request dispatch (close the premature-spawn window)"
+        );
+        assert_eq!(
+            state.current_lens,
+            Some(jcode_session_types::ReviewLens::Correctness),
+            "the loop must not advance to the next lens before the fix is dispatched"
+        );
+    });
+}
+
+// Regression (remote tick self-drive): the local idle tick self-drive is
+// covered by idle_tick_self_drives_review_loop_advance, but the REMOTE run loop
+// drives review via remote::handle_tick (remote.rs), which must equally consume
+// a ready verdict and advance the loop. This pins that a remote reviewer's CLEAN
+// verdict is polled and the loop advances to the next lens from a remote tick.
+#[test]
+fn remote_tick_self_drives_review_loop_advance() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+        app.is_remote = true;
+
+        // Seed a live review loop at the first lens with an in-flight reviewer
+        // whose session holds a CLEAN verdict, exactly as a finished lens
+        // reviewer leaves behind.
+        let mut state = jcode_session_types::ReviewLoopState::new();
+        super::review_loop::enter_review_loop(&mut state);
+        let mut reviewer = crate::session::Session::create(None, None);
+        let reviewer_id = reviewer.id.clone();
+        reviewer.add_message_with_display_role(
+            crate::message::Role::User,
+            vec![crate::message::ContentBlock::Text {
+                text: "VERDICT: CLEAN".to_string(),
+                cache_control: None,
+            }],
+            None,
+        );
+        reviewer.save().expect("save reviewer session");
+        state.active_reviewer_id = Some(reviewer_id);
+        app.session.review_loop = Some(state);
+        app.is_processing = false;
+        app.pending_queued_dispatch = false;
+
+        // The REMOTE idle tick must poll the reviewer and advance to the next
+        // lens without any turn-end event.
+        let _ = rt.block_on(crate::tui::app::remote::handle_tick(&mut app, &mut remote));
+
+        let advanced = app.session.review_loop.as_ref().unwrap();
+        assert_eq!(
+            advanced.current_lens,
+            Some(jcode_session_types::ReviewLens::ALL[1]),
+            "remote idle tick must consume the CLEAN verdict and advance to the next lens"
+        );
+        assert!(
+            advanced.active_reviewer_id.is_some(),
+            "advancing must spawn an active reviewer for the next lens"
+        );
+    });
+}
+
+// Regression (multi-step, Round E): verify the full remote findings -> fix
+// enqueue (R-G1) -> dispatch (R-E guard) -> re-check -> advance sequence does
+// not corrupt loop state across successive step_review_loop calls.
+#[test]
+fn remote_findings_fix_then_recheck_advances() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        app.is_remote = true;
+        app.is_replay = false;
+        app.runtime_mode = super::AppRuntimeMode::RemoteClient;
+
+        // Step 1: seed a loop with an in-flight reviewer that returns FINDINGS.
+        let mut state = jcode_session_types::ReviewLoopState::new();
+        super::review_loop::enter_review_loop(&mut state);
+        let mut reviewer = crate::session::Session::create(None, None);
+        let reviewer_id = reviewer.id.clone();
+        reviewer.add_message_with_display_role(
+            crate::message::Role::User,
+            vec![crate::message::ContentBlock::Text {
+                text: "VERDICT: FINDINGS\nFINDING: MEDIUM|b.rs|Leak".to_string(),
+                cache_control: None,
+            }],
+            None,
+        );
+        reviewer.save().expect("save reviewer session");
+        state.active_reviewer_id = Some(reviewer_id);
+        app.session.review_loop = Some(state);
+
+        // Step 2: consume the FINDINGS verdict -> QueueFixTurn enqueues the fix.
+        super::commands_review::step_review_loop(&mut app);
+        assert_eq!(app.queued_messages.len(), 1);
+        assert!(app.pending_queued_dispatch, "fix must be flagged for dispatch");
+        let lens = app.session.review_loop.as_ref().unwrap();
+        assert!(lens.awaiting_postfix_recheck, "must await the post-fix re-check");
+
+        // Step 3: simulate the fix being dispatched and completing (R-G1 sends it,
+        // the server runs it, and a Done arrives that clears processing + dispatch).
+        app.queued_messages.clear();
+        app.is_processing = true; // fix turn in flight
+        app.pending_queued_dispatch = false;
+        app.is_processing = false; // fix turn Done
+        let recheck_lens = app.session.review_loop.as_ref().unwrap().current_lens.unwrap();
+
+        // Step 4: the post-fix Done path re-spawns the re-check reviewer for the
+        // SAME lens (active_reviewer_id was None after the fix).
+        super::commands_review::step_review_loop(&mut app);
+        let rechecker_id = app
+            .session
+            .review_loop
+            .as_ref()
+            .unwrap()
+            .active_reviewer_id
+            .clone()
+            .expect("a fresh re-check reviewer must be spawned");
+        assert_eq!(
+            app.session.review_loop.as_ref().unwrap().current_lens,
+            Some(recheck_lens),
+            "re-check must stay on the same lens, not advance before it is clean"
+        );
+
+        // Step 5: the re-check reviewer reports CLEAN -> the loop records it and
+        // advances to the next lens.
+        let mut rechecker = crate::session::Session::load(&rechecker_id).expect("load re-checker");
+        rechecker.add_message_with_display_role(
+            crate::message::Role::User,
+            vec![crate::message::ContentBlock::Text {
+                text: "VERDICT: CLEAN".to_string(),
+                cache_control: None,
+            }],
+            None,
+        );
+        rechecker.save().expect("save re-checker verdict");
+        super::commands_review::step_review_loop(&mut app);
+
+        let advanced = app.session.review_loop.as_ref().unwrap();
+        assert!(!advanced.finished);
+        assert_eq!(
+            advanced.current_lens,
+            Some(jcode_session_types::ReviewLens::ALL[1]),
+            "after a fixed-then-clean lens the loop must advance to the next lens"
+        );
+    });
+}
