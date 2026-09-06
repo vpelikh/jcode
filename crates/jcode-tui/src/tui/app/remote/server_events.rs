@@ -1024,7 +1024,13 @@ pub(in crate::tui::app) fn handle_server_event(
                     "Headless review did not produce a verdict ({kind}): {message}"
                 ));
             }
-            crate::tui::app::commands::apply_headless_review_result(app, id, &kind, findings);
+            crate::tui::app::commands::apply_headless_review_result(
+                app,
+                id,
+                &kind,
+                findings,
+                message,
+            );
             true
         }
         ServerEvent::Interrupted => {

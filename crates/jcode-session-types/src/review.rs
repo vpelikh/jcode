@@ -338,6 +338,14 @@ pub struct ReviewLoopState {
     /// spawn a new reviewer or poll a (nonexistent local) reviewer session.
     #[serde(default)]
     pub awaiting_headless: bool,
+    /// Unix timestamp (ms) when the in-flight `Request::HeadlessReview` for the
+    /// current lens was actually sent to the server. Persisted so a reloaded
+    /// client (whose in-memory `active_headless_request_id` reset to `None`)
+    /// still knows the request was dispatched and can recover via the stale
+    /// timeout instead of waiting forever for a result it can no longer
+    /// correlate. `None` means no request has been sent for this lens yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headless_dispatched_at: Option<u64>,
     /// How many times the current lens's reviewer has been respawned after
     /// being lost (see `reviewer_respawn`): caps how many times a transient
     /// reviewer loss is retried before the loop hard-finalizes. Reset to zero
@@ -370,6 +378,7 @@ impl Default for ReviewLoopState {
             awaiting_postfix_recheck: false,
             active_reviewer_id: None,
             awaiting_headless: false,
+            headless_dispatched_at: None,
             reviewer_respawn_count: 0,
             last_fix_touched_files: false,
             fix_baseline_tree: None,

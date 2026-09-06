@@ -1491,6 +1491,16 @@ pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteC
                         // Correlate the eventual result to this request so a
                         // stale/late HeadlessReviewResult is not mis-applied.
                         app.active_headless_request_id = Some(request_id);
+                        // Persist the dispatch time so a reloaded client (whose
+                        // in-memory request id reset to None) can still recover
+                        // via the stale timeout instead of waiting forever. The
+                        // stale-timeout recovery is bounded separately by
+                        // `reviewer_respawn_count` in the loop state.
+                        if let Some(state) = app.session.review_loop.as_mut() {
+                            state.headless_dispatched_at =
+                                Some(crate::tui::test_harness::now_ms());
+                        }
+                        let _ = app.session.save();
                     }
                     Err(error) => {
                         crate::logging::warn(&format!(

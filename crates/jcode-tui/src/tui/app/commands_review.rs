@@ -1346,15 +1346,17 @@ pub(super) fn maybe_poll_review_loop_from_idle(app: &mut App) -> bool {
         return false;
     }
     // Headless mode: a request is in flight and there is no local reviewer
-    // session to poll. Progress is driven by the `HeadlessReviewResult` event,
-    // not by idle polls.
+    // session to poll. Progress is normally driven by the `HeadlessReviewResult`
+    // event, not by idle polls. But an idle tick still needs to run the loop's
+    // stalled-headless recovery (re-dispatch a lost/orphaned/stale request)
+    // instead of parking forever, so step (not skip) here.
     if app
         .session
         .review_loop
         .as_ref()
         .is_some_and(|s| s.awaiting_headless)
     {
-        return false;
+        return step_review_loop(app);
     }
     let now = Instant::now();
     let due = match app.last_review_loop_idle_poll {
@@ -1499,6 +1501,91 @@ pub(super) fn reviewer_session_stale(
     idle >= timeout
 }
 
+/// Recover a headless review lens whose `Request::HeadlessReview` was lost or
+/// stalled, so the awaiting loop cannot wait forever for a result that will
+/// never (or can no longer) be correlated. Returns `true` when the loop should
+/// keep waiting (parked), `false` when a recovery action was taken.
+///
+/// Two recoverable cases:
+/// - **Orphaned**: the loop is `awaiting_headless` but there is no queued
+///   dispatch (`pending_headless_review`), no in-memory request id, and no
+///   recorded dispatch timestamp (`headless_dispatched_at`). This happens when
+///   the client reloaded/resumed while a dispatch was queued-but-not-yet-sent,
+///   or the request handoff was lost. Re-dispatch the lens (bounded).
+/// - **Stale**: the request *was* dispatched (`headless_dispatched_at` set) but
+///   no `HeadlessReviewResult` arrived within `stale_reviewer_timeout`. The
+///   server likely hung or the result was lost. Re-dispatch (bounded).
+///
+/// Bounded by `REVIEW_LOOP_MAX_REVIEWER_RESPAWNS` re-dispatches per lens (mirroring
+/// the session-polling respawn path); once exhausted, the loop finalizes with a
+/// clear digest instead of parking forever.
+fn maybe_recover_stalled_headless(
+    app: &mut App,
+    state: &mut jcode_session_types::ReviewLoopState,
+) -> bool {
+    // A dispatch is queued (pending_headless_review) but not yet sent by the
+    // async drain. Not stalled; wait for the drain to send it.
+    if app.pending_headless_review.is_some() {
+        return true;
+    }
+
+    let dispatched_at = state.headless_dispatched_at;
+    let has_inflight_id = app.active_headless_request_id.is_some();
+
+    // Orphaned: awaiting but no dispatch was recorded and no id is in flight.
+    // This can only mean a reload lost the queued dispatch. Re-dispatch.
+    let orphaned = dispatched_at.is_none() && !has_inflight_id;
+    // Stale: dispatched but no result within the timeout.
+    let stale = dispatched_at.is_some_and(|t| {
+        stale_reviewer_timeout().is_some_and(|timeout| {
+            let now = crate::tui::test_harness::now_ms();
+            now.saturating_sub(t) >= timeout.as_millis() as u64
+        })
+    });
+
+    if !orphaned && !stale {
+        return true;
+    }
+
+    let lens = state.current_lens.unwrap_or(jcode_session_types::ReviewLens::Correctness);
+    if state.reviewer_respawn_count >= REVIEW_LOOP_MAX_REVIEWER_RESPAWNS {
+        // Budget exhausted: finalize rather than loop forever.
+        state.finished = true;
+        state.finish_reason = Some("review_headless_lost".to_string());
+        let digest = format!(
+            "## Review stopped\n\nThe '{}' lens's headless reviewer was lost {} times and never produced a verdict.",
+            lens.label(),
+            REVIEW_LOOP_MAX_REVIEWER_RESPAWNS
+        );
+        let record = state.record.get_or_insert_with(jcode_session_types::ReviewRecord::default);
+        record.digest = Some(digest);
+        app.push_display_message(DisplayMessage::system(
+            "Review loop stopped: the headless reviewer was repeatedly lost.".to_string(),
+        ));
+        app.set_status_notice("Review loop: headless reviewer lost");
+        // Persist the finalized loop. `maybe_recover_stalled_headless` returns
+        // true so the caller parks a *finished* loop (no further dispatch).
+        app.session.review_loop = Some(state.clone());
+        let _ = app.session.save();
+        return true;
+    }
+
+    // Re-dispatch the lens headlessly (bounded). This resets the state to
+    // awaiting and queues `pending_headless_review`; the drain will re-send and
+    // refresh `headless_dispatched_at`, giving a fresh timeout.
+    state.reviewer_respawn_count += 1;
+    state.awaiting_headless = false; // spawn below re-marks it
+    app.session.review_loop = None;
+    spawn_review_loop_reviewer(app, state, lens);
+    app.set_status_notice(format!(
+        "Review loop: re-dispatching lost '{}' reviewer (attempt {}/{}).",
+        lens.label(),
+        state.reviewer_respawn_count,
+        REVIEW_LOOP_MAX_REVIEWER_RESPAWNS
+    ));
+    false
+}
+
 /// Step the review loop from the turn-end followups hook. Returns true when a
 /// follow-up was scheduled (so the caller can consider the turn extended).
 pub(super) fn step_review_loop(app: &mut App) -> bool {
@@ -1510,10 +1597,14 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
 
     // Headless mode: the lens review is running server-side and the loop waits
     // on the `HeadlessReviewResult` event to apply the verdict. Do not spawn or
-    // poll (there is no local reviewer session); just park the state so the
-    // loop resumes when the event arrives.
+    // poll (there is no local reviewer session); park the loop unless the
+    // headless request has been lost or stalled, in which case recover and
+    // re-dispatch (bounded) so the loop cannot wait forever.
     if state.awaiting_headless {
-        app.session.review_loop = Some(state);
+        let park = maybe_recover_stalled_headless(app, &mut state);
+        if park {
+            app.session.review_loop = Some(state);
+        }
         return false;
     }
 
@@ -1769,12 +1860,15 @@ fn apply_review_report(
 /// Apply a server `HeadlessReviewResult` to the loop: clear the awaiting state
 /// and, when the verdict parsed, feed it through the shared report-application
 /// path (`apply_review_report`). `findings` entries are `sev|path|text` strings
-/// serialized by the server. Returns `()`.
+/// serialized by the server. `message` is the server's human-readable detail
+/// for non-verdict results (errors / no-verdict reason), surfaced in the
+/// finalized digest. Returns `()`.
 pub(super) fn apply_headless_review_result(
     app: &mut App,
     id: u64,
     kind: &str,
     findings: Vec<String>,
+    message: String,
 ) {
     // Drop a stale/late result whose request id does not match the in-flight
     // headless review (guards against a result from a previous lens or loop
@@ -1851,9 +1945,15 @@ pub(super) fn apply_headless_review_result(
             let record = state
                 .record
                 .get_or_insert_with(jcode_session_types::ReviewRecord::default);
+            let detail = if message.trim().is_empty() {
+                String::new()
+            } else {
+                format!("\n\nSERVER: {}", message.trim())
+            };
             record.digest = Some(format!(
-                "## Review stopped\n\nThe reviewer for the '{}' lens did not produce a usable verdict ({kind}).",
-                state.current_lens.map(|l| l.label()).unwrap_or("?")
+                "## Review stopped\n\nThe reviewer for the '{}' lens did not produce a usable verdict ({kind}).{}",
+                state.current_lens.map(|l| l.label()).unwrap_or("?"),
+                detail
             ));
             app.session.review_loop = Some(state);
             app.push_display_message(DisplayMessage::system(format!(
@@ -1913,6 +2013,11 @@ fn spawn_review_loop_reviewer(
     // the legacy per-lens headed-terminal reviewer.
     state.active_reviewer_id = None;
     state.awaiting_headless = true;
+    // This lens is freshly dispatched; the dispatch timestamp is recorded by
+    // the async drain when it actually sends the request. Reset any prior one
+    // (e.g. from a re-dispatch of a stale lens) so the new dispatch gets a fresh
+    // timeout.
+    state.headless_dispatched_at = None;
     app.session.review_loop = Some(state.clone());
     let _ = app.session.save();
     app.pending_headless_review = Some(lens.label().to_string());

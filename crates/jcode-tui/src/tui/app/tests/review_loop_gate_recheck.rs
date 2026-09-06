@@ -781,7 +781,7 @@ fn remote_tick_self_drives_review_loop_advance() {
         // The server replies with a CLEAN result, which the event handler feeds
         // into the loop; this must advance to the next lens.
         app.active_headless_request_id = Some(42);
-        super::commands::apply_headless_review_result(&mut app, 42, "clean", Vec::new());
+        super::commands::apply_headless_review_result(&mut app, 42, "clean", Vec::new(), String::new());
         let advanced = app.session.review_loop.as_ref().unwrap();
         assert_eq!(
             advanced.current_lens,
@@ -917,35 +917,33 @@ fn remote_findings_fix_then_recheck_advances() {
         let recheck_lens = app.session.review_loop.as_ref().unwrap().current_lens.unwrap();
 
         // Step 4: the post-fix Done path re-spawns the re-check reviewer for the
-        // SAME lens (active_reviewer_id was None after the fix).
+        // SAME lens. On the remote server-client path this dispatches the lens
+        // headlessly (no local reviewer session), so `active_reviewer_id` stays
+        // None and the loop awaits a server verdict.
         super::commands_review::step_review_loop(&mut app);
-        let rechecker_id = app
-            .session
-            .review_loop
-            .as_ref()
-            .unwrap()
-            .active_reviewer_id
-            .clone()
-            .expect("a fresh re-check reviewer must be spawned");
+        let recheck_state = app.session.review_loop.as_ref().unwrap();
+        assert!(
+            recheck_state.awaiting_headless,
+            "re-check must be dispatched headlessly"
+        );
+        assert!(
+            recheck_state.active_reviewer_id.is_none(),
+            "headless re-check must not set a local reviewer session"
+        );
+        assert!(
+            app.pending_headless_review.is_some(),
+            "re-check must queue a headless dispatch"
+        );
         assert_eq!(
-            app.session.review_loop.as_ref().unwrap().current_lens,
+            recheck_state.current_lens,
             Some(recheck_lens),
             "re-check must stay on the same lens, not advance before it is clean"
         );
 
-        // Step 5: the re-check reviewer reports CLEAN -> the loop records it and
-        // advances to the next lens.
-        let mut rechecker = crate::session::Session::load(&rechecker_id).expect("load re-checker");
-        rechecker.add_message_with_display_role(
-            crate::message::Role::User,
-            vec![crate::message::ContentBlock::Text {
-                text: "VERDICT: CLEAN".to_string(),
-                cache_control: None,
-            }],
-            None,
-        );
-        rechecker.save().expect("save re-checker verdict");
-        super::commands_review::step_review_loop(&mut app);
+        // Step 5: the re-check reports CLEAN via HeadlessReviewResult -> the loop
+        // records it and advances to the next lens.
+        app.active_headless_request_id = Some(42);
+        super::commands::apply_headless_review_result(&mut app, 42, "clean", Vec::new(), String::new());
 
         let advanced = app.session.review_loop.as_ref().unwrap();
         assert!(!advanced.finished);
@@ -1243,7 +1241,7 @@ fn unrelated_interleave_does_not_stall_review_loop_advance() {
 
         // A CLEAN verdict still advances to the next lens.
         app.active_headless_request_id = Some(42);
-        super::commands::apply_headless_review_result(&mut app, 42, "clean", Vec::new());
+        super::commands::apply_headless_review_result(&mut app, 42, "clean", Vec::new(), String::new());
         let state = app.session.review_loop.as_ref().unwrap();
         assert_eq!(
             state.current_lens,
@@ -1434,13 +1432,17 @@ fn idle_poll_does_not_step_loop_while_non_fix_dispatch_pending() {
 }
 
 // Regression (respawn then verdict): a lost reviewer is respawned (bounded), and
-// the respawned reviewer's CLEAN verdict is honored — the loop advances to the
+// the respawned lens's CLEAN verdict is honored — the loop advances to the
 // next lens exactly as if the original had produced it. Pins that respawning does
 // not corrupt the loop's ability to make progress from the respawned reviewer.
+// On the remote server-client path the respawn dispatches the lens **headlessly**
+// (no local reviewer session), so the verdict arrives as a `HeadlessReviewResult`.
 #[test]
 fn loop_advances_after_respawned_reviewer_reports_clean() {
     with_temp_jcode_home(|| {
         let mut app = create_test_app();
+        // Respawn dispatches the lens headlessly (remote server-client path).
+        app.is_remote = true;
 
         // Live loop at Correctness with a reviewer that is lost.
         let mut state = jcode_session_types::ReviewLoopState::new();
@@ -1452,31 +1454,20 @@ fn loop_advances_after_respawned_reviewer_reports_clean() {
         app.pending_queued_dispatch = false;
 
         // First step: the lost reviewer triggers a respawn (budget 0 -> 1).
+        // On the remote path this dispatches the lens headlessly (no local
+        // reviewer session), so there is no `active_reviewer_id`.
         let followup = super::commands_review::step_review_loop(&mut app);
         assert!(followup, "one-shot respawn must schedule a fresh reviewer");
-        let respawned_id = app
-            .session
-            .review_loop
-            .as_ref()
-            .unwrap()
-            .active_reviewer_id
-            .clone()
-            .expect("a respawned reviewer session must be set");
-
-        // The respawned reviewer reports CLEAN.
-        let mut reviewer = crate::session::Session::load(&respawned_id).expect("load respawned");
-        reviewer.add_message_with_display_role(
-            crate::message::Role::User,
-            vec![crate::message::ContentBlock::Text {
-                text: "VERDICT: CLEAN".to_string(),
-                cache_control: None,
-            }],
-            None,
+        // Headless respawn: no local reviewer session, but the lens is queued
+        // for dispatch and awaiting the server verdict.
+        assert!(
+            app.pending_headless_review.is_some(),
+            "headless respawn must queue a fresh dispatch"
         );
-        reviewer.save().expect("save respawned verdict");
 
-        // Stepping again consumes the CLEAN verdict and advances to the next lens.
-        super::commands_review::step_review_loop(&mut app);
+        // The respawned headless lens reports CLEAN via HeadlessReviewResult.
+        app.active_headless_request_id = Some(42);
+        super::commands::apply_headless_review_result(&mut app, 42, "clean", Vec::new(), String::new());
         let state = app.session.review_loop.as_ref().unwrap();
         assert!(!state.finished, "a clean respawned verdict must keep the loop running");
         assert_eq!(
@@ -1643,4 +1634,205 @@ fn changed_files_from_signature_handles_empty() {
         changed_files_from_signature("  \n  \n").is_empty(),
         "whitespace-only lines yield no files"
     );
+}
+
+// Regression: a reloaded/resumed client loses the in-memory headless dispatch
+// handoff (active_headless_request_id / pending_headless_review reset to None)
+// while `awaiting_headless` persists on the session. The loop must NOT park
+// forever: an orphaned awaited lens (no dispatch recorded, no in-flight id, no
+// queued dispatch) is re-dispatched (bounded), not abandoned.
+#[test]
+fn orphaned_headless_request_is_redipatched_not_parked() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        app.is_remote = true;
+
+        // A loop awaiting a headless verdict, as it would be loaded after a
+        // client reload: awaiting_headless persisted, but the in-memory request
+        // id and queued dispatch are gone.
+        let mut state = jcode_session_types::ReviewLoopState::new();
+        super::review_loop::enter_review_loop(&mut state);
+        state.awaiting_headless = true;
+        state.headless_dispatched_at = None;
+        app.session.review_loop = Some(state);
+        app.active_headless_request_id = None;
+        app.pending_headless_review = None;
+
+        let _ = super::commands::step_review_loop(&mut app);
+
+        let recovered = app.session.review_loop.as_ref().unwrap();
+        assert!(
+            recovered.awaiting_headless,
+            "orphaned lens must remain awaiting after re-dispatch"
+        );
+        assert_eq!(
+            recovered.current_lens,
+            Some(jcode_session_types::ReviewLens::Correctness),
+            "re-dispatch must keep the same lens"
+        );
+        assert_eq!(
+            recovered.reviewer_respawn_count, 1,
+            "orphaned recovery counts as one respawn"
+        );
+        assert!(
+            app.pending_headless_review.is_some(),
+            "orphaned recovery must queue a fresh headless dispatch"
+        );
+        assert!(
+            !recovered.finished,
+            "a bounded orphaned re-dispatch must not finalize the loop"
+        );
+    });
+}
+
+// Regression: a normally-awaiting headless lens (dispatch recorded, in-flight
+// request id present) must NOT be treated as orphaned and re-dispatched.
+#[test]
+fn in_flight_headless_request_is_left_parked() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        app.is_remote = true;
+
+        let mut state = jcode_session_types::ReviewLoopState::new();
+        super::review_loop::enter_review_loop(&mut state);
+        state.awaiting_headless = true;
+        // Dispatched just now (recent, well within the stale timeout).
+        state.headless_dispatched_at = Some(crate::tui::test_harness::now_ms());
+        app.session.review_loop = Some(state);
+        app.active_headless_request_id = Some(7);
+        app.pending_headless_review = None;
+
+        let _ = super::commands::step_review_loop(&mut app);
+
+        let parked = app.session.review_loop.as_ref().unwrap();
+        assert_eq!(
+            parked.reviewer_respawn_count, 0,
+            "an in-flight request must not be re-dispatched"
+        );
+        assert!(
+            app.pending_headless_review.is_none(),
+            "an in-flight request must not queue another dispatch"
+        );
+        assert!(parked.awaiting_headless, "loop must stay parked awaiting");
+    });
+}
+
+// Regression: an awaited headless lens whose dispatch has gone stale (past
+// stale_reviewer_timeout with no result) is re-dispatched (bounded), not parked
+// forever. Uses headless_dispatched_at=0 (epoch) so any configured timeout
+// (default 1800s) is long exceeded without needing a test clock.
+#[test]
+fn stale_headless_request_is_redipatched_not_parked() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        app.is_remote = true;
+
+        let mut state = jcode_session_types::ReviewLoopState::new();
+        super::review_loop::enter_review_loop(&mut state);
+        state.awaiting_headless = true;
+        // Dispatched "long ago": far past the stale timeout. No in-flight id
+        // (reload-scenario) so stale detection is the only recovery trigger.
+        state.headless_dispatched_at = Some(0);
+        app.session.review_loop = Some(state);
+        app.active_headless_request_id = None;
+        app.pending_headless_review = None;
+
+        let _ = super::commands::step_review_loop(&mut app);
+
+        let recovered = app.session.review_loop.as_ref().unwrap();
+        assert_eq!(
+            recovered.reviewer_respawn_count, 1,
+            "stale recovery must re-dispatch and count one respawn"
+        );
+        assert!(
+            app.pending_headless_review.is_some(),
+            "stale recovery must queue a fresh dispatch"
+        );
+        assert!(
+            !recovered.finished,
+            "a bounded stale re-dispatch must not finalize the loop"
+        );
+    });
+}
+
+// Regression: when the headless respawn budget is exhausted (the lens keeps
+// being lost/orphaned/stale), the loop finalizes with a clear digest instead of
+// re-dispatching forever.
+#[test]
+fn headless_loss_budget_exhaustion_finalizes() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        app.is_remote = true;
+
+        let mut state = jcode_session_types::ReviewLoopState::new();
+        super::review_loop::enter_review_loop(&mut state);
+        state.awaiting_headless = true;
+        state.headless_dispatched_at = None;
+        state.reviewer_respawn_count = 2; // budget (REVIEW_LOOP_MAX_REVIEWER_RESPAWNS)
+        app.session.review_loop = Some(state);
+        app.active_headless_request_id = None;
+        app.pending_headless_review = None;
+
+        let _ = super::commands::step_review_loop(&mut app);
+
+        let finished = app.session.review_loop.as_ref().unwrap();
+        assert!(finished.finished, "budget exhaustion must finalize the loop");
+        assert_eq!(
+            finished.finish_reason.as_deref(),
+            Some("review_headless_lost"),
+            "finalize reason must name the headless-loss outcome"
+        );
+        assert!(
+            app.pending_headless_review.is_none(),
+            "after finalize no further dispatch is queued"
+        );
+        let digest = finished
+            .record
+            .as_ref()
+            .and_then(|r| r.digest.clone())
+            .unwrap_or_default();
+        assert!(
+            digest.contains("headless reviewer was lost"),
+            "digest must explain the headless-loss stop, got: {digest}"
+        );
+    });
+}
+
+// The server's no-verdict message detail is surfaced in the finalized digest.
+#[test]
+fn headless_no_verdict_surfaces_server_message() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        app.is_remote = true;
+
+        let mut state = jcode_session_types::ReviewLoopState::new();
+        super::review_loop::enter_review_loop(&mut state);
+        state.awaiting_headless = true;
+        app.session.review_loop = Some(state);
+        app.active_headless_request_id = Some(9);
+
+        super::commands::apply_headless_review_result(
+            &mut app,
+            9,
+            "no_verdict",
+            Vec::new(),
+            "server-side parser found no VERDICT".to_string(),
+        );
+
+        let state = app.session.review_loop.as_ref().unwrap();
+        assert!(state.finished, "no-verdict must finalize the loop");
+        assert_eq!(
+            state.finish_reason.as_deref(),
+            Some("review_no_verdict")
+        );
+        let digest = state
+            .record
+            .as_ref()
+            .and_then(|r| r.digest.clone())
+            .unwrap_or_default();
+        assert!(
+            digest.contains("server-side parser found no VERDICT"),
+            "no-verdict digest must include the server message, got: {digest}"
+        );
+    });
 }

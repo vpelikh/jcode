@@ -29,7 +29,7 @@
 
 use crate::agent::Agent;
 use crate::logging;
-use crate::message::{ContentBlock, Role};
+use crate::message::ContentBlock;
 use crate::provider::Provider;
 use crate::session::Session;
 use crate::tool;
@@ -72,7 +72,7 @@ pub async fn run_review_lens_headless(
     // applied consistently regardless of which client dispatched the review.
     let lens_prompt = build_lens_prompt(parent_session.id.as_str(), lens_label);
 
-    let child = match build_reviewer_session(parent_session, &lens_prompt, working_dir) {
+    let child = match build_reviewer_session(parent_session, working_dir) {
         Ok(c) => c,
         Err(e) => return HeadlessReviewOutcome::Failed(format!("set up reviewer session: {e}")),
     };
@@ -210,11 +210,14 @@ fn stored_message_text(message: &crate::session::StoredMessage) -> String {
     text
 }
 
-/// Build a fresh reviewer session cloning the parent's context, with the lens
-/// prompt injected as the one-shot first user turn.
+/// Build a fresh reviewer session cloning the parent's context, WITHOUT
+/// injecting the lens prompt. The prompt is delivered by `run_once_capture_with_display_role`
+/// (as `Agent::new_with_session` + `run_once_capture` do for ambient scheduled
+/// sessions), which appends it as the reviewer's one-shot user turn. Injecting
+/// it here as well would produce two back-to-back identical user turns, so the
+/// prompt is intentionally NOT added here.
 fn build_reviewer_session(
     parent_session: &Session,
-    lens_prompt: &str,
     working_dir: Option<String>,
 ) -> anyhow::Result<Session> {
     let mut child = Session::create(Some(parent_session.id.clone()), Some("review".to_string()));
@@ -234,16 +237,6 @@ fn build_reviewer_session(
     child.autoreview_enabled = Some(false);
     child.autojudge_enabled = Some(false);
     child.status = crate::session::SessionStatus::Closed;
-    // Inject the lens prompt as the reviewer's first user turn; the agent will
-    // process it on its own (one-shot) rather than wait for a client submit.
-    child.add_message_with_display_role(
-        Role::User,
-        vec![crate::message::ContentBlock::Text {
-            text: lens_prompt.to_string(),
-            cache_control: None,
-        }],
-        Some(crate::session::StoredDisplayRole::System),
-    );
     child.rebuild_event_map();
     child.save()?;
     Ok(child)
@@ -314,5 +307,34 @@ mod tests {
             ReviewReport::Findings(fs) => assert_eq!(fs[0].severity, "MEDIUM"),
             ReviewReport::Clean => panic!("expected the newer FINDINGS verdict"),
         }
+    }
+
+    #[test]
+    fn build_reviewer_session_does_not_inject_lens_prompt() {
+        // Regression: the reviewer session must NOT pre-inject the lens prompt.
+        // The prompt is delivered exactly once by `run_once_capture_with_display_role`,
+        // so pre-injecting here would produce a duplicated user turn.
+        let parent = Session::create(None, None);
+        let child =
+            build_reviewer_session(&parent, None).expect("build reviewer session clones parent");
+        // The only message(s) in the reviewer should be a clone of the parent's
+        // (which is empty here) — no injected user turn carrying "You are the".
+        let texts: Vec<String> = child
+            .messages
+            .iter()
+            .map(|m| {
+                let mut t = String::new();
+                for block in &m.content {
+                    if let ContentBlock::Text { text, .. } = block {
+                        t.push_str(text);
+                    }
+                }
+                t
+            })
+            .collect();
+        assert!(
+            texts.iter().all(|t| !t.contains("You are the")),
+            "reviewer session must not embed the lens prompt, got {texts:?}"
+        );
     }
 }
