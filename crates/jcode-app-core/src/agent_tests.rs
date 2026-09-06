@@ -3174,3 +3174,118 @@ fn compaction_retry_limit_error_distinguishes_413_from_context_limit() {
     );
     assert!(!msg.contains("Request body"), "no size-limit wording for context errors");
 }
+
+#[derive(Clone)]
+struct RecoverThenCompleteProvider {
+    calls: Arc<std::sync::Mutex<usize>>,
+}
+
+impl RecoverThenCompleteProvider {
+    fn new() -> Self {
+        Self {
+            calls: Arc::new(std::sync::Mutex::new(0)),
+        }
+    }
+}
+
+#[async_trait]
+impl Provider for RecoverThenCompleteProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        let mut guard = self.calls.lock().unwrap();
+        *guard += 1;
+        let attempt = *guard;
+        drop(guard);
+
+        let (tx, rx) = tokio_mpsc::channel::<Result<StreamEvent>>(2);
+        if attempt == 1 {
+            // First attempt: the provider streams a 413 "request too large"
+            // error as an in-stream Err item (the real OpenRouter SSE delivery
+            // — `complete` still returns `Ok(stream)`).
+            let payload_err = anyhow::anyhow!(
+                "OpenAI-compatible chat request failed\n  endpoint: https://example/chat/completions\n  model: DeepSeek-V4-Flash\n  auth: OPENAI_COMPAT_API_KEY\n  status: 413 Payload Too Large\n  response: Hint: the provider rejected the request because the serialized body exceeded its size limit"
+            );
+            tokio::spawn(async move {
+                let _ = tx.send(Err(payload_err)).await;
+            });
+        } else {
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(Ok(StreamEvent::TextDelta(
+                        "recovered and completed".to_string(),
+                    )))
+                    .await;
+                let _ = tx
+                    .send(Ok(StreamEvent::MessageEnd {
+                        stop_reason: Some("end_turn".to_string()),
+                    }))
+                    .await;
+            });
+        }
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    fn name(&self) -> &str {
+        "openrouter"
+    }
+
+    fn supports_compaction(&self) -> bool {
+        true
+    }
+
+    fn context_window(&self) -> usize {
+        1_000
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+}
+
+/// Drive the real streaming turn loop: the first API attempt 413s, the agent
+/// runs hard-compaction recovery, and the retried attempt completes. This is
+/// the public turn-path the live bird session exercises, not a direct call to
+/// the internal helper.
+#[tokio::test]
+async fn streaming_turn_recovers_from_413_payload_too_large_and_retries() {
+    let _guard = crate::storage::lock_test_env();
+    let stub = RecoverThenCompleteProvider::new();
+    let calls = stub.calls.clone();
+    let provider: Arc<dyn Provider> = Arc::new(stub);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // A transcript large enough for hard compaction (accumulated volume, no
+    // oversized single block), matching the bird-session failure profile.
+    for i in 0..30 {
+        agent.add_message(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: format!("turn {i} {}", "x".repeat(300)),
+                cache_control: None,
+            }],
+        );
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    agent
+        .run_turn_streaming_mpsc(tx)
+        .await
+        .expect("the turn should auto-recover from the 413 and complete");
+
+    assert!(
+        *calls.lock().unwrap() >= 2,
+        "recovery must retry (made {} complete calls)",
+        *calls.lock().unwrap()
+    );
+    // The retried call must send the reduced (compacted) transcript.
+    assert!(
+        agent.session.compaction.as_ref().is_some_and(|c| c.compacted_count > 0),
+        "recovery must have hard-compacted older messages to shrink the payload"
+    );
+}
