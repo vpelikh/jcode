@@ -270,6 +270,13 @@ if [ "$download_mode" = "tar" ]; then
   find "$tmpdir" -maxdepth 1 -type f \( -name "${ARTIFACT}${EXE}.bin" -o -name 'libssl.so*' -o -name 'libcrypto.so*' \) \
     -exec cp -f {} "$dest_version_dir/" \;
   mv "$src_bin" "$dest_version_dir/$bin_name"
+  # Install the native desktop app sibling (jcode-desktop2-*) if the payload
+  # shipped it, as "jcode-desktop2" next to the jcode binary.
+  desktop_src="$(find "$tmpdir" -maxdepth 1 -type f -name 'jcode-desktop2-*' | head -1 || true)"
+  if [ -n "$desktop_src" ] && [ -f "$desktop_src" ]; then
+    cp -f "$desktop_src" "$dest_version_dir/jcode-desktop2${EXE}"
+    chmod +x "$dest_version_dir/jcode-desktop2${EXE}" 2>/dev/null || true
+  fi
 elif [ "$download_mode" = "bin" ]; then
   mv "$tmpdir/jcode.download" "$dest_version_dir/$bin_name"
 else
@@ -286,6 +293,11 @@ else
   src_bin="$src_dir/target/release/$bin_name"
   [ -f "$src_bin" ] || err "Built binary not found at $src_bin"
   cp "$src_bin" "$dest_version_dir/$bin_name"
+  # Best-effort build of the desktop sibling too.
+  if (cd "$src_dir" && cargo build --release -p jcode-desktop2 --bin jcode-desktop2) 2>/dev/null && [ -f "$src_dir/target/release/jcode-desktop2${EXE}" ]; then
+    cp "$src_dir/target/release/jcode-desktop2${EXE}" "$dest_version_dir/jcode-desktop2${EXE}"
+    chmod +x "$dest_version_dir/jcode-desktop2${EXE}" 2>/dev/null || true
+  fi
 fi
 
 chmod +x "$dest_version_dir/$bin_name" 2>/dev/null || true
@@ -339,6 +351,11 @@ if [ "$(uname -s)" = "Darwin" ]; then
   # first interactive jcode launch performs the same version-gated repair.
   if "$launcher_path" setup-launcher </dev/null >/dev/null 2>&1; then
     info "Installed macOS launcher and turn-notification broker."
+  fi
+  # Bundle the native desktop app from the jcode-desktop2 sibling when present.
+  if [ -x "$dest_version_dir/jcode-desktop2${EXE}" ] && \
+       "$launcher_path" setup-launcher --desktop </dev/null >/dev/null 2>&1; then
+    info "Installed macOS Jcode Desktop.app."
   fi
 fi
 
