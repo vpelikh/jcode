@@ -77,12 +77,20 @@ accounting design (see "Interpretation noted" above).
   `tool::bash::test_detached_promoted_command_…`). All pass in isolation and are
   untouched by this work (pre-existing flake).
 
-## Remaining from the plan (not started)
+## Follow-ups (open, awaiting steer)
 
-Deliberately parked; all are large, cross-cutting, and benefit from a steer:
+These are explicitly open and are tracked as follow-ups, not delivered work:
 
-- P1 #12 branded IDs — ~95 `ToolContext`/ID construction-site refactor.
-- P1 #2+#8 execution-world seam + fail-closed sandbox — confinement, not just
-  classification.
-- P2 #10 jobs seam, #11 durable inbox, #14 waterfall hooks.
-- P3 #15 goals domain, #17 layered config, #18 postmortem culture.
+- **F1 — physical `session.messages` consolidation (doc-literal #5).** The
+  state-only bracket (this branch) records the log bracket but does NOT
+  physically collapse `session.messages` into a summary + tail, as the takeaways
+  doc's "still open" note literally asks. Delivering that requires rebasing
+  `CompactionManager.compacted_count` and the persisted compaction state so
+  reload resolves against the shorter vector. It is a separate, riskier,
+  cross-crate change and is deliberately parked pending a steer.
+- **F2 — remaining plan items (large refactors).** P1 #12 branded IDs
+  (~95 `ToolContext`/ID construction sites); P1 #2+#8 execution-world seam +
+  fail-closed sandbox (confinement, not just classification); P2 #10 jobs
+  seam, #11 durable inbox, #14 waterfall hooks; P3 #15 goals domain, #17
+  layered config, #18 postmortem culture. These are large, cross-cutting, and
+  benefit from a steer before work begins.
