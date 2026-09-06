@@ -613,7 +613,10 @@ const LEGACY_TODO_CONFIDENCE_SPIKE_CONTINUATION_MESSAGE: &str =
 /// sessions can still contain it and must keep treating it as a hidden gate.
 const PRE_EVIDENCE_TODO_CONFIDENCE_SPIKE_CONTINUATION_MESSAGE: &str = "[automated follow-up - not a user message] Independently recheck the work below. Keep the todo up to date; do not reply or wait for the user.";
 
-fn normalized_group(group: Option<&str>) -> Option<String> {
+/// Canonical normalization for a group label: trim whitespace and collapse an
+/// empty label to `None` (the ungrouped list). Shared by the group-key helpers
+/// and by callers that must match a goal's group against a todo group.
+pub fn normalized_group(group: Option<&str>) -> Option<String> {
     group
         .map(str::trim)
         .filter(|group| !group.is_empty())
@@ -2333,6 +2336,14 @@ mod tests {
             todo("b", "completed", Some("g")),
         ];
         assert_eq!(completed_group_keys(&done), vec![Some("g".to_string())]);
+    }
+
+    #[test]
+    fn normalized_group_trims_and_collapses_empty() {
+        assert_eq!(normalized_group(None), None);
+        assert_eq!(normalized_group(Some("  ")), None);
+        assert_eq!(normalized_group(Some("release")), Some("release".to_string()));
+        assert_eq!(normalized_group(Some("  release  ")), Some("release".to_string()));
     }
 
     #[test]

@@ -1651,16 +1651,13 @@ impl App {
         // progress and reset a stuck group's budget. The ungrouped list
         // (`None`) is completed when there is at least one ungrouped todo and
         // all of them are completed.
-        let normalized = |group: Option<&str>| -> Option<String> {
-            group.map(str::trim).filter(|g| !g.is_empty()).map(str::to_string)
-        };
         // Same completed-group set the ownership gate evaluates, so the two stay
         // in lock step (`completed_group_keys` drives both).
         let completed_groups = crate::todo::completed_group_keys(todos);
 
         let mut entries: Vec<(String, String)> = Vec::new();
         for goal in goals {
-            let key = normalized(goal.group.as_deref());
+            let key = crate::todo::normalized_group(goal.group.as_deref());
             if !completed_groups.contains(&key) {
                 // Not a completed group, not gated.
                 continue;
@@ -1706,7 +1703,7 @@ impl App {
             }
         }
         for todo in todos.iter().filter(|t| t.status == "completed") {
-            let group = normalized(todo.group.as_deref()).unwrap_or_default();
+            let group = crate::todo::normalized_group(todo.group.as_deref()).unwrap_or_default();
             entries.push((
                 format!("todo:{group}:{}:completion_confidence", todo.id),
                 todo.completion_confidence
