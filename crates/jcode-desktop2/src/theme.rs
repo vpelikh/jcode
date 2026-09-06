@@ -53,11 +53,11 @@ pub struct Theme {
     /// tuned to contrast with paper nearly vanishes on a wash, and a
     /// highlight you cannot see is the same as no highlight.
     pub selection_on_wash: Color,
-    /// Ink for an added line of a diff, and for a removed one. The one place
-    /// the print theme spends hue: a diff is read by scanning for which side a
-    /// line is on, and `+`/`-` alone makes that a character-by-character job.
-    /// Kept desaturated so a card full of them still reads as a document
-    /// rather than as a terminal.
+    /// Ink for an added line of a diff, and for a removed one. A diff is read
+    /// by scanning for which side a line is on, and `+`/`-` alone makes that
+    /// a character-by-character job, so it is the one *scanning* hue ([`Self::accent`]
+    /// is the one *state* hue). Kept desaturated so a card full of them still
+    /// reads as a document rather than as a terminal.
     pub added: Color,
     pub removed: Color,
     /// Fill behind a whole added line of a diff, and behind a removed one.
@@ -358,7 +358,13 @@ mod tests {
             // (both are green-dominant here), not just that the two differ.
             let dominant = |c: Color| {
                 let [r, g, b, _] = c.components;
-                if r >= g && r >= b { 0usize } else if g >= b { 1usize } else { 2usize }
+                if r >= g && r >= b {
+                    0usize
+                } else if g >= b {
+                    1usize
+                } else {
+                    2usize
+                }
             };
             assert!(
                 dominant(theme.accent) == dominant(theme.accent_wash),
