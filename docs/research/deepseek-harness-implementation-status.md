@@ -43,17 +43,28 @@ So the migration adds a **non-message-rewriting bracket seam**:
 | `51665ff60` | `apply_openai_native_compaction` also writes through the bracket for consistency. |
 | `c4cae0c3b` | jcode-tui's mirror writers (`sync_session_compaction_state_from_manager`, `apply_openai_native_compaction`) use the bracket too. |
 
+### Interpretation noted (deviation from the literal doc)
+
+The takeaways doc's "still open" text says the live producer should
+`compact_transcript_with_bracket()` — i.e. **physically consolidate**
+`session.messages` into a summary + recent tail. What this branch actually
+implemented is the **log bracket without physical collapse** (a state-only
+bracket). That is a deliberate judgment call made because the physical
+collapse would shift `CompactionManager.compacted_count` offsets and corrupt
+reload/background accounting; it is **not** a faithful execution of the doc's
+literal recommendation. If the user's intent was specifically the physical
+consolidation, this branch does **not** deliver it — that remains open as a
+separate, documented follow-up.
+
 ### Why not physical consolidation
 
-The takeaways doc's "still open" note describes physically collapsing
-`session.messages` into `[summary, ...tail]`. That would require rebasing the
-manager's `compacted_count` and the persisted compaction state so reload
-resolves against the shorter vector — a broad, behavior-changing, cross-crate
-change entangled with forking, ambient runners, recovery, and the provider
-view. This branch deliberately delivers the takeaway's headline property
-**(log-bracketed, replayable compaction)** on the live path without taking
-that risk. Physical consolidation, if ever wanted, is a separate, documented
-follow-up with its own accounting design.
+The physical collapse — `compacted_count` rebase + persisted-state realign so
+reload resolves against the shorter vector — is broad and behavior-changing,
+entangled with forking, ambient runners, recovery, and the provider view. This
+branch deliberately delivers the takeaway's headline property **(log-bracketed,
+replayable compaction)** on the live path without taking that risk. Physical
+consolidation, if ever wanted, is a separate, documented follow-up with its own
+accounting design (see "Interpretation noted" above).
 
 ## Verification
 
