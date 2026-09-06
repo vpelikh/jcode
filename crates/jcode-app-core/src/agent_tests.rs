@@ -3145,3 +3145,32 @@ async fn non_payload_too_large_error_does_not_fall_through_to_hard_compaction() 
         "unrelated errors must not compact the transcript"
     );
 }
+
+#[test]
+fn compaction_retry_limit_error_distinguishes_413_from_context_limit() {
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    // Build an agent so we can call the &self helper.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = crate::storage::lock_test_env();
+    let registry = rt.block_on(Registry::new(provider.clone()));
+    let mut agent = Agent::new(provider, registry);
+
+    let payload_err = "OpenAI-compatible chat request failed\n  status: 413 Payload Too Large";
+    let msg = agent.compaction_retry_limit_error(payload_err);
+    assert!(
+        msg.contains("Request body still exceeds provider size limit"),
+        "413 must be described as a size-limit failure, got: {msg}"
+    );
+    assert!(
+        msg.contains("/compact"),
+        "413 guidance should suggest manual recovery, got: {msg}"
+    );
+
+    let ctx_err = "OpenAI API error 400: This model's maximum context length is 200000 tokens";
+    let msg = agent.compaction_retry_limit_error(ctx_err);
+    assert!(
+        msg.contains("Context limit exceeded"),
+        "context-limit error must keep the existing wording, got: {msg}"
+    );
+    assert!(!msg.contains("Request body"), "no size-limit wording for context errors");
+}
