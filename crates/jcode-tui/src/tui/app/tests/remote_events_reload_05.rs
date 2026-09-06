@@ -1383,3 +1383,64 @@ fn confidence_fingerprint_ignores_confidence_churn_when_history_is_non_empty() {
         "confidence churn on a todo with empty history must count as confidence-gate progress"
     );
 }
+
+#[test]
+fn confidence_fingerprint_ignores_priority_churn_on_todo_without_completion_confidence() {
+    // A todo without completion_confidence forces needs_validation via
+    // `missing_completion_confidence` and is excluded from the weighted
+    // average, so its priority never affects the gate. Churning priority on it
+    // must not register as confidence-gate progress.
+    let base = crate::todo::TodoItem {
+        id: "a".to_string(),
+        content: "same".to_string(),
+        status: "completed".to_string(),
+        priority: "high".to_string(),
+        completion_confidence: None, // never enters the weighted average
+        ..Default::default()
+    };
+    let fp_base = <App>::confidence_gate_fingerprint(&[base.clone()]);
+
+    let mut churned = base.clone();
+    churned.priority = "critical".to_string();
+    let fp_churned = <App>::confidence_gate_fingerprint(&[churned]);
+    assert_eq!(
+        fp_base, fp_churned,
+        "priority churn on a todo without completion_confidence must not count as confidence-gate progress"
+    );
+
+    // But when completion_confidence IS present, priority is the weighted-
+    // average weight and must be reflected.
+    let mut with = base.clone();
+    with.completion_confidence = Some(crate::todo::ConfidenceState::Validated);
+    let mut with_churned = with.clone();
+    with_churned.priority = "critical".to_string();
+    let fp_with = <App>::confidence_gate_fingerprint(&[with]);
+    let fp_with_churned = <App>::confidence_gate_fingerprint(&[with_churned]);
+    assert_ne!(
+        fp_with, fp_with_churned,
+        "priority churn on a todo WITH completion_confidence must count as confidence-gate progress"
+    );
+}
+
+#[test]
+fn confidence_fingerprint_is_agnostic_to_a_completed_todos_group() {
+    // The confidence gate (`todo_confidence_summary`) averages ALL completed
+    // todos regardless of group, so moving a completed todo between groups
+    // must not register as confidence-gate progress.
+    let mut in_g = crate::todo::TodoItem {
+        id: "a".to_string(),
+        content: "same".to_string(),
+        status: "completed".to_string(),
+        group: Some("g".to_string()),
+        completion_confidence: Some(crate::todo::ConfidenceState::Validated),
+        ..Default::default()
+    };
+    let fp_in_g = <App>::confidence_gate_fingerprint(&[in_g.clone()]);
+
+    in_g.group = Some("different-group".to_string());
+    let fp_other = <App>::confidence_gate_fingerprint(&[in_g]);
+    assert_eq!(
+        fp_in_g, fp_other,
+        "moving a completed todo between groups must not count as confidence-gate progress"
+    );
+}

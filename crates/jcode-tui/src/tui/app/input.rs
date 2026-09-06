@@ -1742,18 +1742,22 @@ impl App {
     /// between confidence-gate nudges.
     ///
     /// Only the completed-todo fields `todo_confidence_summary` reads count:
-    /// completion_confidence, priority (the weighted-average weight), the
-    /// confidence_history tail (spike detection), and `confidence` only when it
-    /// is the empty-history spike fallback. Unrelated churn (todo content,
-    /// group-scoped ownership fields, `confidence` on a todo that already has
-    /// history) must not register. The projection is sorted so reordering todos
-    /// does not register as a change.
+    /// completion_confidence, priority (the weighted-average weight, only when
+    /// present alongside completion_confidence), the confidence_history tail
+    /// (spike detection), and `confidence` only when it is the empty-history
+    /// spike fallback. Unrelated churn (todo content, group-scoped ownership
+    /// fields, `confidence` on a todo that already has history, `priority` on a
+    /// todo lacking completion_confidence, or a todo's group) must not register.
+    /// The projection is sorted so reordering todos does not register as a change.
     pub(super) fn confidence_gate_fingerprint(todos: &[crate::todo::TodoItem]) -> String {
         let mut entries: Vec<(String, String)> = Vec::new();
+        // The confidence gate (`todo_confidence_summary`) is group-agnostic: it
+        // averages ALL completed todos regardless of group. So the fingerprint
+        // keys must NOT include the group, or moving a completed todo between
+        // groups would look like gate progress.
         for todo in todos.iter().filter(|t| t.status == "completed") {
-            let group = crate::todo::normalized_group(todo.group.as_deref()).unwrap_or_default();
             entries.push((
-                format!("todo:{group}:{}:completion_confidence", todo.id),
+                format!("todo:{}:completion_confidence", todo.id),
                 todo.completion_confidence
                     .map(|s| s.as_str())
                     .unwrap_or("")
@@ -1766,7 +1770,7 @@ impl App {
             // it on a todo that already has history is not mistaken for progress.
             if todo.confidence_history.is_empty() {
                 entries.push((
-                    format!("todo:{group}:{}:confidence", todo.id),
+                    format!("todo:{}:confidence", todo.id),
                     todo.confidence
                         .map(|s| s.as_str())
                         .unwrap_or("")
@@ -1775,11 +1779,17 @@ impl App {
             }
             // The confidence gate's weighted average uses priority as its
             // weight (`todo_confidence_weight`), so a priority change alters
-            // the gated signal and must count as progress.
-            entries.push((
-                format!("todo:{group}:{}:priority", todo.id),
-                todo.priority.clone(),
-            ));
+            // the gated signal and must count as progress — BUT only for todos
+            // that actually enter the average (those with completion_confidence).
+            // A todo without completion_confidence is excluded from the average
+            // AND forces needs_validation via `missing_completion_confidence`
+            // regardless of priority, so its priority is irrelevant to the gate.
+            if todo.completion_confidence.is_some() {
+                entries.push((
+                    format!("todo:{}:priority", todo.id),
+                    todo.priority.clone(),
+                ));
+            }
             // Spike detection reads only the last two confidence_history entries
             // (or falls back to confidence/completion_confidence when empty,
             // which are already projected above). Joining the FULL history would
@@ -1795,7 +1805,7 @@ impl App {
                 )),
             };
             entries.push((
-                format!("todo:{group}:{}:confidence_history_tail", todo.id),
+                format!("todo:{}:confidence_history_tail", todo.id),
                 spike_tail
                     .map(|(a, b)| format!("{a}>{b}"))
                     .unwrap_or_default(),
