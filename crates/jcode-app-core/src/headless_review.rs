@@ -16,10 +16,10 @@
 //! the lens prompt headlessly, closes the agent, and re-loads the session to
 //! parse the machine-readable `VERDICT`.
 //!
-//! The client review loop can then dispatch "run this lens headless" to the
-//! server and poll the reviewer session for the verdict, exactly as it already
-//! polls a spawned-window reviewer — but with no window and no terminal
-//! dependence. This module is the foundation of that integration.
+//! The client review loop dispatches "run this lens headless" to the server,
+//! which runs the reviewer here and replies with a `ServerEvent::HeadlessReviewResult`
+//! that the client applies to advance the loop — no window and no terminal
+//! dependence, and no client-side session polling.
 //!
 //! The execution pattern mirrors
 //! `ambient::runner::spawn_session_for_scheduled_item` (fork provider -> build
@@ -53,10 +53,10 @@ pub enum HeadlessReviewOutcome {
 ///
 /// The reviewer is a clone of the parent session (context + working dir) plus
 /// the lens prompt injected as its one-shot first user turn, preserving the
-/// per-lens independence the proposal requires. `lens` is used for logging; the
-/// actual review instructions live in `lens_prompt`, which the caller should
-/// build with `build_lens_review_startup_message` (TUI) or its server
-/// equivalent so the report contract (`VERDICT: CLEAN | FINDINGS`) is emitted.
+/// per-lens independence the proposal requires. `lens_label` is used for
+/// logging; the actual review instructions live in `lens_prompt`, which the
+/// caller builds (server-side or on the client) so the report contract
+/// (`VERDICT: CLEAN | FINDINGS`) is emitted.
 ///
 /// Returns a `HeadlessReviewOutcome` — never a hard error for a missing or
 /// malformed verdict: the caller's loop decides how to surface a non-verdict.
@@ -160,7 +160,7 @@ fn build_reviewer_session(
     lens_prompt: &str,
     working_dir: Option<String>,
 ) -> anyhow::Result<Session> {
-    let mut child = Session::create(Some(parent_session.id.clone()), Some("revel".to_string()));
+    let mut child = Session::create(Some(parent_session.id.clone()), Some("review".to_string()));
     child.replace_messages(parent_session.messages.clone());
     child.compaction = parent_session.compaction.clone();
     child.provider_key = parent_session.provider_key.clone();
@@ -240,7 +240,8 @@ mod tests {
 
     #[test]
     fn verdict_scan_prefers_most_recent_message() {
-        // A stale CLEAN followed by a new FINDINGS must surface find more recent.
+        // A stale CLEAN followed by a newer FINDINGS must surface the newer
+        // verdict (the scan goes most-recent-first).
         let mut session = session_with_verdict("VERDICT: CLEAN");
         session.add_message_with_display_role(
             Role::User,

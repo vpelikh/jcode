@@ -615,6 +615,9 @@ fn remote_done_seeds_review_loop_on_remote_product_path() {
 fn idle_tick_self_drives_review_loop_advance() {
     with_temp_jcode_home(|| {
         let mut app = create_test_app();
+        // Headless dispatch (the advance after a verdict) requires the
+        // remote server-client path.
+        app.is_remote = true;
 
         // Seed a live review loop at the first lens (Correctness).
         let mut state = jcode_session_types::ReviewLoopState::new();
@@ -1049,6 +1052,9 @@ fn step_review_loop_finalizes_when_reviewer_session_is_gone() {
 fn step_review_loop_respawns_lost_reviewer_within_budget() {
     with_temp_jcode_home(|| {
         let mut app = create_test_app();
+        // A respawn dispatches the lens headlessly, which requires the remote
+        // server-client path.
+        app.is_remote = true;
 
         let mut state = jcode_session_types::ReviewLoopState::new();
         super::review_loop::enter_review_loop(&mut state);

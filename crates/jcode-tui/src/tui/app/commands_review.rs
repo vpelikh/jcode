@@ -1718,12 +1718,10 @@ fn apply_review_report(
             _ => false,
         };
         state.last_fix_touched_files = touched;
-        if touched {
-            if let Some(now_sig) = now_sig {
+        if touched && let Some(now_sig) = now_sig {
                 let files = changed_files_from_signature(&now_sig);
                 review_loop::record_fix_files(state, files);
             }
-        }
     }
     let action = review_loop::apply_verdict(state, report, max_stalled);
     match action {
@@ -1735,12 +1733,11 @@ fn apply_review_report(
                 .collect::<Vec<_>>()
                 .join("\n");
             let prompt = format!("The reviewer found the following issues. Fix them:\n\n{summary}");
-            if let Some(cwd) = active_working_dir(app) {
-                if let Some(sig) = working_tree_signature(&cwd) {
-                    if let Some(s) = app.session.review_loop.as_mut() {
-                        s.fix_baseline_tree = Some(sig);
-                    }
-                }
+            if let Some(cwd) = active_working_dir(app)
+                && let Some(sig) = working_tree_signature(&cwd)
+                && let Some(s) = app.session.review_loop.as_mut()
+            {
+                s.fix_baseline_tree = Some(sig);
             }
             if app.is_remote {
                 app.queued_messages.push(prompt);
@@ -1784,10 +1781,7 @@ pub(super) fn apply_headless_review_result(
         .session
         .review_loop
         .as_mut()
-        .map(|s| {
-            let awaiting = std::mem::replace(&mut s.awaiting_headless, false);
-            awaiting
-        })
+        .map(|s| std::mem::replace(&mut s.awaiting_headless, false))
         .unwrap_or(false);
     if !accepted {
         crate::logging::warn(&format!(
@@ -1833,7 +1827,23 @@ pub(super) fn apply_headless_review_result(
     let result = match report {
         Some(report) => apply_review_report(app, &mut state, &report, max_stalled),
         None => {
+            // A failed / no-verdict lens. Finalize the loop with a clear digest
+            // instead of parking it — parking re-dispatches the same lens on the
+            // next idle poll, which loops forever on a consistently failing lens.
+            state.finished = true;
+            state.finish_reason = Some("review_no_verdict".to_string());
+            let record = state
+                .record
+                .get_or_insert_with(jcode_session_types::ReviewRecord::default);
+            record.digest = Some(format!(
+                "## Review stopped\n\nThe reviewer for the '{}' lens did not produce a usable verdict ({kind}).",
+                state.current_lens.map(|l| l.label()).unwrap_or("?")
+            ));
             app.session.review_loop = Some(state);
+            app.push_display_message(DisplayMessage::system(format!(
+                "Review loop stopped: the reviewer produced no usable verdict ({kind})."
+            )));
+            app.set_status_notice("Review loop: no verdict");
             false
         }
     };
@@ -1848,13 +1858,37 @@ pub(super) fn apply_headless_review_result(
 /// On the remote server-client path the reviewer runs **headlessly** on the
 /// server (no terminal window): this queues a `Request::HeadlessReview` via
 /// `app.pending_headless_review`, which the async remote run loop drains and
-/// sends. On a non-remote/local session (no server dispatch), it falls back to
-/// spawning a headed reviewer in a new terminal window (the legacy behaviour).
+/// sends. On a non-remote/local session (no server dispatch) it finalizes the
+/// loop with a clear "requires server mode" reason — the loop cannot run
+/// without the server headless reviewer, and we no longer fall back to a
+/// headed-terminal reviewer.
 fn spawn_review_loop_reviewer(
     app: &mut App,
     state: &mut jcode_session_types::ReviewLoopState,
     lens: jcode_session_types::ReviewLens,
 ) -> bool {
+    if !app.is_remote {
+        // Headless review runs on the server; without a server connection
+        // (the non-remote/local client) there is no way to run a reviewer, so
+        // finalize the loop with a clear digest instead of waiting forever for
+        // a `HeadlessReviewResult` that can never arrive.
+        state.finished = true;
+        state.finish_reason = Some("review_requires_server".to_string());
+        let record = state
+            .record
+            .get_or_insert_with(jcode_session_types::ReviewRecord::default);
+        record.digest = Some(
+            "## Review stopped\n\nThe review loop runs headlessly on the server. Start the server (remote server-client) to run review rounds.".to_string(),
+        );
+        app.session.review_loop = Some(state.clone());
+        let _ = app.session.save();
+        app.push_display_message(DisplayMessage::system(
+            "Review loop requires server mode; skipped review.".to_string(),
+        ));
+        app.set_status_notice("Review loop: requires server mode");
+        return false;
+    }
+
     // Headless dispatch (no terminal window): mark the loop as awaiting a
     // server verdict for this lens and stash the lens so the async remote tick
     // rebuilds the prompt and sends `Request::HeadlessReview`. The server runs
