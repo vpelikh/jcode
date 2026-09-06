@@ -2846,6 +2846,155 @@ fn test_compact_transcript_with_bracket_produces_balanced_durable_bracket() {
         .expect("reloaded bracket producer log must stay consistent");
 }
 
+/// `Session::set_compaction_with_bracket` records the live producer's compaction
+/// state as a balanced bracket WITHOUT rewriting messages (the virtual-summary
+/// model). The bracket must be balanced, leave no orphan, survive reload, and
+/// the messages must be untouched.
+#[test]
+fn test_set_compaction_with_bracket_records_balanced_bracket_without_rewriting_messages() {
+    let mut session = Session::create_with_id(
+        "bracket_state".to_string(),
+        None,
+        Some("Bracket state".to_string()),
+    );
+    for i in 0..3 {
+        session.append_stored_message(StoredMessage {
+            id: format!("m{i}"),
+            role: Role::User,
+            content: vec![text_block(&format!("msg {i}"))],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+    let original_length = session.messages.len();
+    let compaction = StoredCompactionState {
+        summary_text: "summarized".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 3,
+        original_turn_count: 3,
+        compacted_count: 2,
+    };
+
+    let id = session.set_compaction_with_bracket("comp_state", compaction.clone());
+    assert_eq!(id, "comp_state");
+
+    // Messages are NOT rewritten (virtual-summary model preserved).
+    assert_eq!(
+        session.messages.len(),
+        original_length,
+        "set_compaction_with_bracket must not replace messages"
+    );
+
+    // Balanced bracket, no orphan.
+    assert!(
+        session.event_map.orphaned_compaction().is_none(),
+        "completed bracket must not leave an orphaned lock"
+    );
+    let ops: Vec<&SessionEventOp> = session.event_map.events.iter().map(|e| &e.op).collect();
+    let has_start = ops
+        .iter()
+        .any(|op| matches!(op, SessionEventOp::CompactionStart { .. }));
+    let has_end = ops
+        .iter()
+        .any(|op| matches!(op, SessionEventOp::CompactionEnd { .. }));
+    assert!(
+        has_start && has_end,
+        "bracket must contain both Start and End markers; ops={ops:?}"
+    );
+
+    // The End carries the authoritative compaction state.
+    let (_, derived_compaction) = session.rederive_all();
+    assert_eq!(
+        derived_compaction.as_ref().map(|c| &c.summary_text),
+        Some(&"summarized".to_string())
+    );
+    session
+        .rederive_all_checked()
+        .expect("bracket state producer must yield a consistent event log");
+
+    // Survive serialize + reload, staying balanced.
+    let json = serde_json::to_string(&session).unwrap();
+    let back: Session = serde_json::from_str(&json).unwrap();
+    assert!(
+        back.event_map.orphaned_compaction().is_none(),
+        "balanced bracket must survive serialize round-trip"
+    );
+    assert_eq!(
+        back.event_map.current_compaction().as_ref().map(|c| &c.summary_text),
+        Some(&"summarized".to_string())
+    );
+    assert_eq!(
+        back.compaction.as_ref().map(|c| &c.summary_text),
+        Some(&"summarized".to_string())
+    );
+    assert_eq!(
+        back.messages.len(),
+        original_length,
+        "reloaded session must keep full messages"
+    );
+    back.rederive_all_checked()
+        .expect("reloaded state bracket log must stay consistent");
+}
+
+/// An invalid compaction state must fall back to a plain (validating) set, so a
+/// malformed bracket is never opened (no dangling CompactionStart).
+#[test]
+fn test_set_compaction_with_bracket_invalid_state_falls_back_without_orphan() {
+    let mut session = Session::create_with_id(
+        "bracket_invalid".to_string(),
+        None,
+        None,
+    );
+    let invalid = StoredCompactionState {
+        summary_text: "x".to_string(),
+        openai_encrypted_content: None,
+        // covers > original -> invalid.
+        covers_up_to_turn: 5,
+        original_turn_count: 3,
+        compacted_count: 2,
+    };
+    session.set_compaction_with_bracket("comp_bad", invalid.clone());
+    // No orphaned bracket, and no persisted (invalid) state in the legacy vector.
+    assert!(
+        session.event_map.orphaned_compaction().is_none(),
+        "invalid compaction must not leave an orphaned bracket"
+    );
+    session
+        .rederive_all_checked()
+        .expect("invalid-state fallback must keep the log consistent");
+}
+
+/// Re-opening a bracket after a prior one completed must be allowed (a fresh
+/// compact starts a new bracket), and completing an already-orphaned bracket
+/// must be idempotent (retry completes it, not double-open).
+#[test]
+fn test_set_compaction_with_bracket_retry_completes_orphan() {
+    let mut session = Session::create_with_id(
+        "bracket_retry".to_string(),
+        None,
+        None,
+    );
+    let good = StoredCompactionState {
+        summary_text: "summarized".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 3,
+        original_turn_count: 3,
+        compacted_count: 2,
+    };
+    session.set_compaction_with_bracket("first", good.clone());
+    // A second call must not orphan the first bracket.
+    session.set_compaction_with_bracket("second", good.clone());
+    assert!(
+        session.event_map.orphaned_compaction().is_none(),
+        "successive brackets must not leave an orphan"
+    );
+    session
+        .rederive_all_checked()
+        .expect("double bracket must stay consistent");
+}
+
 /// The `CompactionBracket` enforcement wired into `compact_transcript_with_bracket`
 /// must actually catch a genuinely broken bracket — not just be inert. A
 /// `CompactionEnd` without a matching open `CompactionStart` (a double-close or

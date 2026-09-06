@@ -2040,6 +2040,82 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         }
     }
 
+    /// Complete a compaction in the live producer as a **log-bracketed** state
+    /// mutation (deepseek-harness takeaway #5).
+    ///
+    /// This is the non-message-rewriting counterpart to
+    /// [`Session::compact_transcript_with_bracket`]. The live producer
+    /// (`jcode-app-core`) runs a *virtual* summary model: it never physically
+    /// rewrites `session.messages`, only records the compaction state and lets
+    /// the provider view prepend the summary at request time. Forcing a physical
+    /// `replace_messages` there would shift the `CompactionManager`'s
+    /// `compacted_count` offsets and corrupt reload/background accounting.
+    ///
+    /// Instead, this records the recovery/bracket around the state write only:
+    /// `CompactionStart` → `SetCompaction` → `CompactionEnd`. Replay sees a
+    /// balanced bracket whose `End` carries the authoritative compaction, and a
+    /// crash mid-run leaves a detectable orphan (via
+    /// [`SessionEventMap::orphaned_compaction`]) rather than a bare `SetCompaction`
+    /// with no bracket.
+    ///
+    /// # Invariants
+    /// - A pre-existing orphaned `CompactionStart` is completed in place (retry
+    ///   idempotency), never double-opened.
+    /// - An invalid compaction state falls back to a plain `set_compaction`
+    ///   (which itself validates) rather than opening a dangling bracket.
+    pub fn set_compaction_with_bracket(
+        &mut self,
+        compaction_id: impl Into<String>,
+        compaction: StoredCompactionState,
+    ) -> String {
+        let compaction_id = compaction_id.into();
+        // A malformed state can be represented in no event, so opening a bracket
+        // would orphan it. Fall back to a plain (validating) `set_compaction`;
+        // it silently no-ops an invalid state rather than diverging the legacy
+        // vector, keeping `rederive_all_checked` consistent.
+        if SessionEventMap::validate_compaction(&compaction).is_err() {
+            self.set_compaction(compaction);
+            return compaction_id;
+        }
+        let had_orphan_before = self.event_map.orphaned_compaction().is_some();
+        let started = if had_orphan_before {
+            // Completing a pre-existing orphaned bracket; the opening marker is
+            // already in the log.
+            true
+        } else {
+            let before = self.event_map.events.len();
+            // Diagnostic span covered by the bracket. Must be positive (the
+            // `CompactionStart` validation rejects covers_up_to_turn == 0), so
+            // derive it from the compaction state, which a live producer always
+            // carries after a real compact.
+            let covers = compaction
+                .covers_up_to_turn
+                .max(compaction.compacted_count)
+                .max(1);
+            self.event_map.start_compaction(compaction_id.clone(), covers);
+            self.event_map.events.len() > before
+        };
+        if started {
+            // Record the surface mutation: the persisted compaction state.
+            self.set_compaction(compaction);
+            self.event_map
+                .end_compaction(self.compaction.clone().expect("set_compaction set state"));
+            // Validate the bracket shape we just emitted. Only enforce balance on
+            // a bracket WE opened (fresh); completing a pre-existing orphan may
+            // legitimately leave a shallower orphan behind.
+            if !had_orphan_before {
+                let mut bracket_registry = invariants::InvariantRegistry::default();
+                bracket_registry.add(invariants::CompactionBracket);
+                let log = bracket_registry.check(&self.event_map);
+                invariants::InvariantLog::enforce(&log, "set_compaction_with_bracket");
+            }
+        } else {
+            // Start was dropped (validation); record the state plainly.
+            self.set_compaction(compaction);
+        }
+        compaction_id
+    }
+
     /// Complete a log-bracketed compaction (deepseek-harness takeaway #5).
     ///
     /// Compaction is a **log-bracketed, replayable operation**: a run appends a

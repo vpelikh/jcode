@@ -650,11 +650,17 @@ impl Agent {
             self.session.compaction = new_state;
             match self.session.compaction.clone() {
                 Some(state) => {
-                    // Emit a SetCompaction event so the event log stays in sync
-                    // with the compaction mutation. `set_compaction` also
-                    // updates `self.compaction`, so the direct assignment above
-                    // is redundant but makes the intent explicit.
-                    self.session.set_compaction(state);
+                    // Emit a compaction event so the event log stays in sync with
+                    // the (virtual) compaction mutation, and record it inside a
+                    // balanced `CompactionStart`/`CompactionEnd` bracket
+                    // (deepseek-harness takeaway #5). This makes the live
+                    // producer's compaction log-bracketed and replayable without
+                    // physically rewriting the transcript, keeping the manager's
+                    // `compacted_count` offsets valid on reload.
+                    self.session.set_compaction_with_bracket(
+                        crate::id::new_id("compact"),
+                        state,
+                    );
                 }
                 None => {
                     // Compaction was cleared (active_summary is None). There is
