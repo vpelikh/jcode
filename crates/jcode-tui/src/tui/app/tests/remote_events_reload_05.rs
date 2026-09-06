@@ -1502,3 +1502,66 @@ fn ownership_fingerprint_ignores_non_first_goal_for_a_completed_group() {
         "changing the first goal a completed group must count as ownership-gate progress"
     );
 }
+
+#[test]
+fn ownership_change_does_not_mask_a_confidence_gate_stall() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        app.auto_poke_incomplete_todos = true;
+
+        // A completed todo with LOW completion confidence (confidence gate
+        // stuck: needs to climb to at least Validated). Its goal is sufficient,
+        // so the ownership gate passes.
+        crate::todo::save_todos(
+            &app.session.id,
+            &[crate::todo::TodoItem {
+                id: "todo-1".to_string(),
+                content: "Ship it".to_string(),
+                status: "completed".to_string(),
+                priority: "high".to_string(),
+                group: Some("release".to_string()),
+                completion_confidence: Some(crate::todo::ConfidenceState::from_legacy_score(40)),
+                ..Default::default()
+            }],
+        )
+        .expect("save completed todo");
+
+        let goal = |trade_off: crate::todo::TradeOffState| crate::todo::TodoGoal {
+            group: Some("release".to_string()),
+            difficulty: Some(crate::todo::Difficulty::Involved),
+            delivery_state: Some(crate::todo::DeliveryState::WorkflowValidated),
+            autonomy: Some(crate::todo::Autonomy::NecessaryFollowthrough),
+            iteration_maturity: Some(crate::todo::IterationMaturity::OutcomeReached),
+            feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::AcceptanceAligned),
+            feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::EdgeAndIntegrationPaths),
+            feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
+            trade_off: Some(trade_off),
+            ..Default::default()
+        };
+        // Diligent passes the ownership gate for an involved goal.
+        crate::todo::save_goals(&app.session.id, &[goal(crate::todo::TradeOffState::Diligent)])
+            .expect("save sufficient goal");
+
+        // Turn 1: the ownership gate passes, so the confidence gate nudges
+        // (confidence budget = 1, confidence fingerprint recorded).
+        assert!(app.schedule_auto_poke_followup_if_needed());
+        assert_eq!(app.todo_confidence_gate_attempts, 1);
+        app.queued_messages.clear();
+        app.pending_queued_dispatch = false;
+
+        // Turn 2: the model churns ONLY the ownership goal's assessment (still
+        // passing, so it does not affect the confidence gate). With a shared
+        // fingerprint this would reset the confidence budget and mask the
+        // confidence stall; with per-gate fingerprints it must NOT.
+        crate::todo::save_goals(&app.session.id, &[goal(crate::todo::TradeOffState::Exhaustive)])
+            .expect("save churned-but-still-sufficient goal");
+
+        // Confidence gate still fails and its budget must NOT have been reset by
+        // the (passing) ownership-goal churn.
+        assert!(app.schedule_auto_poke_followup_if_needed());
+        assert_eq!(
+            app.todo_confidence_gate_attempts, 2,
+            "ownership-goal churn must not reset the confidence gate budget"
+        );
+    });
+}
