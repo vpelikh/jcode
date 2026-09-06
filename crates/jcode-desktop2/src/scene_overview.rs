@@ -304,12 +304,15 @@ pub(crate) fn draw_overview(
             );
         }
         // Fill: the session you are in is inked, the rest are paper, so "where
-        // am I" is answered before any label is read.
+        // am I" is answered before any label is read. The session you are in
+        // is a selected tile, so it takes the accent wash rather than the
+        // neutral wash: it stays quiet under the text, but still shares the
+        // one hue that marks "current" everywhere.
         scene.fill(
             vello::peniko::Fill::NonZero,
             Affine::scale(scale),
             if card.current {
-                theme.wash.with_alpha(phase as f32)
+                theme.accent_wash.with_alpha(phase as f32)
             } else {
                 theme.background.with_alpha(phase as f32)
             },
@@ -325,6 +328,10 @@ pub(crate) fn draw_overview(
         } else {
             1.0
         };
+        // The focused ring is this surface's whole focus signal, so it stays near-
+        // full ink: switching it to the accent cut its weight against the
+        // unfocused ring roughly in half, which would trade away the one thing
+        // this ring exists to carry. Hue consistency yields to visibility here.
         scene.stroke(
             &vello::kurbo::Stroke::new(
                 if card.focused {

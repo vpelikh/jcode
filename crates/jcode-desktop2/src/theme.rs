@@ -42,9 +42,6 @@ pub struct Theme {
     pub field: Color,
     /// Hairline around an unfocused field.
     pub field_border: Color,
-    /// Hairline around the focused field. Stronger than `field_border` so
-    /// focus is visible without a colour accent.
-    pub field_border_focus: Color,
     /// Errors. The print theme keeps this ink-only per the style guide;
     /// other themes may use hue.
     pub error: Color,
@@ -104,7 +101,6 @@ impl Theme {
             code_wash: Color::from_rgb8(0xea, 0xea, 0xea),
             field: Color::from_rgb8(0xff, 0xff, 0xff),
             field_border: Color::from_rgb8(0xd4, 0xd4, 0xd4),
-            field_border_focus: Color::from_rgb8(0x77, 0x77, 0x77),
             error: Color::from_rgb8(0x11, 0x11, 0x11),
             selection: Color::from_rgb8(0xd8, 0xd8, 0xd8),
             selection_on_wash: Color::from_rgb8(0xc4, 0xc4, 0xc4),
@@ -136,7 +132,6 @@ impl Theme {
             code_wash: Color::from_rgb8(0x24, 0x24, 0x24),
             field: Color::from_rgb8(0x10, 0x10, 0x10),
             field_border: Color::from_rgb8(0x3a, 0x3a, 0x3a),
-            field_border_focus: Color::from_rgb8(0x88, 0x88, 0x88),
             error: Color::from_rgb8(0xee, 0xee, 0xee),
             selection: Color::from_rgb8(0x3a, 0x3a, 0x3a),
             selection_on_wash: Color::from_rgb8(0x4c, 0x4c, 0x4c),
