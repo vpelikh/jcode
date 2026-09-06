@@ -1419,7 +1419,8 @@ fn test_tool_summary_compass_query_truncation_respects_width_and_keeps_focus() {
 }
 
 /// A degenerate narrow row collapses the query during truncation; the arm must
-/// return an empty summary rather than emitting a misleading bare `''` label.
+/// return an empty summary (or a never-misleading label) rather than emitting a
+/// bare `''` for any budget that cannot fit both quotes and content.
 #[test]
 fn test_tool_summary_compass_query_degenerate_budget_yields_empty() {
     let tool = ToolCall {
@@ -1433,7 +1434,17 @@ fn test_tool_summary_compass_query_degenerate_budget_yields_empty() {
         thought_signature: None,
     };
 
-    // With a ~2-wide row budget, `bounded(40).saturating_sub(2)` is near zero.
-    let summary = tools_ui::get_tool_summary_with_budget(&tool, 50, Some(2));
-    assert_eq!(summary, "", "degenerate budget must not emit `''`: {summary:?}");
+    // `bounded(w).saturating_sub(2)` reaches 0 for w <= 2. For each such
+    // degenerate budget the summary must never collapse to the misleading `''`.
+    for width in [0, 1, 2, 3] {
+        let summary = tools_ui::get_tool_summary_with_budget(&tool, 50, Some(width));
+        assert_ne!(
+            summary, "''",
+            "degenerate budget {width} must not emit bare `''`: {summary:?}"
+        );
+        assert!(
+            unicode_width::UnicodeWidthStr::width(summary.as_str()) <= width,
+            "summary exceeds budget {width}: {summary:?}"
+        );
+    }
 }

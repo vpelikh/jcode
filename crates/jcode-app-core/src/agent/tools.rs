@@ -138,9 +138,10 @@ fn tool_summary_line(tool: &ToolCall) -> Option<String> {
         "compass_query" | "agentgrep" => {
             // Show the query that was given, matching `grep` which prints the
             // pattern. Queries are free-form so this surfaces in the live tool
-            // summary exactly what was searched. The quoted style mirrors the
-            // TUI summary (`get_tool_summary_with_budget`) so both rendering
-            // layers present the same tool identically.
+            // summary exactly what was searched. The quoted style matches the
+            // TUI compass_query summary (`get_tool_summary_with_budget`);
+            // agentgrep is grouped here for its query (the TUI agentgrep arm
+            // additionally prefixes the resolved mode, e.g. `grep 'query'`).
             tool.input
                 .get("query")
                 .and_then(|v| v.as_str())
@@ -201,8 +202,24 @@ mod tests {
         let line = tool_summary_line(&tool_call("compass_query", &long)).unwrap();
         assert!(line.starts_with("'xxxx"));
         assert!(line.ends_with("...'"));
-        // 2 quotes + up to 60 chars + "..."
+        // 2 quotes + up to 60 bytes + "..."
         assert!(line.chars().count() <= 2 + 60 + 3);
+    }
+
+    /// Byte-based truncation against a multi-byte query must not panic and
+    /// must end at a valid UTF-8 char boundary (truncate_str guarantees this).
+    #[test]
+    fn tool_summary_truncates_multibyte_query_without_panicking() {
+        // 100 three-byte CJK chars (300 bytes), exceeding the 60-byte cap.
+        let long = "界".repeat(100);
+        let line = tool_summary_line(&tool_call("compass_query", &long)).expect("non-blank query");
+        assert!(line.starts_with('\''));
+        assert!(line.ends_with("...'"));
+        // Rebuild the inner label (no leading/trailing quotes + ellipsis) and
+        // assert it is a valid slice of the original input, proving no chars
+        // were split mid-boundary. Inner = line without outer quotes.
+        let inner = line.trim_matches('\'').trim_end_matches("...");
+        assert!(long.starts_with(inner), "inner must be a prefix: {inner:?}");
     }
 
     #[test]
