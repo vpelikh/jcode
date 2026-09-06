@@ -135,13 +135,25 @@ fn tool_summary_line(tool: &ToolCall) -> Option<String> {
             .get("pattern")
             .and_then(|v| v.as_str())
             .map(|pattern| format!("'{}'", pattern)),
-        "compass_query" | "agentgrep" => {
-            // Show the query that was given, matching `grep` which prints the
-            // pattern. Queries are free-form so this surfaces in the live tool
-            // summary exactly what was searched. The quoted style matches the
-            // TUI compass_query summary (`get_tool_summary_with_budget`);
-            // agentgrep is grouped here for its query (the TUI agentgrep arm
-            // additionally prefixes the resolved mode, e.g. `grep 'query'`).
+        "compass_query" => tool
+            .input
+            .get("query")
+            .and_then(|v| v.as_str())
+            .filter(|query| !query.trim().is_empty())
+            .map(|query| {
+                let label = if query.len() > 60 {
+                    format!("{}...", crate::util::truncate_str(query, 60))
+                } else {
+                    query.to_string()
+                };
+                format!("'{}'", label)
+            }),
+        "agentgrep" => {
+            // `query` describes grep/find searches. Other modes (outline, trace,
+            // smart) use different fields (`file`, `terms`), so fall back to the
+            // resolved mode name rather than emitting an empty summary. This
+            // mirrors the TUI agentgrep arm (`grep 'query'`, mode name otherwise)
+            // and the `mode` default is "grep".
             tool.input
                 .get("query")
                 .and_then(|v| v.as_str())
@@ -153,6 +165,14 @@ fn tool_summary_line(tool: &ToolCall) -> Option<String> {
                         query.to_string()
                     };
                     format!("'{}'", label)
+                })
+                .or_else(|| {
+                    let mode = tool
+                        .input
+                        .get("mode")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("grep");
+                    (!mode.is_empty()).then(|| mode.to_string())
                 })
         }
         "ls" => Some(
@@ -178,6 +198,19 @@ mod tests {
         }
     }
 
+    fn agentgrep_call(mode: &str, query: Option<&str>) -> ToolCall {
+        let mut input = serde_json::Map::new();
+        input.insert("mode".to_string(), serde_json::json!(mode));
+        if let Some(query) = query {
+            input.insert("query".to_string(), serde_json::json!(query));
+        }
+        ToolCall {
+            name: "agentgrep".to_string(),
+            input: serde_json::Value::Object(input),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn tool_summary_shows_compass_query() {
         let line = tool_summary_line(&tool_call("compass_query", "search for the config"));
@@ -188,6 +221,38 @@ mod tests {
     fn tool_summary_shows_agentgrep_query() {
         let line = tool_summary_line(&tool_call("agentgrep", "fn config"));
         assert_eq!(line.as_deref(), Some("'fn config'"));
+    }
+
+    #[test]
+    fn tool_summary_agentgrep_grep_with_query_shows_query() {
+        let line = tool_summary_line(&agentgrep_call("grep", Some("fn config")));
+        assert_eq!(line.as_deref(), Some("'fn config'"));
+    }
+
+    /// agentgrep modes that don't use `query` (outline, trace, smart) fall back
+    /// to the resolved mode name instead of an empty summary, mirroring the TUI.
+    #[test]
+    fn tool_summary_agentgrep_non_grep_mode_without_query_shows_mode() {
+        assert_eq!(
+            tool_summary_line(&agentgrep_call("outline", None)),
+            Some("outline".to_string())
+        );
+        assert_eq!(
+            tool_summary_line(&agentgrep_call("trace", None)),
+            Some("trace".to_string())
+        );
+        assert_eq!(
+            tool_summary_line(&agentgrep_call("smart", None)),
+            Some("smart".to_string())
+        );
+    }
+
+    /// A blank query in grep mode still falls back to the mode name (never an
+    /// empty summary with no info at all).
+    #[test]
+    fn tool_summary_agentgrep_blank_query_falls_back_to_mode() {
+        let line = tool_summary_line(&agentgrep_call("grep", Some("   ")));
+        assert_eq!(line, Some("grep".to_string()));
     }
 
     #[test]
