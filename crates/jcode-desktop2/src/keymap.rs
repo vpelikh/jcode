@@ -649,7 +649,10 @@ pub const NOT_PORTED: &[(&str, &str)] = &[
         "tab",
         "no slash-command autocomplete yet (Ctrl+Tab switches sessions)",
     ),
-    ("ctrl+t as queue-mode", "ctrl+t is bound to new-session panel"),
+    (
+        "ctrl+t as queue-mode",
+        "ctrl+t is bound to new-session panel",
+    ),
     ("ctrl+a as start-of-line", "web select-all wins; use Home"),
     ("ctrl+s", "no input stash yet"),
     ("ctrl+p", "no auto-poke yet"),

@@ -4,8 +4,8 @@
 //! for dark. The window reports the real system theme through winit, and
 //! `Model::resolve_theme_from_system` applies it. These tests lock that seam.
 
-use crate::theme::ThemeMode;
 use crate::Model;
+use crate::theme::ThemeMode;
 
 /// A System-preference window follows a dark desktop on first show.
 #[test]

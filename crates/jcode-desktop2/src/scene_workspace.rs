@@ -7,9 +7,9 @@
 //! [`crate::workspace`], each clipped to a rounded window with its own border
 //! ring, so where one session ends and the next begins is legible at a glance.
 
-use crate::{paint, scene, scene_file_tree, strip, workspace, Model};
-use vello::kurbo::{Affine, Rect, RoundedRect, Stroke};
+use crate::{Model, paint, scene, scene_file_tree, strip, workspace};
 use vello::Scene;
+use vello::kurbo::{Affine, Rect, RoundedRect, Stroke};
 
 /// Corner radius of a session page, in logical units. Soft enough to read as
 /// a window, square enough that the transcript inside does not lose its
