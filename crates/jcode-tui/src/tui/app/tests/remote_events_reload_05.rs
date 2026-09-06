@@ -1233,3 +1233,55 @@ fn confidence_progress_does_not_mask_an_ownership_gate_stall() {
         assert!(!app.auto_poke_incomplete_todos);
     });
 }
+
+#[test]
+fn confidence_fingerprint_ignores_history_appends_that_keep_the_same_spike_tail() {
+    // The confidence gate's spike detection reads only the last two
+    // confidence_history entries. Appending an entry while the last two stay
+    // identical must NOT register as gate progress, or a stuck confidence gate
+    // could keep resetting its budget by re-appending the same tail.
+    let base = crate::todo::TodoItem {
+        id: "a".to_string(),
+        content: "same".to_string(),
+        status: "completed".to_string(),
+        confidence: Some(crate::todo::ConfidenceState::from_legacy_score(50)),
+        completion_confidence: Some(crate::todo::ConfidenceState::from_legacy_score(50)),
+        confidence_history: vec![crate::todo::ConfidenceState::from_legacy_score(30)],
+        ..Default::default()
+    };
+
+    // [x, y, y] and [x, y, y, y] both read the same spike-relevant tail (y, y):
+    // appending while the tail stays equal must not change the fingerprint.
+    let mut short = base.clone();
+    short.confidence_history = vec![
+        crate::todo::ConfidenceState::from_legacy_score(30),
+        crate::todo::ConfidenceState::from_legacy_score(50),
+        crate::todo::ConfidenceState::from_legacy_score(50),
+    ];
+    let mut long = base.clone();
+    long.confidence_history = vec![
+        crate::todo::ConfidenceState::from_legacy_score(30),
+        crate::todo::ConfidenceState::from_legacy_score(50),
+        crate::todo::ConfidenceState::from_legacy_score(50),
+        crate::todo::ConfidenceState::from_legacy_score(50),
+    ];
+    let fp_short = <App>::confidence_gate_fingerprint(&[short]);
+    let fp_long = <App>::confidence_gate_fingerprint(&[long]);
+    assert_eq!(
+        fp_short, fp_long,
+        "appending history without changing the spike-relevant tail must not count as confidence-gate progress"
+    );
+
+    // But a genuinely-changed spike tail (a steep jump into the last two)
+    // MUST change the fingerprint.
+    let mut spiked = base.clone();
+    spiked.confidence_history = vec![
+        crate::todo::ConfidenceState::from_legacy_score(30),
+        crate::todo::ConfidenceState::from_legacy_score(100),
+    ];
+    let jumped = <App>::confidence_gate_fingerprint(&[spiked]);
+    assert_ne!(
+        fp_short, jumped,
+        "a changed spike-relevant tail must count as confidence-gate progress"
+    );
+}

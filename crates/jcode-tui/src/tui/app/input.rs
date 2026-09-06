@@ -1751,15 +1751,25 @@ impl App {
                 format!("todo:{group}:{}:priority", todo.id),
                 todo.priority.clone(),
             ));
-            // Spike detection reads the last two confidence_history entries (or
-            // falls back to confidence/completion_confidence when empty).
+            // Spike detection reads only the last two confidence_history entries
+            // (or falls back to confidence/completion_confidence when empty,
+            // which are already projected above). Joining the FULL history would
+            // let appending an entry be mistaken for progress even when the
+            // effective spike signal (the last two) is unchanged, so a model
+            // re-appending identical tail values could keep resetting a stuck
+            // confidence gate's budget. Project exactly the tail the gate reads.
+            let spike_tail: Option<(&str, &str)> = match todo.confidence_history.as_slice() {
+                [] | [_] => None,
+                history => Some((
+                    history[history.len() - 2].as_str(),
+                    history[history.len() - 1].as_str(),
+                )),
+            };
             entries.push((
-                format!("todo:{group}:{}:confidence_history", todo.id),
-                todo.confidence_history
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(">"),
+                format!("todo:{group}:{}:confidence_history_tail", todo.id),
+                spike_tail
+                    .map(|(a, b)| format!("{a}>{b}"))
+                    .unwrap_or_default(),
             ));
         }
         entries.sort();
