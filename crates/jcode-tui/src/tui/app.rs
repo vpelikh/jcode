@@ -1580,6 +1580,12 @@ pub struct App {
     /// tick does not do a `Session::load` behind a pending reviewer on every
     /// tick, and so parallel tests do not share timing.
     last_review_loop_idle_poll: Option<Instant>,
+    /// When a review loop is running headlessly, the lens label of the lens
+    /// whose `Request::HeadlessReview` has been dispatched to the server and is
+    /// awaiting a `ServerEvent::HeadlessReviewResult`. `None` when no headless
+    /// review is in flight. The async run loop drains this to send the request;
+    /// the result handler clears it and feeds the verdict to the loop.
+    pending_headless_review: Option<String>,
     // Tab completion state: (base_input, suggestion_index)
     // base_input is the original input before cycling, suggestion_index is current position
     tab_completion_state: Option<(String, usize)>,

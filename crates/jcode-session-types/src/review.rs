@@ -326,9 +326,18 @@ pub struct ReviewLoopState {
     pub awaiting_postfix_recheck: bool,
     /// Session id of the in-flight reviewer child session for the current lens,
     /// if any. Persisted (not just in-memory) so a reloaded session can keep
-    /// polling the same reviewer instead of spawning a duplicate.
+    /// polling the same reviewer instead of spawning a duplicate. In headless
+    /// mode this is `None` and [`Self::awaiting_headless`] is `true` until the
+    /// server's verdict event arrives.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_reviewer_id: Option<String>,
+    /// When true, the current lens is being reviewed **headlessly**: a
+    /// `Request::HeadlessReview` has been dispatched to the server and the loop
+    /// is waiting for the `ServerEvent::HeadlessReviewResult`, which feeds the
+    /// verdict in (`apply_verdict`). While set, the idle self-drive must not
+    /// spawn a new reviewer or poll a (nonexistent local) reviewer session.
+    #[serde(default)]
+    pub awaiting_headless: bool,
     /// How many times the current lens's reviewer has been respawned after
     /// being lost (see `reviewer_respawn`): caps how many times a transient
     /// reviewer loss is retried before the loop hard-finalizes. Reset to zero
@@ -360,6 +369,7 @@ impl Default for ReviewLoopState {
             phase: ReviewLoopPhase::Lenses,
             awaiting_postfix_recheck: false,
             active_reviewer_id: None,
+            awaiting_headless: false,
             reviewer_respawn_count: 0,
             last_fix_touched_files: false,
             fix_baseline_tree: None,

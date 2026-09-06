@@ -1008,6 +1008,25 @@ pub(in crate::tui::app) fn handle_server_event(
             let _ = app.acknowledge_pending_soft_interrupt(id);
             false
         }
+        ServerEvent::HeadlessReviewResult {
+            id: _,
+            session_id: _,
+            lens: _,
+            kind,
+            findings,
+            message,
+        } => {
+            // A server-side headless review-lens finished. Feed the verdict
+            // into the client's review loop (which is awaiting this result).
+            crate::logging::info(&format!("HeadlessReviewResult kind={kind}"));
+            if kind != "clean" && kind != "findings" && !message.is_empty() {
+                crate::logging::warn(&format!(
+                    "Headless review did not produce a verdict ({kind}): {message}"
+                ));
+            }
+            crate::tui::app::commands::apply_headless_review_result(app, &kind, findings);
+            true
+        }
         ServerEvent::Interrupted => {
             crate::logging::info(&format!(
                 "REMOTE_INTERRUPT_EVENT_RECEIVED kind=interrupted session={:?} current_message_id={:?} is_processing={} status={:?} streaming_text_bytes={} pending_soft_interrupts={} queued_messages={}",

@@ -1228,7 +1228,7 @@ pub(super) enum RefactorCommand {
 /// Per-lens reviewer startup message. Independent per-lens reviewers each get a
 /// clean prompt focused on a single lens, with the report contract so the
 /// harness can parse the verdict deterministically.
-fn build_lens_review_startup_message(parent_session_id: &str, lens_name: &str, lens_label: &str, lens_focus: &str) -> String {
+pub(super) fn build_lens_review_startup_message(parent_session_id: &str, lens_name: &str, lens_label: &str, lens_focus: &str) -> String {
     format!(
         "You are the `{lens_name}` reviewer for parent session `{parent_session_id}`.\n\
 You are one of several independent reviewers. Your job is ONLY to inspect the recent work through the `{lens_label}` lens.\n\
@@ -1343,6 +1343,17 @@ pub(super) fn maybe_poll_review_loop_from_idle(app: &mut App) -> bool {
     // an unrelated interleave message or hidden reminder must not stall lens
     // progress.
     if review_fix_pending(app) {
+        return false;
+    }
+    // Headless mode: a request is in flight and there is no local reviewer
+    // session to poll. Progress is driven by the `HeadlessReviewResult` event,
+    // not by idle polls.
+    if app
+        .session
+        .review_loop
+        .as_ref()
+        .is_some_and(|s| s.awaiting_headless)
+    {
         return false;
     }
     let now = Instant::now();
@@ -1546,6 +1557,15 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
         _ => return false,
     };
 
+    // Headless mode: the lens review is running server-side and the loop waits
+    // on the `HeadlessReviewResult` event to apply the verdict. Do not spawn or
+    // poll (there is no local reviewer session); just park the state so the
+    // loop resumes when the event arrives.
+    if state.awaiting_headless {
+        app.session.review_loop = Some(state);
+        return false;
+    }
+
     let max_stalled = crate::config::config().autoreview.max_stalled_turns;
 
     // The in-flight reviewer id is persisted on the state (not just in-memory)
@@ -1602,104 +1622,9 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
             }
             PollResult::Report(report) => {
                 state.active_reviewer_id = None;
-                // A verdict was consumed: the loss-budget for this lens's
-                // reviewer is spent, so the next reviewer (a later lens, or the
-                // re-check after a fix) starts with a full respawn budget.
-                state.reviewer_respawn_count = 0;
-                // Determine whether the fix turn actually changed files: compare
-                // the baseline captured at fix-queue time against the current
-                // working tree. A file-touching fix is productive repair work and
-                // must not count toward the stall cap.
-                if let Some(cwd) = active_working_dir(app) {
-                    // Capture the current signature once and reuse it for both
-                    // the touched-flag comparison and the file list, avoiding a
-                    // second `git status` subprocess.
-                    let now_sig = working_tree_signature(&cwd);
-                    let touched = match (&state.fix_baseline_tree, &now_sig) {
-                        (Some(baseline), Some(now)) => now != baseline,
-                        _ => false,
-                    };
-                    state.last_fix_touched_files = touched;
-                    // Record which files the fix turn actually touched so the
-                    // digest can report real "Files touched" counts. This was
-                    // previously dead code (record_fix_files was never called).
-                    if touched {
-                        if let Some(now_sig) = now_sig {
-                            let files = changed_files_from_signature(&now_sig);
-                            review_loop::record_fix_files(&mut state, files);
-                        }
-                    }
-                }
-                let action = review_loop::apply_verdict(&mut state, &report, max_stalled);
-                match action {
-                    review_loop::ReviewLoopAction::QueueFixTurn(findings) => {
-                        app.session.review_loop = Some(state);
-                        let summary = findings
-                            .iter()
-                            .map(|f| format!("[{}] {}: {}", f.severity, f.path, f.text))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        let prompt = format!(
-                            "The reviewer found the following issues. Fix them:\n\n{summary}"
-                        );
-                        // Capture the working-tree signature so the next re-check
-                        // can tell whether the fix actually changed files (a
-                        // productive, file-touching fix must not count toward the
-                        // stall cap even if the open set did not shrink).
-                        if let Some(cwd) = active_working_dir(app) {
-                            if let Some(sig) = working_tree_signature(&cwd) {
-                                app.session.review_loop.as_mut().unwrap().fix_baseline_tree =
-                                    Some(sig);
-                            }
-                        }
-                        if app.is_remote {
-                            // R-G1: the remote client has NO `pending_turn`
-                            // handler -- `start_synthetic_user_turn` sets
-                            // `pending_turn`, which only the local `run()`
-                            // loop consumes. On the product TUI (remote
-                            // server-client) the synthetic fix turn would never
-                            // be sent, so the loop would stall after the first
-                            // findings. Enqueue the fix prompt instead:
-                            // `process_remote_followups` drains `queued_messages`
-                            // on the remote run loop and dispatches it via
-                            // `begin_remote_send` (which sets is_processing,
-                            // streams, emits Done -> the loop re-polls the
-                            // re-check reviewer). The server owns the transcript
-                            // on the remote path (echo), so we do NOT add the
-                            // message locally here -- that would double-record it.
-                            app.queued_messages.push(prompt);
-                            // Round-E guard: until the fix turn is actually
-                            // dispatched (begin_remote_send sets is_processing),
-                            // `is_processing` is still false and `active_reviewer_id`
-                            // is None, so an idle tick would otherwise spawn the
-                            // post-fix re-check reviewer prematurely (reviewing the
-                            // pre-fix tree). Marking pending_queued_dispatch both
-                            // guards the tick-poll off and forces the remote run
-                            // loop to clear-and-dispatch the queued fix on its next
-                            // iteration.
-                            app.pending_queued_dispatch = true;
-                        } else {
-                            super::commands_improve::start_synthetic_user_turn(app, prompt);
-                        }
-                        true
-                    }
-                    review_loop::ReviewLoopAction::Converged => {
-                        let recheck = review_touched_files(&state);
-                        finish_review_loop(app, &mut state, recheck);
-                        false
-                    }
-                    review_loop::ReviewLoopAction::Stalled => {
-                        finish_review_loop(app, &mut state, false);
-                        false
-                    }
-                    review_loop::ReviewLoopAction::SpawnReviewer(lens) => {
-                        spawn_review_loop_reviewer(app, &mut state, lens)
-                    }
-                    review_loop::ReviewLoopAction::None => {
-                        app.session.review_loop = Some(state);
-                        false
-                    }
-                }
+                // Headless loops never have a local reviewer session to keep
+                // polling; the field is cleared above regardless.
+                apply_review_report(app, &mut state, &report, max_stalled)
             }
         }
     } else {
@@ -1813,15 +1738,186 @@ pub(super) fn finish_review_loop(
     let _ = app.session.save();
 }
 
+/// Apply a completed reviewer verdict for the current lens to the loop: update
+/// the round record / stall counters and dispatch the resulting loop action
+/// (queue a fix turn, converge, stall, or advance to the next lens). Shared by
+/// the session-polling path (`step_review_loop`) and the headless-result path
+/// (`apply_headless_review_result`).
+///
+/// Returns `true` when the loop scheduled further work (a fix turn or the next
+/// lens), `false` when the loop is quiescent / finished.
+fn apply_review_report(
+    app: &mut App,
+    state: &mut jcode_session_types::ReviewLoopState,
+    report: &jcode_session_types::ReviewReport,
+    max_stalled: u32,
+) -> bool {
+    // A verdict was consumed: the loss-budget for this lens's reviewer is
+    // spent, so the next reviewer (a later lens, or the re-check after a fix)
+    // starts with a full respawn budget.
+    state.reviewer_respawn_count = 0;
+    // Determine whether the fix turn actually changed files: compare the
+    // baseline captured at fix-queue time against the current working tree. A
+    // file-touching fix is productive repair work and must not count toward the
+    // stall cap.
+    if let Some(cwd) = active_working_dir(app) {
+        let now_sig = working_tree_signature(&cwd);
+        let touched = match (&state.fix_baseline_tree, &now_sig) {
+            (Some(baseline), Some(now)) => now != baseline,
+            _ => false,
+        };
+        state.last_fix_touched_files = touched;
+        if touched {
+            if let Some(now_sig) = now_sig {
+                let files = changed_files_from_signature(&now_sig);
+                review_loop::record_fix_files(state, files);
+            }
+        }
+    }
+    let action = review_loop::apply_verdict(state, report, max_stalled);
+    match action {
+        review_loop::ReviewLoopAction::QueueFixTurn(findings) => {
+            app.session.review_loop = Some(state.clone());
+            let summary = findings
+                .iter()
+                .map(|f| format!("[{}] {}: {}", f.severity, f.path, f.text))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let prompt = format!("The reviewer found the following issues. Fix them:\n\n{summary}");
+            if let Some(cwd) = active_working_dir(app) {
+                if let Some(sig) = working_tree_signature(&cwd) {
+                    if let Some(s) = app.session.review_loop.as_mut() {
+                        s.fix_baseline_tree = Some(sig);
+                    }
+                }
+            }
+            if app.is_remote {
+                app.queued_messages.push(prompt);
+                app.pending_queued_dispatch = true;
+            } else {
+                super::commands_improve::start_synthetic_user_turn(app, prompt);
+            }
+            true
+        }
+        review_loop::ReviewLoopAction::Converged => {
+            let recheck = review_touched_files(state);
+            finish_review_loop(app, state, recheck);
+            false
+        }
+        review_loop::ReviewLoopAction::Stalled => {
+            finish_review_loop(app, state, false);
+            false
+        }
+        review_loop::ReviewLoopAction::SpawnReviewer(lens) => {
+            spawn_review_loop_reviewer(app, state, lens)
+        }
+        review_loop::ReviewLoopAction::None => {
+            app.session.review_loop = Some(state.clone());
+            false
+        }
+    }
+}
+
+/// Apply a server `HeadlessReviewResult` to the loop: clear the awaiting state
+/// and, when the verdict parsed, feed it through the shared report-application
+/// path (`apply_review_report`). `findings` entries are `sev|path|text` strings
+/// serialized by the server. Returns `()`.
+pub(super) fn apply_headless_review_result(
+    app: &mut App,
+    kind: &str,
+    findings: Vec<String>,
+) {
+    // The loop can only accept a verdict if it is currently awaiting a headless
+    // result (guards against a stale/late event).
+    let accepted = app
+        .session
+        .review_loop
+        .as_mut()
+        .map(|s| {
+            let awaiting = std::mem::replace(&mut s.awaiting_headless, false);
+            awaiting
+        })
+        .unwrap_or(false);
+    if !accepted {
+        crate::logging::warn(&format!(
+            "Ignoring HeadlessReviewResult (kind={kind}) with no loop awaiting it"
+        ));
+        return;
+    }
+
+    let report = match kind {
+        "clean" => Some(jcode_session_types::ReviewReport::Clean),
+        "findings" => {
+            let parsed = findings
+                .into_iter()
+                .filter_map(|f| {
+                    let mut parts = f.splitn(3, '|');
+                    let severity = parts.next().unwrap_or("").to_string();
+                    let path = parts.next().unwrap_or("").to_string();
+                    let text = parts.next().unwrap_or("").to_string();
+                    if text.is_empty() {
+                        None
+                    } else {
+                        Some(jcode_session_types::Finding::new(&severity, &path, &text))
+                    }
+                })
+                .collect::<Vec<_>>();
+            if parsed.is_empty() {
+                None
+            } else {
+                Some(jcode_session_types::ReviewReport::Findings(parsed))
+            }
+        }
+        _ => None,
+    };
+
+    // Take the loop state; if we cannot (loop finished/gone), bail.
+    let mut state = match app.session.review_loop.take() {
+        Some(s) if !s.finished => s,
+        _ => {
+            return;
+        }
+    };
+    let max_stalled = crate::config::config().autoreview.max_stalled_turns;
+    let result = match report {
+        Some(report) => apply_review_report(app, &mut state, &report, max_stalled),
+        None => {
+            app.session.review_loop = Some(state);
+            false
+        }
+    };
+    let _ = result;
+}
+
 /// Spawn the per-lens reviewer for the current lens and persist the resulting
 /// loop state. Returns `false` and ends the loop cleanly when spawn fails, so
 /// a transient spawn failure does not re-trigger an infinite spawn-and-poll
 /// cycle every turn-end.
+///
+/// On the remote server-client path the reviewer runs **headlessly** on the
+/// server (no terminal window): this queues a `Request::HeadlessReview` via
+/// `app.pending_headless_review`, which the async remote run loop drains and
+/// sends. On a non-remote/local session (no server dispatch), it falls back to
+/// spawning a headed reviewer in a new terminal window (the legacy behaviour).
 fn spawn_review_loop_reviewer(
     app: &mut App,
     state: &mut jcode_session_types::ReviewLoopState,
     lens: jcode_session_types::ReviewLens,
 ) -> bool {
+    if app.is_remote {
+        // Headless dispatch: mark the loop as awaiting a server verdict for this
+        // lens and stash the lens so the async remote tick rebuilds the prompt
+        // and sends Request::HeadlessReview.
+        // We persist awaiting_headless so progress is event-driven, and stash
+        // only the lens label; the drain reconstructs the prompt from the lens.
+        state.active_reviewer_id = None;
+        state.awaiting_headless = true;
+        app.session.review_loop = Some(state.clone());
+        let _ = app.session.save();
+        app.pending_headless_review = Some(lens.label().to_string());
+        app.set_status_notice(format!("Review loop: reviewing {} (headless)", lens.label()));
+        return true;
+    }
     match spawn_loop_reviewer(app, lens) {
         Ok(id) => {
             state.active_reviewer_id = Some(id);

@@ -1465,6 +1465,50 @@ pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteC
         return;
     }
 
+    // Drain a queued headless review-lens dispatch. The review loop set
+    // `app.pending_headless_review` (lens label) and marked the loop
+    // `awaiting_headless`; rebuild the lens prompt and send the server request.
+    // The verdict comes back as a `ServerEvent::HeadlessReviewResult` which the
+    // event handler feeds into the loop.
+    if let Some(lens_label) = app.pending_headless_review.take() {
+        if !app.is_processing {
+            let parent_session_id =
+                crate::tui::app::commands_review::current_feedback_target_session_id(app);
+            if let Some(lens) = jcode_session_types::ReviewLens::from_name(&lens_label) {
+                let prompt = crate::tui::app::commands_review::build_lens_review_startup_message(
+                    &parent_session_id,
+                    lens.name(),
+                    lens.label(),
+                    lens.focus(),
+                );
+                let working_dir =
+                    crate::tui::app::commands::active_working_dir(app).map(|p| p.to_string_lossy().into_owned());
+                if let Err(error) = remote
+                    .headless_review(parent_session_id, lens_label.clone(), prompt, working_dir)
+                    .await
+                {
+                    crate::logging::warn(&format!(
+                        "Headless review dispatch failed for '{}': {error}",
+                        lens_label
+                    ));
+                    // Un-mark awaiting so the loop can surface a failure / retry.
+                    if let Some(state) = app.session.review_loop.as_mut() {
+                        state.awaiting_headless = false;
+                    }
+                    let _ = app.session.save();
+                    app.set_status_notice(format!("Review loop: dispatch failed ({lens_label})"));
+                }
+            } else {
+                app.push_display_message(DisplayMessage::error(format!(
+                    "Review loop: unknown lens {lens_label}"
+                )));
+            }
+        } else {
+            // still processing; keep the pending lens for the next tick.
+            app.pending_headless_review = Some(lens_label);
+        }
+    }
+
     if app.is_processing {
         if let Some(interleave_msg) = app.interleave_message.take()
             && !interleave_msg.trim().is_empty()

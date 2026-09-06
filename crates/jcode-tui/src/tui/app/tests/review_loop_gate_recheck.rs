@@ -754,57 +754,55 @@ fn remote_findings_enqueue_fix_turn_for_dispatch() {
 fn remote_tick_self_drives_review_loop_advance() {
     with_temp_jcode_home(|| {
         let mut app = create_test_app();
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let _guard = rt.enter();
-        let mut remote = crate::tui::backend::RemoteConnection::dummy();
 
         app.is_remote = true;
 
-        // Seed a live review loop at the first lens with an in-flight reviewer
-        // whose session holds a CLEAN verdict, exactly as a finished lens
-        // reviewer leaves behind.
+        // Seed a live review loop at the first lens, no in-flight reviewer yet.
         let mut state = jcode_session_types::ReviewLoopState::new();
         super::review_loop::enter_review_loop(&mut state);
-        let mut reviewer = crate::session::Session::create(None, None);
-        let reviewer_id = reviewer.id.clone();
-        reviewer.add_message_with_display_role(
-            crate::message::Role::User,
-            vec![crate::message::ContentBlock::Text {
-                text: "VERDICT: CLEAN".to_string(),
-                cache_control: None,
-            }],
-            None,
-        );
-        reviewer.save().expect("save reviewer session");
-        state.active_reviewer_id = Some(reviewer_id);
         app.session.review_loop = Some(state);
         app.is_processing = false;
         app.pending_queued_dispatch = false;
 
-        // The REMOTE idle tick must poll the reviewer and advance to the next
-        // lens without any turn-end event.
-        let _ = rt.block_on(crate::tui::app::remote::handle_tick(&mut app, &mut remote));
+        // Drive the loop from the idle tick. On the remote path this dispatches
+        // a headless review for the first lens and marks the loop awaiting the
+        // server verdict (no terminal window, no local reviewer session).
+        let _polled = step_review_loop_from_idle(&mut app);
 
+        let dispatching = app.session.review_loop.as_ref().unwrap();
+        assert!(
+            dispatching.awaiting_headless,
+            "remote loop must wait for a headless server verdict"
+        );
+        assert!(
+            app.pending_headless_review.is_some(),
+            "remote loop must queue a headless review dispatch"
+        );
+
+        // The server replies with a CLEAN result, which the event handler feeds
+        // into the loop; this must advance to the next lens.
+        super::commands::apply_headless_review_result(&mut app, "clean", Vec::new());
         let advanced = app.session.review_loop.as_ref().unwrap();
         assert_eq!(
             advanced.current_lens,
             Some(jcode_session_types::ReviewLens::ALL[1]),
-            "remote idle tick must consume the CLEAN verdict and advance to the next lens"
+            "a headless CLEAN verdict must advance to the next lens"
+        );
+        // Advancing immediately dispatches the next lens headlessly, so the
+        // loop is once again awaiting a server verdict (for Edges/Errors).
+        assert!(
+            advanced.awaiting_headless,
+            "after advancing, the loop must await the next lens's headless verdict"
         );
         assert!(
-            advanced.active_reviewer_id.is_some(),
-            "advancing must spawn an active reviewer for the next lens"
-        );
-        // Same parent-side progress signal as the local path: the spawned
-        // next-lens reviewer is surfaced in the status notice.
-        assert!(
-            app.status_notice
-                .as_ref()
-                .is_some_and(|(n, _)| n.contains("reviewing") && n.contains("Edges/Errors")),
-            "remote advance must surface the new lens in the parent status notice, got {:?}",
-            app.status_notice.as_ref().map(|(n, _)| n.as_str())
+            app.pending_headless_review.is_some(),
+            "the next lens must be queued for headless dispatch"
         );
     });
+}
+
+fn step_review_loop_from_idle(app: &mut crate::tui::app::App) -> bool {
+    crate::tui::app::commands::maybe_poll_review_loop_from_idle(app)
 }
 
 // Regression (multi-step, Round E): verify the full remote findings -> fix
@@ -1140,27 +1138,12 @@ fn idle_self_drive_debounces_rapid_repeats() {
 fn unrelated_interleave_does_not_stall_review_loop_advance() {
     with_temp_jcode_home(|| {
         let mut app = create_test_app();
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let _guard = rt.enter();
-        let mut remote = crate::tui::backend::RemoteConnection::dummy();
 
         app.is_remote = true;
 
-        // Live loop at Correctness with a reviewer that already emitted CLEAN.
+        // Live loop at Correctness, no in-flight reviewer yet.
         let mut state = jcode_session_types::ReviewLoopState::new();
         super::review_loop::enter_review_loop(&mut state);
-        let mut reviewer = crate::session::Session::create(None, None);
-        let reviewer_id = reviewer.id.clone();
-        reviewer.add_message_with_display_role(
-            crate::message::Role::User,
-            vec![crate::message::ContentBlock::Text {
-                text: "VERDICT: CLEAN".to_string(),
-                cache_control: None,
-            }],
-            None,
-        );
-        reviewer.save().expect("save reviewer session");
-        state.active_reviewer_id = Some(reviewer_id);
         app.session.review_loop = Some(state);
         app.is_processing = false;
         app.pending_queued_dispatch = false;
@@ -1168,20 +1151,27 @@ fn unrelated_interleave_does_not_stall_review_loop_advance() {
 
         // An unrelated interleave message is staged. The old guard
         // (`has_queued_followups()`) would treat this as "queued work" and block
-        // the loop; the narrow `review_fix_pending` guard does not.
+        // the loop; the narrow guards do not.
         app.interleave_message = Some("user background note".to_string());
 
-        let _ = rt.block_on(crate::tui::app::remote::handle_tick(&mut app, &mut remote));
+        // The loop must still dispatch the lens headlessly despite the interleave.
+        step_review_loop_from_idle(&mut app);
+        assert!(
+            app.session.review_loop.as_ref().unwrap().awaiting_headless,
+            "an unrelated interleave message must not stall the headless dispatch"
+        );
+        assert!(
+            app.pending_headless_review.is_some(),
+            "the loop must still queue a headless reviewer despite the interleave"
+        );
 
+        // A CLEAN verdict still advances to the next lens.
+        super::commands::apply_headless_review_result(&mut app, "clean", Vec::new());
         let state = app.session.review_loop.as_ref().unwrap();
         assert_eq!(
             state.current_lens,
             Some(jcode_session_types::ReviewLens::ALL[1]),
             "an unrelated interleave message must not stall the review loop advance"
-        );
-        assert!(
-            state.active_reviewer_id.is_some(),
-            "the loop must still spawn the next lens reviewer despite the interleave"
         );
     });
 }

@@ -12,7 +12,8 @@ pub(super) use super::commands_plan::{
 #[cfg(test)]
 pub(super) use super::commands_review::queue_autojudge_remote;
 pub(super) use super::commands_review::{
-    ImproveCommand, ManualSubagentSpec, RefactorCommand, autojudge_status_message,
+    ImproveCommand, ManualSubagentSpec, RefactorCommand, apply_headless_review_result,
+    autojudge_status_message,
     autoreview_status_message, build_autojudge_startup_message, build_autoreview_startup_message,
     build_judge_startup_message, build_review_startup_message, clear_review_loop_on_improve,
     current_feedback_target_session_id, handle_autojudge_command_local, handle_autoreview_command_local,
