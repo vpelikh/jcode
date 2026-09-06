@@ -45,7 +45,8 @@ mod windows_hotkeys;
 mod windows_setup;
 #[cfg(any(test, target_os = "macos"))]
 use macos_launcher::{
-    install_macos_app_launcher, install_macos_desktop_app_launcher, should_refresh_macos_app_launcher,
+    install_macos_app_launcher, install_macos_desktop_app_launcher,
+    should_refresh_macos_app_launcher,
 };
 #[cfg(target_os = "macos")]
 use macos_terminal::launch_script_for_macos_terminal;
@@ -2525,7 +2526,7 @@ pub fn run_setup_desktop_launcher() -> Result<()> {
                 );
                 eprintln!();
                 eprintln!("  Launchpad/Spotlight/Dock will open the native desktop app directly.");
-                return Ok(());
+                Ok(())
             }
             Err(e) => {
                 eprintln!("  \x1b[31m✗\x1b[0m Failed: {}", e);
@@ -2533,7 +2534,6 @@ pub fn run_setup_desktop_launcher() -> Result<()> {
             }
         }
     }
-
     #[cfg(not(target_os = "macos"))]
     {
         eprintln!("Jcode Desktop.app is only supported on macOS.");

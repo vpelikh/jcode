@@ -195,24 +195,26 @@ fn macos_desktop_bundle_is_valid_when_binary_plist_and_icon_present() {
     let app = temp.path().join("Jcode Desktop.app");
     std::fs::create_dir_all(app.join("Contents/MacOS")).expect("create MacOS");
     std::fs::create_dir_all(app.join("Contents/Resources")).expect("create Resources");
+    std::fs::write(app.join("Contents/Info.plist"), macos_desktop_info_plist())
+        .expect("write plist");
     std::fs::write(
-        app.join("Contents/Info.plist"),
-        macos_desktop_info_plist(),
-    )
-    .expect("write plist");
-    std::fs::write(
-        app.join("Contents/MacOS").join(MACOS_DESKTOP_APP_EXECUTABLE),
+        app.join("Contents/MacOS")
+            .join(MACOS_DESKTOP_APP_EXECUTABLE),
         "binary",
     )
     .expect("write executable");
     std::fs::write(
-        app.join("Contents/Resources").join(MACOS_APP_ICON_FILE_NAME),
+        app.join("Contents/Resources")
+            .join(MACOS_APP_ICON_FILE_NAME),
         MACOS_APP_ICON_BYTES,
     )
     .expect("write icon");
     assert!(macos_desktop_app_launcher_is_valid(&app));
 
-    std::fs::remove_file(app.join("Contents/MacOS").join(MACOS_DESKTOP_APP_EXECUTABLE))
-        .expect("remove executable");
+    std::fs::remove_file(
+        app.join("Contents/MacOS")
+            .join(MACOS_DESKTOP_APP_EXECUTABLE),
+    )
+    .expect("remove executable");
     assert!(!macos_desktop_app_launcher_is_valid(&app));
 }

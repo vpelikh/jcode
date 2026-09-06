@@ -155,10 +155,13 @@ jobs:
             cargo build --release --target ${{ matrix.target }}
           fi
           # Native GPU desktop app, shipped as a sibling of the `jcode` binary
-          # so `setup-launcher --desktop` can bundle it. Best-effort: it is a
-          # non-essential companion on Linux, but required for the Jcode
-          # Desktop.app bundle on macOS.
-          cargo build --release --target ${{ matrix.target }} -p jcode-desktop2 --bin jcode-desktop2 || echo "::warning::jcode-desktop2 build skipped for ${{ matrix.target }}"
+          # so `setup-launcher --desktop` can bundle it. Required on macOS (the
+          # Jcode Desktop.app bundle depends on it), best-effort elsewhere.
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            cargo build --release --target ${{ matrix.target }} -p jcode-desktop2 --bin jcode-desktop2
+          else
+            cargo build --release --target ${{ matrix.target }} -p jcode-desktop2 --bin jcode-desktop2 || echo "::warning::jcode-desktop2 build skipped for ${{ matrix.target }}"
+          fi
         env:
           JCODE_RELEASE_BUILD: "1"
           JCODE_CI_BUILD: "1"
@@ -181,12 +184,16 @@ jobs:
           cp target/${{ matrix.target }}/release/jcode dist/${{ matrix.artifact }}
           chmod +x dist/${{ matrix.artifact }}
           # Ship the desktop binary as a sibling so the installed payload can
-          # generate the Jcode Desktop.app bundle.
+          # generate the Jcode Desktop.app bundle. Build an explicit file list
+          # (not `.`) so tar never includes its own output archive.
+          DESKTOP_BIN=""
           if [ -f target/${{ matrix.target }}/release/jcode-desktop2 ]; then
             cp target/${{ matrix.target }}/release/jcode-desktop2 dist/jcode-desktop2-${{ matrix.target }}
             chmod +x dist/jcode-desktop2-${{ matrix.target }}
+            DESKTOP_BIN="jcode-desktop2-${{ matrix.target }}"
           fi
-          cd dist && tar czf ${{ matrix.artifact }}.tar.gz .
+          cd dist
+          tar czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }} $DESKTOP_BIN
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
