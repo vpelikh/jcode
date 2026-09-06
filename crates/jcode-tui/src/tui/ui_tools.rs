@@ -778,6 +778,22 @@ fn truncate_query_display(query: &str, max_width: usize) -> String {
     truncate_focus_token_display(query, max_width)
 }
 
+/// Quoted form of a search query, bounded to `max_width` (which already
+/// accounts for the `'` delimiters). Returns an empty string when the budget
+/// cannot fit even one character of content, so callers never emit a
+/// misleading bare `''`. Blank queries also collapse to empty.
+fn quoted_query_display(query: &str, max_width: usize) -> String {
+    if query.trim().is_empty() {
+        return String::new();
+    }
+    let text = truncate_query_display(query, max_width);
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!("'{}'", text)
+    }
+}
+
 fn truncate_command_display(command: &str, max_width: usize) -> String {
     if UnicodeWidthStr::width(command) <= max_width {
         return command.to_string();
@@ -1136,29 +1152,13 @@ pub(super) fn get_tool_summary_with_budget(
             .input
             .get("query")
             .and_then(|v| v.as_str())
-            .map(|q| {
-                format!(
-                    "'{}'",
-                    truncate_query_display(q, bounded(40).saturating_sub(2))
-                )
-            })
+            .map(|q| quoted_query_display(q, bounded(40).saturating_sub(2)))
             .unwrap_or_default(),
         "compass_query" => tool
             .input
             .get("query")
             .and_then(|v| v.as_str())
-            .filter(|q| !q.trim().is_empty())
-            .map(|q| {
-                let text = truncate_query_display(q, bounded(40).saturating_sub(2));
-                // A degenerate budget (very narrow row) can collapse the query
-                // to an empty string; don't emit the misleading `''` label that
-                // the blank-query guard above is meant to suppress.
-                if text.is_empty() {
-                    String::new()
-                } else {
-                    format!("'{}'", text)
-                }
-            })
+            .map(|q| quoted_query_display(q, bounded(40).saturating_sub(2)))
             .unwrap_or_default(),
         "browser" => browser_summary(tool, max_width),
         "gmail" => {
@@ -1168,12 +1168,12 @@ pub(super) fn get_tool_summary_with_budget(
                 .and_then(|v| v.as_str())
                 .unwrap_or("gmail");
             let detail = match action {
-                "search" | "threads" => tool.input.get("query").and_then(|v| v.as_str()).map(|q| {
-                    format!(
-                        "'{}'",
-                        truncate_query_display(q, bounded(40).saturating_sub(2))
-                    )
-                }),
+                "search" | "threads" => tool
+                    .input
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .map(|q| quoted_query_display(q, bounded(40).saturating_sub(2)))
+                    .filter(|s| !s.is_empty()),
                 "read" | "trash" | "modify_labels" => tool
                     .input
                     .get("message_id")
@@ -1350,12 +1350,7 @@ pub(super) fn get_tool_summary_with_budget(
             .input
             .get("query")
             .and_then(|v| v.as_str())
-            .map(|q| {
-                format!(
-                    "'{}'",
-                    truncate_query_display(q, bounded(40).saturating_sub(2))
-                )
-            })
+            .map(|q| quoted_query_display(q, bounded(40).saturating_sub(2)))
             .unwrap_or_default(),
         "memory" => {
             let action = tool
@@ -1477,19 +1472,11 @@ pub(super) fn get_tool_summary_with_budget(
             .input
             .get("query")
             .and_then(|v| v.as_str())
-            .map(|q| {
-                format!(
-                    "'{}'",
-                    truncate_query_display(q, bounded(40).saturating_sub(2))
-                )
-            })
+            .map(|q| quoted_query_display(q, bounded(40).saturating_sub(2)))
             .unwrap_or_default(),
         "conversation_search" => {
             if let Some(q) = tool.input.get("query").and_then(|v| v.as_str()) {
-                format!(
-                    "'{}'",
-                    truncate_query_display(q, bounded(40).saturating_sub(2))
-                )
+                quoted_query_display(q, bounded(40).saturating_sub(2))
             } else if tool
                 .input
                 .get("stats")

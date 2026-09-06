@@ -1448,3 +1448,41 @@ fn test_tool_summary_compass_query_degenerate_budget_yields_empty() {
         );
     }
 }
+
+/// Query-based summary arms (websearch, session_search, conversation_search,
+/// codesearch, gmail search) share the `quoted_query_display` helper, so a
+/// degenerate/budget or blank query never renders a misleading bare `''`.
+#[test]
+fn test_tool_summary_query_arms_never_emit_bare_quotes() {
+    let cases = [
+        (
+            "websearch",
+            serde_json::json!({ "query": "find the config" }),
+        ),
+        (
+            "session_search",
+            serde_json::json!({ "query": "find the config" }),
+        ),
+        (
+            "codesearch",
+            serde_json::json!({ "query": "find the config" }),
+        ),
+    ];
+
+    for (name, input) in cases {
+        let mut tool = ToolCall {
+            id: format!("call_{name}").to_string(),
+            name: name.to_string(),
+            input,
+            intent: None,
+            thought_signature: None,
+        };
+        // Degenerate width drops the query entirely to empty, never `''`.
+        let summary = tools_ui::get_tool_summary_with_budget(&tool, 50, Some(2));
+        assert_ne!(summary, "''", "{name} degenerate must not emit `''`: {summary:?}");
+        // Blank query collapses to empty, never `''`.
+        tool.input = serde_json::json!({ "query": "   " });
+        let summary = tools_ui::get_tool_summary_with_budget(&tool, 50, Some(40));
+        assert_ne!(summary, "''", "{name} blank must not emit `''`: {summary:?}");
+    }
+}
