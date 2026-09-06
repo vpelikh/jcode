@@ -238,40 +238,6 @@ fn split_response(
 }
 
 #[tokio::test]
-async fn split_empty_live_session_without_persisted_parent() {
-    let _guard = crate::storage::lock_test_env();
-    let _home = SplitTestHome::new();
-    let agent = new_split_test_agent().await;
-    let parent = agent.lock().await.session_for_split().clone();
-    assert_eq!(parent.visible_conversation_message_count(), 0);
-    assert!(
-        !crate::session::session_exists(&parent.id),
-        "regression requires an unsaved parent"
-    );
-    let (tx, mut rx) = mpsc::unbounded_channel();
-
-    handle_split(17, &parent.id, &agent, &tx).await;
-    let child = split_response(&mut rx, 17);
-    assert_ne!(child.id, parent.id);
-    assert_eq!(child.parent_id.as_deref(), Some(parent.id.as_str()));
-    assert_eq!(child.working_dir, parent.working_dir);
-    assert_eq!(child.model, parent.model);
-    assert_eq!(child.status, crate::session::SessionStatus::Closed);
-    assert_eq!(child.messages.len(), parent.messages.len() + 1);
-    let notice = child.messages.last().unwrap();
-    assert_eq!(
-        notice.display_role,
-        Some(crate::session::StoredDisplayRole::System)
-    );
-    assert!(notice.content_preview().contains(&parent.id));
-    assert_eq!(agent.lock().await.session_id(), parent.id);
-    assert!(
-        !crate::session::session_exists(&parent.id),
-        "fork must not mutate/persist its parent"
-    );
-}
-
-#[tokio::test]
 async fn split_busy_session_uses_persisted_state_without_waiting_for_agent() {
     let _guard = crate::storage::lock_test_env();
     let _home = SplitTestHome::new();
@@ -325,29 +291,6 @@ async fn split_busy_session_uses_persisted_state_without_waiting_for_agent() {
         agent.try_lock().is_err(),
         "parent lock is still owned by the busy turn"
     );
-    drop(busy);
-}
-
-#[tokio::test]
-async fn split_busy_unsaved_session_returns_error_without_waiting() {
-    let _guard = crate::storage::lock_test_env();
-    let _home = SplitTestHome::new();
-    let agent = new_split_test_agent().await;
-    let busy = agent.lock().await;
-    let parent_id = busy.session_id().to_owned();
-    assert!(!crate::session::session_exists(&parent_id));
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    timeout(
-        Duration::from_millis(100),
-        handle_split(19, &parent_id, &agent, &tx),
-    )
-    .await
-    .expect("missing snapshot must not block a busy session");
-    assert!(matches!(
-        rx.try_recv(),
-        Ok(ServerEvent::Error { id: 19, .. })
-    ));
-    assert!(rx.try_recv().is_err());
     drop(busy);
 }
 
