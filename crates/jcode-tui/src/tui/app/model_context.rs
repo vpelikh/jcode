@@ -1136,7 +1136,13 @@ impl App {
                     let provider_messages = self.materialized_provider_messages();
                     match manager.hard_compact_with(&provider_messages) {
                         Ok(dropped) if dropped > 0 => {
-                            self.messages = provider_messages;
+                            // `hard_compact_with` advanced the manager's
+                            // compaction cursor; sync it to the session. Do NOT
+                            // assign the (pre-compaction) `provider_messages`
+                            // into `self.messages` — `messages_for_provider`
+                            // rebuilds the API view through the manager, so a
+                            // stale assignment would only shadow the reduced
+                            // transcript.
                             self.sync_session_compaction_state_from_manager(&manager);
                             self.push_display_message(DisplayMessage::system(format!(
                                 "⚡ Request was too large; hard-compacted {} older message(s) to shrink the payload, and retrying...",
