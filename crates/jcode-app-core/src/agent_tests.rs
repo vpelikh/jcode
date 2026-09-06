@@ -3172,7 +3172,10 @@ fn compaction_retry_limit_error_distinguishes_413_from_context_limit() {
         msg.contains("Context limit exceeded"),
         "context-limit error must keep the existing wording, got: {msg}"
     );
-    assert!(!msg.contains("Request body"), "no size-limit wording for context errors");
+    assert!(
+        !msg.contains("Request body"),
+        "no size-limit wording for context errors"
+    );
 }
 
 #[derive(Clone)]
@@ -3285,7 +3288,11 @@ async fn streaming_turn_recovers_from_413_payload_too_large_and_retries() {
     );
     // The retried call must send the reduced (compacted) transcript.
     assert!(
-        agent.session.compaction.as_ref().is_some_and(|c| c.compacted_count > 0),
+        agent
+            .session
+            .compaction
+            .as_ref()
+            .is_some_and(|c| c.compacted_count > 0),
         "recovery must have hard-compacted older messages to shrink the payload"
     );
 }
