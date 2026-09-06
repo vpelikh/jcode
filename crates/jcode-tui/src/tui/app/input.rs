@@ -1630,6 +1630,22 @@ impl App {
         true
     }
 
+    /// Reset both completion-gate circuit breakers to a fresh budget, clearing
+    /// their per-gate attempt counters and state fingerprints.
+    ///
+    /// Centralized because a new auto-poke cycle (open todos, clean finish,
+    /// `/poke off`, `/poke on`, or a cycle-ending disarm) must always forget
+    /// the previous gate's progress. Duplicating the four field resets at every
+    /// site risks missing one when a gate budget/fingerprint is added later,
+    /// which would carry a stale counter or fingerprint into the next cycle and
+    /// silently mis-arm the breaker.
+    pub(super) fn reset_todo_gate_devices(&mut self) {
+        self.todo_ownership_gate_attempts = 0;
+        self.todo_ownership_gate_fingerprint = None;
+        self.todo_confidence_gate_attempts = 0;
+        self.todo_confidence_gate_fingerprint = None;
+    }
+
     /// Fingerprint of exactly the owned-goal state the ownership gate
     /// evaluates, used to detect genuine progress between ownership-gate nudges.
     ///
@@ -1881,10 +1897,7 @@ impl App {
                 ));
                 self.auto_poke_incomplete_todos = false;
                 self.todo_confidence_spike_challenged = false;
-                self.todo_ownership_gate_attempts = 0;
-                self.todo_ownership_gate_fingerprint = None;
-                self.todo_confidence_gate_attempts = 0;
-                self.todo_confidence_gate_fingerprint = None;
+                self.reset_todo_gate_devices();
                 self.todo_gate_digest_delivered = false;
                 self.pending_queued_dispatch = false;
                 return false;
@@ -1918,10 +1931,7 @@ impl App {
             // A finished cycle re-arms the review for whatever work comes next;
             // without this a session could only ever deliver one digest.
             self.todo_gate_digest_delivered = false;
-            self.todo_ownership_gate_attempts = 0;
-            self.todo_ownership_gate_fingerprint = None;
-            self.todo_confidence_gate_attempts = 0;
-            self.todo_confidence_gate_fingerprint = None;
+            self.reset_todo_gate_devices();
             if !self.todo_final_response_requested {
                 self.todo_final_response_requested = true;
                 self.push_display_message(DisplayMessage::system(format!(
@@ -1971,10 +1981,7 @@ impl App {
         ));
         // Open todos mean the model is still iterating; completion-gate
         // exhaustion should only trip when the gate itself stops moving.
-        self.todo_ownership_gate_attempts = 0;
-        self.todo_ownership_gate_fingerprint = None;
-        self.todo_confidence_gate_attempts = 0;
-        self.todo_confidence_gate_fingerprint = None;
+        self.reset_todo_gate_devices();
         self.last_auto_poke_fingerprint = Some(fingerprint);
         self.queued_messages.push(poke_message);
         self.pending_queued_dispatch = true;
