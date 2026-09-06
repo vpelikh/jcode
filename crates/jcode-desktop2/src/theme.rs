@@ -354,12 +354,14 @@ mod tests {
                 theme.mode
             );
             // Wash and mark share a hue family: the same colour doing two jobs,
-            // not two unrelated accents.
-            let same_hue = (theme.accent.components[0] - theme.accent_wash.components[0]).abs()
-                + (theme.accent.components[1] - theme.accent_wash.components[1]).abs()
-                + (theme.accent.components[2] - theme.accent_wash.components[2]).abs();
+            // not two unrelated accents. Same dominant channel proves the hue
+            // (both are green-dominant here), not just that the two differ.
+            let dominant = |c: Color| {
+                let [r, g, b, _] = c.components;
+                if r >= g && r >= b { 0usize } else if g >= b { 1usize } else { 2usize }
+            };
             assert!(
-                same_hue > 0.1,
+                dominant(theme.accent) == dominant(theme.accent_wash),
                 "accent and accent_wash are not the same hue in {:?}",
                 theme.mode
             );
