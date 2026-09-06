@@ -1630,6 +1630,90 @@ impl App {
         true
     }
 
+    /// Fingerprint of exactly the state the completion gates evaluate, used to
+    /// detect genuine progress between gate nudges.
+    ///
+    /// Deliberately NOT the whole `(todos, goals)` shape: a model with a stuck
+    /// gate must not get an unlimited budget just because it churns unrelated
+    /// fields (reworded a todo, reordered a list, edited a `feedback_loop`
+    /// description). Only the goal-assessment fields `delivery_state_passes`
+    /// reads and the completed-todo confidence fields `todo_confidence_summary`
+    /// reads count as progress. The projection is sorted so reordering a list
+    /// does not register as a state change.
+    pub(super) fn gated_state_fingerprint(
+        todos: &[crate::todo::TodoItem],
+        goals: &[crate::todo::TodoGoal],
+    ) -> String {
+        let mut entries: Vec<(String, String)> = Vec::new();
+        for goal in goals {
+            let group = goal.group.clone().unwrap_or_default();
+            let pushes = [
+                ("delivery_state", goal.delivery_state.map(|s| s.as_str())),
+                ("autonomy", goal.autonomy.map(|s| s.as_str())),
+                (
+                    "iteration_maturity",
+                    goal.iteration_maturity.map(|s| s.as_str()),
+                ),
+                (
+                    "stopping_evidence_present",
+                    goal.stopping_evidence.as_deref().map(|s| {
+                        if s.trim().is_empty() {
+                            "no"
+                        } else {
+                            "yes"
+                        }
+                    }),
+                ),
+                ("trade_off", goal.trade_off.map(|s| s.as_str())),
+                (
+                    "feedback_loop_relevance",
+                    goal.feedback_loop_relevance.map(|s| s.as_str()),
+                ),
+                (
+                    "feedback_loop_coverage",
+                    goal.feedback_loop_coverage.map(|s| s.as_str()),
+                ),
+                (
+                    "feedback_loop_traceability",
+                    goal.feedback_loop_traceability.map(|s| s.as_str()),
+                ),
+                ("difficulty", goal.difficulty.map(|s| s.as_str())),
+            ];
+            for (field, value) in pushes {
+                entries.push((
+                    format!("goal:{group}:{field}"),
+                    value.unwrap_or("").to_string(),
+                ));
+            }
+        }
+        for todo in todos.iter().filter(|t| t.status == "completed") {
+            let group = todo.group.clone().unwrap_or_default();
+            entries.push((
+                format!("todo:{group}:{}:completion_confidence", todo.id),
+                todo.completion_confidence
+                    .map(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            ));
+            entries.push((
+                format!("todo:{group}:{}:confidence", todo.id),
+                todo.confidence.map(|s| s.as_str()).unwrap_or("").to_string(),
+            ));
+            // Spike detection reads the last two confidence_history entries (or
+            // falls back to confidence/completion_confidence when empty).
+            entries.push((
+                format!("todo:{group}:{}:confidence_history", todo.id),
+                todo.confidence_history
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(">"),
+            ));
+        }
+        entries.sort();
+        serde_json::to_string(&entries).unwrap_or_default()
+    }
+
     pub(super) fn schedule_auto_poke_followup_if_needed(&mut self) -> bool {
         if !self.auto_poke_incomplete_todos
             || self.pending_queued_dispatch
@@ -1696,8 +1780,7 @@ impl App {
             // hand a fresh budget so a progressing model is never spuriously
             // disarmed (the warning text promises we only stop when validation
             // "isn't holding up" - i.e. the state is NOT moving).
-            let gate_fingerprint =
-                serde_json::to_string(&(&todos, &goals)).unwrap_or_default();
+            let gate_fingerprint = Self::gated_state_fingerprint(&todos, &goals);
             let state_progressed = self
                 .todo_completion_gate_fingerprint
                 .as_deref()

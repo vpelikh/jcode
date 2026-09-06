@@ -862,3 +862,128 @@ fn gate_budget_resets_when_gated_goal_state_progresses_between_pokes() {
         }
     });
 }
+
+#[test]
+fn gate_budget_does_not_reset_when_only_unrelated_fields_churn() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        app.auto_poke_incomplete_todos = true;
+
+        // A completed todo whose goal has a genuinely-stuck gate: trade_off
+        // stays None (required for an "involved" goal), so delivery never
+        // passes no matter how much unrelated content churns.
+        crate::todo::save_todos(
+            &app.session.id,
+            &[crate::todo::TodoItem {
+                id: "todo-1".to_string(),
+                content: "Stuck gate workflow".to_string(),
+                status: "completed".to_string(),
+                priority: "high".to_string(),
+                group: Some("release".to_string()),
+                completion_confidence: Some(crate::todo::ConfidenceState::Verified),
+                ..Default::default()
+            }],
+        )
+        .expect("save completed todo");
+
+        let stuck_goal = || crate::todo::TodoGoal {
+            group: Some("release".to_string()),
+            difficulty: Some(crate::todo::Difficulty::Involved),
+            delivery_state: Some(crate::todo::DeliveryState::WorkflowValidated),
+            autonomy: Some(crate::todo::Autonomy::NecessaryFollowthrough),
+            iteration_maturity: Some(crate::todo::IterationMaturity::OutcomeReached),
+            feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::AcceptanceAligned),
+            feedback_loop_coverage: Some(
+                crate::todo::FeedbackLoopCoverage::EdgeAndIntegrationPaths,
+            ),
+            feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
+            trade_off: None, // the stuck gate
+            ..Default::default()
+        };
+
+        crate::todo::save_goals(&app.session.id, &[stuck_goal()]).expect("save stuck goal");
+
+        // Drive the gate to exhaustion: 5 identical nudges with no gated-state
+        // progress. Only unrelated content changes between turns.
+        for attempt in 0..App::TODO_COMPLETION_GATE_MAX_ATTEMPTS {
+            assert!(
+                app.schedule_auto_poke_followup_if_needed(),
+                "attempt {attempt} should still schedule a gate nudge"
+            );
+            app.queued_messages.clear();
+            app.pending_queued_dispatch = false;
+            // Unrelated churn: reword the todo content (not gated) but keep the
+            // gated goal assessment identical.
+            let mut todos = crate::todo::load_todos(&app.session.id).expect("load todos");
+            todos[0].content = format!("Unrelated rewording #{}", attempt + 1);
+            crate::todo::save_todos(&app.session.id, &todos).expect("rewrite todo");
+        }
+
+        // The stuck gate must still exhaust its budget and disarm, because
+        // unrelated content churn is not progress on the gate.
+        assert!(
+            !app.schedule_auto_poke_followup_if_needed(),
+            "stuck gate plus unrelated churn must still trip the circuit breaker"
+        );
+        assert!(
+            !app.auto_poke_incomplete_todos,
+            "a stuck gate must disarm even when unrelated fields churn"
+        );
+    });
+}
+
+#[test]
+fn gated_state_fingerprint_ignores_todo_order_and_unrelated_content() {
+    let mut todo_a = crate::todo::TodoItem {
+        id: "a".to_string(),
+        content: "first".to_string(),
+        status: "completed".to_string(),
+        ..Default::default()
+    };
+    todo_a.completion_confidence = Some(crate::todo::ConfidenceState::Validated);
+    let mut todo_b = crate::todo::TodoItem {
+        id: "b".to_string(),
+        content: "second".to_string(),
+        status: "completed".to_string(),
+        ..Default::default()
+    };
+    todo_b.completion_confidence = Some(crate::todo::ConfidenceState::Verified);
+    let goals = vec![crate::todo::TodoGoal {
+        group: Some("g".to_string()),
+        delivery_state: Some(crate::todo::DeliveryState::WorkflowValidated),
+        trade_off: Some(crate::todo::TradeOffState::SomeConsidered),
+        ..Default::default()
+    }];
+
+    // Same gated state, different todo order and wording -> identical fingerprint.
+    let ab = [todo_a.clone(), todo_b.clone()];
+    let ba = [todo_b.clone(), todo_a.clone()];
+    let a_renamed = [
+        crate::todo::TodoItem {
+            content: "totally different wording".to_string(),
+            ..todo_a.clone()
+        },
+        todo_b.clone(),
+    ];
+    let f1 = <App>::gated_state_fingerprint(&ab, &goals);
+    let f2 = <App>::gated_state_fingerprint(&ba, &goals);
+    let f3 = <App>::gated_state_fingerprint(&a_renamed, &goals);
+    assert_eq!(
+        f1, f2,
+        "reordering completed todos must not change the gated fingerprint"
+    );
+    assert_eq!(
+        f1, f3,
+        "rewording a completed todo must not change the gated fingerprint"
+    );
+
+    // Advancing the gated confidence state DOES change the fingerprint:
+    // todo_a goes from Validated to Verified.
+    let mut a_up = todo_a.clone();
+    a_up.completion_confidence = Some(crate::todo::ConfidenceState::Verified);
+    let f4 = <App>::gated_state_fingerprint(&[a_up, todo_b.clone()], &goals);
+    assert_ne!(
+        f1, f4,
+        "advancing completion confidence must change the gated fingerprint"
+    );
+}
