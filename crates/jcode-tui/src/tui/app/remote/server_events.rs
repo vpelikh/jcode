@@ -1009,7 +1009,7 @@ pub(in crate::tui::app) fn handle_server_event(
             false
         }
         ServerEvent::HeadlessReviewResult {
-            id: _,
+            id,
             session_id: _,
             lens: _,
             kind,
@@ -1018,13 +1018,13 @@ pub(in crate::tui::app) fn handle_server_event(
         } => {
             // A server-side headless review-lens finished. Feed the verdict
             // into the client's review loop (which is awaiting this result).
-            crate::logging::info(&format!("HeadlessReviewResult kind={kind}"));
+            crate::logging::info(&format!("HeadlessReviewResult id={id} kind={kind}"));
             if kind != "clean" && kind != "findings" && !message.is_empty() {
                 crate::logging::warn(&format!(
                     "Headless review did not produce a verdict ({kind}): {message}"
                 ));
             }
-            crate::tui::app::commands::apply_headless_review_result(app, &kind, findings);
+            crate::tui::app::commands::apply_headless_review_result(app, id, &kind, findings);
             true
         }
         ServerEvent::Interrupted => {

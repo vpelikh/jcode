@@ -1483,20 +1483,27 @@ pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteC
                 );
                 let working_dir =
                     crate::tui::app::commands::active_working_dir(app).map(|p| p.to_string_lossy().into_owned());
-                if let Err(error) = remote
+                match remote
                     .headless_review(parent_session_id, lens_label.clone(), prompt, working_dir)
                     .await
                 {
-                    crate::logging::warn(&format!(
-                        "Headless review dispatch failed for '{}': {error}",
-                        lens_label
-                    ));
-                    // Un-mark awaiting so the loop can surface a failure / retry.
-                    if let Some(state) = app.session.review_loop.as_mut() {
-                        state.awaiting_headless = false;
+                    Ok(request_id) => {
+                        // Correlate the eventual result to this request so a
+                        // stale/late HeadlessReviewResult is not mis-applied.
+                        app.active_headless_request_id = Some(request_id);
                     }
-                    let _ = app.session.save();
-                    app.set_status_notice(format!("Review loop: dispatch failed ({lens_label})"));
+                    Err(error) => {
+                        crate::logging::warn(&format!(
+                            "Headless review dispatch failed for '{}': {error}",
+                            lens_label
+                        ));
+                        // Un-mark awaiting so the loop can surface a failure / retry.
+                        if let Some(state) = app.session.review_loop.as_mut() {
+                            state.awaiting_headless = false;
+                        }
+                        let _ = app.session.save();
+                        app.set_status_notice(format!("Review loop: dispatch failed ({lens_label})"));
+                    }
                 }
             } else {
                 app.push_display_message(DisplayMessage::error(format!(

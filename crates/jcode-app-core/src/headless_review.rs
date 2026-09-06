@@ -64,9 +64,14 @@ pub async fn run_review_lens_headless(
     provider: Arc<dyn Provider>,
     parent_session: &Session,
     lens_label: &str,
-    lens_prompt: String,
+    _lens_prompt: String,
     working_dir: Option<String>,
 ) -> HeadlessReviewOutcome {
+    // The lens prompt is built server-side from the lens label (not trusted from
+    // the client), so the report contract and read-only guardrails are always
+    // applied consistently regardless of which client dispatched the review.
+    let lens_prompt = build_lens_prompt(parent_session.id.as_str(), lens_label);
+
     let child = match build_reviewer_session(parent_session, &lens_prompt, working_dir) {
         Ok(c) => c,
         Err(e) => return HeadlessReviewOutcome::Failed(format!("set up reviewer session: {e}")),
@@ -129,6 +134,58 @@ pub async fn run_review_lens_headless(
         ),
     }
 }
+
+/// Build the server-side lens review prompt from the lens label. The report
+/// contract and read-only guardrails are always applied here so the reviewer
+/// emits a parseable `VERDICT` and stays analysis-only, independent of which
+/// client dispatched the review.
+fn build_lens_prompt(parent_session_id: &str, lens_label: &str) -> String {
+    let (lens_name, focus) = match jcode_session_types::ReviewLens::from_name(lens_label) {
+        Some(lens) => (lens.name(), lens.focus()),
+        None => (lens_label, ""),
+    };
+    format!(
+        "You are the `{lens_name}` reviewer for parent session `{parent_session_id}`.\n\
+You are one of several independent reviewers. Your job is ONLY to inspect the recent work through the `{lens_label}` lens.\n\
+\n\
+First read only the conversation history you actually need:\n\
+1. Use `conversation_search` with `stats=true` to learn the history size.\n\
+2. Read the most recent turns with `conversation_search turns` (start with roughly the last 6-12 turns, then widen only if needed).\n\
+3. If requirements are unclear, use `conversation_search query` to find the latest relevant user request or acceptance criteria.\n\
+\n\
+{guard}\
+Inspect the actual repo changes with targeted commands such as `git diff --stat`, `git diff --name-only`, and focused file reads.\n\
+\n\
+LENS FOCUS — only flag issues in this area:\n{focus}\n\
+\n\
+Only flag issues in the changed code (the recent batch). Prefer concrete findings over style comments.\n\
+When done, respond with the machine-readable report contract and nothing else:\n\
+\n\
+VERDICT: CLEAN\n\
+  (if nothing in your lens scope is wrong)\n\
+or\n\
+VERDICT: FINDINGS\n\
+FINDING: <severity>|<file>|<issue text>\n\
+FINDING: <severity>|<file>|<issue text>\n\
+  (one FINDING line per issue; severity is HIGH/MEDIUM/LOW/INFO)\n\
+\n\
+Then stop. Do not ask the user anything. Keep your session concise.",
+        parent_session_id = parent_session_id,
+        lens_name = lens_name,
+        lens_label = lens_label,
+        focus = focus,
+        guard = READ_ONLY_GUARDRAILS,
+    )
+}
+
+/// Read-only guardrails applied to every headless reviewer prompt so a review
+/// lens never modifies files or continues implementation.
+const READ_ONLY_GUARDRAILS: &str = "Important constraints for this session:\n\
+- This session is analysis-only. Do not do the work yourself.\n\
+- Do not modify files or repo state. Do not call `edit`, `write`, `multiedit`, `patch`, `apply_patch`, or destructive `bash`/`git` commands.\n\
+- Do not continue implementation, fix issues, or take follow-up actions yourself.\n\
+- If additional work is needed, describe it in your DM to the parent session instead.\n\
+\n";
 
 /// Scan a session's messages (most-recent-first) for the first parseable
 /// review verdict. Returns `None` when no message contains a `VERDICT` line.

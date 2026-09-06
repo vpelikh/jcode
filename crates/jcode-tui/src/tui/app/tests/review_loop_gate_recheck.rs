@@ -780,7 +780,8 @@ fn remote_tick_self_drives_review_loop_advance() {
 
         // The server replies with a CLEAN result, which the event handler feeds
         // into the loop; this must advance to the next lens.
-        super::commands::apply_headless_review_result(&mut app, "clean", Vec::new());
+        app.active_headless_request_id = Some(42);
+        super::commands::apply_headless_review_result(&mut app, 42, "clean", Vec::new());
         let advanced = app.session.review_loop.as_ref().unwrap();
         assert_eq!(
             advanced.current_lens,
@@ -802,6 +803,74 @@ fn remote_tick_self_drives_review_loop_advance() {
 
 fn step_review_loop_from_idle(app: &mut crate::tui::app::App) -> bool {
     crate::tui::app::commands::maybe_poll_review_loop_from_idle(app)
+}
+
+// Integration: the headless review round-trip through the real server-event
+// handler. The loop dispatches a headless lens; the server's
+// HeadlessReviewResult event is fed through handle_server_event; a matching
+// request id applies the verdict and advances the loop; a stale/wrong-id result
+// is ignored.
+#[test]
+fn headless_review_result_event_drives_loop_advance() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        app.is_remote = true;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+        // Seed a loop, dispatch the first lens headlessly.
+        let mut state = jcode_session_types::ReviewLoopState::new();
+        super::review_loop::enter_review_loop(&mut state);
+        app.session.review_loop = Some(state);
+        app.is_processing = false;
+        app.pending_queued_dispatch = false;
+        step_review_loop_from_idle(&mut app);
+        assert!(app.session.review_loop.as_ref().unwrap().awaiting_headless);
+
+        // The drain reported request id 7 as dispatched.
+        app.active_headless_request_id = Some(7);
+
+        // A stale/wrong-id result must be ignored (loop stays awaiting, lens
+        // unchanged).
+        let _ = app.handle_server_event(
+            crate::protocol::ServerEvent::HeadlessReviewResult {
+                id: 99,
+                session_id: "x".to_string(),
+                lens: "Correctness".to_string(),
+                kind: "clean".to_string(),
+                findings: vec![],
+                message: String::new(),
+            },
+            &mut remote,
+        );
+        let after_stale = app.session.review_loop.as_ref().unwrap();
+        assert_eq!(
+            after_stale.current_lens,
+            Some(jcode_session_types::ReviewLens::Correctness),
+            "a wrong-id result must not advance the loop"
+        );
+        assert!(after_stale.awaiting_headless, "loop must stay awaiting");
+
+        // The matching result applies the CLEAN verdict -> advance to next lens.
+        let _ = app.handle_server_event(
+            crate::protocol::ServerEvent::HeadlessReviewResult {
+                id: 7,
+                session_id: "x".to_string(),
+                lens: "Correctness".to_string(),
+                kind: "clean".to_string(),
+                findings: vec![],
+                message: String::new(),
+            },
+            &mut remote,
+        );
+        let advanced = app.session.review_loop.as_ref().unwrap();
+        assert_eq!(
+            advanced.current_lens,
+            Some(jcode_session_types::ReviewLens::ALL[1]),
+            "a matching headless CLEAN result must advance to the next lens"
+        );
+    });
 }
 
 // Regression (multi-step, Round E): verify the full remote findings -> fix
@@ -1173,7 +1242,8 @@ fn unrelated_interleave_does_not_stall_review_loop_advance() {
         );
 
         // A CLEAN verdict still advances to the next lens.
-        super::commands::apply_headless_review_result(&mut app, "clean", Vec::new());
+        app.active_headless_request_id = Some(42);
+        super::commands::apply_headless_review_result(&mut app, 42, "clean", Vec::new());
         let state = app.session.review_loop.as_ref().unwrap();
         assert_eq!(
             state.current_lens,

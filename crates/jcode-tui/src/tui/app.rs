@@ -1586,6 +1586,11 @@ pub struct App {
     /// review is in flight. The async run loop drains this to send the request;
     /// the result handler clears it and feeds the verdict to the loop.
     pending_headless_review: Option<String>,
+    /// Request id of the in-flight headless review (returned by the drain when
+    /// it sends `Request::HeadlessReview`). `apply_headless_review_result`
+    /// drops a `HeadlessReviewResult` whose id does not match, so a stale/late
+    /// result from a previous lens or loop cannot mis-apply.
+    active_headless_request_id: Option<u64>,
     // Tab completion state: (base_input, suggestion_index)
     // base_input is the original input before cycling, suggestion_index is current position
     tab_completion_state: Option<(String, usize)>,

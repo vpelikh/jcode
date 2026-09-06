@@ -214,8 +214,7 @@ fn advance_lens(state: &mut ReviewLoopState) -> ReviewLoopAction {
         let next = ReviewLens::ALL
             .iter()
             .copied()
-            .skip(idx + 1)
-            .next();
+            .nth(idx + 1);
         match next {
             Some(nl) => {
                 state.current_lens = Some(nl);
@@ -228,7 +227,7 @@ fn advance_lens(state: &mut ReviewLoopState) -> ReviewLoopAction {
             }
         }
     } else {
-        let next = ReviewLens::ALL.iter().copied().skip(idx + 1).next();
+        let next = ReviewLens::ALL.iter().copied().nth(idx + 1);
         match next {
             Some(nl) => {
                 state.current_lens = Some(nl);

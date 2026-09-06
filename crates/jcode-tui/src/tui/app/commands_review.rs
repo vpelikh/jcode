@@ -1772,9 +1772,22 @@ fn apply_review_report(
 /// serialized by the server. Returns `()`.
 pub(super) fn apply_headless_review_result(
     app: &mut App,
+    id: u64,
     kind: &str,
     findings: Vec<String>,
 ) {
+    // Drop a stale/late result whose request id does not match the in-flight
+    // headless review (guards against a result from a previous lens or loop
+    // being mis-applied). We must NOT take/clear the id on a mismatch, or a
+    // later correct result would find it already gone.
+    let expected = app.active_headless_request_id;
+    if expected.is_none() || expected != Some(id) {
+        crate::logging::warn(&format!(
+            "Ignoring HeadlessReviewResult id={id} (expected {expected:?}) with no matching in-flight request"
+        ));
+        return;
+    }
+
     // The loop can only accept a verdict if it is currently awaiting a headless
     // result (guards against a stale/late event).
     let accepted = app
@@ -1789,6 +1802,9 @@ pub(super) fn apply_headless_review_result(
         ));
         return;
     }
+    // The id matched and we're applying: take it so a duplicate result is
+    // dropped.
+    app.active_headless_request_id = None;
 
     let report = match kind {
         "clean" => Some(jcode_session_types::ReviewReport::Clean),
