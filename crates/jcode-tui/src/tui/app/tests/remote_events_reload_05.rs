@@ -1001,6 +1001,106 @@ fn gate_budget_oscillating_gated_state_still_trips_the_breaker() {
 }
 
 #[test]
+fn gate_budget_ignores_goal_for_non_completed_group_when_driving_stuck_gate() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        app.auto_poke_incomplete_todos = true;
+
+        // A completed todo in the "release" group with a genuinely-stuck gate:
+        // trade_off stays None (required for an involved goal), so "release"
+        // never passes its delivery gate.
+        crate::todo::save_todos(
+            &app.session.id,
+            &[
+                crate::todo::TodoItem {
+                    id: "release-1".to_string(),
+                    content: "Stuck release".to_string(),
+                    status: "completed".to_string(),
+                    priority: "high".to_string(),
+                    group: Some("release".to_string()),
+                    completion_confidence: Some(crate::todo::ConfidenceState::Verified),
+                    ..Default::default()
+                },
+                crate::todo::TodoItem {
+                    id: "wip-1".to_string(),
+                    content: "Cancelled work".to_string(),
+                    // A cancelled todo is not "incomplete" (`is_incomplete_poke
+                    // _todo` excludes cancelled), so the completion-gate branch
+                    // still runs. But `group_is_complete` requires status ==
+                    // "completed", so the "wip" group is NOT completed and its
+                    // goal is not gated by the ownership gate.
+                    status: "cancelled".to_string(),
+                    priority: "high".to_string(),
+                    group: Some("wip".to_string()),
+                    ..Default::default()
+                },
+            ],
+        )
+        .expect("save completed + in-progress todos");
+
+        let release_goal = || crate::todo::TodoGoal {
+            group: Some("release".to_string()),
+            difficulty: Some(crate::todo::Difficulty::Involved),
+            delivery_state: Some(crate::todo::DeliveryState::WorkflowValidated),
+            autonomy: Some(crate::todo::Autonomy::NecessaryFollowthrough),
+            iteration_maturity: Some(crate::todo::IterationMaturity::OutcomeReached),
+            feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::AcceptanceAligned),
+            feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::EdgeAndIntegrationPaths),
+            feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
+            trade_off: None, // the stuck gate on the completed group
+            ..Default::default()
+        };
+        let wip_goal = |iteration: crate::todo::IterationMaturity| crate::todo::TodoGoal {
+            group: Some("wip".to_string()),
+            difficulty: Some(crate::todo::Difficulty::Routine),
+            delivery_state: Some(crate::todo::DeliveryState::ChangeMade),
+            iteration_maturity: Some(iteration), // churns below
+            ..Default::default()
+        };
+
+        crate::todo::save_goals(
+            &app.session.id,
+            &[release_goal(), wip_goal(crate::todo::IterationMaturity::Exploring)],
+        )
+        .expect("save release + wip goals");
+
+        // The "wip" group contains a cancelled (not completed) todo, so it is
+        // NOT completed and its goal is not gated by the ownership gate.
+        // Churning its assessment must not reset the stuck "release" gate's
+        // budget.
+        for attempt in 0..App::TODO_COMPLETION_GATE_MAX_ATTEMPTS {
+            assert!(
+                app.schedule_auto_poke_followup_if_needed(),
+                "attempt {attempt} should still schedule the release gate nudge"
+            );
+            app.queued_messages.clear();
+            app.pending_queued_dispatch = false;
+            // Churn the non-completed "wip" group's non-gated assessment.
+            crate::todo::save_goals(
+                &app.session.id,
+                &[
+                    release_goal(),
+                    wip_goal(if attempt % 2 == 0 {
+                        crate::todo::IterationMaturity::Exploring
+                    } else {
+                        crate::todo::IterationMaturity::Improving
+                    }),
+                ],
+            )
+            .expect("save churned goals");
+        }
+
+        // The stuck "release" gate must still reach exhaustion and disarm,
+        // because churning a non-completed group's goal is not progress on it.
+        assert!(
+            !app.schedule_auto_poke_followup_if_needed(),
+            "non-completed group goal churn must not keep resetting the stuck gate budget"
+        );
+        assert!(!app.auto_poke_incomplete_todos);
+    });
+}
+
+#[test]
 fn gated_state_fingerprint_ignores_todo_order_and_unrelated_content() {
     let mut todo_a = crate::todo::TodoItem {
         id: "a".to_string(),

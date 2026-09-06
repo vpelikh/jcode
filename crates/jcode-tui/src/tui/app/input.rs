@@ -1644,9 +1644,40 @@ impl App {
         todos: &[crate::todo::TodoItem],
         goals: &[crate::todo::TodoGoal],
     ) -> String {
+        // Mirror the ownership gate's scoping (`completed_groups_have_sufficient
+        // _delivery`): it only evaluates goals for groups whose todos are ALL
+        // completed. A goal for an in-progress group is not gated, so changing
+        // its (non-gated) assessment must not register as completion-gate
+        // progress and reset a stuck group's budget. The ungrouped list
+        // (`None`) is completed when there is at least one ungrouped todo and
+        // all of them are completed.
+        let normalized = |group: Option<&str>| -> Option<String> {
+            group.map(str::trim).filter(|g| !g.is_empty()).map(str::to_string)
+        };
+        let mut group_todo_counts: Vec<(Option<String>, usize, bool)> = Vec::new();
+        for todo in todos {
+            let key = normalized(todo.group.as_deref());
+            if let Some(entry) = group_todo_counts.iter_mut().find(|(k, _, _)| *k == key) {
+                entry.1 += 1;
+                entry.2 = entry.2 && todo.status == "completed";
+            } else {
+                group_todo_counts.push((key, 1, todo.status == "completed"));
+            }
+        }
+        let completed_groups: Vec<Option<String>> = group_todo_counts
+            .into_iter()
+            .filter(|(_, count, all_completed)| *count > 0 && *all_completed)
+            .map(|(key, _, _)| key)
+            .collect();
+
         let mut entries: Vec<(String, String)> = Vec::new();
         for goal in goals {
-            let group = goal.group.clone().unwrap_or_default();
+            let key = normalized(goal.group.as_deref());
+            if !completed_groups.contains(&key) {
+                // Not a completed group, not gated.
+                continue;
+            }
+            let group = key.unwrap_or_default();
             let pushes = [
                 ("delivery_state", goal.delivery_state.map(|s| s.as_str())),
                 ("autonomy", goal.autonomy.map(|s| s.as_str())),
@@ -1687,7 +1718,7 @@ impl App {
             }
         }
         for todo in todos.iter().filter(|t| t.status == "completed") {
-            let group = todo.group.clone().unwrap_or_default();
+            let group = normalized(todo.group.as_deref()).unwrap_or_default();
             entries.push((
                 format!("todo:{group}:{}:completion_confidence", todo.id),
                 todo.completion_confidence
