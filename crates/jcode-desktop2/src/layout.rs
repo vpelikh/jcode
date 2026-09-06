@@ -372,9 +372,17 @@ impl Frame {
         // sliding it off-paper.
         let available = (width - sidebar).max(0.0);
         let gutter = (available * 0.06).clamp(20.0, 64.0);
-        let column = (available - gutter * 2.0).clamp(120.0, MEASURE);
-        let left = sidebar
-            + ((available - column) / 2.0).max(gutter.min((available - column).max(0.0)));
+        // The column normally keeps a 120-unit floor, but on a window too
+        // narrow to hold the floor alongside the sidebar it must shrink to
+        // fit rather than push `right` past the edge.
+        let column = (available - gutter * 2.0).clamp(120.0, MEASURE).min(available).max(1.0);
+        let left = (sidebar
+            + ((available - column) / 2.0).max(gutter.min((available - column).max(0.0))))
+        // The sidebar can be wider than the window at the 240-unit floor, so
+        // keep the page on-paper even then: shrink the honoured sidebar (the
+        // explorer overhangs the leftover) rather than let the column run off
+        // the right edge.
+        .min((width - column).max(0.0));
         let right = left + column;
 
         // No masthead: the transcript starts at the top margin. The window
@@ -917,6 +925,8 @@ mod tests {
     #[test]
     fn a_sidebar_shifts_the_column_clear_of_it() {
         const SIDEBAR: f64 = 252.0;
+        // A window wide enough for the sidebar and the minimum column always
+        // pushes the page clear of the sidebar.
         for (width, scale) in [(1100usize, 1.0), (800, 1.0), (1400, 1.75), (400, 1.0)] {
             let frame = Frame::with_content_sidebar(
                 (width as u32, 720),
@@ -928,17 +938,31 @@ mod tests {
             );
             assert!(
                 frame.left >= SIDEBAR - 0.001,
-                "at ({width},{scale}) the column started {} under the sidebar",
-                SIDEBAR - frame.left
+                "at ({width},{scale}) the column started under the sidebar"
             );
             assert!(
                 frame.right <= frame.width + 0.001,
                 "at ({width},{scale}) the column ran off-paper"
             );
-            assert!(
-                frame.column() > 0.0,
-                "at ({width},{scale}) the column collapsed"
+            assert!(frame.column() > 0.0, "at ({width},{scale}) collapsed");
+        }
+        // Windows too narrow to hold the sidebar and any column must degrade
+        // on-paper: the column stays above zero and never runs off the right
+        // edge, even though the sidebar overhangs the leftover width.
+        for (width, scale) in [(300usize, 1.0), (260, 1.0), (240, 1.0)] {
+            let frame = Frame::with_content_sidebar(
+                (width as u32, 720),
+                scale,
+                1,
+                false,
+                0.0,
+                SIDEBAR,
             );
+            assert!(
+                frame.right <= frame.width + 0.001,
+                "at ({width},{scale}) the column ran off-paper"
+            );
+            assert!(frame.column() > 0.0, "at ({width},{scale}) collapsed");
         }
     }
 
