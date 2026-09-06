@@ -267,11 +267,11 @@ impl App {
             self.session.compaction = new_state;
             match self.session.compaction.clone() {
                 Some(state) => {
-                    // Emit a SetCompaction event so the event log stays in sync
-                    // with the compaction mutation. `set_compaction` also
-                    // updates `self.compaction`, so the direct assignment above
-                    // is redundant but makes the intent explicit.
-                    self.session.set_compaction(state);
+                    // Emit a compaction event so the event log stays in sync with
+                    // the (virtual) compaction mutation, inside a balanced bracket
+                    // (takeaway #5), matching the daemon path. This does not
+                    // rewrite messages, so the manager's offsets stay valid.
+                    self.session.set_compaction_with_bracket(id::new_id("compact"), state);
                 }
                 None => {
                     // Compaction was cleared (active_summary is None). There is
@@ -322,10 +322,10 @@ impl App {
         };
 
         self.session.compaction = Some(state.clone());
-        // Emit a SetCompaction event so the event log stays in sync with the
-        // compaction mutation. `set_compaction` also updates `self.compaction`,
-        // but the direct assignment above keeps the intent explicit.
-        self.session.set_compaction(state.clone());
+        // Emit a compaction event so the event log stays in sync with the
+        // compaction mutation, inside a balanced bracket (takeaway #5),
+        // consistent with the daemon path.
+        self.session.set_compaction_with_bracket(id::new_id("compact"), state.clone());
         let provider_messages = self.materialized_provider_messages();
         let compaction = self.registry.compaction();
         if let Ok(mut manager) = compaction.try_write() {
