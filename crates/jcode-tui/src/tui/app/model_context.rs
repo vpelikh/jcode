@@ -1133,7 +1133,7 @@ impl App {
             if self.provider.supports_compaction() {
                 let compaction = self.registry.compaction();
                 if let Ok(mut manager) = compaction.try_write() {
-                    let mut provider_messages = self.materialized_provider_messages();
+                    let provider_messages = self.materialized_provider_messages();
                     match manager.hard_compact_with(&provider_messages) {
                         Ok(dropped) if dropped > 0 => {
                             self.messages = provider_messages;
