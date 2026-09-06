@@ -100,6 +100,7 @@ The single highest-value category: this is where the first cut actually broke.
 | 4.3 | Hierarchy comes from ink density: `text` > `muted` > `faint` > `rule`. | `theme::tests::ink_densities_are_ordered` |
 | 4.4 | Every role is visible against its background in both modes. | `every_role_differs_from_the_background`, `both_modes_are_defined_for_every_role` |
 | 4.5 | Dark mode follows the system preference. | manual: `from_env` currently defaults light |
+| 4.6 | One semantic **accent** hue exists, used only for *state* (focus, active, busy, selection), never decoration, so the print page stays quiet where nothing is happening. | `theme::tests::the_accent_is_a_readable_state_colour` |
 
 ## 5. State coverage
 

@@ -1514,28 +1514,30 @@ pub fn build_scene(
     }
 
     // Session overview and settings, in the margin above the column's trailing
-    // edge. Both stay quiet until used so they do not compete with the page.
+    // edge. Both stay quiet until used so they do not compete with the page;
+    // when its panel is open each takes the accent, tying "open" to the same
+    // state colour that marks focus and activity elsewhere.
     icons::draw(
         scene,
         icons::Icon::Sessions,
         frame.sessions(),
         if model.overview.is_open() {
-            theme.text
+            theme.accent
         } else {
             theme.faint
         },
         scale,
     );
 
-    // The settings gear, in the margin above the column's trailing edge. Faint
-    // until the panel is open, when it takes full ink so the mark and the menu
-    // it opened read as one thing.
+    // The settings gear, in the margin above the column's trailing edge. A
+    // faint echo until the panel is open, when it takes the accent so the mark
+    // and the menu it opened read as one active thing.
     icons::draw(
         scene,
         icons::Icon::Settings,
         frame.gear(),
         if model.panel.is_open() {
-            theme.text
+            theme.accent
         } else {
             theme.faint
         },
