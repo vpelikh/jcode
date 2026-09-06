@@ -1483,6 +1483,17 @@ pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteC
                 );
                 let working_dir =
                     crate::tui::app::commands::active_working_dir(app).map(|p| p.to_string_lossy().into_owned());
+                // Mark the dispatch as still-queued/in-flight during the send.
+                // The review loop's orphaned-recovery (step_review_loop ->
+                // maybe_recover_stalled_headless) treats a lens with no queued
+                // dispatch AND no in-flight request id as "orphaned" and would
+                // re-dispatch it. Without this marker, a concurrent step (e.g.
+                // the input/poke path) running while the request is being sent
+                // would see no pending dispatch and no id yet (the id is only
+                // set after the await succeeds) and wrongly re-send the same
+                // lens. Keeping pending set for the duration of the send makes
+                // recovery park until the send resolves.
+                app.pending_headless_review = Some(lens_label.clone());
                 match remote
                     .headless_review(parent_session_id, lens_label.clone(), prompt, working_dir)
                     .await
@@ -1515,6 +1526,9 @@ pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteC
                         app.set_status_notice(format!("Review loop: dispatch failed ({lens_label})"));
                     }
                 }
+                // The dispatch (or its failure) is settled; clear the in-flight
+                // marker so a later stray result is correctly seen as one.
+                app.pending_headless_review = None;
             } else {
                 app.push_display_message(DisplayMessage::error(format!(
                     "Review loop: unknown lens {lens_label}"
