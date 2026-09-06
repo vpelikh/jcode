@@ -313,4 +313,80 @@ mod tests {
         let mut output = Scene::new();
         build_workspace_scene(&mut output, &mut painter, &source, (1000, 720), 1.0);
     }
+
+    /// A workspace-active row (focused session alongside a neighbor) with a
+    /// file tree present must still draw the focused session's top-left
+    /// sessions button *right of* the explorer, not underneath it. This is the
+    /// integration split the layout reservation exists to serve: the page is
+    /// clipped to its column and translated by `workspace::placement`, so the
+    /// explorer would otherwise sit over it here too.
+    #[test]
+    #[ignore = "requires a GPU"]
+    fn workspace_row_keeps_the_focused_sessions_button_clear_of_the_explorer() {
+        let mut source = Model {
+            working_dir: Some("/tmp".into()),
+            ..Model::default()
+        };
+        source.file_tree.sync_root(Some("/tmp"));
+        source.session_id = Some("live".into());
+        source.strips = strip::Strips::build(
+            vec![
+                strip::Panel::new("live", Some("/tmp")),
+                strip::Panel::new("neighbor", Some("/tmp")),
+            ],
+            Some("live"),
+        );
+        source
+            .transcript
+            .push(crate::transcript::Message::assistant("hello"));
+        source
+            .peeks
+            .insert("neighbor", transcript([Message::assistant("side")]));
+
+        let size = (1400u32, 900u32);
+        let mut painter = crate::paint::Painter::default();
+        let mut output = Scene::new();
+        build_workspace_scene(&mut output, &mut painter, &source, size, 1.0);
+        let Ok(pixels) = crate::capture::capture_scene_to_rgba(&output, size.0, size.1) else {
+            eprintln!("skipping: no GPU");
+            return;
+        };
+        let luma = |x: u32, y: u32| {
+            let i = ((y * size.0 + x) * 4) as usize;
+            (0.2126 * pixels[i] as f64 + 0.7152 * pixels[i + 1] as f64 + 0.0722 * pixels[i + 2] as f64)
+                / 255.0
+        };
+        let clip = |v: f64| v.max(0.0) as u32;
+
+        // The focused column's origin from the same placement the render uses,
+        // and its native page size (the render builds the child scene at the
+        // column width, not the whole window).
+        let column = workspace::placement(
+            &source.strips,
+            &source.workspace,
+            source.session_id.as_deref(),
+            (f64::from(size.0), f64::from(size.1)),
+            workspace::GAP,
+        )
+        .into_iter()
+        .find(|c| c.focused)
+        .unwrap();
+        let page_height = (f64::from(size.1) - workspace::VERTICAL_INSET * 2.0).max(1.0) as u32;
+        let frame = crate::App::frame_for_model((column.width as u32, page_height), 1.0, &source);
+        let button = frame.sessions();
+        // The focused page reserves the sidebar, so its top-left chrome sits
+        // clear of the explorer even after the column is placed in the window.
+        assert!(
+            button.x0 >= crate::file_tree::WIDTH,
+            "focused page reserves no room for the explorer"
+        );
+        let window_x = column.x + button.x0;
+        let mid_y = column.y + workspace::VERTICAL_INSET + button.y0 + button.height() / 2.0;
+        let dark = (clip(window_x)..=clip(window_x + button.width()))
+            .any(|x| luma(x, clip(mid_y)) < 0.9);
+        assert!(
+            dark,
+            "the focused sessions button was not drawn clear of the explorer"
+        );
+    }
 }
