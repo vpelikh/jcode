@@ -75,7 +75,7 @@ The single highest-value category: this is where the first cut actually broke.
 | 2.2 | The column is centered with balanced gutters that shrink gracefully on narrow windows. | `column_is_horizontally_balanced`, `column_stays_inside_the_window` |
 | 2.3 | Regions have a strict vertical order and **never overlap**. | `regions_are_ordered_and_never_overlap`, `visual_tests::nothing_draws_in_the_gap_above_the_composer` |
 | 2.8 | The input box sits on the **middle of the page** and grows symmetrically about that line; it only leaves the centre when the window is too short. | `layout::tests::the_composer_sits_on_the_middle_of_the_page`, `a_roomy_page_centres_the_composer_exactly`, `visual_tests::the_composer_well_is_drawn_on_the_middle_of_the_window` |
-| 2.9 | The masthead carries the build identity: version, update state, and signed-in account. | `meta::tests::the_caption_lists_version_update_and_account`, `visual_tests::the_masthead_meta_row_is_drawn_and_legible` |
+| 2.9 | The masthead carries the build identity: version, update state, and signed-in account. | `meta::tests::the_caption_lists_version_update_and_account`, `visual_tests::the_model_caption_is_drawn_on_the_right_of_the_footnote_row` |
 | 2.4 | Nothing is drawn in the margins or off-paper; text wraps rather than clipping at the window edge. | `visual_tests::margins_stay_empty` |
 | 2.7 | The footnote row is reserved even when empty, so a notice never shifts the composer. | `regions_are_ordered_and_never_overlap`, `layout_is_scale_independent_in_logical_units` |
 | 2.5 | Degenerate windows (0-sized, extreme aspect ratios) never panic or invert geometry. | `degenerate_sizes_do_not_panic_or_invert` |
@@ -87,7 +87,7 @@ The single highest-value category: this is where the first cut actually broke.
 |---|------|-------------|
 | 3.1 | One family (JetBrains Mono) with a fallback stack, declared once in `text.rs`. | `scripts/desktop2_visual_check.sh` |
 | 3.2 | Body leading 1.65; captions carry 0.1-0.2em letterspacing. | `layout::BODY_LEADING`, caption styles |
-| 3.3 | Single-line fields **elide**, never wrap past their own rule. | `tests::elide_*`, `visual_tests::masthead_rule_is_clear_of_text` |
+| 3.3 | Single-line fields **elide**, never wrap past their own rule. | `scene::tests::elide_respects_budget_and_keeps_ends`, `scene::tests::elide_handles_tiny_budget` |
 | 3.4 | Elision keeps the informative ends (head and tail of paths, ids, errors). | `tests::elide_respects_budget_and_keeps_ends` |
 | 3.5 | Sentence case; product names keep their own casing (`jcode` lowercase). | manual |
 
@@ -207,15 +207,15 @@ windows. That is compositor policy, not a bug to fix here.
 |---|------|-------------|
 | 6.54 | A long line wraps inside the well instead of running past its right edge. | `visual_tests::a_long_line_wraps_inside_the_composer_well` |
 | 6.55 | Wrapping grows the well and is a view concern: the buffer keeps one logical line. | `action_tests::a_long_line_wraps_into_multiple_rows_and_grows_the_well` |
-| 6.56 | Wrapping breaks at whitespace, and mid-word only when a word exceeds the row. | `wrap::tests::long_text_wraps_at_whitespace`, `a_word_longer_than_the_line_breaks_mid_word` |
-| 6.57 | No row exceeds the width budget, at any budget. | `wrap::tests::wrapped_rows_never_exceed_the_budget` |
-| 6.58 | Wrapping never loses, duplicates, or splits a character. | `wrapping_preserves_every_character`, `row_boundaries_stay_on_char_boundaries` |
-| 6.59 | Rows are ordered, never overlap, and cover the whole text. | `wrap::tests::rows_are_ordered_and_never_overlap` |
-| 6.60 | Every cursor offset maps to a row, so the caret can never vanish. | `wrap::tests::every_offset_maps_to_some_row`, `the_cursor_maps_to_a_row_and_column` |
+| 6.56 | Wrapping breaks at whitespace, and mid-word only when a word exceeds the row. | `input::tests::an_unbreakable_word_wraps_instead_of_overflowing` |
+| 6.57 | No row exceeds the width budget, at any budget. | `input::tests::lines_tile_the_text` |
+| 6.58 | Wrapping never loses, duplicates, or splits a character. | `input::tests::lines_tile_the_text` |
+| 6.59 | Rows are ordered, never overlap, and cover the whole text. | `input::tests::lines_tile_the_text` |
+| 6.60 | Every cursor offset maps to a row, so the caret can never vanish. | `visual_tests::the_caret_sits_on_the_cursor_row_when_wrapped`, `input::tests::lines_tile_the_text` |
 | 6.64 | The caret is drawn on the row that owns the cursor, not the first row. | `visual_tests::the_caret_sits_on_the_cursor_row_when_wrapped` |
-| 6.61 | The wrap budget matches the measured font width, so text cannot silently overflow. | `action_tests::the_wrap_budget_matches_the_measured_font_width` |
+| 6.61 | The wrap budget matches the measured font width, so text cannot silently overflow. | `text::tests::a_narrower_column_wraps_into_more_lines` |
 | 6.62 | Clicking a wrapped row places the caret on that row. | `action_tests::clicking_a_wrapped_row_lands_on_that_row` |
-| 6.63 | A degenerate width never hangs or panics. | `wrap::tests::a_zero_budget_does_not_hang_or_panic` |
+| 6.63 | A degenerate width never hangs or panics. | `input::tests::degenerate_input_does_not_panic` |
 
 Remaining interaction gaps, honestly:
 
