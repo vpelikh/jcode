@@ -1124,6 +1124,43 @@ impl App {
             0
         };
         if stripped == 0 && truncated == 0 {
+            // No single oversized image or tool result drove the 413. The body
+            // is likely large because of accumulated message volume, so fall
+            // back to a hard compaction to collapse older messages into a
+            // summary (mirroring `auto_recover_context_limit`). This is what
+            // lets a long session keep retrying instead of hard-failing when it
+            // hits the provider's HTTP size cap.
+            if self.provider.supports_compaction() {
+                let compaction = self.registry.compaction();
+                if let Ok(mut manager) = compaction.try_write() {
+                    let mut provider_messages = self.materialized_provider_messages();
+                    match manager.hard_compact_with(&provider_messages) {
+                        Ok(dropped) if dropped > 0 => {
+                            self.messages = provider_messages;
+                            self.sync_session_compaction_state_from_manager(&manager);
+                            self.push_display_message(DisplayMessage::system(format!(
+                                "⚡ Request was too large; hard-compacted {} older message(s) to shrink the payload, and retrying...",
+                                dropped
+                            )));
+                            return self.finish_payload_recovery_and_retry(terminal, event_stream).await;
+                        }
+                        Ok(_) => {
+                            crate::logging::warn(
+                                "Payload-too-large hard compaction dropped nothing; no recovery possible",
+                            );
+                        }
+                        Err(reason) => {
+                            crate::logging::warn(&format!(
+                                "Payload-too-large hard compaction failed: {reason}"
+                            ));
+                        }
+                    }
+                } else {
+                    crate::logging::warn(
+                        "Payload-too-large recovery skipped: compaction manager lock busy",
+                    );
+                }
+            }
             return false;
         }
 
@@ -1138,6 +1175,16 @@ impl App {
             stripped, truncated
         )));
 
+        self.finish_payload_recovery_and_retry(terminal, event_stream).await
+    }
+
+    /// Run the shared tail of a payload-too-large recovery: reset session and
+    /// streaming state, then retry the turn. Returns whether the retry succeeded.
+    async fn finish_payload_recovery_and_retry(
+        &mut self,
+        terminal: &mut AppTerminal,
+        event_stream: &mut EventStream,
+    ) -> bool {
         self.reset_state_for_compaction_retry();
         self.run_compaction_retry_turn(terminal, event_stream).await
     }
