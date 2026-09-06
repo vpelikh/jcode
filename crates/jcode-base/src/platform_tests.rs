@@ -157,3 +157,64 @@ fn spawn_replacement_process_returns_without_waiting_for_child_exit() {
     child.kill().ok();
     let _ = child.wait();
 }
+
+/// Unix: killing a detached process group must terminate the whole descendant
+/// tree, not just the direct child. This backs the bash tool's
+/// ProcessGroupKillGuard, which relies on signaling the group (negative PID) to
+/// reap `bash -> cargo -> rustc` worker descendants rather than letting them
+/// orphan under the long-lived server.
+#[cfg(unix)]
+#[test]
+fn signal_detached_process_group_terminates_descendant_tree_unix() {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let ready_path = temp.path().join("descendant-ready.txt");
+    let survived_path = temp.path().join("descendant-survived.txt");
+    // The descendant writes `ready` immediately, then sleeps briefly; if it is
+    // NOT killed with the group it reaches the short sleep's end and writes the
+    // `survived` marker. The group-kill must prevent that.
+    let parent_script = format!(
+        "sh -c 'echo ready > \"{}\"; sleep 2; echo survived > \"{}\"' &\nwait",
+        ready_path.display(),
+        survived_path.display()
+    );
+
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(&parent_script)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut parent = super::spawn_detached(&mut cmd).expect("spawn detached parent");
+    let parent_pid = parent.id();
+
+    // Wait for the descendant (the backgrounded `sh ... sleep 2`) to have started.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready_path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(ready_path.exists(), "descendant should report ready");
+    assert!(super::is_process_running(parent_pid), "parent should be running");
+
+    super::signal_detached_process_group(parent_pid, libc::SIGKILL)
+        .expect("kill the whole process group of the detached parent");
+
+    // Parent must stop.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while super::is_process_running(parent_pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = parent.wait();
+    assert!(!super::is_process_running(parent_pid), "parent should stop");
+
+    // The grandchild, if it survived the group kill, would finish its 2s sleep
+    // and write the "survived" marker. Wait comfortably past that (4s) so a
+    // surviving descendant has time to (wrongly) declare survival, then assert
+    // it never did.
+    std::thread::sleep(Duration::from_millis(4000));
+    assert!(
+        !survived_path.exists(),
+        "descendant should not survive the detached process-group kill"
+    );
+}
