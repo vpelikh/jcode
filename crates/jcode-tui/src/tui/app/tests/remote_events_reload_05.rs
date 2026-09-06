@@ -1086,4 +1086,14 @@ fn gated_state_fingerprint_ignores_todo_order_and_unrelated_content() {
         f1, f4,
         "advancing completion confidence must change the gated fingerprint"
     );
+
+    // The confidence gate's weighted average uses priority as its weight, so a
+    // priority change is also a gated-state change and must register as progress.
+    let mut a_priority = todo_a.clone();
+    a_priority.priority = "critical".to_string();
+    let f5 = <App>::gated_state_fingerprint(&[a_priority, todo_b.clone()], &goals);
+    assert_ne!(
+        f5, f1,
+        "a completed todo's priority change must change the gated fingerprint"
+    );
 }

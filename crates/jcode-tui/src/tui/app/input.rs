@@ -1715,6 +1715,13 @@ impl App {
                 format!("todo:{group}:{}:confidence", todo.id),
                 todo.confidence.map(|s| s.as_str()).unwrap_or("").to_string(),
             ));
+            // The confidence gate's weighted average uses priority as its
+            // weight (`todo_confidence_weight`), so a priority change alters
+            // the gated signal and must count as progress.
+            entries.push((
+                format!("todo:{group}:{}:priority", todo.id),
+                todo.priority.clone(),
+            ));
             // Spike detection reads the last two confidence_history entries (or
             // falls back to confidence/completion_confidence when empty).
             entries.push((
