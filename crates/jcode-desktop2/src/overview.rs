@@ -650,6 +650,42 @@ mod tests {
         }
     }
 
+    /// A row is centred in the field: the run of cards in one workspace sits
+    /// symmetrically about the field's midline, never shoved to one edge.
+    #[test]
+    fn each_row_is_centred_in_the_field() {
+        let field = field();
+        let mid = AREA.0 + (AREA.2 - AREA.0) / 2.0;
+        // Group cards by row, then assert each row's horizontal extent is
+        // centred about the field's midline.
+        let mut rows: Vec<Vec<&Card>> = Vec::new();
+        for card in &field.cards {
+            match rows.iter_mut().find(|r| r[0].label == card.label) {
+                Some(r) => r.push(card),
+                None => rows.push(vec![card]),
+            }
+        }
+        assert!(!rows.is_empty());
+        for row in rows {
+            let x0 = row.iter().map(|c| c.rect.0).fold(f64::INFINITY, f64::min);
+            let x1 = row
+                .iter()
+                .map(|c| c.rect.2)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let rcx = (x0 + x1) / 2.0;
+            assert!(
+                (rcx - mid).abs() < 1.0,
+                "row {} centre {rcx:.1} is not near the field midline {mid:.1} (x0={x0:.1}, x1={x1:.1})",
+                row[0].label
+            );
+        }
+        // A single-row field is centred too: one workspace fills the middle.
+        let solo = layout(&[entry("solo", "/tmp", 100.0)], Some("solo"), None, AREA);
+        let c = &solo.cards[0];
+        let cl = c.rect.0 + (c.rect.2 - c.rect.0) / 2.0;
+        assert!((cl - mid).abs() < 1.0, "single row centred, got {cl:.1}");
+    }
+
     /// The field has to fit the window: a card drawn off-page is a session the
     /// user cannot reach.
     #[test]
