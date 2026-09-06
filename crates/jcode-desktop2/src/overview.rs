@@ -61,10 +61,20 @@ pub fn area(frame: &crate::layout::Frame) -> (f64, f64, f64, f64) {
     // away from it. Caps keep the panel readable on a large monitor, while the
     // fractions make it gracefully fill a small window without touching its
     // edges.
+    //
+    // The field must stay inside the window: centring on the column shifts the
+    // midpoint right of the window's own centre when a sidebar is present, so a
+    // full-window-sized width would spill past the right edge and hide the
+    // cards it is supposed to compare. Clamp the field to the room the column's
+    // midpoint leaves on either side of it, keeping the centred relationship
+    // without ever running off-paper.
     let width = (frame.width * 0.84).min(960.0).max(1.0);
     let height = (frame.height * 0.68).min(620.0).max(1.0);
     let column_mid = (frame.left + frame.right) / 2.0;
-    let left = column_mid - width / 2.0;
+    // The widest a field can be while its midpoint stays on the column's.
+    let flank_room = column_mid.min(frame.width - column_mid).max(1.0);
+    let width = width.min(flank_room * 2.0);
+    let left = (column_mid - width / 2.0).max(0.0);
     let top = (frame.height - height) / 2.0;
     (left, top, left + width, top + height)
 }
@@ -942,7 +952,7 @@ mod tests {
     #[test]
     fn the_field_centres_on_the_page_column_not_the_window() {
         const SIDEBAR: f64 = 252.0;
-        for (width, scale) in [(1100usize, 1.0), (1920, 1.0), (1400, 1.75)] {
+        for (width, scale) in [(1100usize, 1.0), (1920, 1.0), (1400, 1.75), (900, 1.0)] {
             let frame = crate::layout::Frame::with_content_sidebar(
                 (width as u32, 720),
                 scale,
@@ -957,6 +967,15 @@ mod tests {
             assert!(
                 (field_mid - column_mid).abs() < 1.0,
                 "at ({width},{scale}) the field mid {field_mid:.1} strayed from the column mid {column_mid:.1}"
+            );
+            // Centring on the column shifts the midpoint right when a sidebar
+            // is present; the field must shrink rather than run off the right
+            // edge, or the rightmost cards would be cut off.
+            assert!(
+                left >= 0.0 && right <= frame.width + 1.0,
+                "at ({width},{scale}) the field [{left:.1},{right:.1}] left the window [{},{}]",
+                0.0,
+                frame.width
             );
         }
         // Without a sidebar the column is the window, so the field must land on
