@@ -6,8 +6,29 @@ This is a parallelism race on process-global state, not a logic bug.
 ## Evidence
 
 - `cargo test -p jcode-tui --lib -- --test-threads=1` passes **2006/2006** (16 ignored).
+  Re-measured 2026-09-06 (suite grown): 2427 ran; 2–3 order-dependent failures
+  reproduced even at `--test-threads=1` on a heavily loaded shared machine, and
+  the same failing tests pass in isolation.
 - The failing set changes between runs at the default thread count.
 - Individually, each failing test passes when run alone.
+
+### Caveat (2026-09-06): how much of the render state is still shared
+
+The root-cause prose below is older and reads as if all of the touched render
+state is process-global. It is **not** all still shared: under `cfg(test)` the
+layout snapshots, scroll positions, copy targets, and prompt positions now live
+in `TEST_*` **thread-locals**, with the production atomics gated behind
+`cfg(not(test))`. The part tests still genuinely share at process scope is in
+`crates/jcode-tui/src/tui/ui_frame_metrics.rs` — the frame-perf, slow-frame, and
+flicker histories (`OnceLock<Mutex>` statics). Details and the residual-state
+question are in `docs/TEST_SPEED_INVESTIGATION.md`.
+
+Two root-cause details below are also stale: (1) `clear_test_render_state_for_tests`
+now takes the render-state lock (via `with_render_state_lock`, with per-thread
+nested detection), so "clears it *without* taking the lock" no longer holds; and
+(2) "~810 call sites" and the "959 `tui::app::tests::` tests" counts are from an
+earlier suite size. The core point — that multiple tests mutate shared frame
+state and can race on it — remains valid.
 
 Counts were taken on 2026-07-27 and will drift as tests are added. Reproduce
 on an otherwise idle machine: under memory pressure (this host has 15 GiB and
@@ -58,17 +79,23 @@ with *and* without the change. Reverted rather than committed as churn.
 ## Suggested direction
 
 The real fix is to stop sharing this state across tests rather than to
-serialize access to it:
+serialize access to it. Since the caveat above was written, part of this
+direction has landed: the `ui.rs` render state (layout/status snapshots, scroll
+positions, copy targets, prompt positions) is now **thread-local under
+`cfg(test)`**. What remains process-global and shared across tests is the
+`ui_frame_metrics.rs` frame-perf/slow-frame/flicker history, so the remaining
+steps are:
 
-1. Make the render state thread-local rather than process-global, so parallel
-   tests cannot observe each other's resets. Production has one render thread,
-   so this should not change runtime behavior.
-2. Failing that, have `create_test_app` skip the render-state clear entirely.
+1. Apply the same thread-local treatment to the residual `ui_frame_metrics`
+   process-global histories under test, being careful that some are part of the
+   production data path (written by the render thread, read by
+   slower-frame/flicker diagnostics). See `docs/TEST_SPEED_INVESTIGATION.md`.
+2. Alternatively, have `create_test_app` skip the render-state clear entirely.
    Only rendering tests depend on it, and they already clear it under the lock.
    This needs an audit of which app tests implicitly rely on the current clear.
 
-Option 1 is preferred: it removes the shared mutable state instead of adding
-coordination around it.
+Option 1 (thread-localize the residual `ui_frame_metrics` state) is preferred:
+it removes the shared mutable state instead of adding coordination around it.
 
 ## Scope note
 
