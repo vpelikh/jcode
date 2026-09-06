@@ -636,12 +636,20 @@ impl Model {
     /// `ActiveEventLoop::system_theme()` at resume and `ThemeChanged` after, so
     /// both funnel here with the authoritative flag. `None` (Wayland/x11, or an
     /// unknown preference) leaves the current resolution alone.
-    pub(crate) fn resolve_theme_from_system(&mut self, system_dark: Option<bool>) {
+    ///
+    /// Returns whether the resolved theme actually changed, so the caller can
+    /// avoid a redundant redraw when an explicit preference keeps the window
+    /// pinned to light/dark despite a fresh system signal.
+    pub(crate) fn resolve_theme_from_system(&mut self, system_dark: Option<bool>) -> bool {
         if self.theme_preference == theme::ThemeMode::System {
             if let Some(dark) = system_dark {
-                self.theme = theme::Theme::for_mode(theme::ThemeMode::System, dark);
+                let next = theme::Theme::for_mode(theme::ThemeMode::System, dark);
+                let changed = next.mode != self.theme.mode;
+                self.theme = next;
+                return changed;
             }
         }
+        false
     }
 
     /// The status line to show as a footnote, or `None` when it is not worth
@@ -2254,11 +2262,16 @@ impl hot_worker::ApplicationWorker for App {
             // System mode follows: an explicit JCODE_DESKTOP2_THEME choice is
             // the user overriding the desktop, and must keep winning.
             WindowEvent::ThemeChanged(system) => {
-                self.model
-                    .resolve_theme_from_system(Some(system == winit::window::Theme::Dark));
-                // The transcript cache keys on the theme, so the switch
-                // relayouts on the next frame without an explicit flush.
-                self.request_redraw();
+                // The transcript cache keys on the theme, so a change
+                // relayouts on the next frame without an explicit flush. An
+                // explicit preference already kept the window pinned, in
+                // which case nothing changed and there is nothing to redraw.
+                if self
+                    .model
+                    .resolve_theme_from_system(Some(system == winit::window::Theme::Dark))
+                {
+                    self.request_redraw();
+                }
             }
             WindowEvent::Focused(focused) => {
                 self.model.focused = focused;
