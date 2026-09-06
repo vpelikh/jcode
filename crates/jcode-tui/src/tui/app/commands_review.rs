@@ -1225,43 +1225,6 @@ pub(super) enum RefactorCommand {
 // are excluded.
 // ============================================================================
 
-/// Per-lens reviewer startup message. Independent per-lens reviewers each get a
-/// clean prompt focused on a single lens, with the report contract so the
-/// harness can parse the verdict deterministically.
-pub(super) fn build_lens_review_startup_message(parent_session_id: &str, lens_name: &str, lens_label: &str, lens_focus: &str) -> String {
-    format!(
-        "You are the `{lens_name}` reviewer for parent session `{parent_session_id}`.\n\
-You are one of several independent reviewers. Your job is ONLY to inspect the recent work through the `{lens_label}` lens.\n\
-\n\
-First read only the conversation history you actually need:\n\
-1. Use `conversation_search` with `stats=true` to learn the history size.\n\
-2. Read the most recent turns with `conversation_search turns` (start with roughly the last 6-12 turns, then widen only if needed).\n\
-3. If requirements are unclear, use `conversation_search query` to find the latest relevant user request or acceptance criteria.\n\
-\n\
-{guard}\
-Inspect the actual repo changes with targeted commands such as `git diff --stat`, `git diff --name-only`, and focused file reads.\n\
-\n\
-LENS FOCUS — only flag issues in this area:\n{lens_focus}\n\
-\n\
-Only flag issues in the changed code (the recent batch). Prefer concrete findings over style comments.\n\
-When done, respond with the machine-readable report contract and nothing else:\n\
-\n\
-VERDICT: CLEAN\n\
-  (if nothing in your lens scope is wrong)\n\
-or\n\
-VERDICT: FINDINGS\n\
-FINDING: <severity>|<file>|<issue text>\n\
-FINDING: <severity>|<file>|<issue text>\n\
-  (one FINDING line per issue; severity is HIGH/MEDIUM/LOW/INFO)\n\
-\n\
-Then stop. Do not ask the user anything. Keep your session concise.",
-        lens_name = lens_name,
-        lens_label = lens_label,
-        lens_focus = lens_focus,
-        guard = review_session_read_only_guardrails(),
-    )
-}
-
 /// True when an auto review loop is active on this session (unfinished).
 pub(super) fn is_review_loop_active(app: &App) -> bool {
     app.session

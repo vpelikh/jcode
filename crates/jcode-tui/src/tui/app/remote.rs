@@ -1474,13 +1474,14 @@ pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteC
         if !app.is_processing {
             let parent_session_id =
                 crate::tui::app::commands_review::current_feedback_target_session_id(app);
-            if let Some(lens) = jcode_session_types::ReviewLens::from_name(&lens_label) {
-                let prompt = crate::tui::app::commands_review::build_lens_review_startup_message(
-                    &parent_session_id,
-                    lens.name(),
-                    lens.label(),
-                    lens.focus(),
-                );
+            // Validate the queued lens is a known machine name (see
+            // spawn_review_loop_reviewer, which stores ReviewLens::name()).
+            // We do NOT build a client-side prompt: the server rebuilds the
+            // lens prompt itself from the lens name (build_lens_prompt in
+            // headless_review.rs), so any lens_prompt sent here would be
+            // discarded. Send an empty one instead.
+            if jcode_session_types::ReviewLens::from_name(&lens_label).is_some() {
+                let lens_prompt = String::new();
                 let working_dir =
                     crate::tui::app::commands::active_working_dir(app).map(|p| p.to_string_lossy().into_owned());
                 // Mark the dispatch as still-queued/in-flight during the send.
@@ -1495,7 +1496,7 @@ pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteC
                 // recovery park until the send resolves.
                 app.pending_headless_review = Some(lens_label.clone());
                 match remote
-                    .headless_review(parent_session_id, lens_label.clone(), prompt, working_dir)
+                    .headless_review(parent_session_id, lens_label.clone(), lens_prompt, working_dir)
                     .await
                 {
                     Ok(request_id) => {
