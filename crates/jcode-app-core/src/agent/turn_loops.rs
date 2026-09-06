@@ -1095,6 +1095,26 @@ impl Agent {
                     total_chars
                 ));
             }
+
+            // Repeat-tool guard (deepseek-harness takeaway #7): if the most recent
+            // tool call is an identical repeat of the prior run, inject a short
+            // model-visible nudge so the model changes approach instead of burning
+            // tokens in a stuck loop.
+            if let Some(reminder) =
+                super::guard::repeat_reminder_from_transcript(&self.session.messages)
+            {
+                let _ = self.add_message(Role::User, reminder.content);
+                crate::logging::info(&format!(
+                    "[guard] repeat-tool reminder injected into headless turn for session {}",
+                    self.session.id
+                ));
+                if let Err(err) = self.session.save() {
+                    logging::warn(&format!(
+                        "Failed to persist repeat-tool reminder for session {}: {}",
+                        self.session.id, err
+                    ));
+                }
+            }
         }
 
         Ok(final_text)

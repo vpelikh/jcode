@@ -2,6 +2,7 @@
 
 mod compaction;
 mod environment;
+mod guard;
 mod inline_tail;
 mod interrupts;
 mod messages;

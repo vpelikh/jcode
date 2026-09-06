@@ -1609,6 +1609,33 @@ impl Agent {
                     let _ = event_tx.send(event);
                 }
             }
+
+            // Repeat-tool guard (deepseek-harness takeaway #7): if the most recent
+            // tool call is an identical repeat of the prior run, inject a short
+            // model-visible nudge so the model changes approach instead of burning
+            // tokens in a stuck loop. This runs after all results are committed so
+            // the transcript reflects the full batch.
+            if let Some(reminder) =
+                super::guard::repeat_reminder_from_transcript(&self.session.messages)
+            {
+                let text = match reminder.content.first() {
+                    Some(ContentBlock::Text { text, .. }) => text.clone(),
+                    _ => super::guard::REPEAT_TOOL_REMINDER.to_string(),
+                };
+                // Surface to the client with the same event soft interrupts use, so
+                // the UI renders it as injected context.
+                let _ = event_tx.send(ServerEvent::SoftInterruptInjected {
+                    content: text.clone(),
+                    display_role: Some("system".to_string()),
+                    point: "D".to_string(),
+                    tools_skipped: None,
+                });
+                let _ = self.add_message(Role::User, reminder.content);
+                crate::logging::info(&format!(
+                    "[guard] repeat-tool reminder injected for session {}",
+                    self.session.id
+                ));
+            }
         }
 
         Ok(())
