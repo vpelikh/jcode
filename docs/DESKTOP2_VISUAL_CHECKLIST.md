@@ -88,7 +88,7 @@ The single highest-value category: this is where the first cut actually broke.
 | 3.1 | One family (JetBrains Mono) with a fallback stack, declared once in `text.rs`. | `scripts/desktop2_visual_check.sh` |
 | 3.2 | Body leading 1.65; captions carry 0.1-0.2em letterspacing. | `layout::BODY_LEADING`, caption styles |
 | 3.3 | Single-line fields **elide**, never wrap past their own rule. | `scene::tests::elide_respects_budget_and_keeps_ends`, `scene::tests::elide_handles_tiny_budget` |
-| 3.4 | Elision keeps the informative ends (head and tail of paths, ids, errors). | `tests::elide_respects_budget_and_keeps_ends` |
+| 3.4 | Elision keeps the informative ends (head and tail of paths, ids, errors). | `scene::tests::elide_respects_budget_and_keeps_ends` |
 | 3.5 | Sentence case; product names keep their own casing (`jcode` lowercase). | manual |
 
 ## 4. Color and contrast
