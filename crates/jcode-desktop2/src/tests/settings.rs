@@ -69,6 +69,39 @@ fn clicking_sessions_opens_the_session_overview() {
     );
 }
 
+/// Clicking the sessions button through the *real* window press path, not the
+/// `settings_press` shortcut the others use. A click at the top-left can be
+/// mistaken for a press on the project explorer, which owns the whole left
+/// band in window space, so this guards the exact dispatch order.
+#[test]
+fn clicking_sessions_through_the_window_press_opens_the_overview() {
+    let mut app = app();
+    // The explorer block is the top-left region's only other owner; with a
+    // working directory set it is actually drawn, exercising the overlap. The
+    // window keeps `App::frame` in step with the model via
+    // `frame_for_model` (it is refreshed before every frame in the event
+    // loop), so the test does the same before pressing.
+    app.model.working_dir = Some("/tmp".into());
+    app.model.file_tree.sync_root(Some("/tmp"));
+    app.frame = crate::App::frame_for_model((1100, 720), 1.0, &app.model);
+    let button = app.frame.sessions();
+    // The page lives right of the explorer, so its top-left chrome is never
+    // hidden underneath it.
+    assert!(
+        button.x0 >= crate::file_tree::WIDTH,
+        "the sessions button sits under the project explorer"
+    );
+    app.pointer = (
+        button.x0 + button.width() / 2.0,
+        button.y0 + button.height() / 2.0,
+    );
+    app.on_pointer_pressed();
+    assert!(
+        app.model.overview.is_open(),
+        "a real window press on the sessions button did not open the overview"
+    );
+}
+
 #[test]
 fn sessions_sits_at_the_top_left_of_the_page() {
     let app = app();

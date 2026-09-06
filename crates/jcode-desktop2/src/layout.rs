@@ -259,7 +259,7 @@ impl Frame {
     /// Resolve geometry with a session strip reserved at the top.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn with_strip(size: (u32, u32), scale: f64, lines: usize, strip: bool) -> Self {
-        Self::resolve(size, scale, lines, strip, 0.0)
+        Self::resolve(size, scale, lines, strip, 0.0, 0.0)
     }
 
     /// Resolve geometry with a strip and a measured transcript height, so the
@@ -272,7 +272,22 @@ impl Frame {
         strip: bool,
         content_height: f64,
     ) -> Self {
-        Self::resolve(size, scale, lines, strip, content_height)
+        Self::resolve(size, scale, lines, strip, content_height, 0.0)
+    }
+
+    /// As [`Self::with_content`], with a left sidebar reserved ahead of the
+    /// page. The project explorer owns the leading edge of the window (it is
+    /// painted over the page's chrome otherwise), so the page column, its
+    /// composer, and its top-left chrome must sit right of its width.
+    pub fn with_content_sidebar(
+        size: (u32, u32),
+        scale: f64,
+        lines: usize,
+        strip: bool,
+        content_height: f64,
+        sidebar: f64,
+    ) -> Self {
+        Self::resolve(size, scale, lines, strip, content_height, sidebar)
     }
 
     fn resolve(
@@ -281,6 +296,7 @@ impl Frame {
         lines: usize,
         strip: bool,
         content_height: f64,
+        sidebar: f64,
     ) -> Self {
         // The strip's row comes out of the transcript's top margin, so the
         // content's own floor has to know about it before the composer is
@@ -288,7 +304,8 @@ impl Frame {
         // real top so a growing transcript pushes the well down correctly.
         let strip_offset = if strip { STRIP_HEIGHT + STRIP_GAP } else { 0.0 };
         let build = |content: f64| {
-            let mut frame = Self::with_composer_lines_and_content(size, scale, lines, content);
+            let mut frame =
+                Self::with_composer_lines_and_content(size, scale, lines, content, sidebar);
             // The strip takes its row out of the transcript's top margin, which
             // is dead space anyway, and only when there is something to show.
             // Nothing is reserved otherwise, so a single-session window is
@@ -326,7 +343,7 @@ impl Frame {
     /// being clipped, and stops growing at [`COMPOSER_MAX_LINES`] so a long
     /// paste can never push the transcript off the page.
     pub fn with_composer_lines(size: (u32, u32), scale: f64, lines: usize) -> Self {
-        Self::resolve(size, scale, lines, false, 0.0)
+        Self::resolve(size, scale, lines, false, 0.0, 0.0)
     }
 
     /// As [`Self::with_composer_lines`], with the measured height of the
@@ -338,6 +355,7 @@ impl Frame {
         scale: f64,
         lines: usize,
         content_height: f64,
+        sidebar: f64,
     ) -> Self {
         let scale = if scale.is_finite() && scale > 0.0 {
             scale
@@ -348,9 +366,15 @@ impl Frame {
         let width = (f64::from(size.0) / scale).max(240.0);
         let height = (f64::from(size.1) / scale).max(200.0);
 
-        let gutter = (width * 0.06).clamp(20.0, 64.0);
-        let column = (width - gutter * 2.0).clamp(120.0, MEASURE);
-        let left = ((width - column) / 2.0).max(gutter.min((width - column).max(0.0)));
+        // The page lives in the space right of the explorer's sidebar: the
+        // column is centred in the remaining width and then shifted over by
+        // the sidebar, so a narrower window shrinks the page instead of
+        // sliding it off-paper.
+        let available = (width - sidebar).max(0.0);
+        let gutter = (available * 0.06).clamp(20.0, 64.0);
+        let column = (available - gutter * 2.0).clamp(120.0, MEASURE);
+        let left = sidebar
+            + ((available - column) / 2.0).max(gutter.min((available - column).max(0.0)));
         let right = left + column;
 
         // No masthead: the transcript starts at the top margin. The window
@@ -884,6 +908,38 @@ mod tests {
             );
             assert!(frame.column() > 0.0, "column collapsed");
         });
+    }
+
+    /// A left sidebar (the project explorer) must push the page column right of
+    /// it, so the column's whole footprint — including the top-left chrome like
+    /// the sessions button that anchors to `left` — stays clear of the sidebar
+    /// rather than hiding underneath it.
+    #[test]
+    fn a_sidebar_shifts_the_column_clear_of_it() {
+        const SIDEBAR: f64 = 252.0;
+        for (width, scale) in [(1100usize, 1.0), (800, 1.0), (1400, 1.75), (400, 1.0)] {
+            let frame = Frame::with_content_sidebar(
+                (width as u32, 720),
+                scale,
+                1,
+                false,
+                0.0,
+                SIDEBAR,
+            );
+            assert!(
+                frame.left >= SIDEBAR - 0.001,
+                "at ({width},{scale}) the column started {} under the sidebar",
+                SIDEBAR - frame.left
+            );
+            assert!(
+                frame.right <= frame.width + 0.001,
+                "at ({width},{scale}) the column ran off-paper"
+            );
+            assert!(
+                frame.column() > 0.0,
+                "at ({width},{scale}) the column collapsed"
+            );
+        }
     }
 
     #[test]
