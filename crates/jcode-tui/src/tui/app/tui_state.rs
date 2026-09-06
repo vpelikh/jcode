@@ -958,11 +958,19 @@ impl crate::tui::TuiState for App {
             ));
         }
         self.status_notice.as_ref().and_then(|(text, at)| {
-            if at.elapsed() <= Duration::from_secs(3) {
-                Some(text.clone())
-            } else {
-                None
-            }
+            // Notices fade after a few seconds in production so a stale status
+            // never lingers. In the test build the wall-clock fade is a flake
+            // source: assertions read the notice right after an action sets it,
+            // and a thread descheduled by parallel test load for over the TTL
+            // would observe it already "expired". Keep the notice live in tests
+            // so they assert the value that was set, not timing luck.
+            //
+            // Gate this on `cfg!(test)` rather than `runtime_mode == TestHarness`:
+            // the production ambient cycle also boots the App via `App::new`,
+            // which defaults `runtime_mode` to `TestHarness`, so a runtime-mode
+            // gate would make status notices never fade there.
+            let fresh = cfg!(test) || at.elapsed() <= Duration::from_secs(3);
+            fresh.then(|| text.clone())
         })
     }
 
