@@ -260,3 +260,31 @@ fn desktop2_sibling_returns_none_when_absent() {
         "no desktop anywhere must yield None"
     );
 }
+
+// The real-world installed layout: the launcher is a symlink chain ending at the
+// real binary in the version dir, with the desktop sibling next to the real
+// binary. The lookup must resolve the symlink to find the sibling.
+#[cfg(unix)]
+#[test]
+fn desktop2_sibling_resolves_launcher_symlink_to_real_binary() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let version = temp.path().join("versions/v1");
+    std::fs::create_dir_all(&version).expect("create version dir");
+    let real = version.join("jcode");
+    let desktop = version.join(MACOS_DESKTOP_APP_EXECUTABLE);
+    std::fs::write(&real, "binary").expect("write real jcode");
+    std::fs::write(&desktop, "binary").expect("write desktop sibling");
+
+    let bin = temp.path().join("bin");
+    std::fs::create_dir_all(&bin).expect("create bin");
+    symlink(&real, bin.join("jcode")).expect("symlink launcher -> real");
+    symlink(bin.join("jcode"), temp.path().join("current")).expect("symlink current -> launcher");
+
+    assert_eq!(
+        find_desktop2_sibling(&temp.path().join("current")),
+        Some(desktop),
+        "launcher symlink must resolve to the real binary's sibling"
+    );
+}
