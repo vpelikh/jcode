@@ -2505,6 +2505,7 @@ pub fn todo_gate_count(kind: TodoGateKind) -> u32 {
             TodoGateKind::IntentUnderstanding => state.todo_gate_intent_count,
             TodoGateKind::Completion => state.todo_gate_completion_count,
             TodoGateKind::ConfidenceSpike => state.todo_gate_spike_count,
+            TodoGateKind::TradeOff => state.todo_gate_tradeoff_count,
         }
     } else {
         0

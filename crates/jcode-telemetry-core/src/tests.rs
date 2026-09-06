@@ -780,6 +780,7 @@ fn test_todo_gate_count_getter_reads_back() {
     record_todo_gate(TodoGateKind::Ownership);
     record_todo_gate(TodoGateKind::ConfidenceSpike);
     record_todo_gate(TodoGateKind::ClosedFeedbackLoop);
+    record_todo_gate(TodoGateKind::TradeOff);
 
     assert_eq!(super::todo_gate_count(TodoGateKind::Completion), 1);
     assert_eq!(super::todo_gate_count(TodoGateKind::Ownership), 1);
@@ -789,6 +790,8 @@ fn test_todo_gate_count_getter_reads_back() {
     assert_eq!(super::todo_gate_count(TodoGateKind::ClosedFeedbackLoop), 1);
     assert_eq!(super::todo_gate_count(TodoGateKind::FeedbackLoopRelevance), 1);
     assert_eq!(super::todo_gate_count(TodoGateKind::Alignment), 0);
+    // TradeOff has its own dedicated counter, read back independently.
+    assert_eq!(super::todo_gate_count(TodoGateKind::TradeOff), 1);
 
     if let Ok(mut session) = SESSION_STATE.lock() {
         *session = None;
