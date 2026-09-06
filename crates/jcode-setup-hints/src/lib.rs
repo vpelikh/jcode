@@ -44,7 +44,9 @@ mod windows_hotkeys;
 #[cfg(windows)]
 mod windows_setup;
 #[cfg(any(test, target_os = "macos"))]
-use macos_launcher::{install_macos_app_launcher, should_refresh_macos_app_launcher};
+use macos_launcher::{
+    install_macos_app_launcher, install_macos_desktop_app_launcher, should_refresh_macos_app_launcher,
+};
 #[cfg(target_os = "macos")]
 use macos_terminal::launch_script_for_macos_terminal;
 #[cfg(target_os = "macos")]
@@ -2501,6 +2503,40 @@ pub fn run_setup_launcher() -> Result<()> {
     #[cfg(not(any(windows, target_os = "macos")))]
     {
         eprintln!("Launcher setup is currently only supported on macOS and Windows.");
+        Ok(())
+    }
+}
+
+/// Install the native desktop app bundle (`Jcode Desktop.app`) that launches
+/// `jcode-desktop2` directly, with no terminal.
+pub fn run_setup_desktop_launcher() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut state = SetupHintsState::load();
+        eprintln!("\x1b[1mjcode setup-launcher --desktop\x1b[0m");
+        eprintln!();
+        match install_macos_desktop_app_launcher() {
+            Ok(app_dir) => {
+                state.desktop_shortcut_created = true;
+                let _ = state.save();
+                eprintln!(
+                    "  \x1b[32m✓\x1b[0m Installed Jcode Desktop app: {}",
+                    app_dir.display()
+                );
+                eprintln!();
+                eprintln!("  Launchpad/Spotlight/Dock will open the native desktop app directly.");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("  \x1b[31m✗\x1b[0m Failed: {}", e);
+                anyhow::bail!("desktop app setup failed: {}", e);
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        eprintln!("Jcode Desktop.app is only supported on macOS.");
         Ok(())
     }
 }

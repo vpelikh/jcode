@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 const MACOS_APP_ICON_FILE_NAME: &str = "Jcode.icns";
+const MACOS_DESKTOP_APP_EXECUTABLE: &str = "jcode-desktop2";
 const MACOS_APP_ICON_BYTES: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../assets/app-icons/Jcode.icns"
@@ -106,6 +107,151 @@ pub(super) fn install_macos_app_launcher() -> Result<(PathBuf, MacTerminalKind)>
     register_macos_app_launcher(&app_dir);
     save_preferred_macos_terminal(terminal)?;
     Ok((app_dir, terminal))
+}
+
+/// Install a `Jcode Desktop.app` that launches the native GPU desktop app
+/// (`jcode-desktop2`) directly, with no terminal.
+///
+/// The desktop binary ships as a sibling of the `jcode` executable in the
+/// install payload. We hard-link (or copy) it into the bundle so the `.app` is
+/// self-contained and double-clickable from Launchpad/Dock/Spotlight, like any
+/// other native macOS application.
+pub(super) fn install_macos_desktop_app_launcher() -> Result<PathBuf> {
+    let app_dir = macos_desktop_app_launcher_dir()?;
+    let sibling = desktop2_sibling_binary()?;
+
+    let staging = app_dir
+        .parent()
+        .context("desktop app bundle has no parent")?
+        .join(format!(
+            ".Jcode Desktop.app.installing-{}",
+            std::process::id()
+        ));
+    remove_path_if_exists(&staging)?;
+    let contents = staging.join("Contents");
+    let macos = contents.join("MacOS");
+    let resources = contents.join("Resources");
+    std::fs::create_dir_all(&macos)?;
+    std::fs::create_dir_all(&resources)?;
+
+    let executable = macos.join(MACOS_DESKTOP_APP_EXECUTABLE);
+    if std::fs::hard_link(&sibling, &executable).is_err() {
+        std::fs::copy(&sibling, &executable).with_context(|| {
+            format!(
+                "failed to install desktop executable from {}",
+                sibling.display()
+            )
+        })?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))?;
+    }
+    std::fs::write(
+        resources.join(MACOS_APP_ICON_FILE_NAME),
+        MACOS_APP_ICON_BYTES,
+    )?;
+    std::fs::write(contents.join("Info.plist"), macos_desktop_info_plist())?;
+
+    if !macos_desktop_app_launcher_is_valid(&staging) {
+        remove_path_if_exists(&staging)?;
+        anyhow::bail!(
+            "desktop app bundle is incomplete after setup: {}",
+            staging.display()
+        );
+    }
+
+    remove_path_if_exists(&app_dir)?;
+    std::fs::rename(&staging, &app_dir).with_context(|| {
+        format!(
+            "failed to publish desktop app bundle at {}",
+            app_dir.display()
+        )
+    })?;
+    register_macos_app_launcher(&app_dir);
+    Ok(app_dir)
+}
+
+fn macos_desktop_app_launcher_dir() -> Result<PathBuf> {
+    let home = dirs::home_dir().context("Could not find home directory")?;
+    Ok(home.join("Applications").join("Jcode Desktop.app"))
+}
+
+/// The `jcode-desktop2` binary expected as a sibling of the running `jcode`
+/// executable. Fails with a helpful build hint when it is not present.
+fn desktop2_sibling_binary() -> Result<PathBuf> {
+    let exe = std::env::current_exe()
+        .context("could not locate the running jcode executable")?;
+    let Some(parent) = exe.parent() else {
+        anyhow::bail!("running jcode executable has no parent directory");
+    };
+    let candidate = parent.join(MACOS_DESKTOP_APP_EXECUTABLE);
+    if candidate.is_file() {
+        return Ok(candidate);
+    }
+    // Fall back to the repo's selfdev build for developer machines that run
+    // `jcode` from a cargo build rather than an installed payload.
+    let selfdev = std::env::current_dir()
+        .ok()
+        .map(|dir| dir.join("target/selfdev").join(MACOS_DESKTOP_APP_EXECUTABLE));
+    if let Some(path) = selfdev.filter(|p| p.is_file()) {
+        return Ok(path);
+    }
+    anyhow::bail!(
+        "jcode-desktop2 binary not found next to {} or in target/selfdev. Build it with `cargo build --profile selfdev -p jcode-desktop2` first.",
+        exe.display()
+    )
+}
+
+fn macos_desktop_app_launcher_is_valid(app_dir: &Path) -> bool {
+    app_dir.is_dir()
+        && app_dir.join("Contents").join("Info.plist").is_file()
+        && app_dir
+            .join("Contents")
+            .join("MacOS")
+            .join(MACOS_DESKTOP_APP_EXECUTABLE)
+            .is_file()
+        && app_dir
+            .join("Contents")
+            .join("Resources")
+            .join(MACOS_APP_ICON_FILE_NAME)
+            .is_file()
+}
+
+fn macos_desktop_info_plist() -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Jcode Desktop</string>
+    <key>CFBundleDisplayName</key>
+    <string>Jcode Desktop</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.jcode.desktop</string>
+    <key>CFBundleVersion</key>
+    <string>{version}</string>
+    <key>CFBundleShortVersionString</key>
+    <string>{version}</string>
+    <key>CFBundleExecutable</key>
+    <string>{executable}</string>
+    <key>CFBundleIconFile</key>
+    <string>{icon_file}</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.developer-tools</string>
+</dict>
+</plist>
+"#,
+        version = jcode_build_meta::version(),
+        executable = MACOS_DESKTOP_APP_EXECUTABLE,
+        icon_file = MACOS_APP_ICON_FILE_NAME,
+    )
 }
 
 fn macos_app_launcher_dir() -> Result<PathBuf> {

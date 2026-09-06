@@ -427,8 +427,12 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
                 notify_cli_launch.as_deref(),
             )?;
         }
-        Some(Command::SetupLauncher) => {
-            setup_hints::run_setup_launcher()?;
+        Some(Command::SetupLauncher { desktop }) => {
+            if desktop {
+                setup_hints::run_setup_desktop_launcher()?;
+            } else {
+                setup_hints::run_setup_launcher()?;
+            }
         }
         Some(Command::Browser { action }) => {
             commands::run_browser(&action).await?;

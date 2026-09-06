@@ -381,7 +381,11 @@ pub(crate) enum Command {
     },
 
     /// Install a launcher so jcode appears in your app launcher
-    SetupLauncher,
+    SetupLauncher {
+        /// Install the native desktop app (Jcode Desktop.app) instead of the terminal launcher
+        #[arg(long)]
+        desktop: bool,
+    },
 
     /// Browser automation setup and status
     Browser {
