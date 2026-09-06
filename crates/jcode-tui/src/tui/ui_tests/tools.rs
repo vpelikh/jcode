@@ -1521,3 +1521,36 @@ fn test_activity_detail_compass_query_shows_query() {
     );
     tools_ui::tests_tool_call_details_override::set(false);
 }
+
+/// memory recall with a blank query falls back to the recent list, never
+/// emitting a misleading `recall ''`.
+#[test]
+fn test_tool_summary_memory_recall_blank_falls_back() {
+    let tool = ToolCall {
+        id: "memory-recall-blank".to_string(),
+        name: "memory".to_string(),
+        input: serde_json::json!({ "action": "recall", "query": "   " }),
+        intent: None,
+        thought_signature: None,
+    };
+    let summary = tools_ui::get_tool_summary_with_budget(&tool, 50, Some(40));
+    assert_eq!(summary, "recall (recent)", "summary={summary:?}");
+}
+
+/// gmail search with a blank query collapses to the bare action, never a
+/// misleading `search ''`.
+#[test]
+fn test_tool_summary_gmail_search_blank_falls_back_to_action() {
+    let tool = ToolCall {
+        id: "gmail-search-blank".to_string(),
+        name: "gmail".to_string(),
+        input: serde_json::json!({
+            "action": "search",
+            "query": "   "
+        }),
+        intent: None,
+        thought_signature: None,
+    };
+    let summary = tools_ui::get_tool_summary_with_budget(&tool, 50, Some(50));
+    assert_eq!(summary, "search", "summary={summary:?}");
+}
