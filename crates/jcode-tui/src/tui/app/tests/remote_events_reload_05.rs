@@ -1344,3 +1344,42 @@ fn ownership_fingerprint_ignores_irrelevant_stopping_evidence_churn() {
         "stopping_evidence change on a plateau-confirmed goal must count as ownership-gate progress"
     );
 }
+
+#[test]
+fn confidence_fingerprint_ignores_confidence_churn_when_history_is_non_empty() {
+    // spike_completed_todos reads the standalone `confidence` field only as the
+    // empty-history fallback. Once confidence_history is non-empty it reads only
+    // the history tail, so `confidence` churn must not register as gate progress.
+    let base = crate::todo::TodoItem {
+        id: "a".to_string(),
+        content: "same".to_string(),
+        status: "completed".to_string(),
+        confidence: Some(crate::todo::ConfidenceState::from_legacy_score(30)),
+        completion_confidence: Some(crate::todo::ConfidenceState::from_legacy_score(50)),
+        confidence_history: vec![crate::todo::ConfidenceState::from_legacy_score(30)],
+        ..Default::default()
+    };
+
+    let fp_base = <App>::confidence_gate_fingerprint(&[base.clone()]);
+
+    let mut churned = base.clone();
+    churned.confidence = Some(crate::todo::ConfidenceState::from_legacy_score(90));
+    let fp_churned = <App>::confidence_gate_fingerprint(&[churned]);
+    assert_eq!(
+        fp_base, fp_churned,
+        "confidence churn on a todo with non-empty history must not count as confidence-gate progress"
+    );
+
+    // But when history IS empty, `confidence` is the spike fallback pair with
+    // completion_confidence, so it must be reflected.
+    let mut empty_hist = base.clone();
+    empty_hist.confidence_history = vec![];
+    let mut empty_churned = empty_hist.clone();
+    empty_churned.confidence = Some(crate::todo::ConfidenceState::from_legacy_score(90));
+    let fp_empty = <App>::confidence_gate_fingerprint(&[empty_hist]);
+    let fp_empty_churned = <App>::confidence_gate_fingerprint(&[empty_churned]);
+    assert_ne!(
+        fp_empty, fp_empty_churned,
+        "confidence churn on a todo with empty history must count as confidence-gate progress"
+    );
+}

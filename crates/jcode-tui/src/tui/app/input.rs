@@ -1742,10 +1742,12 @@ impl App {
     /// between confidence-gate nudges.
     ///
     /// Only the completed-todo fields `todo_confidence_summary` reads count:
-    /// completion_confidence, confidence, priority (the weighted-average
-    /// weight), and confidence_history (spike detection). Unrelated churn
-    /// (todo content, group-scoped ownership fields) must not register. The
-    /// projection is sorted so reordering todos does not register as a change.
+    /// completion_confidence, priority (the weighted-average weight), the
+    /// confidence_history tail (spike detection), and `confidence` only when it
+    /// is the empty-history spike fallback. Unrelated churn (todo content,
+    /// group-scoped ownership fields, `confidence` on a todo that already has
+    /// history) must not register. The projection is sorted so reordering todos
+    /// does not register as a change.
     pub(super) fn confidence_gate_fingerprint(todos: &[crate::todo::TodoItem]) -> String {
         let mut entries: Vec<(String, String)> = Vec::new();
         for todo in todos.iter().filter(|t| t.status == "completed") {
@@ -1757,10 +1759,20 @@ impl App {
                     .unwrap_or("")
                     .to_string(),
             ));
-            entries.push((
-                format!("todo:{group}:{}:confidence", todo.id),
-                todo.confidence.map(|s| s.as_str()).unwrap_or("").to_string(),
-            ));
+            // spike_completed_todos reads the standalone `confidence` field ONLY
+            // as the empty-history fallback (`confidence.zip(completion_confidence)`);
+            // once confidence_history is non-empty it reads only the history tail.
+            // Project `confidence` only when it can affect the gate, so churning
+            // it on a todo that already has history is not mistaken for progress.
+            if todo.confidence_history.is_empty() {
+                entries.push((
+                    format!("todo:{group}:{}:confidence", todo.id),
+                    todo.confidence
+                        .map(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                ));
+            }
             // The confidence gate's weighted average uses priority as its
             // weight (`todo_confidence_weight`), so a priority change alters
             // the gated signal and must count as progress.
