@@ -592,7 +592,9 @@ fn draw_model_picker(
             (band.width() - layout::MODEL_MENU_TEXT_PAD * 2.0).max(1.0) as f32,
             ParagraphStyle {
                 font_size: layout::CAPTION_SIZE,
-                color: if current { theme.accent } else { theme.muted },
+                // The label is text, so it stays readable ink; the accent dot
+                // beside it carries the "current" state, so hue is not lost.
+                color: if current { theme.text } else { theme.muted },
                 letter_spacing_em: 0.05,
                 ..Default::default()
             },
