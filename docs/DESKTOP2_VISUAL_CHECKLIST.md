@@ -166,7 +166,7 @@ deliberately skipped, with the reason.
 | 6.33 | Typing or deleting replaces the selection, undoably. | `editor::selection_tests::typing_replaces_the_selection`, `deleting_a_selection_is_undoable` |
 | 6.34 | Copy and cut prefer the selection over the whole line. | `copy_prefers_the_selection_over_the_whole_line`, `cut_removes_only_the_selection_when_there_is_one` |
 | 6.35 | The selection renders as a band under the text, and only when there is a selection. | `visual_tests::a_selection_is_visible_and_text_on_it_stays_readable`, `no_band_is_drawn_without_a_selection` |
-| 4.6 | Selected text stays readable against the selection band, in both themes. | `theme::tests::selected_text_stays_readable` |
+| 4.7 | Selected text stays readable against the selection band, in both themes. | `theme::tests::selected_text_stays_readable` |
 | 5.9 | The mouse wheel scrolls the transcript and clamps. | `action_tests::the_wheel_scrolls_and_clamps_like_the_keyboard` |
 
 ### Multi-line composer
