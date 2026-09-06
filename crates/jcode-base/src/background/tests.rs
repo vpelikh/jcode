@@ -864,7 +864,7 @@ async fn cancel_adopted_task_kills_inner_child_process() -> Result<()> {
     }
     let child_pid = child_pid.expect("child pid marker should appear");
     assert!(
-        pid_alive(child_pid),
+        crate::platform::is_process_running(child_pid),
         "child {child_pid} should be running before cancel"
     );
 
@@ -873,14 +873,8 @@ async fn cancel_adopted_task_kills_inner_child_process() -> Result<()> {
 
     sleep(Duration::from_millis(300)).await;
     assert!(
-        !pid_alive(child_pid),
+        !crate::platform::is_process_running(child_pid),
         "child {child_pid} should be killed when the adopted task is cancelled"
     );
     Ok(())
-}
-
-#[cfg(unix)]
-pub(super) fn pid_alive(pid: u32) -> bool {
-    let rc = unsafe { libc::kill(pid as i32, 0) };
-    rc == 0
 }
