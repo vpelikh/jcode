@@ -627,6 +627,23 @@ impl Model {
         self.notice = Some(notice.into());
     }
 
+    /// Re-resolve the theme against the desktop's *actual* system theme, once
+    /// the window can provide it.
+    ///
+    /// The `system_prefers_dark` probe only knows the Linux portals, so on
+    /// macOS and Windows a System-preference window would boot light even when
+    /// the desktop asks for dark. winit reports the real theme through
+    /// `ActiveEventLoop::system_theme()` at resume and `ThemeChanged` after, so
+    /// both funnel here with the authoritative flag. `None` (Wayland/x11, or an
+    /// unknown preference) leaves the current resolution alone.
+    pub(crate) fn resolve_theme_from_system(&mut self, system_dark: Option<bool>) {
+        if self.theme_preference == theme::ThemeMode::System {
+            if let Some(dark) = system_dark {
+                self.theme = theme::Theme::for_mode(theme::ThemeMode::System, dark);
+            }
+        }
+    }
+
     /// The status line to show as a footnote, or `None` when it is not worth
     /// the user's attention.
     ///
@@ -2078,6 +2095,18 @@ impl hot_worker::ApplicationWorker for App {
         if self.state.is_some() {
             return;
         }
+        // The resolved theme starts from the saved preference plus whatever
+        // `system_prefers_dark` could ask at process start. On Windows and
+        // macOS that probe is silent (it only knows the Linux portals), so a
+        // "system" window would boot light even when the desktop asks for
+        // dark. The window has just become able to tell us for real, so
+        // re-resolve before the first frame is built. On Wayland/x11 this
+        // returns None and the Linux probe keeps running the show.
+        self.model.resolve_theme_from_system(
+            event_loop
+                .system_theme()
+                .map(|theme| theme == winit::window::Theme::Dark),
+        );
         // Reopen where the user left off.
         let geometry = window_state::Geometry::load();
         let mut attributes = Window::default_attributes()
@@ -2225,13 +2254,11 @@ impl hot_worker::ApplicationWorker for App {
             // System mode follows: an explicit JCODE_DESKTOP2_THEME choice is
             // the user overriding the desktop, and must keep winning.
             WindowEvent::ThemeChanged(system) => {
-                if self.model.theme_preference == theme::ThemeMode::System {
-                    let dark = system == winit::window::Theme::Dark;
-                    self.model.theme = theme::Theme::for_mode(theme::ThemeMode::System, dark);
-                    // The transcript cache keys on the theme, so the switch
-                    // relayouts on the next frame without an explicit flush.
-                    self.request_redraw();
-                }
+                self.model
+                    .resolve_theme_from_system(Some(system == winit::window::Theme::Dark));
+                // The transcript cache keys on the theme, so the switch
+                // relayouts on the next frame without an explicit flush.
+                self.request_redraw();
             }
             WindowEvent::Focused(focused) => {
                 self.model.focused = focused;
