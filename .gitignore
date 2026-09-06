@@ -26,3 +26,6 @@ captures/
 
 # JetBrains IDE workspace files
 /.idea/
+
+# Git worktrees (development artifacts, never committed).
+/.worktrees/
