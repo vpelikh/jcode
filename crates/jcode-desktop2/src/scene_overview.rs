@@ -347,7 +347,7 @@ pub(crate) fn draw_overview(
                 scene,
                 &model.activity,
                 (rect.x1 - 14.0, rect.y0 + 14.0),
-                theme.muted.with_alpha(phase as f32),
+                theme.accent.with_alpha(phase as f32),
                 scale,
                 now,
             );

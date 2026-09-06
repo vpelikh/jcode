@@ -389,7 +389,8 @@ fn draw_strip(
             } => {
                 // Unfocused blocks are dim so the focused one reads instantly;
                 // a busy session is drawn at full ink even when unfocused, so
-                // work happening off-screen is visible rather than silent.
+                // work happening off-screen is visible rather than silent. The
+                // focused session is the strip's "now", so it takes the accent.
                 let busy = model
                     .strips
                     .strips()
@@ -398,7 +399,7 @@ fn draw_strip(
                     .map(|entry| entry.busy)
                     .unwrap_or(false);
                 let color = if focused {
-                    model.theme.text
+                    model.theme.accent
                 } else if busy {
                     model.theme.muted
                 } else {
@@ -591,7 +592,7 @@ fn draw_model_picker(
             (band.width() - layout::MODEL_MENU_TEXT_PAD * 2.0).max(1.0) as f32,
             ParagraphStyle {
                 font_size: layout::CAPTION_SIZE,
-                color: if current { theme.text } else { theme.muted },
+                color: if current { theme.accent } else { theme.muted },
                 letter_spacing_em: 0.05,
                 ..Default::default()
             },
@@ -601,7 +602,7 @@ fn draw_model_picker(
             scene.fill(
                 vello::peniko::Fill::NonZero,
                 Affine::scale(scale),
-                theme.text,
+                theme.accent,
                 None,
                 &Circle::new((band.x1 - 8.0, band.y0 + band.height() / 2.0), 2.0),
             );
@@ -886,7 +887,7 @@ fn draw_transcript(
                         text_left + SPINNER_SIZE / 2.0,
                         message_top + placed.message.height / 2.0,
                     ),
-                    theme.muted,
+                    theme.accent,
                     scale,
                     std::time::Instant::now(),
                 );
@@ -1553,8 +1554,12 @@ pub fn build_scene(
         layout::COMPOSER_RADIUS,
     );
     fill_round(scene, theme.field, &well);
+    // Focus is the composer's one true state, so it is the first place the
+    // accent earns its keep: a focused well reads green, an unfocused one is
+    // neutral ink. The border also thickens on focus, so the change reads by
+    // weight even for a user who cannot see the hue.
     let (border_color, border_width) = if model.focused {
-        (theme.field_border_focus, layout::COMPOSER_BORDER_FOCUS)
+        (theme.accent, layout::COMPOSER_BORDER_FOCUS)
     } else {
         (theme.field_border, layout::COMPOSER_BORDER)
     };
@@ -1757,7 +1762,7 @@ pub fn build_scene(
             if bottom > top {
                 fill(
                     scene,
-                    theme.text,
+                    theme.accent,
                     &Rect::new(caret_x, top, caret_x + layout::CARET_WIDTH, bottom),
                 );
             }
