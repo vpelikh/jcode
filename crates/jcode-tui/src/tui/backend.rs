@@ -815,6 +815,30 @@ impl RemoteConnection {
         self.send_request(request).await
     }
 
+    /// Run a silent (headless) review-lens turn for `parent_session_id` on the
+    /// server. The server runs an Agent over a fresh reviewer child, then
+    /// replies with a `ServerEvent::HeadlessReviewResult`. Returns the request
+    /// id, which the caller uses to match the result event.
+    pub async fn headless_review(
+        &mut self,
+        parent_session_id: String,
+        lens: String,
+        lens_prompt: String,
+        working_dir: Option<String>,
+    ) -> Result<u64> {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let request = Request::HeadlessReview {
+            id,
+            parent_session_id,
+            lens,
+            lens_prompt,
+            working_dir,
+        };
+        self.send_request(request).await?;
+        Ok(id)
+    }
+
     /// Set compaction mode on the server for this session.
     pub async fn set_compaction_mode(&mut self, mode: crate::config::CompactionMode) -> Result<()> {
         let request = Request::SetCompactionMode {
