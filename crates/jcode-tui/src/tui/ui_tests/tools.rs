@@ -1486,3 +1486,38 @@ fn test_tool_summary_query_arms_never_emit_bare_quotes() {
         assert_ne!(summary, "''", "{name} blank must not emit `''`: {summary:?}");
     }
 }
+
+/// The live activity line for `compass_query` surfaces the search intent and
+/// the queried text. Here `intent` is the schema's search category; without a
+/// details override it leads, and with details shown the query summary
+/// follows.
+#[test]
+fn test_activity_detail_compass_query_shows_query() {
+    let tool = ToolCall {
+        id: "compass-activity".to_string(),
+        name: "compass_query".to_string(),
+        input: serde_json::json!({
+            "intent": "search",
+            "query": "find the config handler"
+        }),
+        intent: None,
+        thought_signature: None,
+    };
+
+    // Default (no details): intent category leads.
+    let detail = tools_ui::get_tool_activity_detail(&tool);
+    assert_eq!(detail, "search", "detail={detail:?}");
+
+    // With details enabled, the query summary is appended.
+    tools_ui::tests_tool_call_details_override::set(true);
+    let detail = tools_ui::get_tool_activity_detail(&tool);
+    assert!(
+        detail.starts_with("search"),
+        "intent should lead: {detail:?}"
+    );
+    assert!(
+        detail.contains("'find the config handler'"),
+        "query should be appended under details: {detail:?}"
+    );
+    tools_ui::tests_tool_call_details_override::set(false);
+}
