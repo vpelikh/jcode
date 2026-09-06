@@ -1580,10 +1580,13 @@ pub struct App {
     /// tick does not do a `Session::load` behind a pending reviewer on every
     /// tick, and so parallel tests do not share timing.
     last_review_loop_idle_poll: Option<Instant>,
-    /// When a review loop is running headlessly, the lens label of the lens
-    /// whose `Request::HeadlessReview` has been dispatched to the server and is
-    /// awaiting a `ServerEvent::HeadlessReviewResult`. `None` when no headless
-    /// review is in flight. The async run loop drains this to send the request;
+    /// When a review loop is running headlessly, the lens MACHINE name (as
+    /// `ReviewLens::name()`, e.g. "correctness") of the lens whose
+    /// `Request::HeadlessReview` is queued for / awaiting a
+    /// `ServerEvent::HeadlessReviewResult`. `None` when no headless review is in
+    /// flight. Stored as the machine name (not the human label) so both the
+    /// drain and the server resolve it via `ReviewLens::from_name`, which only
+    /// matches machine names. The async run loop drains this to send the request;
     /// the result handler clears it and feeds the verdict to the loop.
     pending_headless_review: Option<String>,
     /// Request id of the in-flight headless review (returned by the drain when

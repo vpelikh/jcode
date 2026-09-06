@@ -2020,7 +2020,12 @@ fn spawn_review_loop_reviewer(
     state.headless_dispatched_at = None;
     app.session.review_loop = Some(state.clone());
     let _ = app.session.save();
-    app.pending_headless_review = Some(lens.label().to_string());
+    // Store the lens MACHINE name (snake_case), NOT the human label: the
+    // drain resolves the queued lens via `ReviewLens::from_name`, which only
+    // matches machine names, and forwards it to the server which re-resolves it
+    // the same way to rebuild the lens prompt. Passing the human label here
+    // would make every `from_name` return None and silently skip every lens.
+    app.pending_headless_review = Some(lens.name().to_string());
     app.set_status_notice(format!("Review loop: reviewing {} (headless)", lens.label()));
     true
 }

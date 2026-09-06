@@ -1836,3 +1836,45 @@ fn headless_no_verdict_surfaces_server_message() {
         );
     });
 }
+
+// Regression (critical): the headless dispatch must carry the lens MACHINE name
+// (as ReviewLens::name()) so both the client drain and the server can resolve it
+// via ReviewLens::from_name — which ONLY matches machine names, not the human
+// label. Previously the dispatch stored lens.label() (e.g. "Edges/Errors"), so
+// from_name returned None for every label and the loop silently skipped every
+// lens ("unknown lens"), meaning headless review never ran. This pins that every
+// lens the loop dispatches is from_name-resolvable.
+#[test]
+fn headless_dispatch_queues_from_name_resolvable_lens() {
+    with_temp_jcode_home(|| {
+        for lens in jcode_session_types::ReviewLens::ALL {
+            let mut app = create_test_app();
+            app.is_remote = true;
+            let mut state = jcode_session_types::ReviewLoopState::new();
+            super::review_loop::enter_review_loop(&mut state);
+            state.current_lens = Some(lens);
+            app.session.review_loop = Some(state);
+            app.is_processing = false;
+            app.pending_queued_dispatch = false;
+
+            // step_review_loop with no active reviewer -> next_action ->
+            // spawn_review_loop_reviewer sets pending_headless_review.
+            super::commands::step_review_loop(&mut app);
+
+            let queued = app
+                .pending_headless_review
+                .as_deref()
+                .expect("a headless dispatch must be queued");
+            assert_eq!(
+                queued,
+                lens.name(),
+                "dispatch must carry the machine name, resolved via from_name"
+            );
+            assert!(
+                jcode_session_types::ReviewLens::from_name(queued).is_some(),
+                "queued lens '{}' must be from_name-resolvable (label mismatch bug)",
+                queued
+            );
+        }
+    });
+}

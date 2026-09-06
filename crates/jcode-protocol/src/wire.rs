@@ -743,7 +743,9 @@ pub enum Request {
         /// Session whose context is cloned for the reviewer (the parent of the
         /// work under review).
         parent_session_id: String,
-        /// Review lens label (for diagnostics), e.g. "Correctness".
+        /// Review lens MACHINE name (as `ReviewLens::name()`, e.g. "correctness").
+        /// The server re-resolves it via `ReviewLens::from_name` (which only
+        /// matches machine names) to rebuild the lens prompt.
         #[serde(default, skip_serializing_if = "String::is_empty")]
         lens: String,
         /// The full lens review prompt (carries the lens focus + report
