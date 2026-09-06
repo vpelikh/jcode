@@ -642,6 +642,7 @@ impl Request {
             Request::CommSubscribeChannel { id, .. } => *id,
             Request::CommUnsubscribeChannel { id, .. } => *id,
             Request::CommAwaitMembers { id, .. } => *id,
+            Request::HeadlessReview { id, .. } => *id,
         }
     }
 

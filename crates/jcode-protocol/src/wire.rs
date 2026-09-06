@@ -730,6 +730,28 @@ pub enum Request {
         #[serde(default = "default_true")]
         wake: bool,
     },
+
+    /// Run a silent (headless, no terminal window) review-lens turn for the
+    /// given session. The server runs an Agent over a fresh reviewer child of
+    /// `parent_session_id`, injects `lens_prompt`, and replies with a
+    /// `HeadlessReviewResult` event carrying the parsed verdict (CLEAN /
+    /// FINDINGS / failed / no-verdict). The client review loop uses this
+    /// instead of spawning a headed client in a new terminal window.
+    #[serde(rename = "headless_review")]
+    HeadlessReview {
+        id: u64,
+        /// Session whose context is cloned for the reviewer (the parent of the
+        /// work under review).
+        parent_session_id: String,
+        /// Review lens label (for diagnostics), e.g. "Correctness".
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        lens: String,
+        /// The full lens review prompt (carries the lens focus + report
+        /// contract the reviewer must honour).
+        lens_prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        working_dir: Option<String>,
+    },
 }
 
 /// Server event sent to client
@@ -1481,5 +1503,26 @@ pub enum ServerEvent {
         is_password: bool,
         /// Tool call ID this is associated with
         tool_call_id: String,
+    },
+
+    /// Result of a headless review-lens run (reply to `Request::HeadlessReview`).
+    #[serde(rename = "headless_review_result")]
+    HeadlessReviewResult {
+        /// Echoes the request id.
+        id: u64,
+        /// The session whose work was reviewed (the parent).
+        session_id: String,
+        /// The review lens label that was run.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        lens: String,
+        /// Verdict kind: "clean" | "findings" | "failed" | "no_verdict".
+        kind: String,
+        /// Parsed findings, one per `FINDING: sev|path|text` line when findings
+        /// were reported. Empty when the verdict is clean or did not parse.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        findings: Vec<String>,
+        /// Human-readable detail (errors, or the no-verdict reason).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        message: String,
     },
 }

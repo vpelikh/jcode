@@ -35,7 +35,7 @@ use crate::session::Session;
 use crate::tool;
 use std::sync::Arc;
 
-use jcode_session_types::{ReviewLens, ReviewReport};
+use jcode_session_types::ReviewReport;
 
 /// Outcome of a headless review-lens run.
 #[derive(Debug, Clone)]
@@ -63,7 +63,7 @@ pub enum HeadlessReviewOutcome {
 pub async fn run_review_lens_headless(
     provider: Arc<dyn Provider>,
     parent_session: &Session,
-    lens: ReviewLens,
+    lens_label: &str,
     lens_prompt: String,
     working_dir: Option<String>,
 ) -> HeadlessReviewOutcome {
@@ -75,7 +75,7 @@ pub async fn run_review_lens_headless(
 
     logging::info(&format!(
         "Headless review: starting '{}' lens on session {} (reviewer {})",
-        lens.label(),
+        lens_label,
         parent_session.id,
         reviewer_id
     ));
@@ -97,7 +97,7 @@ pub async fn run_review_lens_headless(
         Err(e) => {
             logging::warn(&format!(
                 "Headless review '{}': could not reload reviewer session {}: {}",
-                lens.label(),
+                lens_label,
                 reviewer_id,
                 e
             ));
@@ -116,7 +116,7 @@ pub async fn run_review_lens_headless(
     if let Some(report) = parse_verdict_from_session(&session) {
         logging::info(&format!(
             "Headless review '{}': verdict parsed from session {}",
-            lens.label(),
+            lens_label,
             reviewer_id
         ));
         return HeadlessReviewOutcome::Report(report);
