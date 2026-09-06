@@ -139,15 +139,7 @@ fn tool_summary_line(tool: &ToolCall) -> Option<String> {
             .input
             .get("query")
             .and_then(|v| v.as_str())
-            .filter(|query| !query.trim().is_empty())
-            .map(|query| {
-                let label = if query.len() > 60 {
-                    format!("{}...", crate::util::truncate_str(query, 60))
-                } else {
-                    query.to_string()
-                };
-                format!("'{}'", label)
-            }),
+            .and_then(agent_query_summary),
         "agentgrep" => {
             // `query` describes grep/find searches. Other modes (outline, trace,
             // smart) use different fields (`file`, `terms`), so fall back to the
@@ -157,15 +149,7 @@ fn tool_summary_line(tool: &ToolCall) -> Option<String> {
             tool.input
                 .get("query")
                 .and_then(|v| v.as_str())
-                .filter(|query| !query.trim().is_empty())
-                .map(|query| {
-                    let label = if query.len() > 60 {
-                        format!("{}...", crate::util::truncate_str(query, 60))
-                    } else {
-                        query.to_string()
-                    };
-                    format!("'{}'", label)
-                })
+                .and_then(agent_query_summary)
                 .or_else(|| {
                     let mode = tool
                         .input
@@ -184,6 +168,22 @@ fn tool_summary_line(tool: &ToolCall) -> Option<String> {
         ),
         _ => None,
     }
+}
+
+/// Quoted, truncated form of a free-form search `query` (used by compass_query
+/// and agentgrep). Returns `None` for a blank query so callers can fall back to
+/// a mode name. The 60-byte truncation keeps a single stdout line bounded and
+/// mirrors the byte cap used by the adjacent `bash` arm.
+fn agent_query_summary(query: &str) -> Option<String> {
+    if query.trim().is_empty() {
+        return None;
+    }
+    let label = if query.len() > 60 {
+        format!("{}...", crate::util::truncate_str(query, 60))
+    } else {
+        query.to_string()
+    };
+    Some(format!("'{}'", label))
 }
 
 #[cfg(test)]
@@ -221,6 +221,23 @@ mod tests {
     fn tool_summary_shows_agentgrep_query() {
         let line = tool_summary_line(&tool_call("agentgrep", "fn config"));
         assert_eq!(line.as_deref(), Some("'fn config'"));
+    }
+
+    #[test]
+    fn agent_query_summary_blank_short_and_long() {
+        // Blank -> None (caller decides a fallback).
+        assert_eq!(agent_query_summary("   "), None);
+        // Short (incl. multibyte) under the 60-byte cap -> quoted unchanged.
+        assert_eq!(
+            agent_query_summary("fn config 配置"),
+            Some("'fn config 配置'".to_string())
+        );
+        // Over the 60-byte cap -> quoted, truncated, ellipsis-suffixed.
+        let long = "界".repeat(100);
+        let s = agent_query_summary(&long).unwrap();
+        assert!(s.starts_with('\''));
+        assert!(s.ends_with("...'"));
+        assert!(long.starts_with(s.trim_matches('\'').trim_end_matches("...")));
     }
 
     #[test]
