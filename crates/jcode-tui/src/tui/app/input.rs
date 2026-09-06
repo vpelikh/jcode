@@ -1684,15 +1684,32 @@ impl App {
                     "iteration_maturity",
                     goal.iteration_maturity.map(|s| s.as_str()),
                 ),
+                // `delivery_state_passes` consults stopping_evidence ONLY when
+                // iteration_maturity is plateau/constraints/budget-exhausted;
+                // for any other maturity stopping_evidence is statically
+                // ignored. Project it only when it can actually flip the gate,
+                // so churning the evidence text on a maturity that does not
+                // require it is not mistaken for gate progress.
                 (
                     "stopping_evidence_present",
-                    goal.stopping_evidence.as_deref().map(|s| {
-                        if s.trim().is_empty() {
-                            "no"
-                        } else {
-                            "yes"
-                        }
-                    }),
+                    matches!(
+                        goal.iteration_maturity,
+                        Some(
+                            crate::todo::IterationMaturity::PlateauConfirmed
+                                | crate::todo::IterationMaturity::ConstraintsExhausted
+                                | crate::todo::IterationMaturity::BudgetExhausted
+                        )
+                    )
+                    .then(|| {
+                        goal.stopping_evidence.as_deref().map(|s| {
+                            if s.trim().is_empty() {
+                                "no"
+                            } else {
+                                "yes"
+                            }
+                        })
+                    })
+                    .flatten(),
                 ),
                 ("trade_off", goal.trade_off.map(|s| s.as_str())),
                 (

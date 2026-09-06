@@ -1285,3 +1285,62 @@ fn confidence_fingerprint_ignores_history_appends_that_keep_the_same_spike_tail(
         "a changed spike-relevant tail must count as confidence-gate progress"
     );
 }
+
+#[test]
+fn ownership_fingerprint_ignores_irrelevant_stopping_evidence_churn() {
+    // A completed group whose goal is gated by the ownership gate.
+    let todos = [crate::todo::TodoItem {
+        id: "a".to_string(),
+        content: "done".to_string(),
+        status: "completed".to_string(),
+        group: Some("g".to_string()),
+        ..Default::default()
+    }];
+    let goal = |maturity, evidence: Option<&str>| crate::todo::TodoGoal {
+        group: Some("g".to_string()),
+        difficulty: Some(crate::todo::Difficulty::Involved),
+        delivery_state: Some(crate::todo::DeliveryState::WorkflowValidated),
+        autonomy: Some(crate::todo::Autonomy::NecessaryFollowthrough),
+        iteration_maturity: maturity,
+        stopping_evidence: evidence.map(|s| s.to_string()),
+        feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::AcceptanceAligned),
+        feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::EdgeAndIntegrationPaths),
+        feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
+        trade_off: Some(crate::todo::TradeOffState::Diligent),
+        ..Default::default()
+    };
+
+    // A mature goal that is NOT plateau/exhausted does not gate on
+    // stopping_evidence, so churning that text must not change the fingerprint.
+    let no_evidence = goal(
+        Some(crate::todo::IterationMaturity::OutcomeReached),
+        None,
+    );
+    let with_evidence = goal(
+        Some(crate::todo::IterationMaturity::OutcomeReached),
+        Some("i verified this end to end"),
+    );
+    let fp_no = <App>::ownership_gate_fingerprint(&todos, &[no_evidence]);
+    let fp_with = <App>::ownership_gate_fingerprint(&todos, &[with_evidence]);
+    assert_eq!(
+        fp_no, fp_with,
+        "stopping_evidence churn on a maturity that does not require it must not count as ownership-gate progress"
+    );
+
+    // But a plateau-confirmed goal DOES gate on stopping_evidence, so the same
+    // change must be reflected in the fingerprint.
+    let plateau_no = goal(
+        Some(crate::todo::IterationMaturity::PlateauConfirmed),
+        None,
+    );
+    let plateau_with = goal(
+        Some(crate::todo::IterationMaturity::PlateauConfirmed),
+        Some("i verified this end to end"),
+    );
+    let fp_plateau_no = <App>::ownership_gate_fingerprint(&todos, &[plateau_no]);
+    let fp_plateau_with = <App>::ownership_gate_fingerprint(&todos, &[plateau_with]);
+    assert_ne!(
+        fp_plateau_no, fp_plateau_with,
+        "stopping_evidence change on a plateau-confirmed goal must count as ownership-gate progress"
+    );
+}
