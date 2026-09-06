@@ -3059,3 +3059,89 @@ async fn compact_frame_skips_turns_that_emit_tool_call() {
         .count();
     assert_eq!(reminders, 0, "no reminder may be injected for a tool_use turn");
 }
+
+#[tokio::test]
+async fn payload_too_large_falls_back_to_hard_compaction_when_strip_finds_nothing() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // Build a large accumulated transcript WITHOUT any single oversized image or
+    // tool-result block (the failure mode that image/tool-result stripping
+    // cannot resolve): many ordinary text turns whose total serialized volume
+    // still exceeds the provider's HTTP request body cap.
+    for i in 0..60 {
+        agent.add_message(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: format!("turn {i} contents {}", "y".repeat(400)),
+                cache_control: None,
+            }],
+        );
+    }
+    let pre_recovery = agent.provider_messages();
+    assert!(
+        pre_recovery.len() > 2,
+        "test transcript must be large enough to allow hard compaction"
+    );
+
+    // A 413 whose message body is dominated by accumulated text volume, with no
+    // oversized images or tool results present.
+    let error = "OpenAI-compatible chat request failed\n  endpoint: https://example/continue-dev/chat/completions\n  model: DeepSeek-V4-Flash\n  auth: OPENAI_COMPAT_API_KEY\n  status: 413 Payload Too Large\n  response: Hint: the provider rejected the request because the serialized body exceeded its size limit";
+
+    let recovered = agent.try_auto_compact_after_context_limit(error);
+    assert!(
+        recovered,
+        "a 413 with accumulated-message volume must fall through to hard compaction"
+    );
+
+    // The provider session/cache must be reset so the retry sends the reduced
+    // payload from a clean state.
+    assert!(agent.provider_session_id.is_none());
+    assert!(agent.session.provider_session_id.is_none());
+
+    // Hard compaction must advance the compaction cursor so a subsequent
+    // provider build skips the older messages, shrinking the serialized body.
+    let compacted_count = agent
+        .session
+        .compaction
+        .as_ref()
+        .map(|c| c.compacted_count)
+        .unwrap_or(0);
+    assert!(
+        compacted_count > 0,
+        "hard compaction must advance compacted_count to shrink the payload"
+    );
+}
+
+#[tokio::test]
+async fn non_payload_too_large_error_does_not_fall_through_to_hard_compaction() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+    for i in 0..60 {
+        agent.add_message(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: format!("turn {i} contents {}", "z".repeat(400)),
+                cache_control: None,
+            }],
+        );
+    }
+    let pre_recovery = agent.provider_messages();
+
+    // An unrelated non-413, non-context-limit error (e.g. auth denied) must NOT
+    // trigger hard compaction just because the transcript is large.
+    let error = "OpenAI-compatible chat request failed\n  status: 401 Unauthorized";
+    let recovered = agent.try_auto_compact_after_context_limit(error);
+    assert!(!recovered, "a 401 must not trigger compaction recovery");
+
+    let post_recovery = agent.provider_messages();
+    assert_eq!(
+        post_recovery.len(),
+        pre_recovery.len(),
+        "unrelated errors must not compact the transcript"
+    );
+}
