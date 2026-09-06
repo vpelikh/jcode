@@ -711,10 +711,12 @@ impl Agent {
         };
 
         self.session.compaction = Some(state.clone());
-        // Emit a SetCompaction event so the event log stays in sync with the
-        // compaction mutation. `set_compaction` also sets `self.compaction`,
-        // making the direct assignment above redundant but explicit.
-        self.session.set_compaction(state.clone());
+        // Emit a compaction event so the event log stays in sync with the
+        // compaction mutation, inside a balanced bracket (takeaway #5), consistent
+        // with the manager-driven path. `set_compaction_with_bracket` sets
+        // `self.compaction` as well, making the direct assignment above redundant
+        // but explicit.
+        self.session.set_compaction_with_bracket(crate::id::new_id("compact"), state.clone());
         let compaction = self.registry.compaction();
         if let Ok(mut manager) = compaction.try_write() {
             manager.set_budget(self.provider.context_window());
