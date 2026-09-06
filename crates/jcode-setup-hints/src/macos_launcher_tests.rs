@@ -288,3 +288,22 @@ fn desktop2_sibling_resolves_launcher_symlink_to_real_binary() {
         "launcher symlink must resolve to the real binary's sibling"
     );
 }
+
+// A stale launcher symlink pointing at a removed binary (canonicalize fails)
+// must not panic; the lookup falls back to the raw path and yields None.
+#[cfg(unix)]
+#[test]
+fn desktop2_sibling_handles_dangling_symlink_gracefully() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let missing = temp.path().join("versions/removed/jcode");
+    let launcher = temp.path().join("stale-jcode");
+    symlink(&missing, &launcher).expect("symlink to missing binary");
+
+    assert_eq!(
+        find_desktop2_sibling(&launcher),
+        None,
+        "a dangling launcher symlink must yield None, not panic"
+    );
+}
