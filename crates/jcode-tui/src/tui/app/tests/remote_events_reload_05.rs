@@ -1444,3 +1444,61 @@ fn confidence_fingerprint_is_agnostic_to_a_completed_todos_group() {
         "moving a completed todo between groups must not count as confidence-gate progress"
     );
 }
+
+#[test]
+fn ownership_fingerprint_ignores_non_first_goal_for_a_completed_group() {
+    // The gate uses `.find()` on per-group goals, so only the FIRST goal for a
+    // group is consulted. A second (duplicate-group) goal must not affect the
+    // fingerprint.
+    let todos = [crate::todo::TodoItem {
+        id: "a".to_string(),
+        content: "done".to_string(),
+        status: "completed".to_string(),
+        group: Some("g".to_string()),
+        ..Default::default()
+    }];
+    let goal = |trade_off: crate::todo::TradeOffState| crate::todo::TodoGoal {
+        group: Some("g".to_string()),
+        difficulty: Some(crate::todo::Difficulty::Involved),
+        delivery_state: Some(crate::todo::DeliveryState::WorkflowValidated),
+        autonomy: Some(crate::todo::Autonomy::NecessaryFollowthrough),
+        iteration_maturity: Some(crate::todo::IterationMaturity::OutcomeReached),
+        feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::AcceptanceAligned),
+        feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::EdgeAndIntegrationPaths),
+        feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
+        trade_off: Some(trade_off),
+        ..Default::default()
+    };
+
+    // First goal stuck (NoneConsidered), second goal different. The gate only
+    // reads the first (`find` on the completed group), so churning the SECOND
+    // must not reset the fingerprint.
+    let fp = <App>::ownership_gate_fingerprint(
+        &todos,
+        &[
+            goal(crate::todo::TradeOffState::NoneConsidered),
+            goal(crate::todo::TradeOffState::Diligent),
+        ],
+    );
+    let fp_churned_second = <App>::ownership_gate_fingerprint(
+        &todos,
+        &[
+            goal(crate::todo::TradeOffState::NoneConsidered),
+            goal(crate::todo::TradeOffState::Exhaustive),
+        ],
+    );
+    assert_eq!(
+        fp, fp_churned_second,
+        "churning a non-first duplicate group goal must not count as ownership-gate progress"
+    );
+
+    // Changing the FIRST goal (the one the gate reads) MUST change the fingerprint.
+    let fp_changed_first = <App>::ownership_gate_fingerprint(
+        &todos,
+        &[goal(crate::todo::TradeOffState::Diligent)],
+    );
+    assert_ne!(
+        fp, fp_changed_first,
+        "changing the first goal a completed group must count as ownership-gate progress"
+    );
+}

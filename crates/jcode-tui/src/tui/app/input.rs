@@ -1667,15 +1667,20 @@ impl App {
         goals: &[crate::todo::TodoGoal],
     ) -> String {
         // Same completed-group set the ownership gate evaluates, so the two stay
-        // in lock step (`completed_group_keys` drives both).
+        // in lock step (`completed_group_keys` drives both). Iterate the
+        // completed groups and pick the FIRST goal per group, exactly as
+        // `completed_groups_have_sufficient_delivery` does via `.find()`. A
+        // non-first duplicate goal for the same group is never consulted by the
+        // gate, so its churn must not be treated as progress either.
         let completed_groups = crate::todo::completed_group_keys(todos);
         let mut entries: Vec<(String, String)> = Vec::new();
-        for goal in goals {
-            let key = crate::todo::normalized_group(goal.group.as_deref());
-            if !completed_groups.contains(&key) {
-                // Not a completed group, not gated.
+        for key in completed_groups {
+            let Some(goal) = goals
+                .iter()
+                .find(|goal| crate::todo::normalized_group(goal.group.as_deref()) == key)
+            else {
                 continue;
-            }
+            };
             let group = key.unwrap_or_default();
             let pushes = [
                 ("delivery_state", goal.delivery_state.map(|s| s.as_str())),
