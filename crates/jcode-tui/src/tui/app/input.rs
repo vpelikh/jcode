@@ -1654,21 +1654,9 @@ impl App {
         let normalized = |group: Option<&str>| -> Option<String> {
             group.map(str::trim).filter(|g| !g.is_empty()).map(str::to_string)
         };
-        let mut group_todo_counts: Vec<(Option<String>, usize, bool)> = Vec::new();
-        for todo in todos {
-            let key = normalized(todo.group.as_deref());
-            if let Some(entry) = group_todo_counts.iter_mut().find(|(k, _, _)| *k == key) {
-                entry.1 += 1;
-                entry.2 = entry.2 && todo.status == "completed";
-            } else {
-                group_todo_counts.push((key, 1, todo.status == "completed"));
-            }
-        }
-        let completed_groups: Vec<Option<String>> = group_todo_counts
-            .into_iter()
-            .filter(|(_, count, all_completed)| *count > 0 && *all_completed)
-            .map(|(key, _, _)| key)
-            .collect();
+        // Same completed-group set the ownership gate evaluates, so the two stay
+        // in lock step (`completed_group_keys` drives both).
+        let completed_groups = crate::todo::completed_group_keys(todos);
 
         let mut entries: Vec<(String, String)> = Vec::new();
         for goal in goals {

@@ -628,6 +628,34 @@ fn group_is_complete(todos: &[TodoItem], group: &Option<String>) -> bool {
     matching.peek().is_some() && matching.all(|todo| todo.status == "completed")
 }
 
+/// The distinct group keys present across `todos`, in first-seen order.
+///
+/// This is the canonical way to enumerate the groups a todo list references (a
+/// `None` key is the ungrouped list). The ownership-completion gate and the TUI
+/// gate-progress fingerprint both build on it, so group enumeration stays a
+/// single source of truth.
+pub fn todo_group_keys(todos: &[TodoItem]) -> Vec<Option<String>> {
+    let mut groups: Vec<Option<String>> = Vec::new();
+    for todo in todos {
+        let group = normalized_group(todo.group.as_deref());
+        if !groups.contains(&group) {
+            groups.push(group);
+        }
+    }
+    groups
+}
+
+/// Group keys whose todos are ALL completed (each group has at least one todo
+/// and every todo in it reports `"completed"`). A `None` entry is the ungrouped
+/// list. This is the exact set the ownership-completion gate evaluates; the TUI
+/// gate-progress fingerprint consumes the same set so the two cannot drift.
+pub fn completed_group_keys(todos: &[TodoItem]) -> Vec<Option<String>> {
+    todo_group_keys(todos)
+        .into_iter()
+        .filter(|group| group_is_complete(todos, group))
+        .collect()
+}
+
 /// Whether every group newly closed by this update has a sufficient recorded
 /// delivery state for its difficulty. Groups completed before this check was
 /// introduced are intentionally grandfathered so existing sessions stay writable.
@@ -636,15 +664,7 @@ pub fn newly_completed_groups_have_sufficient_delivery(
     incoming: &[TodoItem],
     goals: &[TodoGoal],
 ) -> bool {
-    let mut groups: Vec<Option<String>> = Vec::new();
-    for todo in incoming {
-        let group = normalized_group(todo.group.as_deref());
-        if !groups.contains(&group) {
-            groups.push(group);
-        }
-    }
-
-    groups.into_iter().all(|group| {
+    todo_group_keys(incoming).into_iter().all(|group| {
         if !group_is_complete(incoming, &group) || group_is_complete(previous, &group) {
             return true;
         }
@@ -660,23 +680,14 @@ pub fn newly_completed_groups_have_sufficient_delivery(
 /// already been persisted, so a weak assessment can block completion without
 /// discarding the model's state transition.
 pub fn completed_groups_have_sufficient_delivery(todos: &[TodoItem], goals: &[TodoGoal]) -> bool {
-    let mut groups: Vec<Option<String>> = Vec::new();
-    for todo in todos {
-        let group = normalized_group(todo.group.as_deref());
-        if !groups.contains(&group) {
-            groups.push(group);
-        }
-    }
-
-    groups.into_iter().all(|group| {
-        if !group_is_complete(todos, &group) {
-            return true;
-        }
-        goals
-            .iter()
-            .find(|goal| normalized_group(goal.group.as_deref()) == group)
-            .is_some_and(delivery_state_passes)
-    })
+    completed_group_keys(todos)
+        .into_iter()
+        .all(|group| {
+            goals
+                .iter()
+                .find(|goal| normalized_group(goal.group.as_deref()) == group)
+                .is_some_and(delivery_state_passes)
+        })
 }
 
 /// Groups that this update closes: complete in `incoming`, not complete before.
@@ -2279,6 +2290,49 @@ mod tests {
                 Some(DeliveryState::WorkflowValidated)
             )],
         ));
+    }
+
+    #[test]
+    fn todo_and_completed_group_keys_enumerate_groups() {
+        let todos = vec![
+            todo("a", "completed", Some("ship")),
+            todo("b", "completed", Some("ship")),
+            todo("c", "cancelled", Some("wip")),
+            todo("d", "completed", None),
+        ];
+        // Enumeration is first-seen, includes cancelled/partial groups and the
+        // ungrouped None key.
+        assert_eq!(
+            todo_group_keys(&todos),
+            vec![
+                Some("ship".to_string()),
+                Some("wip".to_string()),
+                None,
+            ]
+        );
+        // Only groups whose todos are ALL completed are "completed": "wip" has a
+        // cancelled todo so it is excluded; "ship" and the ungrouped list pass.
+        assert_eq!(
+            completed_group_keys(&todos),
+            vec![Some("ship".to_string()), None]
+        );
+    }
+
+    #[test]
+    fn completed_group_keys_require_all_todos_completed() {
+        // An in-progress todo keeps its group out of the completed set.
+        let mixed = vec![
+            todo("a", "completed", Some("g")),
+            todo("b", "in_progress", Some("g")),
+        ];
+        assert_eq!(completed_group_keys(&mixed), Vec::<Option<String>>::new());
+
+        // All completed -> the group is present.
+        let done = vec![
+            todo("a", "completed", Some("g")),
+            todo("b", "completed", Some("g")),
+        ];
+        assert_eq!(completed_group_keys(&done), vec![Some("g".to_string())]);
     }
 
     #[test]
