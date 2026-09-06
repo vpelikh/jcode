@@ -327,6 +327,11 @@ mod tests {
             working_dir: Some("/tmp".into()),
             ..Model::default()
         };
+        // The icon is checked against a luminance floor, so the palette must
+        // be deterministic: `Model::default()` reads the developer's saved
+        // theme, which would make this GPU test fail on a dark-theme machine.
+        source.theme = crate::theme::Theme::print_light();
+        source.theme_preference = crate::theme::ThemeMode::Light;
         source.file_tree.sync_root(Some("/tmp"));
         source.session_id = Some("live".into());
         source.strips = strip::Strips::build(
