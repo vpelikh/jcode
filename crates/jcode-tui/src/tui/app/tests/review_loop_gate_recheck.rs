@@ -1878,3 +1878,78 @@ fn headless_dispatch_queues_from_name_resolvable_lens() {
         }
     });
 }
+
+// Regression: a headless lens that FAILS server-side (kind="failed", e.g. the
+// server could not set up the reviewer session or the provider was transiently
+// unavailable) is retried a bounded number of times — mirroring the
+// session-polling path that retries a lost reviewer — instead of finalizing the
+// whole loop on the first transient failure. Once the retry budget is
+// exhausted, the loop finalizes with a terminal digest.
+#[test]
+fn headless_failed_lens_retries_before_finalizing() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        app.is_remote = true;
+
+        // Seed a loop awaiting a headless verdict.
+        let mut state = jcode_session_types::ReviewLoopState::new();
+        super::review_loop::enter_review_loop(&mut state);
+        state.awaiting_headless = true;
+        app.session.review_loop = Some(state);
+
+        // First failure: retried, not finalized.
+        app.active_headless_request_id = Some(7);
+        super::commands::apply_headless_review_result(
+            &mut app,
+            7,
+            "failed",
+            Vec::new(),
+            "provider momentarily unavailable".to_string(),
+        );
+        let after_first = app.session.review_loop.as_ref().unwrap();
+        assert_eq!(
+            after_first.reviewer_respawn_count, 1,
+            "first server-side failure must retry (respawn 1), not finalize"
+        );
+        assert!(!after_first.finished, "loop must stay live after a retry");
+        assert!(after_first.awaiting_headless, "retry must re-await a verdict");
+        assert!(
+            app.pending_headless_review.is_some(),
+            "retry must queue a fresh dispatch"
+        );
+
+        // Second failure: still within budget -> retry #2.
+        app.active_headless_request_id = Some(8);
+        super::commands::apply_headless_review_result(
+            &mut app,
+            8,
+            "failed",
+            Vec::new(),
+            "still failing".to_string(),
+        );
+        let after_second = app.session.review_loop.as_ref().unwrap();
+        assert_eq!(after_second.reviewer_respawn_count, 2);
+        assert!(!after_second.finished);
+
+        // Third failure: budget exhausted (MAX_REVIEWER_RESPAWNS = 2) -> finalize.
+        app.active_headless_request_id = Some(9);
+        super::commands::apply_headless_review_result(
+            &mut app,
+            9,
+            "failed",
+            Vec::new(),
+            "still failing".to_string(),
+        );
+        let finalized = app.session.review_loop.as_ref().unwrap();
+        assert!(finalized.finished, "budget exhaustion must finalize");
+        assert_eq!(
+            finalized.finish_reason.as_deref(),
+            Some("review_server_failed"),
+            "finalize reason must name the server-failure outcome"
+        );
+        assert!(
+            app.pending_headless_review.is_none(),
+            "after finalize no further dispatch is queued"
+        );
+    });
+}

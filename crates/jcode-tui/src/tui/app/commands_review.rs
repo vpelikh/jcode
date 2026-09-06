@@ -1377,8 +1377,8 @@ pub(super) fn maybe_poll_review_loop_from_idle(app: &mut App) -> bool {
 pub(super) fn maybe_enter_review_loop(app: &mut App) {
     // The review loop auto-seeds for the normal TUI (server-client with
     // `is_remote`), matching the manual `/review-loop` command, which already
-    // works there using the same local clone/spawn mechanism. Replay sessions
-    // are excluded (deterministic playback, never reviews live work).
+    // works there via the same per-lens headless server dispatch. Replay
+    // sessions are excluded (deterministic playback, never reviews live work).
     if app.is_replay || !app.autoreview_enabled {
         return;
     }
@@ -1862,14 +1862,16 @@ fn apply_review_report(
 /// path (`apply_review_report`). `findings` entries are `sev|path|text` strings
 /// serialized by the server. `message` is the server's human-readable detail
 /// for non-verdict results (errors / no-verdict reason), surfaced in the
-/// finalized digest. Returns `()`.
+/// finalized digest. Returns `true` when the loop scheduled further work (a
+/// fix turn, a bounded retry, or the next lens), `false` when quiescent,
+/// finished, or the result was dropped as stale.
 pub(super) fn apply_headless_review_result(
     app: &mut App,
     id: u64,
     kind: &str,
     findings: Vec<String>,
     message: String,
-) {
+) -> bool {
     // Drop a stale/late result whose request id does not match the in-flight
     // headless review (guards against a result from a previous lens or loop
     // being mis-applied). We must NOT take/clear the id on a mismatch, or a
@@ -1879,7 +1881,7 @@ pub(super) fn apply_headless_review_result(
         crate::logging::warn(&format!(
             "Ignoring HeadlessReviewResult id={id} (expected {expected:?}) with no matching in-flight request"
         ));
-        return;
+        return false;
     }
 
     // The loop can only accept a verdict if it is currently awaiting a headless
@@ -1894,7 +1896,7 @@ pub(super) fn apply_headless_review_result(
         crate::logging::warn(&format!(
             "Ignoring HeadlessReviewResult (kind={kind}) with no loop awaiting it"
         ));
-        return;
+        return false;
     }
     // The id matched and we're applying: take it so a duplicate result is
     // dropped.
@@ -1930,18 +1932,48 @@ pub(super) fn apply_headless_review_result(
     let mut state = match app.session.review_loop.take() {
         Some(s) if !s.finished => s,
         _ => {
-            return;
+            return false;
         }
     };
     let max_stalled = crate::config::config().autoreview.max_stalled_turns;
-    let result = match report {
+    match report {
         Some(report) => apply_review_report(app, &mut state, &report, max_stalled),
         None => {
-            // A failed / no-verdict lens. Finalize the loop with a clear digest
-            // instead of parking it — parking re-dispatches the same lens on the
-            // next idle poll, which loops forever on a consistently failing lens.
+            // A failed / no-verdict lens. Mirror the session-polling path: a
+            // *transient failure* (kind="failed", e.g. the server could not set
+            // up the reviewer session or the provider was momentarily
+            // unavailable) is retried a bounded number of times before
+            // finalizing, so one flaky failure does not abort the other five
+            // lenses. A *no-verdict* (the model ran a turn but did not emit the
+            // report contract) is treated as terminal: re-running the identical
+            // prompt would just fail again, so finalize with a clear digest
+            // rather than spin on a lens that cannot make progress.
+            if kind == "failed"
+                && state.reviewer_respawn_count < REVIEW_LOOP_MAX_REVIEWER_RESPAWNS
+            {
+                state.reviewer_respawn_count += 1;
+                let lens = state
+                    .current_lens
+                    .unwrap_or(jcode_session_types::ReviewLens::Correctness);
+                app.push_display_message(DisplayMessage::system(format!(
+                    "↻ Review loop: the '{}' reviewer failed server-side; retrying (attempt {} of {}).",
+                    lens.label(),
+                    state.reviewer_respawn_count,
+                    REVIEW_LOOP_MAX_REVIEWER_RESPAWNS,
+                )));
+                let respawned = spawn_review_loop_reviewer(app, &mut state, lens);
+                if respawned {
+                    app.set_status_notice("Review loop: retrying failed reviewer");
+                }
+                return respawned;
+            }
+
             state.finished = true;
-            state.finish_reason = Some("review_no_verdict".to_string());
+            state.finish_reason = Some(if kind == "failed" {
+                "review_server_failed".to_string()
+            } else {
+                "review_no_verdict".to_string()
+            });
             let record = state
                 .record
                 .get_or_insert_with(jcode_session_types::ReviewRecord::default);
@@ -1950,20 +1982,28 @@ pub(super) fn apply_headless_review_result(
             } else {
                 format!("\n\nSERVER: {}", message.trim())
             };
+            let lens_desc = state.current_lens.map(|l| l.label()).unwrap_or("?");
+            let outcome_desc = if kind == "failed" {
+                "failed server-side"
+            } else {
+                "did not produce a usable verdict"
+            };
             record.digest = Some(format!(
-                "## Review stopped\n\nThe reviewer for the '{}' lens did not produce a usable verdict ({kind}).{}",
-                state.current_lens.map(|l| l.label()).unwrap_or("?"),
-                detail
+                "## Review stopped\n\nThe reviewer for the '{}' lens {outcome_desc} ({kind}).{}",
+                lens_desc, detail
             ));
             app.session.review_loop = Some(state);
             app.push_display_message(DisplayMessage::system(format!(
-                "Review loop stopped: the reviewer produced no usable verdict ({kind})."
+                "Review loop stopped: the reviewer {outcome_desc} ({kind})."
             )));
-            app.set_status_notice("Review loop: no verdict");
+            app.set_status_notice("Review loop: stopped");
+            // The loop is finished; drop any queued headless dispatch left over
+            // from a prior retry so a later drain cannot dispatch a lens against
+            // a stopped loop.
+            app.pending_headless_review = None;
             false
         }
-    };
-    let _ = result;
+    }
 }
 
 /// Spawn the per-lens reviewer for the current lens and persist the resulting
