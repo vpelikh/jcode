@@ -1745,17 +1745,6 @@ impl App {
         serde_json::to_string(&entries).unwrap_or_default()
     }
 
-    /// Record that a completion-gate nudge was dispatched against a gated-state
-    /// fingerprint, so the recent-states window knows it is not "new progress"
-    /// to be rewarded with a further budget reset. The window is bounded by
-    /// `GATE_PROGRESS_WINDOW` to keep memory constant.
-    fn record_gate_state(&mut self, fingerprint: String) {
-        self.todo_completion_gate_recent_states.push_back(fingerprint);
-        if self.todo_completion_gate_recent_states.len() > Self::GATE_PROGRESS_WINDOW {
-            self.todo_completion_gate_recent_states.pop_front();
-        }
-    }
-
     pub(super) fn schedule_auto_poke_followup_if_needed(&mut self) -> bool {
         if !self.auto_poke_incomplete_todos
             || self.pending_queued_dispatch
@@ -1823,15 +1812,10 @@ impl App {
             // disarmed (the warning text promises we only stop when validation
             // "isn't holding up" - i.e. the state is NOT moving).
             let gate_fingerprint = Self::gated_state_fingerprint(&todos, &goals);
-            // Progress = the gated state has NOT already been nudged about
-            // within the recent-steps window. This resets the budget on genuine
-            // multi-step convergence (all distinct states) but refuses to reset
-            // when a model merely oscillates one gated assessment back to a
-            // state it already tried (A -> B -> A -> ...), which keeps the
-            // circuit breaker able to trip on that adversarial pattern too.
             let state_progressed = !self
-                .todo_completion_gate_recent_states
-                .contains(&gate_fingerprint);
+                .todo_completion_gate_fingerprint
+                .as_deref()
+                .is_some_and(|prev| prev == gate_fingerprint);
             if state_progressed {
                 self.todo_completion_gate_attempts = 0;
             }
@@ -1840,7 +1824,7 @@ impl App {
             if ownership_needs_followup && gate_budget_left {
                 self.todo_completion_gate_attempts =
                     self.todo_completion_gate_attempts.saturating_add(1);
-                self.record_gate_state(gate_fingerprint.clone());
+                self.todo_completion_gate_fingerprint = Some(gate_fingerprint.clone());
                 crate::telemetry::record_todo_gate(crate::telemetry::TodoGateKind::Ownership);
                 self.push_display_message(DisplayMessage::system(
                     "🔍 Checking end-to-end ownership before finishing...",
@@ -1862,7 +1846,7 @@ impl App {
             {
                 self.todo_completion_gate_attempts =
                     self.todo_completion_gate_attempts.saturating_add(1);
-                self.record_gate_state(gate_fingerprint.clone());
+                self.todo_completion_gate_fingerprint = Some(gate_fingerprint.clone());
                 let notice = if confidence_summary.completion_confidence_needs_validation {
                     crate::telemetry::record_todo_gate(crate::telemetry::TodoGateKind::Completion);
                     "🔍 Double-checking confidence for you..."
@@ -1901,7 +1885,7 @@ impl App {
                 self.auto_poke_incomplete_todos = false;
                 self.todo_confidence_spike_challenged = false;
                 self.todo_completion_gate_attempts = 0;
-                self.todo_completion_gate_recent_states.clear();
+                self.todo_completion_gate_fingerprint = None;
                 self.todo_gate_digest_delivered = false;
                 self.pending_queued_dispatch = false;
                 return false;
@@ -1914,7 +1898,7 @@ impl App {
             // without this a session could only ever deliver one digest.
             self.todo_gate_digest_delivered = false;
             self.todo_completion_gate_attempts = 0;
-            self.todo_completion_gate_recent_states.clear();
+            self.todo_completion_gate_fingerprint = None;
             if !self.todo_final_response_requested {
                 self.todo_final_response_requested = true;
                 self.push_display_message(DisplayMessage::system(format!(
@@ -1965,7 +1949,7 @@ impl App {
         // Open todos mean the model is still iterating; completion-gate
         // exhaustion should only trip when the gate itself stops moving.
         self.todo_completion_gate_attempts = 0;
-        self.todo_completion_gate_recent_states.clear();
+        self.todo_completion_gate_fingerprint = None;
         self.last_auto_poke_fingerprint = Some(fingerprint);
         self.queued_messages.push(poke_message);
         self.pending_queued_dispatch = true;
