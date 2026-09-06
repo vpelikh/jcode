@@ -55,9 +55,9 @@ pub struct Theme {
     pub selection_on_wash: Color,
     /// Ink for an added line of a diff, and for a removed one. A diff is read
     /// by scanning for which side a line is on, and `+`/`-` alone makes that
-    /// a character-by-character job, so it is the one *scanning* hue ([`Self::accent`]
-    /// is the one *state* hue). Kept desaturated so a card full of them still
-    /// reads as a document rather than as a terminal.
+    /// a character-by-character job, so added/removed are the *scanning* hue
+    /// pair ([`Self::accent`] is the one *state* hue). Kept desaturated so a
+    /// card full of them still reads as a document rather than as a terminal.
     pub added: Color,
     pub removed: Color,
     /// Fill behind a whole added line of a diff, and behind a removed one.
