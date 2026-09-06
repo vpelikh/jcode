@@ -75,6 +75,13 @@ pub struct SetupHintsState {
     pub alacritty_dismissed: bool,
     #[serde(default)]
     pub desktop_shortcut_created: bool,
+    /// Whether the native macOS desktop app bundle (`Jcode Desktop.app`,
+    /// launched by `setup-launcher --desktop`) has been installed. Kept
+    /// separate from [`desktop_shortcut_created`]: installing the desktop app
+    /// must not suppress auto-creation or refresh of the terminal `Jcode.app`
+    /// launcher.
+    #[serde(default)]
+    pub desktop_app_created: bool,
     #[serde(default = "default_true")]
     pub startup_spawn_hint_dismissed: bool,
     pub mac_ghostty_guided: bool,
@@ -138,6 +145,7 @@ impl Default for SetupHintsState {
             alacritty_configured: false,
             alacritty_dismissed: false,
             desktop_shortcut_created: false,
+            desktop_app_created: false,
             // Dismissed by default: the system-wide launch-hotkey spawn notice is
             // opt-in noise, so new state starts with it suppressed.
             startup_spawn_hint_dismissed: true,
@@ -2518,7 +2526,7 @@ pub fn run_setup_desktop_launcher() -> Result<()> {
         eprintln!();
         match install_macos_desktop_app_launcher() {
             Ok(app_dir) => {
-                state.desktop_shortcut_created = true;
+                state.desktop_app_created = true;
                 let _ = state.save();
                 eprintln!(
                     "  \x1b[32m✓\x1b[0m Installed Jcode Desktop app: {}",
