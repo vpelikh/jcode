@@ -45,6 +45,17 @@ pub const ROW_LABEL_BAND: f64 = 20.0;
 /// same reason [`crate::layout::Frame`] is: if the two ever disagreed, clicks
 /// would land on a different card than the one under the cursor.
 pub fn area(frame: &crate::layout::Frame) -> (f64, f64, f64, f64) {
+    // Centre the picker on the page column's measure rather than the raw
+    // window. When a left sidebar (the project explorer) owns the leading edge,
+    // the conversation and its chrome start at `frame.left`, so centring on
+    // `frame.width` would float the field to the right of the content it
+    // overlays and read as a lopsided gap on the left. Centring the field by
+    // its *midpoint* against the column's midpoint keeps it optically lined up
+    // with the page the user is comparing it against, while the field still
+    // sizes itself from the full window so a large monitor keeps the generous
+    // panel. Without a sidebar the column is already centred on the window, so
+    // the two definitions coincide.
+    //
     // Deliberately leave a substantial ring of the current page visible. The
     // session picker is a temporary object over the conversation, not a route
     // away from it. Caps keep the panel readable on a large monitor, while the
@@ -52,7 +63,8 @@ pub fn area(frame: &crate::layout::Frame) -> (f64, f64, f64, f64) {
     // edges.
     let width = (frame.width * 0.84).min(960.0).max(1.0);
     let height = (frame.height * 0.68).min(620.0).max(1.0);
-    let left = (frame.width - width) / 2.0;
+    let column_mid = (frame.left + frame.right) / 2.0;
+    let left = column_mid - width / 2.0;
     let top = (frame.height - height) / 2.0;
     (left, top, left + width, top + height)
 }
@@ -921,6 +933,38 @@ mod tests {
         overview.advance(0.02);
         overview.open(Some("a1"));
         assert_eq!(overview.focus(), Some("a3"));
+    }
+
+    /// The picker centres itself on the page column, not the raw window. When
+    /// the left sidebar (project explorer) pushes the page right, centring on
+    /// `frame.width` would float the field off to the right of the content it
+    /// overlays and read as a lopsided gap on the left.
+    #[test]
+    fn the_field_centres_on_the_page_column_not_the_window() {
+        const SIDEBAR: f64 = 252.0;
+        for (width, scale) in [(1100usize, 1.0), (1920, 1.0), (1400, 1.75)] {
+            let frame = crate::layout::Frame::with_content_sidebar(
+                (width as u32, 720),
+                scale,
+                1,
+                false,
+                0.0,
+                SIDEBAR,
+            );
+            let (left, _, right, _) = area(&frame);
+            let field_mid = (left + right) / 2.0;
+            let column_mid = (frame.left + frame.right) / 2.0;
+            assert!(
+                (field_mid - column_mid).abs() < 1.0,
+                "at ({width},{scale}) the field mid {field_mid:.1} strayed from the column mid {column_mid:.1}"
+            );
+        }
+        // Without a sidebar the column is the window, so the field must land on
+        // the window centre exactly as the old code did.
+        let frame = crate::layout::Frame::new((1920, 720), 1.0);
+        let (left, _, right, _) = area(&frame);
+        let field_mid = (left + right) / 2.0;
+        assert!((field_mid - frame.width / 2.0).abs() < 1.0);
     }
 
     #[test]
