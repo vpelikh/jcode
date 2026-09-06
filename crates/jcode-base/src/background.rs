@@ -45,6 +45,20 @@ pub struct BackgroundTaskManager {
     output_dir: PathBuf,
 }
 
+/// Aborts a task handle when dropped. Used to propagate cancellation from a
+/// tracking wrapper task into the inner adopted task it awaits, so that
+/// aborting the wrapper (cancel/reload) also stops the inner task and any
+/// child processes it owns.
+struct AbortOnDrop {
+    handle: tokio::task::AbortHandle,
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 impl BackgroundTaskManager {
     /// Create a manager rooted at a specific output directory.
     ///
@@ -696,7 +710,23 @@ impl BackgroundTaskManager {
         let (registered_tx, registered_rx) = tokio::sync::oneshot::channel::<()>();
 
         let wrapper_handle = tokio::spawn(async move {
+            // The promoted task returned from the tool (e.g. a foreground bash
+            // command that exceeded its timeout) is already running in its OWN
+            // spawned future (`handle`). `RunningTask.handle` tracks THIS wrapper.
+            //
+            // Cancelling / reloading aborts `wrapper_handle`. On its own, aborting
+            // the wrapper only drops the `await` on `handle`; it
+            // does NOT stop the inner task, so any child the inner task owns (e.g.
+            // a `kill_on_drop` cargo build or a process-group kill guard) would
+            // keep running orphaned, accumulating stale processes. Holding an
+            // [`AbortOnDrop`] guard lets the wrapper propagate cancellation into
+            // the inner task: when the wrapper is aborted, the guard is dropped and
+            // aborts `handle`, which drops the inner future (and its children).
+            let inner_abort_guard = AbortOnDrop {
+                handle: handle.abort_handle(),
+            };
             let tool_result = handle.await;
+            drop(inner_abort_guard);
             let duration_secs = started_at.elapsed().as_secs_f64();
 
             let (status, exit_code, error, output_text) = match tool_result {
