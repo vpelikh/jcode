@@ -181,6 +181,51 @@ pub trait Tool: Send + Sync {
             input_schema: ensure_intent_in_schema(self.parameters_schema()),
         }
     }
+
+    /// Optional per-call execution timeout (deepseek-harness takeaway #7).
+    ///
+    /// A tool that can legitimately hang (e.g. a long-running subprocess) may
+    /// declare a timeout here. The registry wraps execution so that a call
+    /// exceeding this bound returns a clear, model-visible timeout error
+    /// instead of stalling the whole session indefinitely.
+    ///
+    /// The default is `None` (no timeout): most tools run quickly and are not
+    /// candidates for wrapping. Only override it for tools whose execution is
+    /// both externally cancellable and allowed to be interrupted.
+    fn execution_timeout(&self) -> Option<std::time::Duration> {
+        None
+    }
+}
+
+/// Execute `tool` with its declared per-call timeout, if any (takeaway #7).
+///
+/// When `tool.execution_timeout()` returns `Some(bound)`, the call is run under
+/// `tokio::time::timeout`; a call exceeding the bound is cancelled and mapped to
+/// a clear, model-visible timeout error. When the tool declares no timeout, it
+/// runs uncapped exactly as before.
+///
+/// Cancellation semantics: `timeout` drops the inner future, so the tool's
+/// `execute` must be externally cancellable (e.g. it spawns a child process with
+/// `kill_on_drop`, or yields on cancellable I/O). Tools that would leave work
+/// running in the background should declare no timeout.
+pub async fn execute_with_deadline<F, T>(
+    deadline: Option<std::time::Duration>,
+    tool_name: &str,
+    fut: F,
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    let Some(deadline) = deadline else {
+        return fut.await;
+    };
+    match tokio::time::timeout(deadline, fut).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "Tool '{tool_name}' timed out after {}s",
+            deadline.as_secs()
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -211,6 +256,14 @@ mod tests {
         // not override the marker must run sequentially, or it could race the
         // shared session state other in-flight calls observe.
         assert!(!MarkerTool.concurrency_safe_marker());
+    }
+
+    #[test]
+    fn execution_timeout_defaults_to_none() {
+        // The per-call timeout is opt-in (takeaway #7). A tool that does not
+        // override `execution_timeout` must run uncapped, so we never wrap
+        // arbitrary tools in an implicit deadline they did not declare.
+        assert!(MarkerTool.execution_timeout().is_none());
     }
 
     #[test]
@@ -326,5 +379,38 @@ mod escape_hatch_tests {
         // ever diverge, the flag would be advertised but never honored, which is
         // worse than not offering it at all.
         assert_eq!(ACCEPT_LARGE_OUTPUT_KEY, "accept_large_output");
+    }
+
+    #[tokio::test]
+    async fn deadline_passthrough_when_none() {
+        let result = execute_with_deadline(None, "read", async { Ok(42) }).await;
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn deadline_completes_under_budget() {
+        let result = execute_with_deadline(Some(std::time::Duration::from_secs(5)), "read", async {
+            Ok(7u64)
+        })
+        .await;
+        assert_eq!(result.unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn deadline_returns_model_visible_timeout_error() {
+        let result = execute_with_deadline(
+            Some(std::time::Duration::from_millis(20)),
+            "bash",
+            async {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                Ok(())
+            },
+        )
+        .await;
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("timed out after"),
+            "unexpected error: {err:#}"
+        );
     }
 }
