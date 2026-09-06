@@ -103,10 +103,13 @@ impl Agent {
             || (lower.contains("exceeded") && lower.contains("tokens"))
     }
 
-    /// Best-effort emergency recovery after a context-limit error.
+    /// Best-effort emergency recovery after a context-limit or provider
+    /// request-too-large (HTTP 413) error.
     ///
-    /// Performs a synchronous hard compaction and resets provider session state,
-    /// allowing the caller to retry the same turn immediately.
+    /// Attempts (in order): OpenAI-encrypted-content recovery, stripping oversized
+    /// inline images / truncating oversized tool results (413), then a synchronous
+    /// hard compaction. On success it resets provider session state so the caller
+    /// can retry the same turn immediately.
     pub(super) fn try_auto_compact_after_context_limit(&mut self, error: &str) -> bool {
         if crate::provider::openai_request::is_openai_encrypted_content_too_large_error(error)
             && self.try_recover_oversized_openai_native_compaction()
