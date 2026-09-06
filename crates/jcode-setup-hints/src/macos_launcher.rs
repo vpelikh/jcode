@@ -191,12 +191,26 @@ fn desktop2_sibling_binary() -> Result<PathBuf> {
         return Ok(candidate);
     }
     // Fall back to the repo's selfdev build for developer machines that run
-    // `jcode` from a cargo build rather than an installed payload.
-    let selfdev = std::env::current_dir()
-        .ok()
-        .map(|dir| dir.join("target/selfdev").join(MACOS_DESKTOP_APP_EXECUTABLE));
-    if let Some(path) = selfdev.filter(|p| p.is_file()) {
-        return Ok(path);
+    // `jcode` from a cargo build rather than an installed payload. Check both
+    // the current working directory (a jcode worktree) and, for a jcode binary
+    // sitting in target/{debug,selfdev,dev}, the sibling selfdev directory.
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("target/selfdev").join(MACOS_DESKTOP_APP_EXECUTABLE));
+    }
+    if parent.ends_with("target/debug") || parent.ends_with("target/dev") {
+        if let Some(target_root) = parent.parent() {
+            candidates.push(
+                target_root
+                    .join("selfdev")
+                    .join(MACOS_DESKTOP_APP_EXECUTABLE),
+            );
+        }
+    }
+    for path in candidates {
+        if path.is_file() {
+            return Ok(path);
+        }
     }
     anyhow::bail!(
         "jcode-desktop2 binary not found next to {} or in target/selfdev. Build it with `cargo build --profile selfdev -p jcode-desktop2` first.",
