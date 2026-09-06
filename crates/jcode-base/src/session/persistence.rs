@@ -478,7 +478,6 @@ impl Session {
         // Do not turn that implementation detail into a transcript on disk. Once
         // the user (or a programmatic caller) adds a real conversation message,
         // the normal first snapshot includes all of the accumulated context.
-        //
         // Persist even without a visible conversation message when the session
         // carries configured state that an explicit save() intends to preserve:
         // a caller-chosen `title` (explicit state just like `custom_title`,

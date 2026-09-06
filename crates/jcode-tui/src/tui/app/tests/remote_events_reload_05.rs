@@ -168,6 +168,10 @@ fn test_reload_preserves_completed_confidence_spike_challenge() {
         assert!(reloaded_app.schedule_auto_poke_followup_if_needed());
         assert!(!reloaded_app.auto_poke_incomplete_todos);
         assert!(reloaded_app.todo_confidence_spike_challenged);
+        assert_eq!(
+            reloaded_app.queued_messages,
+            vec![crate::todo::TODO_FINAL_RESPONSE_CONTINUATION_MESSAGE.to_string()]
+        );
         assert!(reloaded_app.hidden_queued_system_messages.is_empty());
     });
 }
@@ -194,6 +198,21 @@ fn test_completion_gate_nudges_stop_after_budget_exhausted() {
             }],
         )
         .expect("save low-confidence completed todo");
+        // Isolate the confidence retry budget from the ownership gate, which
+        // deliberately does not retry unchanged assessments.
+        crate::todo::save_goals(
+            &app.session.id,
+            &[crate::todo::TodoGoal {
+                delivery_state: Some(crate::todo::DeliveryState::WorkflowValidated),
+                autonomy: Some(crate::todo::Autonomy::NecessaryFollowthrough),
+                iteration_maturity: Some(crate::todo::IterationMaturity::OutcomeReached),
+                feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
+                feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::MainPaths),
+                feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
+                ..Default::default()
+            }],
+        )
+        .expect("save passing ownership assessment");
 
         // Each scheduled nudge consumes budget. Simulate the dispatch loop by
         // clearing the queued state between iterations (as if the turn ran and

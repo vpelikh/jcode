@@ -162,6 +162,14 @@ pub(crate) fn invalidate_ambient_info_cache() {
 pub(crate) fn open_path_or_url_detached(
     target: impl AsRef<std::ffi::OsStr>,
 ) -> std::io::Result<()> {
+    if crate::tui::is_ssh_remote() {
+        let target = target.as_ref().to_string_lossy();
+        if !target.starts_with("https://") && !target.starts_with("http://") {
+            return Err(std::io::Error::other(
+                "remote file opening is unavailable over SSH; open it on the remote host or ask the agent to read it",
+            ));
+        }
+    }
     if crate::auth::browser_suppressed(false) {
         return Err(std::io::Error::other(
             "opening files/URLs is suppressed (NO_BROWSER/JCODE_NO_BROWSER or test harness)",
@@ -1165,6 +1173,9 @@ fn spawn_git_refresh(key: String, work_dir: Option<&Path>) {
 pub(super) fn gather_todos_and_goals_for_session(
     session_id: Option<&str>,
 ) -> (Vec<TodoItem>, Vec<crate::todo::TodoGoal>) {
+    if crate::tui::is_ssh_remote() {
+        return (Vec::new(), Vec::new());
+    }
     use std::time::Instant;
 
     const TTL: Duration = Duration::from_secs(1);
@@ -1221,6 +1232,12 @@ pub(super) fn gather_todos_and_goals_for_session(
 }
 
 pub(super) fn gather_ambient_info(ambient_enabled: bool) -> Option<AmbientWidgetData> {
+    if crate::tui::is_ssh_remote() {
+        // The cache and queue are laptop-local. The native protocol does not
+        // currently carry remote scheduler state, so leave both widget/footer
+        // absent instead of displaying unrelated local tasks.
+        return None;
+    }
     use std::time::Instant;
     const TTL: Duration = Duration::from_secs(2);
 

@@ -1383,6 +1383,7 @@ async fn run_swarm_plan_loop(
                     spawn_if_needed
                 },
                 message: params.message.clone(),
+                model: params.model.clone(),
                 effort: params.effort.clone(),
             };
             match send_request(request).await {
@@ -1533,6 +1534,7 @@ async fn spawn_assignment_session(ctx: &ToolContext, params: &CommunicateInput) 
         initial_message: None,
         request_nonce: Some(fresh_spawn_request_nonce(ctx)),
         spawn_mode: params.spawn_mode.clone(),
+        model: params.model.clone(),
         effort: params.effort.clone(),
         label: None,
     };
@@ -1741,17 +1743,17 @@ fn format_swarm_model_list(
     ));
     match configured_swarm_model {
         Some(pin) if !pin.trim().is_empty() => {
-            out.push_str(&format!("Configured agents.swarm_model pin: {pin}\n"));
+            out.push_str(&format!("Configured agents.swarm_model default: {pin}\n"));
         }
         _ => out.push_str(
-            "No agents.swarm_model pin configured (workers inherit the coordinator's model).\n",
+            "No agents.swarm_model default configured (workers inherit the coordinator's model unless model is passed).\n",
         ),
     }
     if model_routes.is_empty() {
-        out.push_str("\nNo model routes reported. Configure agents.swarm_model or use inherit.");
+        out.push_str("\nNo model routes reported. Omit model to use the configured default, or pass inherit to use the coordinator.");
         return out;
     }
-    out.push_str("\nAvailable model routes (configure agents.swarm_model with a bare model or route-pinned value):\n");
+    out.push_str("\nAvailable model routes (pass model with a bare model or route-pinned value to override the configured default):\n");
     for route in model_routes {
         let availability = if route.available {
             ""
@@ -1888,6 +1890,10 @@ struct CommunicateInput {
     /// Reasoning effort for spawned agents (none|minimal|low|medium|high|xhigh|max).
     #[serde(default)]
     effort: Option<String>,
+    /// Per-worker model override for spawn and assignment-created workers.
+    /// Takes precedence over agents.swarm_model; see list_models for routes.
+    #[serde(default)]
+    model: Option<String>,
     /// Short human-readable label for a spawned agent shown in swarm UI.
     /// Required and nonblank for the explicit `spawn` action.
     #[serde(default)]
@@ -2051,6 +2057,10 @@ impl Tool for CommunicateTool {
                     "type": "string",
                     "enum": ["visible", "headless", "inline", "auto"],
                     "description": "Spawn UI mode: visible terminal, headless, inline gallery, or auto. Defaults to inline."
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Model for newly spawned workers (spawn, assign_task, assign_next, fill_slots, run_plan), e.g. 'gpt-6-astra' or 'openai-api:gpt-5.6-luna'. Overrides agents.swarm_model. Omit to use that default or inherit the coordinator if unset. Use 'inherit' to force the coordinator's model and route. Does not change reused workers. See list_models."
                 },
                 "effort": {
                     "type": "string",
@@ -2729,6 +2739,7 @@ impl Tool for CommunicateTool {
                     initial_message: params.spawn_initial_message(),
                     request_nonce: None,
                     spawn_mode: params.spawn_mode.clone(),
+                    model: params.model.clone(),
                     effort: params.effort.clone(),
                     label: Some(label),
                 };
@@ -3033,6 +3044,7 @@ impl Tool for CommunicateTool {
                     prefer_spawn: params.prefer_spawn,
                     spawn_if_needed: params.spawn_if_needed,
                     message: params.message.clone(),
+                    model: params.model.clone(),
                     effort: params.effort.clone(),
                 };
 
@@ -3084,6 +3096,7 @@ impl Tool for CommunicateTool {
                         prefer_spawn: params.prefer_spawn,
                         spawn_if_needed: params.spawn_if_needed,
                         message: params.message.clone(),
+                        model: params.model.clone(),
                         effort: params.effort.clone(),
                     };
 
