@@ -444,3 +444,161 @@ fn the_delivery_tone_ramps_with_the_acknowledgement() {
     assert_eq!(acked.tone(now + WIGGLE), 1.0);
     assert_eq!(acked.tone(now + WIGGLE * 3), 1.0);
 }
+
+/// The daemon does not replay a finished turn's events to a freshly
+/// re-attached connection: `attached`+`session_status` arrive with no
+/// `text_delta`, no `tool_*`, and crucially no `turn_done`. So a connection
+/// that drops mid-turn must retire the in-flight turn itself, or the message
+/// it was about to deliver would sit under an infinite "thinking" spinner with
+/// `busy` never cleared.
+#[test]
+fn a_connection_loss_retires_the_in_flight_turn() {
+    let mut app = app_with_session();
+    let (updates, update_rx) = std::sync::mpsc::channel();
+    let (commands, _command_rx) = std::sync::mpsc::channel();
+    app.harness = Some((update_rx, harness::CommandSender::for_test(commands)));
+
+    app.apply(Action::Insert, Some("hello"));
+    app.apply(Action::Submit, None);
+    assert!(app.model.busy, "the send started a turn");
+    assert_eq!(
+        app.model.transcript.messages().last().map(|m| m.source.as_str()),
+        Some("thinking"),
+        "the turn showed its provisional thinking row"
+    );
+
+    // The connection dies mid-turn and the worker re-attaches to the same
+    // (now idle) session. The daemon never re-emits the finished turn's end.
+    updates
+        .send(harness::HarnessUpdate::ConnectionLost("surprise".into()))
+        .expect("queue the disconnect");
+    updates
+        .send(harness::HarnessUpdate::Attached {
+            session_id: "session_test".into(),
+            working_dir: Some("/tmp".into()),
+            busy: false,
+        })
+        .expect("queue the re-attach");
+    app.drain_harness_updates();
+
+    assert!(
+        !app.model.busy,
+        "re-attaching to an idle session must not leave the turn running"
+    );
+    assert!(
+        app.model
+            .transcript
+            .messages()
+            .iter()
+            .all(|m| m.role != Role::Tool),
+        "a stranded thinking row survived the reconnect"
+    );
+    // The user's message was sent before the drop; it stays on the page, just
+    // no longer claiming a turn is in flight.
+    assert_eq!(deliveries(&app), vec![Some(Delivery::Sent)]);
+}
+
+/// A connection loss must retire the *in-flight* turn but must not flush queued
+/// messages: the messages waiting behind a busy turn expect a real turn
+/// boundary before being sent, and a dead connection is not one. Sending into
+/// it would lose them to the disconnect rather than deliver them after a
+/// reconnect. Queuing survives the drop and waits on the next honest boundary.
+#[test]
+fn a_connection_loss_does_not_flush_queued_messages() {
+    let mut app = app_with_session();
+    let (updates, update_rx) = std::sync::mpsc::channel();
+    let (commands, command_rx) = std::sync::mpsc::channel();
+    app.harness = Some((update_rx, harness::CommandSender::for_test(commands)));
+
+    // Start a turn, then queue a second message while it is busy.
+    app.apply(Action::Insert, Some("first"));
+    app.apply(Action::Submit, None);
+    let _ = command_rx.try_recv();
+    app.apply(Action::Insert, Some("second"));
+    app.apply(Action::Submit, None);
+    assert_eq!(
+        deliveries(&app),
+        vec![Some(Delivery::Sent), Some(Delivery::Queued)],
+        "prereq: second message queued behind the busy turn"
+    );
+
+    // The connection drops. Busy is left untouched (the re-attach reconciles it
+    // authoritatively), so a still-in-flight turn is not wrongly marked idle --
+    // and neither is the queue flushed into a dead connection.
+    updates
+        .send(harness::HarnessUpdate::ConnectionLost("surprise".into()))
+        .expect("queue the disconnect");
+    app.drain_harness_updates();
+
+    // The queued message must not be sent while disconnected.
+    assert!(
+        command_rx
+            .try_iter()
+            .all(|command| !matches!(command, harness::Command::Send { .. })),
+        "a queued message was flushed into a disconnected harness"
+    );
+    // The in-flight turn is only retired once the re-attach reports the daemon
+    // state. Until then it stays running so nothing is spuriously marked idle.
+    assert!(app.model.busy, "busy is not cleared by connection loss alone");
+    assert_eq!(
+        deliveries(&app),
+        vec![Some(Delivery::Sent), Some(Delivery::Queued)],
+        "a disconnected connection must not send the queued message"
+    );
+}
+
+/// Attach is authoritative for whether a turn is running: a session the daemon
+/// still reports as busy keeps the spinner, and one it reports idle ends the
+/// stranded "thinking" row. Without the busy field the app could neither tell
+/// them apart nor recover a finished turn.
+#[test]
+fn a_reconnect_reconciles_busy_from_the_daemon() {
+    let mut app = app_with_session();
+    let (updates, update_rx) = std::sync::mpsc::channel();
+    let (commands, _command_rx) = std::sync::mpsc::channel();
+    app.harness = Some((update_rx, harness::CommandSender::for_test(commands)));
+
+    app.apply(Action::Insert, Some("hello"));
+    app.apply(Action::Submit, None);
+    assert!(app.model.busy, "the send started a turn");
+
+    // Re-attach while the daemon still reports the session busy: the turn is
+    // genuinely in flight and must not be marked idle.
+    updates
+        .send(harness::HarnessUpdate::Attached {
+            session_id: "session_test".into(),
+            working_dir: Some("/tmp".into()),
+            busy: true,
+        })
+        .expect("queue the busy re-attach");
+    app.drain_harness_updates();
+    assert!(
+        app.model.busy,
+        "a daemon-reported-busy session must keep the turn running"
+    );
+
+    // The session finishes and re-attaches idle: the stranded turn is retired.
+    updates
+        .send(harness::HarnessUpdate::ConnectionLost("flap".into()))
+        .expect("queue the next disconnect");
+    updates
+        .send(harness::HarnessUpdate::Attached {
+            session_id: "session_test".into(),
+            working_dir: Some("/tmp".into()),
+            busy: false,
+        })
+        .expect("queue the idle re-attach");
+    app.drain_harness_updates();
+    assert!(
+        !app.model.busy,
+        "a daemon-reported-idle session must retire the turn"
+    );
+    assert!(
+        app.model
+            .transcript
+            .messages()
+            .iter()
+            .all(|m| m.role != Role::Tool),
+        "the stranded thinking row must not survive an idle re-attach"
+    );
+}

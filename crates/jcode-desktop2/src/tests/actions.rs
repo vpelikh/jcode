@@ -1688,6 +1688,7 @@ fn a_new_session_preserves_the_old_panel_until_the_new_one_attaches() {
         .send(crate::harness::HarnessUpdate::Attached {
             session_id: "new".into(),
             working_dir: Some("/work".into()),
+            busy: false,
         })
         .unwrap();
     app.drain_harness_updates();
@@ -1720,6 +1721,7 @@ fn a_fresh_window_requests_exactly_one_neighboring_panel() {
         .send(crate::harness::HarnessUpdate::Attached {
             session_id: "first".into(),
             working_dir: Some("/work".into()),
+            busy: false,
         })
         .unwrap();
     app.drain_harness_updates();

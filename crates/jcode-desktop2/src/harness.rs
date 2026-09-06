@@ -38,6 +38,18 @@ fn connection_phase_label(phase: String) -> String {
     }
 }
 
+/// Whether a daemon-reported session status means a turn is in flight.
+///
+/// The bridge derives the `status` string from the runtime's `is_processing`
+/// flag: an in-flight session is reported as `"processing"`, an idle one as
+/// `"idle"`. The protocol layer itself renders that same flag as `"busy"`
+/// (`comm_format`), so both strings mean in-flight and are accepted here.
+/// Treating only `"busy"` as busy would misread a genuinely running turn as
+/// idle on re-attach, since the bridge emits `"processing"`.
+fn session_is_busy(status: &str) -> bool {
+    matches!(status, "busy" | "processing")
+}
+
 /// UI-facing updates produced by the connection worker.
 #[derive(Debug)]
 pub enum HarnessUpdate {
@@ -46,6 +58,10 @@ pub enum HarnessUpdate {
         session_id: String,
         /// The session's working directory, as the daemon reports it.
         working_dir: Option<String>,
+        /// Whether the daemon reports the session as busy right now. Reconciles
+        /// the desktop's `busy` after a reconnect: a session the daemon is
+        /// still serving must keep its spinner, while a finished one must not.
+        busy: bool,
     },
     /// The provider and model serving the session.
     Model {
@@ -370,6 +386,7 @@ fn run(
     ui.send(HarnessUpdate::Attached {
         session_id: attached.session_id,
         working_dir: attached.working_dir,
+        busy: session_is_busy(&attached.status),
     });
 
     // Command thread: forwards user messages immediately even while the event
@@ -419,6 +436,7 @@ fn run(
                             ui.send(HarnessUpdate::Attached {
                                 session_id: session.session_id,
                                 working_dir: session.working_dir,
+                                busy: session_is_busy(&session.status),
                             })
                         })
                     }
@@ -747,6 +765,16 @@ mod command_sender_tests {
             "New must not wait in the FIFO queue"
         );
     }
+
+    /// The bridge reports an in-flight session as `"processing"`, so that
+    /// string must count as busy alongside the desktop's own `"busy"`.
+    #[test]
+    fn processing_status_counts_as_busy() {
+        assert!(session_is_busy("busy"));
+        assert!(session_is_busy("processing"));
+        assert!(!session_is_busy("idle"));
+        assert!(!session_is_busy("attached"));
+    }
 }
 
 /// A session-list entry, sized for the overview.
@@ -755,7 +783,7 @@ fn to_entry(session: jcode_sdk::SessionInfo) -> crate::strip::Panel {
         session_id: session.session_id,
         title: session.title,
         working_dir: session.working_dir,
-        busy: session.status == "busy",
+        busy: session_is_busy(&session.status),
         // The overview sizes a blob by how much conversation the session
         // holds; a session the server could not measure is drawn at the floor
         // rather than dropped.

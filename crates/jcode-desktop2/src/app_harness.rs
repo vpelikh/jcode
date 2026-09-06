@@ -23,9 +23,18 @@ impl App {
                 harness::HarnessUpdate::Status(status) => self.model.status = status,
                 harness::HarnessUpdate::ConnectionLost(message) => {
                     // The harness worker reattaches automatically. Keep the
-                    // transcript and in-flight turn intact while it does so.
-                    // Turning this into `Failed` used to add two scary error
-                    // cards for one routine daemon reload.
+                    // transcript and the message that was sent so a reconnect
+                    // does not look like a dropped submission. Turning this
+                    // into `Failed` used to add two scary error cards for one
+                    // routine daemon reload.
+                    //
+                    // Deliberately leave `busy` alone here: the in-flight turn
+                    // is reconciled authoritatively on the re-attach, from the
+                    // daemon's reported session status. The daemon does not
+                    // replay a finished turn's events to a fresh subscription,
+                    // so clearing busy now would both wrongly mark a still-
+                    // running turn idle and strand nothing in the finished case
+                    // (the re-attach handles that). Let the reconnect decide.
                     self.model.status = message;
                     self.model
                         .set_notice("connection interrupted, reconnecting");
@@ -54,6 +63,7 @@ impl App {
                 harness::HarnessUpdate::Attached {
                     session_id,
                     working_dir,
+                    busy,
                 } => {
                     let initial_attach = self.model.session_id.is_none();
                     let reconnected = self.model.failure.is_some();
@@ -73,6 +83,19 @@ impl App {
                     // reconnected window must not keep reporting the outage it
                     // just recovered from.
                     self.model.failure = None;
+                    // Reconcile the turn with the daemon's reported state. The
+                    // daemon does not replay a finished turn's stream events to
+                    // a freshly re-attached subscription, so a connection that
+                    // dropped around a completed turn would otherwise strand
+                    // `busy` under an infinite "thinking" spinner. If the daemon
+                    // still reports the session busy, a turn is genuinely in
+                    // flight and its events keep streaming; otherwise the turn
+                    // (and any stranded thinking row) is over.
+                    self.model.busy = busy;
+                    if !busy {
+                        self.model.activity.finish();
+                        self.model.transcript.clear_live_tool();
+                    }
                     // A reconnect re-attaches the same session; the transcript
                     // on screen is the one that was being read, so it stays.
                     self.model.strips.focus_session(&session_id);
