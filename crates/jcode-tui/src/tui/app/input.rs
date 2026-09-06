@@ -1688,11 +1688,29 @@ impl App {
             let goals = crate::todo::load_goals(&todo_session_id).unwrap_or_default();
             let ownership_needs_followup =
                 !crate::todo::completed_groups_have_sufficient_delivery(&todos, &goals);
+            // The gate budget is a circuit breaker against a model that stopped
+            // updating the gated state. It must NOT be a flat 5-attempt quota: a
+            // model converging gate-by-gate (trade-off, then relevance, then
+            // coverage) legitimately needs more than 5 nudges if each fix is a
+            // separate turn. Detect genuine progress on the gated state and
+            // hand a fresh budget so a progressing model is never spuriously
+            // disarmed (the warning text promises we only stop when validation
+            // "isn't holding up" - i.e. the state is NOT moving).
+            let gate_fingerprint =
+                serde_json::to_string(&(&todos, &goals)).unwrap_or_default();
+            let state_progressed = self
+                .todo_completion_gate_fingerprint
+                .as_deref()
+                .is_some_and(|prev| prev != &gate_fingerprint);
+            if state_progressed {
+                self.todo_completion_gate_attempts = 0;
+            }
             let gate_budget_left =
                 self.todo_completion_gate_attempts < Self::TODO_COMPLETION_GATE_MAX_ATTEMPTS;
             if ownership_needs_followup && gate_budget_left {
                 self.todo_completion_gate_attempts =
                     self.todo_completion_gate_attempts.saturating_add(1);
+                self.todo_completion_gate_fingerprint = Some(gate_fingerprint.clone());
                 crate::telemetry::record_todo_gate(crate::telemetry::TodoGateKind::Ownership);
                 self.push_display_message(DisplayMessage::system(
                     "🔍 Checking end-to-end ownership before finishing...",
@@ -1714,6 +1732,7 @@ impl App {
             {
                 self.todo_completion_gate_attempts =
                     self.todo_completion_gate_attempts.saturating_add(1);
+                self.todo_completion_gate_fingerprint = Some(gate_fingerprint.clone());
                 let notice = if confidence_summary.completion_confidence_needs_validation {
                     crate::telemetry::record_todo_gate(crate::telemetry::TodoGateKind::Completion);
                     "🔍 Double-checking confidence for you..."
@@ -1752,6 +1771,7 @@ impl App {
                 self.auto_poke_incomplete_todos = false;
                 self.todo_confidence_spike_challenged = false;
                 self.todo_completion_gate_attempts = 0;
+                self.todo_completion_gate_fingerprint = None;
                 self.todo_gate_digest_delivered = false;
                 self.pending_queued_dispatch = false;
                 return false;
@@ -1764,6 +1784,7 @@ impl App {
             // without this a session could only ever deliver one digest.
             self.todo_gate_digest_delivered = false;
             self.todo_completion_gate_attempts = 0;
+            self.todo_completion_gate_fingerprint = None;
             if !self.todo_final_response_requested {
                 self.todo_final_response_requested = true;
                 self.push_display_message(DisplayMessage::system(format!(
@@ -1814,6 +1835,7 @@ impl App {
         // Open todos mean the model is still iterating; completion-gate
         // exhaustion should only trip when the gate itself stops moving.
         self.todo_completion_gate_attempts = 0;
+        self.todo_completion_gate_fingerprint = None;
         self.last_auto_poke_fingerprint = Some(fingerprint);
         self.queued_messages.push(poke_message);
         self.pending_queued_dispatch = true;

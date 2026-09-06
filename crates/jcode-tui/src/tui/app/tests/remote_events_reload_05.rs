@@ -741,3 +741,124 @@ fn completed_cycle_rearms_auto_poke_only_when_default_on() {
         );
     });
 }
+
+#[test]
+fn gate_budget_resets_when_gated_goal_state_progresses_between_pokes() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        app.auto_poke_incomplete_todos = true;
+
+        // A completed todo whose goal is currently short of the delivery gate
+        // (trade_off missing AND coverage too narrow for an "involved" goal).
+        crate::todo::save_todos(
+            &app.session.id,
+            &[crate::todo::TodoItem {
+                id: "todo-1".to_string(),
+                content: "Ship the involved workflow".to_string(),
+                status: "completed".to_string(),
+                priority: "high".to_string(),
+                group: Some("release".to_string()),
+                confidence: Some(crate::todo::ConfidenceState::Verified),
+                completion_confidence: Some(crate::todo::ConfidenceState::Verified),
+                confidence_history: vec![crate::todo::ConfidenceState::Verified],
+                ..Default::default()
+            }],
+        )
+        .expect("save completed todo");
+
+        let goal = |trade_off: Option<crate::todo::TradeOffState>,
+                     coverage: Option<crate::todo::FeedbackLoopCoverage>|
+         -> crate::todo::TodoGoal {
+            crate::todo::TodoGoal {
+                group: Some("release".to_string()),
+                difficulty: Some(crate::todo::Difficulty::Involved),
+                delivery_state: Some(crate::todo::DeliveryState::WorkflowValidated),
+                autonomy: Some(crate::todo::Autonomy::NecessaryFollowthrough),
+                iteration_maturity: Some(crate::todo::IterationMaturity::OutcomeReached),
+                feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::AcceptanceAligned),
+                feedback_loop_coverage: coverage,
+                feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
+                trade_off,
+                ..Default::default()
+            }
+        };
+
+        // Simulate a model converging gate-by-gate across many turns. Each turn
+        // it makes progress on the gated goal state (trade_off climbs, then
+        // coverage climbs) but has not yet cleared every gate, so auto-poke
+        // keeps raising a continuation. Because the state is genuinely moving,
+        // the gate budget must keep resetting; only an unchanged, stalled state
+        // may exhaust the circuit breaker.
+        //
+        // For an "involved" goal both trade_off >= diligent and coverage >=
+        // edge_and_integration_paths are required to pass.
+        let states: Vec<(crate::todo::TradeOffState, crate::todo::FeedbackLoopCoverage)> = vec![
+            // Turn 1: everything low.
+            (crate::todo::TradeOffState::NoneConsidered, crate::todo::FeedbackLoopCoverage::Narrow),
+            // Turn 2: agent improved after the first poke (progress #1).
+            (crate::todo::TradeOffState::Implicit, crate::todo::FeedbackLoopCoverage::Narrow),
+            // Turn 3: agent improved again (progress #2) - still gated.
+            (crate::todo::TradeOffState::SomeConsidered, crate::todo::FeedbackLoopCoverage::MainPaths),
+            // Turn 4: agent improved yet again (progress #3).
+            (crate::todo::TradeOffState::Diligent, crate::todo::FeedbackLoopCoverage::EdgeAndIntegrationPaths),
+        ];
+
+        // Turn 1 arm.
+        crate::todo::save_goals(
+            &app.session.id,
+            &[goal(Some(states[0].0), Some(states[0].1))],
+        )
+        .expect("save turn-1 goal");
+        assert!(
+            app.schedule_auto_poke_followup_if_needed(),
+            "turn 1 gates and must schedule a continuation"
+        );
+        assert!(
+            app.auto_poke_incomplete_todos,
+            "a progressing gate must not disarm"
+        );
+        assert_eq!(app.todo_completion_gate_attempts, 1);
+
+        // Turns 2..N: each makes the gated goal state strictly better. The
+        // budget must reset on each progress step, so the model may always get
+        // a fresh runway and is never disarmed while it keeps converging.
+        for (idx, &state) in states.iter().enumerate().skip(1) {
+            // Simulate the previous continuation having been dispatched and run.
+            app.queued_messages.clear();
+            app.pending_queued_dispatch = false;
+
+            crate::todo::save_goals(
+                &app.session.id,
+                &[goal(Some(state.0), Some(state.1))],
+            )
+            .expect("save progressed goal");
+
+            if idx == states.len() - 1 {
+                // Final state clears every gate (diligent + edge coverage), so
+                // the cycle finishes cleanly instead of poking again.
+                assert!(app.schedule_auto_poke_followup_if_needed());
+                assert!(
+                    app.pending_queued_dispatch
+                        || app.queued_messages
+                            == vec![crate::todo::TODO_FINAL_RESPONSE_CONTINUATION_MESSAGE.to_string()],
+                    "cleared gate should reach the final-response handoff"
+                );
+            } else {
+                // Still gated, but progress was made: budget resets and the
+                // next poke is armed without disarming.
+                assert!(
+                    app.schedule_auto_poke_followup_if_needed(),
+                    "turn {} still gates and must keep offering runway", idx + 1
+                );
+                assert!(
+                    app.auto_poke_incomplete_todos,
+                    "turn {} must not disarm while the gated state progresses", idx + 1
+                );
+                assert_eq!(
+                    app.todo_completion_gate_attempts, 1,
+                    "turn {} must get a fresh budget after progress", idx + 1
+                );
+            }
+        }
+    });
+}

@@ -959,6 +959,13 @@ pub struct App {
     /// has sent. Without a budget, a model that stops updating its todos gets
     /// nudged on every turn forever, silently burning an API call per tick.
     todo_completion_gate_attempts: u8,
+    /// Fingerprint of the gated goal/todo state the last completion-gate nudge
+    /// was raised against. When the model makes genuine progress on the gated
+    /// state (a goal assessment that was low climbs, even if not yet passing),
+    /// the gate budget resets so a gate-by-gate-converging model is not
+    /// spuriously disarmed after a flat 5 attempts. `None` means "no gate
+    /// nudge sent yet this cycle" (fresh budget).
+    todo_completion_gate_fingerprint: Option<String>,
     /// Whether the clean completion handoff has already requested a user-facing
     /// final response for the current todo cycle.
     todo_final_response_requested: bool,
