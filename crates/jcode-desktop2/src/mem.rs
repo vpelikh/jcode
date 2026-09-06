@@ -197,12 +197,18 @@ mod tests {
     fn the_sampler_throttles_between_refreshes() {
         let mut sampler = Sampler::default();
         let start = Instant::now();
-        // The first sample always reads (this test runs on Linux, where
-        // /proc/self exists, so it must succeed).
+        // The first sample only reads on Linux, where /proc/self exists. On
+        // other platforms rss_of returns None and sample is None, so only
+        // assert the read side on Linux. The throttle logic is platform-free.
+        #[cfg(target_os = "linux")]
         assert!(sampler.sample(start).is_some());
+        #[cfg(not(target_os = "linux"))]
+        let _ = sampler.sample(start);
         // Inside the window nothing is re-read.
         assert!(sampler.sample(start + Duration::from_millis(100)).is_none());
-        // Past the window it reads again.
+        // Past the window it reads again (throttle resets regardless of whether
+        // a readout was produced).
+        #[cfg(target_os = "linux")]
         assert!(sampler.sample(start + REFRESH).is_some());
     }
 }

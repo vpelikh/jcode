@@ -115,6 +115,10 @@ mod tests {
 
     #[test]
     fn reload_flag_is_consumed_once() {
+        // Without install() the default SIGUSR2 disposition terminates the
+        // process, which would kill the whole test binary. Install the real
+        // async-signal-safe handler first so request() only sets the flag.
+        install();
         request();
         assert!(requested());
         assert!(!requested());
