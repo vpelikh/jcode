@@ -142,9 +142,13 @@ impl Theme {
             added_mark: Color::from_rgb8(0x1d, 0x4a, 0x30),
             removed_mark: Color::from_rgb8(0x53, 0x22, 0x26),
             // The same green family as light, brightened for the dark page so
-            // it holds its hue against black without getting muddy.
+            // it holds its hue against black without getting muddy. The wash
+            // must stay perceptibly lighter than the black page: at 0x14261c
+            // it was ~0.016 luma off pure black, so the current-card tint was
+            // indistinguishable from the sibling cards. 0x21402c lifts it to
+            // ~0.042, visible as a gentle tint without competing with text.
             accent: Color::from_rgb8(0x5b, 0xbf, 0x85),
-            accent_wash: Color::from_rgb8(0x14, 0x26, 0x1c),
+            accent_wash: Color::from_rgb8(0x21, 0x40, 0x2c),
         }
     }
 
@@ -348,9 +352,15 @@ mod tests {
                 "the accent wash is no fainter than the accent in {:?}",
                 theme.mode
             );
+            // The wash must be *perceptibly* distinct from the page, or a
+            // selected tile is indistinguishable from its siblings and the role
+            // (marking "current") silently fails. 0.03 luma is the smallest
+            // gap most eyes reliably notice on a contiguous surface; the dark
+            // theme once set the wash so close to black (0.016) that the
+            // current card vanished.
             assert!(
-                wash > 0.01,
-                "the accent wash vanishes against paper in {:?}",
+                wash > 0.03,
+                "the accent wash is not perceptible against paper in {:?} (luma {wash:.3})",
                 theme.mode
             );
             // Wash and mark share a hue family: the same colour doing two jobs,
