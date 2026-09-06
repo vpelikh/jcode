@@ -824,3 +824,63 @@ async fn disarm_stall_watchdog_clears_state() -> Result<()> {
     manager.cancel(&info.task_id).await?;
     Ok(())
 }
+
+/// Verify that cancelling an *adopted* task aborts the inner task and kills the
+/// child process that task owns. Regression for stale-process accumulation: a
+/// foreground bash command promoted to a background task on timeout must have
+/// its child process killed when the task is cancelled.
+#[tokio::test]
+async fn cancel_adopted_task_kills_inner_child_process() -> Result<()> {
+    let tmp = tempdir()?;
+    let manager = BackgroundTaskManager::with_output_dir(tmp.path().to_path_buf());
+
+    // Inner task that spawns a child, records its pid, then blocks (waits). If
+    // this inner task's future is dropped via cancellation, kill_on_drop should
+    // terminate the child.
+    let marker = tmp.path().join("child.pid");
+    let child_output = marker.clone();
+    let inner = tokio::spawn(async move {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg("sleep 991");
+        cmd.kill_on_drop(true);
+        let child = cmd.spawn().expect("spawn child");
+        let pid = child.id().unwrap_or(0);
+        tokio::fs::write(&child_output, pid.to_string()).await.ok();
+        let _ = child.wait_with_output().await;
+        Ok(jcode_tool_types::ToolOutput::new("done"))
+    });
+
+    let info = manager.adopt("bash", "session-cascade", inner).await;
+
+    let mut child_pid = None;
+    for _ in 0..50 {
+        if let Ok(contents) = std::fs::read_to_string(&marker) {
+            if let Ok(pid) = contents.trim().parse::<u32>() {
+                child_pid = Some(pid);
+                break;
+            }
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    let child_pid = child_pid.expect("child pid marker should appear");
+    assert!(
+        pid_alive(child_pid),
+        "child {child_pid} should be running before cancel"
+    );
+
+    let cancelled = manager.cancel(&info.task_id).await?;
+    assert!(cancelled, "adopted task should be cancellable");
+
+    sleep(Duration::from_millis(300)).await;
+    assert!(
+        !pid_alive(child_pid),
+        "child {child_pid} should be killed when the adopted task is cancelled"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(super) fn pid_alive(pid: u32) -> bool {
+    let rc = unsafe { libc::kill(pid as i32, 0) };
+    rc == 0
+}
