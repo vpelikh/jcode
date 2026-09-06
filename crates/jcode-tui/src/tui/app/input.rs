@@ -1630,31 +1630,29 @@ impl App {
         true
     }
 
-    /// Fingerprint of exactly the state the completion gates evaluate, used to
-    /// detect genuine progress between gate nudges.
+    /// Fingerprint of exactly the owned-goal state the ownership gate
+    /// evaluates, used to detect genuine progress between ownership-gate nudges.
     ///
-    /// Deliberately NOT the whole `(todos, goals)` shape: a model with a stuck
-    /// gate must not get an unlimited budget just because it churns unrelated
-    /// fields (reworded a todo, reordered a list, edited a `feedback_loop`
-    /// description). Only the goal-assessment fields `delivery_state_passes`
-    /// reads and the completed-todo confidence fields `todo_confidence_summary`
-    /// reads count as progress. The projection is sorted so reordering a list
-    /// does not register as a state change.
-    pub(super) fn gated_state_fingerprint(
+    /// Deliberately NOT the whole `(todos, goals)` shape nor the full goal: a
+    /// model with a stuck ownership gate must not get an unlimited budget just
+    /// because it churns unrelated fields (reworded a todo, reordered a list,
+    /// edited a `feedback_loop` description) or edits a *different* gate's
+    /// signal (completion confidence). Only the goal-assessment fields
+    /// `delivery_state_passes` reads count as progress. The projection is
+    /// sorted so reordering goals does not register as a state change.
+    ///
+    /// Scoped like the ownership gate: it only includes goals for groups whose
+    /// todos are ALL completed (`completed_group_keys`, the same set
+    /// `delivery_state_passes` evaluates). A goal for an in-progress group is
+    /// not gated, so changing its assessment must not register as ownership
+    /// progress.
+    pub(super) fn ownership_gate_fingerprint(
         todos: &[crate::todo::TodoItem],
         goals: &[crate::todo::TodoGoal],
     ) -> String {
-        // Mirror the ownership gate's scoping (`completed_groups_have_sufficient
-        // _delivery`): it only evaluates goals for groups whose todos are ALL
-        // completed. A goal for an in-progress group is not gated, so changing
-        // its (non-gated) assessment must not register as completion-gate
-        // progress and reset a stuck group's budget. The ungrouped list
-        // (`None`) is completed when there is at least one ungrouped todo and
-        // all of them are completed.
         // Same completed-group set the ownership gate evaluates, so the two stay
         // in lock step (`completed_group_keys` drives both).
         let completed_groups = crate::todo::completed_group_keys(todos);
-
         let mut entries: Vec<(String, String)> = Vec::new();
         for goal in goals {
             let key = crate::todo::normalized_group(goal.group.as_deref());
@@ -1702,6 +1700,21 @@ impl App {
                 ));
             }
         }
+        entries.sort();
+        serde_json::to_string(&entries).unwrap_or_default()
+    }
+
+    /// Fingerprint of exactly the completed-todo confidence state the
+    /// completion-confidence gate evaluates, used to detect genuine progress
+    /// between confidence-gate nudges.
+    ///
+    /// Only the completed-todo fields `todo_confidence_summary` reads count:
+    /// completion_confidence, confidence, priority (the weighted-average
+    /// weight), and confidence_history (spike detection). Unrelated churn
+    /// (todo content, group-scoped ownership fields) must not register. The
+    /// projection is sorted so reordering todos does not register as a change.
+    pub(super) fn confidence_gate_fingerprint(todos: &[crate::todo::TodoItem]) -> String {
+        let mut entries: Vec<(String, String)> = Vec::new();
         for todo in todos.iter().filter(|t| t.status == "completed") {
             let group = crate::todo::normalized_group(todo.group.as_deref()).unwrap_or_default();
             entries.push((
@@ -1795,28 +1808,32 @@ impl App {
             let goals = crate::todo::load_goals(&todo_session_id).unwrap_or_default();
             let ownership_needs_followup =
                 !crate::todo::completed_groups_have_sufficient_delivery(&todos, &goals);
-            // The gate budget is a circuit breaker against a model that stopped
-            // updating the gated state. It must NOT be a flat 5-attempt quota: a
-            // model converging gate-by-gate (trade-off, then relevance, then
-            // coverage) legitimately needs more than 5 nudges if each fix is a
-            // separate turn. Detect genuine progress on the gated state and
-            // hand a fresh budget so a progressing model is never spuriously
-            // disarmed (the warning text promises we only stop when validation
-            // "isn't holding up" - i.e. the state is NOT moving).
-            let gate_fingerprint = Self::gated_state_fingerprint(&todos, &goals);
-            let state_progressed = !self
-                .todo_completion_gate_fingerprint
+            // Each completion gate keeps its OWN circuit-breaker budget and
+            // fingerprint. The ownership gate evaluates completed-group goal
+            // assessments; the completion-confidence gate evaluates completed-
+            // todo confidence. Fusing them lets one gate's progress mask the
+            // other's stall (completion-confidence fixes would reset a genuinely
+            // stuck ownership gate), silently disabling the breaker for the
+            // stalled gate. Each budget is keyed to real movement in ITS OWN
+            // fingerprinted state, not a flat 5-attempt quota: a model
+            // converging gate-by-gate (trade-off, then relevance, then coverage)
+            // legitimately needs more than 5 nudges, so a gate that is genuinely
+            // moving is never spuriously disarmed while a stalled sibling still
+            // exhausts its own budget.
+            let ownership_fingerprint = Self::ownership_gate_fingerprint(&todos, &goals);
+            if !self
+                .todo_ownership_gate_fingerprint
                 .as_deref()
-                .is_some_and(|prev| prev == gate_fingerprint);
-            if state_progressed {
-                self.todo_completion_gate_attempts = 0;
+                .is_some_and(|prev| prev == ownership_fingerprint)
+            {
+                self.todo_ownership_gate_attempts = 0;
             }
-            let gate_budget_left =
-                self.todo_completion_gate_attempts < Self::TODO_COMPLETION_GATE_MAX_ATTEMPTS;
-            if ownership_needs_followup && gate_budget_left {
-                self.todo_completion_gate_attempts =
-                    self.todo_completion_gate_attempts.saturating_add(1);
-                self.todo_completion_gate_fingerprint = Some(gate_fingerprint.clone());
+            let ownership_budget_left = self.todo_ownership_gate_attempts
+                < Self::TODO_COMPLETION_GATE_MAX_ATTEMPTS;
+            if ownership_needs_followup && ownership_budget_left {
+                self.todo_ownership_gate_attempts =
+                    self.todo_ownership_gate_attempts.saturating_add(1);
+                self.todo_ownership_gate_fingerprint = Some(ownership_fingerprint);
                 crate::telemetry::record_todo_gate(crate::telemetry::TodoGateKind::Ownership);
                 self.push_display_message(DisplayMessage::system(
                     "🔍 Checking end-to-end ownership before finishing...",
@@ -1833,12 +1850,49 @@ impl App {
                 super::commands::format_todo_completion_confidence(confidence_summary);
             let needs_spike_challenge = confidence_summary.confidence_spike_detected
                 && !self.todo_confidence_spike_challenged;
-            if (confidence_summary.completion_confidence_needs_validation || needs_spike_challenge)
-                && gate_budget_left
+            let confidence_needs_followup = confidence_summary
+                .completion_confidence_needs_validation
+                || needs_spike_challenge;
+            let confidence_fingerprint = Self::confidence_gate_fingerprint(&todos);
+            if !self
+                .todo_confidence_gate_fingerprint
+                .as_deref()
+                .is_some_and(|prev| prev == confidence_fingerprint)
             {
-                self.todo_completion_gate_attempts =
-                    self.todo_completion_gate_attempts.saturating_add(1);
-                self.todo_completion_gate_fingerprint = Some(gate_fingerprint.clone());
+                self.todo_confidence_gate_attempts = 0;
+            }
+            let confidence_budget_left = self.todo_confidence_gate_attempts
+                < Self::TODO_COMPLETION_GATE_MAX_ATTEMPTS;
+            // A gate that still needs followup but has exhausted ITS OWN budget
+            // means the model stopped making progress on that specific gate.
+            // Disarm the whole cycle so the original "one stalled gate stops
+            // all poking" guarantee is preserved, rather than nudging a sibling
+            // gate and letting the stalled one keep burning API calls.
+            if (ownership_needs_followup && !ownership_budget_left)
+                || (confidence_needs_followup && !confidence_budget_left)
+            {
+                crate::logging::warn(&format!(
+                    "Todo completion gate exhausted (ownership={}, confidence={}); stopping auto-poke to avoid an infinite continuation loop",
+                    ownership_needs_followup && !ownership_budget_left,
+                    confidence_needs_followup && !confidence_budget_left
+                ));
+                self.push_display_message(DisplayMessage::system(
+                    "⚠️ We nudged the agent several times but its validation still isn't holding up. We stopped poking; review the remaining todos yourself.",
+                ));
+                self.auto_poke_incomplete_todos = false;
+                self.todo_confidence_spike_challenged = false;
+                self.todo_ownership_gate_attempts = 0;
+                self.todo_ownership_gate_fingerprint = None;
+                self.todo_confidence_gate_attempts = 0;
+                self.todo_confidence_gate_fingerprint = None;
+                self.todo_gate_digest_delivered = false;
+                self.pending_queued_dispatch = false;
+                return false;
+            }
+            if confidence_needs_followup && confidence_budget_left {
+                self.todo_confidence_gate_attempts =
+                    self.todo_confidence_gate_attempts.saturating_add(1);
+                self.todo_confidence_gate_fingerprint = Some(confidence_fingerprint.clone());
                 let notice = if confidence_summary.completion_confidence_needs_validation {
                     crate::telemetry::record_todo_gate(crate::telemetry::TodoGateKind::Completion);
                     "🔍 Double-checking confidence for you..."
@@ -1857,31 +1911,6 @@ impl App {
                 self.pending_queued_dispatch = true;
                 return true;
             }
-            if (ownership_needs_followup
-                || confidence_summary.completion_confidence_needs_validation
-                || needs_spike_challenge)
-                && !gate_budget_left
-            {
-                // The gate keeps failing but the model is no longer making
-                // progress on it. Nudging again would loop forever, burning an
-                // API call per turn (observed live: an unattended session
-                // resent the same continuation every ~5s). Stop the cycle and
-                // surface the stall instead.
-                crate::logging::warn(&format!(
-                    "Todo completion gate exhausted after {} attempts; stopping auto-poke to avoid an infinite continuation loop",
-                    self.todo_completion_gate_attempts
-                ));
-                self.push_display_message(DisplayMessage::system(
-                    "⚠️ We nudged the agent several times but its validation still isn't holding up. We stopped poking; review the remaining todos yourself.",
-                ));
-                self.auto_poke_incomplete_todos = false;
-                self.todo_confidence_spike_challenged = false;
-                self.todo_completion_gate_attempts = 0;
-                self.todo_completion_gate_fingerprint = None;
-                self.todo_gate_digest_delivered = false;
-                self.pending_queued_dispatch = false;
-                return false;
-            }
             // Cycle finished cleanly. When auto-poke is the configured default
             // it stays armed so the next batch of work is covered too; only an
             // explicit /poke off (or a circuit breaker above) disarms it.
@@ -1889,8 +1918,10 @@ impl App {
             // A finished cycle re-arms the review for whatever work comes next;
             // without this a session could only ever deliver one digest.
             self.todo_gate_digest_delivered = false;
-            self.todo_completion_gate_attempts = 0;
-            self.todo_completion_gate_fingerprint = None;
+            self.todo_ownership_gate_attempts = 0;
+            self.todo_ownership_gate_fingerprint = None;
+            self.todo_confidence_gate_attempts = 0;
+            self.todo_confidence_gate_fingerprint = None;
             if !self.todo_final_response_requested {
                 self.todo_final_response_requested = true;
                 self.push_display_message(DisplayMessage::system(format!(
@@ -1940,8 +1971,10 @@ impl App {
         ));
         // Open todos mean the model is still iterating; completion-gate
         // exhaustion should only trip when the gate itself stops moving.
-        self.todo_completion_gate_attempts = 0;
-        self.todo_completion_gate_fingerprint = None;
+        self.todo_ownership_gate_attempts = 0;
+        self.todo_ownership_gate_fingerprint = None;
+        self.todo_confidence_gate_attempts = 0;
+        self.todo_confidence_gate_fingerprint = None;
         self.last_auto_poke_fingerprint = Some(fingerprint);
         self.queued_messages.push(poke_message);
         self.pending_queued_dispatch = true;

@@ -217,7 +217,7 @@ fn test_completion_gate_nudges_stop_after_budget_exhausted() {
         assert!(!app.pending_queued_dispatch);
         assert!(app.queued_messages.is_empty());
         assert!(app.hidden_queued_system_messages.is_empty());
-        assert_eq!(app.todo_completion_gate_attempts, 0);
+        assert_eq!(app.todo_confidence_gate_attempts, 0);
     });
 }
 
@@ -817,7 +817,7 @@ fn gate_budget_resets_when_gated_goal_state_progresses_between_pokes() {
             app.auto_poke_incomplete_todos,
             "a progressing gate must not disarm"
         );
-        assert_eq!(app.todo_completion_gate_attempts, 1);
+        assert_eq!(app.todo_ownership_gate_attempts, 1);
 
         // Turns 2..N: each makes the gated goal state strictly better. The
         // budget must reset on each progress step, so the model may always get
@@ -854,8 +854,7 @@ fn gate_budget_resets_when_gated_goal_state_progresses_between_pokes() {
                     app.auto_poke_incomplete_todos,
                     "turn {} must not disarm while the gated state progresses", idx + 1
                 );
-                assert_eq!(
-                    app.todo_completion_gate_attempts, 1,
+                assert_eq!(app.todo_ownership_gate_attempts, 1,
                     "turn {} must get a fresh budget after progress", idx + 1
                 );
             }
@@ -1033,11 +1032,12 @@ fn gate_budget_ignores_goal_for_non_completed_group_when_driving_stuck_gate() {
 }
 
 #[test]
-fn gated_state_fingerprint_ignores_todo_order_and_unrelated_content() {
+fn per_gate_fingerprints_ignore_order_and_unrelated_content() {
     let mut todo_a = crate::todo::TodoItem {
         id: "a".to_string(),
         content: "first".to_string(),
         status: "completed".to_string(),
+        group: Some("g".to_string()),
         ..Default::default()
     };
     todo_a.completion_confidence = Some(crate::todo::ConfidenceState::Validated);
@@ -1045,6 +1045,7 @@ fn gated_state_fingerprint_ignores_todo_order_and_unrelated_content() {
         id: "b".to_string(),
         content: "second".to_string(),
         status: "completed".to_string(),
+        group: Some("g".to_string()),
         ..Default::default()
     };
     todo_b.completion_confidence = Some(crate::todo::ConfidenceState::Verified);
@@ -1055,7 +1056,51 @@ fn gated_state_fingerprint_ignores_todo_order_and_unrelated_content() {
         ..Default::default()
     }];
 
-    // Same gated state, different todo order and wording -> identical fingerprint.
+    // Ownership fingerprint: same gated goal state, different goal order ->
+    // identical fingerprint (todo content/order is not part of the ownership
+    // signal; only goal assessments for completed groups are).
+    let same = <App>::ownership_gate_fingerprint(&[todo_a.clone(), todo_b.clone()], &goals);
+    let shuffled_goals = {
+        let mut g = goals.clone();
+        g.reverse();
+        g
+    };
+    assert_eq!(
+        same,
+        <App>::ownership_gate_fingerprint(&[todo_b.clone(), todo_a.clone()], &shuffled_goals),
+        "reordering completed todos or goals must not change the ownership fingerprint"
+    );
+
+    // Advancing a goal-assessment field DOES change the ownership fingerprint.
+    let mut better_goal = goals[0].clone();
+    better_goal.trade_off = Some(crate::todo::TradeOffState::Diligent);
+    assert_ne!(
+        same,
+        <App>::ownership_gate_fingerprint(&[todo_a.clone()], &[better_goal]),
+        "advancing a goal assessment must change the ownership fingerprint"
+    );
+
+    // Grouping matters: a goal for a NON-completed (in-progress) group is not
+    // gated, so its assessment must not be part of the ownership fingerprint.
+    let mut wip_todo = todo_a.clone();
+    wip_todo.id = "wip-1".to_string();
+    wip_todo.status = "in_progress".to_string();
+    wip_todo.group = Some("wip".to_string());
+    let mut wip_goal = goals[0].clone();
+    wip_goal.group = Some("wip".to_string());
+    wip_goal.trade_off = Some(crate::todo::TradeOffState::Diligent);
+    let fp_with_gated = <App>::ownership_gate_fingerprint(
+        &[todo_a.clone(), wip_todo],
+        &[goals[0].clone(), wip_goal],
+    );
+    let fp_ignoring_wip = <App>::ownership_gate_fingerprint(&[todo_a.clone()], &goals);
+    assert_eq!(
+        fp_with_gated, fp_ignoring_wip,
+        "a non-completed group's goal assessment must not enter the ownership fingerprint"
+    );
+
+    // Confidence fingerprint: same completed-todo state, different order and
+    // wording -> identical fingerprint.
     let ab = [todo_a.clone(), todo_b.clone()];
     let ba = [todo_b.clone(), todo_a.clone()];
     let a_renamed = [
@@ -1065,35 +1110,126 @@ fn gated_state_fingerprint_ignores_todo_order_and_unrelated_content() {
         },
         todo_b.clone(),
     ];
-    let f1 = <App>::gated_state_fingerprint(&ab, &goals);
-    let f2 = <App>::gated_state_fingerprint(&ba, &goals);
-    let f3 = <App>::gated_state_fingerprint(&a_renamed, &goals);
+    let c1 = <App>::confidence_gate_fingerprint(&ab);
+    let c2 = <App>::confidence_gate_fingerprint(&ba);
+    let c3 = <App>::confidence_gate_fingerprint(&a_renamed);
     assert_eq!(
-        f1, f2,
-        "reordering completed todos must not change the gated fingerprint"
+        c1, c2,
+        "reordering completed todos must not change the confidence fingerprint"
     );
     assert_eq!(
-        f1, f3,
-        "rewording a completed todo must not change the gated fingerprint"
+        c1, c3,
+        "rewording a completed todo must not change the confidence fingerprint"
     );
 
-    // Advancing the gated confidence state DOES change the fingerprint:
+    // Advancing the confidence state DOES change the confidence fingerprint:
     // todo_a goes from Validated to Verified.
     let mut a_up = todo_a.clone();
     a_up.completion_confidence = Some(crate::todo::ConfidenceState::Verified);
-    let f4 = <App>::gated_state_fingerprint(&[a_up, todo_b.clone()], &goals);
+    let c4 = <App>::confidence_gate_fingerprint(&[a_up, todo_b.clone()]);
     assert_ne!(
-        f1, f4,
-        "advancing completion confidence must change the gated fingerprint"
+        c1, c4,
+        "advancing completion confidence must change the confidence fingerprint"
     );
 
     // The confidence gate's weighted average uses priority as its weight, so a
     // priority change is also a gated-state change and must register as progress.
     let mut a_priority = todo_a.clone();
     a_priority.priority = "critical".to_string();
-    let f5 = <App>::gated_state_fingerprint(&[a_priority, todo_b.clone()], &goals);
+    let c5 = <App>::confidence_gate_fingerprint(&[a_priority, todo_b.clone()]);
     assert_ne!(
-        f5, f1,
-        "a completed todo's priority change must change the gated fingerprint"
+        c5, c1,
+        "a completed todo's priority change must change the confidence fingerprint"
     );
+}
+
+#[test]
+fn confidence_progress_does_not_mask_an_ownership_gate_stall() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        app.auto_poke_incomplete_todos = true;
+
+        // A completed todo in group "release" whose goal is genuinely stuck:
+        // trade_off stays None (required for an involved goal), so the
+        // ownership gate never passes.
+        crate::todo::save_todos(
+            &app.session.id,
+            &[crate::todo::TodoItem {
+                id: "todo-1".to_string(),
+                content: "Stuck ownership".to_string(),
+                status: "completed".to_string(),
+                priority: "high".to_string(),
+                group: Some("release".to_string()),
+                completion_confidence: Some(crate::todo::ConfidenceState::from_legacy_score(40)),
+                ..Default::default()
+            }],
+        )
+        .expect("save completed todo");
+
+        let stuck_goal = || crate::todo::TodoGoal {
+            group: Some("release".to_string()),
+            difficulty: Some(crate::todo::Difficulty::Involved),
+            delivery_state: Some(crate::todo::DeliveryState::WorkflowValidated),
+            autonomy: Some(crate::todo::Autonomy::NecessaryFollowthrough),
+            iteration_maturity: Some(crate::todo::IterationMaturity::OutcomeReached),
+            feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::AcceptanceAligned),
+            feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::EdgeAndIntegrationPaths),
+            feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
+            trade_off: Some(crate::todo::TradeOffState::NoneConsidered), // stuck: needs diligent
+            ..Default::default()
+        };
+        crate::todo::save_goals(&app.session.id, &[stuck_goal()]).expect("save stuck goal");
+
+        // Turn 1: the ownership gate schedules a nudge (ownership budget = 1).
+        assert!(app.schedule_auto_poke_followup_if_needed());
+        assert_eq!(app.todo_ownership_gate_attempts, 1);
+        app.queued_messages.clear();
+        app.pending_queued_dispatch = false;
+
+        // Turn 2: the model makes progress ONLY on completion confidence
+        // (not on the stuck ownership goal), clearing the confidence gate. This
+        // changes the confidence fingerprint but NOT the ownership fingerprint.
+        // With the old shared fingerprint, this would reset the ownership budget
+        // and mask the ownership stall. With per-gate fingerprints it must NOT.
+        crate::todo::save_todos(
+            &app.session.id,
+            &[crate::todo::TodoItem {
+                id: "todo-1".to_string(),
+                content: "Stuck ownership".to_string(),
+                status: "completed".to_string(),
+                priority: "high".to_string(),
+                group: Some("release".to_string()),
+                completion_confidence: Some(crate::todo::ConfidenceState::Verified),
+                ..Default::default()
+            }],
+        )
+        .expect("save confidence-cleared todo");
+        crate::todo::save_goals(&app.session.id, &[stuck_goal()]).expect("save same stuck goal");
+
+        // Ownership gate still fails and its budget must NOT have been reset by
+        // the confidence progress.
+        assert!(app.schedule_auto_poke_followup_if_needed());
+        assert_eq!(
+            app.todo_ownership_gate_attempts, 2,
+            "confidence progress must not reset the ownership gate budget"
+        );
+
+        // Drive the ownership gate to exhaustion. Confidence progress on later
+        // turns must never extend the ownership runway.
+        for attempt in 2..App::TODO_COMPLETION_GATE_MAX_ATTEMPTS {
+            app.queued_messages.clear();
+            app.pending_queued_dispatch = false;
+            assert!(
+                app.schedule_auto_poke_followup_if_needed(),
+                "attempt {attempt} should still schedule an ownership nudge"
+            );
+        }
+        app.queued_messages.clear();
+        app.pending_queued_dispatch = false;
+        assert!(
+            !app.schedule_auto_poke_followup_if_needed(),
+            "stuck ownership gate must still exhaust its own budget and disarm"
+        );
+        assert!(!app.auto_poke_incomplete_todos);
+    });
 }

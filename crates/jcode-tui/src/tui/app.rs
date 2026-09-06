@@ -955,19 +955,37 @@ pub struct App {
     /// delivered. The digest asks the model to verify weak points, so re-asking
     /// after it has done so would loop; one delivery per turn is the contract.
     todo_gate_digest_delivered: bool,
-    /// How many completion-confidence gate nudges the current auto-poke cycle
-    /// has sent. Without a budget, a model that stops updating its todos gets
+    /// How many ownership-gate nudges the current auto-poke cycle has sent.
+    /// Without a budget, a model that stops updating its gated state gets
     /// nudged on every turn forever, silently burning an API call per tick.
-    todo_completion_gate_attempts: u8,
-    /// Fingerprint of the gated goal/todo state the last completion-gate nudge
-    /// was raised against. When the model makes genuine progress on the gated
-    /// state (a goal assessment that was low climbs, even if not yet passing),
-    /// the gate budget resets so a gate-by-gate-converging model is not
-    /// spuriously disarmed after a flat 5 attempts. `None` means "no gate
-    /// nudge sent yet this cycle" (fresh budget). This mirrors the single
-    /// fingerprint + consecutive-stall-counter idiom used by `last_auto_poke_
-    /// fingerprint` and the overnight auto-poke (`stalled_turns`).
-    todo_completion_gate_fingerprint: Option<String>,
+    ///
+    /// The ownership gate and the completion-confidence gate keep SEPARATE
+    /// budgets and fingerprints. Fusing them lets one gate's progress mask the
+    /// other's stall (e.g. completion-confidence fixes resetting a genuinely
+    /// stuck ownership gate, or vice versa), which would silently disable the
+    /// circuit breaker for the stalled gate. Each budget is independently reset
+    /// by progress on that gate's own fingerprinted state, so a gate-by-gate-
+    /// converging model is not spuriously disarmed while a genuinely stalled
+    /// gate still exhausts its own budget.
+    todo_ownership_gate_attempts: u8,
+    /// Fingerprint of the owned-goal state the last ownership-gate nudge was
+    /// raised against. When the model makes genuine progress on that state (a
+    /// goal assessment that was low climbs, even if not yet passing), the
+    /// ownership budget resets. `None` means "no ownership nudge sent yet this
+    /// cycle" (fresh budget). Mirrors the single fingerprint + consecutive-
+    /// stall-counter idiom used by `last_auto_poke_fingerprint` and the
+    /// overnight auto-poke (`stalled_turns`).
+    todo_ownership_gate_fingerprint: Option<String>,
+    /// How many completion-confidence gate nudges the current auto-poke cycle
+    /// has sent. Independent of the ownership-gate budget (see
+    /// `todo_ownership_gate_attempts`), so completion-confidence progress
+    /// cannot mask an ownership-gate stall and vice versa.
+    todo_confidence_gate_attempts: u8,
+    /// Fingerprint of the completed-todo confidence state the last completion-
+    /// confidence gate nudge was raised against. Progress on that state resets
+    /// `todo_confidence_gate_attempts`. `None` means "no confidence nudge sent
+    /// yet this cycle" (fresh budget).
+    todo_confidence_gate_fingerprint: Option<String>,
     /// Whether the clean completion handoff has already requested a user-facing
     /// final response for the current todo cycle.
     todo_final_response_requested: bool,
