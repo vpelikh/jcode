@@ -182,19 +182,27 @@ fn macos_desktop_app_launcher_dir() -> Result<PathBuf> {
 /// executable. Fails with a helpful build hint when it is not present.
 fn desktop2_sibling_binary() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("could not locate the running jcode executable")?;
-    let Some(parent) = exe.parent() else {
-        anyhow::bail!("running jcode executable has no parent directory");
-    };
-    // Prefer the sibling of the running jcode binary. This is the installed
-    // layout (jcode and jcode-desktop2 sit side by side in the version dir)
-    // and also the layout when both are built into the same target dir.
+    find_desktop2_sibling(&exe).ok_or_else(|| {
+        anyhow::anyhow!(
+            "jcode-desktop2 binary not found next to {} or in a sibling target/selfdev. Build it with `cargo build --profile selfdev -p jcode-desktop2` first.",
+            exe.display()
+        )
+    })
+}
+
+/// Locate the `jcode-desktop2` binary relative to a given `jcode` executable.
+/// Pure so the layout logic is unit-testable.
+///
+/// 1. Sibling of `jcode`: the installed layout (both in the version dir) and
+///    the layout when both are built into the same target dir.
+/// 2. Dev fallback: a `jcode` binary in target/{debug,dev,selfdev,release}
+///    where the desktop was built separately into target/selfdev.
+fn find_desktop2_sibling(jcode: &Path) -> Option<PathBuf> {
+    let parent = jcode.parent()?;
     let sibling = parent.join(MACOS_DESKTOP_APP_EXECUTABLE);
     if sibling.is_file() {
-        return Ok(sibling);
+        return Some(sibling);
     }
-    // Dev fallback: a `jcode` binary in target/{debug,dev,selfdev} with the
-    // desktop built separately into target/{selfdev}. This is deterministic and
-    // does not depend on the caller's working directory.
     for profile in ["debug", "dev", "selfdev", "release"] {
         if parent.ends_with(format!("target/{profile}"))
             && let Some(target_root) = parent.parent()
@@ -203,14 +211,11 @@ fn desktop2_sibling_binary() -> Result<PathBuf> {
                 .join("selfdev")
                 .join(MACOS_DESKTOP_APP_EXECUTABLE);
             if candidate.is_file() {
-                return Ok(candidate);
+                return Some(candidate);
             }
         }
     }
-    anyhow::bail!(
-        "jcode-desktop2 binary not found next to {} or in a sibling target/selfdev. Build it with `cargo build --profile selfdev -p jcode-desktop2` first.",
-        exe.display()
-    )
+    None
 }
 
 fn macos_desktop_app_launcher_is_valid(app_dir: &Path) -> bool {

@@ -218,3 +218,45 @@ fn macos_desktop_bundle_is_valid_when_binary_plist_and_icon_present() {
     .expect("remove executable");
     assert!(!macos_desktop_app_launcher_is_valid(&app));
 }
+
+#[test]
+fn desktop2_sibling_prefers_a_real_sibling_next_to_jcode() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let exe = temp.path().join("jcode");
+    let desktop = temp.path().join(MACOS_DESKTOP_APP_EXECUTABLE);
+    std::fs::write(&desktop, "binary").expect("write desktop sibling");
+    assert_eq!(
+        find_desktop2_sibling(&exe),
+        Some(desktop),
+        "installed sibling layout must win"
+    );
+}
+
+#[test]
+fn desktop2_sibling_falls_back_to_target_selfdev_for_dev_binary() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let target = temp.path().join("target");
+    let debug = target.join("debug");
+    let selfdev = target.join("selfdev");
+    std::fs::create_dir_all(&debug).expect("create debug");
+    std::fs::create_dir_all(&selfdev).expect("create selfdev");
+    let exe = debug.join("jcode");
+    let desktop = selfdev.join(MACOS_DESKTOP_APP_EXECUTABLE);
+    std::fs::write(&desktop, "binary").expect("write selfdev desktop");
+    assert_eq!(
+        find_desktop2_sibling(&exe),
+        Some(desktop),
+        "target/debug jcode must find the sibling target/selfdev desktop"
+    );
+}
+
+#[test]
+fn desktop2_sibling_returns_none_when_absent() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let exe = temp.path().join("jcode");
+    assert_eq!(
+        find_desktop2_sibling(&exe),
+        None,
+        "no desktop anywhere must yield None"
+    );
+}
