@@ -1953,3 +1953,35 @@ fn headless_failed_lens_retries_before_finalizing() {
         );
     });
 }
+
+// Regression: `/review-loop stop` must fully clear the in-memory headless
+// dispatch state — including active_headless_request_id — so a HeadlessReviewResult
+// that late-arrives for the stopped loop's dispatch cannot be correlated to (and
+// then mis-applied to) a later/restarted loop via the stale id.
+#[test]
+fn review_loop_stop_clears_inflight_headless_state() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        let mut state = jcode_session_types::ReviewLoopState::new();
+        super::review_loop::enter_review_loop(&mut state);
+        state.awaiting_headless = true;
+        app.session.review_loop = Some(state);
+        app.active_headless_request_id = Some(7);
+        app.pending_headless_review = Some("correctness".to_string());
+
+        app.input = "/review-loop stop".to_string();
+        app.submit_input();
+
+        let state = app.session.review_loop.as_ref().unwrap();
+        assert!(state.finished, "stop must finalize the loop");
+        assert!(!state.awaiting_headless, "stop must clear the awaiting flag");
+        assert!(
+            app.active_headless_request_id.is_none(),
+            "stop must clear the in-flight request id so a stale result cannot be correlated"
+        );
+        assert!(
+            app.pending_headless_review.is_none(),
+            "stop must clear any queued dispatch"
+        );
+    });
+}

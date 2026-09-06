@@ -2091,6 +2091,13 @@ pub(super) fn handle_review_loop_command_local(app: &mut App, trimmed: &str) -> 
             app.queued_messages.clear();
             app.hidden_queued_system_messages.clear();
             app.pending_queued_dispatch = false;
+            // A fresh start must not inherit stale in-memory headless dispatch
+            // state (a request id or queued dispatch left over from a previous
+            // stopped/finished loop): a stale HeadlessReviewResult from the old
+            // run must not be applied to the new loop. Cleared here so the new
+            // loop begins with a clean dispatch slate.
+            app.pending_headless_review = None;
+            app.active_headless_request_id = None;
             let state = app
                 .session
                 .review_loop
@@ -2116,6 +2123,10 @@ pub(super) fn handle_review_loop_command_local(app: &mut App, trimmed: &str) -> 
                 // HeadlessReviewResult (or the async drain) cannot act on a
                 // stopped loop.
                 app.pending_headless_review = None;
+                // Drop the in-memory request id: a stale result for the old
+                // dispatch must not be correlated to this stopped loop (or a
+                // later restarted one) via the old id.
+                app.active_headless_request_id = None;
                 // Cancel any review fix turn that is queued-but-not-yet-dispatched
                 // (remote path stages the fix into queued_messages). After stop
                 // the loop is finished, but the queued "fix them" prompt would
@@ -2186,6 +2197,9 @@ pub(super) fn clear_review_loop_on_improve(app: &mut App) {
         // Cancel a queued headless review dispatch (the loop is gone, so a
         // pending request/result must not act on it).
         app.pending_headless_review = None;
+        // Drop the matching request id: a stale HeadlessReviewResult for the
+        // old dispatch must not be correlated to whatever runs next.
+        app.active_headless_request_id = None;
         // Cancel any review fix turn that is queued-but-undispatched, mirroring
         // `/review-loop stop`: the loop is being replaced by improve/refactor,
         // so a stranded "fix them" prompt must not be dispatched later.
