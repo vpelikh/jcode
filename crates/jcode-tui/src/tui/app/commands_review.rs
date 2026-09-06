@@ -1429,55 +1429,6 @@ pub(super) fn maybe_enter_review_loop(app: &mut App) {
     app.set_status_notice("Review loop: started");
 }
 
-/// Spawn the independent per-lens reviewer for the loop's current lens.
-fn spawn_loop_reviewer(app: &mut App, lens: jcode_session_types::ReviewLens) -> anyhow::Result<String> {
-    let parent_session_id = current_feedback_target_session_id(app);
-    let lens_prompt = build_lens_review_startup_message(
-        &parent_session_id,
-        lens.name(),
-        lens.label(),
-        lens.focus(),
-    );
-    let model_override = current_autoreview_model_override();
-    let initial_model = model_override
-        .clone()
-        .unwrap_or_else(|| current_autoreview_model_summary(app));
-
-    // Each lens gets its own fresh reviewer session + client process. This is
-    // the per-lens independence the proposal requires (see
-    // `docs/proposals/review-rounds.md`): a lens review runs on a clean slate,
-    // untainted by an earlier lens's prompt or verdict.
-    //
-    // Reusing a single `reviewer_session_id` across lenses does NOT work: the
-    // startup prompt is delivered via the one-shot `client-input-<id>` handoff
-    // file, which a headed client process consumes only once at launch
-    // (`--fresh-spawn --resume <id>`, see `tui_lifecycle_runtime.rs`). On the
-    // second lens we do not launch a new process, so the already-running
-    // reviewer never receives the new lens prompt and `poll_loop_reviewer`
-    // would wait forever (or mis-read a stale verdict still in the reused
-    // session's history). We deliberately spawn fresh per lens.
-    let (session_id, _name) =
-        clone_session_for_review(app, "review-loop", initial_model, None)?;
-
-    prepare_review_spawned_session(
-        &session_id,
-        lens_prompt,
-        model_override,
-        None,
-        Some("review-loop".to_string()),
-        None,
-    );
-
-    let exe = super::launch_client_executable();
-    let cwd = active_working_dir(app)
-        .filter(|path| path.is_dir())
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let socket = std::env::var("JCODE_SOCKET").ok();
-    super::spawn_in_new_terminal(&exe, &session_id, &cwd, socket.as_deref())?;
-    Ok(session_id)
-}
-
 /// Poll the in-flight reviewer child session for a `VERDICT`.
 enum PollResult {
     /// The reviewer session is gone (deleted/unloadable); the loop cannot make
@@ -1904,54 +1855,19 @@ fn spawn_review_loop_reviewer(
     state: &mut jcode_session_types::ReviewLoopState,
     lens: jcode_session_types::ReviewLens,
 ) -> bool {
-    if app.is_remote {
-        // Headless dispatch: mark the loop as awaiting a server verdict for this
-        // lens and stash the lens so the async remote tick rebuilds the prompt
-        // and sends Request::HeadlessReview.
-        // We persist awaiting_headless so progress is event-driven, and stash
-        // only the lens label; the drain reconstructs the prompt from the lens.
-        state.active_reviewer_id = None;
-        state.awaiting_headless = true;
-        app.session.review_loop = Some(state.clone());
-        let _ = app.session.save();
-        app.pending_headless_review = Some(lens.label().to_string());
-        app.set_status_notice(format!("Review loop: reviewing {} (headless)", lens.label()));
-        return true;
-    }
-    match spawn_loop_reviewer(app, lens) {
-        Ok(id) => {
-            state.active_reviewer_id = Some(id);
-            app.session.review_loop = Some(state.clone());
-            let _ = app.session.save();
-            // Surface the lens actually being reviewed so the parent status bar
-            // tracks loop progress. The spawned reviewer runs in its own window;
-            // this is the parent-side signal that the loop advanced (and it makes
-            // the next idle redraw show the current lens rather than a stale one).
-            app.set_status_notice(format!("Review loop: reviewing {}", lens.label()));
-            true
-        }
-        Err(error) => {
-            state.finished = true;
-            state.finish_reason = Some("spawn_failed".to_string());
-            let record = state.record.get_or_insert_with(jcode_session_types::ReviewRecord::default);
-            record.digest = Some(
-                format!(
-                    "## Review stopped\n\nCould not spawn the reviewer for the '{}' lens: {}",
-                    lens.label(),
-                    error
-                ),
-            );
-            app.session.review_loop = Some(state.clone());
-            let _ = app.session.save();
-            app.push_display_message(DisplayMessage::error(format!(
-                "Review loop stopped: failed to spawn reviewer for '{}': {}",
-                lens.label(),
-                error
-            )));
-            app.set_status_notice("Review loop: spawn failed");
-            false
-        }
-    }
+    // Headless dispatch (no terminal window): mark the loop as awaiting a
+    // server verdict for this lens and stash the lens so the async remote tick
+    // rebuilds the prompt and sends `Request::HeadlessReview`. The server runs
+    // the reviewer and replies with a `HeadlessReviewResult`, which the event
+    // handler feeds back through `apply_headless_review_result`. This replaced
+    // the legacy per-lens headed-terminal reviewer.
+    state.active_reviewer_id = None;
+    state.awaiting_headless = true;
+    app.session.review_loop = Some(state.clone());
+    let _ = app.session.save();
+    app.pending_headless_review = Some(lens.label().to_string());
+    app.set_status_notice(format!("Review loop: reviewing {} (headless)", lens.label()));
+    true
 }
 
 /// Manual `/review-loop` command (mirrors `/improve`): start a full per-lens
@@ -1995,6 +1911,11 @@ pub(super) fn handle_review_loop_command_local(app: &mut App, trimmed: &str) -> 
         "stop" => {
             if let Some(state) = app.session.review_loop.as_mut() {
                 state.finish_with("user_stopped");
+                state.awaiting_headless = false;
+                // Cancel any queued headless review dispatch so a late
+                // HeadlessReviewResult (or the async drain) cannot act on a
+                // stopped loop.
+                app.pending_headless_review = None;
                 // Cancel any review fix turn that is queued-but-not-yet-dispatched
                 // (remote path stages the fix into queued_messages). After stop
                 // the loop is finished, but the queued "fix them" prompt would
@@ -2062,6 +1983,9 @@ pub(super) fn handle_review_loop_command_local(app: &mut App, trimmed: &str) -> 
 pub(super) fn clear_review_loop_on_improve(app: &mut App) {
     if app.session.review_loop.as_ref().map(|s| !s.finished).unwrap_or(false) {
         app.session.review_loop = None;
+        // Cancel a queued headless review dispatch (the loop is gone, so a
+        // pending request/result must not act on it).
+        app.pending_headless_review = None;
         // Cancel any review fix turn that is queued-but-undispatched, mirroring
         // `/review-loop stop`: the loop is being replaced by improve/refactor,
         // so a stranded "fix them" prompt must not be dispatched later.

@@ -652,26 +652,22 @@ fn idle_tick_self_drives_review_loop_advance() {
         assert!(advanced.is_some(), "review loop must remain present");
         // The CLEAN verdict for Correctness was consumed: the loop advanced to
         // EdgesErrors AND spawned (and set an active reviewer for) that lens.
+        // The idle tick polls the session reviewer; the CLEAN verdict for Correctness
+        // is consumed and the loop advances to the next lens, dispatching it
+        // headlessly (no local reviewer session to poll).
         let advanced = advanced.unwrap();
         assert_eq!(
             advanced.current_lens,
             Some(jcode_session_types::ReviewLens::ALL[1]),
             "idle tick must consume the CLEAN verdict and advance to the next lens"
         );
-        // The next lens reviewer was spawned (active_reviewer_id set for it).
         assert!(
-            advanced.active_reviewer_id.is_some(),
-            "advancing must spawn an active reviewer for the next lens"
+            advanced.awaiting_headless,
+            "advancing must dispatch the next lens headlessly"
         );
-        // The parent status notice reflects the lens now under review (the
-        // spawned reviewer runs in its own window; this is the parent-side
-        // signal that the loop advanced).
         assert!(
-            app.status_notice
-                .as_ref()
-                .is_some_and(|(n, _)| n.contains("reviewing") && n.contains("Edges/Errors")),
-            "advancing must surface the new lens in the parent status notice, got {:?}",
-            app.status_notice.as_ref().map(|(n, _)| n.as_str())
+            advanced.active_reviewer_id.is_none(),
+            "headless advance must not set a local reviewer session"
         );
     });
 }
@@ -1076,9 +1072,14 @@ fn step_review_loop_respawns_lost_reviewer_within_budget() {
             Some(jcode_session_types::ReviewLens::Correctness),
             "respawn must keep the same lens"
         );
+        // The respawn dispatches the lens headlessly (no local reviewer session).
         assert!(
-            state.active_reviewer_id.is_some(),
-            "a fresh reviewer session must be spawned for the lost lens"
+            state.awaiting_headless,
+            "the respawned lens must be dispatched headlessly"
+        );
+        assert!(
+            state.active_reviewer_id.is_none(),
+            "headless respawn must not set a local reviewer session"
         );
         assert!(
             app.status_notice.as_ref().is_some_and(|(n, _)| n.contains("respawning")),
