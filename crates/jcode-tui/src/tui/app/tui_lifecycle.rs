@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use super::state_ui::RestoredReloadInput;
 use super::*;
 use crate::tui::{backend, keybind};
@@ -517,7 +518,7 @@ impl App {
             todo_confidence_spike_challenged: false,
             todo_gate_digest_delivered: false,
             todo_completion_gate_attempts: 0,
-            todo_completion_gate_fingerprint: None,
+            todo_completion_gate_recent_states: VecDeque::new(),
             todo_final_response_requested: false,
             last_auto_poke_fingerprint: None,
             turn_guardrail_stopped: false,
@@ -966,7 +967,7 @@ impl App {
             todo_confidence_spike_challenged: false,
             todo_gate_digest_delivered: false,
             todo_completion_gate_attempts: 0,
-            todo_completion_gate_fingerprint: None,
+            todo_completion_gate_recent_states: VecDeque::new(),
             todo_final_response_requested: false,
             last_auto_poke_fingerprint: None,
             turn_guardrail_stopped: false,

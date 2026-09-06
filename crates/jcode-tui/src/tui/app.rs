@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use super::DisplayMessageRoleExt;
 use super::keybind::{
     CenteredToggleKeys, ModelSwitchKeys, OptionalBinding, ScrollKeys, WorkspaceNavigationKeys,
@@ -959,13 +960,16 @@ pub struct App {
     /// has sent. Without a budget, a model that stops updating its todos gets
     /// nudged on every turn forever, silently burning an API call per tick.
     todo_completion_gate_attempts: u8,
-    /// Fingerprint of the gated goal/todo state the last completion-gate nudge
-    /// was raised against. When the model makes genuine progress on the gated
-    /// state (a goal assessment that was low climbs, even if not yet passing),
-    /// the gate budget resets so a gate-by-gate-converging model is not
-    /// spuriously disarmed after a flat 5 attempts. `None` means "no gate
-    /// nudge sent yet this cycle" (fresh budget).
-    todo_completion_gate_fingerprint: Option<String>,
+    /// Recent gated-state fingerprints the completion gate has already nudged
+    /// about in this cycle. Progress is detected as a fingerprint that is not in
+    /// this window, so the budget resets on forward movement but NOT when the
+    /// state merely returns to a recently-seen value. This distinguishes a
+    /// gate-by-gate-converging model (distinct states -> resets -> never
+    /// spuriously disarmed) from a model oscillating one gated assessment back
+    /// and forth (A -> B -> A -> ... -> the returned-to state is already in the
+    /// window, so the budget is NOT reset and the breaker still trips). Empty
+    /// means "no gate nudge sent yet this cycle" (fresh budget).
+    todo_completion_gate_recent_states: VecDeque<String>,
     /// Whether the clean completion handoff has already requested a user-facing
     /// final response for the current todo cycle.
     todo_final_response_requested: bool,
@@ -1732,6 +1736,14 @@ impl App {
     /// full API call per nudge. The counter resets whenever a nudge actually
     /// changes the stored todos (progress) or auto-poke is re-armed.
     const TODO_COMPLETION_GATE_MAX_ATTEMPTS: u8 = 5;
+    /// How many recent gated-state fingerprints are kept to decide whether the
+    /// completion-gate budget should reset. Resetting on any change lets a
+    /// model oscillating one gated assessment (A -> B -> A -> ...) reset forever;
+    /// requiring novelty against a small window of recent states refuses to
+    /// reset when the model merely returns to a state it already tried, so the
+    /// circuit breaker still trips on oscillation while genuine multi-step
+    /// convergence (all distinct states) keeps getting a fresh budget.
+    const GATE_PROGRESS_WINDOW: usize = 4;
     /// Consecutive guardrail/refusal-stopped turns tolerated before automatic
     /// continuation paths (auto-poke, overnight poke) are stopped. Guardrail
     /// refusals are deterministic for the same request, so re-poking the same
