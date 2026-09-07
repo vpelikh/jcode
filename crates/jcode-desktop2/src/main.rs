@@ -1350,6 +1350,7 @@ impl App {
         let wanted = if self.frame.hits_gear(x, y)
             || self.frame.hits_sessions(x, y)
             || self.strip_session_at(x, y).is_some()
+            || self.over_model_caption(x, y)
             || (self.model.model_picker.is_open()
                 && self
                     .frame

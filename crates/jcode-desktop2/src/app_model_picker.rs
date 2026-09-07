@@ -81,10 +81,7 @@ impl App {
         // Ctrl+M chord does, so the pointer and the keyboard reach the same
         // surface. This runs before the open-menu branch: while the menu is up
         // the caption is covered, and a click there dismisses it instead.
-        let over_caption = self.model.model.is_some()
-            && x >= self.frame.left + self.frame.column() * 0.5
-            && y >= self.frame.footnote_top
-            && y <= self.frame.footnote_bottom;
+        let over_caption = self.over_model_caption(x, y);
         if over_caption && !self.model.model_picker.is_open() {
             self.toggle_model_picker();
             return true;
@@ -114,10 +111,7 @@ impl App {
         // drawn at the trailing edge, opens the catalog when clicked. Hovering
         // it glows with the accent so the affordance is visible before the
         // click, the same way a browser link changes colour on hover.
-        let over_caption = self.model.model.is_some()
-            && x >= self.frame.left + self.frame.column() * 0.5
-            && y >= self.frame.footnote_top
-            && y <= self.frame.footnote_bottom;
+        let over_caption = self.over_model_caption(x, y);
         changed |= self.model.model_picker.set_button_hover(over_caption);
         let row = self
             .model
@@ -130,5 +124,16 @@ impl App {
             .flatten();
         changed |= self.model.model_picker.set_hover(row);
         changed
+    }
+
+    /// Whether `(x, y)` is over the active-model caption: the right half of the
+    /// footnote row, and only when a model is actually named (there is nothing
+    /// clickable otherwise). Shared by hover, press, and the cursor icon so the
+    /// three always agree about where the affordance is.
+    pub(crate) fn over_model_caption(&self, x: f64, y: f64) -> bool {
+        self.model.model.is_some()
+            && x >= self.frame.left + self.frame.column() * 0.5
+            && y >= self.frame.footnote_top
+            && y <= self.frame.footnote_bottom
     }
 }
