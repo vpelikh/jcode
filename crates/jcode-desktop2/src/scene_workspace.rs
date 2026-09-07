@@ -174,6 +174,7 @@ fn retained_session_model(source: &Model, entry: &strip::Panel) -> Model {
         peeks: crate::overview::Peeks::default(),
         resume: crate::resume::Picker::default(),
         help_open: false,
+        palette: crate::palette::Palette::default(),
         working_dir: entry.working_dir.clone(),
         file_tree: crate::file_tree::FileTree::default(),
         model: None,

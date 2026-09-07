@@ -84,6 +84,10 @@ const VIEW_ROWS: &[Row] = &[
         description: "choose model",
     },
     Row {
+        key: "Ctrl/Cmd+P",
+        description: "command palette",
+    },
+    Row {
         key: "Ctrl/Cmd+,",
         description: "settings",
     },

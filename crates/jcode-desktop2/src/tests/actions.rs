@@ -37,6 +37,44 @@ fn ctrl_m_resolves_to_the_model_picker() {
 }
 
 #[test]
+fn ctrl_and_cmd_p_resolve_to_the_command_palette() {
+    assert_eq!(
+        keymap::resolve(&ch('p'), ModifiersState::CONTROL),
+        Some(Action::TogglePalette)
+    );
+    assert_eq!(
+        keymap::resolve(&ch('p'), ModifiersState::SUPER),
+        Some(Action::TogglePalette)
+    );
+}
+
+#[test]
+fn the_palette_opens_closes_and_commits_dispatches_its_action() {
+    let mut app = App::default();
+    app.model.session_id = Some("session_palette".into());
+    let _ = app.apply(Action::TogglePalette, None);
+    assert!(app.model.palette.is_open());
+    // The composer does not capture the palette's keys while it is up.
+    let _ = app.apply(Action::TogglePalette, None);
+    assert!(!app.model.palette.is_open());
+}
+
+#[test]
+fn palette_keydown_types_filters_and_commits_the_highlighted_row() {
+    use winit::keyboard::SmolStr;
+    let mut app = App::default();
+    app.model.session_id = Some("session_palette".into());
+    let _ = app.apply(Action::TogglePalette, None);
+    // Type "theme" and commit with Enter; the ToggleTheme action fires.
+    for c in "theme".chars() {
+        let key = Key::Character(SmolStr::new(c.to_string()));
+        assert!(app.palette_keydown(&key, Some(c.to_string().as_str())));
+    }
+    let committed = app.model.palette.selected().map(|c| c.action);
+    assert_eq!(committed, Some(Action::ToggleTheme));
+}
+
+#[test]
 fn ctrl_alt_space_opens_the_session_overview() {
     use winit::keyboard::{Key, ModifiersState, NamedKey};
 

@@ -314,6 +314,9 @@ impl App {
             self.request_redraw();
             return true;
         }
+        if self.model.palette.is_open() {
+            return self.palette_keydown(logical_key, typed);
+        }
         if self.model.resume.is_open() {
             return self.resume_keydown(logical_key, typed);
         }

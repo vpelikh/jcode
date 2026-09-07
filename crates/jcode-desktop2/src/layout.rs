@@ -133,6 +133,22 @@ pub const MODEL_MENU_RADIUS: f64 = 6.0;
 pub const MODEL_MENU_GAP: f64 = 6.0;
 pub const MODEL_MENU_TEXT_PAD: f64 = 10.0;
 
+/// The command palette card, and a row within it.
+///
+/// A centred card like the help overlay, sized to hold the command list without
+/// eating the page: the whole point of an overlay is that the conversation
+/// stays visible around it. Fractions of the window's short side, clamped so it
+/// is neither unreadable nor a wall.
+pub const PALETTE_WIDTH_FRACTION: f64 = 0.44;
+pub const PALETTE_WIDTH_MIN: f64 = 300.0;
+pub const PALETTE_WIDTH_MAX: f64 = 460.0;
+pub const PALETTE_ROW_HEIGHT: f64 = 30.0;
+pub const PALETTE_SEARCH_HEIGHT: f64 = 34.0;
+pub const PALETTE_PAD: f64 = 10.0;
+pub const PALETTE_RADIUS: f64 = 8.0;
+pub const PALETTE_TEXT_PAD: f64 = 12.0;
+pub const PALETTE_HINT_GAP: f64 = 14.0;
+
 /// The resume overlay: a left panel of stored sessions, a preview to its
 /// right, both floating over the conversation rather than replacing it.
 ///
@@ -516,6 +532,49 @@ impl Frame {
             return None;
         }
         let index = (offset / MODEL_MENU_ROW_HEIGHT) as usize;
+        (index < rows).then_some(index)
+    }
+
+    /// The command-palette card: a centred box sized to `rows` + the query
+    /// line. Clamped so a tall list never touches the page header or the
+    /// composer's footnote.
+    pub fn palette_card(&self, rows: usize) -> vello::kurbo::Rect {
+        let short = self.width.min(self.height).max(1.0);
+        let width = (short * PALETTE_WIDTH_FRACTION).clamp(PALETTE_WIDTH_MIN, PALETTE_WIDTH_MAX);
+        let rows = rows.max(1);
+        let body = rows as f64 * PALETTE_ROW_HEIGHT;
+        let height = PALETTE_SEARCH_HEIGHT + PALETTE_PAD + body + PALETTE_PAD;
+        let available = (self.height - 40.0 * 2.0).max(height);
+        let height = height.min(available);
+        let x0 = (self.width - width) / 2.0;
+        let y0 = (self.height - height) / 2.0;
+        vello::kurbo::Rect::new(x0, y0, x0 + width, y0 + height)
+    }
+
+    /// Row `index` inside the palette card, below the query line.
+    pub fn palette_row(&self, rows: usize, index: usize) -> vello::kurbo::Rect {
+        let card = self.palette_card(rows);
+        let y0 = card.y0 + PALETTE_SEARCH_HEIGHT + PALETTE_PAD + index as f64 * PALETTE_ROW_HEIGHT;
+        vello::kurbo::Rect::new(
+            card.x0 + PALETTE_TEXT_PAD,
+            y0,
+            card.x1 - PALETTE_TEXT_PAD,
+            y0 + PALETTE_ROW_HEIGHT,
+        )
+    }
+
+    /// Row at a point inside the palette card, for pointer hit-testing.
+    pub fn palette_row_at(&self, rows: usize, x: f64, y: f64) -> Option<usize> {
+        let rows = rows.max(1);
+        let card = self.palette_card(rows);
+        if !card.contains(vello::kurbo::Point::new(x, y)) {
+            return None;
+        }
+        let list_top = card.y0 + PALETTE_SEARCH_HEIGHT + PALETTE_PAD;
+        if y < list_top {
+            return None;
+        }
+        let index = ((y - list_top) / PALETTE_ROW_HEIGHT) as usize;
         (index < rows).then_some(index)
     }
 

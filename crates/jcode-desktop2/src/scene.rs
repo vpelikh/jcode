@@ -1892,6 +1892,11 @@ pub fn build_scene(
     // Draw outside the boot reveal layer and after every other overlay. Help is
     // a modal reference, not part of the page fading in underneath it.
     crate::scene_help::draw_help(scene, text, model, &frame, scale);
+
+    // The command palette is drawn on top of everything: it is the single
+    // discoverable entry point, and it closed any other overlay when it opened,
+    // so nothing can legitimately cover it.
+    crate::scene_palette::draw_palette(scene, text, model, &frame, scale);
 }
 
 /// Middle-elide `text` to at most `max_chars` characters, keeping the head and

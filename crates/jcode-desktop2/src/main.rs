@@ -9,6 +9,7 @@ mod activity;
 mod app_harness;
 mod app_model_picker;
 mod app_overview;
+mod app_palette;
 mod app_resume;
 mod app_selection;
 mod app_settings;
@@ -37,6 +38,7 @@ mod mem;
 mod meta;
 mod model_picker;
 mod overview;
+mod palette;
 mod paint;
 mod place;
 mod png;
@@ -48,6 +50,7 @@ mod scene;
 mod scene_file_tree;
 mod scene_help;
 mod scene_overview;
+mod scene_palette;
 mod scene_resume;
 mod scene_workspace;
 mod scroll;
@@ -436,6 +439,10 @@ pub struct Model {
     /// Desktop-native keyboard and local-command reference. This is deliberately
     /// local state: help must be available before a daemon session attaches.
     pub help_open: bool,
+    /// The command palette: one fuzzy type-to-act surface over the desktop's
+    /// real actions. Part of the model so a frame stays a pure function of it
+    /// and the open palette is capturable without a window.
+    pub palette: palette::Palette,
     /// Working directory of the attached session, as the daemon reports it.
     /// `None` until attach, because a guess here is worse than silence: it is
     /// the fact that decides whether an answer applies to your project.
@@ -536,6 +543,7 @@ impl Default for Model {
             peeks: overview::Peeks::default(),
             resume: resume::Picker::default(),
             help_open: false,
+            palette: palette::Palette::default(),
             working_dir: None,
             file_tree: file_tree::FileTree::default(),
             model: None,
@@ -1064,6 +1072,29 @@ impl App {
                 return;
             }
         }
+        // The palette is modal and drawn on top, so it gets the press before
+        // any overlay or the page: a click on a row commits it, a click on the
+        // dimmed paper dismisses, and a click inside the card but off a row is
+        // ignored so the keyboard keeps the highlight.
+        if self.model.palette.is_open() {
+            let rows = self.model.palette.rows().len();
+            match self.frame.palette_row_at(rows, x, y) {
+                Some(index) => {
+                    self.model.palette.select_row(index);
+                    self.palette_commit();
+                }
+                None if !self
+                    .frame
+                    .palette_card(rows)
+                    .contains(vello::kurbo::Point::new(x, y)) =>
+                {
+                    self.model.palette.close();
+                    self.request_redraw();
+                }
+                None => {}
+            }
+            return;
+        }
         // The picker is modal: a click on a row takes it, a click on a project
         // heading opens or shuts it, and a click on the dimmed page around the
         // card dismisses, like any overlay.
@@ -1272,6 +1303,21 @@ impl App {
     fn update_cursor_icon(&mut self) {
         let (x, y) = self.focused_pointer();
         let panel_rows = self.model.panel.rows().len();
+        // The palette's rows are the only clickable thing while it is up, so
+        // the pointer says so there and stays an arrow over the dimmed page.
+        if self.model.palette.is_open() {
+            let wanted = match self.frame.palette_row_at(self.model.palette.rows().len(), x, y) {
+                Some(_) => winit::window::CursorIcon::Pointer,
+                None => winit::window::CursorIcon::Default,
+            };
+            if self.cursor_icon != wanted {
+                self.cursor_icon = wanted;
+                if let Some(state) = self.state.as_ref() {
+                    state.set_cursor_icon(wanted);
+                }
+            }
+            return;
+        }
         // The picker's rows are the only clickable thing while it is up, so the
         // pointer says so there and stays an arrow over the dimmed page.
         if self.model.resume.is_open() {
@@ -1342,6 +1388,21 @@ impl App {
     }
 
     fn on_pointer_moved(&mut self) {
+        // The palette owns the pointer while it is up: hovering a row moves the
+        // highlight so the mouse and the keyboard drive one selection. A hover
+        // off the list leaves the highlight where it was.
+        if self.model.palette.is_open() {
+            let (x, y) = self.focused_pointer();
+            let rows = self.model.palette.rows().len();
+            if let Some(row) = self.frame.palette_row_at(rows, x, y)
+                && row != self.model.palette.cursor()
+            {
+                self.model.palette.select_row(row);
+                self.request_redraw();
+            }
+            self.update_cursor_icon();
+            return;
+        }
         // The picker owns the pointer while it is up: hovering a row moves the
         // highlight, so the mouse and the keyboard drive one selection and the
         // preview follows the cursor. A hover off the list leaves the highlight
@@ -1836,6 +1897,11 @@ impl App {
             }
 
             Action::ToggleModelPicker => self.toggle_model_picker(),
+
+            // The palette opens over everything as the single discoverable
+            // entry point to the chord map; committing a row re-dispatches the
+            // action it names.
+            Action::TogglePalette => self.toggle_palette(),
 
             // The palette, on a key. The notice names what it landed on, so
             // the chord is self-documenting the first time it is hit by

@@ -73,6 +73,7 @@ pub const NODES: &[(&str, NodeBuilder)] = &[
     ("settings_panel", settings_panel),
     ("settings_panel_hover", settings_panel_hover),
     ("model_picker", model_picker),
+    ("palette", palette),
     ("notice", notice),
     ("error", error),
     ("offline", offline),
@@ -125,6 +126,7 @@ fn connecting() -> Model {
         editor: crate::editor::Editor::default(),
         resume: crate::resume::Picker::default(),
         help_open: false,
+        palette: crate::palette::Palette::default(),
         caret: fixed_caret(),
         // Nodes render the focused case: an unfocused window hides the caret,
         // which would make most caret nodes indistinguishable.
@@ -294,6 +296,7 @@ fn attached_empty() -> Model {
         editor: crate::editor::Editor::default(),
         resume: crate::resume::Picker::default(),
         help_open: false,
+        palette: crate::palette::Palette::default(),
         caret: fixed_caret(),
         // Nodes render the focused case: an unfocused window hides the caret,
         // which would make most caret nodes indistinguishable.
@@ -998,6 +1001,21 @@ fn model_picker() -> Model {
                 "The picker will open with Ctrl+M, move with the arrow keys, and close without disturbing your draft.".into(),
             ),
         ]),
+        ..attached_empty()
+    }
+}
+
+/// The command palette open over a conversation: a centred card with the query
+/// line and the command list. The cursor starts on the first row.
+fn palette() -> Model {
+    let mut palette = crate::palette::Palette::default();
+    palette.open();
+    Model {
+        palette,
+        transcript: conversation(vec![(
+            "How do I switch sessions?".into(),
+            "Hit Ctrl/Cmd+P and type to filter; Enter runs the highlighted command.".into(),
+        )]),
         ..attached_empty()
     }
 }
