@@ -18,6 +18,7 @@ impl App {
         let mut turn_ended = false;
         let mut begin_new_panel_slide = false;
         let mut create_startup_panel = false;
+        let mut resume_auto_open = false;
         while let Ok(update) = updates.try_recv() {
             match update {
                 harness::HarnessUpdate::Status(status) => self.model.status = status,
@@ -165,6 +166,10 @@ impl App {
                         // sending so a reconnect can never multiply panels.
                         self.startup_panel_pending = false;
                         create_startup_panel = true;
+                        // Guard the resume auto-open behind the attach: open
+                        // only once, when the workspace first comes up, not on
+                        // a later reconnect.
+                        resume_auto_open = true;
                     }
                     if reconnected {
                         self.model.set_notice("reconnected");
@@ -374,6 +379,13 @@ impl App {
         }
         if create_startup_panel {
             self.new_session();
+        }
+        if resume_auto_open {
+            // Ask the store whether this user is returning to work. If it
+            // finds stored sessions, the resume picker opens over the fresh
+            // page on the first scan (see `drain_resume_scans`). Only when the
+            // workspace first comes up, so a reconnect never re-opens it.
+            self.resume_auto_open_pending = self.start_resume_scan();
         }
         self.model
             .file_tree

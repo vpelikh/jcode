@@ -205,6 +205,14 @@ struct App {
     /// requested, so the reply only replaces the page when nothing new has
     /// streamed in since (which would be clobbered by the stale snapshot).
     reload_len: Option<usize>,
+    /// When the window first attaches, a store scan is kicked off so a
+    /// returning user's sessions can surface without another keystroke. This
+    /// latches once the first scan with stored sessions lands: the resume
+    /// picker opens over the fresh session so "continue what I was doing" is
+    /// the first thing a returning user sees. Cleared as soon as it is spent
+    /// (or once the user has dismissed the picker), so a reconnect never
+    /// re-opens it.
+    resume_auto_open_pending: bool,
     /// Geometry of the most recently built frame. Pointer hit-testing reads
     /// this instead of the GPU state, so input handling is testable without a
     /// window and can never disagree with what was actually drawn.
@@ -251,6 +259,7 @@ impl Default for App {
             startup_panel_pending: true,
             reload_pending: false,
             reload_len: None,
+            resume_auto_open_pending: false,
             // A sensible frame until the first real one is built, so input
             // before the first paint is still handled sanely.
             frame: layout::Frame::new((1100, 720), 1.0),
