@@ -69,6 +69,11 @@ impl App {
                     // queued behind the failed turn gets its chance now
                     // rather than waiting forever.
                     turn_ended = true;
+                    // The transcript reflects the outcome, so a pending history
+                    // reload (which was for the drop that preceded this) is now
+                    // stale.
+                    self.reload_pending = false;
+                    self.reload_len = None;
                 }
                 harness::HarnessUpdate::Attached {
                     session_id,
@@ -264,6 +269,12 @@ impl App {
                     // there is none, and a card left behind would claim work
                     // is still happening.
                     self.model.transcript.clear_live_tool();
+                    // A real turn boundary makes any pending history reload
+                    // stale: this turn streamed its outcome (or the previous
+                    // idle reconnect already applied its). Drop it so it cannot
+                    // fire against a later idle reconnect.
+                    self.reload_pending = false;
+                    self.reload_len = None;
                     // Progress cards deliberately survive the turn: a
                     // backgrounded build keeps running after the agent stops
                     // waiting on it, and its own completion event is what

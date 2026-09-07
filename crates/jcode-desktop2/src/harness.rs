@@ -520,23 +520,15 @@ fn run(
                     // transcript from stored history. The daemon never re-streams
                     // a finished turn to the fresh subscription, so without this
                     // a reply that completed while disconnected never appears.
-                    // Fetched on its own connection for the same isolation as
-                    // `Peek`; the caller only issues it for an idle session.
+                    // Runs on a clone of the *attached* client so `get_history`
+                    // (which requires an attached connection) returns the full,
+                    // authoritative transcript rather than the overview's capped
+                    // preview; the caller only issues it for an idle session.
                     Command::Reload(target) => {
                         let ui = ui.clone();
+                        let client = client.clone();
                         std::thread::spawn(move || {
-                            let reload = JcodeClient::connect(ConnectOptions {
-                                client_name: concat!(
-                                    "jcode-desktop2-reload/",
-                                    env!("CARGO_PKG_VERSION")
-                                )
-                                .to_string(),
-                                ensure_runtime: false,
-                                ..Default::default()
-                            });
-                            if let Ok(client) = reload
-                                && let Ok(messages) = client.peek_session(&target, None)
-                            {
+                            if let Ok(messages) = client.get_history(&target) {
                                 ui.send(HarnessUpdate::History {
                                     session_id: target,
                                     transcript: to_transcript(messages),
