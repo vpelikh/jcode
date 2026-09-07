@@ -429,11 +429,18 @@ mod tests {
     #[test]
     fn resume_landing_is_unseen_until_marked() {
         let mut settings = Settings::default();
-        assert!(!settings.resume_landing_seen, "the first launch should still offer the landing");
-        settings.mark_resume_landing_shown();
-        assert!(settings.resume_landing_seen, "marking should latch it for later launches");
         assert!(
-            Settings::parse_over(Settings::default(), "resume_landing_seen=on\n").resume_landing_seen,
+            !settings.resume_landing_seen,
+            "the first launch should still offer the landing"
+        );
+        settings.mark_resume_landing_shown();
+        assert!(
+            settings.resume_landing_seen,
+            "marking should latch it for later launches"
+        );
+        assert!(
+            Settings::parse_over(Settings::default(), "resume_landing_seen=on\n")
+                .resume_landing_seen,
             "the persisted latch should be read back from the file format"
         );
     }

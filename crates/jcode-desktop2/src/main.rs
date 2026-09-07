@@ -38,8 +38,8 @@ mod mem;
 mod meta;
 mod model_picker;
 mod overview;
-mod palette;
 mod paint;
+mod palette;
 mod place;
 mod png;
 mod profile;
@@ -1306,7 +1306,10 @@ impl App {
         // The palette's rows are the only clickable thing while it is up, so
         // the pointer says so there and stays an arrow over the dimmed page.
         if self.model.palette.is_open() {
-            let wanted = match self.frame.palette_row_at(self.model.palette.rows().len(), x, y) {
+            let wanted = match self
+                .frame
+                .palette_row_at(self.model.palette.rows().len(), x, y)
+            {
                 Some(_) => winit::window::CursorIcon::Pointer,
                 None => winit::window::CursorIcon::Default,
             };

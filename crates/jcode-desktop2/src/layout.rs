@@ -147,7 +147,6 @@ pub const PALETTE_SEARCH_HEIGHT: f64 = 34.0;
 pub const PALETTE_PAD: f64 = 10.0;
 pub const PALETTE_RADIUS: f64 = 8.0;
 pub const PALETTE_TEXT_PAD: f64 = 12.0;
-pub const PALETTE_HINT_GAP: f64 = 14.0;
 
 /// The resume overlay: a left panel of stored sessions, a preview to its
 /// right, both floating over the conversation rather than replacing it.
@@ -1343,6 +1342,42 @@ mod tests {
             assert!(frame.column() > 0.0);
             assert!(frame.body_top <= frame.body_bottom);
             assert!(frame.composer_top < frame.composer_bottom);
+        }
+    }
+
+    #[test]
+    fn palette_rows_stay_ordered_and_inside_the_card() {
+        // The palette card and its rows must be well-formed at any size: rows
+        // strictly ordered, each row inside the card, and neither inverted nor
+        // off-paper on degenerate windows. Locked like the other geometry so a
+        // future tweak cannot push the list over the card's own edge.
+        for &size in SIZES {
+            for &scale in SCALES {
+                let frame = Frame::new(size, scale);
+                let rows = 7;
+                let card = frame.palette_card(rows);
+                assert!(
+                    card.width() > 0.0 && card.height() > 0.0,
+                    "palette card inverted at {size:?} x{scale}"
+                );
+                let mut prev_bottom = card.y0;
+                for index in 0..rows {
+                    let row = frame.palette_row(rows, index);
+                    assert!(
+                        row.y0 >= prev_bottom - 1e-9,
+                        "palette row {index} overlapped the one above at {size:?}"
+                    );
+                    assert!(
+                        row.x0 >= card.x0 && row.x1 <= card.x1,
+                        "palette row {index} escaped the card horizontally at {size:?}"
+                    );
+                    assert!(
+                        row.y0 >= card.y0 && row.y1 <= card.y1 + 1e-9,
+                        "palette row {index} escaped the card vertically at {size:?}"
+                    );
+                    prev_bottom = row.y1;
+                }
+            }
         }
     }
 

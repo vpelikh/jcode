@@ -30,13 +30,41 @@ pub struct Command {
 /// each row must resolve to an action the app really implements, so a novice
 /// is never pointed at something that silently does nothing.
 pub const COMMANDS: &[Command] = &[
-    Command { label: "New session", hint: "Ctrl/Cmd+T", action: Action::SessionNew },
-    Command { label: "Resume a saved session", hint: "Ctrl/Cmd+R", action: Action::ToggleResume },
-    Command { label: "Choose model", hint: "Ctrl/Cmd+M", action: Action::ToggleModelPicker },
-    Command { label: "Settings", hint: "Ctrl/Cmd+,", action: Action::ToggleSettings },
-    Command { label: "Toggle dark / light theme", hint: "Ctrl+Shift+D", action: Action::ToggleTheme },
-    Command { label: "Step through a reply's reasoning", hint: "Ctrl+Shift+R", action: Action::CycleReasoningDisplay },
-    Command { label: "Help", hint: "F1", action: Action::ToggleHelp },
+    Command {
+        label: "New session",
+        hint: "Ctrl/Cmd+T",
+        action: Action::SessionNew,
+    },
+    Command {
+        label: "Resume a saved session",
+        hint: "Ctrl/Cmd+R",
+        action: Action::ToggleResume,
+    },
+    Command {
+        label: "Choose model",
+        hint: "Ctrl/Cmd+M",
+        action: Action::ToggleModelPicker,
+    },
+    Command {
+        label: "Settings",
+        hint: "Ctrl/Cmd+,",
+        action: Action::ToggleSettings,
+    },
+    Command {
+        label: "Toggle dark / light theme",
+        hint: "Ctrl+Shift+D",
+        action: Action::ToggleTheme,
+    },
+    Command {
+        label: "Step through a reply's reasoning",
+        hint: "Ctrl+Shift+R",
+        action: Action::CycleReasoningDisplay,
+    },
+    Command {
+        label: "Help",
+        hint: "F1",
+        action: Action::ToggleHelp,
+    },
 ];
 
 /// The palette's modal state: whether it is open, the query, and where the
@@ -62,8 +90,7 @@ impl Palette {
         let mut matched: Vec<&'static Command> = COMMANDS
             .iter()
             .filter(|command| {
-                query.is_empty()
-                    || jcode_fuzzy::fuzzy_match(query, command.label).is_some()
+                query.is_empty() || jcode_fuzzy::fuzzy_match(query, command.label).is_some()
             })
             .collect();
         if !query.is_empty() {
@@ -201,11 +228,23 @@ mod tests {
         for _ in 0..len.saturating_sub(1) {
             palette.next();
         }
-        assert_eq!(palette.cursor(), len - 1, "cursor should rest on the last row");
+        assert_eq!(
+            palette.cursor(),
+            len - 1,
+            "cursor should rest on the last row"
+        );
         palette.next();
-        assert_eq!(palette.cursor(), 0, "next past the last row wraps to the top");
+        assert_eq!(
+            palette.cursor(),
+            0,
+            "next past the last row wraps to the top"
+        );
         palette.prev();
-        assert_eq!(palette.cursor(), len - 1, "prev from the top wraps to the last row");
+        assert_eq!(
+            palette.cursor(),
+            len - 1,
+            "prev from the top wraps to the last row"
+        );
     }
 
     #[test]
@@ -216,6 +255,9 @@ mod tests {
             palette.type_char(ch);
         }
         palette.clamp();
-        assert_eq!(palette.selected().unwrap().label, "Toggle dark / light theme");
+        assert_eq!(
+            palette.selected().unwrap().label,
+            "Toggle dark / light theme"
+        );
     }
 }

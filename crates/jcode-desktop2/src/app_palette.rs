@@ -51,11 +51,12 @@ impl App {
                 NamedKey::Space => self.model.palette.type_char(' '),
                 _ => {}
             },
-            winit::keyboard::Key::Character(text) => {
+            winit::keyboard::Key::Character(_text) => {
                 // The chord that opened the palette (Ctrl/Cmd+P) also closes
                 // it. Escape is handled in the named arm; this is the fallback
                 // so the opening chord is a toggle even mid-gesture.
-                if keymap::resolve(logical_key, self.modifiers) == Some(keymap::Action::TogglePalette)
+                if keymap::resolve(logical_key, self.modifiers)
+                    == Some(keymap::Action::TogglePalette)
                 {
                     self.model.palette.close();
                     self.request_redraw();
@@ -67,7 +68,6 @@ impl App {
                 if let Some(ch) = typed.and_then(|t| t.chars().next()) {
                     self.model.palette.type_char(ch);
                 }
-                let _ = text;
             }
             _ => {}
         }

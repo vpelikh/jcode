@@ -201,5 +201,8 @@ fn clicking_the_model_caption_opens_the_catalog() {
     let y = (f.footnote_top + f.footnote_bottom) / 2.0;
     click(&mut app, (x, y));
     // The harness send succeeds (receiver alive), so the picker opens.
-    assert!(app.model.model_picker.is_open(), "caption click should open the picker");
+    assert!(
+        app.model.model_picker.is_open(),
+        "caption click should open the picker"
+    );
 }
