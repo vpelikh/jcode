@@ -539,7 +539,12 @@ impl Frame {
     /// composer's footnote.
     pub fn palette_card(&self, rows: usize) -> vello::kurbo::Rect {
         let short = self.width.min(self.height).max(1.0);
-        let width = (short * PALETTE_WIDTH_FRACTION).clamp(PALETTE_WIDTH_MIN, PALETTE_WIDTH_MAX);
+        // Never wider than the page the card is drawn on: on a window narrower
+        // than the 300px floor the card must shrink to fit, not spill off the
+        // left edge. The floor is a target, not a guarantee, on tiny windows.
+        let width = (short * PALETTE_WIDTH_FRACTION)
+            .clamp(PALETTE_WIDTH_MIN, PALETTE_WIDTH_MAX)
+            .min(self.width);
         let rows = rows.max(1);
         let body = rows as f64 * PALETTE_ROW_HEIGHT;
         let height = PALETTE_SEARCH_HEIGHT + PALETTE_PAD + body + PALETTE_PAD;
@@ -1351,7 +1356,8 @@ mod tests {
         // strictly ordered, each row inside the card, and neither inverted nor
         // off-paper on degenerate windows. Locked like the other geometry so a
         // future tweak cannot push the list over the card's own edge.
-        for &size in SIZES {
+        let sizes: &[(u32, u32)] = &[(200, 400), (300, 200), (320, 240), (640, 480)];
+        for &size in sizes {
             for &scale in SCALES {
                 let frame = Frame::new(size, scale);
                 let rows = 7;
@@ -1359,6 +1365,10 @@ mod tests {
                 assert!(
                     card.width() > 0.0 && card.height() > 0.0,
                     "palette card inverted at {size:?} x{scale}"
+                );
+                assert!(
+                    card.x0 >= 0.0 && card.x1 <= frame.width,
+                    "palette card spilled off-paper at {size:?} x{scale}"
                 );
                 let mut prev_bottom = card.y0;
                 for index in 0..rows {
