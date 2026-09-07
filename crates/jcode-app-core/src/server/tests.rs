@@ -139,6 +139,14 @@ async fn close_owned_sessions_marks_live_sessions_closed_and_clears_markers() {
         crate::session::SessionStatus::Closed,
         "a gracefully-shutdown session must be Closed, not left Active"
     );
+
+    // Acceptance boundary: the crash scan that drives the picker and restart
+    // flows must no longer report this session as "exited unexpectedly".
+    let reported = crate::session::find_recent_crashed_sessions();
+    assert!(
+        !reported.iter().any(|(id, _)| id == &session_id),
+        "a gracefully-shutdown session must not be reported as crashed by the scan"
+    );
 }
 
 #[test]
