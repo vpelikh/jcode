@@ -60,6 +60,27 @@ fn the_palette_opens_closes_and_commits_dispatches_its_action() {
 }
 
 #[test]
+fn every_palette_command_dispatches_safely_and_closes_the_palette() {
+    // The palette registry must never drift from the actions the app can
+    // actually run: if a future Action is added to COMMANDS but not handled
+    // by `apply`, this test fails where the user would have been hit by a
+    // row that silently did nothing. Mirror of the ported-chord sweep.
+    for (index, command) in crate::palette::COMMANDS.iter().enumerate() {
+        let mut app = App::default();
+        app.model.session_id = Some("session_palette".into());
+        app.model.palette.open();
+        assert!(app.model.palette.select_row(index));
+        let kept = app.palette_commit();
+        assert!(kept, "committing {:?} requested exit", command.label);
+        assert!(
+            !app.model.palette.is_open(),
+            "palette stayed open after committing {:?}",
+            command.label
+        );
+    }
+}
+
+#[test]
 fn palette_keydown_types_filters_and_commits_the_highlighted_row() {
     use winit::keyboard::SmolStr;
     let mut app = App::default();

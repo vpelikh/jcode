@@ -67,14 +67,24 @@ impl App {
             // If this is the very first launch and the store has history,
             // spend the auto-open latch once: a returning user lands on the
             // resume picker instead of a blank page, so "continue what I was
-            // doing" is the first thing they see. The picker closes normally
-            // afterwards and this never re-opens on a reconnect.
-            if self.resume_auto_open_pending && !self.model.resume.records().is_empty() {
+            // doing" is the first thing they see. Only the first time: once
+            // shown (or dismissed), the latch is persisted and later launches
+            // never interrupt with it again.
+            if self.resume_auto_open_pending
+                && !self.model.resume.records().is_empty()
+                && !self.model.settings.resume_landing_seen
+            {
                 self.resume_auto_open_pending = false;
+                self.model.settings.mark_resume_landing_shown();
                 self.model.panel.close();
                 if !self.model.resume.is_open() {
                     self.model.resume.open(false);
                 }
+            } else if self.resume_auto_open_pending {
+                // Either there is no history yet, or the landing has already
+                // been shown on an earlier launch. Either way, do not re-open
+                // on a later scan.
+                self.resume_auto_open_pending = false;
             }
             // The highlight may now be on a different session than the one
             // whose tail we fetched, so ask for the new one.

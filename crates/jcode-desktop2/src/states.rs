@@ -185,6 +185,7 @@ fn connecting() -> Model {
             reasoning: crate::reasoning::ReasoningMode::Current,
             motion: true,
             copy_on_select: false,
+            resume_landing_seen: false,
         },
         panel: crate::settings::Panel::default(),
     }
@@ -353,6 +354,7 @@ fn attached_empty() -> Model {
             reasoning: crate::reasoning::ReasoningMode::Current,
             motion: true,
             copy_on_select: false,
+            resume_landing_seen: false,
         },
         panel: crate::settings::Panel::default(),
     }
@@ -971,6 +973,7 @@ fn settings_panel_hover() -> Model {
             reasoning: crate::reasoning::ReasoningMode::Full,
             motion: false,
             copy_on_select: false,
+            resume_landing_seen: false,
         },
         ..attached_empty()
     }

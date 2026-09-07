@@ -21,6 +21,7 @@ fn app() -> App {
         reasoning: crate::reasoning::ReasoningMode::Current,
         motion: true,
         copy_on_select: false,
+        resume_landing_seen: false,
     };
     // The window is pinned to match, so a developer whose saved theme is dark
     // does not see a different starting state than one whose is light.

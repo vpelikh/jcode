@@ -72,6 +72,12 @@ pub struct Settings {
     /// settings file and `JCODE_DESKTOP2_COPY_ON_SELECT` rather than spending
     /// a row on a click nobody repeats.
     pub copy_on_select: bool,
+    /// Whether the one-time "resume a previous session" landing has been shown
+    /// to this user. On the very first launch with stored history the resume
+    /// picker opens once; afterwards it never interrupts again, so a returning
+    /// user who cleared it is not asked every time. Not a panel row: like
+    /// `copy_on_select` it is a latch, not a preference to keep changing.
+    pub resume_landing_seen: bool,
 }
 
 impl Default for Settings {
@@ -81,6 +87,7 @@ impl Default for Settings {
             reasoning: ReasoningMode::default(),
             motion: true,
             copy_on_select: false,
+            resume_landing_seen: false,
         }
     }
 }
@@ -178,16 +185,18 @@ impl Settings {
             motion: !crate::donut_disabled(),
             copy_on_select: std::env::var("JCODE_DESKTOP2_COPY_ON_SELECT")
                 .is_ok_and(|value| matches!(value.trim(), "1" | "on" | "true")),
+            resume_landing_seen: false,
         }
     }
 
     pub fn serialize(&self) -> String {
         format!(
-            "theme={}\nreasoning_display={}\nmotion={}\ncopy_on_select={}\n",
+            "theme={}\nreasoning_display={}\nmotion={}\ncopy_on_select={}\nresume_landing_seen={}\n",
             self.value(Row::Theme),
             self.value(Row::Reasoning),
             self.value(Row::Motion),
             on_off(self.copy_on_select),
+            on_off(self.resume_landing_seen),
         )
     }
 
@@ -223,6 +232,11 @@ impl Settings {
                 "copy_on_select" => {
                     if let Some(on) = parse_on_off(value) {
                         settings.copy_on_select = on;
+                    }
+                }
+                "resume_landing_seen" => {
+                    if let Some(on) = parse_on_off(value) {
+                        settings.resume_landing_seen = on;
                     }
                 }
                 _ => {}
@@ -277,6 +291,15 @@ impl Settings {
         if let Err(error) = self.try_save() {
             eprintln!("settings: not saved: {error}");
         }
+    }
+
+    /// Record that the one-time resume landing has been shown, so later
+    /// launches never interrupt with it again, and persist immediately. The
+    /// save is best-effort (see [`Self::save`]): if it fails, the worst case
+    /// is a future launch briefly reminds the user again, never a crash.
+    pub fn mark_resume_landing_shown(&mut self) {
+        self.resume_landing_seen = true;
+        self.save();
     }
 
     fn try_save(&self) -> std::io::Result<()> {
@@ -366,6 +389,7 @@ mod tests {
             reasoning: ReasoningMode::Off,
             motion: false,
             copy_on_select: true,
+            resume_landing_seen: true,
         };
         assert_eq!(
             Settings::parse_over(Settings::default(), &settings.serialize()),
@@ -400,6 +424,20 @@ mod tests {
         assert!(Settings::parse_over(Settings::default(), "copy_on_select=on\n").copy_on_select);
     }
 
+    /// The one-time resume landing defaults to unseen and marks itself so after
+    /// it has been shown, so a returning user is asked at most once.
+    #[test]
+    fn resume_landing_is_unseen_until_marked() {
+        let mut settings = Settings::default();
+        assert!(!settings.resume_landing_seen, "the first launch should still offer the landing");
+        settings.mark_resume_landing_shown();
+        assert!(settings.resume_landing_seen, "marking should latch it for later launches");
+        assert!(
+            Settings::parse_over(Settings::default(), "resume_landing_seen=on\n").resume_landing_seen,
+            "the persisted latch should be read back from the file format"
+        );
+    }
+
     #[test]
     fn a_partial_file_leaves_the_other_keys_alone() {
         let base = Settings {
@@ -407,12 +445,14 @@ mod tests {
             reasoning: ReasoningMode::Full,
             motion: false,
             copy_on_select: true,
+            resume_landing_seen: true,
         };
         let parsed = Settings::parse_over(base, "theme=light\n");
         assert_eq!(parsed.theme, ThemeMode::Light);
         assert_eq!(parsed.reasoning, ReasoningMode::Full);
         assert!(!parsed.motion);
         assert!(parsed.copy_on_select);
+        assert!(parsed.resume_landing_seen);
     }
 
     #[test]
