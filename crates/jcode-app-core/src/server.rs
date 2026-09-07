@@ -747,11 +747,9 @@ pub struct Server {
     gateway_config_override: Option<crate::gateway::GatewayConfig>,
     /// Server identity for multi-server support
     identity: ServerIdentity,
-    /// Broadcast channel for streaming events to all subscribers
-    event_tx: broadcast::Sender<ServerEvent>,
     /// Active sessions (session_id -> Agent)
     sessions: Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>,
-    /// Current processing state
+    /// Current processing state.
     is_processing: Arc<RwLock<bool>>,
     /// Session ID for the default session
     session_id: Arc<RwLock<String>>,
@@ -812,7 +810,6 @@ impl Server {
         // Copilot, Antigravity, Gemini, Cursor, Bedrock, and OpenRouter.
         crate::provider::set_active_provider(Arc::clone(&provider));
 
-        let (event_tx, _) = broadcast::channel(1024);
         let (client_debug_response_tx, _) = broadcast::channel(64);
 
         // Generate a memorable server name unless the operator configured a
@@ -853,7 +850,6 @@ impl Server {
             debug_socket_path: debug_socket_path(),
             gateway_config_override: None,
             identity,
-            event_tx,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             is_processing: Arc::new(RwLock::new(false)),
             session_id: Arc::new(RwLock::new(String::new())),

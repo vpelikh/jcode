@@ -447,9 +447,7 @@ pub(super) async fn handle_client(
     // service split: callers pass typed handles instead of a 28-arg positional
     // list, while the handler body is unchanged.
     let sessions = session_service.sessions;
-    let _global_event_tx = session_service.event_tx;
     let provider_template = client_service.provider;
-    let _global_is_processing = session_service.is_processing;
     let global_session_id = session_service.session_id;
     let client_count = client_service.client_count;
     let client_connections = client_service.client_connections;
