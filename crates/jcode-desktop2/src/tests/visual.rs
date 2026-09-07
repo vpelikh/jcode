@@ -129,12 +129,12 @@ impl Rendered {
 
     /// Vertical extent, in logical units, of the composer wash as actually
     /// drawn. The composer is an outlined field, so its top and bottom borders
-    /// are horizontal lines spanning the measure column. Those are the
-    /// full-width inked rows; the well is the bottom-most outlined figure on
-    /// the page, so its borders are the lowest two such rows that are not
-    /// separated by a full-width gap from the page bottom's footnote. Cards and
-    /// busy spinners never form full-width border lines (they are bounded
-    /// blobs), so they cannot be mistaken for the well.
+    /// are horizontal lines spanning the measure column, and the well is the
+    /// bottom-most outlined figure on the page. A row counts as a border when
+    /// most of the measure column is inked in it; cards and busy spinners are
+    /// bounded blobs rather than full-width lines, so they never register.
+    /// The few full-width rows the notes/transcript draw collapse into bands,
+    /// and the two lowest bands are the well's top and bottom borders.
     pub(super) fn wash_band(&self) -> Option<(f64, f64)> {
         let s = self.frame.scale;
         let (x0, x1) = (2.0, self.frame.right - 4.0);
