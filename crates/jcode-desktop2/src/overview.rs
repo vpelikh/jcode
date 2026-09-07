@@ -71,12 +71,16 @@ pub fn area(frame: &crate::layout::Frame) -> (f64, f64, f64, f64) {
     let width = (frame.width * 0.84).min(960.0).max(1.0);
     let height = (frame.height * 0.68).min(620.0).max(1.0);
     let column_mid = (frame.left + frame.right) / 2.0;
-    // The widest a field can be while its midpoint stays on the column's.
-    let flank_room = column_mid.min(frame.width - column_mid).max(1.0);
-    let width = width.min(flank_room * 2.0);
-    let left = (column_mid - width / 2.0).max(0.0);
+    // Half-width that keeps the field symmetric about the column's midpoint
+    // while never crossing either window edge. The narrower flank wins, so a
+    // column hugging an edge at a degenerate window (e.g. a sidebar wider than
+    // the window) yields a field that ends exactly at that edge rather than
+    // leaking past it. `frame` clamps `left >= 0` and `right <= width`, so
+    // `column_mid` is always within the window and `half` stays non-negative.
+    let half = (width / 2.0).min(column_mid).min(frame.width - column_mid);
+    let left = column_mid - half;
     let top = (frame.height - height) / 2.0;
-    (left, top, left + width, top + height)
+    (left, top, left + half * 2.0, top + height)
 }
 
 /// A direction for keyboard navigation across the field.
@@ -1000,6 +1004,61 @@ mod tests {
                 "overlay filled the page at {size:?}"
             );
             assert!(right - left <= 960.0 && bottom - top <= 620.0);
+        }
+    }
+
+    /// Exhaustive sweep: the overview field must stay inside the window and
+    /// symmetric about the page column's midpoint for *every* plausible
+    /// window width, height, scale, and sidebar width.
+    ///
+    /// The discrete point checks above catch the sizes a human thinks to try.
+    /// This step scan catches the ones in between — the width where a narrow
+    /// window with a wide sidebar first crosses into overflow, or a HiDPI
+    /// half-pixel or a sidebar wider than the window. It is the guarantee the
+    /// field can never read as "larger than the window".
+    #[test]
+    fn the_field_stays_on_paper_across_the_whole_sweep() {
+        for height in [540usize, 720, 900, 1080] {
+            for scale in [1.0f64, 1.25, 1.5, 1.75, 2.0] {
+                for sidebar in [0.0f64, 120.0, 252.0, 380.0] {
+                    for width in (280usize..=2200).step_by(60) {
+                        let frame = crate::layout::Frame::with_content_sidebar(
+                            (width as u32, height as u32),
+                            scale,
+                            1,
+                            false,
+                            0.0,
+                            sidebar,
+                        );
+                        let (left, top, right, bottom) = area(&frame);
+                        let ctx = format!("w{width} h{height} s{scale} bar{sidebar}");
+                        // On-paper on every side.
+                        assert!(
+                            left >= -1e-6 && right <= frame.width + 1e-6,
+                            "{ctx}: field [{left:.2},{right:.2}] left the window [0,{:.2}]",
+                            frame.width
+                        );
+                        assert!(
+                            top >= -1e-6 && bottom <= frame.height + 1e-6,
+                            "{ctx}: field y [{top:.2},{bottom:.2}] left the window [0,{:.2}]",
+                            frame.height
+                        );
+                        // Symmetric about the column midpoint.
+                        let field_mid = (left + right) / 2.0;
+                        let column_mid = (frame.left + frame.right) / 2.0;
+                        assert!(
+                            (field_mid - column_mid).abs() < 1.0,
+                            "{ctx}: field mid {field_mid:.2} strayed from column mid {column_mid:.2}"
+                        );
+                        // Non-degenerate.
+                        assert!(
+                            right - left >= 1.0,
+                            "{ctx}: field collapsed to width {:.2}",
+                            right - left
+                        );
+                    }
+                }
+            }
         }
     }
 }
