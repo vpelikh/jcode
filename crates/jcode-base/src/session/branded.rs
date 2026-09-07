@@ -38,9 +38,12 @@ use std::fmt;
 ///   `Ord`, `Display`, `From<String>`, and `From<&str>`;
 /// - has `Self::new(prefix)` generating a fresh id via `crate::id::new_id`,
 ///   and `Self::from_static(prefix, literal)` for deterministic test ids.
-/// - exposes `Self::as_str()`/`Self::is_empty()` as the *only* read access; it
-///   implements no `Deref`/`AsRef`/`Into<String>`, so a branded id cannot be
-///   silently treated as (or round-tripped through) a generic string.
+/// - exposes `Self::as_str()`/`Self::is_empty()` for explicit borrowed access;
+///   it implements no `Deref`/`AsRef`/`Into<String>`, so a branded id cannot be
+///   *silently* dereferenced to a generic string. `Display` is provided only for
+///   formatting/error text (e.g. `SessionEventError` messages); extracting the
+///   string still requires an explicit `{}`/`.to_string()` call, never an
+///   implicit coercion at a `&str`/`String` site.
 macro_rules! branded_id {
     (
         $(#[doc = $doc:literal])*
@@ -70,12 +73,12 @@ macro_rules! branded_id {
                 Self(format!("{prefix}_{literal}"))
             }
 
-            /// The underlying string.
+            /// The underlying string, as a borrowed `&str`.
             ///
-            /// This is the *only* way to extract the raw string from a branded
-            /// id. The type deliberately implements no `Deref`/`AsRef`/`Into<String>`
-            /// so a branded id cannot be silently treated as a generic string
-            /// (or round-tripped through `String`) without an explicit call.
+            /// This is the explicit way to read the raw string from a branded id.
+            /// The type implements no `Deref`/`AsRef`/`Into<String>`, so a branded
+            /// id is never *implicitly* coerced to a generic string; `Display`
+            /// (`.to_string()`) exists only for formatting/error text.
             pub fn as_str(&self) -> &str {
                 &self.0
             }
@@ -172,15 +175,14 @@ mod tests {
     }
 
     #[test]
-    fn as_str_is_the_only_string_access() {
+    fn as_str_is_the_explicit_string_access() {
         let ev = EventId::from("event_x");
         assert_eq!(ev.as_str(), "event_x");
-        // Display is available for formatting/logging but is NOT a conversion
-        // back to `String` the caller can type-check against the id type.
+        // Display is available for formatting but is an explicit conversion
+        // (a `{}`/`.to_string()` call), not an implicit coercion to `&str`/`String`.
         assert_eq!(ev.to_string(), "event_x");
-        // The type deliberately provides no `Deref`/`AsRef<str>`/`Into<String>`,
-        // so there is no way to treat the id as a bare string except `as_str`.
-        // (This is enforced at compile time by the absence of those impls.)
+        // The type provides no `Deref`/`AsRef<str>`/`Into<String>`, so it can
+        // never be *implicitly* used where a `&str` or `String` is expected.
     }
 
     #[test]
