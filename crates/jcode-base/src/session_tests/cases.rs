@@ -935,7 +935,7 @@ fn load_for_remote_startup_preserves_journaled_log_only_events() -> Result<()> {
     assert!(
         session.append_session_event(SessionEvent {
             timestamp: Utc::now(),
-            event_id: "plugin_remote_1".to_string(),
+            event_id: "plugin_remote_1".to_string().into(),
             op: SessionEventOp::Unknown {
                 event_type: "plugin/remote".to_string(),
                 data: serde_json::json!({ "k": "v" }),
@@ -3042,7 +3042,7 @@ fn test_journal_append_reload_keeps_sources_consistent() -> Result<()> {
     session.compaction = Some(compaction.clone());
     let plugin_event = SessionEvent {
         timestamp: chrono::Utc::now(),
-        event_id: "plugin_1".to_string(),
+        event_id: "plugin_1".to_string().into(),
         op: SessionEventOp::Unknown {
             event_type: "review_round".to_string(),
             data: serde_json::json!({ "rounds": 3 }),
@@ -3348,7 +3348,7 @@ fn unknown_plugin_event_survives_public_api_journal_append_reload() -> Result<()
     // then save → journal append path.
     let appended = session.append_session_event(SessionEvent {
         timestamp: chrono::Utc::now(),
-        event_id: "plugin_checkpoint_1".to_string(),
+        event_id: "plugin_checkpoint_1".to_string().into(),
         op: SessionEventOp::Unknown {
             event_type: "plugin/checkpoint".to_string(),
             data: serde_json::json!({ "turns": 42, "sha": "abc" }),
@@ -3503,7 +3503,7 @@ fn log_only_plugin_event_forces_persistence_without_message() -> Result<()> {
     assert!(session.ensure_initial_session_context_message());
     let appended = session.append_session_event(SessionEvent {
         timestamp: chrono::Utc::now(),
-        event_id: "plugin_marker".to_string(),
+        event_id: "plugin_marker".to_string().into(),
         op: SessionEventOp::Unknown {
             event_type: "plugin/marker".to_string(),
             data: serde_json::json!({ "submission": true }),
@@ -3582,7 +3582,7 @@ fn test_journal_salvage_preserves_unknown_event_from_glued_entry() -> Result<()>
     assert!(
         session.append_session_event(SessionEvent {
             timestamp: chrono::Utc::now(),
-            event_id: "plugin_salvage_1".to_string(),
+            event_id: "plugin_salvage_1".to_string().into(),
             op: SessionEventOp::Unknown {
                 event_type: "plugin/checkpoint".to_string(),
                 data: serde_json::json!({ "salvaged": true }),

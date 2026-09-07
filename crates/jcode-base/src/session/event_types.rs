@@ -1,6 +1,7 @@
+use crate::session::model::StoredReplayEvent;
+use crate::session::{CompactionId, EventId, MessageId};
 use chrono::{DateTime, Utc};
 use jcode_session_types::{StoredCompactionState, StoredMemoryInjection, StoredMessage};
-use crate::session::model::StoredReplayEvent;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
@@ -18,11 +19,11 @@ const MAX_EVENT_AGE_SECS: i64 = 86400 * 365; // ~1 year
 #[derive(Debug, Clone)]
 pub enum SessionEventError {
     /// Event ID is invalid or malformed
-    InvalidEventId { event_id: String },
+    InvalidEventId { event_id: EventId },
     /// Event timestamp is invalid (too far in future or past)
     InvalidTimestamp { timestamp: DateTime<Utc> },
     /// Message content is invalid
-    InvalidMessageContent { message_id: String },
+    InvalidMessageContent { message_id: MessageId },
     /// Compaction state is invalid
     InvalidCompactionState { reason: String },
     /// Memory injection data is invalid
@@ -77,7 +78,7 @@ impl Error for SessionEventError {}
 pub enum SessionEventOp {
     /// Append a new message to the session
     AppendMessage {
-        message_id: String,
+        message_id: MessageId,
         message: StoredMessage,
     },
     /// Replace messages in a range
@@ -114,7 +115,7 @@ pub enum SessionEventOp {
     /// Carries the compaction id / boundary being consolidated so a crash that
     /// happens mid-run can be tied back to which span was being summarized.
     CompactionStart {
-        compaction_id: String,
+        compaction_id: CompactionId,
         /// Number of turns being summarized in this bracket (diagnostic).
         covers_up_to_turn: usize,
     },
@@ -365,7 +366,7 @@ impl<'de> Deserialize<'de> for SessionEventOp {
 /// with no `op` tag).
 #[derive(Deserialize)]
 struct AppendMessageFields {
-    message_id: String,
+    message_id: MessageId,
     message: StoredMessage,
 }
 #[derive(Deserialize)]
@@ -393,7 +394,7 @@ struct SetCompactionFields {
 }
 #[derive(Deserialize)]
 struct CompactionStartFields {
-    compaction_id: String,
+    compaction_id: CompactionId,
     covers_up_to_turn: usize,
 }
 #[derive(Deserialize)]
@@ -405,11 +406,11 @@ struct CompactionEndFields {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionEvent {
     pub timestamp: DateTime<Utc>,
-    pub event_id: String,
+    pub event_id: EventId,
     pub op: SessionEventOp,
     /// Optional parent event ID for merge-extensibility
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_id: Option<String>,
+    pub parent_id: Option<EventId>,
     /// Version for conflict resolution
     pub version: u64,
 }
@@ -679,10 +680,10 @@ impl SessionEventMap {
     }
 
     /// Open a compaction bracket by appending a `CompactionStart` marker.
-    pub fn start_compaction(&mut self, compaction_id: impl Into<String>, covers_up_to_turn: usize) {
+    pub fn start_compaction(&mut self, compaction_id: impl Into<CompactionId>, covers_up_to_turn: usize) {
         let event = SessionEvent {
             timestamp: chrono::Utc::now(),
-            event_id: crate::id::new_id("compaction_start"),
+            event_id: crate::id::new_id("compaction_start").into(),
             op: SessionEventOp::CompactionStart {
                 compaction_id: compaction_id.into(),
                 covers_up_to_turn,
@@ -701,7 +702,7 @@ impl SessionEventMap {
     pub fn end_compaction(&mut self, compaction: StoredCompactionState) {
         let event = SessionEvent {
             timestamp: chrono::Utc::now(),
-            event_id: crate::id::new_id("compaction_end"),
+            event_id: crate::id::new_id("compaction_end").into(),
             op: SessionEventOp::CompactionEnd {
                 compaction: compaction.clone(),
             },
@@ -783,7 +784,7 @@ impl SessionEventMap {
             SessionEventOp::Unknown { event_type, .. } => {
                 if event_type.is_empty() {
                     return Err(SessionEventError::InvalidEventId {
-                        event_id: "<unknown op>".to_string(),
+                        event_id: EventId::from("<unknown op>"),
                     });
                 }
             }
@@ -794,17 +795,21 @@ impl SessionEventMap {
     }
     
     /// Validate a message content
-    fn validate_message(message: &StoredMessage, message_id: &str) -> Result<(), SessionEventError> {
-        if message.id.is_empty() && message_id.is_empty() {
+    fn validate_message(message: &StoredMessage, event_id: &EventId) -> Result<(), SessionEventError> {
+        if message.id.is_empty() && event_id.is_empty() {
             return Err(SessionEventError::InvalidMessageContent {
-                message_id: message_id.to_string()
+                message_id: MessageId::from(event_id.as_str())
             });
         }
         // A message with no content blocks carries no signal (neither text nor
         // tool use/result); refuse to record it so the log stays meaningful.
         if message.content.is_empty() {
             return Err(SessionEventError::InvalidMessageContent {
-                message_id: if message.id.is_empty() { message_id.to_string() } else { message.id.clone() }
+                message_id: if message.id.is_empty() {
+                    MessageId::from(event_id.as_str())
+                } else {
+                    MessageId::from(message.id.clone())
+                }
             });
         }
         Ok(())

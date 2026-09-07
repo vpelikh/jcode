@@ -572,7 +572,7 @@ impl Agent {
                     // with the sanitized compaction state.
                     self.session.append_session_event(SessionEvent {
                         timestamp: Utc::now(),
-                        event_id: crate::id::new_id("compaction"),
+                        event_id: crate::id::new_id("compaction").into(),
                         op: SessionEventOp::SetCompaction { compaction: inner },
                         parent_id: None,
                         version: 1,

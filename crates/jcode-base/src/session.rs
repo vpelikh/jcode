@@ -36,6 +36,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
 pub mod event_types;
+mod branded;
+pub use branded::{CompactionId, EventId, MessageId};
 pub use invariants::{
     CompactionBracket, InvariantLog, InvariantRegistry, InvariantViolation, LogInvariant,
     LogProjection, MessageCountProjection, fold_projection, project_map,
@@ -1496,7 +1498,7 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
     fn record_transcript_replacement(&mut self) {
         let event = SessionEvent {
             timestamp: chrono::Utc::now(),
-            event_id: crate::id::new_id("transcript_mutation"),
+            event_id: crate::id::new_id("transcript_mutation").into(),
             op: SessionEventOp::ReplaceMessages {
                 start_index: 0,
                 end_index: usize::MAX,
@@ -1520,9 +1522,9 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         };
         let event = SessionEvent {
             timestamp: chrono::Utc::now(),
-            event_id: message_id.clone(),
+            event_id: message_id.clone().into(),
             op: SessionEventOp::AppendMessage {
-                message_id: message_id.clone(),
+                message_id: message_id.clone().into(),
                 message: message.clone(),
             },
             parent_id: None,
@@ -1569,7 +1571,7 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         let message_id = crate::id::new_id("insert");
         let event = SessionEvent {
             timestamp: chrono::Utc::now(),
-            event_id: message_id.clone(),
+            event_id: message_id.clone().into(),
             op: SessionEventOp::InsertMessage { index, message: message.clone() },
             parent_id: None,
             version: 1,
@@ -1605,7 +1607,7 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         // "to the end".
         let event = SessionEvent {
             timestamp: chrono::Utc::now(),
-            event_id: crate::id::new_id("replace_all"),
+            event_id: crate::id::new_id("replace_all").into(),
             op: SessionEventOp::ReplaceMessages {
                 start_index: 0,
                 end_index: usize::MAX,
@@ -1643,7 +1645,7 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
             // desyncs the derived log from the truncated legacy vector).
             let event = SessionEvent {
                 timestamp: chrono::Utc::now(),
-                event_id: crate::id::new_id("truncate"),
+                event_id: crate::id::new_id("truncate").into(),
                 op: SessionEventOp::ReplaceMessages {
                     start_index: len,
                     end_index: usize::MAX,
@@ -1669,7 +1671,7 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
     pub fn clear_messages(&mut self) {
         let event = SessionEvent {
             timestamp: chrono::Utc::now(),
-            event_id: crate::id::new_id("clear_all"),
+            event_id: crate::id::new_id("clear_all").into(),
             op: SessionEventOp::ClearAll,
             parent_id: None,
             version: 1,
@@ -1818,7 +1820,7 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         // Append to event log
         let event = SessionEvent {
             timestamp: injection.timestamp,
-            event_id: crate::id::new_id("mem_inj"),
+            event_id: crate::id::new_id("mem_inj").into(),
             op: SessionEventOp::MemoryInjection {
                 memory_injection: injection.clone(),
             },
@@ -1876,7 +1878,7 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
     pub fn record_replay_event(&mut self, replay_event: &StoredReplayEvent) {
         let event = SessionEvent {
             timestamp: replay_event.timestamp,
-            event_id: crate::id::new_id("replay"),
+            event_id: crate::id::new_id("replay").into(),
             op: SessionEventOp::ReplayEvent {
                 replay_event: replay_event.clone(),
             },
@@ -2015,7 +2017,7 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
     pub fn set_compaction(&mut self, compaction: StoredCompactionState) {
         let event = SessionEvent {
             timestamp: chrono::Utc::now(),
-            event_id: crate::id::new_id("set_compaction"),
+            event_id: crate::id::new_id("set_compaction").into(),
             op: SessionEventOp::SetCompaction {
                 compaction: compaction.clone(),
             },
@@ -2524,9 +2526,9 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         for (i, message) in self.messages.iter().enumerate() {
             map.push_event(SessionEvent {
                 timestamp: message.timestamp.unwrap_or(now),
-                event_id: format!("rehydrate_{}", i),
+                event_id: format!("rehydrate_{}", i).into(),
                 op: SessionEventOp::AppendMessage {
-                    message_id: message.id.clone(),
+                    message_id: message.id.clone().into(),
                     message: message.clone(),
                 },
                 parent_id: None,
@@ -2537,7 +2539,7 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         for (j, injection) in self.memory_injections.iter().enumerate() {
             map.push_event(SessionEvent {
                 timestamp: injection.timestamp,
-                event_id: format!("rehydrate_mem_{}", j),
+                event_id: format!("rehydrate_mem_{}", j).into(),
                 op: SessionEventOp::MemoryInjection {
                     memory_injection: injection.clone(),
                 },
@@ -2549,7 +2551,7 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         for (k, replay) in self.replay_events.iter().enumerate() {
             map.push_event(SessionEvent {
                 timestamp: replay.timestamp,
-                event_id: format!("rehydrate_replay_{}", k),
+                event_id: format!("rehydrate_replay_{}", k).into(),
                 op: SessionEventOp::ReplayEvent {
                     replay_event: replay.clone(),
                 },
@@ -2561,7 +2563,7 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         if let Some(compaction) = &self.compaction {
             map.push_event(SessionEvent {
                 timestamp: now,
-                event_id: "rehydrate_compaction".to_string(),
+                event_id: "rehydrate_compaction".to_string().into(),
                 op: SessionEventOp::SetCompaction {
                     compaction: compaction.clone(),
                 },
