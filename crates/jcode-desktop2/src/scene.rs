@@ -1780,6 +1780,16 @@ pub fn build_scene(
     // a masthead, so the top of the page stays clear while a failure to attach
     // is still visible.
     let footnote = model.footnote().map(|line| {
+        let caption_present = model.model.is_some();
+        // The footnote and the active-model caption share this row: the caption
+        // is right-aligned from the column midline, so the footnote must stay
+        // in the left half when a caption is shown, otherwise a long notice
+        // would run under the model id. Without a caption the footnote may use
+        // the whole row.
+        if caption_present {
+            let chars = (frame.column() / (f64::from(layout::CAPTION_SIZE) * 0.72)) as usize / 2;
+            return elide(&line, chars.max(6));
+        }
         let chars = (frame.column() / (f64::from(layout::CAPTION_SIZE) * 0.72)) as usize;
         elide(&line, chars.max(12))
     });
