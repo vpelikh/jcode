@@ -38,6 +38,11 @@ impl App {
                     self.model.status = message;
                     self.model
                         .set_notice("connection interrupted, reconnecting");
+                    // A fresh disconnect invalidates any in-flight reload's
+                    // snapshot window: if reload_len were kept, a History reply
+                    // from a reload issued before this drop could still apply
+                    // against the later state.
+                    self.reload_len = None;
                     // Backfill the live transcript once the worker re-attaches:
                     // a turn that finished during the gap is not re-streamed, so
                     // the stored history is the only record of it. Only worth it

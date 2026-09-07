@@ -791,3 +791,64 @@ fn a_session_change_cancels_a_pending_reload() {
         "a session switch must not request a reload for the new session"
     );
 }
+
+/// A fresh disconnect invalidates an in-flight reload's snapshot window. A
+/// History reply from a reload issued *before* that disconnect must not still
+/// replace the page afterwards.
+#[test]
+fn a_disconnect_invalidates_an_in_flight_reload() {
+    let mut app = app_with_session();
+    let (updates, update_rx) = std::sync::mpsc::channel();
+    let (commands, command_rx) = std::sync::mpsc::channel();
+    app.harness = Some((update_rx, harness::CommandSender::for_test(commands)));
+    app.model.session_id = Some("session_test".into());
+
+    app.apply(Action::Insert, Some("hello"));
+    app.apply(Action::Submit, None);
+    let _ = command_rx.try_iter().count();
+
+    // First drop arms a reload; the idle re-attach fires it (reload_len set).
+    updates
+        .send(harness::HarnessUpdate::ConnectionLost("drop".into()))
+        .expect("queue the disconnect");
+    app.drain_harness_updates();
+    updates
+        .send(harness::HarnessUpdate::Attached {
+            session_id: "session_test".into(),
+            working_dir: Some("/tmp".into()),
+            activity: SessionActivity::Idle,
+        })
+        .expect("queue the idle re-attach");
+    app.drain_harness_updates();
+    assert!(
+        command_rx
+            .try_iter()
+            .any(|c| matches!(c, harness::Command::Reload(_))),
+        "the first idle reconnect requested a reload"
+    );
+
+    // A second drop invalidates that reload's snapshot window.
+    updates
+        .send(harness::HarnessUpdate::ConnectionLost("drop again".into()))
+        .expect("queue the second disconnect");
+    app.drain_harness_updates();
+
+    // The (now stale) History reply from the first reload arrives; it must not
+    // replace the page because the disconnect invalidated the window.
+    let mut history = crate::transcript::Transcript::default();
+    history.push(crate::transcript::Message::user("hello"));
+    history.push(crate::transcript::Message::assistant("stale reply"));
+    updates
+        .send(harness::HarnessUpdate::History {
+            session_id: "session_test".into(),
+            transcript: history.clone(),
+        })
+        .expect("queue the stale history");
+    app.drain_harness_updates();
+
+    let text = app.model.transcript.plain_text();
+    assert!(
+        !text.contains("stale reply"),
+        "a reload invalidated by a later disconnect still replaced the page: {text:?}"
+    );
+}
