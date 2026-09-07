@@ -40,9 +40,14 @@ impl App {
                         .set_notice("connection interrupted, reconnecting");
                     // Backfill the live transcript once the worker re-attaches:
                     // a turn that finished during the gap is not re-streamed, so
-                    // the stored history is the only record of it. Only replayed
-                    // for an idle re-attach (see the `Attached` arm).
-                    self.reload_pending = true;
+                    // the stored history is the only record of it. Only worth it
+                    // if a turn was actually running; a clean disconnect (e.g. a
+                    // routine daemon reload) has nothing to backfill. Only replayed
+                    // for an idle re-attach to the *same* session (see the
+                    // `Attached` arm).
+                    if self.model.busy {
+                        self.reload_pending = true;
+                    }
                 }
                 // A failure goes into the conversation, not only the status
                 // line: the status line is suppressed once a session is
@@ -72,6 +77,7 @@ impl App {
                 } => {
                     let initial_attach = self.model.session_id.is_none();
                     let reconnected = self.model.failure.is_some();
+                    let same_session = self.model.session_id.as_deref() == Some(session_id.as_str());
                     // SessionNew is a panel creation, not a destructive clear of
                     // the panel under the pointer. Keep that old panel visible
                     // while the daemon creates its replacement, then reset the
@@ -98,6 +104,12 @@ impl App {
                     // (and any stranded thinking row) is over.
                     let processing = activity.is_processing();
                     self.model.busy = processing;
+                    // A session change cancels any pending reload: it targeted a
+                    // conversation the user is no longer looking at.
+                    if !same_session {
+                        self.reload_pending = false;
+                        self.reload_len = None;
+                    }
                     if !processing {
                         self.model.activity.finish();
                         self.model.transcript.clear_live_tool();
@@ -105,8 +117,12 @@ impl App {
                         // where the daemon will not re-send the reply that
                         // finished while we were out; ask the worker to backfill
                         // it from stored history.
-                        if self.reload_pending {
+                        if self.reload_pending && same_session {
                             self.reload_pending = false;
+                            // Remember how much conversation was on screen so the
+                            // history reply only replaces the page if nothing new
+                            // has streamed in since (which it would clobber).
+                            self.reload_len = Some(self.model.transcript.messages().len());
                             if let Some((_, outgoing)) = self.harness.as_ref() {
                                 let _ = outgoing.send(harness::Command::Reload(
                                     session_id.clone(),
@@ -272,12 +288,19 @@ impl App {
                     // snapshot that would clobber it.
                     if self.model.session_id.as_deref() != Some(session_id.as_str()) {
                         self.model.peeks.insert(&session_id, transcript);
-                    } else if !self.model.busy {
+                    } else if !self.model.busy
+                        && self.reload_len == Some(self.model.transcript.messages().len())
+                    {
+                        // Nothing new streamed in since the reload was requested,
+                        // so the stored history is still an accurate replacement.
                         let reasoning = self.model.transcript.reasoning_mode();
                         self.model.transcript = transcript;
                         self.model.transcript.set_reasoning_mode(reasoning);
                         self.model.stream.reveal_all();
                     }
+                    // Whether or not the snapshot was applied, the reload window
+                    // is over: it must not replace a later turn.
+                    self.reload_len = None;
                 }
                 harness::HarnessUpdate::Sessions(entries) => {
                     let had_panels = !self.model.strips.is_empty();

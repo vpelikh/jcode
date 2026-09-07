@@ -201,6 +201,10 @@ struct App {
     /// transcript is backfilled from stored history, because the daemon never
     /// re-streams a turn that finished while disconnected.
     reload_pending: bool,
+    /// Length (in messages) of the live transcript when a history reload was
+    /// requested, so the reply only replaces the page when nothing new has
+    /// streamed in since (which would be clobbered by the stale snapshot).
+    reload_len: Option<usize>,
     /// Geometry of the most recently built frame. Pointer hit-testing reads
     /// this instead of the GPU state, so input handling is testable without a
     /// window and can never disagree with what was actually drawn.
@@ -246,6 +250,7 @@ impl Default for App {
             new_session_transition_pending: false,
             startup_panel_pending: true,
             reload_pending: false,
+            reload_len: None,
             // A sensible frame until the first real one is built, so input
             // before the first paint is still handled sanely.
             frame: layout::Frame::new((1100, 720), 1.0),
