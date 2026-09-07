@@ -1808,6 +1808,13 @@ pub fn build_scene(
     // without colliding (both elide to their own half).
     if let Some(caption) = model.model.as_ref().and_then(ModelId::caption) {
         let hovered = model.model_picker.button_hover();
+        // Elide the caption to its half of the footnote row, exactly as the
+        // transient footnote elides to the other half. The width budget is half
+        // the column; without this, a long model id would wrap to a second line
+        // below the row and collide with whatever the page draws beneath it.
+        let half_chars =
+            ((frame.column() / (f64::from(layout::CAPTION_SIZE) * 0.72)) as usize / 2).max(6);
+        let caption = elide(&caption, half_chars);
         text.draw_paragraph_scaled(
             scene,
             &caption,
