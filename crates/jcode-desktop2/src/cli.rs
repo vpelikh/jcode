@@ -722,7 +722,13 @@ fn run_capture(args: &[String]) -> Result<()> {
         // draws the project-explorer sidebar on top of the overview, so a
         // node like `overview_with_sidebar` would otherwise capture the field
         // with no sidebar at all — defeating the node's purpose.
-        scene_workspace::build_workspace_scene(&mut scene, &mut painter, model, (WIDTH, HEIGHT), SCALE);
+        scene_workspace::build_workspace_scene(
+            &mut scene,
+            &mut painter,
+            model,
+            (WIDTH, HEIGHT),
+            SCALE,
+        );
         capture::capture_scene_to_png(&scene, WIDTH, HEIGHT, path)?;
         println!("captured {name} -> {}", path.display());
         Ok(())

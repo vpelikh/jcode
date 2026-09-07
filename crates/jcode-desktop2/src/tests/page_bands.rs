@@ -8,13 +8,29 @@
 use super::visual::{Rendered, nodes};
 use crate::Model;
 
-/// Nodes without the session overview up. The overview is the one sanctioned
-/// full-page layer: it veils the page and spreads blobs across every band and
-/// margin by design, so the page-band invariants below it do not apply.
+/// Nodes in the settled window, i.e. those whose page-band invariants hold.
+///
+/// The capture set includes full-window modes that paint over the page by
+/// design, so the space the bands are supposed to keep bare is not theirs to
+/// keep. Those are excluded:
+///   * the session overview veils the page and spreads blobs across every
+///     band and margin;
+///   * the resume picker dims the whole window behind its card;
+///   * the help overlay puts a dimmed full-window card over everything;
+///   * the boot reveal paints the entire window with the opening black paper,
+///     the full-page hero donut, and a fading-in chrome group, so "nothing in
+///     the left margin" is false for every frame before the chrome is solid.
+/// A settled (default) `Boot` reports a `Solid` chrome layer, so only the
+/// pinned mid-reveal captures are filtered out.
 fn page_nodes() -> Vec<(&'static str, Model)> {
     nodes()
         .into_iter()
-        .filter(|(_, model)| !model.overview.is_visible())
+        .filter(|(_, model)| {
+            !model.overview.is_visible()
+                && !model.resume.is_open()
+                && !model.help_open
+                && model.boot.chrome_layer() == crate::boot::ChromeReveal::Solid
+        })
         .collect()
 }
 
