@@ -45,9 +45,8 @@ fn page_nodes() -> Vec<(&'static str, Model)> {
 ///
 /// Sweeps the settled page nodes, i.e. those reaching `page_nodes()` that are
 /// not busy. A busy page draws its activity spinner beside the composer well,
-/// in the same column `wash_band` samples, so the well cannot be cleanly
-/// isolated there; the "is the well centred where it is drawn" invariant
-/// belongs to the settled page.
+/// which `wash_band` could mistake for the well, so the "is the well centred
+/// where it is drawn" invariant is tested on the settled page.
 #[test]
 #[ignore = "requires a GPU"]
 fn the_composer_well_is_drawn_on_the_middle_of_the_window() {

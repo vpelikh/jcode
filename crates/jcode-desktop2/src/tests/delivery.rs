@@ -192,15 +192,19 @@ fn an_acknowledged_card_visibly_moves() {
 
     // Start from the attached node, so the page is a live conversation rather
     // than the boot reveal (which fades the whole transcript in and would
-    // dominate the measurement).
-    let mut model = crate::states::by_name("attached_empty").expect("attached_empty node");
-    model.transcript = crate::transcript::Transcript::default();
-    model
-        .transcript
-        .push(crate::transcript::Message::sent("acknowledge me"));
-    model.donut = None;
+    // dominate the measurement). Built fresh per render so the single message
+    // is always in the Sent (pending) state when acknowledged.
+    let make_model = || {
+        let mut model = crate::states::by_name("attached_empty").expect("attached_empty node");
+        model.transcript = crate::transcript::Transcript::default();
+        model
+            .transcript
+            .push(crate::transcript::Message::sent("acknowledge me"));
+        model.donut = None;
+        model
+    };
 
-    let pending = Rendered::new(&model).expect("render the pending card");
+    let pending = Rendered::new(&make_model()).expect("render the pending card");
 
     // The card is a wash on paper, so its left edge is the first column that
     // is darker than the page. Scan the whole transcript region and take the
@@ -241,17 +245,8 @@ fn an_acknowledged_card_visibly_moves() {
     // could hide the wiggle, and that cannot happen for a spread of peaks.
     let peaks = [1, 3, 5, 7];
     let mut edges = Vec::new();
-    let mut valid = 0;
     for eighth in peaks {
-        // Build a fresh model each pass so the message is back to Sent; the
-        // acknowledged wiggle is then rendered from a fresh phase rather than
-        // a stale Acked delivery from the previous sample.
-        let mut model = crate::states::by_name("attached_empty").expect("node");
-        model.transcript = crate::transcript::Transcript::default();
-        model
-            .transcript
-            .push(crate::transcript::Message::sent("acknowledge me"));
-        model.donut = None;
+        let mut model = make_model();
         let at = Instant::now() - WIGGLE.mul_f64(f64::from(eighth) / 8.0);
         assert!(
             model.transcript.acknowledge_oldest_pending(at),
@@ -259,12 +254,7 @@ fn an_acknowledged_card_visibly_moves() {
         );
         let acked = Rendered::new(&model).expect("render the acknowledged card");
         edges.push(left_edge(&acked));
-        valid += usize::from(edges.last().unwrap().is_some());
     }
-    assert!(
-        valid > 0,
-        "the acknowledged card did not ink at any sampled phase"
-    );
     // Assert the card edge really moved: across the four peak phases at least
     // two distinct edges must appear, otherwise the acknowledgement wiggle was
     // never drawn.
