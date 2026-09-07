@@ -140,6 +140,29 @@ pub(super) async fn remove_session_entry<T>(
     removed
 }
 
+/// Close every session still owned by this server before an intentional,
+/// graceful daemon shutdown (SIGTERM, idle timeout, temporary-server exit).
+///
+/// Server-owned sessions all share the long-running server PID. When the server
+/// exits without closing them, each stays `Active` with an `active_pids` marker
+/// pointing at the now-dead server PID; the next crash scan (`find_recent_
+/// crashed_sessions`) then relabels them "Process N exited unexpectedly", even
+/// though the user quit them normally. Graceful shutdown is not a crash, so it
+/// must persist them as `Closed` and clear their presence markers before the
+/// process exits. A genuine hard kill (SIGKILL, panic) never reaches this
+/// handler, so real crash detection is unaffected.
+pub(super) async fn close_owned_sessions(sessions: &SessionAgents) {
+    let ids: Vec<String> = sessions.read().await.keys().cloned().collect();
+    for session_id in ids {
+        let Some(agent_arc) = remove_session_entry(sessions, &session_id).await else {
+            continue;
+        };
+        if let Ok(mut agent) = agent_arc.try_lock() {
+            agent.mark_closed();
+        }
+    }
+}
+
 const SERVER_NAME_ENV: &str = "JCODE_SERVER_NAME";
 const SERVER_DISPLAY_NAME_ENV: &str = "JCODE_SERVER_DISPLAY_NAME";
 const MAX_CONFIGURED_SERVER_NAME_LEN: usize = 64;
@@ -1328,11 +1351,18 @@ impl Server {
         #[cfg(unix)]
         {
             let sigterm_server_name = self.identity.name.clone();
+            let sigterm_sessions = Arc::clone(&self.sessions);
             tokio::spawn(async move {
                 use tokio::signal::unix::{SignalKind, signal};
                 if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
                     sigterm.recv().await;
                     crate::logging::info("Server received SIGTERM, shutting down gracefully");
+                    // A SIGTERM is an intentional graceful stop, not a crash.
+                    // Close owned sessions so their on-disk state is `Closed`
+                    // (and presence markers are cleared) instead of being left
+                    // `Active` pointing at this now-dead PID and later relabelled
+                    // "exited unexpectedly" by the crash scan.
+                    close_owned_sessions(&sigterm_sessions).await;
                     let _ = crate::registry::unregister_server(&sigterm_server_name).await;
                     std::process::exit(0);
                 }
@@ -1851,6 +1881,10 @@ impl Server {
                                     "Server idle for {} minutes with no clients. Shutting down.",
                                     idle_duration / 60
                                 ));
+                                // Graceful idle shutdown: close any lingering owned
+                                // sessions so they persist as Closed rather than being
+                                // left Active and later relabelled crashed.
+                                close_owned_sessions(&idle_sessions).await;
                                 let _ = crate::registry::unregister_server(&idle_server_name).await;
                                 std::process::exit(EXIT_IDLE_TIMEOUT);
                             }

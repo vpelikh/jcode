@@ -101,6 +101,46 @@ async fn removing_server_session_clears_active_pid_marker() {
     );
 }
 
+/// A graceful daemon shutdown (SIGTERM, idle timeout) must close the sessions
+/// the server still owns: clear the live map entry, remove the presence marker,
+/// and persist a `Closed` status — so a later crash scan does not relabel them
+/// "Process N exited unexpectedly". This mirrors the reported bug where sessions
+/// the user quit were left Active and later shown as crashed.
+#[tokio::test]
+async fn close_owned_sessions_marks_live_sessions_closed_and_clears_markers() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(StreamingMockProvider::default());
+    let agent_arc = test_agent(provider).await;
+    let session_id = {
+        let agent = agent_arc.lock().await;
+        agent.session_id().to_string()
+    };
+    // Simulate a server-owned live session with a presence marker.
+    crate::storage::register_active_pid(&session_id, std::process::id());
+
+    let sessions = super::SessionAgents::default();
+    sessions.write().await.insert(session_id.clone(), agent_arc);
+
+    super::close_owned_sessions(&sessions).await;
+
+    assert!(
+        !sessions.read().await.contains_key(&session_id),
+        "all server-owned sessions must be removed from the live map on shutdown"
+    );
+    assert!(
+        !crate::storage::active_session_ids()
+            .iter()
+            .any(|id| id == &session_id),
+        "graceful shutdown must clear the session's presence marker"
+    );
+    let closed = crate::session::Session::load(&session_id).expect("session on disk");
+    assert_eq!(
+        closed.status,
+        crate::session::SessionStatus::Closed,
+        "a gracefully-shutdown session must be Closed, not left Active"
+    );
+}
+
 #[test]
 fn configured_server_name_normalizes_operator_labels() {
     assert_eq!(
