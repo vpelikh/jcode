@@ -201,9 +201,12 @@ fn an_acknowledged_card_visibly_moves() {
     model.donut = None;
 
     let pending = Rendered::new(&model).expect("render the pending card");
-    // A quarter through the wiggle is near its first peak, so the card is at
-    // its most displaced and the comparison is not measuring a zero crossing.
-    let at = Instant::now() - WIGGLE.mul_f64(0.25);
+    // A full wiggle carries CYCLES=2 oscillations, so its first peak (sin
+    // argument pi/2) lands at one-eighth of the way through, where the
+    // card is at its most displaced. Sampling at the zero crossing
+    // (which a quarter-way point is, for two cycles) would read a
+    // stationary card and fail under scheduler jitter.
+    let at = Instant::now() - WIGGLE.mul_f64(0.125);
     assert!(model.transcript.acknowledge_oldest_pending(at));
     let acked = Rendered::new(&model).expect("render the acknowledged card");
 
