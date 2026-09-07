@@ -660,7 +660,6 @@ pub const NOT_PORTED: &[(&str, &str)] = &[
     ),
     ("ctrl+a as start-of-line", "web select-all wins; use Home"),
     ("ctrl+s", "no input stash yet"),
-    ("ctrl+p", "no auto-poke yet"),
     ("ctrl+g", "no diagram overlay yet"),
     (
         "ctrl+[ / ctrl+]",
