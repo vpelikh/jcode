@@ -151,12 +151,13 @@ async fn close_owned_sessions_marks_live_sessions_closed_and_clears_markers() {
 
 /// An actively-running (lock-contended) agent must not be force-closed as
 /// `Closed` on graceful shutdown: that would mask genuinely-interrupted work a
-/// user would want to recover via the crash-resume flow. But its presence marker
-/// is still cleared, so it isn't falsely labelled "exited unexpectedly" either —
-/// it just stays `Active` (marked for recovery) rather than becoming a false
-/// crash.
+/// user would want to recover via the crash-resume flow. Its presence marker
+/// must be left INTACT (and status Active) so that after the daemon exits the
+/// crash scan finds the now-dead pid and relabels it `Crashed`, keeping the
+/// interrupted turn recoverable. Clearing the marker here would make the
+/// session invisible to the crash scan and permanently lost.
 #[tokio::test]
-async fn close_owned_sessions_does_not_force_close_busy_agent_but_clears_marker() {
+async fn close_owned_sessions_preserves_busy_agent_for_recovery() {
     let _guard = crate::storage::lock_test_env();
     let provider: Arc<dyn Provider> = Arc::new(StreamingMockProvider::default());
     let agent_arc = test_agent(provider).await;
@@ -178,17 +179,30 @@ async fn close_owned_sessions_does_not_force_close_busy_agent_but_clears_marker(
 
     super::close_owned_sessions(&sessions).await;
 
-    // The marker must be cleared so the session is not reported as crashed.
+    // The marker must be PRESERVED so the session stays recoverable after the
+    // daemon exits (the crash scan finds the dead pid and marks it crashed).
     assert!(
-        !crate::storage::active_session_ids()
+        crate::storage::active_session_ids()
             .iter()
             .any(|id| id == &session_id),
-        "a busy agent's stale presence marker must still be cleared on shutdown"
+        "a busy agent's presence marker must be preserved so it stays recoverable"
     );
-    let not_cr = crate::session::find_recent_crashed_sessions();
+    // The session must remain in the live map (not force-closed).
     assert!(
-        !not_cr.iter().any(|(id, _)| id == &session_id),
-        "a contended (busy) agent's session must not be reported as crashed"
+        sessions.read().await.contains_key(&session_id),
+        "a busy agent must not be removed from the live map on shutdown"
+    );
+
+    // End-to-end: once the daemon process dies, the preserved marker points at a
+    // dead pid, so the crash scan must surface the interrupted turn as crashed
+    // (recoverable) rather than dropping it silently.
+    drop(_busy_guard);
+    crate::storage::unregister_active_pid(&session_id);
+    crate::storage::register_active_pid(&session_id, 2_000_000_002u32);
+    let crashed = crate::session::find_recent_crashed_sessions();
+    assert!(
+        crashed.iter().any(|(id, _)| id == &session_id),
+        "a busy agent interrupted by shutdown must be reported as crashed so it can be recovered"
     );
 }
 

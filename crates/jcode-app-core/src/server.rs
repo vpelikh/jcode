@@ -140,25 +140,56 @@ pub(super) async fn remove_session_entry<T>(
     removed
 }
 
-/// Close every session still owned by this server before an intentional,
+/// Close the idle sessions still owned by this server before an intentional,
 /// graceful daemon shutdown (SIGTERM, idle timeout, temporary-server exit).
 ///
 /// Server-owned sessions all share the long-running server PID. When the server
 /// exits without closing them, each stays `Active` with an `active_pids` marker
 /// pointing at the now-dead server PID; the next crash scan (`find_recent_
 /// crashed_sessions`) then relabels them "Process N exited unexpectedly", even
-/// though the user quit them normally. Graceful shutdown is not a crash, so it
-/// must persist them as `Closed` and clear their presence markers before the
-/// process exits. A genuine hard kill (SIGKILL, panic) never reaches this
-/// handler, so real crash detection is unaffected.
+/// though the user quit them normally. Graceful shutdown is not a crash, so
+/// idle sessions are persisted as `Closed` and their presence markers cleared
+/// before the process exits.
+///
+/// A session whose agent is actively running (lock-contended) is intentionally
+/// left alone — marker and `Active` status intact — so that after the daemon
+/// exits the crash scan finds its now-dead pid marker and relabels it `Crashed`,
+/// keeping the interrupted turn recoverable. A genuine hard kill (SIGKILL,
+/// panic) never reaches this handler, so real crash detection is unaffected.
 pub(super) async fn close_owned_sessions(sessions: &SessionAgents) {
     let ids: Vec<String> = sessions.read().await.keys().cloned().collect();
     for session_id in ids {
-        let Some(agent_arc) = remove_session_entry(sessions, &session_id).await else {
+        let Some(agent_arc) = sessions.read().await.get(&session_id).cloned() else {
             continue;
         };
-        if let Ok(mut agent) = agent_arc.try_lock() {
-            agent.mark_closed();
+        // A busy (lock-contended) agent is left alone — marker and `Active`
+        // status intact — so that after the daemon exits the crash scan finds
+        // its now-dead pid marker and relabels it `Crashed`, keeping the
+        // interrupted turn recoverable.
+        if let Ok(agent) = agent_arc.try_lock() {
+            // Idle agent: close it so it persists as `Closed` and its presence
+            // marker is cleared (rather than being relabelled "exited
+            // unexpectedly" by the crash scan after the daemon exits).
+            drop(agent); // release before taking the map write lock (lock ordering)
+            // remove_session_entry clears the marker; only remove the entry once
+            // we can close it, so a busy agent never loses its marker.
+            match (
+                remove_session_entry(sessions, &session_id).await,
+                agent_arc.try_lock(),
+            ) {
+                // Idle: persisted Closed, marker removed. Correct.
+                (Some(_), Ok(mut agent)) => agent.mark_closed(),
+                // The agent became busy between the idle check and removal (a
+                // turn started during teardown). It is still Active but its
+                // marker was cleared, which would make it vanish from the crash
+                // scan. Re-register the marker so the interrupted turn stays
+                // recoverable after the daemon exits.
+                (Some(_), Err(_)) => {
+                    crate::storage::register_active_pid(&session_id, std::process::id());
+                }
+                // Already removed concurrently; nothing to do.
+                (None, _) => {}
+            }
         }
     }
 }
