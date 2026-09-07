@@ -24,6 +24,8 @@ pub enum SessionEventError {
     InvalidTimestamp { timestamp: DateTime<Utc> },
     /// Message content is invalid
     InvalidMessageContent { message_id: MessageId },
+    /// An event's `op` discriminator is invalid or missing
+    InvalidEventOp { reason: String },
     /// Compaction state is invalid
     InvalidCompactionState { reason: String },
     /// Memory injection data is invalid
@@ -41,6 +43,9 @@ impl fmt::Display for SessionEventError {
             }
             SessionEventError::InvalidMessageContent { message_id } => {
                 write!(f, "Invalid message content for message ID: {}", message_id)
+            }
+            SessionEventError::InvalidEventOp { reason } => {
+                write!(f, "Invalid event op: {}", reason)
             }
             SessionEventError::InvalidCompactionState { reason } => {
                 write!(f, "Invalid compaction state: {}", reason)
@@ -780,11 +785,11 @@ impl SessionEventMap {
             // The escape hatch must still carry a meaningful discriminator. An
             // empty `op` tag would produce an event the log cannot later promote
             // or route (it matches no known variant and names no future plugin),
-            // so reject it like an empty event_id.
+            // so reject it as an invalid op discriminator.
             SessionEventOp::Unknown { event_type, .. } => {
                 if event_type.is_empty() {
-                    return Err(SessionEventError::InvalidEventId {
-                        event_id: EventId::from("<unknown op>"),
+                    return Err(SessionEventError::InvalidEventOp {
+                        reason: "op tag is empty".to_string(),
                     });
                 }
             }
