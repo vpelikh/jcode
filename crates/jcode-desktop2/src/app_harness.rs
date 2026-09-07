@@ -126,8 +126,10 @@ impl App {
                         // An idle re-attach after a disconnect is the one case
                         // where the daemon will not re-send the reply that
                         // finished while we were out; ask the worker to backfill
-                        // it from stored history.
-                        if self.reload_pending && same_session {
+                        // it from stored history. (Skipped when a message is still
+                        // queued: the flush below starts a new turn that would
+                        // invalidate the snapshot, so the fetch would be wasted.)
+                        if self.reload_pending && same_session && !self.model.transcript.has_queued() {
                             self.reload_pending = false;
                             // Remember how much conversation was on screen so the
                             // history reply only replaces the page if nothing new
@@ -138,6 +140,17 @@ impl App {
                                     session_id.clone(),
                                 ));
                             }
+                        }
+                        // A genuine reconnect to an idle session is a fresh turn
+                        // boundary for any message queued before the drop: the
+                        // daemon is free again, so the oldest waiting message
+                        // goes now (flushed once, at the end of this drain).
+                        if same_session && self.model.transcript.has_queued() {
+                            turn_ended = true;
+                            // The queued message supersedes the backfill: it is
+                            // what gets sent now, so there is nothing to reload.
+                            self.reload_pending = false;
+                            self.reload_len = None;
                         }
                     }
                     // A reconnect re-attaches the same session; the transcript

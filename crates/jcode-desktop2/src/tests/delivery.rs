@@ -853,11 +853,11 @@ fn a_disconnect_invalidates_an_in_flight_reload() {
     );
 }
 
-/// The reload must never erase a queued (unsent) user message. Queued messages
-/// live only in the local transcript, not in the daemon's stored history, so a
-/// history snapshot that is shorter than the live page would drop them. The
-/// reload only applies when the history is at least as complete as the page it
-/// is replacing.
+/// A queued (unsent) message must survive a reconnect, and be sent once the
+/// session reattaches idle. Queued messages live only in the local transcript,
+/// not in the daemon's stored history, so a history backfill must be skipped
+/// (it would drop them); instead the queued message is flushed on the idle
+/// re-attach.
 #[test]
 fn a_reload_never_erases_a_queued_message() {
     let mut app = app_with_session();
@@ -892,26 +892,30 @@ fn a_reload_never_erases_a_queued_message() {
         .expect("queue the idle re-attach");
     app.drain_harness_updates();
 
-    // The daemon history only knows the delivered message; it does not contain
-    // the still-queued second one.
-    let mut history = crate::transcript::Transcript::default();
-    history.push(crate::transcript::Message::user("first"));
-    updates
-        .send(harness::HarnessUpdate::History {
-            session_id: "session_test".into(),
-            transcript: history.clone(),
-        })
-        .expect("queue the history");
-    app.drain_harness_updates();
-
+    // The queued message was flushed: it is promoted to Sent, and the oldest
+    // queued one (with its content) is sent down the wire.
     assert_eq!(
         deliveries(&app),
-        vec![Some(Delivery::Sent), Some(Delivery::Queued)],
-        "the reload erased the queued message that history does not contain"
+        vec![Some(Delivery::Sent), Some(Delivery::Sent)],
+        "the re-attached idle session must flush the queued message, not erase it"
+    );
+    assert!(
+        command_rx
+            .try_iter()
+            .any(|c| matches!(c, harness::Command::Send { content, .. } if content == "second")),
+        "the queued message was not actually sent after the reconnect"
+    );
+    // A history backfill is skipped entirely when a message is queued: it would
+    // only erase the local-only queued message.
+    assert!(
+        command_rx
+            .try_iter()
+            .all(|c| !matches!(c, harness::Command::Reload(_))),
+        "no reload should be requested while a queued message is pending"
     );
     let text = app.model.transcript.plain_text();
     assert!(
         text.contains("second"),
-        "the queued 'second' message disappeared after the reload: {text:?}"
+        "the queued 'second' message disappeared: {text:?}"
     );
 }
