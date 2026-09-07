@@ -96,10 +96,6 @@ const VIEW_ROWS: &[Row] = &[
         description: "toggle theme",
     },
     Row {
-        key: "Ctrl+Shift+R",
-        description: "cycle reasoning display",
-    },
-    Row {
         key: "Ctrl + / - / 0",
         description: "zoom in, out, or reset",
     },

@@ -57,7 +57,10 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         label: "Step through a reply's reasoning",
-        hint: "Ctrl+Shift+R",
+        // No keyboard chord for this one (the settings row and this palette
+        // entry are how it is reached), so do not invent a shortcut the map
+        // does not back up.
+        hint: "",
         action: Action::CycleReasoningDisplay,
     },
     Command {
