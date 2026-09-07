@@ -4661,6 +4661,7 @@ dependencies = [
  "arboard",
  "image",
  "jcode-build-meta",
+ "jcode-fuzzy",
  "jcode-math",
  "jcode-render-core",
  "jcode-sdk",
