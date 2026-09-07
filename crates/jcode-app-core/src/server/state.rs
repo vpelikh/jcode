@@ -364,7 +364,7 @@ pub struct SwarmEvent {
 /// Ring buffer for recent swarm events
 pub(super) const MAX_EVENT_HISTORY: usize = 5000;
 
-pub(super) type SessionInterruptQueues = Arc<RwLock<HashMap<String, SoftInterruptQueue>>>;
+pub(crate) type SessionInterruptQueues = Arc<RwLock<HashMap<String, SoftInterruptQueue>>>;
 
 pub(super) async fn register_session_event_sender(
     swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,

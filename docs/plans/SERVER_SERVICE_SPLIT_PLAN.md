@@ -1,10 +1,18 @@
-# Server Service Split Plan
+# Server Service Split Plan (Rebuilt for Current Workspace)
 
-Status: Audit-based plan
+Status: Audit-based plan, **re-based 2026-09 against the current crate layout**
 
-Scope: `src/server*.rs` and `src/server/**/*.rs` in the current shared-server architecture.
+> This is a rebuild of `SERVER_SERVICE_SPLIT_PLAN.md` against the code as it
+> actually exists today. The original plan targeted `src/server.rs` and
+> `src/server/**` inside the monolithic root crate. Since then the server moved
+> wholesale into `crates/jcode-app-core/src/server/`. The *diagnosis* remains
+> valid, but the *file moves* and *exit criteria* below are re-anchored to the
+> current tree so they are actionable rather than aspirational.
 
-This document audits the current server stack and proposes an incremental split into five in-process services:
+Scope: the shared-server implementation in `crates/jcode-app-core/src/server*.rs`
+and `crates/jcode-app-core/src/server/**`.
+
+This document proposes an incremental split into five **in-process** services:
 
 - session
 - client
@@ -12,25 +20,25 @@ This document audits the current server stack and proposes an incremental split 
 - debug
 - maintenance
 
-The intent is to improve ownership boundaries and reduce argument fanout without changing the single-process runtime model.
+The intent is unchanged from the original plan: improve ownership boundaries and
+reduce argument fanout **without changing the single-process runtime model**.
 
-See also:
-
-- [`SERVER_ARCHITECTURE.md`](../SERVER_ARCHITECTURE.md)
-- [`SWARM_ARCHITECTURE.md`](../SWARM_ARCHITECTURE.md)
-- [`UNIFIED_SELFDEV_SERVER_PLAN.md`](./UNIFIED_SELFDEV_SERVER_PLAN.md)
+---
 
 ## Executive Summary
 
-Today the server is already logically split by file, but not by ownership boundary.
-The dominant pattern is:
+The architecture is still exactly what the original plan described, merely in a
+new location:
 
-- `Server` owns nearly all shared state in one struct.
-- `ServerRuntime` clones that full state bag into connection handlers.
-- `handle_client()` and `handle_debug_client()` receive very wide dependency lists.
-- maintenance loops in `server.rs` mutate the same raw maps used by client, session, swarm, and debug paths.
-
-That means the main extraction seam is **not** transport or process boundaries. The main seam is introducing **service-owned state + service APIs** inside the existing process.
+- `Server` (`crates/jcode-app-core/src/server.rs:687`, ~2.4k LOC) still owns
+  nearly all shared state in one struct.
+- `ServerRuntime` (`server/runtime.rs:91`) still clones that full state bag,
+  field-by-field, into connection handlers.
+- `handle_client()` (`server/client_lifecycle.rs:435`) still receives a
+  **28-argument** list spanning session, swarm, client, debug, and maintenance
+  concerns.
+- The main extraction seam is still **not** transport or process boundaries. The
+  main seam is **service-owned state + service APIs inside the existing process**.
 
 The safest path is:
 
@@ -38,15 +46,23 @@ The safest path is:
 2. keep current modules and behavior
 3. introduce service handle structs around existing state
 4. move mutation behind service methods
-5. reduce `handle_client()` and `handle_debug_client()` to a few service/context arguments
+5. reduce `handle_client()` and `handle_debug_client()` to a few typed contexts
 
-Do **not** start with crates, traits, or IPC splits. The code is not ready for that yet, and the current pain is mostly ownership fanout, not runtime topology.
+Do **not** start with crates, traits, or IPC splits. The code is not ready for
+that yet, and the current pain is ownership fanout, not runtime topology.
+
+> **What changed since the original write-up.** The giant cross-cutting *files*
+> the old plan blamed (`src/server.rs` @ ~1731 lines, `client_lifecycle.rs` etc.)
+> have mostly been split into a fine-grained `server/**` module tree inside
+> `jcode-app-core`. What has **not** changed is the *state ownership*: the
+> individual module files are still thin slices over one giant state bag passed
+> by hand.
+
+---
 
 ## Current Stack Audit
 
 ### Top-level runtime shape
-
-Current runtime flow:
 
 ```mermaid
 flowchart TD
@@ -55,319 +71,235 @@ flowchart TD
   Runtime --> DebugAccept[debug socket accept loop]
   Runtime --> GatewayAccept[gateway accept loop]
 
-  MainAccept --> ClientLifecycle[client_lifecycle.rs::handle_client]
-  DebugAccept --> DebugRouter[debug.rs::handle_debug_client]
+  MainAccept --> ClientLifecycle[server/client_lifecycle.rs::handle_client]
+  DebugAccept --> DebugRouter[server/client_debug.rs::handle_debug_client]
   GatewayAccept --> ClientLifecycle
 
   Server --> Maintenance[reload, bus monitor, idle timeout, registry, memory, ambient]
-  ClientLifecycle --> SessionModules[session/actions/provider/session-state handlers]
+  ClientLifecycle --> SessionModules[client_session / client_actions / provider_control]
   ClientLifecycle --> SwarmModules[comm_* and swarm handlers]
   DebugRouter --> DebugModules[debug_* handlers]
 ```
 
 ### Shared state concentration
 
-`src/server.rs` owns one large `Server` struct with state spanning all concerns, including:
+`server.rs::Server` still owns one broad state struct. Verified current fields:
 
-- sessions and default session id
-- client count and client connection map
-- swarm membership, plans, shared context, coordinator map
-- file touch tracking and reverse indexes
-- channel subscriptions and reverse indexes
-- debug client routing and debug jobs
-- swarm event history and event bus
-- ambient runner, shared MCP pool
-- shutdown signals and soft interrupt queues
-- await-members runtime
+| Field | Concern |
+|---|---|
+| `sessions` | session |
+| `session_id`, `is_processing` | session / client |
+| `client_count`, `client_connections` | client |
+| `swarm_state`, `shared_context`, `swarms_by_id`, `swarm_plans`, `swarm_coordinators` | swarm |
+| `file_touch`, `channel_subscriptions[(_by_session)]` | swarm file-touch + channels |
+| `client_debug_state`, `client_debug_response_tx`, `debug_jobs` | debug |
+| `event_history`, `event_counter`, `swarm_event_tx` | swarm events |
+| `ambient_runner`, `mcp_pool` | maintenance / shared |
+| `shutdown_signals`, `soft_interrupt_queues` | session lifecycle |
+| `await_members_runtime`, `swarm_mutation_runtime` | swarm coordination |
 
-This is a service container in practice, but it is represented as one broad state owner.
+This is a service container in practice, but still one broad state owner.
 
 ### Existing positive seams
 
-The code already contains a few useful seams we should preserve:
-
 - `runtime.rs` already isolates accept-loop orchestration from bootstrap.
-- `state.rs` already centralizes shared types and delivery helpers.
-- `swarm.rs` is already the closest thing to a stateful domain service.
-- `reload.rs` is already separate from bootstrap, even though `server.rs` still owns most maintenance wiring.
-- `debug_*` modules are already split by debug command domain.
+- `state.rs` already centralizes shared delivery helpers: `SessionControlHandle`,
+  `SwarmState`, `SharedContext`, file-touch and channel bookkeeping.
+- `swarm.rs` is already a stateful domain service (membership, plans,
+  coordination).
+- `reload.rs`, `debug_*`, `client_*` are split by command/domain already.
+- `pub(super) struct ServerRuntime` (only a small `server` accessor fn) already
+  centralizes the state bag clone.
 
-These are good extraction points. The plan below leans on them instead of fighting them.
+These are good extraction points. The plan below leans on them.
 
-## Module Heat Map
-
-Largest server-side modules at the time of audit:
+### Module heat map (current)
 
 | File | Lines | Primary concern today | Future service |
 |---|---:|---|---|
-| `src/server/client_lifecycle.rs` | 1767 | client request loop and router | client |
-| `src/server/client_comm.rs` | 1492 | swarm communication requests | swarm |
-| `src/server/client_actions.rs` | 1249 | session-local actions | session |
-| `src/server/swarm.rs` | 1202 | swarm state mutation and fanout | swarm |
-| `src/server/comm_control.rs` | 1183 | swarm control / await-members / client debug bridge | swarm + debug |
-| `src/server/client_session.rs` | 1091 | subscribe, resume, clear, reload | session + client boundary |
-| `src/server/comm_session.rs` | 987 | spawn/stop session flows | session + swarm boundary |
-| `src/server/debug.rs` | 980 | debug socket command router | debug |
-| `src/server/reload.rs` | 826 | reload and graceful shutdown | maintenance |
-| `src/server/debug_server_state.rs` | 748 | debug snapshots across all stores | debug |
+| `server/client_lifecycle.rs` | ~3660 | client request loop + wide router | client |
+| `server/swarm.rs` | ~3200 | swarm state mutation and fanout | swarm |
+| `server/comm_control.rs` | ~2600 | swarm control / await-members / debug bridge | swarm + debug |
+| `server/client_session.rs` | ~1770 | subscribe, resume, clear, reload | session + client boundary |
+| `server/provider_control.rs` | ~1610 | provider lifecycle per session | session |
+| `server/client_lifecycle.rs` (tests) | ~1500 | | |
+| `server/comm_session` | ~ | spawn/stop session flows | session + swarm boundary |
+| `server/debug.rs` | ~980 | debug socket command router | debug |
+| `server/reload.rs` | ~826 | reload + graceful shutdown | maintenance |
 
-Interpretation:
+Interpretation is unchanged: the architecture is **not** blocked on missing
+modules. It is blocked on **cross-service state access** and **router width**.
 
-- The architecture is not blocked on missing modules.
-- It is blocked on **cross-service state access** and **router width**.
+---
 
 ## Where Coupling Is Highest
 
 ### 1. `ServerRuntime` is a full-state courier
 
-`runtime.rs` clones almost every shared field into the runtime and forwards them into:
-
-- main client handling
-- debug client handling
-- gateway client handling
-
-This makes transport code depend on internal service storage details.
+`runtime.rs` clones almost every shared field into the runtime and forwards them
+into accept loops. This makes transport code depend on internal service storage
+details.
 
 ### 2. `handle_client()` is both connection loop and application router
 
-`client_lifecycle.rs::handle_client()` currently combines:
+The 28-argument prototype at `client_lifecycle.rs:435`:
 
-- stream read loop
-- per-connection state
-- session attach / resume / clear
-- provider control
-- swarm communication dispatch
-- debug bridge requests
-- message processing lifecycle
-- disconnect cleanup
+```rust
+pub(super) async fn handle_client(
+    stream: Stream,
+    sessions: SessionAgents,
+    _global_event_tx: broadcast::Sender<ServerEvent>,
+    provider_template: Arc<dyn Provider>,
+    _global_is_processing: Arc<RwLock<bool>>,
+    global_session_id: Arc<RwLock<String>>,
+    client_count: Arc<RwLock<usize>>,
+    client_connections: Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
+    swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>>,
+    swarms_by_id: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    shared_context: Arc<RwLock<...>>,
+    swarm_plans: Arc<RwLock<HashMap<String, VersionedPlan>>>,
+    swarm_coordinators: Arc<RwLock<HashMap<String, String>>>,
+    file_touch: FileTouchService,
+    channel_subscriptions: ChannelSubscriptions,
+    channel_subscriptions_by_session: ChannelSubscriptions,
+    client_debug_state: Arc<RwLock<ClientDebugState>>,
+    client_debug_response_tx: broadcast::Sender<(u64, String)>,
+    event_history: Arc<RwLock<VecDeque<SwarmEvent>>>,
+    event_counter: Arc<AtomicU64>,
+    swarm_event_tx: broadcast::Sender<SwarmEvent>,
+    server_name: String,
+    server_icon: String,
+    mcp_pool: Arc<SharedMcpPool>,
+    shutdown_signals: Arc<RwLock<HashMap<String, InterruptSignal>>>,
+    soft_interrupt_queues: SessionInterruptQueues,
+    await_members_runtime: AwaitMembersRuntime,
+    swarm_mutation_runtime: SwarmMutationRuntime,
+) -> Result<()> { ... }
+```
 
-That is the clearest signal that client, session, swarm, and debug responsibilities are crossing in one place.
+This is the clearest signal that client, session, swarm, and debug
+responsibilities cross in one place. Wide, positional, all `Arc`s.
 
-### 3. session flows directly mutate swarm state
+### 3. Session flows directly mutate swarm state
 
-`client_session.rs` does real session work, but also directly touches:
+`client_session.rs` still does session work while directly touching swarm
+membership, channel subscription cleanup, plan participant rename/removal, status
+updates, event sender registration, and interrupt queue rename/removal.
 
-- swarm member registration
-- channel subscription cleanup
-- plan participant rename/removal
-- status updates
-- event sender registration
-- interrupt queue rename/removal
+### 4. Maintenance loops reach into domain maps directly
 
-That makes session lifecycle hard to extract cleanly because it owns both agent state and swarm membership side effects.
+`server.rs` maintenance tasks (reload, background wakeup/notification, bus
+monitor/file-touch, idle timeout, runtime memory logging, registry publishing,
+ambient scheduling) still touch shared state directly.
 
-### 4. maintenance loops reach into domain maps directly
+### 5. Debug paths bypass future boundaries
 
-`server.rs` maintenance tasks currently touch shared state directly for:
+`debug.rs` + `debug_*` inspect/mutate many raw stores directly. Fine now, but
+they will block extraction unless debug becomes a consumer of service snapshots.
 
-- reload handling
-- background task wakeup / notification delivery
-- bus monitoring and file touch conflict detection
-- idle timeout
-- runtime memory logging
-- registry publishing
-- ambient scheduling
-
-This makes background jobs depend on storage layout instead of service APIs.
-
-### 5. debug paths bypass future boundaries
-
-`debug.rs` and `debug_*` modules inspect or mutate many raw stores directly.
-That is fine for now, but it will block extraction unless debug becomes a consumer of service snapshots and public mutation methods.
+---
 
 ## Proposed Service Split
 
-The target split is still one process and one Tokio runtime.
-The change is ownership and APIs, not deployment.
+Still one process, one Tokio runtime. The change is ownership and APIs.
 
 ### 1. Session Service
 
-**Owns:**
+**Owns:** `sessions`, `session_id`, `shutdown_signals`, `soft_interrupt_queues`,
+session event sender registration/fanout, session-local agent actions and
+provider/session mutation, headless session primitives.
 
-- `sessions`
-- `session_id` default/global session tracking
-- `shutdown_signals`
-- `soft_interrupt_queues`
-- session event sender registration and fanout
-- session-local agent actions and provider/session mutation
-- headless session creation primitives
+Primary modules: `state.rs` delivery pieces, `client_session.rs` session-only
+parts, `client_actions.rs`, `provider_control.rs`, `headless.rs`, parts of
+`reload.rs` for graceful-shutdown helpers.
 
-**Primary modules after split:**
+Public API examples: `attach_client`, `resume_session`, `clear_session`,
+`spawn_headless_session`, `queue_soft_interrupt`, `fanout_session_event`,
+`rename_session`, `shutdown_session`, `session_snapshot`.
 
-- `state.rs` delivery pieces
-- `client_session.rs` session-only parts
-- `client_actions.rs`
-- `provider_control.rs`
-- `headless.rs`
-- parts of `reload.rs` for graceful shutdown helpers
-
-**Public API examples:**
-
-- `attach_client(...)`
-- `resume_session(...)`
-- `clear_session(...)`
-- `spawn_headless_session(...)`
-- `queue_soft_interrupt(...)`
-- `fanout_session_event(...)`
-- `rename_session(...)`
-- `shutdown_session(...)`
-- `session_snapshot(...)`
-
-**Boundary rule:** session service should not directly own swarm membership rules.
-It can expose lifecycle events or return session metadata that another layer uses to update swarm state.
+Boundary rule: must not directly own swarm membership rules. It exposes
+lifecycle events / returns metadata that another layer uses to update swarm state.
 
 ### 2. Client Service
 
-**Owns:**
+**Owns:** socket/debug/gateway transport accept loops, client connection
+registry, client count / attachment count, connection-scoped state and request
+routing, subscribe/reconnect orchestration across services, client API wrappers.
 
-- socket, debug socket, gateway transport accept loops
-- client connection registry
-- client count / attachment count
-- connection-scoped state and request routing
-- subscribe / reconnect orchestration across services
-- client API wrappers
+Primary modules: `runtime.rs`, `socket.rs`, `client_api.rs`, `client_lifecycle.rs`
+(connection loop + router only), `client_disconnect_cleanup.rs`, client-facing
+parts of `client_state.rs`.
 
-**Primary modules after split:**
+Public API examples: `spawn_accept_loops`, `run_client_connection(stream)`,
+`register_connection`, `cleanup_connection`, `connected_clients_snapshot`.
 
-- `runtime.rs`
-- `socket.rs`
-- `client_api.rs`
-- `client_lifecycle.rs` connection loop and router only
-- `client_disconnect_cleanup.rs`
-- client-facing parts of `client_state.rs`
-
-**Public API examples:**
-
-- `spawn_accept_loops(...)`
-- `run_client_connection(stream)`
-- `register_connection(...)`
-- `cleanup_connection(...)`
-- `connected_clients_snapshot()`
-
-**Boundary rule:** client service routes requests, but does not own business state for sessions, swarms, or debug jobs.
+Boundary rule: routes requests, does not own business state for sessions, swarms,
+or debug jobs.
 
 ### 3. Swarm Service
 
-**Owns:**
+**Owns:** `swarm_members`, `swarms/plans/coordinators`, `shared_context`,
+channel subscriptions and reverse indexes, swarm event history/broadcast, file
+touch tracking + reverse indexes, await-members runtime, status/plan/conflict
+broadcast.
 
-- `swarm_members`
-- `swarms_by_id`
-- `shared_context`
-- `swarm_plans`
-- `swarm_coordinators`
-- channel subscriptions and reverse indexes
-- swarm event history and event broadcast
-- file touch tracking and reverse indexes
-- await-members runtime
-- status broadcasting, plan broadcasting, conflict notifications
+Primary modules: `swarm.rs`, `client_comm.rs`, `comm_plan.rs`,
+`comm_control.rs` (swarm), `comm_session.rs` (coordination portions),
+`comm_sync.rs`, `file_touch_service.rs`, `swarm_channels.rs`,
+`await_members_state.rs`, `swarm_mutation_state.rs`.
 
-**Primary modules after split:**
+Public API examples: `join_swarm`, `leave_swarm`, `set_member_status`,
+`assign_role`, `update_plan`, `subscribe_channel`, `publish_notification`,
+`record_file_touch`, `detect_conflicts`, `await_members`, `snapshot_swarm`.
 
-- `swarm.rs`
-- `client_comm.rs`
-- `comm_plan.rs`
-- `comm_control.rs` swarm portions
-- `comm_session.rs` swarm coordination portions
-- `comm_sync.rs`
-- file-touch portions of `server.rs::monitor_bus`
-- `await_members_state.rs`
-
-**Public API examples:**
-
-- `join_swarm(...)`
-- `leave_swarm(...)`
-- `set_member_status(...)`
-- `assign_role(...)`
-- `update_plan(...)`
-- `subscribe_channel(...)`
-- `publish_notification(...)`
-- `record_file_touch(...)`
-- `detect_conflicts(...)`
-- `await_members(...)`
-- `snapshot_swarm(...)`
-
-**Boundary rule:** swarm service can request message delivery through the session service, but should not reach into raw session maps.
+Boundary rule: can request message delivery through the session service but not
+reach into raw session maps.
 
 ### 4. Debug Service
 
-**Owns:**
+**Owns:** debug socket request router, client debug bridge state, debug job
+registry, testers + debug command execution helpers, server + swarm snapshots for
+inspection.
 
-- debug socket request router
-- client debug bridge state
-- debug job registry
-- testers and debug command execution helpers
-- server and swarm snapshots for inspection
+Primary modules: `debug.rs`, `debug_command_exec.rs`, `debug_events.rs`,
+`debug_help.rs`, `debug_jobs.rs`, `debug_server_state.rs`,
+`debug_session_admin.rs`, `debug_swarm_read.rs`, `debug_swarm_write.rs`,
+`debug_testers.rs`, `debug_ambient.rs`.
 
-**Primary modules after split:**
+Public API examples: `run_debug_connection`, `submit_debug_job`,
+`server_snapshot`, `swarm_snapshot`, `route_transcript_injection`.
 
-- `debug.rs`
-- `debug_command_exec.rs`
-- `debug_events.rs`
-- `debug_help.rs`
-- `debug_jobs.rs`
-- `debug_server_state.rs`
-- `debug_session_admin.rs`
-- `debug_swarm_read.rs`
-- `debug_swarm_write.rs`
-- `debug_testers.rs`
-- `debug_ambient.rs`
-
-**Public API examples:**
-
-- `run_debug_connection(stream)`
-- `submit_debug_job(...)`
-- `server_snapshot()`
-- `swarm_snapshot(...)`
-- `route_transcript_injection(...)`
-
-**Boundary rule:** debug service should read snapshots from other services and mutate them only through explicit service methods.
-It should not be a privileged backdoor around normal APIs except where intentionally documented.
+Boundary rule: reads snapshots from other services; mutates only through explicit
+service methods. Not a privileged backdoor except where intentionally documented.
 
 ### 5. Maintenance Service
 
-**Owns:**
+**Owns:** reload monitor/reload plumbing, registry publish/cleanup, idle timeout,
+runtime memory logging, embedding preload/unload, ambient loop wiring, background
+task completion delivery, bus subscription loops.
 
-- reload monitor and reload-state plumbing
-- registry publish / cleanup background tasks
-- idle timeout monitor
-- runtime memory logging loop
-- embedding preload and idle unload
-- ambient loop startup/wiring
-- background task completion delivery orchestration
-- bus subscription loops that translate infra events into service calls
+Primary modules: `reload.rs`, `reload_state.rs`, `server.rs` background-task
+delivery, registry / idle / memory pieces, `monitor_bus()` after it is narrowed.
 
-**Primary modules after split:**
+Public API examples: `start_background_loops`, `handle_reload_signal`,
+`deliver_background_task_completion`, `publish_registry_metadata`, `run_idle_monitor`,
+`run_bus_monitor`.
 
-- `reload.rs`
-- `reload_state.rs`
-- background-task delivery logic from `server.rs`
-- registry and idle-timeout pieces from `server.rs`
-- runtime memory logging pieces from `server.rs`
-- `monitor_bus()` after it is narrowed to service calls
+Boundary rule: orchestrates services, does not own their domain maps.
 
-**Public API examples:**
-
-- `start_background_loops(...)`
-- `handle_reload_signal(...)`
-- `deliver_background_task_completion(...)`
-- `publish_registry_metadata(...)`
-- `run_idle_monitor(...)`
-- `run_bus_monitor(...)`
-
-**Boundary rule:** maintenance service should orchestrate services, not own their domain maps.
+---
 
 ## Recommended Dependency Direction
 
 ```mermaid
-flowchart LR
-  Client[Client Service] --> Session[Session Service]
-  Client --> Swarm[Swarm Service]
-  Client --> Debug[Debug Service]
-
-  Swarm --> Session
-  Debug --> Session
-  Debug --> Swarm
-  Maintenance --> Session
+graph TD
+  DBG[Debug] --> Sess[Session]
+  DBG --> Swarm[Swarm]
+  Client --> Sess
+  Client --> Swarm
+  Client --> DBG
+  Swarm --> Sess
+  Maintenance --> Sess
   Maintenance --> Swarm
   Maintenance --> Client
 ```
@@ -377,222 +309,196 @@ Rules:
 - `Server` becomes bootstrap and wiring only.
 - `ServerRuntime` becomes transport runtime only.
 - session and swarm are the main domain services.
-- debug and maintenance depend on domain services, not the other way around.
+- debug and maintenance depend on domain services, not the reverse.
 
-## Concrete Extraction Seams
+## Concrete Extraction Seams (re-anchored)
 
 ### Seam A: turn `state.rs` into the session-delivery foundation
 
-`state.rs` already contains the best low-risk shared seam:
+`state.rs` already centralizes `SessionAgents` registries, session event fanout,
+soft-interrupt queues, and `SessionControlHandle`. Make this the backbone of the
+session service rather than generic helpers.
 
-- session event sender registration
-- session event fanout
-- soft interrupt queue registration and enqueue
-
-Make this the initial backbone of the session service instead of leaving it as generic helpers.
-
-Why this is safe:
-
-- logic is already centralized
-- heavily reused by swarm, debug, and maintenance
-- extraction reduces duplication of `SessionAgents` and queue plumbing without changing behavior
+Why safe: logic already centralized, heavily reused by swarm/debug/maintenance.
 
 ### Seam B: separate connection routing from business handlers
 
 Split `client_lifecycle.rs` into:
 
-- `ClientConnection` or `ClientLoop` for stream handling and per-client state
-- `ClientRequestRouter` for mapping `Request` variants to service calls
+- a `ClientConnection` type (stream handling + per-client state)
+- a `ClientRequestRouter` mapping `Request` variants to service calls over
+  `SessionService`, `SwarmService`, `DebugService` handles (not raw
+  `Arc<RwLock<HashMap<...>>>`).
 
-The router should depend on `SessionService`, `SwarmService`, and `DebugService`, not raw `Arc<RwLock<HashMap<...>>>` fields.
-
-Why this is safe:
-
-- no protocol change
-- no state ownership change yet
-- mostly signature narrowing and file movement
+Why safe: no protocol change, no state-ownership change; mostly signature
+narrowing and file movement.
 
 ### Seam C: move swarm membership side effects out of session lifecycle code
 
-Today subscribe/resume/clear paths do both session and swarm work.
-That should become:
+Subscribe/resume/clear paths should become:
 
-- session service: attach/resume/rename session
-- swarm service: join/update/leave member state
+- session service: attach/resume/rename
+- swarm service: join/update/leave member
 - client service: orchestrate the sequence for a request
 
-This is likely the most important semantic seam for future maintainability.
-
-Why this is safe:
-
-- it clarifies ownership without changing the shared-server model
-- it removes the hardest cross-domain coupling first
+This is the most important semantic seam. See
+`client_session.rs` side effects today.
 
 ### Seam D: make maintenance loops call service APIs only
 
-`monitor_bus()`, reload orchestration, idle timeout, and background-task wakeup should stop mutating shared maps directly.
-They should call:
-
-- `session_service.queue_soft_interrupt(...)`
-- `session_service.fanout_session_event(...)`
-- `swarm_service.record_file_touch(...)`
-- `swarm_service.broadcast_status(...)`
-- `swarm_service.detect_conflicts(...)`
-
-Why this is safe:
-
-- behavior stays the same
-- background logic becomes testable in isolation
-- future refactors no longer require editing `server.rs`
+`monitor_bus()`, reload, idle, background-task wakeup should call
+`session_service.queue_soft_interrupt(...)`, `swarm_service.record_file_touch(...)`,
+`swarm_service.broadcast_status(...)`, etc., instead of mutating maps directly.
 
 ### Seam E: make debug consume snapshots, not storage
 
-The debug stack currently knows too much about internal maps.
-Introduce service snapshot methods so debug code reads pre-shaped data:
+Introduce `session_service.snapshot_sessions()`, `client_service.snapshot_connections()`,
+`swarm_service.snapshot_state()`, `maintenance_service.snapshot_runtime_health()` so
+debug reads pre-shaped data.
 
-- `session_service.snapshot_sessions()`
-- `client_service.snapshot_connections()`
-- `swarm_service.snapshot_state()`
-- `maintenance_service.snapshot_runtime_health()`
+---
 
-Why this is safe:
+## Service Handle Structs (the concrete first move)
 
-- debug stays powerful
-- domain internals become easier to change
-- read-only inspection stops blocking storage changes
+The first code change is to add thin handles, each wrapping the relevant `Arc`/
+`Arc<RwLock<...>>` fields already cloned into `ServerRuntime`:
+
+```rust
+// server/services/session.rs
+#[derive(Clone)]
+pub struct SessionServiceHandle {
+    sessions: SessionAgents,
+    session_id: Arc<RwLock<String>>,
+    shutdown_signals: Arc<RwLock<HashMap<String, InterruptSignal>>>,
+    soft_interrupt_queues: SessionInterruptQueues,
+    event_tx: broadcast::Sender<ServerEvent>,
+    // ...
+}
+
+// server/services/client.rs
+#[derive(Clone)]
+pub struct ClientServiceHandle { a: SessionAgents, client_count: ..., client_connections: ..., ... }
+
+// server/services/swarm.rs
+#[derive(Clone)]
+pub struct SwarmServiceHandle { swarm_state: SwarmState, shared_context, file_touch, channels, event_history, ... }
+
+// server/services/debug.rs
+
+ // server/services/maintenance.rs
+```
+
+These do **not** move logic yet. They wrap the current fields, which stops the
+spread of 20+ argument lists immediately and gives values a home.
+
+---
 
 ## First Safe Moves
 
-These are the first changes I would recommend landing in order.
+1. **Docs + ownership rules** (this document) so later extractions don't worsen coupling.
+2. **Introduce service handle structs** with zero behavior change (wraps current Arc fields).
+3. **Change `ServerRuntime::from_server` to build handles once**; store handle in the runtime.
+4. **Narrow `handle_client()` / `handle_debug_client()` inputs** to use the handles +
+   a small `ClientRequestContext`/`DebugRequestContext`.
+5. **Extract swarm membership orchestration from `client_session.rs`** into
+   `SwarmService` methods, called by session/client flows.
+6. **Move `monitor_bus()` behind the swarm/session API boundary.**
 
-### Move 1: docs and ownership rules
+## Moves to avoid early
 
-Land this plan and treat it as the contract for future refactors.
-
-**Why first:** it prevents accidental partial extractions that worsen coupling.
-
-### Move 2: introduce service handle structs with zero behavior change
-
-Add thin wrappers such as:
-
-- `SessionServiceHandle`
-- `ClientServiceHandle`
-- `SwarmServiceHandle`
-- `DebugServiceHandle`
-- `MaintenanceServiceHandle`
-
-Initially these can just wrap the current `Arc` fields.
-No logic movement is required yet.
-
-**Payoff:** stops the spread of 20+ argument lists.
-
-### Move 3: change `ServerRuntime` to hold service handles, not raw maps
-
-`runtime.rs` is the cleanest place to narrow dependencies because it already acts as the server’s execution runtime.
-
-**Payoff:** connection accept code no longer needs to know the storage layout of every subsystem.
-
-### Move 4: change `handle_client()` and `handle_debug_client()` signatures
-
-Replace wide argument lists with a few typed contexts:
-
-- `ClientRequestContext`
-- `DebugRequestContext`
-- service handles
-
-**Payoff:** largest readability win with limited behavioral risk.
-
-### Move 5: extract swarm membership orchestration from `client_session.rs`
-
-Create explicit swarm membership methods and have client/session flows call them.
-
-**Payoff:** this is the first real domain split and removes one of the biggest architecture knots.
-
-### Move 6: move `monitor_bus()` behind the swarm/session API boundary
-
-Keep behavior, but stop direct map access from the maintenance loop.
-
-**Payoff:** background infrastructure becomes modular and easier to test.
-
-## Moves To Avoid Early
-
-Avoid these until the service-handle layer exists:
+Until the service-handle layer exists:
 
 - splitting into separate processes
-- creating new crates for each service
-- introducing async traits for every domain call
+- creating new crates per service
+- async traits for every domain call
 - changing the on-the-wire protocol
 - changing session persistence format
-- merging debug and normal sockets into one transport path as part of the refactor
+- merging debug + normal sockets as part of the refactor
 
-These are higher-risk and do not solve the present problem as directly as state/API narrowing.
-
-## Suggested File Landing Plan
+## Suggested file landing plan
 
 ### Phase 1: no behavior change
 
 - add service handle types
-- make `Server` store those handles or construct them centrally
+- make `Server` hold/construct those handles
 - thread handles through `runtime.rs`
-- narrow `handle_client()` and `handle_debug_client()` inputs
+- narrow `handle_client` + `handle_debug_client`
 
 ### Phase 2: move ownership boundaries
 
 - move session delivery helpers under session service
 - move swarm membership/status/channel/plan mutation fully under swarm service
-- move debug readers to service snapshots
 - move maintenance loops to service APIs
+- move debug readers to service snapshots
 
 ### Phase 3: clean module layout
 
-Possible end-state layout:
-
 ```text
-src/server/
-  bootstrap.rs            # current server.rs bootstrap pieces
-  runtime.rs              # accept loops and transport runtime
+jcode-app-core/src/server/
+  bootstrap.rs            # server.rs bootstrap pieces
+  runtime.rs              # accept loops + transport runtime
   services/
     session.rs
     client.rs
     swarm.rs
     debug.rs
     maintenance.rs
-  session/
-    actions.rs
-    lifecycle.rs
-    provider.rs
-    delivery.rs
-  swarm/
-    comm.rs
-    plan.rs
-    control.rs
-    sync.rs
-    state.rs
-  debug/
-    router.rs
-    jobs.rs
-    snapshots.rs
-    testers.rs
-  maintenance/
-    reload.rs
-    bus.rs
-    idle.rs
-    memory.rs
-    registry.rs
+  session/                # actions.rs, lifecycle.rs, provider.rs, delivery.rs
+  swarm/                  # comm.rs, plan.rs, control.rs, sync.rs, state.rs
+  debug/                  # router.rs, jobs.rs, snapshots.rs, testers.rs
+  maintenance/            # reload.rs, bus.rs, idle.rs, memory.rs, registry.rs
 ```
-
-This can be reached gradually. It does not need to happen in one PR.
 
 ## Decision Record
 
 ### Recommended first code extraction
 
-If one tiny extraction is desired after docs, the safest one is:
+After this document: **introduce service handle structs only** (`services/*.rs`),
+the same safe first move the original plan recommended. It narrows dependency
+surfaces immediately and creates a place to move methods later.
 
-- introduce **service handle structs only**, with no behavior change
+### Verified-not-done against current tree
 
-That is the highest-leverage low-risk move because it narrows dependency surfaces immediately and creates a place to move methods later.
+Checked 2026-09-07 against `crates/jcode-app-core/src/`:
 
-### Recommended non-goal for now
+- No `services/` module, no `*ServiceHandle` types → Phase 2 move not started.
+  **Now updated:** Slice 1 landed a `server/services/*.rs` module with the five
+  `*ServiceHandle` structs + `from_server` (additive, no behavior change). The
+  `ServerRuntime` wiring and `handle_client`/`handle_debug_client` narrowing are
+  still pending (Slice 2).
+- `ServerRuntime` (`runtime.rs`) still clones the full field-by-field state bag.
+- `handle_client()` is still a 28-argument positional list.
+- Session lifecycle (`client_session.rs`) still mutates swarm membership directly.
+- Maintenance (`server.rs`) still reaches into raw maps; `monitor_bus` unchanged.
+- Debug still reads raw maps.
 
-Do not split the server into separate OS services. The current architecture benefits from shared MCP pool, shared embedding lifecycle, shared reload handling, and shared in-memory coordination. The code should first be made modular **inside** the existing process.
+What HAS landed: the breadth-level file split (many focused modules), `runtime.rs`
+already isolates accept loops, `state.rs` centralizes delivery types and
+`SwarmState`, `swarm.rs` is already a stateful domain service. The remaining work
+is the service-handle/ownership boundary, which is untouched.
+
+---
+
+## Recommended first slice (the highest-leverage, lowest-risk landing)
+
+> **Slice 1 (landed):** `server/services/*.rs` handle structs only, no behavior
+> change.
+
+This is the single highest-value move from the plan that unblocks everything else
+without risking the runtime model. It is deliberately a **slice**, not a PR:
+
+- **Slice 1 — additive handle structs.** A new `server/services/` module holds
+  the five `*ServiceHandle` structs and their `from_server(&Server)` constructors.
+  It is a zero-behavior grouping of the existing state bag; nothing else changes.
+  This lands cleanly by itself and gives the future service methods a home.
+- **Slice 2 — wire `ServerRuntime`.** Construct and hold the handles in
+  `ServerRuntime::from_server`, then route the `handle_client` /
+  `handle_debug_client` call sites through them. Merging a duplicate
+  flat-field store is intentionally avoided so nothing is double-homed.
+- **Slice 3+ — ownership moves.** Swarm-membership extraction out of
+  `client_session.rs`, `monitor_bus` to service APIs, debug snapshots, then a
+  reduced `handle_client`/`handle_debug_client` signature. Each is mechanical
+  once the handles exist.
+
+Each slice is independently reviewable and behavior-preserving; none is gated on
+the rest.

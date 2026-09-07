@@ -1,28 +1,20 @@
 use super::client_lifecycle::handle_client;
-use super::debug::{ClientConnectionInfo, ClientDebugState, handle_debug_client};
-use super::debug_jobs::DebugJob;
-use super::util::get_shared_mcp_pool;
-use super::{
-    AwaitMembersRuntime, FileTouchService, ServerIdentity, SessionInterruptQueues, SharedContext,
-    SwarmEvent, SwarmMutationRuntime, SwarmState,
+use super::debug::handle_debug_client;
+use super::services::{
+    ClientServiceHandle, DebugServiceHandle, MaintenanceServiceHandle, SessionServiceHandle,
+    SwarmServiceHandle,
 };
-use crate::agent::Agent;
+use super::util::get_shared_mcp_pool;
+use super::util::ServerIdentity;
 use crate::ambient_runner::AmbientRunnerHandle;
 use crate::gateway::GatewayClient;
-use crate::protocol::ServerEvent;
-use crate::provider::Provider;
 use crate::transport::{Listener, Stream};
-use jcode_agent_runtime::InterruptSignal;
-use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use std::time::Instant;
-use tokio::sync::{Mutex, OnceCell, RwLock, broadcast, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-
-type ChannelSubscriptions = Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
 
 /// Owns every connection task spawned by a server runtime.
 ///
@@ -89,67 +81,38 @@ fn log_task_completion(result: Result<(), tokio::task::JoinError>) {
 
 #[derive(Clone)]
 pub(super) struct ServerRuntime {
-    sessions: Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>,
-    event_tx: broadcast::Sender<ServerEvent>,
-    provider: Arc<dyn Provider>,
-    is_processing: Arc<RwLock<bool>>,
-    session_id: Arc<RwLock<String>>,
     client_count: Arc<RwLock<usize>>,
-    client_connections: Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
-    swarm_state: SwarmState,
-    shared_context: Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
-    file_touch: FileTouchService,
-    channel_subscriptions: ChannelSubscriptions,
-    channel_subscriptions_by_session: ChannelSubscriptions,
-    client_debug_state: Arc<RwLock<ClientDebugState>>,
-    client_debug_response_tx: broadcast::Sender<(u64, String)>,
-    debug_jobs: Arc<RwLock<HashMap<String, DebugJob>>>,
-    event_history: Arc<RwLock<VecDeque<SwarmEvent>>>,
-    event_counter: Arc<AtomicU64>,
-    swarm_event_tx: broadcast::Sender<SwarmEvent>,
     server_name: String,
     server_icon: String,
     server_identity: ServerIdentity,
     ambient_runner: Option<AmbientRunnerHandle>,
-    mcp_pool: Arc<OnceCell<Arc<crate::mcp::SharedMcpPool>>>,
-    shutdown_signals: Arc<RwLock<HashMap<String, InterruptSignal>>>,
-    soft_interrupt_queues: SessionInterruptQueues,
-    await_members_runtime: AwaitMembersRuntime,
-    swarm_mutation_runtime: SwarmMutationRuntime,
     tasks: Arc<RuntimeTaskScope>,
+
+    /// Service handles (server service split, Slice 2). These group the shared
+    /// state by ownership domain and route `handle_client` / `handle_debug_client`
+    /// through typed handles instead of the flat field bag.
+    session_service: SessionServiceHandle,
+    client_service: ClientServiceHandle,
+    swarm_service: SwarmServiceHandle,
+    debug_service: DebugServiceHandle,
+    maintenance_service: MaintenanceServiceHandle,
 }
 
 impl ServerRuntime {
     pub(super) fn from_server(server: &super::Server) -> Self {
         Self {
-            sessions: Arc::clone(&server.sessions),
-            event_tx: server.event_tx.clone(),
-            provider: Arc::clone(&server.provider),
-            is_processing: Arc::clone(&server.is_processing),
-            session_id: Arc::clone(&server.session_id),
             client_count: Arc::clone(&server.client_count),
-            client_connections: Arc::clone(&server.client_connections),
-            swarm_state: server.swarm_state.clone(),
-            shared_context: Arc::clone(&server.shared_context),
-            file_touch: server.file_touch.clone(),
-            channel_subscriptions: Arc::clone(&server.channel_subscriptions),
-            channel_subscriptions_by_session: Arc::clone(&server.channel_subscriptions_by_session),
-            client_debug_state: Arc::clone(&server.client_debug_state),
-            client_debug_response_tx: server.client_debug_response_tx.clone(),
-            debug_jobs: Arc::clone(&server.debug_jobs),
-            event_history: Arc::clone(&server.event_history),
-            event_counter: Arc::clone(&server.event_counter),
-            swarm_event_tx: server.swarm_event_tx.clone(),
             server_name: server.identity.name.clone(),
             server_icon: server.identity.icon.clone(),
             server_identity: server.identity.clone(),
             ambient_runner: server.ambient_runner.clone(),
-            mcp_pool: Arc::clone(&server.mcp_pool),
-            shutdown_signals: Arc::clone(&server.shutdown_signals),
-            soft_interrupt_queues: Arc::clone(&server.soft_interrupt_queues),
-            await_members_runtime: server.await_members_runtime.clone(),
-            swarm_mutation_runtime: server.swarm_mutation_runtime.clone(),
             tasks: Arc::new(RuntimeTaskScope::default()),
+
+            session_service: SessionServiceHandle::from_server(server),
+            client_service: ClientServiceHandle::from_server(server),
+            swarm_service: SwarmServiceHandle::from_server(server),
+            debug_service: DebugServiceHandle::from_server(server),
+            maintenance_service: MaintenanceServiceHandle::from_server(server),
         }
     }
 
@@ -339,36 +302,36 @@ impl ServerRuntime {
     ) {
         let result = {
             let client = async {
-                let mcp_pool = get_shared_mcp_pool(&self.mcp_pool).await;
+                let mcp_pool = get_shared_mcp_pool(&self.maintenance_service.mcp_pool).await;
                 handle_client(
                     stream,
-                    Arc::clone(&self.sessions),
-                    self.event_tx.clone(),
-                    Arc::clone(&self.provider),
-                    Arc::clone(&self.is_processing),
-                    Arc::clone(&self.session_id),
-                    Arc::clone(&self.client_count),
-                    Arc::clone(&self.client_connections),
-                    Arc::clone(&self.swarm_state.members),
-                    Arc::clone(&self.swarm_state.swarms_by_id),
-                    Arc::clone(&self.shared_context),
-                    Arc::clone(&self.swarm_state.plans),
-                    Arc::clone(&self.swarm_state.coordinators),
-                    self.file_touch.clone(),
-                    Arc::clone(&self.channel_subscriptions),
-                    Arc::clone(&self.channel_subscriptions_by_session),
-                    Arc::clone(&self.client_debug_state),
-                    self.client_debug_response_tx.clone(),
-                    Arc::clone(&self.event_history),
-                    Arc::clone(&self.event_counter),
-                    self.swarm_event_tx.clone(),
+                    Arc::clone(&self.session_service.sessions),
+                    self.session_service.event_tx.clone(),
+                    Arc::clone(&self.client_service.provider),
+                    Arc::clone(&self.session_service.is_processing),
+                    Arc::clone(&self.session_service.session_id),
+                    Arc::clone(&self.client_service.client_count),
+                    Arc::clone(&self.client_service.client_connections),
+                    Arc::clone(&self.swarm_service.swarm_state.members),
+                    Arc::clone(&self.swarm_service.swarm_state.swarms_by_id),
+                    Arc::clone(&self.swarm_service.shared_context),
+                    Arc::clone(&self.swarm_service.swarm_state.plans),
+                    Arc::clone(&self.swarm_service.swarm_state.coordinators),
+                    self.swarm_service.file_touch.clone(),
+                    Arc::clone(&self.swarm_service.channel_subscriptions),
+                    Arc::clone(&self.swarm_service.channel_subscriptions_by_session),
+                    Arc::clone(&self.debug_service.client_debug_state),
+                    self.debug_service.client_debug_response_tx.clone(),
+                    Arc::clone(&self.swarm_service.event_history),
+                    Arc::clone(&self.swarm_service.event_counter),
+                    self.swarm_service.swarm_event_tx.clone(),
                     self.server_name.clone(),
                     self.server_icon.clone(),
                     mcp_pool,
-                    Arc::clone(&self.shutdown_signals),
-                    Arc::clone(&self.soft_interrupt_queues),
-                    self.await_members_runtime.clone(),
-                    self.swarm_mutation_runtime.clone(),
+                    Arc::clone(&self.session_service.shutdown_signals),
+                    Arc::clone(&self.session_service.soft_interrupt_queues),
+                    self.swarm_service.await_members_runtime.clone(),
+                    self.swarm_service.swarm_mutation_runtime.clone(),
                 )
                 .await
             };
@@ -397,34 +360,34 @@ impl ServerRuntime {
         cancellation: CancellationToken,
     ) {
         let client = async {
-            let mcp_pool = Some(get_shared_mcp_pool(&self.mcp_pool).await);
+            let mcp_pool = Some(get_shared_mcp_pool(&self.maintenance_service.mcp_pool).await);
             handle_debug_client(
                 stream,
-                Arc::clone(&self.sessions),
-                Arc::clone(&self.is_processing),
-                Arc::clone(&self.session_id),
-                Arc::clone(&self.provider),
-                Arc::clone(&self.client_connections),
-                Arc::clone(&self.swarm_state.members),
-                Arc::clone(&self.swarm_state.swarms_by_id),
-                Arc::clone(&self.shared_context),
-                Arc::clone(&self.swarm_state.plans),
-                Arc::clone(&self.swarm_state.coordinators),
-                self.file_touch.clone(),
-                Arc::clone(&self.channel_subscriptions),
-                Arc::clone(&self.channel_subscriptions_by_session),
-                Arc::clone(&self.client_debug_state),
-                self.client_debug_response_tx.clone(),
-                Arc::clone(&self.debug_jobs),
-                Arc::clone(&self.event_history),
-                Arc::clone(&self.event_counter),
-                self.swarm_event_tx.clone(),
+                Arc::clone(&self.session_service.sessions),
+                Arc::clone(&self.session_service.is_processing),
+                Arc::clone(&self.session_service.session_id),
+                Arc::clone(&self.client_service.provider),
+                Arc::clone(&self.client_service.client_connections),
+                Arc::clone(&self.swarm_service.swarm_state.members),
+                Arc::clone(&self.swarm_service.swarm_state.swarms_by_id),
+                Arc::clone(&self.swarm_service.shared_context),
+                Arc::clone(&self.swarm_service.swarm_state.plans),
+                Arc::clone(&self.swarm_service.swarm_state.coordinators),
+                self.swarm_service.file_touch.clone(),
+                Arc::clone(&self.swarm_service.channel_subscriptions),
+                Arc::clone(&self.swarm_service.channel_subscriptions_by_session),
+                Arc::clone(&self.debug_service.client_debug_state),
+                self.debug_service.client_debug_response_tx.clone(),
+                Arc::clone(&self.debug_service.debug_jobs),
+                Arc::clone(&self.swarm_service.event_history),
+                Arc::clone(&self.swarm_service.event_counter),
+                self.swarm_service.swarm_event_tx.clone(),
                 self.server_identity.clone(),
                 server_start_time,
                 self.ambient_runner.clone(),
                 mcp_pool,
-                Arc::clone(&self.shutdown_signals),
-                Arc::clone(&self.soft_interrupt_queues),
+                Arc::clone(&self.session_service.shutdown_signals),
+                Arc::clone(&self.session_service.soft_interrupt_queues),
             )
             .await
         };
