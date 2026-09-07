@@ -140,9 +140,14 @@ modules. It is blocked on **cross-service state access** and **router width**.
 into accept loops. This makes transport code depend on internal service storage
 details.
 
-### 2. `handle_client()` is both connection loop and application router
+### 2. `handle_client()` was both connection loop and application router
 
-The 28-argument prototype at `client_lifecycle.rs:435`:
+> **Historical (pre-refactor).** This section documents the original coupling the
+> split resolves. Slice 3 replaced this 28-argument prototype with the service
+> handles (see "Recommended first slice"), so the signature below no longer
+> reflects `client_lifecycle.rs:435`.
+
+The 28-argument prototype that previously lived at `client_lifecycle.rs:435`:
 
 ```rust
 pub(super) async fn handle_client(
