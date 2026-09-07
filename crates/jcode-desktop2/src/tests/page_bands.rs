@@ -42,10 +42,16 @@ fn page_nodes() -> Vec<(&'static str, Model)> {
 
 /// The input box must be *drawn* on the middle of the window, not merely laid
 /// out there: this catches a renderer that ignores the centred geometry.
+///
+/// Sweeps the settled page nodes, i.e. those reaching `page_nodes()` that are
+/// not busy. A busy page draws its activity spinner beside the composer well,
+/// in the same column `wash_band` samples, so the well cannot be cleanly
+/// isolated there; the "is the well centred where it is drawn" invariant
+/// belongs to the settled page.
 #[test]
 #[ignore = "requires a GPU"]
 fn the_composer_well_is_drawn_on_the_middle_of_the_window() {
-    for (name, model) in nodes() {
+    for (name, model) in page_nodes().into_iter().filter(|(_, model)| !model.busy) {
         let Some(r) = Rendered::new(&model) else {
             return;
         };
