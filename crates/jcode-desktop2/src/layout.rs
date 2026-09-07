@@ -548,7 +548,11 @@ impl Frame {
         let rows = rows.max(1);
         let body = rows as f64 * PALETTE_ROW_HEIGHT;
         let height = PALETTE_SEARCH_HEIGHT + PALETTE_PAD + body + PALETTE_PAD;
-        let available = (self.height - 40.0 * 2.0).max(height);
+        // Cap the card to the vertical space the page allows, so a short
+        // window does not push its top and bottom off-paper. The floor keeps a
+        // degenerate page from shrinking the card to nothing; the list simply
+        // over-clips to the card rather than scrolling.
+        let available = (self.height - 80.0).max(120.0);
         let height = height.min(available);
         let x0 = (self.width - width) / 2.0;
         let y0 = (self.height - height) / 2.0;
@@ -1371,8 +1375,15 @@ mod tests {
                     "palette card spilled off-paper at {size:?} x{scale}"
                 );
                 let mut prev_bottom = card.y0;
+                // Rows beyond the card's bottom are legitimate when the card is
+                // height-capped on a short window (the list is clipped there
+                // rather than scrolled); only rows inside the card must stay
+                // ordered and contained.
                 for index in 0..rows {
                     let row = frame.palette_row(rows, index);
+                    if row.y1 > card.y1 + 1e-9 {
+                        continue;
+                    }
                     assert!(
                         row.y0 >= prev_bottom - 1e-9,
                         "palette row {index} overlapped the one above at {size:?}"
@@ -1382,8 +1393,8 @@ mod tests {
                         "palette row {index} escaped the card horizontally at {size:?}"
                     );
                     assert!(
-                        row.y0 >= card.y0 && row.y1 <= card.y1 + 1e-9,
-                        "palette row {index} escaped the card vertically at {size:?}"
+                        row.y0 >= card.y0,
+                        "palette row {index} started above the card at {size:?}"
                     );
                     prev_bottom = row.y1;
                 }

@@ -117,8 +117,16 @@ fn draw_list(
 ) {
     let theme = &model.theme;
     let rows = commands.len();
+    let card = frame.palette_card(rows);
+    // On a very short window the card is height-capped below the full list, so
+    // only the rows that actually fit inside the card are drawn; anything
+    // below the card's bottom is left out rather than painted over the veil.
+    let fits = |band_y0: f64, band_y1: f64| band_y0 >= card.y0 - 1e-9 && band_y1 <= card.y1 + 1e-9;
     for (index, command) in commands.iter().enumerate() {
         let band = frame.palette_row(rows, index);
+        if !fits(band.y0, band.y1) {
+            continue;
+        }
         if model.palette.cursor() == index {
             scene.fill(
                 vello::peniko::Fill::NonZero,
