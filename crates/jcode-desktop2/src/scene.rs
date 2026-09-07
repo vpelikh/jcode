@@ -5,7 +5,7 @@
 //! possible.
 
 use crate::text::ParagraphStyle;
-use crate::{Model, donut, icons, layout, text};
+use crate::{Model, ModelId, donut, icons, layout, text};
 use vello::Scene;
 use vello::kurbo::{Affine, BezPath, Circle, Rect, RoundedRect, Shape};
 use vello::peniko::Color;
@@ -1793,6 +1793,30 @@ pub fn build_scene(
                 font_size: layout::CAPTION_SIZE,
                 color: theme.faint,
                 letter_spacing_em: 0.1,
+                ..Default::default()
+            },
+            scale,
+        );
+    }
+
+    // The active model, right-aligned on the same footnote row. It is the one
+    // piece of permanent chrome that names what is answering, and clicking it
+    // opens the model catalog, so it takes a slightly stronger ink than the
+    // transient footnote and glows with the accent while hovered (the same
+    // hint `button_hover` tracks for the pointer). It is drawn after the
+    // footnote so a long footnote and the caption each hold half the row
+    // without colliding (both elide to their own half).
+    if let Some(caption) = model.model.as_ref().and_then(ModelId::caption) {
+        let hovered = model.model_picker.button_hover();
+        text.draw_paragraph_scaled(
+            scene,
+            &caption,
+            (frame.left + frame.column() * 0.5, frame.footnote_top),
+            (frame.column() * 0.5) as f32,
+            ParagraphStyle {
+                font_size: layout::CAPTION_SIZE,
+                color: if hovered { theme.accent } else { theme.muted },
+                align: text::Align::End,
                 ..Default::default()
             },
             scale,

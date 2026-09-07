@@ -74,6 +74,7 @@ pub const NODES: &[(&str, NodeBuilder)] = &[
     ("settings_panel_hover", settings_panel_hover),
     ("model_picker", model_picker),
     ("palette", palette),
+    ("model_caption", model_caption),
     ("notice", notice),
     ("error", error),
     ("offline", offline),
@@ -1016,6 +1017,18 @@ fn palette() -> Model {
             "How do I switch sessions?".into(),
             "Hit Ctrl/Cmd+P and type to filter; Enter runs the highlighted command.".into(),
         )]),
+        ..attached_empty()
+    }
+}
+
+/// A session with an active model, so the caption right of the footnote is
+/// visible: the one permanent line that names what is answering.
+fn model_caption() -> Model {
+    Model {
+        model: Some(crate::ModelId {
+            provider: Some("anthropic".into()),
+            model: Some("claude-sonnet-4-5".into()),
+        }),
         ..attached_empty()
     }
 }

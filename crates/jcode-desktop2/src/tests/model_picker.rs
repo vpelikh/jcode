@@ -176,3 +176,30 @@ fn open_catalog_reaches_the_pixels_above_the_composer() {
         "the open model catalog did not reach the rendered frame"
     );
 }
+
+#[test]
+fn the_model_caption_state_names_an_answerable_model() {
+    let model = crate::states::by_name("model_caption").expect("model_caption state");
+    let caption = model
+        .model
+        .as_ref()
+        .and_then(crate::ModelId::caption)
+        .expect("the caption node should carry an active model");
+    assert!(caption.contains("claude-sonnet-4-5"), "caption={caption}");
+}
+
+#[test]
+fn clicking_the_model_caption_opens_the_catalog() {
+    // Keep the command receiver alive: dropping it closes the harness channel,
+    // so `toggle_model_picker`'s ListModels send would fail before it opens.
+    let (mut app, _, _command_rx) = app();
+    assert!(!app.model.model_picker.is_open());
+    // The caption is the right half of the footnote row. Click just right of
+    // the column midline, inside the footnote band.
+    let f = app.frame;
+    let x = f.left + f.column() * 0.75;
+    let y = (f.footnote_top + f.footnote_bottom) / 2.0;
+    click(&mut app, (x, y));
+    // The harness send succeeds (receiver alive), so the picker opens.
+    assert!(app.model.model_picker.is_open(), "caption click should open the picker");
+}

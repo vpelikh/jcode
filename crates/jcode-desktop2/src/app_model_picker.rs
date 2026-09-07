@@ -77,6 +77,18 @@ impl App {
     /// transcript see it. Like the settings panel, dismiss clicks are consumed
     /// so closing a menu cannot also move the caret underneath it.
     pub(crate) fn model_picker_press(&mut self, x: f64, y: f64) -> bool {
+        // Clicking the active-model caption opens the catalog, exactly as the
+        // Ctrl+M chord does, so the pointer and the keyboard reach the same
+        // surface. This runs before the open-menu branch: while the menu is up
+        // the caption is covered, and a click there dismisses it instead.
+        let over_caption = self.model.model.is_some()
+            && x >= self.frame.left + self.frame.column() * 0.5
+            && y >= self.frame.footnote_top
+            && y <= self.frame.footnote_bottom;
+        if over_caption && !self.model.model_picker.is_open() {
+            self.toggle_model_picker();
+            return true;
+        }
         if self.model.model_picker.is_open() {
             let rows = self.model.model_picker.visual_rows();
             if let Some(index) = self.frame.model_menu_row_at(rows, x, y) {
@@ -97,7 +109,16 @@ impl App {
     /// Track both the caption button and the rows in its menu. Returns whether
     /// painting state changed.
     pub(crate) fn model_picker_hover(&mut self, x: f64, y: f64) -> bool {
-        let mut changed = self.model.model_picker.set_button_hover(false);
+        let mut changed = false;
+        // The caption is the right half of the footnote row: the model id,
+        // drawn at the trailing edge, opens the catalog when clicked. Hovering
+        // it glows with the accent so the affordance is visible before the
+        // click, the same way a browser link changes colour on hover.
+        let over_caption = self.model.model.is_some()
+            && x >= self.frame.left + self.frame.column() * 0.5
+            && y >= self.frame.footnote_top
+            && y <= self.frame.footnote_bottom;
+        changed |= self.model.model_picker.set_button_hover(over_caption);
         let row = self
             .model
             .model_picker
