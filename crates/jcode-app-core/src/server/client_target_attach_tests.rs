@@ -1,7 +1,7 @@
 #![allow(clippy::await_holding_lock)]
 use super::*;
 use crate::message::{Message, ToolDefinition};
-use crate::provider::EventStream;
+use crate::provider::{EventStream, Provider};
 use async_trait::async_trait;
 
 struct NoRequests;

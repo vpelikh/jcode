@@ -462,12 +462,17 @@ surfaces immediately and creates a place to move methods later.
 Checked 2026-09-07 against `crates/jcode-app-core/src/`:
 
 - No `services/` module, no `*ServiceHandle` types → Phase 2 move not started.
-  **Now updated:** Slice 1 landed a `server/services/*.rs` module with the five
-  `*ServiceHandle` structs + `from_server` (additive, no behavior change). The
-  `ServerRuntime` wiring and `handle_client`/`handle_debug_client` narrowing are
-  still pending (Slice 2).
-- `ServerRuntime` (`runtime.rs`) still clones the full field-by-field state bag.
-- `handle_client()` is still a 28-argument positional list.
+  **Now updated:** Slices 1 + 2 landed. Slice 1 added the `server/services/*.rs`
+  module with the five `*ServiceHandle` structs + `from_server`; Slice 2 wired
+  `ServerRuntime` to hold and route through them. `handle_client`/`handle_debug_client`
+  narrowing (Slice 3) is landed too: both now take the service handles and
+  destructure them back into the body's flat locals. The remaining
+  ownership-move slices (swarm-membership extraction, `monitor_bus` to service
+  APIs, debug snapshots) are still pending.
+- `ServerRuntime` (`runtime.rs`) now holds and routes through the service
+  handles instead of a flat field-by-field clone.
+- `handle_client()`/`handle_debug_client` now take the service handles (plus
+  their few non-handle params) instead of a 28-argument positional list.
 - Session lifecycle (`client_session.rs`) still mutates swarm membership directly.
 - Maintenance (`server.rs`) still reaches into raw maps; `monitor_bus` unchanged.
 - Debug still reads raw maps.
@@ -491,14 +496,20 @@ without risking the runtime model. It is deliberately a **slice**, not a PR:
   the five `*ServiceHandle` structs and their `from_server(&Server)` constructors.
   It is a zero-behavior grouping of the existing state bag; nothing else changes.
   This lands cleanly by itself and gives the future service methods a home.
+  *(landed)*
 - **Slice 2 — wire `ServerRuntime`.** Construct and hold the handles in
   `ServerRuntime::from_server`, then route the `handle_client` /
   `handle_debug_client` call sites through them. Merging a duplicate
   flat-field store is intentionally avoided so nothing is double-homed.
-- **Slice 3+ — ownership moves.** Swarm-membership extraction out of
-  `client_session.rs`, `monitor_bus` to service APIs, debug snapshots, then a
-  reduced `handle_client`/`handle_debug_client` signature. Each is mechanical
-  once the handles exist.
+  *(landed)*
+- **Slice 3 — narrow the handler signatures.** `handle_client` and
+  `handle_debug_client` now take the service handles (plus their few
+  non-handle params) instead of the 28-arg positional list, and destructure
+  them back into the body's existing flat locals — preserving the bodies
+  with no behavior change. *(landed)*
+- **Slice 4+ — ownership moves.** Swarm-membership extraction out of
+  `client_session.rs`, `monitor_bus` to service APIs, and debug snapshot
+  readers. Each is mechanical now that the handles exist.
 
 Each slice is independently reviewable and behavior-preserving; none is gated on
 the rest.

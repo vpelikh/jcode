@@ -1,6 +1,10 @@
 use super::*;
 use crate::message::{ContentBlock, Message, StreamEvent, ToolDefinition};
 use crate::provider::{EventStream, Provider};
+use crate::server::{
+    AwaitMembersRuntime, ClientDebugState, FileTouchService, SessionInterruptQueues, SwarmState,
+    SwarmMutationRuntime,
+};
 use async_trait::async_trait;
 use futures::stream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1405,36 +1409,50 @@ async fn lightweight_comm_request_skips_full_session_initialization() {
     let shutdown_signals = Arc::new(RwLock::new(HashMap::new()));
     let soft_interrupt_queues: SessionInterruptQueues = Arc::new(RwLock::new(HashMap::new()));
     let mcp_pool = Arc::new(crate::mcp::SharedMcpPool::from_default_config());
+    let debug_jobs = Arc::new(RwLock::new(HashMap::new()));
+
+    let swarm_state = SwarmState {
+        members: Arc::clone(&swarm_members),
+        swarms_by_id: Arc::clone(&swarms_by_id),
+        plans: Arc::clone(&swarm_plans),
+        coordinators: Arc::clone(&swarm_coordinators),
+    };
 
     let server_task = tokio::spawn(handle_client(
         server_stream,
-        Arc::clone(&sessions),
-        _global_event_tx,
-        provider_template,
-        global_is_processing,
-        global_session_id,
-        client_count,
-        Arc::clone(&client_connections),
-        swarm_members,
-        swarms_by_id,
-        shared_context,
-        swarm_plans,
-        swarm_coordinators,
-        file_touch,
-        channel_subscriptions,
-        channel_subscriptions_by_session,
-        client_debug_state,
-        _debug_response_tx,
-        event_history,
-        event_counter,
-        swarm_event_tx,
+        SessionServiceHandle {
+            sessions: Arc::clone(&sessions),
+            event_tx: _global_event_tx,
+            session_id: Arc::clone(&global_session_id),
+            is_processing: Arc::clone(&global_is_processing),
+            shutdown_signals: Arc::clone(&shutdown_signals),
+            soft_interrupt_queues: Arc::clone(&soft_interrupt_queues),
+        },
+        ClientServiceHandle {
+            client_count: Arc::clone(&client_count),
+            client_connections: Arc::clone(&client_connections),
+            provider: Arc::clone(&provider_template),
+        },
+        SwarmServiceHandle {
+            swarm_state,
+            shared_context: Arc::clone(&shared_context),
+            file_touch: file_touch.clone(),
+            channel_subscriptions: Arc::clone(&channel_subscriptions),
+            channel_subscriptions_by_session: Arc::clone(&channel_subscriptions_by_session),
+            event_history: Arc::clone(&event_history),
+            event_counter: Arc::clone(&event_counter),
+            swarm_event_tx: swarm_event_tx.clone(),
+            await_members_runtime: AwaitMembersRuntime::default(),
+            swarm_mutation_runtime: SwarmMutationRuntime::default(),
+        },
+        DebugServiceHandle {
+            client_debug_state: Arc::clone(&client_debug_state),
+            client_debug_response_tx: _debug_response_tx,
+            debug_jobs: Arc::clone(&debug_jobs),
+        },
         "jcode-test".to_string(),
         "🧪".to_string(),
         mcp_pool,
-        shutdown_signals,
-        soft_interrupt_queues,
-        AwaitMembersRuntime::default(),
-        SwarmMutationRuntime::default(),
     ));
 
     let (client_reader, mut client_writer) = client_stream.into_split();

@@ -45,18 +45,19 @@ use super::provider_control::{
     handle_switch_anthropic_account, handle_switch_openai_account,
     try_available_models_updated_event,
 };
+use super::services::{
+    ClientServiceHandle, DebugServiceHandle, SessionServiceHandle, SwarmServiceHandle,
+};
 use super::{
-    AwaitMembersRuntime, ClientConnectionInfo, ClientDebugState, FileTouchService,
-    SessionControlHandle, SessionInterruptQueues, SharedContext, SwarmEvent, SwarmMember,
-    SwarmMutationRuntime, VersionedPlan, format_structured_completion_report,
-    register_session_interrupt_queue, send_swarm_plan_to_session, truncate_detail,
-    update_member_status, update_member_status_with_report, update_member_status_with_report_tldr,
+    ClientConnectionInfo, SessionControlHandle, SessionInterruptQueues, SwarmEvent, SwarmMember,
+    format_structured_completion_report, register_session_interrupt_queue, send_swarm_plan_to_session,
+    truncate_detail, update_member_status, update_member_status_with_report,
+    update_member_status_with_report_tldr,
 };
 use crate::agent::Agent;
 use crate::bus::{Bus, BusEvent};
 use crate::id;
 use crate::protocol::{Request, ServerEvent, decode_request, encode_event};
-use crate::provider::Provider;
 use crate::tool::Registry;
 use crate::transport::Stream;
 use anyhow::Result;
@@ -73,7 +74,6 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 
 type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
-type ChannelSubscriptions = Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
 const RELOAD_STARTING_GUARD_MAX_AGE: Duration = Duration::from_secs(30);
 const REQUEST_HANDLER_STALL_THRESHOLDS_MS: [u64; 3] = [2_000, 10_000, 60_000];
 
@@ -434,34 +434,42 @@ async fn refresh_session_control_handle(
 )]
 pub(super) async fn handle_client(
     stream: Stream,
-    sessions: SessionAgents,
-    _global_event_tx: broadcast::Sender<ServerEvent>,
-    provider_template: Arc<dyn Provider>,
-    _global_is_processing: Arc<RwLock<bool>>,
-    global_session_id: Arc<RwLock<String>>,
-    client_count: Arc<RwLock<usize>>,
-    client_connections: Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
-    swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    shared_context: Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
-    swarm_plans: Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    swarm_coordinators: Arc<RwLock<HashMap<String, String>>>,
-    file_touch: FileTouchService,
-    channel_subscriptions: ChannelSubscriptions,
-    channel_subscriptions_by_session: ChannelSubscriptions,
-    client_debug_state: Arc<RwLock<ClientDebugState>>,
-    client_debug_response_tx: broadcast::Sender<(u64, String)>,
-    event_history: Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: broadcast::Sender<SwarmEvent>,
+    session_service: SessionServiceHandle,
+    client_service: ClientServiceHandle,
+    swarm_service: SwarmServiceHandle,
+    debug_service: DebugServiceHandle,
     server_name: String,
     server_icon: String,
     mcp_pool: Arc<crate::mcp::SharedMcpPool>,
-    shutdown_signals: Arc<RwLock<HashMap<String, InterruptSignal>>>,
-    soft_interrupt_queues: SessionInterruptQueues,
-    await_members_runtime: AwaitMembersRuntime,
-    swarm_mutation_runtime: SwarmMutationRuntime,
 ) -> Result<()> {
+    // Destructure the service handles back into the flat locals the body uses,
+    // preserving every downstream reference. This is Slice 3 of the server
+    // service split: callers pass typed handles instead of a 28-arg positional
+    // list, while the handler body is unchanged.
+    let sessions = session_service.sessions;
+    let _global_event_tx = session_service.event_tx;
+    let provider_template = client_service.provider;
+    let _global_is_processing = session_service.is_processing;
+    let global_session_id = session_service.session_id;
+    let client_count = client_service.client_count;
+    let client_connections = client_service.client_connections;
+    let swarm_members = swarm_service.swarm_state.members;
+    let swarms_by_id = swarm_service.swarm_state.swarms_by_id;
+    let shared_context = swarm_service.shared_context;
+    let swarm_plans = swarm_service.swarm_state.plans;
+    let swarm_coordinators = swarm_service.swarm_state.coordinators;
+    let file_touch = swarm_service.file_touch;
+    let channel_subscriptions = swarm_service.channel_subscriptions;
+    let channel_subscriptions_by_session = swarm_service.channel_subscriptions_by_session;
+    let client_debug_state = debug_service.client_debug_state;
+    let client_debug_response_tx = debug_service.client_debug_response_tx;
+    let event_history = swarm_service.event_history;
+    let event_counter = swarm_service.event_counter;
+    let swarm_event_tx = swarm_service.swarm_event_tx;
+    let shutdown_signals = session_service.shutdown_signals;
+    let soft_interrupt_queues = session_service.soft_interrupt_queues;
+    let await_members_runtime = swarm_service.await_members_runtime;
+    let swarm_mutation_runtime = swarm_service.swarm_mutation_runtime;
     let (reader, writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let writer = Arc::new(Mutex::new(writer));
