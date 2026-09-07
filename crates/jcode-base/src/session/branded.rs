@@ -25,9 +25,8 @@
 //! every `String` in the log: brand the *structural* identities the log uses
 //! to correlate events, messages, and compaction brackets.
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::ops::Deref;
 
 /// Macro for a `#[repr(transparent)]` branded id over `String`.
 ///
@@ -36,10 +35,12 @@ use std::ops::Deref;
 /// - serializes/deserializes as the bare string (`#[serde(transparent)]`), so
 ///   the on-disk / on-wire format is identical to the previous raw `String`;
 /// - implements `Clone`, `Debug`, `PartialEq`, `Eq`, `Hash`, `PartialOrd`,
-///   `Ord`, `AsRef<str>`, `Deref<Target = str>`, `Display`, `From<String>`,
-///   `From<&str>`, and `From<Self>` for `String`;
+///   `Ord`, `Display`, `From<String>`, and `From<&str>`;
 /// - has `Self::new(prefix)` generating a fresh id via `crate::id::new_id`,
 ///   and `Self::from_static(prefix, literal)` for deterministic test ids.
+/// - exposes `Self::as_str()`/`Self::is_empty()` as the *only* read access; it
+///   implements no `Deref`/`AsRef`/`Into<String>`, so a branded id cannot be
+///   silently treated as (or round-tripped through) a generic string.
 macro_rules! branded_id {
     (
         $(#[doc = $doc:literal])*
@@ -48,8 +49,9 @@ macro_rules! branded_id {
     ) => {
         $(#[doc = $doc])*
         #[doc = $impl_doc]
-        #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
         #[repr(transparent)]
+        #[serde(transparent)]
         pub struct $name(pub(crate) String);
 
         impl $name {
@@ -69,6 +71,11 @@ macro_rules! branded_id {
             }
 
             /// The underlying string.
+            ///
+            /// This is the *only* way to extract the raw string from a branded
+            /// id. The type deliberately implements no `Deref`/`AsRef`/`Into<String>`
+            /// so a branded id cannot be silently treated as a generic string
+            /// (or round-tripped through `String`) without an explicit call.
             pub fn as_str(&self) -> &str {
                 &self.0
             }
@@ -91,31 +98,6 @@ macro_rules! branded_id {
             }
         }
 
-        impl From<$name> for String {
-            fn from(id: $name) -> String {
-                id.0
-            }
-        }
-
-        impl From<&$name> for String {
-            fn from(id: &$name) -> String {
-                id.0.clone()
-            }
-        }
-
-        impl AsRef<str> for $name {
-            fn as_ref(&self) -> &str {
-                &self.0
-            }
-        }
-
-        impl Deref for $name {
-            type Target = str;
-            fn deref(&self) -> &str {
-                &self.0
-            }
-        }
-
         impl fmt::Display for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str(&self.0)
@@ -125,22 +107,6 @@ macro_rules! branded_id {
         impl fmt::Debug for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_fmt(format_args!("{}({:?})", stringify!($name), self.0))
-            }
-        }
-
-        // `#[serde(transparent)]` on the struct makes the wire format a bare
-        // string — identical to the previous raw `String` fields, so persisted
-        // events round-trip unchanged.
-        impl Serialize for $name {
-            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-                serializer.serialize_str(&self.0)
-            }
-        }
-
-        impl<'de> Deserialize<'de> for $name {
-            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                let s = String::deserialize(deserializer)?;
-                Ok(Self(s))
             }
         }
     };
@@ -206,14 +172,15 @@ mod tests {
     }
 
     #[test]
-    fn deref_and_string_conversions() {
+    fn as_str_is_the_only_string_access() {
         let ev = EventId::from("event_x");
         assert_eq!(ev.as_str(), "event_x");
-        assert_eq!(ev.as_ref() as &str, "event_x");
-        assert_eq!(&*ev, "event_x");
+        // Display is available for formatting/logging but is NOT a conversion
+        // back to `String` the caller can type-check against the id type.
         assert_eq!(ev.to_string(), "event_x");
-        let back: String = ev.clone().into();
-        assert_eq!(back, "event_x");
+        // The type deliberately provides no `Deref`/`AsRef<str>`/`Into<String>`,
+        // so there is no way to treat the id as a bare string except `as_str`.
+        // (This is enforced at compile time by the absence of those impls.)
     }
 
     #[test]

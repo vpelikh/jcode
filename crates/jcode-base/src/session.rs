@@ -2067,9 +2067,9 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
     ///   (which itself validates) rather than opening a dangling bracket.
     pub fn set_compaction_with_bracket(
         &mut self,
-        compaction_id: impl Into<String>,
+        compaction_id: impl Into<CompactionId>,
         compaction: StoredCompactionState,
-    ) -> String {
+    ) -> CompactionId {
         let compaction_id = compaction_id.into();
         // A malformed state can be represented in no event, so opening a bracket
         // would orphan it. Fall back to a plain (validating) `set_compaction`;
@@ -2155,11 +2155,11 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
     /// enforces this on replay).
     pub fn compact_transcript_with_bracket(
         &mut self,
-        compaction_id: impl Into<String>,
+        compaction_id: impl Into<CompactionId>,
         messages: Vec<StoredMessage>,
         compaction: StoredCompactionState,
         covers_up_to_turn: usize,
-    ) -> String {
+    ) -> CompactionId {
         let compaction_id = compaction_id.into();
         // Pre-validate the compaction state before opening a bracket. If it's
         // invalid (e.g. `covers_up_to_turn`/`compacted_count` exceeding

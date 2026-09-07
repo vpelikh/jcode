@@ -108,6 +108,27 @@ at log-inspection time.
   same `branded_id!` macro to those domains is a per-domain follow-up, not part
   of this branch.
 
+  **Tightened surface (review, no backcompat constraint).** The branch was
+  refined to remove the remaining ergonomics trade-offs now that backward
+  compatibility is not a concern:
+  - The `impl Into<String>` leak on `set_compaction_with_bracket` /
+    `compact_transcript_with_bracket` was changed to `impl Into<CompactionId>`
+    (returning `CompactionId`), so the branded type is never round-tripped
+    through `String`.
+  - The escape-hatch impls (`Deref`, `AsRef<str>`, `From<Id> for String`,
+    `From<&Id> for String`) were removed; `as_str()` is the only string
+    extraction path, so a branded id cannot be silently treated as (or
+    round-tripped through) a plain `String`.
+  - `validate_message` no longer fabricates a `MessageId` from a containing
+    `EventId` (a type-crossing); it reports the message's own id, or a synthetic
+    `"<no-id>"` marker. The now-dead `event_id.is_empty()` branch (event_id is
+    validated non-empty before the op match) was dropped.
+  - The manual `Serialize`/`Deserialize` impls were replaced with
+    `#[derive(Serialize, Deserialize)] #[serde(transparent)]` — same bare-string
+    wire format, less code (net -77 lines).
+  These changes are behavior-preserving (1555 jcode-base lib tests green;
+  app-core/tui build).
+
 ## Follow-ups (open, awaiting steer)
 
 These are explicitly open and are tracked as follow-ups, not delivered work:

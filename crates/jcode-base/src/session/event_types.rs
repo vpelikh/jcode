@@ -753,10 +753,10 @@ impl SessionEventMap {
         // Validate operation based on event type
         match &event.op {
             SessionEventOp::AppendMessage { message, .. } => {
-                Self::validate_message(message, &event.event_id)?;
+                Self::validate_message(message)?;
             }
             SessionEventOp::InsertMessage { message, .. } => {
-                Self::validate_message(message, &event.event_id)?;
+                Self::validate_message(message)?;
             }
             SessionEventOp::SetCompaction { compaction } => {
                 Self::validate_compaction(compaction)?;
@@ -794,28 +794,21 @@ impl SessionEventMap {
         Ok(())
     }
     
-    /// Validate a message content
+    /// Validate a message content.
     ///
-    /// `event_id` is the id of the containing event, used only as a diagnostic
-    /// fallback for the `MessageId` in the error when the message itself carries
-    /// no id. In the append path the event id equals the message id, so this
-    /// preserves the exact pre-branding error value.
-    fn validate_message(message: &StoredMessage, event_id: &EventId) -> Result<(), SessionEventError> {
-        if message.id.is_empty() && event_id.is_empty() {
-            return Err(SessionEventError::InvalidMessageContent {
-                message_id: MessageId::from(event_id.as_str())
-            });
-        }
+    /// Reports a `MessageId` for the offending message from the message's own id;
+    /// when the message carries no id, uses a synthetic marker so the branded
+    /// `MessageId` type is never fabricated from an unrelated (`EventId`) value.
+    fn validate_message(message: &StoredMessage) -> Result<(), SessionEventError> {
         // A message with no content blocks carries no signal (neither text nor
         // tool use/result); refuse to record it so the log stays meaningful.
         if message.content.is_empty() {
-            return Err(SessionEventError::InvalidMessageContent {
-                message_id: if message.id.is_empty() {
-                    MessageId::from(event_id.as_str())
-                } else {
-                    MessageId::from(message.id.clone())
-                }
-            });
+            let message_id = if message.id.is_empty() {
+                MessageId::from("<no-id>")
+            } else {
+                MessageId::from(message.id.clone())
+            };
+            return Err(SessionEventError::InvalidMessageContent { message_id });
         }
         Ok(())
     }

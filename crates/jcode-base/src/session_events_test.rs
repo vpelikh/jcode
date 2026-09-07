@@ -2878,7 +2878,7 @@ fn test_set_compaction_with_bracket_records_balanced_bracket_without_rewriting_m
     };
 
     let id = session.set_compaction_with_bracket("comp_state", compaction.clone());
-    assert_eq!(id, "comp_state");
+    assert_eq!(id.as_str(), "comp_state");
 
     // Messages are NOT rewritten (virtual-summary model preserved).
     assert_eq!(
@@ -3985,7 +3985,7 @@ fn test_session_event_parent_id_and_version_round_trip() {
     );
     let back: SessionEvent = serde_json::from_str(&json).expect("deserialize parent_id");
     assert_eq!(
-        back.parent_id.as_deref(),
+        back.parent_id.as_ref().map(|p| p.as_str()),
         Some("parent_event"),
         "parent_id must round-trip"
     );
