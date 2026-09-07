@@ -81,6 +81,32 @@ fn every_palette_command_dispatches_safely_and_closes_the_palette() {
 }
 
 #[test]
+fn palette_commands_that_open_surfaces_really_open_them() {
+    // The safe-dispatch sweep above only proves no-panic on a no-harness app;
+    // a command whose action silently opened the wrong surface would still
+    // pass it. Here the surface-opening commands are committed and asserted to
+    // visibly open exactly the surface their label names.
+    let cases: &[(&str, &dyn Fn(&App) -> bool)] = &[
+        ("Settings", &|app| app.model.panel.is_open()),
+        ("Help", &|app| app.model.help_open),
+    ];
+    for (label, opened) in cases {
+        let mut app = app_with("draft");
+        app.model.palette.open();
+        let index = crate::palette::COMMANDS
+            .iter()
+            .position(|c| c.label == *label)
+            .unwrap_or_else(|| panic!("command '{}' missing from registry", label));
+        app.model.palette.select_row(index);
+        app.palette_commit();
+        assert!(
+            opened(&app),
+            "palette command '{label}' did not open its surface after commit"
+        );
+    }
+}
+
+#[test]
 fn palette_keydown_types_filters_and_commits_the_highlighted_row() {
     use winit::keyboard::SmolStr;
     let mut app = App::default();
