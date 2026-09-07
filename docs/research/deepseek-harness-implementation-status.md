@@ -87,6 +87,26 @@ accounting design (see "Interpretation noted" above).
   `tool::bash::test_detached_promoted_command_…`). All pass in isolation and are
   untouched by this work (pre-existing flake).
 
+## Branch `jc/branded-session-ids` — takeaway #12 (branded IDs)
+
+Brands the event-sourced-log's structural identity fields at the type level so
+an `EventId` can never be passed where a `MessageId` or `CompactionId` is
+expected (and vice versa), catching ID-mismatch bugs at compile time rather than
+at log-inspection time.
+
+| Commit | Change |
+|---|---|
+| `6e7b9cdc2` | **Branded identity types.** New `crates/jcode-base/src/session/branded.rs` defines `EventId` (`SessionEvent.event_id` + `parent_id`), `MessageId` (`AppendMessage.message_id`), and `CompactionId` (`CompactionStart.compaction_id`) as `#[repr(transparent)]` newtypes over `String` with **`#[serde(transparent)]`** — the on-disk/on-wire format is byte-identical to the previous raw `String` fields, so persisted event logs round-trip unchanged. `SessionEventError::InvalidEventId`/`InvalidMessageContent` now carry the branded types too. Wired through the `SessionEventMap` producers (`session.rs`, `event_types.rs`), the app-core `SetCompaction` site (`agent.rs`), and every test/`invariant`s construction site. 4 new unit tests. |
+
+  **Interpretation noted.** Takeaway #12's shortlist mentions branding
+  session/tool-call/job/compaction ids broadly. This branch scopes branding to
+  the **event-sourced-session-log identity domain** (event / message / compaction
+  ids) — the subsystem the prior plan work (`#3/#4/#5/#7/#13`) has been focused
+  on — rather than sprawling `Branded` newtypes across every `String` id in the
+  codebase (`SessionId`, `ToolCallId`, `JobId`, … remain `String`). Extending the
+  same `branded_id!` macro to those domains is a per-domain follow-up, not part
+  of this branch.
+
 ## Follow-ups (open, awaiting steer)
 
 These are explicitly open and are tracked as follow-ups, not delivered work:
@@ -98,9 +118,13 @@ These are explicitly open and are tracked as follow-ups, not delivered work:
   `CompactionManager.compacted_count` and the persisted compaction state so
   reload resolves against the shorter vector. It is a separate, riskier,
   cross-crate change and is deliberately parked pending a steer.
-- **F2 — remaining plan items (large refactors).** P1 #12 branded IDs
-  (~95 `ToolContext`/ID construction sites); P1 #2+#8 execution-world seam +
+- **F2 — remaining plan items (large refactors).** P1 #2+#8 execution-world seam +
   fail-closed sandbox (confinement, not just classification); P2 #10 jobs
   seam, #11 durable inbox, #14 waterfall hooks; P3 #15 goals domain, #17
   layered config, #18 postmortem culture. These are large, cross-cutting, and
   benefit from a steer before work begins.
+- **F3 — extend `branded_id!` beyond the event log.** The `branded_id!` macro
+  now exists in `jcode-base`; applying it to `SessionId`, `ToolCallId`, `JobId`
+  would carry takeaway #12's protection wider. Per-id, mechanical, benefits from a
+  steer on scope (the event-log branding shipped in `6e7b9cdc2` is the seeded
+  pattern).
