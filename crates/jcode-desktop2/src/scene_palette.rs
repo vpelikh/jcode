@@ -71,10 +71,16 @@ fn draw_query(
         card.y0 + layout::PALETTE_SEARCH_HEIGHT,
     );
     let query = model.palette.query();
-    let (label, color) = match query.is_empty() {
+    let (mut label, color) = match query.is_empty() {
         true => ("Type a command, then ↵".to_string(), theme.faint),
         false => (format!("{query}\u{2502}"), theme.text),
     };
+    // A single-line field elides rather than wrapping into the list beneath it
+    // (visual-checklist rule 3.3). The *displayed* label is elided only; the
+    // underlying `palette::query()` keeps the whole string, so matching is
+    // never truncated by what the row happens to show.
+    let budget = (box_.width() / (f64::from(layout::CAPTION_SIZE) * 0.72)).max(1.0) as usize;
+    label = crate::scene::elide(&label, budget);
     text.draw_paragraph_scaled(
         scene,
         &label,
