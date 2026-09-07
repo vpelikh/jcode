@@ -129,11 +129,18 @@ fn draw_list(
             );
         }
         let baseline = band.y0 + (band.height() - f64::from(layout::CAPTION_SIZE) * 1.4) / 2.0;
+        let label_width = (band.width() * 0.62).max(1.0);
+        // A row is exactly PALETTE_ROW_HEIGHT tall, so a label longer than its
+        // 62% slot would wrap onto a second line and spill into the row below
+        // (visual-checklist rule 3.3, same as the query line). Elide to fit.
+        let label_chars =
+            (label_width / (f64::from(layout::CAPTION_SIZE) * 0.72)).max(1.0) as usize;
+        let label = crate::scene::elide(command.label, label_chars);
         text.draw_paragraph_scaled(
             scene,
-            command.label,
+            &label,
             (band.x0, baseline),
-            (band.width() * 0.62).max(1.0) as f32,
+            label_width as f32,
             ParagraphStyle {
                 font_size: layout::CAPTION_SIZE,
                 color: if model.palette.cursor() == index {
