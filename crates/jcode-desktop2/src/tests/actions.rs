@@ -96,6 +96,40 @@ fn palette_keydown_types_filters_and_commits_the_highlighted_row() {
 }
 
 #[test]
+fn the_palette_chord_rises_above_another_open_modal() {
+    // The palette is the app's one discoverable entry point, so Ctrl/Cmd+P
+    // must open it even while a different overlay owns the keyboard. Without
+    // this, a palette meant to replace the chord map is itself unreachable the
+    // moment a model menu or resume overlay is up.
+    let mut app = app_with("draft");
+    // Hand the model picker a harness so it can actually open on Ctrl+M. Keep
+    // both receivers alive so sending ListModels does not fail before it opens.
+    let (update_tx, update_rx) = std::sync::mpsc::channel();
+    let (command_tx, command_rx) = std::sync::mpsc::channel();
+    app.harness = Some((
+        update_rx,
+        crate::harness::CommandSender::for_test(command_tx),
+    ));
+    let (_update_tx, _command_rx) = (update_tx, command_rx);
+    let _ = app.apply(Action::ToggleModelPicker, None);
+    assert!(
+        app.model.model_picker.is_open(),
+        "precondition: model picker open"
+    );
+    app.modifiers = ModifiersState::CONTROL;
+    assert!(app.key_pressed(&ch('p'), Some("p")));
+    assert!(
+        app.model.palette.is_open(),
+        "Ctrl+P should open the palette above the model picker"
+    );
+    assert!(
+        !app.model.model_picker.is_open(),
+        "opening the palette should close the model picker beneath it"
+    );
+    drop(_command_rx);
+}
+
+#[test]
 fn ctrl_alt_space_opens_the_session_overview() {
     use winit::keyboard::{Key, ModifiersState, NamedKey};
 
