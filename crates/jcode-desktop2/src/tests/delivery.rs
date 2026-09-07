@@ -201,19 +201,7 @@ fn an_acknowledged_card_visibly_moves() {
     model.donut = None;
 
     let pending = Rendered::new(&model).expect("render the pending card");
-    // A full wiggle carries CYCLES=2 oscillations, so its first peak (sin
-    // argument pi/2) lands at one-eighth of the way through, where the
-    // card is at its most displaced. Sampling at the zero crossing
-    // (which a quarter-way point is, for two cycles) would read a
-    // stationary card and fail under scheduler jitter.
-    let at = Instant::now() - WIGGLE.mul_f64(0.125);
-    assert!(model.transcript.acknowledge_oldest_pending(at));
-    let acked = Rendered::new(&model).expect("render the acknowledged card");
 
-    // The card is a wash on paper, so its left edge is the first column near
-    // the measure that is darker than the page. Sampling a band around
-    // `frame.left` keeps the window's own furniture (borders, scrollbar) out of
-    // the measurement.
     // The card is a wash on paper, so its left edge is the first column that
     // is darker than the page. Scan the whole transcript region and take the
     // topmost row that inks near the measure, so this does not depend on where
@@ -235,14 +223,59 @@ fn an_acknowledged_card_visibly_moves() {
         }
         None
     };
-    let (before, after) = (left_edge(&pending), left_edge(&acked));
+    let before = left_edge(&pending);
     assert!(
-        before.is_some() && after.is_some(),
-        "the user card did not ink at all: {before:?} {after:?}"
+        before.is_some(),
+        "the user card did not ink at all: {before:?}"
     );
-    assert_ne!(
-        before, after,
-        "the acknowledgement wiggle drew nothing: card edge stayed at {before:?}"
+
+    // The wiggle is drawn at the renderer's own `Instant::now()`, so the phase
+    // that lands on screen is the render's real elapsed time and drifts with
+    // how long the GPU spends on the frame (heavier across the parallel suite).
+    // A single fixed-phase sample is therefore unreliable here. Instead sample
+    // the acknowledged card at the four peak phases of the double oscillation
+    // (one-eighth, three-eighths, five-eighths, seven-eighths of the way
+    // through): under any real render delay the same offset shifts all four,
+    // but at least two land on different peaks, giving visibly different card
+    // edges. Only a coincidence that pinned every sample to a zero crossing
+    // could hide the wiggle, and that cannot happen for a spread of peaks.
+    let peaks = [1, 3, 5, 7];
+    let mut edges = Vec::new();
+    let mut valid = 0;
+    for eighth in peaks {
+        // Build a fresh model each pass so the message is back to Sent; the
+        // acknowledged wiggle is then rendered from a fresh phase rather than
+        // a stale Acked delivery from the previous sample.
+        let mut model = crate::states::by_name("attached_empty").expect("node");
+        model.transcript = crate::transcript::Transcript::default();
+        model
+            .transcript
+            .push(crate::transcript::Message::sent("acknowledge me"));
+        model.donut = None;
+        let at = Instant::now() - WIGGLE.mul_f64(f64::from(eighth) / 8.0);
+        assert!(
+            model.transcript.acknowledge_oldest_pending(at),
+            "the message should still be pending at sample {eighth}/8"
+        );
+        let acked = Rendered::new(&model).expect("render the acknowledged card");
+        edges.push(left_edge(&acked));
+        valid += usize::from(edges.last().unwrap().is_some());
+    }
+    assert!(
+        valid > 0,
+        "the acknowledged card did not ink at any sampled phase"
+    );
+    // Assert the card edge really moved: across the four peak phases at least
+    // two distinct edges must appear, otherwise the acknowledgement wiggle was
+    // never drawn.
+    let distinct = edges
+        .iter()
+        .filter(|e| e.is_some())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    assert!(
+        distinct >= 2,
+        "the acknowledgement wiggle drew nothing: the card edge was the same at every peak phase ({before:?}, {edges:?})"
     );
 }
 
