@@ -2,7 +2,7 @@
 
 use crate::session::event_types::SessionEventOp;
 use crate::session::{CompactionId, EventId, MessageId, Session};
-use crate::session::event_types::{SessionEvent, SessionEventMap};
+use crate::session::event_types::{SessionEvent, SessionEventError, SessionEventMap};
 use crate::message::ContentBlock;
 use jcode_session_types::{StoredCompactionState, StoredMemoryInjection, StoredMessage};
 use jcode_message_types::Role;
@@ -914,6 +914,30 @@ fn test_unknown_op_validation() {
         1,
         "empty event_type must be rejected for an Unknown op"
     );
+}
+
+/// An `Unknown` event with an empty `op` discriminator must be rejected as an
+/// invalid op tag, not as an invalid (fabricated) event id. This locks the
+/// dedicated `InvalidEventOp` error path.
+#[test]
+fn test_empty_unknown_op_tag_is_rejected_as_invalid_event_op() {
+    let event = SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "unknown_empty_type".to_string().into(),
+        op: SessionEventOp::Unknown {
+            event_type: String::new(),
+            data: serde_json::json!({ "k": "v" }),
+        },
+        parent_id: None,
+        version: 1,
+    };
+    let err = SessionEventMap::validate_event(&event).expect_err("empty op tag must be rejected");
+    match err {
+        SessionEventError::InvalidEventOp { reason } => {
+            assert_eq!(reason, "op tag is empty");
+        }
+        other => panic!("expected InvalidEventOp, got {other:?}"),
+    }
 }
 
 #[test]

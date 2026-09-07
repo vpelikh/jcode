@@ -73,7 +73,7 @@ wanted, is a separate, documented follow-up with its own accounting design
 
 ## Verification
 
-- `jcode-base` full lib: 1554 passed, 0 failed (session_events_test: 90).
+- `jcode-base` full lib: 1555 passed, 0 failed (session_events_test: 91).
 - `jcode-app-core`: compaction (+ native-compaction, 413-recovery) green.
 - `jcode-tui` type-checks clean.
 - Under full parallel-suite load, `jcode-app-core` shows 3 timing-flaky tests

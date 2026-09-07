@@ -724,7 +724,7 @@ impl SessionEventMap {
     ///
     /// # Returns
     /// Ok(()) if event is valid, Err(SessionEventError) otherwise
-    fn validate_event(event: &SessionEvent) -> Result<(), SessionEventError> {
+    pub(crate) fn validate_event(event: &SessionEvent) -> Result<(), SessionEventError> {
         // Validate event_id
         if event.event_id.is_empty() {
             return Err(SessionEventError::InvalidEventId {
