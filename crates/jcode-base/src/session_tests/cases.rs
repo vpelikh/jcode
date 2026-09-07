@@ -4339,3 +4339,127 @@ fn clear_with_existing_snapshot_and_journal_checkpoints_cleanly() -> Result<()> 
         .expect("cleared (snapshot+journal) reload must keep the event log consistent");
     Ok(())
 }
+
+/// Backward-compat (takeaway #12) at the REAL persistence boundary: a session
+/// journal written by a pre-branding build carries `append_events` whose
+/// `SessionEvent.event_id` and `SessionEventOp::AppendMessage.message_id` /
+/// `CompactionStart.compaction_id` are plain JSON strings (no wrapper object).
+/// The branded newtypes are `#[serde(transparent)]`, so such a journal must load
+/// through `Session::load` and re-derive the same events — not just parse at the
+/// serde level, but survive the full journal → event-map reconciliation path.
+#[test]
+fn legacy_branded_ids_journal_loads_through_real_persistence() -> Result<()> {
+    use crate::session::event_types::{SessionEvent, SessionEventOp};
+
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-legacy-branded-journal-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_legacy_branded_journal_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("legacy".to_string()));
+    session.append_stored_message(StoredMessage {
+        id: "m1".to_string(),
+        role: Role::User,
+        content: vec![crate::message::ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+
+    // A compaction bracket + a plugin Unknown event that only the event log
+    // carries.
+    let compaction = StoredCompactionState {
+        summary_text: "summarized".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 1,
+    };
+    session.event_map.start_compaction("comp_1", 1);
+    session.event_map.end_compaction(compaction.clone());
+    session.compaction = Some(compaction.clone());
+    let plugin_event = SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "legacy_plugin".to_string().into(),
+        op: SessionEventOp::Unknown {
+            event_type: "review_round".to_string(),
+            data: serde_json::json!({ "rounds": 3 }),
+        },
+        parent_id: None,
+        version: 1,
+    };
+    session.event_map.append_event(plugin_event);
+
+    // First save → snapshot (no journal).
+    session.save()?;
+    let journal_path = session_journal_path(id)?;
+    assert!(!journal_path.exists(), "first save is a snapshot");
+
+    // Reload to seed the journal baseline, then append a message on the live
+    // session → journaled (append_events carries events).
+    let _baseline = Session::load(id)?;
+    session.append_stored_message(StoredMessage {
+        id: "m2".to_string(),
+        role: Role::User,
+        content: vec![crate::message::ContentBlock::Text {
+            text: "world".to_string(),
+            cache_control: None,
+        }],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    session.save()?;
+    assert!(
+        journal_path.exists(),
+        "second save must produce a journal carrying append_events"
+    );
+
+    // Simulate a PRE-BRANDING journal: leave the event id fields as bare JSON
+    // strings (the 'event_id' top-level and message_id/compaction_id under
+    // 'data'). This is exactly the raw-string shape a branding-era build wrote.
+    let line = std::fs::read_to_string(&journal_path)?;
+    let mut entry: serde_json::Value = serde_json::from_str(&line.trim_end())?;
+    if let Some(events) = entry.get_mut("append_events").and_then(|v| v.as_array_mut()) {
+        for ev in events {
+            // event_id must be a bare string, not an object.
+            assert!(
+                ev.get("event_id").and_then(|v| v.as_str()).is_some(),
+                "persisted journal must keep event_id as a bare string"
+            );
+        }
+    } else {
+        return Err(anyhow!("journal append_events missing for event-carrying save"));
+    }
+    std::fs::write(&journal_path, format!("{}\n", serde_json::to_string(&entry)?))?;
+
+    // Reload through the real path: the legacy raw-string events must hydrate
+    // into the branded types and the transcript must re-derive to m1 + m2.
+    let loaded = Session::load(id)?;
+    let derived = loaded.derive_messages();
+    assert_eq!(derived.len(), 2, "m1 + m2 must survive legacy-journal load");
+    assert_eq!(derived[0].content_preview(), "hello");
+    assert_eq!(derived[1].content_preview(), "world");
+
+    // The plugin Unknown event (log-only) must have been replayed with its
+    // branded EventId intact.
+    let plugin_found = loaded
+        .event_map
+        .events
+        .iter()
+        .any(|e| e.event_id.as_str() == "legacy_plugin");
+    assert!(plugin_found, "log-only plugin event must survive legacy-journal load");
+
+    // The compaction bracket must have replayed to a consistent compaction.
+    assert!(loaded.compaction.is_some(), "compaction must survive");
+    loaded.rederive_all_checked().expect("legacy journal load stays consistent");
+    Ok(())
+}
