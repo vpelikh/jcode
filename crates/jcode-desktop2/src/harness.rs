@@ -38,16 +38,46 @@ fn connection_phase_label(phase: String) -> String {
     }
 }
 
-/// Whether a daemon-reported session status means a turn is in flight.
+/// The kind of turn a daemon-reported session status describes.
 ///
-/// The bridge derives the `status` string from the runtime's `is_processing`
-/// flag: an in-flight session is reported as `"processing"`, an idle one as
-/// `"idle"`. The protocol layer itself renders that same flag as `"busy"`
-/// (`comm_format`), so both strings mean in-flight and are accepted here.
-/// Treating only `"busy"` as busy would misread a genuinely running turn as
-/// idle on re-attach, since the bridge emits `"processing"`.
-fn session_is_busy(status: &str) -> bool {
-    matches!(status, "busy" | "processing")
+/// Parsed from the bridge's `status` string once, at the harness edge, so the
+/// rest of the app never string-matches on wire values. The bridge derives the
+/// status from the runtime's `is_processing` flag: `"processing"` means a turn
+/// is in flight and `"idle"` means one is not; `"attached"` is the neutral
+/// "connected, nothing running" state a connection reports for itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionActivity {
+    /// A turn is running (`"processing"`, or the protocol layer's `"busy"`).
+    Processing,
+    /// No turn is running (`"idle"`).
+    Idle,
+    /// The connection's own attachment state (`"attached"`).
+    Attached,
+    /// A status value this client has never seen. Treat as not-in-flight rather
+    /// than guessing, so an unknown word never spins a finished turn.
+    Unknown,
+}
+
+impl SessionActivity {
+    /// Whether this kind means a turn is in flight.
+    pub fn is_processing(self) -> bool {
+        matches!(self, SessionActivity::Processing)
+    }
+}
+
+/// Map the bridge's session `status` string to a typed [`SessionActivity`].
+///
+/// `"processing"` and `"idle"` are the values the bridge emits; `"busy"` is the
+/// protocol layer's own word for the same in-flight state (`comm_format`), so
+/// it maps to [`SessionActivity::Processing`] too. Everything else is
+/// [`SessionActivity::Unknown`] rather than a panic on an unknown value.
+fn session_activity(status: &str) -> SessionActivity {
+    match status {
+        "processing" | "busy" => SessionActivity::Processing,
+        "idle" => SessionActivity::Idle,
+        "attached" => SessionActivity::Attached,
+        _ => SessionActivity::Unknown,
+    }
 }
 
 /// UI-facing updates produced by the connection worker.
@@ -58,10 +88,10 @@ pub enum HarnessUpdate {
         session_id: String,
         /// The session's working directory, as the daemon reports it.
         working_dir: Option<String>,
-        /// Whether the daemon reports the session as busy right now. Reconciles
+        /// Whether the daemon reports a turn in flight right now. Reconciles
         /// the desktop's `busy` after a reconnect: a session the daemon is
         /// still serving must keep its spinner, while a finished one must not.
-        busy: bool,
+        activity: SessionActivity,
     },
     /// The provider and model serving the session.
     Model {
@@ -126,6 +156,11 @@ pub enum HarnessUpdate {
         session_id: String,
         transcript: crate::transcript::Transcript,
     },
+    /// Stored history for the live session, backfilled after an idle reconnect.
+    History {
+        session_id: String,
+        transcript: crate::transcript::Transcript,
+    },
 }
 
 /// A command from the UI thread to the connection worker.
@@ -144,6 +179,10 @@ pub enum Command {
     Attach(String),
     /// Fetch the tail of another session without attaching to it.
     Peek(String),
+    /// Replace the live transcript with the stored history for one session.
+    /// Used after a reconnect to an idle session, whose finished reply the
+    /// daemon never re-streams to the fresh subscription.
+    Reload(String),
     /// Start a fresh session and attach to it. Travels the same channel as
     /// `Send` and `Attach` so a message typed just before it still lands in
     /// the session the user was looking at when they typed it.
@@ -386,7 +425,7 @@ fn run(
     ui.send(HarnessUpdate::Attached {
         session_id: attached.session_id,
         working_dir: attached.working_dir,
-        busy: session_is_busy(&attached.status),
+        activity: session_activity(&attached.status),
     });
 
     // Command thread: forwards user messages immediately even while the event
@@ -436,7 +475,7 @@ fn run(
                             ui.send(HarnessUpdate::Attached {
                                 session_id: session.session_id,
                                 working_dir: session.working_dir,
-                                busy: session_is_busy(&session.status),
+                                activity: session_activity(&session.status),
                             })
                         })
                     }
@@ -477,11 +516,35 @@ fn run(
                         });
                         Ok(())
                     }
-                    // A daemon connection is permanently bound to the session
-                    // from its first subscribe. Signal the stream loop to drop
-                    // this connection and let the outer worker create on a new
-                    // one instead of issuing a second subscribe that can never
-                    // produce a different id.
+                    // A reconnect to an *idle* session backfills the live
+                    // transcript from stored history. The daemon never re-streams
+                    // a finished turn to the fresh subscription, so without this
+                    // a reply that completed while disconnected never appears.
+                    // Fetched on its own connection for the same isolation as
+                    // `Peek`; the caller only issues it for an idle session.
+                    Command::Reload(target) => {
+                        let ui = ui.clone();
+                        std::thread::spawn(move || {
+                            let reload = JcodeClient::connect(ConnectOptions {
+                                client_name: concat!(
+                                    "jcode-desktop2-reload/",
+                                    env!("CARGO_PKG_VERSION")
+                                )
+                                .to_string(),
+                                ensure_runtime: false,
+                                ..Default::default()
+                            });
+                            if let Ok(client) = reload
+                                && let Ok(messages) = client.peek_session(&target, None)
+                            {
+                                ui.send(HarnessUpdate::History {
+                                    session_id: target,
+                                    transcript: to_transcript(messages),
+                                });
+                            }
+                        });
+                        Ok(())
+                    }
                     Command::New => {
                         if let Ok(mut guard) = session_id.lock() {
                             guard.clear();
@@ -767,13 +830,23 @@ mod command_sender_tests {
     }
 
     /// The bridge reports an in-flight session as `"processing"`, so that
-    /// string must count as busy alongside the desktop's own `"busy"`.
+    /// string must parse as in-flight alongside the protocol's own `"busy"`;
+    /// `"idle"` and `"attached"` must not.
     #[test]
     fn processing_status_counts_as_busy() {
-        assert!(session_is_busy("busy"));
-        assert!(session_is_busy("processing"));
-        assert!(!session_is_busy("idle"));
-        assert!(!session_is_busy("attached"));
+        assert!(session_activity("busy").is_processing());
+        assert!(session_activity("processing").is_processing());
+        assert!(!session_activity("idle").is_processing());
+        assert!(!session_activity("attached").is_processing());
+        // An unknown value is never guessed to be busy: it must not spin a
+        // finished turn if a newer daemon invents a new status word.
+        assert!(!session_activity("chatting").is_processing());
+        assert_eq!(session_activity("processing"), SessionActivity::Processing);
+        assert_eq!(session_activity("idle"), SessionActivity::Idle);
+        assert_eq!(
+            session_activity("attached"),
+            SessionActivity::Attached
+        );
     }
 }
 
@@ -783,7 +856,7 @@ fn to_entry(session: jcode_sdk::SessionInfo) -> crate::strip::Panel {
         session_id: session.session_id,
         title: session.title,
         working_dir: session.working_dir,
-        busy: session_is_busy(&session.status),
+        busy: session_activity(&session.status).is_processing(),
         // The overview sizes a blob by how much conversation the session
         // holds; a session the server could not measure is drawn at the floor
         // rather than dropped.

@@ -197,6 +197,10 @@ struct App {
     /// session; reconnects and later attaches already have a session id and do
     /// not create more panels.
     startup_panel_pending: bool,
+    /// Set when the connection is lost: on the next idle re-attach the live
+    /// transcript is backfilled from stored history, because the daemon never
+    /// re-streams a turn that finished while disconnected.
+    reload_pending: bool,
     /// Geometry of the most recently built frame. Pointer hit-testing reads
     /// this instead of the GPU state, so input handling is testable without a
     /// window and can never disagree with what was actually drawn.
@@ -241,6 +245,7 @@ impl Default for App {
             workspace_frame: None,
             new_session_transition_pending: false,
             startup_panel_pending: true,
+            reload_pending: false,
             // A sensible frame until the first real one is built, so input
             // before the first paint is still handled sanely.
             frame: layout::Frame::new((1100, 720), 1.0),

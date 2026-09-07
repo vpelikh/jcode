@@ -474,6 +474,7 @@ fn run_e2e(message: &str) -> Result<()> {
             // The e2e probe drives one session, so another session's tail is
             // nothing it needs to assert on.
             harness::HarnessUpdate::Peek { .. } => {}
+            harness::HarnessUpdate::History { .. } => {}
             harness::HarnessUpdate::Model {
                 provider,
                 model: id,

@@ -38,6 +38,11 @@ impl App {
                     self.model.status = message;
                     self.model
                         .set_notice("connection interrupted, reconnecting");
+                    // Backfill the live transcript once the worker re-attaches:
+                    // a turn that finished during the gap is not re-streamed, so
+                    // the stored history is the only record of it. Only replayed
+                    // for an idle re-attach (see the `Attached` arm).
+                    self.reload_pending = true;
                 }
                 // A failure goes into the conversation, not only the status
                 // line: the status line is suppressed once a session is
@@ -63,7 +68,7 @@ impl App {
                 harness::HarnessUpdate::Attached {
                     session_id,
                     working_dir,
-                    busy,
+                    activity,
                 } => {
                     let initial_attach = self.model.session_id.is_none();
                     let reconnected = self.model.failure.is_some();
@@ -88,13 +93,26 @@ impl App {
                     // a freshly re-attached subscription, so a connection that
                     // dropped around a completed turn would otherwise strand
                     // `busy` under an infinite "thinking" spinner. If the daemon
-                    // still reports the session busy, a turn is genuinely in
-                    // flight and its events keep streaming; otherwise the turn
+                    // still reports the session processing, a turn is genuinely
+                    // in flight and its events keep streaming; otherwise the turn
                     // (and any stranded thinking row) is over.
-                    self.model.busy = busy;
-                    if !busy {
+                    let processing = activity.is_processing();
+                    self.model.busy = processing;
+                    if !processing {
                         self.model.activity.finish();
                         self.model.transcript.clear_live_tool();
+                        // An idle re-attach after a disconnect is the one case
+                        // where the daemon will not re-send the reply that
+                        // finished while we were out; ask the worker to backfill
+                        // it from stored history.
+                        if self.reload_pending {
+                            self.reload_pending = false;
+                            if let Some((_, outgoing)) = self.harness.as_ref() {
+                                let _ = outgoing.send(harness::Command::Reload(
+                                    session_id.clone(),
+                                ));
+                            }
+                        }
                     }
                     // A reconnect re-attaches the same session; the transcript
                     // on screen is the one that was being read, so it stays.
@@ -244,6 +262,22 @@ impl App {
                     // stream, so a peek reply for it is only ever cache: it
                     // must not overwrite the live page.
                     self.model.peeks.insert(&session_id, transcript);
+                }
+                harness::HarnessUpdate::History {
+                    session_id,
+                    transcript,
+                } => {
+                    // Only the live page is reloaded, and only while idle: a
+                    // busy turn is still streaming and history is a stale
+                    // snapshot that would clobber it.
+                    if self.model.session_id.as_deref() != Some(session_id.as_str()) {
+                        self.model.peeks.insert(&session_id, transcript);
+                    } else if !self.model.busy {
+                        let reasoning = self.model.transcript.reasoning_mode();
+                        self.model.transcript = transcript;
+                        self.model.transcript.set_reasoning_mode(reasoning);
+                        self.model.stream.reveal_all();
+                    }
                 }
                 harness::HarnessUpdate::Sessions(entries) => {
                     let had_panels = !self.model.strips.is_empty();

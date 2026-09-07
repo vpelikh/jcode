@@ -11,6 +11,7 @@ use crate::ack::{Delivery, WIGGLE};
 use crate::keymap::Action;
 use crate::transcript::Role;
 use crate::{App, harness};
+use crate::harness::SessionActivity;
 use std::time::Instant;
 
 fn app_with_session() -> App {
@@ -476,7 +477,7 @@ fn a_connection_loss_retires_the_in_flight_turn() {
         .send(harness::HarnessUpdate::Attached {
             session_id: "session_test".into(),
             working_dir: Some("/tmp".into()),
-            busy: false,
+            activity: SessionActivity::Idle,
         })
         .expect("queue the re-attach");
     app.drain_harness_updates();
@@ -568,7 +569,7 @@ fn a_reconnect_reconciles_busy_from_the_daemon() {
         .send(harness::HarnessUpdate::Attached {
             session_id: "session_test".into(),
             working_dir: Some("/tmp".into()),
-            busy: true,
+            activity: SessionActivity::Processing,
         })
         .expect("queue the busy re-attach");
     app.drain_harness_updates();
@@ -585,7 +586,7 @@ fn a_reconnect_reconciles_busy_from_the_daemon() {
         .send(harness::HarnessUpdate::Attached {
             session_id: "session_test".into(),
             working_dir: Some("/tmp".into()),
-            busy: false,
+            activity: SessionActivity::Idle,
         })
         .expect("queue the idle re-attach");
     app.drain_harness_updates();
@@ -600,5 +601,90 @@ fn a_reconnect_reconciles_busy_from_the_daemon() {
             .iter()
             .all(|m| m.role != Role::Tool),
         "the stranded thinking row must not survive an idle re-attach"
+    );
+}
+
+/// An idle re-attach after a disconnect backfills the live transcript from
+/// stored history, because the daemon never re-streams a turn that finished
+/// while the connection was down. The worker is asked to reload, and the
+/// history reply lands on the live page.
+#[test]
+fn an_idle_reconnect_backfills_stored_history() {
+    let mut app = app_with_session();
+    let (updates, update_rx) = std::sync::mpsc::channel();
+    let (commands, command_rx) = std::sync::mpsc::channel();
+    app.harness = Some((update_rx, harness::CommandSender::for_test(commands)));
+    app.model.session_id = Some("session_test".into());
+
+    // A disconnect leaves a reload pending.
+    updates
+        .send(harness::HarnessUpdate::ConnectionLost("drop".into()))
+        .expect("queue the disconnect");
+    app.drain_harness_updates();
+
+    // The worker re-attaches to an idle session; it should be asked to reload.
+    updates
+        .send(harness::HarnessUpdate::Attached {
+            session_id: "session_test".into(),
+            working_dir: Some("/tmp".into()),
+            activity: SessionActivity::Idle,
+        })
+        .expect("queue the idle re-attach");
+    app.drain_harness_updates();
+    assert!(
+        command_rx
+            .try_iter()
+            .any(|c| matches!(c, harness::Command::Reload(s) if s == "session_test")),
+        "an idle reconnect must ask the worker to reload history"
+    );
+
+    // The history arrives and replaces the live page.
+    let mut history = crate::transcript::Transcript::default();
+    history.push(crate::transcript::Message::user("hello"));
+    history.push(crate::transcript::Message::assistant("the reply"));
+    updates
+        .send(harness::HarnessUpdate::History {
+            session_id: "session_test".into(),
+            transcript: history.clone(),
+        })
+        .expect("queue the history");
+    app.drain_harness_updates();
+    assert_eq!(app.model.transcript.plain_text(), "hello\n\nthe reply");
+}
+
+/// A busy re-attach must not backfill history: the turn is still streaming and
+/// the stored history is a stale snapshot that would clobber it.
+#[test]
+fn a_busy_reconnect_does_not_backfill() {
+    let mut app = app_with_session();
+    let (updates, update_rx) = std::sync::mpsc::channel();
+    let (commands, command_rx) = std::sync::mpsc::channel();
+    app.harness = Some((update_rx, harness::CommandSender::for_test(commands)));
+    app.model.session_id = Some("session_test".into());
+
+    app.apply(Action::Insert, Some("hello"));
+    app.apply(Action::Submit, None);
+    let _ = command_rx.try_recv(); // the send itself
+
+    updates
+        .send(harness::HarnessUpdate::ConnectionLost("drop".into()))
+        .expect("queue the disconnect");
+    app.drain_harness_updates();
+
+    updates
+        .send(harness::HarnessUpdate::Attached {
+            session_id: "session_test".into(),
+            working_dir: Some("/tmp".into()),
+            activity: SessionActivity::Processing,
+        })
+        .expect("queue the busy re-attach");
+    app.drain_harness_updates();
+    assert!(
+        app.model.busy,
+        "a session still in flight keeps its turn"
+    );
+    assert!(
+        command_rx.try_iter().all(|c| !matches!(c, harness::Command::Reload(_))),
+        "a busy re-attach must not request a history reload"
     );
 }
