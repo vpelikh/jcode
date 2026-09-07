@@ -308,6 +308,9 @@ impl App {
                         self.model.transcript = transcript;
                         self.model.transcript.set_reasoning_mode(reasoning);
                         self.model.stream.reveal_all();
+                        // The reload dropped in a page's worth of history; jump
+                        // to the live tail rather than stranding the old scroll.
+                        self.model.scroll = 0.0;
                     }
                     // Whether or not the snapshot was applied, the reload window
                     // is over: it must not replace a later turn.
