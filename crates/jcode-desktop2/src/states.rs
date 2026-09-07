@@ -58,6 +58,7 @@ pub const NODES: &[(&str, NodeBuilder)] = &[
     ("session_strip_second_group", session_strip_second_group),
     ("mem_readout", mem_readout),
     ("overview", overview),
+    ("overview_with_sidebar", overview_with_sidebar),
     ("overview_opening", overview_opening),
     ("overview_other_session", overview_other_session),
     ("overview_preview", overview_preview),
@@ -636,6 +637,16 @@ fn overview() -> Model {
         ),
         ..session_strip()
     }
+}
+
+/// The overview with the project explorer sidebar open. The sidebar owns the
+/// window's leading edge and pushes the page (and its chrome) right to
+/// `frame.left`, so this is the state that proves the field centres on the
+/// page column rather than drifting to the right of the content it overlays.
+fn overview_with_sidebar() -> Model {
+    let mut model = overview();
+    model.file_tree.sync_root(Some("/home/j/jcode"));
+    model
 }
 
 /// Mid-zoom. Captured because the transition is the feature: a field that
