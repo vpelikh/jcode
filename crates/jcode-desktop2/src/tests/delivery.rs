@@ -919,3 +919,63 @@ fn a_reload_never_erases_a_queued_message() {
         "the queued 'second' message disappeared: {text:?}"
     );
 }
+
+/// A history backfill must still apply when the live page carries live-only
+/// decoration (notices) that the daemon history does not include. Earlier the
+/// reload compared history length against the live page's, so any equality or
+/// shortfall on a decorated page silently dropped the backfill and the reply
+/// never came back. Only the no-new-content guard should gate the replacement.
+#[test]
+fn a_history_reload_applies_despite_live_only_decoration() {
+    let mut app = app_with_session();
+    let (updates, update_rx) = std::sync::mpsc::channel();
+    let (commands, command_rx) = std::sync::mpsc::channel();
+    app.harness = Some((update_rx, harness::CommandSender::for_test(commands)));
+    app.model.session_id = Some("session_test".into());
+
+    app.apply(Action::Insert, Some("hello"));
+    app.apply(Action::Submit, None);
+    let _ = command_rx.try_iter().count();
+    // Live-only notices the daemon history will not contain.
+    app.model.transcript.push_notice("live note 1");
+    app.model.transcript.push_notice("live note 2");
+
+    updates
+        .send(harness::HarnessUpdate::ConnectionLost("drop".into()))
+        .expect("queue the disconnect");
+    app.drain_harness_updates();
+
+    updates
+        .send(harness::HarnessUpdate::Attached {
+            session_id: "session_test".into(),
+            working_dir: Some("/tmp".into()),
+            activity: SessionActivity::Idle,
+        })
+        .expect("queue the idle re-attach");
+    app.drain_harness_updates();
+    assert!(
+        command_rx
+            .try_iter()
+            .any(|c| matches!(c, harness::Command::Reload(_))),
+        "the idle reconnect requested a reload"
+    );
+
+    // The daemon history is shorter than the live page (notices excluded) but
+    // must still replace it so the missing reply is backfilled.
+    let mut history = crate::transcript::Transcript::default();
+    history.push(crate::transcript::Message::user("hello"));
+    history.push(crate::transcript::Message::assistant("the reply"));
+    updates
+        .send(harness::HarnessUpdate::History {
+            session_id: "session_test".into(),
+            transcript: history.clone(),
+        })
+        .expect("queue the history");
+    app.drain_harness_updates();
+
+    assert_eq!(
+        app.model.transcript.plain_text(),
+        "hello\n\nthe reply",
+        "the reload was dropped because of live-only decoration"
+    );
+}

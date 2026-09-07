@@ -319,15 +319,18 @@ impl App {
                         self.model.peeks.insert(&session_id, transcript);
                     } else if let Some(len_at_issue) = self.reload_len {
                         // Apply only if nothing new streamed in since the reload
-                        // was requested (the no-change guard) AND the incoming
-                        // history is at least as complete as the page it would
-                        // replace. Queued (unsent) messages live only in the
-                        // local transcript, not in the daemon's stored history,
-                        // so a shorter snapshot would erase them.
+                        // was requested: a changed page means a new turn is in
+                        // flight or queued work appeared, and a stale snapshot
+                        // must not clobber it. The reload is only ever requested
+                        // when no message is queued (see the `Attached` arm), and
+                        // `unchanged` keeps it that way until the reply lands.
+                        //
+                        // The incoming history need not contain every live-only
+                        // decoration (edit/todo/progress cards, reasoning), so
+                        // its length is not compared against the live page's.
                         let unchanged =
                             self.model.transcript.messages().len() == len_at_issue;
-                        let complete = transcript.messages().len() >= len_at_issue;
-                        if !self.model.busy && unchanged && complete {
+                        if !self.model.busy && unchanged {
                             let reasoning = self.model.transcript.reasoning_mode();
                             self.model.transcript = transcript;
                             self.model.transcript.set_reasoning_mode(reasoning);
