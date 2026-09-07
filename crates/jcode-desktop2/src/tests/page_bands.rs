@@ -10,24 +10,30 @@ use crate::Model;
 
 /// Nodes in the settled window, i.e. those whose page-band invariants hold.
 ///
-/// The capture set includes full-window modes that paint over the page by
-/// design, so the space the bands are supposed to keep bare is not theirs to
-/// keep. Those are excluded:
-///   * the session overview veils the page and spreads blobs across every
-///     band and margin;
-///   * the resume picker dims the whole window behind its card;
-///   * the help overlay puts a dimmed full-window card over everything;
-///   * the boot reveal paints the entire window with the opening black paper,
-///     the full-page hero donut, and a fading-in chrome group, so "nothing in
-///     the left margin" is false for every frame before the chrome is solid.
+/// The capture set includes states that are not the settled page, and the
+/// page-band invariants do not apply to them:
+///   * full-window modes that paint over the page by design — the space the
+///     bands are supposed to keep bare is not theirs to keep:
+///       - the session overview veils the page and spreads blobs across every
+///         band and margin;
+///       - the resume picker dims the whole window behind its card;
+///       - the settings panel hangs a dropdown over the top-right chrome;
+///       - the help overlay puts a dimmed full-window card over everything;
+///       - the boot reveal paints the entire window with the opening black
+///         paper, the full-page hero donut, and a fading-in chrome group, so
+///         "nothing in the left margin" is false before the chrome is solid;
+///   * pre-session screens with no attached session, which draw their own
+///     connecting/starting status lines instead of a settled transcript.
 /// A settled (default) `Boot` reports a `Solid` chrome layer, so only the
 /// pinned mid-reveal captures are filtered out.
 fn page_nodes() -> Vec<(&'static str, Model)> {
     nodes()
         .into_iter()
         .filter(|(_, model)| {
-            !model.overview.is_visible()
+            model.session_id.is_some()
+                && !model.overview.is_visible()
                 && !model.resume.is_open()
+                && !model.panel.is_open()
                 && !model.help_open
                 && model.boot.chrome_layer() == crate::boot::ChromeReveal::Solid
         })
