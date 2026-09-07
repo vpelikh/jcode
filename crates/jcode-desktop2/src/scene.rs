@@ -1780,7 +1780,10 @@ pub fn build_scene(
     // a masthead, so the top of the page stays clear while a failure to attach
     // is still visible.
     let footnote = model.footnote().map(|line| {
-        let caption_present = model.model.is_some();
+        // A caption shares this row only when one is actually drawn: a
+        // `Some(ModelId)` whose provider and model are both empty draws
+        // nothing, so the footnote keeps the whole row in that case.
+        let caption_present = model.model.as_ref().and_then(ModelId::caption).is_some();
         // The footnote and the active-model caption share this row: the caption
         // is right-aligned from the column midline, so the footnote must stay
         // in the left half when a caption is shown, otherwise a long notice
