@@ -4427,7 +4427,7 @@ fn legacy_branded_ids_journal_loads_through_real_persistence() -> Result<()> {
     // strings (the 'event_id' top-level and message_id/compaction_id under
     // 'data'). This is exactly the raw-string shape a branding-era build wrote.
     let line = std::fs::read_to_string(&journal_path)?;
-    let mut entry: serde_json::Value = serde_json::from_str(&line.trim_end())?;
+    let mut entry: serde_json::Value = serde_json::from_str(line.trim_end())?;
     if let Some(events) = entry.get_mut("append_events").and_then(|v| v.as_array_mut()) {
         for ev in events {
             // event_id must be a bare string, not an object.
