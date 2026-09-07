@@ -7,7 +7,7 @@
 
 use crate::{
     App, DONUT_GRID, Model, ModelId, build_scene, capture, donut, harness, keymap, layout, paint,
-    profile, scroll_bench, scroll_profile, states, transcript,
+    profile, scene_workspace, scroll_bench, scroll_profile, states, transcript,
 };
 use anyhow::Result;
 use vello::Scene;
@@ -717,7 +717,12 @@ fn run_capture(args: &[String]) -> Result<()> {
     let mut painter = paint::Painter::default();
     let mut render_node = |name: &str, model: &Model, path: &std::path::Path| -> Result<()> {
         let mut scene = Scene::new();
-        build_scene(&mut scene, &mut painter, model, (WIDTH, HEIGHT), SCALE);
+        // Render through the same workspace-compositor entry the event loop
+        // uses every frame, not the bare single-page builder. Only that path
+        // draws the project-explorer sidebar on top of the overview, so a
+        // node like `overview_with_sidebar` would otherwise capture the field
+        // with no sidebar at all — defeating the node's purpose.
+        scene_workspace::build_workspace_scene(&mut scene, &mut painter, model, (WIDTH, HEIGHT), SCALE);
         capture::capture_scene_to_png(&scene, WIDTH, HEIGHT, path)?;
         println!("captured {name} -> {}", path.display());
         Ok(())
