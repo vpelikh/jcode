@@ -583,7 +583,11 @@ impl Frame {
             return None;
         }
         let index = ((y - list_top) / PALETTE_ROW_HEIGHT) as usize;
-        (index < rows).then_some(index)
+        // A card height-capped to a short window clips rows whose full band
+        // would extend past its bottom; the hit test must agree with what the
+        // renderer draws, so a row that is half-hidden is not selectable.
+        let band_end = list_top + (index + 1) as f64 * PALETTE_ROW_HEIGHT;
+        (index < rows && band_end <= card.y1 + 1e-9).then_some(index)
     }
 
     /// The caret must stay inside the composer well at any size.
@@ -1399,6 +1403,51 @@ mod tests {
                     prev_bottom = row.y1;
                 }
             }
+        }
+    }
+
+    /// A height-capped card must not be hit-testable on a row the renderer
+    /// clipped away: clicking a half-hidden (or absent) row selects nothing,
+    /// so the pointer and the pixels agree.
+    #[test]
+    fn palette_hit_test_agrees_with_the_clipped_rows() {
+        for &scale in SCALES {
+            // No matter the card height (it may cap on a short logical frame),
+            // any row whose full band fits inside the card is hit-testable at
+            // its centre, and any row that does not fit is not: the pointer
+            // and the pixels always agree.
+            let frame = Frame::new((800, 900), scale);
+            let rows = 7;
+            let card = frame.palette_card(rows);
+            for index in 0..rows {
+                let band = frame.palette_row(rows, index);
+                let fits = band.y0 >= card.y0 - 1e-9 && band.y1 <= card.y1 + 1e-9;
+                let hit = frame.palette_row_at(rows, band.x0 + 1.0, (band.y0 + band.y1) / 2.0);
+                assert_eq!(
+                    hit.is_some(),
+                    fits,
+                    "row {index} hit-testability disagreed with its clip @ {scale}"
+                );
+            }
+            // A very short card: rows past its bottom are neither drawn nor
+            // hit-testable, and clicking off-paper selects nothing.
+            let short = Frame::new((800, 120), scale);
+            let first_shown = short.palette_row(rows, 0);
+            assert!(
+                short
+                    .palette_row_at(
+                        rows,
+                        first_shown.x0 + 1.0,
+                        (first_shown.y0 + first_shown.y1) / 2.0
+                    )
+                    .is_some(),
+                "first row should be hit-testable on the short card @ {scale}"
+            );
+            assert_eq!(
+                short.palette_row_at(rows, 1.0, short.height + 1.0),
+                None,
+                "off-paper click hit a row @ {scale}"
+            );
         }
     }
 
