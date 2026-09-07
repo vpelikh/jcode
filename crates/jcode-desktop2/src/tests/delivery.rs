@@ -852,3 +852,66 @@ fn a_disconnect_invalidates_an_in_flight_reload() {
         "a reload invalidated by a later disconnect still replaced the page: {text:?}"
     );
 }
+
+/// The reload must never erase a queued (unsent) user message. Queued messages
+/// live only in the local transcript, not in the daemon's stored history, so a
+/// history snapshot that is shorter than the live page would drop them. The
+/// reload only applies when the history is at least as complete as the page it
+/// is replacing.
+#[test]
+fn a_reload_never_erases_a_queued_message() {
+    let mut app = app_with_session();
+    let (updates, update_rx) = std::sync::mpsc::channel();
+    let (commands, command_rx) = std::sync::mpsc::channel();
+    app.harness = Some((update_rx, harness::CommandSender::for_test(commands)));
+    app.model.session_id = Some("session_test".into());
+
+    app.apply(Action::Insert, Some("first"));
+    app.apply(Action::Submit, None);
+    let _ = command_rx.try_iter().count();
+    // While the first turn is busy, a second message is queued, not sent.
+    app.apply(Action::Insert, Some("second"));
+    app.apply(Action::Submit, None);
+    assert_eq!(
+        deliveries(&app),
+        vec![Some(Delivery::Sent), Some(Delivery::Queued)],
+        "prereq: second message queued behind a busy turn"
+    );
+
+    updates
+        .send(harness::HarnessUpdate::ConnectionLost("drop".into()))
+        .expect("queue the disconnect");
+    app.drain_harness_updates();
+
+    updates
+        .send(harness::HarnessUpdate::Attached {
+            session_id: "session_test".into(),
+            working_dir: Some("/tmp".into()),
+            activity: SessionActivity::Idle,
+        })
+        .expect("queue the idle re-attach");
+    app.drain_harness_updates();
+
+    // The daemon history only knows the delivered message; it does not contain
+    // the still-queued second one.
+    let mut history = crate::transcript::Transcript::default();
+    history.push(crate::transcript::Message::user("first"));
+    updates
+        .send(harness::HarnessUpdate::History {
+            session_id: "session_test".into(),
+            transcript: history.clone(),
+        })
+        .expect("queue the history");
+    app.drain_harness_updates();
+
+    assert_eq!(
+        deliveries(&app),
+        vec![Some(Delivery::Sent), Some(Delivery::Queued)],
+        "the reload erased the queued message that history does not contain"
+    );
+    let text = app.model.transcript.plain_text();
+    assert!(
+        text.contains("second"),
+        "the queued 'second' message disappeared after the reload: {text:?}"
+    );
+}

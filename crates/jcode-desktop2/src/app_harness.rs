@@ -304,18 +304,25 @@ impl App {
                     // snapshot that would clobber it.
                     if self.model.session_id.as_deref() != Some(session_id.as_str()) {
                         self.model.peeks.insert(&session_id, transcript);
-                    } else if !self.model.busy
-                        && self.reload_len == Some(self.model.transcript.messages().len())
-                    {
-                        // Nothing new streamed in since the reload was requested,
-                        // so the stored history is still an accurate replacement.
-                        let reasoning = self.model.transcript.reasoning_mode();
-                        self.model.transcript = transcript;
-                        self.model.transcript.set_reasoning_mode(reasoning);
-                        self.model.stream.reveal_all();
-                        // The reload dropped in a page's worth of history; jump
-                        // to the live tail rather than stranding the old scroll.
-                        self.model.scroll = 0.0;
+                    } else if let Some(len_at_issue) = self.reload_len {
+                        // Apply only if nothing new streamed in since the reload
+                        // was requested (the no-change guard) AND the incoming
+                        // history is at least as complete as the page it would
+                        // replace. Queued (unsent) messages live only in the
+                        // local transcript, not in the daemon's stored history,
+                        // so a shorter snapshot would erase them.
+                        let unchanged =
+                            self.model.transcript.messages().len() == len_at_issue;
+                        let complete = transcript.messages().len() >= len_at_issue;
+                        if !self.model.busy && unchanged && complete {
+                            let reasoning = self.model.transcript.reasoning_mode();
+                            self.model.transcript = transcript;
+                            self.model.transcript.set_reasoning_mode(reasoning);
+                            self.model.stream.reveal_all();
+                            // The reload dropped in a page's worth of history; jump
+                            // to the live tail rather than stranding the old scroll.
+                            self.model.scroll = 0.0;
+                        }
                     }
                     // Whether or not the snapshot was applied, the reload window
                     // is over: it must not replace a later turn.
