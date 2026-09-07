@@ -27,26 +27,29 @@ reduce argument fanout **without changing the single-process runtime model**.
 
 ## Executive Summary
 
-The architecture is still exactly what the original plan described, merely in a
-new location:
+> **Landing status (2026-09):** Slices 1-3 are landed (service-handle structs,
+> `ServerRuntime` wiring, and handler-signature narrowing). This summary
+> describes the problems the split set out to solve and the current state.
 
-- `Server` (`crates/jcode-app-core/src/server.rs:687`, ~2.4k LOC) still owns
-  nearly all shared state in one struct.
-- `ServerRuntime` (`server/runtime.rs:91`) still clones that full state bag,
-  field-by-field, into connection handlers.
-- `handle_client()` (`server/client_lifecycle.rs:435`) still receives a
-  **28-argument** list spanning session, swarm, client, debug, and maintenance
-  concerns.
-- The main extraction seam is still **not** transport or process boundaries. The
-  main seam is **service-owned state + service APIs inside the existing process**.
+The architecture was a single broad state owner, now incrementally moved onto
+service handles:
 
-The safest path is:
+- `Server` (`crates/jcode-app-core/src/server.rs`) owns nearly all shared state
+  in one struct (still ~2.4k LOC).
+- `ServerRuntime` (`server/runtime.rs`) previously cloned that full state bag
+  field-by-field; it now holds the five service handles (Slice 2).
+- `handle_client()`/`handle_debug_client` previously received 28-argument lists;
+  they now take the service handles (Slice 3).
+- The main extraction seam is **service-owned state + service APIs inside the
+  existing process** (in progress via Slice 4+).
+
+The safest path:
 
 1. keep one server process
 2. keep current modules and behavior
-3. introduce service handle structs around existing state
-4. move mutation behind service methods
-5. reduce `handle_client()` and `handle_debug_client()` to a few typed contexts
+3. introduce service handle structs around existing state — *landed*
+4. move mutation behind service methods — *Slice 4+*
+5. reduce `handle_client()` and `handle_debug_client()` to a few typed contexts — *landed (Slice 3)*
 
 Do **not** start with crates, traits, or IPC splits. The code is not ready for
 that yet, and the current pain is ownership fanout, not runtime topology.
@@ -466,8 +469,7 @@ surfaces immediately and creates a place to move methods later.
 
 Checked 2026-09-07 against `crates/jcode-app-core/src/`:
 
-- No `services/` module, no `*ServiceHandle` types → Phase 2 move not started.
-  **Now updated:** Slices 1 + 2 landed. Slice 1 added the `server/services/*.rs`
+- Slices 1 + 2 landed. Slice 1 added the `server/services/*.rs`
   module with the five `*ServiceHandle` structs + `from_server`; Slice 2 wired
   `ServerRuntime` to hold and route through them. `handle_client`/`handle_debug_client`
   narrowing (Slice 3) is landed too: both now take the service handles and
@@ -484,8 +486,9 @@ Checked 2026-09-07 against `crates/jcode-app-core/src/`:
 
 What HAS landed: the breadth-level file split (many focused modules), `runtime.rs`
 already isolates accept loops, `state.rs` centralizes delivery types and
-`SwarmState`, `swarm.rs` is already a stateful domain service. The remaining work
-is the service-handle/ownership boundary, which is untouched.
+`SwarmState`, `swarm.rs` is already a stateful domain service. Slices 1-3 added
+the service-handle structs, wired `ServerRuntime`, and narrowed the handler
+signatures. The remaining work is the ownership-move slices (Slice 4+).
 
 ---
 
