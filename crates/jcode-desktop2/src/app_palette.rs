@@ -48,7 +48,16 @@ impl App {
                     return true;
                 }
                 NamedKey::Backspace => self.model.palette.backspace(),
-                NamedKey::Space => self.model.palette.type_char(' '),
+                // A bare space types into the query; a modified Space (Ctrl/Cmd/
+                // Alt) is a chord, not input — matching how the resume overlay
+                // treats it — so it is not swallowed as a literal space.
+                NamedKey::Space
+                    if !self.modifiers.control_key()
+                        && !self.modifiers.super_key()
+                        && !self.modifiers.alt_key() =>
+                {
+                    self.model.palette.type_char(' ');
+                }
                 _ => {}
             },
             winit::keyboard::Key::Character(_text) => {
