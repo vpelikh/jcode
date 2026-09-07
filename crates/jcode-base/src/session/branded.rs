@@ -36,8 +36,8 @@ use std::fmt;
 ///   the on-disk / on-wire format is identical to the previous raw `String`;
 /// - implements `Clone`, `Debug`, `PartialEq`, `Eq`, `Hash`, `PartialOrd`,
 ///   `Ord`, `Display`, `From<String>`, and `From<&str>`;
-/// - has `Self::new(prefix)` generating a fresh id via `crate::id::new_id`,
-///   and `Self::from_static(prefix, literal)` for deterministic test ids.
+/// - constructs via `From<String>`/`From<&str>` (callers use `.into()`, e.g.
+///   `crate::id::new_id("event").into()`);
 /// - exposes `Self::as_str()`/`Self::is_empty()` for explicit borrowed access;
 ///   it implements no `Deref`/`AsRef`/`Into<String>`, so a branded id cannot be
 ///   *silently* dereferenced to a generic string. `Display` is provided only for
@@ -58,21 +58,6 @@ macro_rules! branded_id {
         pub struct $name(pub(crate) String);
 
         impl $name {
-            /// Generate a fresh id with the given `prefix` (e.g. `"event"`).
-            pub fn new(prefix: &str) -> Self {
-                Self(crate::id::new_id(prefix))
-            }
-
-            /// Build a deterministic id from a prefix + literal marker.
-            ///
-            /// Intended for tests and small fixed identities (e.g.
-            /// `EventId::from_static("event", "rehydrate_0")`); production ids
-            /// should prefer [`Self::new`] which includes a timestamp+random
-            /// tail.
-            pub fn from_static(prefix: &str, literal: &str) -> Self {
-                Self(format!("{prefix}_{literal}"))
-            }
-
             /// The underlying string, as a borrowed `&str`.
             ///
             /// This is the explicit way to read the raw string from a branded id.
@@ -153,7 +138,7 @@ mod tests {
     fn branded_ids_are_distinct_types_but_same_layout() {
         let ev = EventId::from("e1".to_string());
         let msg = MessageId::from("m1");
-        let comp = CompactionId::new("compaction");
+        let comp = CompactionId::from("comp_1");
 
         // PartialEq is only defined across the *same* type — the following
         // cross-type comparisons are compile errors, which is the point of
@@ -183,13 +168,5 @@ mod tests {
         assert_eq!(ev.to_string(), "event_x");
         // The type provides no `Deref`/`AsRef<str>`/`Into<String>`, so it can
         // never be *implicitly* used where a `&str` or `String` is expected.
-    }
-
-    #[test]
-    fn from_static_is_deterministic() {
-        let a = EventId::from_static("event", "rehydrate_0");
-        let b = EventId::from_static("event", "rehydrate_0");
-        assert_eq!(a, b);
-        assert_eq!(a.as_str(), "event_rehydrate_0");
     }
 }
