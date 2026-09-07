@@ -149,6 +149,49 @@ async fn close_owned_sessions_marks_live_sessions_closed_and_clears_markers() {
     );
 }
 
+/// An actively-running (lock-contended) agent must not be force-closed as
+/// `Closed` on graceful shutdown: that would mask genuinely-interrupted work a
+/// user would want to recover via the crash-resume flow. But its presence marker
+/// is still cleared, so it isn't falsely labelled "exited unexpectedly" either —
+/// it just stays `Active` (marked for recovery) rather than becoming a false
+/// crash.
+#[tokio::test]
+async fn close_owned_sessions_does_not_force_close_busy_agent_but_clears_marker() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(StreamingMockProvider::default());
+    let agent_arc = test_agent(provider).await;
+    let session_id = {
+        let agent = agent_arc.lock().await;
+        agent.session_id().to_string()
+    };
+    // Simulate a server-owned live session with a presence marker.
+    crate::storage::register_active_pid(&session_id, std::process::id());
+
+    let sessions = super::SessionAgents::default();
+    sessions
+        .write()
+        .await
+        .insert(session_id.clone(), agent_arc.clone());
+
+    // Hold the agent lock to emulate an actively-running turn so try_lock fails.
+    let _busy_guard = agent_arc.lock().await;
+
+    super::close_owned_sessions(&sessions).await;
+
+    // The marker must be cleared so the session is not reported as crashed.
+    assert!(
+        !crate::storage::active_session_ids()
+            .iter()
+            .any(|id| id == &session_id),
+        "a busy agent's stale presence marker must still be cleared on shutdown"
+    );
+    let not_cr = crate::session::find_recent_crashed_sessions();
+    assert!(
+        !not_cr.iter().any(|(id, _)| id == &session_id),
+        "a contended (busy) agent's session must not be reported as crashed"
+    );
+}
+
 #[test]
 fn configured_server_name_normalizes_operator_labels() {
     assert_eq!(
