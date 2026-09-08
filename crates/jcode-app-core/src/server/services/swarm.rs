@@ -69,4 +69,44 @@ impl SwarmServiceHandle {
             .get(session_id)
             .is_none_or(|member| member.status != "running")
     }
+
+    /// Rename a swarm member's identity when its session id changes (resume /
+    /// re-subscribe under a new id). Preserves the spawn tree by re-pointing
+    /// `report_back_to_session_id` from the old id to the new one, and moves
+    /// the member between `swarms_by_id` sets without holding both maps at
+    /// once.
+    pub(crate) async fn rename_member_session(&self, old_session_id: &str, new_session_id: &str) {
+        // Never hold both swarm maps at once. Coordinator cleanup reads them in
+        // the opposite order, so retaining the member write guard while waiting
+        // for the swarm map can permanently deadlock reconnects and every later
+        // subscribe.
+        let renamed_swarm_id = {
+            let mut members = self.swarm_state.members.write().await;
+            let renamed_swarm_id = members.remove(old_session_id).and_then(|mut member| {
+                let swarm_id = member.swarm_id.clone();
+                member.session_id = new_session_id.to_string();
+                member.status = "ready".to_string();
+                member.detail = None;
+                members.insert(new_session_id.to_string(), member);
+                swarm_id
+            });
+
+            // Keep the spawn tree intact across the rename: children that
+            // reported back to the old session id must follow it.
+            for member in members.values_mut() {
+                if member.report_back_to_session_id.as_deref() == Some(old_session_id) {
+                    member.report_back_to_session_id = Some(new_session_id.to_string());
+                }
+            }
+            renamed_swarm_id
+        };
+
+        if let Some(swarm_id) = renamed_swarm_id {
+            let mut swarms = self.swarm_state.swarms_by_id.write().await;
+            if let Some(swarm) = swarms.get_mut(&swarm_id) {
+                swarm.remove(old_session_id);
+                swarm.insert(new_session_id.to_string());
+            }
+        }
+    }
 }

@@ -3,8 +3,8 @@ use super::{
     apply_or_defer_subscribe_working_dir, claim_live_target_agent, effective_subscribe_working_dir,
     handle_clear_session, handle_reload, handle_resume_session, handle_subscribe,
     mark_remote_reload_started, prewarm_idle_agent, remove_detached_source_if_unclaimed,
-    rename_shutdown_signal, rename_swarm_member_session, restored_session_was_interrupted,
-    session_was_interrupted_by_reload, subscribe_working_dir_replacement,
+    rename_shutdown_signal, restored_session_was_interrupted, session_was_interrupted_by_reload,
+    subscribe_working_dir_replacement,
 };
 use crate::agent::Agent;
 use crate::message::ContentBlock;
@@ -220,18 +220,21 @@ async fn resume_rename_releases_member_lock_before_waiting_for_swarm_map() {
     // Force the rename to wait for swarms_by_id. While it waits, the member map
     // must remain readable or coordinator cleanup can form a permanent cycle.
     let swarm_map_guard = swarms_by_id.write().await;
-    let rename_task = tokio::spawn({
-        let swarm_members = Arc::clone(&swarm_members);
-        let swarms_by_id = Arc::clone(&swarms_by_id);
-        async move {
-            rename_swarm_member_session(
-                old_session_id,
-                new_session_id,
-                &swarm_members,
-                &swarms_by_id,
-            )
+    let handle = swarm_handle_full(
+        Arc::clone(&swarm_members),
+        Arc::clone(&swarms_by_id),
+        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(RwLock::new(VecDeque::new())),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        broadcast::channel(8).0,
+    );
+    let rename_task = tokio::spawn(async move {
+        handle
+            .rename_member_session(old_session_id, new_session_id)
             .await;
-        }
     });
 
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
