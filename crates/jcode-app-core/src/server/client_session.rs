@@ -10,7 +10,7 @@ use super::{
     remove_session_channel_subscriptions, remove_session_from_swarm,
     remove_session_interrupt_queue, rename_background_tool_signal, rename_plan_participant,
     rename_session_interrupt_queue, send_swarm_plan_to_session, swarm_id_for_session,
-    unregister_session_event_sender, update_member_status,
+    unregister_session_event_sender,
 };
 use crate::agent::Agent;
 use crate::message::ContentBlock;
@@ -149,12 +149,7 @@ pub(super) async fn handle_clear_session(
     // Swarm-domain state is reached through the swarm service handle. These
     // locals keep the body single-homed on the handle's fields instead of a
     // flat pass-through argument bag (server service split, Slice 4).
-    let swarm_members = &swarm.swarm_state.members;
-    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
     let swarm_plans = &swarm.swarm_state.plans;
-    let event_history = &swarm.event_history;
-    let event_counter = &swarm.event_counter;
-    let swarm_event_tx = &swarm.swarm_event_tx;
 
     let clear_start = Instant::now();
     let old_session_id = client_session_id.clone();
@@ -253,17 +248,7 @@ pub(super) async fn handle_clear_session(
         swarm,
     )
     .await;
-    update_member_status(
-        &new_id,
-        "ready",
-        None,
-        swarm_members,
-        swarms_by_id,
-        Some(event_history),
-        Some(event_counter),
-        Some(swarm_event_tx),
-    )
-    .await;
+    swarm.set_member_status(&new_id, "ready", None).await;
     if let Some(ref swarm_id) = swarm_id_for_update {
         remove_plan_participant(swarm_id, client_session_id, swarm_plans).await;
     }
@@ -525,9 +510,6 @@ pub(super) async fn handle_subscribe(
     let swarm_coordinators = &swarm.swarm_state.coordinators;
     let channel_subscriptions = &swarm.channel_subscriptions;
     let channel_subscriptions_by_session = &swarm.channel_subscriptions_by_session;
-    let event_history = &swarm.event_history;
-    let event_counter = &swarm.event_counter;
-    let swarm_event_tx = &swarm.swarm_event_tx;
 
     let subscribe_start = Instant::now();
     crate::logging::event_info(
@@ -802,17 +784,7 @@ pub(super) async fn handle_subscribe(
     );
 
     if swarm.member_should_mark_ready(client_session_id).await {
-        update_member_status(
-            client_session_id,
-            "ready",
-            None,
-            swarm_members,
-            swarms_by_id,
-            Some(event_history),
-            Some(event_counter),
-            Some(swarm_event_tx),
-        )
-        .await;
+        swarm.set_member_status(client_session_id, "ready", None).await;
     }
 
     // Re-send the current swarm plan so a reconnecting client renders the
@@ -1097,9 +1069,6 @@ pub(super) async fn handle_resume_session(
     let channel_subscriptions = &swarm.channel_subscriptions;
     let channel_subscriptions_by_session = &swarm.channel_subscriptions_by_session;
     let file_touch = &swarm.file_touch;
-    let event_history = &swarm.event_history;
-    let event_counter = &swarm.event_counter;
-    let swarm_event_tx = &swarm.swarm_event_tx;
 
     let resume_start = Instant::now();
     let incoming_client_instance_id = client_instance_id.map(str::to_string);
@@ -1520,17 +1489,7 @@ pub(super) async fn handle_resume_session(
                     }
                 }
             }
-            update_member_status(
-                &session_id,
-                "ready",
-                None,
-                swarm_members,
-                swarms_by_id,
-                Some(event_history),
-                Some(event_counter),
-                Some(swarm_event_tx),
-            )
-            .await;
+            swarm.set_member_status(&session_id, "ready", None).await;
             if let Some(swarm_id) = {
                 let members = swarm_members.read().await;
                 members

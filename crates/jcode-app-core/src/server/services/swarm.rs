@@ -275,4 +275,27 @@ impl SwarmServiceHandle {
         .await;
         identity
     }
+
+    /// Update a member's status (and optional detail) through the swarm service,
+    /// so session code does not reach into the raw membership map or the event
+    /// sinks. Deferred to `swarm::update_member_status` which owns the
+    /// coordinator-notification and event-fanout behavior.
+    pub(crate) async fn set_member_status(
+        &self,
+        session_id: &str,
+        status: &str,
+        detail: Option<String>,
+    ) {
+        super::super::swarm::update_member_status(
+            session_id,
+            status,
+            detail,
+            &self.swarm_state.members,
+            &self.swarm_state.swarms_by_id,
+            Some(&self.event_history),
+            Some(&self.event_counter),
+            Some(&self.swarm_event_tx),
+        )
+        .await;
+    }
 }
