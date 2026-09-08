@@ -1600,7 +1600,7 @@ fn handle_git_command(app: &mut App, trimmed: &str) -> bool {
 /// The command name is unique; the directory is derived from it
 /// (`<repo>/.worktrees/<name>`), and the branch defaults to a `feat/` branch
 /// named after the worktree unless an explicit `-b <branch>` is supplied.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct WorktreeSpec {
     /// The worktree name, used both for the folder and (by default) the branch.
     pub name: String,

@@ -75,6 +75,7 @@ mod idle_heap_release;
 mod inline_interactive;
 mod input;
 mod input_help;
+mod intent;
 mod local;
 mod misc_ui;
 mod model_context;

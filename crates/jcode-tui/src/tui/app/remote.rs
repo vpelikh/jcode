@@ -54,12 +54,13 @@ use workspace::{handle_workspace_command, handle_workspace_navigation_key};
 #[allow(unused_imports)]
 pub(super) use input_dispatch::{
     apply_remote_transcript_event, apply_transcript_event, begin_remote_send,
-    begin_remote_split_launch, finish_remote_split_launch, history_matches_pending_startup_prompt,
-    route_prepared_input_to_new_remote_session, stage_turn_for_remote_tick_loop,
-    submit_prepared_remote_input, submit_remote_slash_input,
+    begin_remote_split_launch, dispatch_intent_command, finish_remote_split_launch,
+    history_matches_pending_startup_prompt, route_prepared_input_to_new_remote_session,
+    stage_turn_for_remote_tick_loop, submit_prepared_remote_input, submit_remote_slash_input,
 };
 pub(super) use key_handling::{
-    handle_remote_char_input, handle_remote_key, handle_remote_key_event, send_interleave_now,
+    handle_remote_char_input, handle_remote_key, handle_remote_key_event, invoke_new_worktree,
+    send_interleave_now,
 };
 pub(super) use server_events::handle_server_event;
 

@@ -142,6 +142,25 @@ pub(in crate::tui::app) async fn submit_prepared_remote_input(
     // A manually submitted prompt supersedes any armed post-error fallback
     // offer (and its staged resend): the user chose to continue differently.
     app.clear_pending_fallback_offer();
+
+    // Automatic command triggers: a plain prompt may carry an intent (e.g.
+    // "make a new worktree for X and work there") that should be honored before
+    // the message is forwarded to the agent. This is the generic hook so new
+    // auto-invocable commands only need a rule in `app::intent`.
+    if let Some((id, label, command)) = app_mod::intent::detect_intent(&prepared.expanded) {
+        if dispatch_intent_command(app, remote, command).await.is_ok() {
+            app.push_display_message(DisplayMessage {
+                role: "system".to_string(),
+                content: app_mod::intent::intent_notice(label),
+                tool_calls: vec![],
+                duration_secs: None,
+                title: None,
+                tool_data: None,
+            });
+            crate::telemetry::record_command_family(&format!("auto/{}", id));
+        }
+    }
+
     // Remember the typed prompt so we can restore it to the input box if this turn
     // fails (e.g. "token refresh needed"), instead of dropping it.
     app.last_submitted_input = Some(prepared.raw_input.clone());
@@ -157,6 +176,27 @@ pub(in crate::tui::app) async fn submit_prepared_remote_input(
         .begin_remote_send(remote, prepared.expanded, prepared.images, false)
         .await;
     Ok(())
+}
+
+/// Execute an auto-detected [`IntentCommand`] against the live session.
+///
+/// This is the generic bridge between the natural-language intent layer
+/// (`app::intent`) and the command execution shared with slash commands
+/// (`invoke_new_worktree`). It returns an error only when the command could
+/// not be honored; a user-visible error notice is already pushed in that case.
+pub(in crate::tui::app) async fn dispatch_intent_command(
+    app: &mut App,
+    remote: &mut RemoteConnection,
+    command: app_mod::intent::IntentCommand,
+) -> Result<(), ()> {
+    match command {
+        app_mod::intent::IntentCommand::NewWorktree(spec) => {
+            match super::invoke_new_worktree(app, remote, spec).await {
+                Some(_) => Ok(()),
+                None => Err(()),
+            }
+        }
+    }
 }
 
 /// Route a slash input through the remote client instead of the local

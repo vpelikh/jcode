@@ -1249,6 +1249,87 @@ fn worktree_creates_and_submits_set_working_dir_request() {
         .output();
 }
 
+#[test]
+fn auto_trigger_new_worktree_intent_creates_and_moves_the_session() {
+    use super::dispatch_intent_command;
+    use crate::tui::app::intent::detect_intent;
+    use std::process::Command;
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+
+    let home = tempfile::tempdir().expect("temp home");
+    let repo = home.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    for args in [vec!["init", "-b", "main"], vec!["add", "."]] {
+        let mut cmd = Command::new("git");
+        cmd.args(&args).current_dir(&repo);
+        if args[0] == "add" {
+            std::fs::write(repo.join("file.txt"), "hi\n").unwrap();
+        }
+        assert!(cmd.output().unwrap().status.success(), "git {args:?}");
+    }
+    let commit = Command::new("git")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .args(["commit", "-m", "init"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(commit.status.success(), "git commit failed");
+
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.remote_session_id = Some("active_sess".to_string());
+    app.session.working_dir = Some(repo.display().to_string());
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    let request_id_before = remote.next_request_id_for_test();
+
+    // A plain prompt carrying worktree intent must auto-detect.
+    let (id, _label, command) =
+        detect_intent("make a new worktree for \"panel-settings\" and do the work")
+            .expect("worktree intent should be detected");
+    assert_eq!(id, "new_worktree");
+
+    rt.block_on(dispatch_intent_command(&mut app, &mut remote, command))
+        .expect("dispatch should succeed");
+
+    let worktree_dir = repo.join(".worktrees").join("panel-settings");
+    assert!(
+        worktree_dir.exists(),
+        "auto-trigger should create the worktree"
+    );
+    let branch = Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(&worktree_dir)
+        .output()
+        .unwrap();
+    let branch = String::from_utf8_lossy(&branch.stdout);
+    assert_eq!(branch.trim(), "feat/panel-settings");
+
+    // The session must move via a SetWorkingDir request (the chained /cd).
+    assert!(
+        remote.next_request_id_for_test() > request_id_before,
+        "auto-trigger must send a SetWorkingDir request"
+    );
+
+    let _ = Command::new("git")
+        .args([
+            "worktree",
+            "remove",
+            "--force",
+            &worktree_dir.display().to_string(),
+        ])
+        .current_dir(&repo)
+        .output();
+    let _ = Command::new("git")
+        .args(["branch", "-D", "feat/panel-settings"])
+        .current_dir(&repo)
+        .output();
+}
+
 /// Reproduces the "stuck on loading session…" bug and verifies the watchdog
 /// recovers it: a remote connection that never receives the bootstrap History
 /// event (so `has_loaded_history()` stays false) must re-request `GetHistory`

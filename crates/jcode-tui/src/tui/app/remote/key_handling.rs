@@ -266,6 +266,54 @@ pub(in crate::tui::app) async fn handle_remote_key_event(
     .await
 }
 
+/// Shared execution for the `/worktree` command and the new-worktree auto
+/// trigger: create a git worktree and move the session into it in place.
+///
+/// Enforces the same guard the slash handler used to (rejects while the agent
+/// is working). Returns the created worktree's absolute path, or `None` when
+/// the request could not be honored (an error notice is already shown).
+pub(in crate::tui::app) async fn invoke_new_worktree(
+    app: &mut App,
+    remote: &mut RemoteConnection,
+    spec: app_mod::commands::WorktreeSpec,
+) -> Option<std::path::PathBuf> {
+    if app.is_processing {
+        app.push_display_message(DisplayMessage::error(
+            "The agent is currently working. Wait for it to finish, then run /worktree again."
+                .to_string(),
+        ));
+        return None;
+    }
+
+    match app_mod::commands::create_git_worktree(app, &spec) {
+        Ok(worktree_dir) => {
+            // Chain a /cd into the fresh worktree so the session's
+            // tools/skills/AGENTS.md/git widget re-scope to it.
+            if remote
+                .set_working_dir(worktree_dir.display().to_string())
+                .await
+                .is_ok()
+            {
+                Some(worktree_dir)
+            } else {
+                // The worktree was created but we could not move into it; still
+                // surface the created path so the user can /cd manually if the
+                // server round-trip failed.
+                app.push_display_message(DisplayMessage::system(format!(
+                    "Created worktree {}. The session could not be moved into it automatically; use /cd {} to switch.",
+                    worktree_dir.display(),
+                    worktree_dir.display()
+                )));
+                Some(worktree_dir)
+            }
+        }
+        Err(error) => {
+            app.push_display_message(DisplayMessage::error(error));
+            None
+        }
+    }
+}
+
 async fn handle_remote_key_internal(
     app: &mut App,
     code: KeyCode,
@@ -2183,23 +2231,7 @@ async fn handle_remote_key_internal(
                             return Ok(());
                         }
                     };
-                    if app.is_processing {
-                        app.push_display_message(DisplayMessage::error(
-                            "The agent is currently working. Wait for it to finish, then run /worktree again."
-                                .to_string(),
-                        ));
-                        return Ok(());
-                    }
-                    match app_mod::commands::create_git_worktree(app, &spec) {
-                        Ok(worktree_dir) => {
-                            // Chain a /cd into the fresh worktree so the session's
-                            // tools/skills/AGENTS.md/git widget re-scope to it.
-                            remote.set_working_dir(worktree_dir.display().to_string()).await?;
-                        }
-                        Err(error) => {
-                            app.push_display_message(DisplayMessage::error(error));
-                        }
-                    }
+                    self::invoke_new_worktree(app, remote, spec).await;
                     return Ok(());
                 }
 
