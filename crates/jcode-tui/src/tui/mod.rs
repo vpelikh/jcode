@@ -137,10 +137,7 @@ pub fn enable_keyboard_enhancement() -> bool {
         PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
     )
     .is_ok()
-        && {
-            crate::tui::terminal_writer::write_serialized(&buf);
-            true
-        };
+        && crate::tui::terminal_writer::write_serialized(&buf);
     crate::logging::info(&format!(
         "Kitty keyboard protocol: {}",
         if result { "enabled" } else { "FAILED" }

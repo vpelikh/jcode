@@ -156,15 +156,17 @@ pub fn write_auxiliary(bytes: &[u8]) -> bool {
 /// OSC-52 clipboard, turn notifications, mode re-apply). Using it guarantees
 /// these escape sequences never interleave with frame bytes on the same
 /// terminal. When no writer is live (startup, session picker, teardown) it
-/// falls back to `io::stdout()`, where there is no concurrent render writer to
-/// race with.
-pub fn write_serialized(bytes: &[u8]) {
+/// falls back to `io::stdout()`, where there is no concurrent renderer to race.
+///
+/// Returns whether the bytes were durably handed off: `true` when a live writer
+/// accepted them (or dropped them on a wedged pty), or when the stdout fallback
+/// `write_all` + `flush` succeeded.
+pub fn write_serialized(bytes: &[u8]) -> bool {
     if write_auxiliary(bytes) {
-        return;
+        return true;
     }
     let mut out = io::stdout();
-    let _ = out.write_all(bytes);
-    let _ = out.flush();
+    out.write_all(bytes).is_ok() && out.flush().is_ok()
 }
 
 enum Chunk {
