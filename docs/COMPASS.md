@@ -22,6 +22,28 @@ blocking a turn on a multi-minute cold build.
   it. On a cold index that build can take minutes on a large repo, which is
   exactly the stall pre-warming removes.
 
+## Result format
+
+Each hit is rendered with its qualified name, source file, node kind, score,
+and matched fields, **plus a compact source snippet** of the declaration read
+from disk. Showing the actual code is what makes `compass_query` a genuine
+substitute for `agentgrep` on symbol/declaration lookups: an earlier version
+returned only a bare ranked list of node names + paths, so a precise lookup
+(e.g. "definition of `SessionId`") surfaced fuzzy unrelated matches and the
+model abandoned compass for a raw grep — the dominant reason `agentgrep`
+grep calls outnumbered `compass_query` in real sessions.
+
+Snippet details:
+- Extracted from the current file on disk (not the index snapshot) relative to
+  the session working directory, **falling back to the git worktree toplevel**
+  so a session bound to a repo subdirectory still resolves the repo-relative
+  source path Compass stores.
+- Span is `[start_line, end_line)` from the node's source anchor, capped at 8
+  lines with a `...` fold marker for longer nodes (bounding context-window cost).
+- Best-effort: a missing/unreadable file, an `..`-escaping or absolute path, or
+  an out-of-range anchor renders no snippet without failing the query (see
+  `tool::compass_query::read_source_snippet`).
+
 ## Cache locations
 
 All Compass cache data lives under the **jcode home** (`~/.jcode`, or
@@ -185,6 +207,12 @@ a panic in a pre-warm thread cannot brick later dedup or cooldown.
 - A per-SHA pre-warm happens only for the SHA a session subscribes to; if a
   session quickly switches branches, the new SHA cold-builds unless another
   subscribe pre-warms it.
+- The `allow_raw_fallback` enforcement re-arms only once per session (after any
+  single `compass_query` attempt). If models keep falling back to raw grep
+  despite the source-snippet results (see the enforcement section), a follow-up
+  is to re-arm the raw fallback more aggressively — e.g. require a fresh
+  `compass_query` for each redirected grep, or refuse the bypass when compass
+  returned hits for the same intent.
 
 ## Integration with compass-first enforcement
 
@@ -216,3 +244,14 @@ are unaffected (they are never redirected and never blocked). The restriction is
 also not applied when `compass_query` has since become unavailable to the session
 (removed or disabled by policy), and the pending flag is reset on a fresh session
 bind or restore, so a re-attached or restored session is never stale-blocked.
+
+Because the pending flag clears after *one* genuine `compass_query` attempt,
+session logs historically show models satisfying that single required call and
+then running the bulk of their grep searches with `allow_raw_fallback: true`
+(often 75–91% of grep calls in a session). The source-snippet rendering above
+attacks the underlying cause — making `compass_query` actually answer the
+declaration/structure queries that previously pushed the model to grep. If
+fallback reliance persists after that, the next lever is to re-arm the raw
+fallback more aggressively (e.g. require a fresh `compass_query` on a redirect
+even after a prior attempt, or refuse the bypass when a compass result was
+returned but unused).
