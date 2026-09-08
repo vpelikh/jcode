@@ -1541,6 +1541,65 @@ fn plain_mention_of_worktree_does_not_auto_trigger_via_enter_key() {
     );
 }
 
+/// The auto-trigger must be disabled in SSH mode: it runs git against the local
+/// filesystem (like `/worktree`/`/cd`), which is wrong when the session belongs
+/// to a remote host. Under SSH, a worktree-intent prompt is forwarded normally
+/// and no local worktree is created.
+///
+/// Run in a child process (via `ssh_test_runs_in_child`) so `JCODE_SSH_REMOTE`
+/// is set in an isolated process and cannot race sibling tests.
+#[test]
+fn auto_trigger_is_disabled_in_ssh_remote_sessions() {
+    use super::submit_prepared_remote_input;
+    use crate::tui::app::commands_dispatch::ssh_test_runs_in_child;
+    use crate::tui::app::input::PreparedInput;
+
+    // Parent spawns an isolated child with SSH mode enabled and returns.
+    if ssh_test_runs_in_child("auto_trigger_is_disabled_in_ssh_remote_sessions") {
+        return;
+    }
+
+    // In the child, SSH mode is active.
+    assert!(crate::tui::is_ssh_remote(), "SSH mode should be active");
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+
+    let (_home, repo) = repo_with_single_commit();
+
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.remote_session_id = Some("active_sess".to_string());
+    app.session.working_dir = Some(repo.display().to_string());
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    remote.mark_history_loaded();
+
+    let prompt = "make a new worktree for \"feature-z\" and do the work there".to_string();
+    rt.block_on(submit_prepared_remote_input(
+        &mut app,
+        &mut remote,
+        PreparedInput {
+            raw_input: prompt.clone(),
+            expanded: prompt.clone(),
+            images: vec![],
+        },
+    ))
+    .expect("submit should succeed");
+
+    // No local worktree was created (SSH disables the auto-trigger).
+    assert!(
+        !repo.join(".worktrees").join("feature-z").exists(),
+        "SSH mode must not create a local worktree"
+    );
+    assert!(
+        !app
+            .display_messages()
+            .iter()
+            .any(|m| m.content.contains("moved this session into it")),
+        "SSH mode must not show an auto-trigger notice"
+    );
+}
+
 /// Reproduces the "stuck on loading session…" bug and verifies the watchdog
 /// recovers it: a remote connection that never receives the bootstrap History
 /// event (so `has_loaded_history()` stays false) must re-request `GetHistory`

@@ -147,7 +147,12 @@ pub(in crate::tui::app) async fn submit_prepared_remote_input(
     // "make a new worktree for X and work there") that should be honored before
     // the message is forwarded to the agent. This is the generic hook so new
     // auto-invocable commands only need a rule in `app::intent`.
-    if let Some((id, _label, command)) = app_mod::intent::detect_intent(&prepared.expanded)
+    //
+    // These run git against the local filesystem (like `/worktree`/`/cd`), so
+    // they must be disabled on SSH sessions where the working directory belongs
+    // to the remote host, exactly as the slash commands are SSH-blocked.
+    if !crate::tui::is_ssh_remote()
+        && let Some((id, _label, command)) = app_mod::intent::detect_intent(&prepared.expanded)
         && let Ok(created_display) = dispatch_intent_command(app, remote, command).await
     {
         app.push_display_message(DisplayMessage {
