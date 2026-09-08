@@ -1268,6 +1268,13 @@ fn worktree_creates_and_submits_set_working_dir_request() {
         app.input.is_empty(),
         "the /worktree command should be consumed from the input box"
     );
+    // The slash command shows an explicit success confirmation on create+move.
+    assert!(
+        app.display_messages()
+            .iter()
+            .any(|m| m.role == "system" && m.content.contains("Created worktree")),
+        "a successful /worktree should show a confirmation notice"
+    );
 
     remove_worktree(&repo, "feat-panel");
 }

@@ -2258,7 +2258,14 @@ async fn handle_remote_key_internal(
                             return Ok(());
                         }
                     };
-                    self::invoke_new_worktree(app, remote, spec).await;
+                    // On success (worktree created and the session moved into
+                    // it) show an explicit confirmation; failure paths already
+                    // surface their own message inside `invoke_new_worktree`.
+                    if let Some(dir) = self::invoke_new_worktree(app, remote, spec).await {
+                        app.push_display_message(DisplayMessage::system(
+                            app_mod::intent::intent_notice(&dir.display().to_string()),
+                        ));
+                    }
                     return Ok(());
                 }
 
