@@ -2164,6 +2164,45 @@ async fn handle_remote_key_internal(
                     return Ok(());
                 }
 
+                if trimmed == "/worktree" || trimmed.starts_with("/worktree ") {
+                    // Create a trimmed git worktree in the session's repo and
+                    // move the session into it in place (chaining a /cd). The
+                    // user only names the feature; the folder/branch are derived:
+                    //   /worktree panel-settings
+                    //     -> <repo>/.worktrees/panel-settings on feat/panel-settings
+                    //   /worktree -b fix/widgets widgets
+                    //     -> <repo>/.worktrees/widgets on fix/widgets
+                    let rest = trimmed
+                        .strip_prefix("/worktree")
+                        .unwrap_or_default()
+                        .trim();
+                    let spec = match app_mod::commands::parse_worktree_spec(rest) {
+                        Ok(spec) => spec,
+                        Err(error) => {
+                            app.push_display_message(DisplayMessage::error(error));
+                            return Ok(());
+                        }
+                    };
+                    if app.is_processing {
+                        app.push_display_message(DisplayMessage::error(
+                            "The agent is currently working. Wait for it to finish, then run /worktree again."
+                                .to_string(),
+                        ));
+                        return Ok(());
+                    }
+                    match app_mod::commands::create_git_worktree(app, &spec) {
+                        Ok(worktree_dir) => {
+                            // Chain a /cd into the fresh worktree so the session's
+                            // tools/skills/AGENTS.md/git widget re-scope to it.
+                            remote.set_working_dir(worktree_dir.display().to_string()).await?;
+                        }
+                        Err(error) => {
+                            app.push_display_message(DisplayMessage::error(error));
+                        }
+                    }
+                    return Ok(());
+                }
+
                 if app.pending_login.is_some() {
                     app.input = trimmed.to_string();
                     app.cursor_pos = app.input.len();

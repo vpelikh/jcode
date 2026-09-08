@@ -57,6 +57,7 @@ pub(super) fn ssh_unsupported_command(input: &str) -> bool {
             | "/unsave"
             | "/transcript"
             | "/git"
+            | "/worktree"
             | "/open"
             | "/file"
             | "/selfdev"
@@ -286,6 +287,7 @@ mod tests {
             "/permissions",
             "/open /etc/passwd",
             "/git",
+            "/worktree",
             "/save name",
             "/resume",
             "/selfdev status",

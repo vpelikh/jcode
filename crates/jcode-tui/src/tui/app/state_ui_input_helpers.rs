@@ -382,6 +382,10 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
         "/cd",
         "Change the session working directory (e.g. into a git worktree)",
     ),
+    RegisteredCommand::public(
+        "/worktree",
+        "Create a git worktree and move the session into it",
+    ),
     RegisteredCommand::with_subcommands(
         "/memory",
         "Toggle memory feature",
@@ -1677,6 +1681,8 @@ impl App {
                 | "/rewind"
                 | "/compact"
                 | "/compact mode"
+                | "/cd"
+                | "/worktree"
                 | "/alignment"
                 | "/compact-notifications"
                 | "/show-agentgrep-output"
