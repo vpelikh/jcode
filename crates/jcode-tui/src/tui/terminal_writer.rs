@@ -1077,4 +1077,73 @@ mod tests {
         drop(release);
         drop(writer);
     }
+
+    /// Validation of the core fix guarantee under the exact concurrency model
+    /// that caused the bug: many threads call `write_serialized` concurrently
+    /// while a live registered writer drains the channel. Every auxiliary escape
+    /// must reach the downstream writer intact and complete — never split by
+    /// bytes from another concurrent writer (that interleaving is what left
+    /// stray characters on the real terminal before routing aux output through
+    /// the single writer thread).
+    #[test]
+    fn concurrent_auxiliary_writes_are_never_split() {
+        let _guard = live_writer_test_guard();
+        let (t, wrx) = mpsc::channel::<Vec<u8>>();
+        let writer = TerminalWriter::new(ChannelWriter { tx: t });
+        writer.register_as_live();
+
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 100;
+        let mut handles = Vec::new();
+        for tid in 0..THREADS {
+            handles.push(thread::spawn(move || {
+                for i in 0..PER_THREAD {
+                    // A distinct, well-delimited OSC-0 style escape per write so
+                    // any split (or byte interleaving) is detectable downstream.
+                    let seq = format!("\x1b]0;t{tid}-{i}\x07");
+                    assert!(
+                        write_serialized(seq.as_bytes()),
+                        "write_serialized must accept while a live writer is registered"
+                    );
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        drop(writer); // drains the channel fully to `wrx`.
+
+        // Concatenate the whole stream and assert every escape arrived whole and
+        // in a contiguous run. Any interleaving would produce a fragment that is
+        // not a complete "\x1b]0;...\x07".
+        let mut got = String::new();
+        while let Ok(chunk) = wrx.recv_timeout(std::time::Duration::from_millis(300)) {
+            got.push_str(std::str::from_utf8(&chunk).expect("payload is ascii"));
+        }
+        let total_escapes = THREADS * PER_THREAD;
+        // Every escape appears verbatim and unbroken.
+        for tid in 0..THREADS {
+            for i in 0..PER_THREAD {
+                let needle = format!("\x1b]0;t{tid}-{i}\x07");
+                assert!(
+                    got.contains(&needle),
+                    "escape {needle:?} was split or lost (stream len {})",
+                    got.len()
+                );
+            }
+        }
+        // No intra-escape interleaving: the pool contains only valid escapes, so
+        // its total byte count must exactly equal the sum of the escapes' lengths
+        // (compute them directly since `i` varies in digit count).
+        let expected_len: usize = (0..THREADS)
+            .flat_map(|tid| (0..PER_THREAD).map(move |i| format!("\x1b]0;t{tid}-{i}\x07")))
+            .map(|s| s.len())
+            .sum();
+        assert_eq!(got.len(), expected_len, "unexpected bytes interleaved in stream");
+        // Provenance is exact: the OSC start marker and the BEL terminator each
+        // appear exactly once per escape, so the stream is exactly the set of
+        // escaped payloads with nothing added, dropped, or split.
+        assert_eq!(got.matches("\x1b]0;").count(), total_escapes);
+        assert_eq!(got.matches('\x07').count(), total_escapes);
+    }
 }
