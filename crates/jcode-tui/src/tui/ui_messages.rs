@@ -586,9 +586,10 @@ fn render_compass_query_output_body(content: &str, row_width: usize) -> Vec<Line
     let rendered = markdown::render_markdown_with_width(&preserved, Some(width));
     let mut lines = markdown::wrap_lines(rendered, width);
     if lines.len() > MAX_BODY_LINES {
+        let truncated = lines.len().saturating_sub(MAX_BODY_LINES);
         lines.truncate(MAX_BODY_LINES);
         lines.push(Line::from(Span::styled(
-            format!("    … {} more lines …", MAX_BODY_LINES),
+            format!("    … {} more lines …", truncated),
             Style::default().fg(dim_color()),
         )));
     }

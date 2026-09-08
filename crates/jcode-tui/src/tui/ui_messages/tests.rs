@@ -3808,7 +3808,17 @@ fn render_compass_query_output_body_caps_huge_output() {
     // 400-line cap plus a single truncation summary line.
     assert_eq!(lines.len(), 401, "should cap the body and add a summary");
     let last = extract_line_text(&lines[lines.len() - 1]);
-    assert!(last.contains("more lines"), "last={last}");
+    // The note reports how many lines were actually hidden (a positive number
+    // strictly less than the cap), not a fixed MAX_BODY_LINES constant.
+    let count = last
+        .find("more lines")
+        .and_then(|idx| last[..idx].rsplit(' ').nth(1))
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    assert!(
+        (1..400).contains(&count),
+        "last={last:?} should report a hidden-line count in (0, 400)"
+    );
 }
 
 /// A realistic multi-result compass response keeps every field on its own
