@@ -268,7 +268,6 @@ pub(super) async fn handle_debug_client(
     let client_connections = client_service.client_connections;
     let swarm_members = swarm_service.swarm_state.members;
     let swarms_by_id = swarm_service.swarm_state.swarms_by_id;
-    let shared_context = swarm_service.shared_context;
     let swarm_plans = swarm_service.swarm_state.plans;
     let swarm_coordinators = swarm_service.swarm_state.coordinators;
     let client_debug_state = debug_service.client_debug_state;
@@ -482,11 +481,7 @@ pub(super) async fn handle_debug_client(
                             cmd,
                             &DebugSwarmWriteContext {
                                 session_id: &session_id,
-                                swarm_members: &swarm_members,
-                                swarms_by_id: &swarms_by_id,
-                                shared_context: &shared_context,
-                                swarm_plans: &swarm_plans,
-                                swarm_coordinators: &swarm_coordinators,
+                                swarm: &swarm_service_handle,
                             },
                         )
                         .await?

@@ -1,19 +1,16 @@
-use super::{SharedContext, SwarmMember, SwarmState, VersionedPlan, persist_swarm_state_for};
+use super::services::SwarmServiceHandle;
+use super::{SharedContext, SwarmState, VersionedPlan, persist_swarm_state_for};
 use crate::plan::PlanItem;
 use crate::protocol::{NotificationType, ServerEvent};
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
 
 pub(super) struct DebugSwarmWriteContext<'a> {
     pub(super) session_id: &'a Arc<RwLock<String>>,
-    pub(super) swarm_members: &'a Arc<RwLock<HashMap<String, SwarmMember>>>,
-    pub(super) swarms_by_id: &'a Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    pub(super) shared_context: &'a Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
-    pub(super) swarm_plans: &'a Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    pub(super) swarm_coordinators: &'a Arc<RwLock<HashMap<String, String>>>,
+    pub(super) swarm: &'a SwarmServiceHandle,
 }
 
 pub(super) async fn maybe_handle_swarm_write_command(
@@ -29,12 +26,12 @@ pub(super) async fn maybe_handle_swarm_write_command(
         // locks. In particular, persistence reads coordinators again, so a
         // retained write guard here self-deadlocks the command.
         let removed = {
-            let mut coordinators = ctx.swarm_coordinators.write().await;
+            let mut coordinators = ctx.swarm.swarm_state.coordinators.write().await;
             coordinators.remove(swarm_id).is_some()
         };
         if removed {
             {
-                let mut members = ctx.swarm_members.write().await;
+                let mut members = ctx.swarm.swarm_state.members.write().await;
                 for member in members.values_mut() {
                     if member.swarm_id.as_deref() == Some(swarm_id) && member.role == "coordinator"
                     {
@@ -43,10 +40,10 @@ pub(super) async fn maybe_handle_swarm_write_command(
                 }
             }
             let swarm_state = SwarmState {
-                members: Arc::clone(ctx.swarm_members),
-                swarms_by_id: Arc::clone(ctx.swarms_by_id),
-                plans: Arc::clone(ctx.swarm_plans),
-                coordinators: Arc::clone(ctx.swarm_coordinators),
+                members: Arc::clone(&ctx.swarm.swarm_state.members),
+                swarms_by_id: Arc::clone(&ctx.swarm.swarm_state.swarms_by_id),
+                plans: Arc::clone(&ctx.swarm.swarm_state.plans),
+                coordinators: Arc::clone(&ctx.swarm.swarm_state.coordinators),
             };
             persist_swarm_state_for(swarm_id, &swarm_state).await;
             return Ok(Some(format!(
@@ -68,7 +65,7 @@ pub(super) async fn maybe_handle_swarm_write_command(
             ));
         }
         let removed = {
-            let mut plans = ctx.swarm_plans.write().await;
+            let mut plans = ctx.swarm.swarm_state.plans.write().await;
             plans.remove(swarm_id)
         };
         let Some(removed) = removed else {
@@ -78,10 +75,10 @@ pub(super) async fn maybe_handle_swarm_write_command(
         // the next server restart resurrects it and every fresh session in
         // this working dir gets the stale plan graph pushed on subscribe.
         let swarm_state = SwarmState {
-            members: Arc::clone(ctx.swarm_members),
-            swarms_by_id: Arc::clone(ctx.swarms_by_id),
-            plans: Arc::clone(ctx.swarm_plans),
-            coordinators: Arc::clone(ctx.swarm_coordinators),
+            members: Arc::clone(&ctx.swarm.swarm_state.members),
+            swarms_by_id: Arc::clone(&ctx.swarm.swarm_state.swarms_by_id),
+            plans: Arc::clone(&ctx.swarm.swarm_state.plans),
+            coordinators: Arc::clone(&ctx.swarm.swarm_state.coordinators),
         };
         persist_swarm_state_for(swarm_id, &swarm_state).await;
         // Push the cleared state to attached clients. Without this, every
@@ -98,14 +95,14 @@ pub(super) async fn maybe_handle_swarm_write_command(
             summary: None,
         };
         let session_ids: Vec<String> = {
-            let swarms = ctx.swarms_by_id.read().await;
+            let swarms = ctx.swarm.swarm_state.swarms_by_id.read().await;
             swarms
                 .get(swarm_id)
                 .map(|s| s.iter().cloned().collect())
                 .unwrap_or_default()
         };
         {
-            let members = ctx.swarm_members.read().await;
+            let members = ctx.swarm.swarm_state.members.read().await;
             for sid in session_ids {
                 if let Some(member) = members.get(&sid) {
                     let _ = member.event_tx.send(clear_event.clone());
@@ -146,7 +143,7 @@ pub(super) async fn maybe_handle_swarm_write_command(
         let swarm_id = if let Some(id) = target_swarm_id {
             Some(id)
         } else {
-            let members = ctx.swarm_members.read().await;
+            let members = ctx.swarm.swarm_state.members.read().await;
             let current_session = ctx.session_id.read().await;
             members
                 .get(&*current_session)
@@ -154,8 +151,8 @@ pub(super) async fn maybe_handle_swarm_write_command(
         };
 
         if let Some(swarm_id) = swarm_id {
-            let swarms = ctx.swarms_by_id.read().await;
-            let members = ctx.swarm_members.read().await;
+            let swarms = ctx.swarm.swarm_state.swarms_by_id.read().await;
+            let members = ctx.swarm.swarm_state.members.read().await;
             let current_session = ctx.session_id.read().await;
             let from_name = members
                 .get(&*current_session)
@@ -208,7 +205,7 @@ pub(super) async fn maybe_handle_swarm_write_command(
                 return Err(anyhow::anyhow!("swarm:notify requires a message"));
             }
 
-            let members = ctx.swarm_members.read().await;
+            let members = ctx.swarm.swarm_state.members.read().await;
             let current_session = ctx.session_id.read().await;
             let from_name = members
                 .get(&*current_session)
@@ -260,7 +257,7 @@ pub(super) async fn maybe_handle_swarm_write_command(
         let value = parts[2].to_string();
 
         let (swarm_id, friendly_name) = {
-            let members = ctx.swarm_members.read().await;
+            let members = ctx.swarm.swarm_state.members.read().await;
             let swarm_id = members
                 .get(acting_session)
                 .and_then(|member| member.swarm_id.clone());
@@ -272,7 +269,7 @@ pub(super) async fn maybe_handle_swarm_write_command(
 
         if let Some(swarm_id) = swarm_id {
             {
-                let mut shared_ctx = ctx.shared_context.write().await;
+                let mut shared_ctx = ctx.swarm.shared_context.write().await;
                 let swarm_ctx = shared_ctx
                     .entry(swarm_id.clone())
                     .or_insert_with(HashMap::new);
@@ -295,13 +292,13 @@ pub(super) async fn maybe_handle_swarm_write_command(
             }
 
             let swarm_session_ids: Vec<String> = {
-                let swarms = ctx.swarms_by_id.read().await;
+                let swarms = ctx.swarm.swarm_state.swarms_by_id.read().await;
                 swarms
                     .get(&swarm_id)
                     .map(|sessions| sessions.iter().cloned().collect())
                     .unwrap_or_default()
             };
-            let members = ctx.swarm_members.read().await;
+            let members = ctx.swarm.swarm_state.members.read().await;
             for sid in &swarm_session_ids {
                 if sid != acting_session
                     && let Some(member) = members.get(sid)
@@ -348,12 +345,12 @@ pub(super) async fn maybe_handle_swarm_write_command(
         let proposer_session = parts[1];
 
         let (swarm_id, is_coordinator) = {
-            let members = ctx.swarm_members.read().await;
+            let members = ctx.swarm.swarm_state.members.read().await;
             let swarm_id = members
                 .get(coord_session)
                 .and_then(|member| member.swarm_id.clone());
             let is_coord = if let Some(ref swarm_id) = swarm_id {
-                let coordinators = ctx.swarm_coordinators.read().await;
+                let coordinators = ctx.swarm.swarm_state.coordinators.read().await;
                 coordinators
                     .get(swarm_id)
                     .map(|coordinator| coordinator == coord_session)
@@ -373,7 +370,7 @@ pub(super) async fn maybe_handle_swarm_write_command(
         if let Some(swarm_id) = swarm_id {
             let proposal_key = format!("plan_proposal:{}", proposer_session);
             let proposal_value = {
-                let shared_ctx = ctx.shared_context.read().await;
+                let shared_ctx = ctx.swarm.shared_context.read().await;
                 shared_ctx
                     .get(&swarm_id)
                     .and_then(|swarm_ctx| swarm_ctx.get(&proposal_key))
@@ -388,7 +385,7 @@ pub(super) async fn maybe_handle_swarm_write_command(
                 Some(proposal) => {
                     if let Ok(items) = serde_json::from_str::<Vec<PlanItem>>(&proposal) {
                         let version = {
-                            let mut plans = ctx.swarm_plans.write().await;
+                            let mut plans = ctx.swarm.swarm_state.plans.write().await;
                             let versioned_plan = plans
                                 .entry(swarm_id.clone())
                                 .or_insert_with(VersionedPlan::new);
@@ -412,7 +409,7 @@ pub(super) async fn maybe_handle_swarm_write_command(
                             versioned_plan.version
                         };
                         {
-                            let mut shared_ctx = ctx.shared_context.write().await;
+                            let mut shared_ctx = ctx.swarm.shared_context.write().await;
                             if let Some(swarm_ctx) = shared_ctx.get_mut(&swarm_id) {
                                 swarm_ctx.remove(&proposal_key);
                             }
@@ -456,12 +453,12 @@ pub(super) async fn maybe_handle_swarm_write_command(
         };
 
         let (swarm_id, is_coordinator) = {
-            let members = ctx.swarm_members.read().await;
+            let members = ctx.swarm.swarm_state.members.read().await;
             let swarm_id = members
                 .get(coord_session)
                 .and_then(|member| member.swarm_id.clone());
             let is_coord = if let Some(ref swarm_id) = swarm_id {
-                let coordinators = ctx.swarm_coordinators.read().await;
+                let coordinators = ctx.swarm.swarm_state.coordinators.read().await;
                 coordinators
                     .get(swarm_id)
                     .map(|coordinator| coordinator == coord_session)
@@ -481,7 +478,7 @@ pub(super) async fn maybe_handle_swarm_write_command(
         if let Some(swarm_id) = swarm_id {
             let proposal_key = format!("plan_proposal:{}", proposer_session);
             let proposal_exists = {
-                let shared_ctx = ctx.shared_context.read().await;
+                let shared_ctx = ctx.swarm.shared_context.read().await;
                 shared_ctx
                     .get(&swarm_id)
                     .and_then(|swarm_ctx| swarm_ctx.get(&proposal_key))
@@ -496,7 +493,7 @@ pub(super) async fn maybe_handle_swarm_write_command(
             }
 
             {
-                let mut shared_ctx = ctx.shared_context.write().await;
+                let mut shared_ctx = ctx.swarm.shared_context.write().await;
                 if let Some(swarm_ctx) = shared_ctx.get_mut(&swarm_id) {
                     swarm_ctx.remove(&proposal_key);
                 }
@@ -592,7 +589,7 @@ async fn handle_debug_graph_op(arg: &str, ctx: &DebugSwarmWriteContext<'_>) -> S
     let swarm_id = parsed.swarm_id.clone();
 
     let result: Result<(usize, &'static str), String> = {
-        let mut plans = ctx.swarm_plans.write().await;
+        let mut plans = ctx.swarm.swarm_state.plans.write().await;
         let plan = plans
             .entry(swarm_id.clone())
             .or_insert_with(VersionedPlan::new);
@@ -695,10 +692,10 @@ async fn handle_debug_graph_op(arg: &str, ctx: &DebugSwarmWriteContext<'_>) -> S
     match result {
         Ok((count, op)) => {
             let swarm_state = SwarmState {
-                members: Arc::clone(ctx.swarm_members),
-                swarms_by_id: Arc::clone(ctx.swarms_by_id),
-                plans: Arc::clone(ctx.swarm_plans),
-                coordinators: Arc::clone(ctx.swarm_coordinators),
+                members: Arc::clone(&ctx.swarm.swarm_state.members),
+                swarms_by_id: Arc::clone(&ctx.swarm.swarm_state.swarms_by_id),
+                plans: Arc::clone(&ctx.swarm.swarm_state.plans),
+                coordinators: Arc::clone(&ctx.swarm.swarm_state.coordinators),
             };
             persist_swarm_state_for(&swarm_id, &swarm_state).await;
             serde_json::json!({"ok": true, "op": op, "count": count, "swarm_id": swarm_id})
@@ -754,11 +751,23 @@ mod tests {
         )])));
         let ctx = DebugSwarmWriteContext {
             session_id: &session_id,
-            swarm_members: &swarm_members,
-            swarms_by_id: &swarms_by_id,
-            shared_context: &shared_context,
-            swarm_plans: &swarm_plans,
-            swarm_coordinators: &swarm_coordinators,
+            swarm: &SwarmServiceHandle {
+                swarm_state: SwarmState {
+                    members: Arc::clone(&swarm_members),
+                    swarms_by_id: Arc::clone(&swarms_by_id),
+                    plans: Arc::clone(&swarm_plans),
+                    coordinators: Arc::clone(&swarm_coordinators),
+                },
+                shared_context: Arc::clone(&shared_context),
+                file_touch: crate::server::FileTouchService::new(),
+                channel_subscriptions: Arc::new(RwLock::new(HashMap::new())),
+                channel_subscriptions_by_session: Arc::new(RwLock::new(HashMap::new())),
+                event_history: Arc::new(RwLock::new(std::collections::VecDeque::new())),
+                event_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                swarm_event_tx: tokio::sync::broadcast::channel(8).0,
+                await_members_runtime: crate::server::AwaitMembersRuntime::default(),
+                swarm_mutation_runtime: crate::server::SwarmMutationRuntime::default(),
+            },
         };
 
         // Force the command to wait at members.write(). A safe path must not
