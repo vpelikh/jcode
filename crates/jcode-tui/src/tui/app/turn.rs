@@ -727,7 +727,7 @@ impl App {
                                         }
                                     }
                                     StreamEvent::SessionId(sid) => {
-                                        self.provider_session_id = Some(sid);
+                                        self.provider_session_id = Some(sid.to_string());
                                         if saw_message_end {
                                             break;
                                         }

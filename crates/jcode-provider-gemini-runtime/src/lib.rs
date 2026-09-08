@@ -702,13 +702,10 @@ impl Provider for GeminiProvider {
                 }
             };
 
-            let _ = tx
-                .send(Ok(StreamEvent::SessionId(
-                    resume_session_id
-                        .clone()
-                        .unwrap_or_else(|| state.session_id.clone()),
-                )))
-                .await;
+            let sid = resume_session_id
+                .clone()
+                .unwrap_or_else(|| state.session_id.clone());
+            let _ = tx.send(Ok(StreamEvent::SessionId(sid.into()))).await;
             let _ = tx
                 .send(Ok(StreamEvent::ConnectionPhase {
                     phase: ConnectionPhase::SendingRequest,

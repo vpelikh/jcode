@@ -65,7 +65,7 @@ async fn fake_subprocess_covers_handshake_models_new_prompt_and_auth_isolation()
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, StreamEvent::SessionId(id) if id == "fake-session-new"))
+            .any(|event| matches!(event, StreamEvent::SessionId(id) if id.as_str() == "fake-session-new"))
     );
     assert!(
         events

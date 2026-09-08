@@ -562,7 +562,7 @@ pub(crate) async fn run_unix_transport_scenario() -> Result<TransportScenarioRes
         StreamEvent::MessageEnd {
             stop_reason: Some("end_turn".to_string()),
         },
-        StreamEvent::SessionId("provider-session-1".to_string()),
+        StreamEvent::SessionId("provider-session-1".to_string().into()),
     ]);
 
     let provider: Arc<dyn jcode::provider::Provider> = Arc::new(provider);
@@ -682,7 +682,7 @@ pub(crate) async fn run_websocket_transport_scenario() -> Result<TransportScenar
         StreamEvent::MessageEnd {
             stop_reason: Some("end_turn".to_string()),
         },
-        StreamEvent::SessionId("provider-session-1".to_string()),
+        StreamEvent::SessionId("provider-session-1".to_string().into()),
     ]);
 
     let provider: Arc<dyn jcode::provider::Provider> = Arc::new(provider);

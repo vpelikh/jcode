@@ -458,7 +458,7 @@ fn run_turn_thread(
                 (response.session_id, response.models)
             };
 
-            tx.send(Ok(StreamEvent::SessionId(session_id.0.to_string())))
+            tx.send(Ok(StreamEvent::SessionId(session_id.0.to_string().into())))
                 .await
                 .map_err(|_| anyhow!("Grok Build stream consumer closed"))?;
 

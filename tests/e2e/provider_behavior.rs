@@ -12,7 +12,7 @@ async fn test_multi_turn_conversation() -> Result<()> {
         StreamEvent::MessageEnd {
             stop_reason: Some("end_turn".to_string()),
         },
-        StreamEvent::SessionId("session-abc".to_string()),
+        StreamEvent::SessionId("session-abc".to_string().into()),
     ]);
 
     // Second turn response
@@ -21,7 +21,7 @@ async fn test_multi_turn_conversation() -> Result<()> {
         StreamEvent::MessageEnd {
             stop_reason: Some("end_turn".to_string()),
         },
-        StreamEvent::SessionId("session-abc".to_string()),
+        StreamEvent::SessionId("session-abc".to_string().into()),
     ]);
 
     let provider: Arc<dyn jcode::provider::Provider> = Arc::new(provider);
@@ -56,7 +56,7 @@ async fn test_token_usage() -> Result<()> {
         StreamEvent::MessageEnd {
             stop_reason: Some("end_turn".to_string()),
         },
-        StreamEvent::SessionId("session-123".to_string()),
+        StreamEvent::SessionId("session-123".to_string().into()),
     ]);
 
     let provider: Arc<dyn jcode::provider::Provider> = Arc::new(provider);
@@ -694,7 +694,7 @@ async fn test_model_switch_resets_provider_session() -> Result<()> {
         StreamEvent::MessageEnd {
             stop_reason: Some("end_turn".to_string()),
         },
-        StreamEvent::SessionId("session-1".to_string()),
+        StreamEvent::SessionId("session-1".to_string().into()),
     ]);
     provider.queue_response(vec![
         StreamEvent::TextDelta("again".to_string()),
@@ -793,14 +793,14 @@ async fn test_model_switch_is_per_session() -> Result<()> {
         StreamEvent::MessageEnd {
             stop_reason: Some("end_turn".to_string()),
         },
-        StreamEvent::SessionId("session-1".to_string()),
+        StreamEvent::SessionId("session-1".to_string().into()),
     ]);
     provider.queue_response(vec![
         StreamEvent::TextDelta("two".to_string()),
         StreamEvent::MessageEnd {
             stop_reason: Some("end_turn".to_string()),
         },
-        StreamEvent::SessionId("session-2".to_string()),
+        StreamEvent::SessionId("session-2".to_string().into()),
     ]);
     provider.queue_response(vec![
         StreamEvent::TextDelta("three".to_string()),
@@ -895,7 +895,7 @@ async fn test_system_prompt_no_claude_code_identity() -> Result<()> {
         StreamEvent::MessageEnd {
             stop_reason: Some("end_turn".to_string()),
         },
-        StreamEvent::SessionId("test-identity-123".to_string()),
+        StreamEvent::SessionId("test-identity-123".to_string().into()),
     ]);
 
     // Keep a clone of Arc<MockProvider> before converting to Arc<dyn Provider>

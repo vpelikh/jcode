@@ -10,6 +10,4 @@
 //! `event_types.rs` imports via `crate::session::{CompactionId, EventId, MessageId}`,
 //! so this re-export keeps every existing path resolving unchanged.
 
-pub use jcode_id_types::{
-    branded_id, CompactionId, EventId, JobId, MessageId, SessionId, ToolCallId,
-};
+pub use jcode_id_types::{CompactionId, EventId, JobId, MessageId, SessionId, ToolCallId};

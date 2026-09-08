@@ -1,3 +1,5 @@
+use jcode_id_types::SessionId;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
     #[serde(default)]
@@ -737,7 +739,7 @@ pub enum StreamEvent {
         retry_after_secs: Option<u64>,
     },
     /// Provider session ID (for conversation resume)
-    SessionId(String),
+    SessionId(SessionId),
     /// Compaction occurred (context was summarized)
     Compaction {
         trigger: String,
@@ -892,5 +894,35 @@ mod tests {
             cache_relevant_message_hashes(&[edited]),
             "real content edits must still change the hash"
         );
+    }
+
+    #[test]
+    fn stream_event_session_id_carries_branded_session_id() {
+        // The provider session id is brandable (deepseek-harness #12): a tagged
+        // wrapper that is still the same bare string on the wire. Constructing
+        // from a String flips it into the branded type, and pattern-matching
+        // yields a SessionId whose as_str() restores the original value.
+        let raw = "provider-session-9".to_string();
+        let event = StreamEvent::SessionId(raw.clone().into());
+        match event {
+            StreamEvent::SessionId(sid) => {
+                assert_eq!(sid.as_str(), "provider-session-9");
+                assert_eq!(sid.to_string(), raw);
+            }
+            _ => panic!("expected SessionId variant"),
+        }
+    }
+
+    #[test]
+    fn stream_event_session_id_distinct_from_tool_call_id() {
+        // SessionId and ToolCallId are structurally distinct branded types, so
+        // this cross-type assignment is a compile error. The wildcard here just
+        // confirms the variant payload is unambiguously a SessionId.
+        let original = StreamEvent::SessionId("s1".into());
+        let sid = match &original {
+            StreamEvent::SessionId(sid) => sid,
+            _ => unreachable!(),
+        };
+        assert_eq!(sid.as_str(), "s1");
     }
 }

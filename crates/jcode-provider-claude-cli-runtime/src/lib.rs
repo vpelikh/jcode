@@ -587,7 +587,7 @@ impl CliOutputParser {
                     });
                 }
                 if let Some(sid) = session_id {
-                    events.push(StreamEvent::SessionId(sid));
+                    events.push(StreamEvent::SessionId(sid.into()));
                 }
                 if is_error {
                     events.push(StreamEvent::Error {
@@ -608,9 +608,10 @@ impl CliOutputParser {
                 message,
                 retry_after_secs,
             }],
-            CliOutput::System { session_id } => {
-                session_id.map(StreamEvent::SessionId).into_iter().collect()
-            }
+            CliOutput::System { session_id } => session_id
+                .map(|sid| StreamEvent::SessionId(sid.into()))
+                .into_iter()
+                .collect(),
             CliOutput::Other => Vec::new(),
         }
     }

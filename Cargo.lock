@@ -4778,6 +4778,7 @@ name = "jcode-message-types"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "jcode-id-types",
  "serde",
  "serde_json",
 ]

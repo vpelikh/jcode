@@ -796,9 +796,10 @@ impl Agent {
                         });
                     }
                     StreamEvent::SessionId(sid) => {
-                        self.provider_session_id = Some(sid.clone());
-                        self.session.provider_session_id = Some(sid.clone());
-                        let _ = event_tx.send(ServerEvent::SessionId { session_id: sid });
+                        self.provider_session_id = Some(sid.clone().to_string());
+                        self.session.provider_session_id = Some(sid.clone().to_string());
+                        let _ =
+                            event_tx.send(ServerEvent::SessionId { session_id: sid.to_string() });
                     }
                     StreamEvent::OpenAIReasoning {
                         id,

@@ -565,8 +565,8 @@ impl Agent {
                         if trace {
                             eprintln!("[trace] session_id {}", sid);
                         }
-                        self.provider_session_id = Some(sid.clone());
-                        self.session.provider_session_id = Some(sid);
+                        self.provider_session_id = Some(sid.clone().to_string());
+                        self.session.provider_session_id = Some(sid.to_string());
                         // We've received session_id, can exit the loop now
                         if saw_message_end {
                             break;

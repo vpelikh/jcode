@@ -508,7 +508,7 @@ pub async fn run_agent_turn(
         .context("Failed to send Cursor agent request headers")?;
 
     let session_id = Uuid::new_v5(&Uuid::NAMESPACE_DNS, access_token.as_bytes()).to_string();
-    let _ = tx.send(Ok(StreamEvent::SessionId(session_id))).await;
+    let _ = tx.send(Ok(StreamEvent::SessionId(session_id.into()))).await;
 
     // Sender task: stream the request frames paced like the real client, then
     // heartbeat until the response completes. The pacing is load-bearing: the
