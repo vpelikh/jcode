@@ -259,6 +259,24 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
         ],
     ),
     RegisteredCommand::with_subcommands(
+        "/show-compass-query-output",
+        "Show/toggle full compass_query search output inline in chat",
+        &[
+            (
+                "/show-compass-query-output status",
+                "Show whether compass_query output is shown inline",
+            ),
+            (
+                "/show-compass-query-output on",
+                "Render full compass_query search results inline in chat",
+            ),
+            (
+                "/show-compass-query-output off",
+                "Show only the one-line compass_query summary",
+            ),
+        ],
+    ),
+    RegisteredCommand::with_subcommands(
         "/tool-call-details",
         "Show/toggle dimmed technical details on tool rows with an intent",
         &[
@@ -1662,6 +1680,7 @@ impl App {
                 | "/alignment"
                 | "/compact-notifications"
                 | "/show-agentgrep-output"
+                | "/show-compass-query-output"
                 | "/reasoning"
                 | "/thinking"
                 | "/thinking-display"

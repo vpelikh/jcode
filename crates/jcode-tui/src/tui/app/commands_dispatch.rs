@@ -40,6 +40,7 @@ pub(super) fn ssh_unsupported_command(input: &str) -> bool {
             | "/thinking-display"
             | "/compact-notifications"
             | "/show-agentgrep-output"
+            | "/show-compass-query-output"
             | "/tool-call-details"
             | "/colors"
             | "/theme"
