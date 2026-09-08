@@ -1710,16 +1710,17 @@ pub(super) fn create_git_worktree_at(
         ));
     }
 
+    // The repository root comes from git and can in principle contain non-UTF-8
+    // bytes. `git` takes the target path as a byte string; rather than silently
+    // passing an empty string on a lossy conversion, surface a clear error so
+    // the user knows the worktree was not created.
+    let worktree_dir_str = worktree_dir
+        .to_str()
+        .ok_or_else(|| format!("Cannot create worktree at a non-UTF-8 path: {}", worktree_dir.display()))?;
+
     run_git_command(
         &repo_root,
-        &[
-            "worktree",
-            "add",
-            "-b",
-            &branch,
-            "-q",
-            worktree_dir.to_str().unwrap_or_default(),
-        ],
+        &["worktree", "add", "-b", &branch, "-q", worktree_dir_str],
     )
     .inspect_err(|_error| {
         // `git worktree add` creates the target dir while preparing; if it
