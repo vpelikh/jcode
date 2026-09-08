@@ -855,6 +855,21 @@ impl Registry {
             return Ok(intercept);
         }
 
+        // Measurement for the "semantic search first" guidance: after the
+        // snippet-rendering fix ships, this per-session counter (compass_query
+        // vs raw `agentgrep` grep) shows whether the ratio actually improves,
+        // before committing to a stricter enforcement rule. Only real
+        // executions are counted (intercepted agentgrep greps already returned
+        // above), and find/outline/trace modes are excluded from the raw-grep
+        // side since compass does not replace them.
+        if resolved_name == "compass_query" {
+            compass_enforcement::record_search_usage(&ctx.session_id, true);
+        } else if resolved_name == "agentgrep"
+            && compass_enforcement::agentgrep_call_is_grep_mode(&input)
+        {
+            compass_enforcement::record_search_usage(&ctx.session_id, false);
+        }
+
         // User-configured pre_tool gate: external policy hook that can block
         // this call (exit 2). Skipped entirely when not configured.
         if crate::hooks::hook_configured("pre_tool") {

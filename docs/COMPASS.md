@@ -40,11 +40,15 @@ Snippet details:
   source path Compass stores.
 - Span is `[start_line, end_line)` from the node's source anchor, capped at 8
   lines with a `...` fold marker for longer nodes (bounding context-window cost).
+- Only the **top 8 results** get a fenced snippet; the rest are listed as
+  name/file/kind rows (still fully ranked) so one query cannot tile many fences
+  into context (`tool::compass_query::MAX_SNIPPET_ROWS`).
+- Source files are read **once per query** and shared across results that land
+  in the same file (`tool::compass_query::SourceCache`), so a wide query does
+  not re-open the same file per hit.
 - Best-effort: a missing/unreadable file, an `..`-escaping or absolute path, or
   an out-of-range anchor renders no snippet without failing the query (see
-  `tool::compass_query::read_source_snippet`; the line window itself is read
-  via `stream_snippet_from_file` so a result pointing at a large
-  generated/minified file is never fully loaded into memory).
+  `tool::compass_query::resolve_source_text`).
 - Only the rendered line window is read from disk: memory and I/O scale with
   the ≤8 displayed lines, not the whole file.
 
@@ -283,6 +287,20 @@ attempt, so every redirected grep (or each new search intent) requires a fresh
 
 **Decision:** keep the one-attempt gate and rely on the source-snippet fix as the
 primary lever — it removes the underlying reason (bare results drove models to
-grep) without risking legitimate out-of-index searches. Re-arm the gate only if
-post-ship measurement shows fallback reliance is unchanged *and* the extra
-compass round-trips on out-of-index searches are acceptable.
+grep) without risking legitimate out-of-index searches. A measurement of 114
+real `compass_query` results reinforces the deferral:
+- 92% (105/114) returned non-empty hits, so a "arm the gate on hits" rule would
+  have kept the escape hatch closed for almost every real compass call;
+- but 22% of compass-with-hits calls were followed by a raw-fallback grep in the
+  same session — the model went back to grep even though compass returned
+  results, i.e. hit-count is a poor proxy for "compass answered." Arming the gate
+  on hits would therefore false-block real searches in that ~22% of cases, which
+  is exactly what the escape hatch exists to avoid.
+
+Because hit-count cannot separate "answered" from "noise," the enforcement is
+**deferred pending real-world measurement**: `tool::compass_enforcement` now
+records per-session `compass_query` vs raw-`agentgrep`-grep counts (logged as
+`COMPASS_SEARCH_USAGE`) so a post-ship check can confirm whether the snippet fix
+lifts the ratio. Re-arm the gate only if that measurement shows reliance is
+unchanged *and* the extra compass round-trips on out-of-index searches are
+acceptable.
