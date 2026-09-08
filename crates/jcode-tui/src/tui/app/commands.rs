@@ -1620,7 +1620,8 @@ fn is_valid_branch_component(branch: &str) -> bool {
     if branch.is_empty()
         || branch == "."
         || branch.ends_with('.')
-        || branch.ends_with(".lock")
+        || branch.to_lowercase().ends_with(".git")
+        || branch.to_lowercase().ends_with(".lock")
         || branch.starts_with('-')
         || branch.starts_with('.')
     {

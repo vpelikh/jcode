@@ -437,7 +437,7 @@ mod worktree {
     fn parse_worktree_spec_rejects_invalid_worktree_name_for_branch() {
         // A name that fails as a git branch component (would become feat/<name>)
         // must be rejected up front.
-        for bad in ["foo..bar", "foo@{x", "leading-dot.", "trailing~"] {
+        for bad in ["foo..bar", "foo@{x", "leading-dot.", "trailing~", "web.git"] {
             let err = super::parse_worktree_spec(bad).unwrap_err();
             assert!(
                 err.contains("invalid git branch"),
