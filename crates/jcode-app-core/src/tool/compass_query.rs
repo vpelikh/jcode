@@ -54,6 +54,7 @@ use compass_model::query_contract::{CodeQueryLimits, SearchRequest};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
@@ -1402,42 +1403,6 @@ fn format_query_output(
     output
 }
 
-/// Extract a source line-range from `text` (1-based, `end` exclusive), trimming
-/// to valid line bounds. Renders with a leading line-number gutter so the model
-/// can anchor line references if it needs to.
-fn extract_snippet(text: &str, start_line: u32, end_line: u32) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let line_count = lines.len() as u32;
-    let start = start_line.max(1);
-    if start > line_count {
-        return String::new();
-    }
-    // Cap the rendered span so a huge node cannot balloon the context window.
-    // The anchor end_line is exclusive; clamp it to the file end. A fold marker
-    // is only emitted when we genuinely cut a long node short (end_line extends
-    // beyond the span cap) — never when the anchor merely runs past EOF, where
-    // we render every remaining line with nothing hidden.
-    let requested_end = end_line.max(start + 1);
-    let capped_end = requested_end.min(start + 8);
-    let render_end = capped_end.min(line_count + 1);
-    let fold = requested_end > capped_end.min(line_count + 1) && capped_end <= line_count;
-    let mut out = String::new();
-    let digits = render_end.saturating_sub(1).to_string().len().max(1);
-    for (idx, line) in lines
-        .iter()
-        .enumerate()
-        .take_while(|(i, _)| ((*i as u32) + 1) < render_end)
-        .skip((start.saturating_sub(1)) as usize)
-    {
-        let lno = (idx as u32) + 1;
-        out.push_str(&format!("{:width$}| {}\n", lno, line, width = digits));
-    }
-    if fold {
-        out.push_str("...\n");
-    }
-    out
-}
-
 /// Read a source snippet for a node anchor from disk, resolving the anchor's
 /// repository-relative `file` against the session working directory and, as a
 /// fallback, the enclosing git worktree root. Compass stores `source.file`
@@ -1454,7 +1419,8 @@ fn read_source_snippet(working_dir: &Path, anchor: &SourceAnchor) -> Option<Stri
         return None;
     }
     // Bound effort: rendering a multi-thousand-line node body is already capped
-    // inside `extract_snippet`, but refuse pathological anchor values outright.
+    // inside `stream_snippet_from_file`, but refuse pathological anchor values
+    // outright.
     if anchor.start_line == 0 || anchor.end_line < anchor.start_line {
         return None;
     }
@@ -1462,11 +1428,67 @@ fn read_source_snippet(working_dir: &Path, anchor: &SourceAnchor) -> Option<Stri
         .chain(git_toplevel_cached(working_dir).map(PathBuf::from))
         .collect();
     for base in &bases {
-        if let Ok(text) = std::fs::read_to_string(base.join(rel)) {
-            return Some(extract_snippet(&text, anchor.start_line, anchor.end_line));
+        if let Some(snippet) = stream_snippet_from_file(&base.join(rel), anchor) {
+            return Some(snippet);
         }
     }
     None
+}
+
+/// Read a source snippet by streaming only the anchor's line window from a file,
+/// rather than loading the whole file into memory. A result can point at a large
+/// (generated/minified) file, and a query renders many results, so loading each
+/// file fully would waste memory and I/O just to show ≤8 lines. Reads lines
+/// until the window's end is reached and stops.
+///
+/// Returns `None` when the file is missing/unreadable or the anchor is
+/// degenerate; never errors the caller's query.
+fn stream_snippet_from_file(path: &Path, anchor: &SourceAnchor) -> Option<String> {
+    if anchor.start_line == 0 || anchor.end_line < anchor.start_line {
+        return None;
+    }
+    // Cap the rendered span so a pathological anchor cannot drive a huge read.
+    let start = anchor.start_line;
+    let requested_end = anchor.end_line.max(start + 1);
+    // 1-based end_line is exclusive; cap the window at start+8 lines.
+    let render_to = requested_end.min(start + 8);
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    // Render lines [start, render_to): end_line is exclusive, and the cap keeps
+    // at most (render_to - start) lines, so the last rendered line is render_to-1.
+    let digits = render_to.saturating_sub(1).to_string().len().max(1);
+    let mut out = String::new();
+    let mut line_num: u32 = 0;
+    let mut buf = String::new();
+    // Walk the file once. We call read_line up to and past the window end so we
+    // can detect truncation, but we only render lines in [start, render_to).
+    loop {
+        buf.clear();
+        let n = reader.read_line(&mut buf).ok()?;
+        if n == 0 {
+            break; // EOF
+        }
+        line_num += 1;
+        if line_num >= start && line_num < render_to {
+            let line = buf.trim_end_matches(['\n', '\r']);
+            out.push_str(&format!("{:width$}| {}\n", line_num, line, width = digits));
+        }
+        if line_num >= render_to {
+            break; // reached (or passed) the exclusive window end
+        }
+    }
+    // Fold only when the node span requested more than the cap AND the file has
+    // content beyond the window. `more > 0` means line render_to (the first
+    // hidden line) exists.
+    if requested_end > render_to {
+        buf.clear();
+        let more = reader.read_line(&mut buf).ok()?;
+        if more > 0 {
+            out.push_str("...\n");
+        }
+    }
+    Some(out)
 }
 
 /// How long a resolved git worktree toplevel is reused. The toplevel is stable
@@ -1986,28 +2008,52 @@ mod tests {
         );
     }
 
+    /// Write a temp file with the given content and return its path.
+    fn temp_file(content: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snippet.txt");
+        std::fs::write(&path, content).unwrap();
+        (dir, path)
+    }
+
+    fn anchor(file: &str, start: u32, end: u32) -> SourceAnchor {
+        SourceAnchor {
+            file: file.to_string(),
+            start_byte: 0,
+            end_byte: 0,
+            start_line: start,
+            start_column: 0,
+            end_line: end,
+            end_column: 0,
+        }
+    }
+
     #[test]
-    fn extract_snippet_renders_line_range_with_gutter() {
-        let text = "line1\nline2\nline3\nline4\nline5\n";
-        let out = extract_snippet(text, 2, 5);
+    fn stream_snippet_renders_line_range_with_gutter() {
+        let (_dir, path) = temp_file("line1\nline2\nline3\nline4\nline5\n");
+        let out = stream_snippet_from_file(&path, &anchor("x", 2, 5))
+            .expect("snippet from file");
         assert_eq!(out, "2| line2\n3| line3\n4| line4\n");
     }
 
     #[test]
-    fn extract_snippet_clamps_out_of_range_and_folds_long_nodes() {
-        let text = "a\nb\nc\n";
-        // end beyond file length clamps to last line; start clamps to >=1.
-        let out = extract_snippet(text, 0, 100);
+    fn stream_snippet_clamps_end_past_eof() {
+        let (_dir, path) = temp_file("a\nb\nc\n");
+        // end beyond file end renders every remaining line, no fold marker.
+        let out = stream_snippet_from_file(&path, &anchor("x", 1, 100))
+            .expect("snippet from file");
         assert_eq!(out, "1| a\n2| b\n3| c\n");
     }
 
     #[test]
-    fn extract_snippet_folds_very_long_anchor() {
-        let mut text = String::new();
+    fn stream_snippet_folds_very_long_anchor() {
+        let mut content = String::new();
         for i in 1..=40 {
-            text.push_str(&format!("line{i}\n"));
+            content.push_str(&format!("line{i}\n"));
         }
-        let out = extract_snippet(&text, 1, 40);
+        let (_dir, path) = temp_file(&content);
+        let out = stream_snippet_from_file(&path, &anchor("x", 1, 40))
+            .expect("snippet from file");
         // Span is capped at start+8 lines (lines 1..=8), then a fold marker.
         assert!(out.starts_with("1| line1\n2| line2\n"), "got: {out}");
         assert!(
@@ -2022,13 +2068,27 @@ mod tests {
     }
 
     #[test]
-    fn extract_snippet_empty_or_out_of_range_start_returns_empty() {
-        // Empty-ish inputs: a start past the file end renders nothing, and an
-        // empty file renders nothing (no fold marker) rather than panicking.
-        assert_eq!(extract_snippet("a\nb\n", 5, 9), "", "start past EOF");
-        assert_eq!(extract_snippet("", 1, 2), "", "empty file");
-        // A degenerate single-line anchor with 0-length span is fine.
-        assert_eq!(extract_snippet("only\n", 1, 1), "1| only\n");
+    fn stream_snippet_empty_or_out_of_range_start_is_none() {
+        // Start past EOF: no lines in range -> empty string.
+        let (_dir, path) = temp_file("a\nb\n");
+        assert_eq!(
+            stream_snippet_from_file(&path, &anchor("x", 5, 9)).unwrap_or_default(),
+            "",
+            "start past EOF renders nothing"
+        );
+        // Empty file renders nothing.
+        let (_dir2, path2) = temp_file("");
+        assert_eq!(
+            stream_snippet_from_file(&path2, &anchor("x", 1, 2)).unwrap_or_default(),
+            "",
+            "empty file renders nothing"
+        );
+        // Degenerate zero-width anchor (start == end) still renders the line.
+        let (_dir3, path3) = temp_file("only\n");
+        assert_eq!(
+            stream_snippet_from_file(&path3, &anchor("x", 1, 1)).unwrap_or_default(),
+            "1| only\n"
+        );
     }
 
     #[test]
