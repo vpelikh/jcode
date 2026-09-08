@@ -502,9 +502,10 @@ Debug now routes all of its swarm-state interaction through the
 memory helpers), and `debug_swarm_write` (via `DebugSwarmWriteContext`). Seam E
 (debug consumes swarm state through the service, not raw maps) is complete.
 `monitor_bus` (Seam D) now takes the `SwarmServiceHandle` for its swarm-domain
-state, keeping only session-scoped state as parameters. The remaining swarm
-state-routing work is incremental forwarding-surface reduction (some session
-functions still call swarm-domain free functions via handle-bound locals).
+state, keeping only session-scoped state as parameters. The session lifecycle
+also moves status updates behind `SwarmServiceHandle::set_member_status`. The
+remaining swarm state-routing work is incremental forwarding-surface reduction
+on the few remaining swarm-domain free-function call sites.
 
 ---
 
