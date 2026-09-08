@@ -3769,6 +3769,69 @@ fn render_agentgrep_output_body_caps_huge_output() {
     assert!(last.contains("more lines"), "last={last}");
 }
 
+/// With `show_agentgrep_output` off, the agentgrep card stays compact: the
+/// search-result body must NOT render inline.
+#[test]
+fn render_tool_message_agentgrep_output_hidden_when_disabled() {
+    crate::tui::ui::tools_ui::tests_show_agentgrep_output_override::set(false);
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "crates/foo.rs\n  symbols: 1 matched".to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_agentgrep_inline".to_string(),
+            name: "agentgrep".to_string(),
+            input: serde_json::json!({ "mode": "grep", "query": "fn bar" }),
+            intent: None,
+            thought_signature: None,
+        }),
+    };
+
+    let rendered = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !rendered.contains("crates/foo.rs"),
+        "agentgrep body must not render when flag is off: {rendered}"
+    );
+}
+
+/// With `show_agentgrep_output` on, the agentgrep search-result body renders
+/// inline beneath the one-line summary.
+#[test]
+fn render_tool_message_agentgrep_output_shows_when_enabled() {
+    crate::tui::ui::tools_ui::tests_show_agentgrep_output_override::set(true);
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "crates/foo.rs\n 1 matched".to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_agentgrep_inline".to_string(),
+            name: "agentgrep".to_string(),
+            input: serde_json::json!({ "mode": "grep", "query": "fn bar" }),
+            intent: None,
+            thought_signature: None,
+        }),
+    };
+
+    let rendered = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("crates/foo.rs"),
+        "agentgrep body must render when flag is on: {rendered}"
+    );
+    crate::tui::ui::tools_ui::tests_show_agentgrep_output_override::set(false);
+}
+
 #[test]
 fn render_compass_query_output_body_renders_markdown() {
     let content = "# Compass query: fn config\n\n\

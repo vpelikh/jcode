@@ -70,6 +70,35 @@ pub(crate) mod tests_show_bash_output_override {
     }
 }
 
+/// Whether the full `agentgrep` search results should render inline in the
+/// transcript beneath the one-line summary, instead of just the summary.
+#[cfg(not(test))]
+pub(crate) fn show_agentgrep_output() -> bool {
+    crate::config::config().display.show_agentgrep_output
+}
+
+#[cfg(test)]
+pub(crate) fn show_agentgrep_output() -> bool {
+    tests_show_agentgrep_output_override::get()
+}
+
+#[cfg(test)]
+pub(crate) mod tests_show_agentgrep_output_override {
+    use std::cell::Cell;
+
+    thread_local! {
+        static SHOW_AGENTGREP_OUTPUT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn get() -> bool {
+        SHOW_AGENTGREP_OUTPUT.with(Cell::get)
+    }
+
+    pub(crate) fn set(value: bool) {
+        SHOW_AGENTGREP_OUTPUT.with(|cell| cell.set(value));
+    }
+}
+
 /// Whether the full `compass_query` search results should render inline in the
 /// transcript beneath the one-line summary, instead of just the summary.
 #[cfg(not(test))]
