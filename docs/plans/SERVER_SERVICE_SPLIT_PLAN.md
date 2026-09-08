@@ -497,10 +497,12 @@ swarm-domain argument bag, and the membership operations have moved onto
 `take_session_membership` for `/clear` teardown). On `monitor_bus`, the dead
 `_swarm_plans`/`_swarm_coordinators`/`_shared_context` arguments were removed
 (full simplification to service APIs is a separate maintenance-service move).
-On debug, `debug_swarm_read::maybe_handle_swarm_read_command` now routes through
-the `SwarmServiceHandle` (Seam E: debug reduces its raw swarm-state reads). The
-remaining work is the ownership-move slices still pending (`monitor_bus` to
-service APIs, `debug_server_state` snapshot reads).
+On debug, `debug_swarm_read::maybe_handle_swarm_read_command` and
+`debug_server_state::maybe_handle_server_state_command` (and its two memory
+payload helpers) now route through the `SwarmServiceHandle` (Seam E: debug
+reduces its raw swarm-state reads). The remaining work is the ownership-move
+slices still pending (`monitor_bus` to service APIs, `debug_swarm_write`
+state routing).
 
 ---
 
