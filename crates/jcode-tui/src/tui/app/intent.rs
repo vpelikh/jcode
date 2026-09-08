@@ -68,6 +68,34 @@ pub(super) fn intent_notice(created_display: &str) -> String {
     format!("Created worktree {created_display} and moved this session into it.")
 }
 
+/// Whether a (lowercased) prompt negates the desire to create a worktree.
+///
+/// A negation like "I don't want a worktree", "do not create a worktree", or
+/// "no worktree" still contains the directive text, so it must be caught here
+/// rather than turning into an unintended worktree creation. Uses contiguous
+/// phrases rather than a bare "not" to avoid false-negatives like "note".
+fn is_negated_worktree_intent(lower: &str) -> bool {
+    const NEGATIONS: &[&str] = &[
+        "don't want a worktree",
+        "don't want a new worktree",
+        "don't want to work in a worktree",
+        "don't want to work in a new worktree",
+        "do not want a worktree",
+        "do not want a new worktree",
+        "do not want to work in a worktree",
+        "do not want to work in a new worktree",
+        "don't create a worktree",
+        "do not create a worktree",
+        "don't make a worktree",
+        "do not make a worktree",
+        "no worktree",
+        "not a worktree",
+        "won't need a worktree",
+        "won't use a worktree",
+    ];
+    NEGATIONS.iter().any(|n| lower.contains(n))
+}
+
 /// Match a plain prompt that asks to begin work in a new worktree, deriving
 /// the worktree/feature name from the message.
 ///
@@ -80,6 +108,14 @@ fn detect_new_worktree(prompt: &str) -> Option<IntentCommand> {
         return None;
     }
     let lower = p.to_lowercase();
+
+    // A directive must not fire when the user is *negating* the intent (e.g.
+    // "I don't want to work in a new worktree for X" still contains the
+    // directive text, but creating a worktree would be the opposite of what the
+    // user asked). Bail early on common negations.
+    if is_negated_worktree_intent(&lower) {
+        return None;
+    }
 
     // Require an explicit directive meaning "begin work in a (new) worktree".
     // A bare mention ("what is a worktree?") must not trigger.
@@ -288,6 +324,36 @@ mod tests {
             let (_, _, got) = detect_intent(prompt).expect("should trigger: {prompt}");
             let IntentCommand::NewWorktree(spec) = got;
             assert_eq!(spec.name, expected, "for prompt {prompt:?}");
+        }
+    }
+
+    #[test]
+    fn negated_worktree_intents_do_not_trigger() {
+        // A prompt that says "don't/won't/no worktree" must not create one, even
+        // though it still contains directive text and a derivable name.
+        for prompt in [
+            "I don't want to work in a new worktree for panel-settings",
+            "do not create a worktree for the api2 thing",
+            "no worktree for the new project please",
+            "we won't need a worktree for server-split",
+        ] {
+            let got = detect_intent(prompt);
+            assert!(got.is_none(), "{prompt:?} should not trigger, got {got:?}");
+        }
+    }
+
+    #[test]
+    fn legitimate_worktree_intents_still_trigger() {
+        // The negation guard must not reject a genuine request, including ones
+        // whose wording happens to contain "want".
+        for prompt in [
+            "make a new worktree for the wide-gadget",
+            "I want to work in a new worktree for the wide-gadget",
+        ] {
+            assert!(
+                detect_intent(prompt).is_some(),
+                "{prompt:?} should still trigger"
+            );
         }
     }
 }
