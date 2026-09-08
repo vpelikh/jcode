@@ -104,17 +104,31 @@ fn register_live_writer(tx: Sender<Chunk>, inner: Arc<WriterInner>) {
     *LIVE_WRITER.lock().unwrap() = Some(LiveWriter { tx, inner });
 }
 
+/// Outcome of an auxiliary terminal-write attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuxWriteResult {
+    /// A live writer accepted (or was told to take) the bytes. It may still be
+    /// applied asynchronously by the writer thread.
+    Accepted,
+    /// No live writer is registered; the caller should fall back to writing
+    /// `io::stdout()` directly.
+    Fallback,
+    /// The bytes were dropped because the pty is wedged (backlog saturated) so
+    /// they cannot be applied. The caller should report the failure rather than
+    /// treating it as a successful delivery.
+    Dropped,
+}
+
 /// Enqueue auxiliary terminal-output bytes through the live writer thread so
-/// they are serialized with frame output. Returns `false` if no live writer is
-/// registered (caller should fall back to writing `io::stdout()` directly),
-/// or if the write would exceed the wedged-pty backlog cap (dropped, no
-/// resync: auxiliary bytes are not cell diffs, so dropping them never
-/// desynchronizes ratatui's model).
+/// they are serialized with frame output. Returns the outcome distinguishing a
+/// genuine hand-off from a fallback and from a wedged-pty drop (see
+/// [`AuxWriteResult`]), so callers can report success/failure honestly and
+/// fall back to `io::stdout()` only when no live writer routes there.
 ///
 /// Never blocks: sending into the unbounded channel is non-blocking.
-pub fn write_auxiliary(bytes: &[u8]) -> bool {
+pub(crate) fn write_auxiliary(bytes: &[u8]) -> AuxWriteResult {
     if bytes.is_empty() {
-        return true;
+        return AuxWriteResult::Accepted;
     }
     // Copy the live writer's handles out from under the lock so we never hold
     // the global registration lock across the CAS reservation, the allocation,
@@ -123,7 +137,7 @@ pub fn write_auxiliary(bytes: &[u8]) -> bool {
     let (tx, inner) = {
         let guard = LIVE_WRITER.lock().unwrap();
         let Some(live) = guard.as_ref() else {
-            return false;
+            return AuxWriteResult::Fallback;
         };
         (live.tx.clone(), Arc::clone(&live.inner))
     };
@@ -131,11 +145,13 @@ pub fn write_auxiliary(bytes: &[u8]) -> bool {
     let mut prev = inner.buffered.load(Ordering::Relaxed);
     loop {
         if prev >= QUEUE_CAPACITY_BYTES {
-            // Wedged pty; drop the auxiliary bytes rather than block.
-            return true;
+            // Wedged pty; drop the auxiliary bytes rather than block. Reported
+            // as Dropped so the caller can surface a failure honestly instead
+            // of reporting that the bytes reached the terminal.
+            return AuxWriteResult::Dropped;
         }
         let Some(next) = prev.checked_add(len) else {
-            return true;
+            return AuxWriteResult::Dropped;
         };
         match inner
             .buffered
@@ -147,10 +163,10 @@ pub fn write_auxiliary(bytes: &[u8]) -> bool {
     }
     let body: Box<[u8]> = bytes.to_vec().into_boxed_slice();
     match tx.send(Chunk::Data(body)) {
-        Ok(()) => true,
+        Ok(()) => AuxWriteResult::Accepted,
         Err(_) => {
             inner.buffered.fetch_sub(len, Ordering::Relaxed);
-            false
+            AuxWriteResult::Fallback
         }
     }
 }
@@ -164,15 +180,19 @@ pub fn write_auxiliary(bytes: &[u8]) -> bool {
 /// terminal. When no writer is live (startup, session picker, teardown) it
 /// falls back to `io::stdout()`, where there is no concurrent renderer to race.
 ///
-/// Returns whether the bytes were durably handed off: `true` when a live writer
-/// accepted them (or dropped them on a wedged pty), or when the stdout fallback
-/// `write_all` + `flush` succeeded.
-pub fn write_serialized(bytes: &[u8]) -> bool {
-    if write_auxiliary(bytes) {
-        return true;
+/// Returns whether the bytes were durably handed off. A live-writer `Dropped`
+/// (wedged pty) is reported as failure, so callers that surface success/failure
+/// (clipboard copy, turn notification fallback) do not report a dropped write
+/// as though it reached the terminal.
+pub(crate) fn write_serialized(bytes: &[u8]) -> bool {
+    match write_auxiliary(bytes) {
+        AuxWriteResult::Accepted => true,
+        AuxWriteResult::Fallback => {
+            let mut out = io::stdout();
+            out.write_all(bytes).is_ok() && out.flush().is_ok()
+        }
+        AuxWriteResult::Dropped => false,
     }
-    let mut out = io::stdout();
-    out.write_all(bytes).is_ok() && out.flush().is_ok()
 }
 
 enum Chunk {
@@ -923,8 +943,9 @@ mod tests {
 
         // Auxiliary bytes enqueued while a writer is registered must land in the
         // same ordered stream, not on a side channel.
-        assert!(
+        assert_eq!(
             write_auxiliary(b"\x1b]0;title\x07"),
+            AuxWriteResult::Accepted,
             "auxiliary write should be accepted while a writer is live"
         );
 
@@ -932,14 +953,15 @@ mod tests {
         shim.write_all(b"\x1b[2;1Hnext").unwrap();
         shim.flush().unwrap();
 
-        // Unregister happens on drop; after that, auxiliary writes fall back to
-        // stdout (return false because no live writer is registered).
+        // Unregister happens on drop; after that, no live writer routes there so
+        // auxiliary writes report Fallback (caller should use io::stdout()).
         drop(shim);
         #[cfg(unix)]
         {
-            assert!(
-                !write_auxiliary(b"\x07"),
-                "auxiliary write must be rejected when no live writer is registered"
+            assert_eq!(
+                write_auxiliary(b"\x07"),
+                AuxWriteResult::Fallback,
+                "auxiliary write must fall back when no live writer is registered"
             );
         }
 
@@ -1023,5 +1045,36 @@ mod tests {
             got.contains("\x1b]0;jcode-title\x07"),
             "auxiliary escape was split or lost: {got:?}"
         );
+    }
+
+    /// Honest wedge-drop reporting: once the wedged-pty backlog is saturated, an
+    /// auxiliary write must report `Dropped` (not `Accepted`), so callers that
+    /// surface success/failure (clipboard copy, turn-notification fallback) do not
+    /// report a dropped write as though it reached the terminal.
+    #[test]
+    fn auxiliary_write_reports_dropped_when_backlog_saturated() {
+        let _guard = live_writer_test_guard();
+        let (wedge, release) = WedgedWriter::new();
+        let mut writer = TerminalWriter::new(wedge);
+        writer.register_as_live();
+
+        // Saturate the wedged-pty backlog with frame writes (each flush reserves
+        // the bytes in `buffered`; the wedged consumer never drains them).
+        for i in 0..(QUEUE_CAPACITY_BYTES / 1024 + 2) {
+            let data = vec![b'x'; 1024];
+            assert!(writer.write_all(&data).is_ok(), "write {i} failed");
+            let _ = writer.flush();
+        }
+
+        // The backlog is saturated, so an auxiliary write is dropped, not accepted.
+        assert_eq!(
+            write_auxiliary(b"\x1b]0;title\x07"),
+            AuxWriteResult::Dropped,
+            "auxiliary write must report Dropped when the backlog is saturated"
+        );
+
+        // Release the wedged writer so the test leaves no leaked thread.
+        drop(release);
+        drop(writer);
     }
 }
