@@ -505,9 +505,22 @@ memory helpers), and `debug_swarm_write` (via `DebugSwarmWriteContext`). Seam E
 `SessionServiceHandle` for its swarm- and session-domain state. The session
 lifecycle moves status updates behind `SwarmServiceHandle::set_member_status`,
 and the session service gains its first method (`SessionServiceHandle::
-queue_soft_interrupt`, Seam A start). The remaining work is extending the
-session-service consolidation broadly and reducing the few remaining
-swarm-domain free-function call sites.
+queue_soft_interrupt`, Seam A start). The session-service consolidation is now
+applied end-to-end to one complete module: `jade_relay` single-homes all of its
+`queue_soft_interrupt_for_session` call sites through
+`SessionServiceHandle::queue_soft_interrupt`, threading the handle through both
+`RelayClient` and `RelayLauncherClient`
+(`spawn_if_configured` -> `run`/`run_from_after` -> `handle_prompt`/
+`handle_cancel`/`handle_launch` -> `deliver_to_session`/`spawn_session_listener`).
+
+The remaining session-service consolidation is a distinct future slice: route
+the other five modules that still call `queue_soft_interrupt_for_session`
+(`comm_control`, `client_actions`, `background_tasks`, `comm_plan`,
+`client_comm_message`) through `SessionServiceHandle::queue_soft_interrupt`,
+plus reducing the few remaining swarm-domain free-function call sites. This is
+purely mechanical, behavior-preserving churn; each module should be converted
+and tested independently. The router clone-then-destructure refactor in
+`handle_client` remains a separate decision (cosmetic, high-churn).
 
 ---
 
