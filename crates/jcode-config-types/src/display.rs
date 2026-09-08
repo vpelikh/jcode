@@ -80,8 +80,8 @@ pub struct DisplayConfig {
     #[serde(default)]
     pub show_agentgrep_output: bool,
     /// Show the full compass_query search output inline in the transcript
-    /// instead of just the one-line summary (default: false)
-    #[serde(default)]
+    /// instead of just the one-line summary (default: true)
+    #[serde(default = "default_true")]
     pub show_compass_query_output: bool,
     /// Render the full, untrimmed bash command output beneath the tool summary
     /// (default: true). This flag is the sole owner of bash output; when false,
@@ -163,7 +163,7 @@ impl Default for DisplayConfig {
             compact_notifications: false,
             copy_badge_alt_label: String::new(),
             show_agentgrep_output: false,
-            show_compass_query_output: false,
+            show_compass_query_output: true,
             show_bash_output: true,
             tool_call_details: true,
             native_scrollbars: NativeScrollbarConfig::default(),
@@ -286,16 +286,16 @@ mod tests {
     }
 
     #[test]
-    fn compass_query_output_default_off_and_round_trips() {
+    fn compass_query_output_default_on_and_round_trips() {
         let default = DisplayConfig::default();
         assert!(
-            !default.show_compass_query_output,
-            "compass_query output should default off (compact one-line summary)"
+            default.show_compass_query_output,
+            "compass_query output should default on (inline search results)"
         );
 
         // Omitting the field keeps the default.
         let missing: DisplayConfig = serde_json::from_str("{}").expect("display config");
-        assert!(!missing.show_compass_query_output);
+        assert!(missing.show_compass_query_output);
 
         // Explicit on/off round-trips.
         let on: DisplayConfig =

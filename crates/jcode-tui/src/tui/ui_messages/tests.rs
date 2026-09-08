@@ -4357,10 +4357,10 @@ fn compass_query_output_msg(content: &str) -> DisplayMessage {
     }
 }
 
-/// With `show_compass_query_output` off (default), the compass_query card stays
-/// compact: the search-result body must NOT render inline.
+/// With `show_compass_query_output` off, the compass_query card stays compact:
+/// the search-result body must NOT render inline.
 #[test]
-fn render_tool_message_compass_query_output_hidden_by_default() {
+fn render_tool_message_compass_query_output_hidden_when_disabled() {
     crate::tui::ui::tools_ui::tests_show_compass_query_output_override::set(false);
     let content = "# Compass query: fn config\n\n**Found 1 result(s)**\n\n## 1. cfg::load\n";
     let msg = compass_query_output_msg(content);
@@ -4380,8 +4380,8 @@ fn render_tool_message_compass_query_output_hidden_by_default() {
     );
 }
 
-/// With `show_compass_query_output` on, the compass_query search-result body
-/// renders inline beneath the one-line summary.
+/// With `show_compass_query_output` on (the default), the compass_query
+/// search-result body renders inline beneath the one-line summary.
 #[test]
 fn render_tool_message_compass_query_output_shows_when_enabled() {
     crate::tui::ui::tools_ui::tests_show_compass_query_output_override::set(true);
