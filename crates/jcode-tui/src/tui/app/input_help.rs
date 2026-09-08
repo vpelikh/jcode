@@ -195,6 +195,9 @@ impl App {
             "show-agentgrep-output" => {
                 "/show-agentgrep-output\nShow whether full agentgrep search output renders inline in the transcript.\n\n/show-agentgrep-output on\nRender the full agentgrep search results inline beneath each agentgrep call instead of just the one-line summary.\n\n/show-agentgrep-output off\nShow only the compact one-line agentgrep summary."
             }
+            "show-compass-query-output" => {
+                "/show-compass-query-output\nShow whether full compass_query search output renders inline in the transcript.\n\n/show-compass-query-output on\nRender the full compass_query search results inline beneath each compass_query call instead of just the one-line summary.\n\n/show-compass-query-output off\nShow only the compact one-line compass_query summary."
+            }
             "tool-call-details" => {
                 "/tool-call-details\nShow whether the technical detail (command, path, args) renders next to the model-provided intent on tool rows.\n\n/tool-call-details on\nOn bash rows, render a verbose block with the full executed command (wrapped), the working directory, the execution time, and the exit code; on other tool rows show the technical detail after the intent, e.g. `bash · Run tests · $ cargo test`.\n\n/tool-call-details off\nShow only the intent on tool rows that have one. Rows without an intent still show the technical detail, and error summaries always render."
             }
