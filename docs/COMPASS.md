@@ -208,11 +208,11 @@ a panic in a pre-warm thread cannot brick later dedup or cooldown.
   session quickly switches branches, the new SHA cold-builds unless another
   subscribe pre-warms it.
 - The `allow_raw_fallback` enforcement re-arms only once per session (after any
-  single `compass_query` attempt). If models keep falling back to raw grep
-  despite the source-snippet results (see the enforcement section), a follow-up
-  is to re-arm the raw fallback more aggressively — e.g. require a fresh
-  `compass_query` for each redirected grep, or refuse the bypass when compass
-  returned hits for the same intent.
+  single `compass_query` attempt). Re-arming it per redirect is considered but
+  deferred (see the weighted trade-off in the enforcement section): it would
+  force `compass_query` usage but risks false-blocking legitimate out-of-index
+  searches. Revisit only if post-ship measurement shows fallback reliance is
+  unchanged despite the source-snippet results.
 
 ## Integration with compass-first enforcement
 
@@ -250,8 +250,35 @@ session logs historically show models satisfying that single required call and
 then running the bulk of their grep searches with `allow_raw_fallback: true`
 (often 75–91% of grep calls in a session). The source-snippet rendering above
 attacks the underlying cause — making `compass_query` actually answer the
-declaration/structure queries that previously pushed the model to grep. If
-fallback reliance persists after that, the next lever is to re-arm the raw
-fallback more aggressively (e.g. require a fresh `compass_query` on a redirect
-even after a prior attempt, or refuse the bypass when a compass result was
-returned but unused).
+declaration/structure queries that previously pushed the model to grep.
+
+### Considered alternative: re-arm the raw-fallback gate per redirect
+
+A stricter alternative is to *not* clear the pending flag on the first compass
+attempt, so every redirected grep (or each new search intent) requires a fresh
+`compass_query` before `allow_raw_fallback` is honored. Weighing:
+
+- **Effectiveness:** would force `compass_query` usage to approximate the grep
+  rate more closely, since a raw-fallback grep must be re-earned each time.
+  Stronger guarantee than relying on the model finding snippets useful.
+- **Cost — false-blocking risk (the decisive drawback):** the whole point of
+  `allow_raw_fallback` is legitimate out-of-index searches (build output, logs,
+  vendored/generated code, files outside the indexed tree). Re-arming per grep
+  means a session doing real work there pays a `compass_query` round-trip before
+  every such grep — wasted turns, budget, and a "call compass that won't help"
+  workflow. The existing one-attempt-per-session rule is already a compromise;
+  our data shows it is *after* that one attempt that models over-use the hatch,
+  which the snippet fix targets directly.
+- **Cost — complexity:** the flag becomes a per-session *counter*/intent-map
+  with state transitions across restore/bind (the current set already has
+  documented edge cases). More state to keep correct under session switching.
+- **Compatibility:** changes behavior for existing sessions mid-flight; harder
+  to reason about for `find`/`outline`/`trace` which legitimately bypass.
+- **Maintenance:** two mechanisms (enforcement + result quality) both poking at
+  the same behavior makes a future regression harder to attribute.
+
+**Decision:** keep the one-attempt gate and rely on the source-snippet fix as the
+primary lever — it removes the underlying reason (bare results drove models to
+grep) without risking legitimate out-of-index searches. Re-arm the gate only if
+post-ship measurement shows fallback reliance is unchanged *and* the extra
+compass round-trips on out-of-index searches are acceptable.
