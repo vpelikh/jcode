@@ -448,7 +448,7 @@ mod worktree {
 
     #[test]
     fn parse_worktree_spec_rejects_invalid_explicit_branch() {
-        for bad in ["bad..branch", "colon:name", "@", "-dash"] {
+        for bad in ["bad..branch", "colon:name", "@", "-dash", "x.git/y"] {
             let err = super::parse_worktree_spec(&format!("widgets -b {bad}")).unwrap_err();
             assert!(
                 err.contains("not a valid git branch name"),

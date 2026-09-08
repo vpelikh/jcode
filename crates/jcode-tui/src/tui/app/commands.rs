@@ -1618,23 +1618,25 @@ pub(super) struct WorktreeSpec {
 /// `:`, and trailing `.` / `.lock`.
 fn is_valid_branch_component(branch: &str) -> bool {
     if branch.is_empty()
-        || branch == "."
-        || branch.ends_with('.')
-        || branch.to_lowercase().ends_with(".git")
-        || branch.to_lowercase().ends_with(".lock")
         || branch.starts_with('-')
         || branch.starts_with('.')
+        || branch.contains("..")
+        || branch.contains("@{")
+        || branch == "@"
+        || branch
+            .chars()
+            .any(|c| matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\' | ' ' | '\t'))
     {
         return false;
     }
-    !branch
-        .chars()
-        .any(|c| matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\' | ' ' | '\t'))
-        && !branch.contains("..")
-        // `@` alone is invalid; `@{` is reserved (reflog). A lone `@` is caught
-        // by the `@{` check plus an exact-match guard below.
-        && !branch.contains("@{")
-        && branch != "@"
+    // Every `/`-separated component must be non-empty and must not end in `.`
+    // or `.git` / `.lock` (git's check-ref-format rules).
+    branch.split('/').all(|component| {
+        !component.is_empty()
+            && !component.ends_with('.')
+            && !component.to_lowercase().ends_with(".git")
+            && !component.to_lowercase().ends_with(".lock")
+    })
 }
 
 /// Parse the arguments of a `/worktree` command.
