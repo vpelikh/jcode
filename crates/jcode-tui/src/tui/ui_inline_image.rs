@@ -1736,7 +1736,7 @@ mod tests {
         let anchored = resolve_anchored_items(&images);
 
         let tool_call = crate::message::ToolCall {
-            id: "tool-present".to_string(),
+            id: "tool-present".to_string().into(),
             name: "read".to_string(),
             input: serde_json::Value::Null,
             intent: None,

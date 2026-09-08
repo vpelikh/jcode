@@ -177,7 +177,7 @@ fn test_pinned_content_uses_left_splitter_instead_of_rounded_box() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "tool-1".to_string(),
+            id: "tool-1".to_string().into(),
             name: "write".to_string(),
             input: serde_json::json!({
                 "file_path": "src/demo.rs",
@@ -220,7 +220,7 @@ fn test_file_diff_uses_left_splitter_instead_of_rounded_box() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "tool-1".to_string(),
+            id: "tool-1".to_string().into(),
             name: "write".to_string(),
             input: serde_json::json!({
                 "file_path": file_path.display().to_string(),

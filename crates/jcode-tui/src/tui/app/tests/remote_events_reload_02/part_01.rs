@@ -508,7 +508,7 @@ fn test_observe_marks_large_tool_results() {
     app.submit_input();
 
     let tool_call = crate::message::ToolCall {
-        id: "tool_big".to_string(),
+        id: "tool_big".to_string().into(),
         name: "read".to_string(),
         input: serde_json::json!({"file_path": "large.txt"}),
         intent: None,
@@ -536,7 +536,7 @@ fn test_observe_repaint_does_not_leave_severity_badge_artifact() {
     let mut terminal = ratatui::Terminal::new(backend).expect("failed to create test terminal");
 
     let tool_call = crate::message::ToolCall {
-        id: "tool_big".to_string(),
+        id: "tool_big".to_string().into(),
         name: "read".to_string(),
         input: serde_json::json!({"file_path": "large.txt"}),
         intent: None,

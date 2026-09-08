@@ -82,7 +82,7 @@ fn test_prepare_messages_places_live_swarm_card_beneath_matching_spawn_tool_call
             duration_secs: None,
             title: None,
             tool_data: Some(ToolCall {
-                id: "call-spawn".to_string(),
+                id: "call-spawn".to_string().into(),
                 name: "swarm".to_string(),
                 input: serde_json::json!({
                     "action": "spawn",
@@ -179,7 +179,7 @@ fn test_prepare_messages_keeps_transcript_card_stable_with_nested_descendants() 
             duration_secs: None,
             title: None,
             tool_data: Some(ToolCall {
-                id: "call-nested-spawn".to_string(),
+                id: "call-nested-spawn".to_string().into(),
                 name: "swarm".to_string(),
                 input: serde_json::json!({"action": "spawn", "label": "API reviewer"}),
                 intent: Some("Spawn an authentication reviewer".to_string()),
@@ -237,7 +237,7 @@ fn test_prepare_messages_uses_exact_spawn_member_outside_gallery_subtree() {
             duration_secs: None,
             title: None,
             tool_data: Some(ToolCall {
-                id: "call-spawn-filter-race".to_string(),
+                id: "call-spawn-filter-race".to_string().into(),
                 name: "swarm".to_string(),
                 input: serde_json::json!({"action": "spawn", "label": "API reviewer"}),
                 intent: Some("Spawn an authentication reviewer".to_string()),
@@ -274,7 +274,7 @@ fn test_prepare_messages_matches_real_prefixed_spawn_result_without_input_metada
             duration_secs: None,
             title: None,
             tool_data: Some(ToolCall {
-                id: "call-spawn".to_string(),
+                id: "call-spawn".to_string().into(),
                 name: "swarm".to_string(),
                 input: serde_json::Value::Null,
                 intent: None,
@@ -307,7 +307,7 @@ fn test_prepare_messages_does_not_attach_member_to_unmatched_spawn_result() {
             duration_secs: None,
             title: None,
             tool_data: Some(ToolCall {
-                id: "call-spawn".to_string(),
+                id: "call-spawn".to_string().into(),
                 name: "swarm".to_string(),
                 input: serde_json::json!({"action": "spawn", "label": "reviewer"}),
                 intent: None,
@@ -342,7 +342,7 @@ fn test_prepare_messages_matches_spawn_member_by_unique_label_when_result_is_ref
             duration_secs: None,
             title: None,
             tool_data: Some(ToolCall {
-                id: "call-spawn".to_string(),
+                id: "call-spawn".to_string().into(),
                 name: "swarm".to_string(),
                 input: serde_json::json!({"action": "spawn", "label": "API reviewer"}),
                 intent: Some("Spawn an authentication reviewer".to_string()),
@@ -379,7 +379,7 @@ fn test_prepare_messages_does_not_guess_when_spawn_label_is_ambiguous() {
             duration_secs: None,
             title: None,
             tool_data: Some(ToolCall {
-                id: "call-spawn".to_string(),
+                id: "call-spawn".to_string().into(),
                 name: "swarm".to_string(),
                 input: serde_json::json!({"action": "spawn", "label": "reviewer"}),
                 intent: None,
@@ -415,7 +415,7 @@ fn test_prepare_messages_live_batch_rows_do_not_soft_wrap_on_narrow_width() {
             completed: 0,
             last_completed: None,
             running: vec![ToolCall {
-                id: "batch-1-bash".to_string(),
+                id: "batch-1-bash".to_string().into(),
                 name: "bash".to_string(),
                 input: serde_json::json!({
                     "command": "cargo test --package jcode --lib tui::ui::tests::render_tool_message_batch_rows_do_not_soft_wrap_on_narrow_width -- --nocapture"
@@ -426,7 +426,7 @@ fn test_prepare_messages_live_batch_rows_do_not_soft_wrap_on_narrow_width() {
             subcalls: vec![crate::bus::BatchSubcallProgress {
                 index: 1,
                 tool_call: ToolCall {
-                    id: "batch-1-bash".to_string(),
+                    id: "batch-1-bash".to_string().into(),
                     name: "bash".to_string(),
                     input: serde_json::json!({
                         "command": "cargo test --package jcode --lib tui::ui::tests::render_tool_message_batch_rows_do_not_soft_wrap_on_narrow_width -- --nocapture"
@@ -476,7 +476,7 @@ fn test_prepare_messages_centered_live_batch_rows_keep_dedicated_padding_span() 
             completed: 0,
             last_completed: None,
             running: vec![ToolCall {
-                id: "batch-1-bash".to_string(),
+                id: "batch-1-bash".to_string().into(),
                 name: "bash".to_string(),
                 input: serde_json::json!({
                     "command": "cargo test --package jcode --lib tui::ui::tests::render_tool_message_batch_rows_do_not_soft_wrap_on_narrow_width -- --nocapture --exact with-extra-flags-and-output-to-stretch-the-line"
@@ -487,7 +487,7 @@ fn test_prepare_messages_centered_live_batch_rows_keep_dedicated_padding_span() 
             subcalls: vec![crate::bus::BatchSubcallProgress {
                 index: 1,
                 tool_call: ToolCall {
-                    id: "batch-1-bash".to_string(),
+                    id: "batch-1-bash".to_string().into(),
                     name: "bash".to_string(),
                     input: serde_json::json!({
                         "command": "cargo test --package jcode --lib tui::ui::tests::render_tool_message_batch_rows_do_not_soft_wrap_on_narrow_width -- --nocapture --exact with-extra-flags-and-output-to-stretch-the-line"
@@ -547,7 +547,7 @@ fn test_prepare_messages_shows_live_batch_progress_in_chat_history() {
             completed: 1,
             last_completed: Some("read".to_string()),
             running: vec![ToolCall {
-                id: "batch-2-bash".to_string(),
+                id: "batch-2-bash".to_string().into(),
                 name: "bash".to_string(),
                 input: serde_json::json!({"command": "cargo build --release --workspace"}),
                 intent: None,
@@ -557,7 +557,7 @@ fn test_prepare_messages_shows_live_batch_progress_in_chat_history() {
                 crate::bus::BatchSubcallProgress {
                     index: 1,
                     tool_call: ToolCall {
-                        id: "batch-1-read".to_string(),
+                        id: "batch-1-read".to_string().into(),
                         name: "read".to_string(),
                         input: serde_json::json!({"file_path": "Cargo.toml"}),
                         intent: None,
@@ -568,7 +568,7 @@ fn test_prepare_messages_shows_live_batch_progress_in_chat_history() {
                 crate::bus::BatchSubcallProgress {
                     index: 2,
                     tool_call: ToolCall {
-                        id: "batch-2-bash".to_string(),
+                        id: "batch-2-bash".to_string().into(),
                         name: "bash".to_string(),
                         input: serde_json::json!({"command": "cargo build --release --workspace"}),
                         intent: None,
@@ -634,7 +634,7 @@ fn test_prepare_messages_places_live_batch_after_committed_assistant_text() {
             completed: 0,
             last_completed: None,
             running: vec![ToolCall {
-                id: "batch-1-read".to_string(),
+                id: "batch-1-read".to_string().into(),
                 name: "read".to_string(),
                 input: serde_json::json!({"file_path": "src/main.rs"}),
                 intent: None,
@@ -643,7 +643,7 @@ fn test_prepare_messages_places_live_batch_after_committed_assistant_text() {
             subcalls: vec![crate::bus::BatchSubcallProgress {
                 index: 1,
                 tool_call: ToolCall {
-                    id: "batch-1-read".to_string(),
+                    id: "batch-1-read".to_string().into(),
                     name: "read".to_string(),
                     input: serde_json::json!({"file_path": "src/main.rs"}),
                     intent: None,
@@ -687,7 +687,7 @@ fn test_prepare_messages_live_batch_spinner_advances_between_frames() {
         completed: 0,
         last_completed: None,
         running: vec![ToolCall {
-            id: "batch-1-bash".to_string(),
+            id: "batch-1-bash".to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({"command": "sleep 1"}),
             intent: None,
@@ -696,7 +696,7 @@ fn test_prepare_messages_live_batch_spinner_advances_between_frames() {
         subcalls: vec![crate::bus::BatchSubcallProgress {
             index: 1,
             tool_call: ToolCall {
-                id: "batch-1-bash".to_string(),
+                id: "batch-1-bash".to_string().into(),
                 name: "bash".to_string(),
                 input: serde_json::json!({"command": "sleep 1"}),
                 intent: None,
@@ -763,7 +763,7 @@ fn test_prepare_messages_live_batch_centered_mode_uses_left_aligned_padding() {
             completed: 0,
             last_completed: None,
             running: vec![ToolCall {
-                id: "batch-1-read".to_string(),
+                id: "batch-1-read".to_string().into(),
                 name: "read".to_string(),
                 input: serde_json::json!({"file_path": "Cargo.toml"}),
                 intent: None,
@@ -772,7 +772,7 @@ fn test_prepare_messages_live_batch_centered_mode_uses_left_aligned_padding() {
             subcalls: vec![crate::bus::BatchSubcallProgress {
                 index: 1,
                 tool_call: ToolCall {
-                    id: "batch-1-read".to_string(),
+                    id: "batch-1-read".to_string().into(),
                     name: "read".to_string(),
                     input: serde_json::json!({"file_path": "Cargo.toml"}),
                     intent: None,
@@ -887,7 +887,7 @@ fn test_prepare_messages_recomputes_when_streaming_text_changes_same_length() {
 #[test]
 fn test_prepare_messages_tool_row_refreshes_after_message_version_bump() {
     let tool_call = ToolCall {
-        id: "tool-1".to_string(),
+        id: "tool-1".to_string().into(),
         name: "read".to_string(),
         input: serde_json::json!({"file_path": "src/main.rs"}),
         intent: None,
@@ -1060,7 +1060,7 @@ fn test_render_tool_message_batch_nested_subcall_params_still_render() {
         duration_secs: None,
         title: None,
         tool_data: Some(ToolCall {
-            id: "call_batch_2".to_string(),
+            id: "call_batch_2".to_string().into(),
             name: "batch".to_string(),
             input: serde_json::json!({
                 "tool_calls": [
@@ -1097,7 +1097,7 @@ fn test_render_tool_message_batch_flat_grep_subcall_uses_pattern_and_path() {
         duration_secs: None,
         title: None,
         tool_data: Some(ToolCall {
-            id: "call_batch_3".to_string(),
+            id: "call_batch_3".to_string().into(),
             name: "batch".to_string(),
             input: serde_json::json!({
                 "tool_calls": [
@@ -1135,7 +1135,7 @@ fn test_render_tool_message_batch_subcall_lines_alignment_unset() {
         duration_secs: None,
         title: None,
         tool_data: Some(ToolCall {
-            id: "call_batch_align".to_string(),
+            id: "call_batch_align".to_string().into(),
             name: "batch".to_string(),
             input: serde_json::json!({
                 "tool_calls": [

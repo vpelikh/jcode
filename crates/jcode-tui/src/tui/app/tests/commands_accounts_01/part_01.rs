@@ -1514,7 +1514,7 @@ fn test_observe_updates_latest_tool_context_only() {
     app.submit_input();
 
     let tool_call = crate::message::ToolCall {
-        id: "tool_1".to_string(),
+        id: "tool_1".to_string().into(),
         name: "read".to_string(),
         input: serde_json::json!({"file_path": "src/main.rs", "start_line": 1, "end_line": 10}),
         intent: None, thought_signature: None, };
@@ -1553,7 +1553,7 @@ fn test_observe_ignores_noise_tools_and_preserves_latest_useful_context() {
     app.submit_input();
 
     let read_tool = crate::message::ToolCall {
-        id: "tool_read".to_string(),
+        id: "tool_read".to_string().into(),
         name: "read".to_string(),
         input: serde_json::json!({"file_path": "src/main.rs"}),
         intent: None, thought_signature: None, };
@@ -1566,7 +1566,7 @@ fn test_observe_ignores_noise_tools_and_preserves_latest_useful_context() {
         .clone();
 
     let noise_tool = crate::message::ToolCall {
-        id: "tool_side_panel".to_string(),
+        id: "tool_side_panel".to_string().into(),
         name: "side_panel".to_string(),
         input: serde_json::json!({"action": "write", "page_id": "plan"}),
         intent: None, thought_signature: None, };

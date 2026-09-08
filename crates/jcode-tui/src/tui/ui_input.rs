@@ -1469,7 +1469,7 @@ mod tests {
                 completed: 0,
                 last_completed: None,
                 running: vec![crate::message::ToolCall {
-                    id: "batch-1-bash".to_string(),
+                    id: "batch-1-bash".to_string().into(),
                     name: "bash".to_string(),
                     input: serde_json::json!({"command": "cargo test -p jcode"}),
                     intent: None,
@@ -1500,21 +1500,21 @@ mod tests {
                 last_completed: None,
                 running: vec![
                     crate::message::ToolCall {
-                        id: "batch-2-grep".to_string(),
+                        id: "batch-2-grep".to_string().into(),
                         name: "grep".to_string(),
                         input: serde_json::json!({"pattern": "foo", "path": "src"}),
                         intent: None,
                         thought_signature: None,
                     },
                     crate::message::ToolCall {
-                        id: "batch-1-bash".to_string(),
+                        id: "batch-1-bash".to_string().into(),
                         name: "bash".to_string(),
                         input: serde_json::json!({"command": "cargo build --release --workspace"}),
                         intent: None,
                         thought_signature: None,
                     },
                     crate::message::ToolCall {
-                        id: "batch-3-read".to_string(),
+                        id: "batch-3-read".to_string().into(),
                         name: "read".to_string(),
                         input: serde_json::json!({"file_path": "README.md"}),
                         intent: None,

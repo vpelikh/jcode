@@ -1017,7 +1017,7 @@ fn render_todo_tool_result_uses_borderless_card_with_goal_scores() {
         duration_secs: None,
         title: Some("1 todos".to_string()),
         tool_data: Some(crate::message::ToolCall {
-            id: "call_todo".to_string(),
+            id: "call_todo".to_string().into(),
             name: "todo".to_string(),
             input: serde_json::json!({ "todos": todos, "goals": goals }),
             intent: Some("Track todo card work".to_string()),
@@ -1104,7 +1104,7 @@ fn render_todo_quality_gate_retry_shows_only_changed_goal_fields() {
         duration_secs: None,
         title: Some("1 todos".to_string()),
         tool_data: Some(crate::message::ToolCall {
-            id: "call_todo_update".to_string(),
+            id: "call_todo_update".to_string().into(),
             name: "todo".to_string(),
             input: serde_json::Value::Null,
             intent: Some("Refine the todo feedback loop".to_string()),
@@ -1330,7 +1330,7 @@ fn render_todo_plan_update_card_shows_only_changed_intent_fields() {
         duration_secs: None,
         title: Some("1 todos".to_string()),
         tool_data: Some(crate::message::ToolCall {
-            id: "call_plan_update".to_string(),
+            id: "call_plan_update".to_string().into(),
             name: "todo".to_string(),
             input: serde_json::Value::Null,
             intent: Some("Reassess the user's intent".to_string()),
@@ -1453,7 +1453,7 @@ fn unbiased_visual_prompt_retry_renders_complete_feedback_change() {
         "Make a pelican riding a bike animation that clearly works in a browser",
         Some(crate::todo::TODO_CLOSED_FEEDBACK_LOOP_CONTINUATION_MESSAGE),
         Some(crate::message::ToolCall {
-            id: "call_initial_todo".to_string(),
+            id: "call_initial_todo".to_string().into(),
             name: "todo".to_string(),
             input: serde_json::Value::Null,
             intent: Some("Track implementation and browser verification".to_string()),
@@ -1542,7 +1542,7 @@ fn visually_appealing_prompt_batched_retry_renders_complete_todo_card() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_batch".to_string(),
+            id: "call_batch".to_string().into(),
             name: "batch".to_string(),
             input: serde_json::json!({
                 "intent": "Inspect starter files and strengthen measurable visual goals",
@@ -1627,7 +1627,7 @@ fn render_ownership_gated_todo_result_keeps_the_full_card() {
         duration_secs: None,
         title: Some("1 todos".to_string()),
         tool_data: Some(crate::message::ToolCall {
-            id: "call_todo_ownership".to_string(),
+            id: "call_todo_ownership".to_string().into(),
             name: "todo".to_string(),
             input: serde_json::json!({ "todos": todos, "goals": goals }),
             intent: Some("Complete the full user outcome".to_string()),
@@ -1708,7 +1708,7 @@ fn render_tool_message_uses_scheduled_card() {
         duration_secs: None,
         title: Some("scheduled: Follow up on the scheduler test".to_string()),
         tool_data: Some(crate::message::ToolCall {
-            id: "call_schedule_card".to_string(),
+            id: "call_schedule_card".to_string().into(),
             name: "schedule".to_string(),
             input: serde_json::json!({
                 "task": "Follow up on the scheduler test",
@@ -2164,7 +2164,7 @@ fn render_tool_message_prefers_subagent_title_with_model() {
         duration_secs: None,
         title: Some("Verify subagent model (general · gpt-5.4)".to_string()),
         tool_data: Some(crate::message::ToolCall {
-            id: "call_1".to_string(),
+            id: "call_1".to_string().into(),
             name: "subagent".to_string(),
             input: serde_json::json!({
                 "description": "Verify subagent model",
@@ -2195,7 +2195,7 @@ fn render_tool_message_shows_intent_and_technical_preview_on_one_line() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_intent".to_string(),
+            id: "call_intent".to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({
                 "command": "cargo test -p jcode render_background_task --lib",
@@ -2241,7 +2241,7 @@ fn tool_call_details_bash_renders_full_wrapped_command_without_lossy_row_snippet
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_user_scenario".to_string(),
+            id: "call_user_scenario".to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({ "command": command }),
             intent: Some("Run the tests".to_string()),
@@ -2286,7 +2286,7 @@ fn render_tool_message_hides_technical_preview_when_tool_details_off() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_intent".to_string(),
+            id: "call_intent".to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({
                 "command": "cargo test -p jcode render_background_task --lib",
@@ -2322,7 +2322,7 @@ fn render_tool_message_keeps_error_summary_when_details_hidden() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_intent_err".to_string(),
+            id: "call_intent_err".to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({
                 "command": "cargoo test",
@@ -2351,7 +2351,7 @@ fn render_tool_message_shows_token_badge() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_2".to_string(),
+            id: "call_2".to_string().into(),
             name: "read".to_string(),
             input: serde_json::json!({"file_path": "src/main.rs"}),
             intent: None,
@@ -2378,7 +2378,7 @@ fn render_tool_message_hides_bash_output() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_bash_output".to_string(),
+            id: "call_bash_output".to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({
                 "command": "python3 -c \"s='pale'; t='bale'; print(type(zip(s,t))); print(list(zip(s,t)))\""
@@ -2405,7 +2405,7 @@ fn render_tool_message_shows_bash_output_when_enabled() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_bash_output_enabled".to_string(),
+            id: "call_bash_output_enabled".to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({"command": "printf output"}),
             intent: Some("Print output".to_string()),
@@ -2447,7 +2447,7 @@ fn render_tool_message_shows_bash_exit_code_badge_on_failed_run() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_bash_exit_failed".to_string(),
+            id: "call_bash_exit_failed".to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({"command": "false"}),
             intent: Some("Run failing command".to_string()),
@@ -2481,7 +2481,7 @@ fn render_tool_message_shows_bash_exit_code_badge_on_success() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_bash_exit_ok".to_string(),
+            id: "call_bash_exit_ok".to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({"command": "git status"}),
             intent: Some("Check git status".to_string()),
@@ -2512,7 +2512,7 @@ fn render_tool_message_shows_command_block_when_tool_call_details_enabled() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_bash_details".to_string(),
+            id: "call_bash_details".to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({
                 "command": "git status",
@@ -2588,7 +2588,7 @@ fn long_bash_command_and_output_wrap_instead_of_truncating() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_bash_long".to_string(),
+            id: "call_bash_long".to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({ "command": long_command }),
             intent: Some("Run heavy command".to_string()),
@@ -2633,7 +2633,7 @@ fn bash_row_has_no_trimmed_command_summary_when_details_are_on() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_bash_row".to_string(),
+            id: "call_bash_row".to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({ "command": command }),
             intent: None,
@@ -2680,7 +2680,7 @@ fn exact_long_command_renders_full_across_wrapped_lines() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_bash_exact".to_string(),
+            id: "call_bash_exact".to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({ "command": command }),
             intent: None,
@@ -2724,7 +2724,7 @@ fn gmail_draft_message(content: &str, input: serde_json::Value) -> DisplayMessag
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_gmail_draft".to_string(),
+            id: "call_gmail_draft".to_string().into(),
             name: "gmail".to_string(),
             input,
             intent: None,
@@ -2873,7 +2873,7 @@ fn render_batch_tool_message_shows_nested_gmail_draft_card() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_batch_gmail".to_string(),
+            id: "call_batch_gmail".to_string().into(),
             name: "batch".to_string(),
             input: serde_json::json!({
                 "tool_calls": [{
@@ -2915,7 +2915,7 @@ fn render_batch_tool_message_shows_flat_and_nested_subcall_intents() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_batch_intents".to_string(),
+            id: "call_batch_intents".to_string().into(),
             name: "batch".to_string(),
             input: serde_json::json!({
                 "tool_calls": [
@@ -2965,7 +2965,7 @@ fn discovery_message(content: &str, input: serde_json::Value) -> DisplayMessage 
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_discovery".to_string(),
+            id: "call_discovery".to_string().into(),
             name: "integration_tools".to_string(),
             input,
             intent: None,
@@ -3043,7 +3043,7 @@ fn batched_discovery_renders_without_disclosure_notice() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_batch_discovery".to_string(),
+            id: "call_batch_discovery".to_string().into(),
             name: "batch".to_string(),
             input: serde_json::json!({
                 "tool_calls": [{
@@ -3236,7 +3236,7 @@ fn render_tool_message_colors_high_token_badge() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_3".to_string(),
+            id: "call_3".to_string().into(),
             name: "read".to_string(),
             input: serde_json::json!({"file_path": "src/main.rs"}),
             intent: None,
@@ -3264,7 +3264,7 @@ fn render_tool_message_shows_inline_diff_for_pascal_case_multiedit() {
         duration_secs: None,
         title: Some("demo.txt".to_string()),
         tool_data: Some(crate::message::ToolCall {
-            id: "call_multiedit_pascal".to_string(),
+            id: "call_multiedit_pascal".to_string().into(),
             name: "MultiEdit".to_string(),
             input: serde_json::json!({
                 "file_path": "demo.txt",
@@ -3296,7 +3296,7 @@ fn render_tool_message_labels_single_file_apply_patch_diff() {
         duration_secs: None,
         title: Some("src/example.rs".to_string()),
         tool_data: Some(crate::message::ToolCall {
-            id: "call_apply_patch_single".to_string(),
+            id: "call_apply_patch_single".to_string().into(),
             name: "apply_patch".to_string(),
             input: serde_json::json!({
                 "intent": "Update example behavior",
@@ -3328,7 +3328,7 @@ fn render_tool_message_preserves_multi_file_apply_patch_boundaries() {
         duration_secs: None,
         title: Some("2 files".to_string()),
         tool_data: Some(crate::message::ToolCall {
-            id: "call_apply_patch_multi".to_string(),
+            id: "call_apply_patch_multi".to_string().into(),
             name: "apply_patch".to_string(),
             input: serde_json::json!({
                 "intent": "Update both examples",
@@ -3371,7 +3371,7 @@ fn render_tool_message_shows_numbered_write_result_diff_after_input_compaction()
         duration_secs: None,
         title: Some("/tmp/head-to-head.html".to_string()),
         tool_data: Some(crate::message::ToolCall {
-            id: "call_write_compacted".to_string(),
+            id: "call_write_compacted".to_string().into(),
             name: "write".to_string(),
             input: serde_json::json!({"file_path": "/tmp/head-to-head.html"}),
             intent: Some("Create an honest data-driven benchmark comparison page".to_string()),
@@ -3414,7 +3414,7 @@ fn render_tool_message_never_draws_an_empty_edit_diff_frame() {
             duration_secs: None,
             title: Some("demo.txt".to_string()),
             tool_data: Some(crate::message::ToolCall {
-                id: format!("call_{name}_compacted"),
+                id: format!("call_{name}_compacted").into(),
                 name: name.to_string(),
                 input: serde_json::json!({"file_path": "demo.txt"}),
                 intent: None,
@@ -3445,7 +3445,7 @@ fn render_tool_message_marks_failed_apply_patch_without_empty_diff() {
         duration_secs: None,
         title: Some("/tmp/main.rs".to_string()),
         tool_data: Some(crate::message::ToolCall {
-            id: "call_apply_patch_failed".to_string(),
+            id: "call_apply_patch_failed".to_string().into(),
             name: "apply_patch".to_string(),
             input: serde_json::json!({"file_path": "/tmp/main.rs"}),
             intent: Some("Replace the benchmark placeholder".to_string()),
@@ -3483,7 +3483,7 @@ fn render_tool_message_inline_mode_truncates_large_diffs() {
         duration_secs: None,
         title: Some("demo.txt".to_string()),
         tool_data: Some(crate::message::ToolCall {
-            id: "call_edit_inline_truncated".to_string(),
+            id: "call_edit_inline_truncated".to_string().into(),
             name: "edit".to_string(),
             input: serde_json::json!({
                 "file_path": "demo.txt",
@@ -3527,7 +3527,7 @@ fn render_tool_message_full_inline_mode_shows_full_diff() {
         duration_secs: None,
         title: Some("demo.txt".to_string()),
         tool_data: Some(crate::message::ToolCall {
-            id: "call_edit_inline_full".to_string(),
+            id: "call_edit_inline_full".to_string().into(),
             name: "edit".to_string(),
             input: serde_json::json!({
                 "file_path": "demo.txt",
@@ -3570,7 +3570,7 @@ fn render_tool_message_memory_recall_centered_mode_left_aligns_with_padding() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_memory_recall_centered".to_string(),
+            id: "call_memory_recall_centered".to_string().into(),
             name: "memory".to_string(),
             input: serde_json::json!({
                 "action": "recall",
@@ -3623,7 +3623,7 @@ fn render_tool_message_memory_store_centered_mode_left_aligns_with_padding() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_memory_store_centered".to_string(),
+            id: "call_memory_store_centered".to_string().into(),
             name: "memory".to_string(),
             input: serde_json::json!({
                 "action": "remember",
@@ -3669,7 +3669,7 @@ fn render_tool_message_shows_swarm_spawn_prompt_summary() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_swarm_spawn".to_string(),
+            id: "call_swarm_spawn".to_string().into(),
             name: "swarm".to_string(),
             input: serde_json::json!({
                 "action": "spawn",
@@ -3703,7 +3703,7 @@ fn render_tool_message_batch_subcall_shows_swarm_dm_details() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_batch_swarm".to_string(),
+            id: "call_batch_swarm".to_string().into(),
             name: "batch".to_string(),
             input: serde_json::json!({
                 "tool_calls": [
@@ -4033,7 +4033,7 @@ fn render_empty_todo_tool_result_collapses_to_compact_line() {
         duration_secs: None,
         title: Some("0 todos".to_string()),
         tool_data: Some(crate::message::ToolCall {
-            id: "call_todo_empty".to_string(),
+            id: "call_todo_empty".to_string().into(),
             name: "todo".to_string(),
             input: serde_json::json!({}),
             intent: Some("Read the todo list".to_string()),
@@ -4161,7 +4161,7 @@ fn bash_row_shows_command_summary_when_details_off() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_bash_nodetails".to_string(),
+            id: "call_bash_nodetails".to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({ "command": command }),
             intent: None,
@@ -4199,7 +4199,7 @@ fn bash_output_renders_independently_when_details_off() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_bash_outonly".to_string(),
+            id: "call_bash_outonly".to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({ "command": "printf x" }),
             intent: Some("Print".to_string()),
@@ -4250,7 +4250,7 @@ fn bash_long_command_and_output_render_fully_wrapped_untrimmed() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_long_bash".to_string(),
+            id: "call_long_bash".to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({ "command": command, "cwd": "/Users/vasilypelikh/IdeaProjects/vpelikh/github/jcode" }),
             intent: Some("Test whether long bash command text gets trimmed".to_string()),
@@ -4307,7 +4307,7 @@ fn render_edit_inline_shows_line_number_gutters_from_embedded_diff() {
         duration_secs: None,
         title: Some("demo.txt".to_string()),
         tool_data: Some(crate::message::ToolCall {
-            id: "call_edit_gutter".to_string(),
+            id: "call_edit_gutter".to_string().into(),
             name: "edit".to_string(),
             input: serde_json::json!({
                 "file_path": "demo.txt",
@@ -4342,7 +4342,7 @@ fn render_edit_inline_strips_config_notice_bullets() {
         duration_secs: None,
         title: Some("config.toml".to_string()),
         tool_data: Some(crate::message::ToolCall {
-            id: "call_edit_config".to_string(),
+            id: "call_edit_config".to_string().into(),
             name: "edit".to_string(),
             input: serde_json::json!({
                 "file_path": "config.toml",
@@ -4378,7 +4378,7 @@ fn render_tool_message_compass_query_row_shows_query() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_compass_card".to_string(),
+            id: "call_compass_card".to_string().into(),
             name: "compass_query".to_string(),
             input: serde_json::json!({
                 "query": "find the config handler",
@@ -4485,7 +4485,7 @@ fn render_tool_message_batch_compass_query_subcall_shows_query() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_batch_compass".to_string(),
+            id: "call_batch_compass".to_string().into(),
             name: "batch".to_string(),
             input: serde_json::json!({
                 "tool_calls": [
@@ -4522,7 +4522,7 @@ fn render_tool_message_compass_query_long_query_truncates() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_compass_long".to_string(),
+            id: "call_compass_long".to_string().into(),
             name: "compass_query".to_string(),
             input: serde_json::json!({ "query": long_query }),
             intent: None,

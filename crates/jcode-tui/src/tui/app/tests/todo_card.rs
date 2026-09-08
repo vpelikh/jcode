@@ -300,7 +300,7 @@ fn pinned_todos_hide_todo_tool_messages_from_the_transcript() {
         DisplayMessage::tool(
             "duplicate todo transcript card",
             crate::message::ToolCall {
-                id: "todo-tool".to_string(),
+                id: "todo-tool".to_string().into(),
                 name: "todo".to_string(),
                 input: serde_json::json!({"todos": []}),
                 intent: None,
@@ -310,7 +310,7 @@ fn pinned_todos_hide_todo_tool_messages_from_the_transcript() {
         DisplayMessage::tool(
             "ordinary tool remains visible",
             crate::message::ToolCall {
-                id: "read-tool".to_string(),
+                id: "read-tool".to_string().into(),
                 name: "read".to_string(),
                 input: serde_json::json!({"file_path": "README.md"}),
                 intent: None,

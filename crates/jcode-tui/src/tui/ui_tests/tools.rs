@@ -54,7 +54,7 @@ fn test_patch_headers_preserve_line_counts_and_token_severity() {
         ),
     ] {
         let tool = crate::message::ToolCall {
-            id: "call_patch_badge".to_string(),
+            id: "call_patch_badge".to_string().into(),
             name: name.to_string(),
             input: serde_json::json!({"patch_text": patch}),
             intent: None,
@@ -145,7 +145,7 @@ fn test_token_badges_survive_full_terminal_draw() {
                             duration_secs: None,
                             title: None,
                             tool_data: Some(crate::message::ToolCall {
-                                id: format!("badge_{version}"),
+                                id: format!("badge_{version}").into(),
                                 name: name.to_string(),
                                 input,
                                 intent: None,
@@ -302,7 +302,7 @@ fn test_render_tool_message_batch_flat_subcall_params_include_read_details() {
         duration_secs: None,
         title: None,
         tool_data: Some(ToolCall {
-            id: "call_batch_1".to_string(),
+            id: "call_batch_1".to_string().into(),
             name: "batch".to_string(),
             input: serde_json::json!({
                 "tool_calls": [
@@ -348,7 +348,7 @@ fn test_render_tool_message_batch_subcalls_show_individual_token_badges() {
             duration_secs: None,
             title: None,
             tool_data: Some(ToolCall {
-                id: "call_batch_tokens".to_string(),
+                id: "call_batch_tokens".to_string().into(),
                 name: "batch".to_string(),
                 input: serde_json::json!({
                     "tool_calls": [
@@ -387,7 +387,7 @@ fn test_render_tool_message_batch_first_subcall_token_badge_with_timing_prefix()
         duration_secs: None,
         title: None,
         tool_data: Some(ToolCall {
-            id: "call_batch_tokens_timing_prefix".to_string(),
+            id: "call_batch_tokens_timing_prefix".to_string().into(),
             name: "batch".to_string(),
             input: serde_json::json!({
                 "tool_calls": [
@@ -421,7 +421,7 @@ fn test_render_tool_message_batch_last_subcall_keeps_token_badge_without_trailin
         duration_secs: None,
         title: None,
         tool_data: Some(ToolCall {
-            id: "call_batch_tokens_no_newline".to_string(),
+            id: "call_batch_tokens_no_newline".to_string().into(),
             name: "batch".to_string(),
             input: serde_json::json!({
                 "tool_calls": [
@@ -467,7 +467,7 @@ Completed: 2 succeeded, 1 failed"
         duration_secs: None,
         title: None,
         tool_data: Some(ToolCall {
-            id: "call_batch_partial".to_string(),
+            id: "call_batch_partial".to_string().into(),
             name: "batch".to_string(),
             input: serde_json::json!({
                 "tool_calls": [
@@ -518,7 +518,7 @@ fn test_render_tool_message_batch_all_failed_marks_all_children_failed() {
         duration_secs: None,
         title: None,
         tool_data: Some(ToolCall {
-            id: "call_batch_all_failed".to_string(),
+            id: "call_batch_all_failed".to_string().into(),
             name: "batch".to_string(),
             input: serde_json::json!({
                 "tool_calls": [
@@ -553,7 +553,7 @@ fn test_render_tool_message_batch_all_failed_marks_all_children_failed() {
 #[test]
 fn test_tool_summary_gmail_actions() {
     let search = ToolCall {
-        id: "call_gmail_search".to_string(),
+        id: "call_gmail_search".to_string().into(),
         name: "gmail".to_string(),
         input: serde_json::json!({
             "action": "search",
@@ -568,7 +568,7 @@ fn test_tool_summary_gmail_actions() {
     assert!(summary.contains("from:alice"), "summary={summary:?}");
 
     let read = ToolCall {
-        id: "call_gmail_read".to_string(),
+        id: "call_gmail_read".to_string().into(),
         name: "gmail".to_string(),
         input: serde_json::json!({
             "action": "read",
@@ -581,7 +581,7 @@ fn test_tool_summary_gmail_actions() {
     assert!(summary.starts_with("read "), "summary={summary:?}");
 
     let send = ToolCall {
-        id: "call_gmail_send".to_string(),
+        id: "call_gmail_send".to_string().into(),
         name: "gmail".to_string(),
         input: serde_json::json!({
             "action": "send",
@@ -598,7 +598,7 @@ fn test_tool_summary_gmail_actions() {
     );
 
     let bare = ToolCall {
-        id: "call_gmail_labels".to_string(),
+        id: "call_gmail_labels".to_string().into(),
         name: "gmail".to_string(),
         input: serde_json::json!({ "action": "labels" }),
         intent: None,
@@ -612,7 +612,7 @@ fn test_tool_summary_gmail_actions() {
 fn test_tool_activity_detail_prefixes_intent_for_gmail_and_browser() {
     tools_ui::tests_tool_call_details_override::set(true);
     let gmail = ToolCall {
-        id: "call_gmail_intent".to_string(),
+        id: "call_gmail_intent".to_string().into(),
         name: "gmail".to_string(),
         input: serde_json::json!({
             "action": "search",
@@ -627,7 +627,7 @@ fn test_tool_activity_detail_prefixes_intent_for_gmail_and_browser() {
     assert!(detail.contains("is:unread"), "detail={detail:?}");
 
     let browser = ToolCall {
-        id: "call_browser_intent".to_string(),
+        id: "call_browser_intent".to_string().into(),
         name: "browser".to_string(),
         input: serde_json::json!({
             "action": "open",
@@ -647,7 +647,7 @@ fn test_tool_activity_detail_prefixes_intent_for_gmail_and_browser() {
 #[test]
 fn test_tool_activity_detail_hides_technical_summary_by_default() {
     let gmail = ToolCall {
-        id: "call_gmail_intent_only".to_string(),
+        id: "call_gmail_intent_only".to_string().into(),
         name: "gmail".to_string(),
         input: serde_json::json!({
             "action": "search",
@@ -708,7 +708,7 @@ fn test_tool_summary_covers_action_shaped_tools_and_fallback() {
     ];
     for (name, input, expected_prefix) in cases {
         let tool = ToolCall {
-            id: format!("call_{name}"),
+            id: format!("call_{name}").into(),
             name: name.to_string(),
             input,
             intent: None,
@@ -725,7 +725,7 @@ fn test_tool_summary_covers_action_shaped_tools_and_fallback() {
 #[test]
 fn test_tool_summary_read_supports_start_line_end_line() {
     let tool = ToolCall {
-        id: "call_read_range".to_string(),
+        id: "call_read_range".to_string().into(),
         name: "read".to_string(),
         input: serde_json::json!({
             "file_path": "src/tool/read.rs",
@@ -749,7 +749,7 @@ fn test_render_tool_message_batch_includes_start_end_read_details() {
         duration_secs: None,
         title: None,
         tool_data: Some(ToolCall {
-            id: "call_batch_range".to_string(),
+            id: "call_batch_range".to_string().into(),
             name: "batch".to_string(),
             input: serde_json::json!({
                 "tool_calls": [
@@ -780,7 +780,7 @@ fn test_render_tool_message_batch_includes_start_end_read_details() {
 #[test]
 fn test_tool_summary_path_truncation_keeps_filename_tail() {
     let tool = ToolCall {
-        id: "call_read_tail".to_string(),
+        id: "call_read_tail".to_string().into(),
         name: "read".to_string(),
         input: serde_json::json!({
             "file_path": "src/tui/really/long/nested/location/ui_messages.rs",
@@ -802,7 +802,7 @@ fn test_tool_summary_path_truncation_keeps_filename_tail() {
 #[test]
 fn test_tool_summary_grep_truncation_prefers_middle() {
     let tool = ToolCall {
-        id: "call_grep_middle".to_string(),
+        id: "call_grep_middle".to_string().into(),
         name: "grep".to_string(),
         input: serde_json::json!({
             "pattern": "prefix_[A-Z0-9]+_important_middle_token_[a-z]+_suffix",
@@ -829,7 +829,7 @@ fn test_tool_summary_grep_truncation_prefers_middle() {
 #[test]
 fn test_tool_summary_bash_truncation_keeps_start_and_end() {
     let tool = ToolCall {
-        id: "call_bash_middle".to_string(),
+        id: "call_bash_middle".to_string().into(),
         name: "bash".to_string(),
         input: serde_json::json!({
             "command": "cargo test --package jcode --lib tui::ui::tests::render_tool_message_batch_flat_subcall_params_include_read_details -- --nocapture"
@@ -852,7 +852,7 @@ fn test_tool_summary_bash_truncation_keeps_start_and_end() {
 #[test]
 fn test_tool_summary_bash_keeps_full_command_when_width_fits() {
     let tool = ToolCall {
-        id: "call_bash_full".to_string(),
+        id: "call_bash_full".to_string().into(),
         name: "bash".to_string(),
         input: serde_json::json!({
             "command": "cargo test --package jcode --lib tui::ui::tests::render_tool_message_batch_rows_do_not_soft_wrap_on_narrow_width -- --nocapture"
@@ -873,7 +873,7 @@ fn test_tool_summary_bash_keeps_full_command_when_width_fits() {
 #[test]
 fn test_render_batch_subcall_line_keeps_full_bash_summary_when_row_fits() {
     let tool = ToolCall {
-        id: "batch-1-bash".to_string(),
+        id: "batch-1-bash".to_string().into(),
         name: "bash".to_string(),
         input: serde_json::json!({
             "command": "cargo test --package jcode --lib tui::ui::tests::render_tool_message_batch_rows_do_not_soft_wrap_on_narrow_width -- --nocapture"
@@ -898,7 +898,7 @@ fn test_render_batch_subcall_line_keeps_full_bash_summary_when_row_fits() {
 fn test_render_batch_subcall_line_shows_model_provided_intent() {
     tools_ui::tests_tool_call_details_override::set(true);
     let tool = ToolCall {
-        id: "batch-1-read".to_string(),
+        id: "batch-1-read".to_string().into(),
         name: "read".to_string(),
         input: serde_json::json!({"file_path": "src/tui/ui_messages.rs"}),
         intent: Some("Inspect completed batch rendering".to_string()),
@@ -922,7 +922,7 @@ fn test_render_batch_subcall_line_shows_model_provided_intent() {
 #[test]
 fn test_render_batch_subcall_line_hides_technical_detail_by_default() {
     let tool = ToolCall {
-        id: "batch-1-read".to_string(),
+        id: "batch-1-read".to_string().into(),
         name: "read".to_string(),
         input: serde_json::json!({"file_path": "src/tui/ui_messages.rs"}),
         intent: Some("Inspect completed batch rendering".to_string()),
@@ -946,7 +946,7 @@ fn test_render_batch_subcall_line_hides_technical_detail_by_default() {
 #[test]
 fn test_agentgrep_summary_uses_default_grep_mode_query() {
     let tool = ToolCall {
-        id: "agentgrep-default-mode".to_string(),
+        id: "agentgrep-default-mode".to_string().into(),
         name: "agentgrep".to_string(),
         input: serde_json::json!({
             "query": "pending_soft_interrupt",
@@ -964,7 +964,7 @@ fn test_agentgrep_summary_uses_default_grep_mode_query() {
 #[test]
 fn test_render_batch_subcall_line_shows_first_subcall_token_badge() {
     let tool = ToolCall {
-        id: "agentgrep-default-mode".to_string(),
+        id: "agentgrep-default-mode".to_string().into(),
         name: "agentgrep".to_string(),
         input: serde_json::json!({
             "query": "pending_soft_interrupt",
@@ -996,7 +996,7 @@ fn test_common_tool_summaries_keep_full_text_when_row_budget_fits() {
     let cases = vec![
         (
             ToolCall {
-                id: "read-wide".to_string(),
+                id: "read-wide".to_string().into(),
                 name: "read".to_string(),
                 input: serde_json::json!({
                     "file_path": "src/tui/ui_messages.rs",
@@ -1010,7 +1010,7 @@ fn test_common_tool_summaries_keep_full_text_when_row_budget_fits() {
         ),
         (
             ToolCall {
-                id: "grep-wide".to_string(),
+                id: "grep-wide".to_string().into(),
                 name: "grep".to_string(),
                 input: serde_json::json!({
                     "pattern": "render_batch_subcall_line",
@@ -1023,7 +1023,7 @@ fn test_common_tool_summaries_keep_full_text_when_row_budget_fits() {
         ),
         (
             ToolCall {
-                id: "glob-wide".to_string(),
+                id: "glob-wide".to_string().into(),
                 name: "glob".to_string(),
                 input: serde_json::json!({
                     "pattern": "src/tui/**/*.rs"
@@ -1035,7 +1035,7 @@ fn test_common_tool_summaries_keep_full_text_when_row_budget_fits() {
         ),
         (
             ToolCall {
-                id: "webfetch-wide".to_string(),
+                id: "webfetch-wide".to_string().into(),
                 name: "webfetch".to_string(),
                 input: serde_json::json!({
                     "url": "https://example.com/docs/api/reference"
@@ -1047,7 +1047,7 @@ fn test_common_tool_summaries_keep_full_text_when_row_budget_fits() {
         ),
         (
             ToolCall {
-                id: "open-wide".to_string(),
+                id: "open-wide".to_string().into(),
                 name: "open".to_string(),
                 input: serde_json::json!({
                     "action": "open",
@@ -1060,7 +1060,7 @@ fn test_common_tool_summaries_keep_full_text_when_row_budget_fits() {
         ),
         (
             ToolCall {
-                id: "memory-wide".to_string(),
+                id: "memory-wide".to_string().into(),
                 name: "memory".to_string(),
                 input: serde_json::json!({
                     "action": "recall",
@@ -1073,7 +1073,7 @@ fn test_common_tool_summaries_keep_full_text_when_row_budget_fits() {
         ),
         (
             ToolCall {
-                id: "codesearch-wide".to_string(),
+                id: "codesearch-wide".to_string().into(),
                 name: "codesearch".to_string(),
                 input: serde_json::json!({
                     "query": "rust unicode width truncation examples"
@@ -1085,7 +1085,7 @@ fn test_common_tool_summaries_keep_full_text_when_row_budget_fits() {
         ),
         (
             ToolCall {
-                id: "debug-wide".to_string(),
+                id: "debug-wide".to_string().into(),
                 name: "debug_socket".to_string(),
                 input: serde_json::json!({
                     "command": "tester:list"
@@ -1107,7 +1107,7 @@ fn test_common_tool_summaries_keep_full_text_when_row_budget_fits() {
 #[test]
 fn test_debug_socket_summary_hides_transient_missing_input() {
     let tool = ToolCall {
-        id: "debug-start".to_string(),
+        id: "debug-start".to_string().into(),
         name: "debug_socket".to_string(),
         input: serde_json::Value::Null,
         intent: None,
@@ -1121,7 +1121,7 @@ fn test_debug_socket_summary_hides_transient_missing_input() {
 #[test]
 fn test_tool_summary_browser_open_shows_url() {
     let tool = ToolCall {
-        id: "browser-open".to_string(),
+        id: "browser-open".to_string().into(),
         name: "browser".to_string(),
         input: serde_json::json!({
             "action": "open",
@@ -1141,7 +1141,7 @@ fn test_tool_summary_browser_open_shows_url() {
 #[test]
 fn test_tool_summary_browser_type_hides_typed_text() {
     let tool = ToolCall {
-        id: "browser-type".to_string(),
+        id: "browser-type".to_string().into(),
         name: "browser".to_string(),
         input: serde_json::json!({
             "action": "type",
@@ -1163,7 +1163,7 @@ fn test_tool_summary_browser_type_hides_typed_text() {
 #[test]
 fn test_tool_summary_browser_type_without_selector_still_hides_text() {
     let tool = ToolCall {
-        id: "browser-type-no-selector".to_string(),
+        id: "browser-type-no-selector".to_string().into(),
         name: "browser".to_string(),
         input: serde_json::json!({
             "action": "type",
@@ -1181,7 +1181,7 @@ fn test_tool_summary_browser_type_without_selector_still_hides_text() {
 #[test]
 fn test_tool_summary_browser_eval_truncates_script() {
     let tool = ToolCall {
-        id: "browser-eval".to_string(),
+        id: "browser-eval".to_string().into(),
         name: "browser".to_string(),
         input: serde_json::json!({
             "action": "eval",
@@ -1200,7 +1200,7 @@ fn test_tool_summary_browser_eval_truncates_script() {
 #[test]
 fn test_tool_summary_agentgrep_smart_uses_terms_subject_relation() {
     let tool = ToolCall {
-        id: "agentgrep-smart-terms".to_string(),
+        id: "agentgrep-smart-terms".to_string().into(),
         name: "agentgrep".to_string(),
         input: serde_json::json!({
             "mode": "smart",
@@ -1217,7 +1217,7 @@ fn test_tool_summary_agentgrep_smart_uses_terms_subject_relation() {
 #[test]
 fn test_tool_summary_agentgrep_smart_uses_query_subject_relation() {
     let tool = ToolCall {
-        id: "agentgrep-smart-query".to_string(),
+        id: "agentgrep-smart-query".to_string().into(),
         name: "agentgrep".to_string(),
         input: serde_json::json!({
             "mode": "smart",
@@ -1234,7 +1234,7 @@ fn test_tool_summary_agentgrep_smart_uses_query_subject_relation() {
 #[test]
 fn test_tool_summary_bg_infers_wait_from_intent_when_action_missing() {
     let tool = ToolCall {
-        id: "bg-intent-only".to_string(),
+        id: "bg-intent-only".to_string().into(),
         name: "bg".to_string(),
         input: serde_json::json!({
             "intent": "Wait for library tests",
@@ -1257,7 +1257,7 @@ fn test_render_tool_message_batch_rows_do_not_soft_wrap_on_narrow_width() {
         duration_secs: None,
         title: None,
         tool_data: Some(ToolCall {
-            id: "call_batch_narrow".to_string(),
+            id: "call_batch_narrow".to_string().into(),
             name: "batch".to_string(),
             input: serde_json::json!({
                 "tool_calls": [
@@ -1295,7 +1295,7 @@ fn test_render_tool_message_keeps_token_badge_when_intent_is_truncated() {
         duration_secs: None,
         title: None,
         tool_data: Some(ToolCall {
-            id: "call_long_intent".to_string(),
+            id: "call_long_intent".to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({
                 "command": "cargo test --package jcode --lib tui::ui::tests::very_long_test_name -- --nocapture"
@@ -1329,7 +1329,7 @@ fn test_render_tool_message_with_intent_never_adds_second_command_line() {
         duration_secs: None,
         title: None,
         tool_data: Some(ToolCall {
-            id: "call_intent_no_wrap".to_string(),
+            id: "call_intent_no_wrap".to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({
                 "command": "set -euo pipefail; python -c 'import modal' && echo ready"
@@ -1365,7 +1365,7 @@ fn test_render_tool_message_keeps_bash_command_visible_when_row_is_narrow() {
         duration_secs: None,
         title: None,
         tool_data: Some(ToolCall {
-            id: "call_narrow_bash".to_string(),
+            id: "call_narrow_bash".to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({
                 "command": "grep -rn \"unwrap()\" src/ --include=\"*.rs\" | wc -l"
@@ -1408,7 +1408,7 @@ fn test_action_tools_hide_missing_placeholder_for_streaming_input() {
     for name in action_tools {
         for input in &transient_inputs {
             let tool = ToolCall {
-                id: format!("{name}-streaming"),
+                id: format!("{name}-streaming").into(),
                 name: name.to_string(),
                 input: input.clone(),
                 intent: None,
@@ -1442,7 +1442,7 @@ fn test_action_tools_degrade_to_tool_name_when_action_absent() {
 
     for (name, input) in cases {
         let tool = ToolCall {
-            id: format!("{name}-no-action"),
+            id: format!("{name}-no-action").into(),
             name: name.to_string(),
             input,
             intent: None,
@@ -1464,7 +1464,7 @@ fn test_action_tools_degrade_to_tool_name_when_action_absent() {
 fn test_activity_detail_prefers_intent_and_appends_summary() {
     tools_ui::tests_tool_call_details_override::set(true);
     let tool = ToolCall {
-        id: "swarm-1".to_string(),
+        id: "swarm-1".to_string().into(),
         name: "swarm".to_string(),
         input: serde_json::json!({
             "intent": "Spin up a worker for the parser fix",
@@ -1492,7 +1492,7 @@ fn test_activity_detail_prefers_intent_and_appends_summary() {
 #[test]
 fn test_activity_detail_falls_back_to_input_intent_field() {
     let tool = ToolCall {
-        id: "swarm-2".to_string(),
+        id: "swarm-2".to_string().into(),
         name: "swarm".to_string(),
         input: serde_json::json!({
             "intent": "Check on worker progress",
@@ -1514,7 +1514,7 @@ fn test_activity_detail_falls_back_to_input_intent_field() {
 #[test]
 fn test_activity_detail_without_intent_matches_summary() {
     let tool = ToolCall {
-        id: "swarm-3".to_string(),
+        id: "swarm-3".to_string().into(),
         name: "swarm".to_string(),
         input: serde_json::json!({ "action": "dm", "to_session": "worker-1", "message": "hello" }),
         intent: None,
@@ -1532,7 +1532,7 @@ fn test_activity_detail_without_intent_matches_summary() {
 #[test]
 fn test_tool_summary_compass_query_shows_query() {
     let tool = ToolCall {
-        id: "compass-1".to_string(),
+        id: "compass-1".to_string().into(),
         name: "compass_query".to_string(),
         input: serde_json::json!({
             "query": "find the config handler",
@@ -1550,7 +1550,7 @@ fn test_tool_summary_compass_query_shows_query() {
 #[test]
 fn test_tool_summary_compass_query_blank_query_is_empty() {
     let tool = ToolCall {
-        id: "compass-2".to_string(),
+        id: "compass-2".to_string().into(),
         name: "compass_query".to_string(),
         input: serde_json::json!({ "query": "   ", "intent": "search" }),
         intent: None,
@@ -1566,7 +1566,7 @@ fn test_tool_summary_compass_query_blank_query_is_empty() {
 #[test]
 fn test_tool_summary_compass_query_truncation_respects_width_and_keeps_focus() {
     let tool = ToolCall {
-        id: "compass-3".to_string(),
+        id: "compass-3".to_string().into(),
         name: "compass_query".to_string(),
         input: serde_json::json!({
             "query": "find_important_config handler that owns the really_long_setting_name field",
@@ -1598,7 +1598,7 @@ fn test_tool_summary_compass_query_truncation_respects_width_and_keeps_focus() {
 #[test]
 fn test_tool_summary_compass_query_degenerate_budget_yields_empty() {
     let tool = ToolCall {
-        id: "compass-4".to_string(),
+        id: "compass-4".to_string().into(),
         name: "compass_query".to_string(),
         input: serde_json::json!({
             "query": "find the config handler",
@@ -1645,7 +1645,7 @@ fn test_tool_summary_query_arms_never_emit_bare_quotes() {
 
     for (name, input) in cases {
         let mut tool = ToolCall {
-            id: format!("call_{name}").to_string(),
+            id: format!("call_{name}").to_string().into(),
             name: name.to_string(),
             input,
             intent: None,
@@ -1668,7 +1668,7 @@ fn test_tool_summary_query_arms_never_emit_bare_quotes() {
 #[test]
 fn test_activity_detail_compass_query_shows_query() {
     let tool = ToolCall {
-        id: "compass-activity".to_string(),
+        id: "compass-activity".to_string().into(),
         name: "compass_query".to_string(),
         input: serde_json::json!({
             "intent": "search",
@@ -1701,7 +1701,7 @@ fn test_activity_detail_compass_query_shows_query() {
 #[test]
 fn test_tool_summary_memory_recall_blank_falls_back() {
     let tool = ToolCall {
-        id: "memory-recall-blank".to_string(),
+        id: "memory-recall-blank".to_string().into(),
         name: "memory".to_string(),
         input: serde_json::json!({ "action": "recall", "query": "   " }),
         intent: None,
@@ -1716,7 +1716,7 @@ fn test_tool_summary_memory_recall_blank_falls_back() {
 #[test]
 fn test_tool_summary_gmail_search_blank_falls_back_to_action() {
     let tool = ToolCall {
-        id: "gmail-search-blank".to_string(),
+        id: "gmail-search-blank".to_string().into(),
         name: "gmail".to_string(),
         input: serde_json::json!({
             "action": "search",

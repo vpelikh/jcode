@@ -739,7 +739,7 @@ fn test_handle_server_event_history_same_session_rewind_then_late_done_does_not_
     app.current_message_id = Some(7);
     app.streaming.streaming_text = "rewound-away assistant text".to_string();
     app.streaming_tool_calls.push(crate::message::ToolCall {
-        id: "tool_stale".to_string(),
+        id: "tool_stale".to_string().into(),
         name: "bash".to_string(),
         input: serde_json::json!({}),
         intent: None,
@@ -1535,7 +1535,7 @@ fn test_handle_server_event_interrupted_clears_stream_state_and_sets_idle() {
     app.current_message_id = Some(42);
     app.streaming.streaming_text = "partial".to_string();
     app.streaming_tool_calls.push(crate::message::ToolCall {
-        id: "tool_1".to_string(),
+        id: "tool_1".to_string().into(),
         name: "bash".to_string(),
         input: serde_json::Value::Null,
         intent: None, thought_signature: None, });
@@ -1836,7 +1836,7 @@ fn test_native_generated_image_renders_inline_without_opening_side_panel() {
             message
                 .tool_data
                 .as_ref()
-                .is_some_and(|tool| tool.id == "image_call_123")
+                .is_some_and(|tool| tool.id == "image_call_123".into())
         })
         .expect("generated image tool row");
     assert_eq!(generated_row.title.as_deref(), Some("Generated image"));

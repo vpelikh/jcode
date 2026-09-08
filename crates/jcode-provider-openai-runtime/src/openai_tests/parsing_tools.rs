@@ -151,7 +151,7 @@ fn test_parse_openai_response_function_call_arguments_streaming() {
 
     match first {
         StreamEvent::ToolUseStart { id, name } => {
-            assert_eq!(id, "call_123");
+            assert_eq!(id, "call_123".into());
             assert_eq!(name, "batch");
         }
         other => panic!("expected ToolUseStart, got {:?}", other),
@@ -604,7 +604,7 @@ fn test_handle_openai_output_item_normalizes_null_arguments() {
 
     match first {
         StreamEvent::ToolUseStart { id, name } => {
-            assert_eq!(id, "call_1");
+            assert_eq!(id, "call_1".into());
             assert_eq!(name, "bash");
         }
         _ => panic!("expected ToolUseStart"),

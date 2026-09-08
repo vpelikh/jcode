@@ -919,7 +919,7 @@ mod tests {
     #[test]
     fn experimental_feature_key_marks_swarm_spawn_actions() {
         let tool = ToolCall {
-            id: "tc".to_string(),
+            id: "tc".to_string().into(),
             name: "swarm".to_string(),
             input: serde_json::json!({"action": "spawn", "prompt": "try it"}),
             intent: None,
@@ -935,7 +935,7 @@ mod tests {
     #[test]
     fn experimental_feature_key_marks_spawn_if_needed_assignment() {
         let tool = ToolCall {
-            id: "tc".to_string(),
+            id: "tc".to_string().into(),
             name: "swarm".to_string(),
             input: serde_json::json!({"action": "assign_task", "spawn_if_needed": true}),
             intent: None,
@@ -951,7 +951,7 @@ mod tests {
     #[test]
     fn experimental_feature_key_ignores_non_spawning_swarm_actions() {
         let tool = ToolCall {
-            id: "tc".to_string(),
+            id: "tc".to_string().into(),
             name: "swarm".to_string(),
             input: serde_json::json!({"action": "status"}),
             intent: None,

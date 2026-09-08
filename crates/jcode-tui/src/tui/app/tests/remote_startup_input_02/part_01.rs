@@ -1147,7 +1147,7 @@ fn test_submit_input_commits_pending_streaming_assistant_text_before_user_messag
     app.display_messages.push(DisplayMessage::tool(
         "file contents",
         crate::message::ToolCall {
-            id: "tool_read".to_string(),
+            id: "tool_read".to_string().into(),
             name: "read".to_string(),
             input: serde_json::json!({"file_path": "src/main.rs"}),
             intent: None, thought_signature: None, },

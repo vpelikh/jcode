@@ -165,7 +165,7 @@ fn create_tool_error_copy_test_app() -> (App, ratatui::Terminal<ratatui::backend
         DisplayMessage::tool(
             "Error: permission denied",
             crate::message::ToolCall {
-                id: "tool_1".to_string(),
+                id: "tool_1".to_string().into(),
                 name: "bash".to_string(),
                 input: serde_json::json!({"command": "cat /root/secret"}),
                 intent: None, thought_signature: None, },
@@ -192,7 +192,7 @@ fn create_tool_failed_output_copy_test_app()
         DisplayMessage::tool(
             "cat: /root/secret: Permission denied\n\nExit code: 1",
             crate::message::ToolCall {
-                id: "tool_1".to_string(),
+                id: "tool_1".to_string().into(),
                 name: "bash".to_string(),
                 input: serde_json::json!({"command": "cat /root/secret"}),
                 intent: None, thought_signature: None, },

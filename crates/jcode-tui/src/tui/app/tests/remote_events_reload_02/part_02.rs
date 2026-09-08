@@ -68,7 +68,7 @@ fn test_replace_display_message_content_bumps_version() {
 fn test_replace_latest_tool_display_message_updates_latest_match_and_bumps_version() {
     let mut app = create_test_app();
     let tool_call = crate::message::ToolCall {
-        id: "tool-1".to_string(),
+        id: "tool-1".to_string().into(),
         name: "read".to_string(),
         input: serde_json::json!({"file_path": "src/main.rs"}),
         intent: None, thought_signature: None, };
@@ -127,7 +127,7 @@ fn test_replace_latest_tool_display_message_removes_background_lifecycle_card() 
         duration_secs: None,
         title: Some("bash".to_string()),
         tool_data: Some(crate::message::ToolCall {
-            id: "tool-bg".to_string(),
+            id: "tool-bg".to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({"command": "cargo test"}),
             intent: None,
@@ -217,7 +217,7 @@ fn test_incremental_display_message_counts_match_full_recompute() {
                 duration_secs: None,
                 title: None,
                 tool_data: Some(crate::message::ToolCall {
-                    id: format!("edit-{i}"),
+                    id: format!("edit-{i}").into(),
                     name: "edit".to_string(),
                     input: serde_json::json!({"file_path": format!("src/file_{i}.rs")}),
                     intent: None,
@@ -428,7 +428,7 @@ fn test_tool_done_preserves_sibling_streaming_tool_inputs_and_intents() {
 
     let remaining = app.streaming_tool_calls();
     assert_eq!(remaining.len(), 1, "sibling tool call should survive");
-    assert_eq!(remaining[0].id, "tool_b");
+    assert_eq!(remaining[0].id, "tool_b".into());
     assert_eq!(remaining[0].intent.as_deref(), Some("Fetch page B"));
     assert_eq!(
         remaining[0].input.get("url").and_then(|v| v.as_str()),
@@ -454,7 +454,7 @@ fn test_tool_done_preserves_sibling_streaming_tool_inputs_and_intents() {
         .find(|dm| {
             dm.tool_data
                 .as_ref()
-                .is_some_and(|td| td.id == "tool_b")
+                .is_some_and(|td| td.id == "tool_b".into())
         })
         .expect("missing tool_b display message");
     let tool_b = tool_b_msg.tool_data.as_ref().unwrap();

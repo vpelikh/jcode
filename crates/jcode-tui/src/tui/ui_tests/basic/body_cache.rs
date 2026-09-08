@@ -750,7 +750,7 @@ fn anchored_tool_image(tool_id: &str) -> crate::session::RenderedImage {
 
 fn read_tool_call(tool_id: &str) -> crate::message::ToolCall {
     crate::message::ToolCall {
-        id: tool_id.to_string(),
+        id: tool_id.to_string().into(),
         name: "read".to_string(),
         input: serde_json::json!({"file_path": "shot.png"}),
         intent: None,

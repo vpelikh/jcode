@@ -146,7 +146,7 @@ fn tool_call_parses_empty_or_null_streamed_input_as_empty_object() {
 fn tool_call_preserves_invalid_streamed_json_as_validation_error() {
     let input = ToolCall::parse_streamed_input_to_object("{");
     let call = ToolCall {
-        id: "call_invalid_json".to_string(),
+        id: "call_invalid_json".to_string().into(),
         name: "bash".to_string(),
         input,
         intent: None,
@@ -162,7 +162,7 @@ fn tool_call_preserves_invalid_streamed_json_as_validation_error() {
 #[test]
 fn tool_call_validation_rejects_empty_name_and_non_object_input() {
     let empty_name = ToolCall {
-        id: "call_1".to_string(),
+        id: "call_1".to_string().into(),
         name: "".to_string(),
         input: serde_json::json!({}),
         intent: None,
@@ -174,7 +174,7 @@ fn tool_call_validation_rejects_empty_name_and_non_object_input() {
     );
 
     let primitive_args = ToolCall {
-        id: "call_2".to_string(),
+        id: "call_2".to_string().into(),
         name: "read".to_string(),
         input: serde_json::json!(20),
         intent: None,
@@ -186,7 +186,7 @@ fn tool_call_validation_rejects_empty_name_and_non_object_input() {
     );
 
     let valid = ToolCall {
-        id: "call_3".to_string(),
+        id: "call_3".to_string().into(),
         name: "read".to_string(),
         input: serde_json::json!({"path":"README.md"}),
         intent: None,

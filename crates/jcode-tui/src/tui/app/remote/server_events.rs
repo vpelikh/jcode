@@ -446,7 +446,7 @@ mod history_dedup_tests {
 
         let mut tool = base.clone();
         tool[1].tool_data = Some(super::ToolCall {
-            id: "t1".to_string(),
+            id: "t1".to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({"command": "ls"}),
             intent: None,

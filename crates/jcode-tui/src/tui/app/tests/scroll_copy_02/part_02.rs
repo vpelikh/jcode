@@ -256,7 +256,7 @@ fn make_edit_badge_test_app(
         DisplayMessage::tool(
             "Edited demo.txt".to_string(),
             crate::message::ToolCall {
-                id: "edit_1".to_string(),
+                id: "edit_1".to_string().into(),
                 name: "edit".to_string(),
                 input: serde_json::json!({
                     "file_path": "demo.txt",
@@ -506,7 +506,7 @@ fn test_expand_badge_shortcut_opens_full_inline_from_non_inline_mode() {
     app.display_messages.push(DisplayMessage::tool(
         "Edited demo.txt".to_string(),
         crate::message::ToolCall {
-            id: "edit_1".to_string(),
+            id: "edit_1".to_string().into(),
             name: "edit".to_string(),
             input: serde_json::json!({
                 "file_path": "demo.txt",
@@ -537,7 +537,7 @@ fn test_expand_badge_shortcut_uses_display_messages_when_edit_count_is_stale() {
     app.display_messages.push(DisplayMessage::tool(
         "Edited demo.txt".to_string(),
         crate::message::ToolCall {
-            id: "edit_1".to_string(),
+            id: "edit_1".to_string().into(),
             name: "edit".to_string(),
             input: serde_json::json!({
                 "file_path": "demo.txt",
@@ -1080,7 +1080,7 @@ fn test_real_draw_click_on_body_anchored_image_label_cycles_level() {
         DisplayMessage::tool(
             "read shot.png",
             crate::message::ToolCall {
-                id: TOOL_ID.to_string(),
+                id: TOOL_ID.to_string().into(),
                 name: "read".to_string(),
                 input: serde_json::json!({"file_path": "shot.png"}),
                 intent: None,
@@ -1233,7 +1233,7 @@ fn test_real_draw_never_emits_inline_image_marker_text() {
         DisplayMessage::tool(
             "read shot.png",
             crate::message::ToolCall {
-                id: TOOL_ID.to_string(),
+                id: TOOL_ID.to_string().into(),
                 name: "read".to_string(),
                 input: serde_json::json!({"file_path": "shot.png"}),
                 intent: None,

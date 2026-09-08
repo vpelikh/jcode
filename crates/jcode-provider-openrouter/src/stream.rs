@@ -843,7 +843,7 @@ mod tests {
         assert_eq!(events.len(), 4, "events: {events:?}");
         assert!(matches!(
             &events[0],
-            StreamEvent::ToolUseStart { id, name } if id == "call_1" && name == "bash"
+            StreamEvent::ToolUseStart { id, name } if id.as_str() == "call_1" && name == "bash"
         ));
         assert!(matches!(
             &events[1],
@@ -892,7 +892,7 @@ mod tests {
                     StreamEvent::ToolUseEnd,
                     StreamEvent::ToolUseSignature(signature),
                     StreamEvent::MessageEnd { stop_reason: Some(reason) },
-                ] if id == "call_vertex"
+                ] if id.as_str() == "call_vertex"
                     && name == "read"
                     && arguments == "{\"path\":\"README.md\"}"
                     && signature == "AY89a1...verbatim"
@@ -918,8 +918,8 @@ mod tests {
             match stream.pending.pop_front() {
                 Some(StreamEvent::ToolUseStart { id, name }) => {
                     assert_eq!(name, "bash");
-                    assert!(id.starts_with("toolu_"), "unexpected fallback id: {id}");
-                    id
+                    assert!(id.as_str().starts_with("toolu_"), "unexpected fallback id: {id}");
+                    id.to_string()
                 }
                 event => panic!("expected tool-use start, got {event:?}"),
             }
