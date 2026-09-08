@@ -2160,10 +2160,14 @@ mod tests {
         build_compass_index(&root, &output_dir, &ast_cache_root).expect("build");
         let engine = compass_query::open(&graph_path, None, &output_dir).expect("open after build");
 
-        // u32::MAX + 1 would wrap to 0 under a naive `as u32`.
+        // u32::MAX + 1 would wrap to 0 under a naive `as u32`. `authenticate`
+        // (not `authentication`) matches the isolated project's single
+        // `fn authenticate` node, so this also end-to-end verifies that a real
+        // compass query renders a source snippet from the built index — not
+        // just this tool's hand-built fixtures.
         let out = execute_query(
             &engine,
-            "authentication",
+            "authenticate",
             None,
             u64::MAX as usize,
             "search",
@@ -2173,6 +2177,14 @@ mod tests {
         assert!(
             out.contains("result(s)"),
             "expected a result report, got: {out}"
+        );
+        assert!(
+            out.contains("fn authenticate"),
+            "real compass query must render a source snippet, got: {out}"
+        );
+        assert!(
+            out.contains("```"),
+            "real compass query snippet must be fenced, got: {out}"
         );
     }
 
