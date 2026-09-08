@@ -4394,7 +4394,7 @@ pub(crate) fn render_tool_message(
 
     // Optionally render the full compass_query search output inline in the
     // transcript. Gated behind `display.show_compass_query_output` (default
-    // false) so most users keep the compact one-line summary. The output is
+    // true); set false to keep only the compact one-line summary. The output is
     // structured markdown, so it renders through the markdown pipeline.
     if tools_ui::canonical_tool_name(&tc.name) == "compass_query"
         && tools_ui::show_compass_query_output()
