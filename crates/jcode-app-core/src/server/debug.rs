@@ -271,9 +271,6 @@ pub(super) async fn handle_debug_client(
     let shared_context = swarm_service.shared_context;
     let swarm_plans = swarm_service.swarm_state.plans;
     let swarm_coordinators = swarm_service.swarm_state.coordinators;
-    let file_touch = swarm_service.file_touch;
-    let channel_subscriptions = swarm_service.channel_subscriptions;
-    let channel_subscriptions_by_session = swarm_service.channel_subscriptions_by_session;
     let client_debug_state = debug_service.client_debug_state;
     let client_debug_response_tx = debug_service.client_debug_response_tx;
     let debug_jobs = debug_service.debug_jobs;
@@ -461,19 +458,11 @@ pub(super) async fn handle_debug_client(
                             cmd,
                             &sessions,
                             &client_connections,
-                            &swarm_members,
+                            &swarm_service_handle,
                             &client_debug_state,
                             &server_identity,
                             server_start_time,
-                            &swarms_by_id,
-                            &shared_context,
-                            &swarm_plans,
-                            &swarm_coordinators,
-                            &file_touch,
-                            &channel_subscriptions,
-                            &channel_subscriptions_by_session,
                             &debug_jobs,
-                            &event_history,
                             &shutdown_signals,
                             &soft_interrupt_queues,
                         )
