@@ -1721,6 +1721,23 @@ fn branch_checked_out_elsewhere(repo_root: &std::path::Path, branch: &str) -> Re
     Ok(false)
 }
 
+/// The branch the main checkout is currently on, if any.
+///
+/// Reads the first (main) block of `git worktree list --porcelain`. Used to give
+/// a precise error when the user asks to create a worktree on the branch the
+/// main checkout already has attached.
+fn main_checkout_branch(repo_root: &std::path::Path) -> Result<Option<String>, String> {
+    let porcelain = run_git_command(repo_root, &["worktree", "list", "--porcelain"])?;
+    let main_block = porcelain
+        .split("\n\n")
+        .next()
+        .unwrap_or_default();
+    Ok(main_block
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("branch refs/heads/"))
+        .map(str::to_string))
+}
+
 /// Create a new git worktree and return its absolute path.
 ///
 /// Pure computation (no `App` borrow): resolves the repo root from `work_dir`,
@@ -1770,6 +1787,14 @@ pub(super) fn create_git_worktree_at(
             return Err(format!(
                 "Branch '{branch}' is already checked out in another worktree; \
                  pick a different branch or worktree name."
+            ));
+        }
+        // A branch that is the main checkout's current branch cannot be attached
+        // to a second worktree; give a precise error instead of a bare git one.
+        if main_checkout_branch(&repo_root)?.as_deref() == Some(branch.as_str()) {
+            return Err(format!(
+                "Branch '{branch}' is already checked out in the main worktree; \
+                 use a different branch or worktree name."
             ));
         }
         // Attach the existing branch to the new worktree.

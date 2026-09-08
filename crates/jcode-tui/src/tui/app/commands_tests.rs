@@ -679,4 +679,42 @@ mod worktree {
             .current_dir(&repo)
             .output();
     }
+
+    #[test]
+    fn create_git_worktree_reports_main_checkout_branch_reuse() {
+        use crate::tui::app::tests::create_test_app;
+        use std::process::Command;
+
+        // Throwaway repo whose main checkout is on `main`.
+        let home = tempfile::tempdir().expect("temp home");
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for (args, envs) in [
+            (vec!["init", "-b", "main"], vec![]),
+            (vec!["add", "."], vec![]),
+            (vec!["commit", "-m", "init"], vec![("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")]),
+        ] {
+            let mut cmd = Command::new("git");
+            cmd.args(&args).current_dir(&repo);
+            for (k, v) in envs {
+                cmd.env(k, v);
+            }
+            if args[0] == "add" {
+                std::fs::write(repo.join("file.txt"), "hi\n").unwrap();
+            }
+            assert!(cmd.output().unwrap().status.success(), "git {args:?}");
+        }
+
+        let mut app = create_test_app();
+        app.session.working_dir = Some(repo.display().to_string());
+
+        // Attaching a branch that is already the main checkout's branch cannot
+        // be checked into a second worktree; report it precisely.
+        let spec = super::parse_worktree_spec("new-slot -b main").unwrap();
+        let err = super::create_git_worktree(&app, &spec).unwrap_err();
+        assert!(
+            err.contains("already checked out in the main worktree"),
+            "expected a main-worktree reuse error, got: {err}"
+        );
+    }
 }
