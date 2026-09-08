@@ -2740,7 +2740,7 @@ impl Provider for FillerWithToolProvider {
                     .await;
                 let _ = tx
                     .send(Ok(StreamEvent::ToolUseStart {
-                        id: "call_stalled_with_tool".to_string(),
+                        id: "call_stalled_with_tool".to_string().into(),
                         name: "bash".to_string(),
                     }))
                     .await;
@@ -3093,7 +3093,7 @@ impl Provider for CompactWithToolProvider {
                     .await;
                 let _ = tx
                     .send(Ok(StreamEvent::ToolUseStart {
-                        id: "call_compact_with_tool".to_string(),
+                        id: "call_compact_with_tool".to_string().into(),
                         name: "bash".to_string(),
                     }))
                     .await;

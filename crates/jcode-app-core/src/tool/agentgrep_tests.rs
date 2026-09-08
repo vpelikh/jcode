@@ -878,7 +878,7 @@ fn bash_exposure_collects_file_and_line_hits() {
     let mut focus = HashSet::new();
     let mut file_mtime_cache = HashMap::new();
     let tool = ToolCall {
-        id: "tool-1".to_string(),
+        id: "tool-1".to_string().into(),
         name: "bash".to_string(),
         input: json!({
             "command": "cat src/tool/lsp.rs && rg -n auth_status src/tool/lsp.rs"

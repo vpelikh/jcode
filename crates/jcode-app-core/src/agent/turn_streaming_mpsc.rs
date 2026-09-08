@@ -1671,7 +1671,7 @@ mod tests {
 
     fn tool_call(name: &str, input: serde_json::Value) -> ToolCall {
         ToolCall {
-            id: "toolu_test".to_string(),
+            id: "toolu_test".to_string().into(),
             name: name.to_string(),
             input,
             intent: None,
