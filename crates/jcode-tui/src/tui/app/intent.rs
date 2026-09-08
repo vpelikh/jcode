@@ -203,9 +203,7 @@ mod tests {
                 .expect("should trigger");
         assert_eq!(id, "new_worktree");
         assert_eq!(label, "new worktree");
-        let IntentCommand::NewWorktree(spec) = got else {
-            panic!("expected NewWorktree");
-        };
+        let IntentCommand::NewWorktree(spec) = got;
         assert_eq!(spec.name, "panel-settings");
     }
 
@@ -214,9 +212,7 @@ mod tests {
         let (_, _, got) =
             detect_intent("create a new worktree for \"server-split\" and do it there")
                 .expect("should trigger");
-        let IntentCommand::NewWorktree(spec) = got else {
-            panic!("expected NewWorktree");
-        };
+        let IntentCommand::NewWorktree(spec) = got;
         assert_eq!(spec.name, "server-split");
     }
 
@@ -225,9 +221,7 @@ mod tests {
         let (_, _, got) =
             detect_intent("please make a new worktree for the panel-settings feature")
                 .expect("should trigger");
-        let IntentCommand::NewWorktree(spec) = got else {
-            panic!("expected NewWorktree");
-        };
+        let IntentCommand::NewWorktree(spec) = got;
         assert_eq!(spec.name, "panel-settings");
     }
 
@@ -292,9 +286,7 @@ mod tests {
             ("create a worktree for the APIClient work", "APIClient"),
         ] {
             let (_, _, got) = detect_intent(prompt).expect("should trigger: {prompt}");
-            let IntentCommand::NewWorktree(spec) = got else {
-                panic!("expected NewWorktree");
-            };
+            let IntentCommand::NewWorktree(spec) = got;
             assert_eq!(spec.name, expected, "for prompt {prompt:?}");
         }
     }
