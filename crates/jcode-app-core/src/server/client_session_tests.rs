@@ -1,10 +1,10 @@
+use crate::server::services::SwarmServiceHandle;
 use super::{
     apply_or_defer_subscribe_working_dir, claim_live_target_agent, effective_subscribe_working_dir,
     handle_clear_session, handle_reload, handle_resume_session, handle_subscribe,
     mark_remote_reload_started, prewarm_idle_agent, remove_detached_source_if_unclaimed,
     rename_shutdown_signal, rename_swarm_member_session, restored_session_was_interrupted,
-    session_was_interrupted_by_reload, subscribe_should_mark_ready,
-    subscribe_working_dir_replacement,
+    session_was_interrupted_by_reload, subscribe_working_dir_replacement,
 };
 use crate::agent::Agent;
 use crate::message::ContentBlock;
@@ -12,8 +12,8 @@ use crate::message::{Message, ToolDefinition};
 use crate::protocol::ServerEvent;
 use crate::provider::{EventStream, Provider};
 use crate::server::{
-    ClientConnectionInfo, ClientDebugState, FileTouchService, SessionInterruptQueues, SwarmEvent,
-    SwarmMember, VersionedPlan,
+    AwaitMembersRuntime, ClientConnectionInfo, ClientDebugState, FileTouchService,
+    SessionInterruptQueues, SwarmEvent, SwarmMember, SwarmMutationRuntime, SwarmState, VersionedPlan,
 };
 use crate::tool::Registry;
 use anyhow::Result;
@@ -123,13 +123,66 @@ fn test_swarm_member(session_id: &str, status: &str) -> SwarmMember {
     }
 }
 
+/// Build a minimal `SwarmServiceHandle` from a members map for testing the
+/// swarm service's membership reads in isolation.
+fn swarm_handle_from_members(
+    members: Arc<RwLock<HashMap<String, SwarmMember>>>,
+) -> SwarmServiceHandle {
+    swarm_handle_full(
+        members,
+        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(RwLock::new(VecDeque::new())),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        broadcast::channel(8).0,
+    )
+}
+
+/// Build a `SwarmServiceHandle` from the constituent swarm maps. Tests that
+/// exercise swarm behavior pass their real maps so membership/plan/channel
+/// state is shared with the code under test.
+#[allow(clippy::too_many_arguments)]
+fn swarm_handle_full(
+    members: Arc<RwLock<HashMap<String, SwarmMember>>>,
+    swarms_by_id: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    plans: Arc<RwLock<HashMap<String, VersionedPlan>>>,
+    coordinators: Arc<RwLock<HashMap<String, String>>>,
+    channel_subscriptions: Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>,
+    channel_subscriptions_by_session: Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>,
+    event_history: Arc<RwLock<VecDeque<SwarmEvent>>>,
+    event_counter: Arc<std::sync::atomic::AtomicU64>,
+    swarm_event_tx: broadcast::Sender<SwarmEvent>,
+) -> SwarmServiceHandle {
+    SwarmServiceHandle {
+        swarm_state: SwarmState {
+            members,
+            swarms_by_id,
+            plans,
+            coordinators,
+        },
+        shared_context: Arc::new(RwLock::new(HashMap::new())),
+        file_touch: FileTouchService::new(),
+        channel_subscriptions,
+        channel_subscriptions_by_session,
+        event_history,
+        event_counter,
+        swarm_event_tx,
+        await_members_runtime: AwaitMembersRuntime::default(),
+        swarm_mutation_runtime: SwarmMutationRuntime::default(),
+    }
+}
+
 #[tokio::test]
 async fn subscribe_does_not_mark_running_startup_worker_ready() {
     let swarm_members = Arc::new(RwLock::new(HashMap::from([(
         "worker".to_string(),
         test_swarm_member("worker", "running"),
     )])));
-    assert!(!subscribe_should_mark_ready("worker", &swarm_members).await);
+    let handle = swarm_handle_from_members(swarm_members);
+    assert!(!handle.member_should_mark_ready("worker").await);
 }
 
 #[tokio::test]
@@ -138,7 +191,8 @@ async fn subscribe_marks_non_running_member_ready() {
         "worker".to_string(),
         test_swarm_member("worker", "spawned"),
     )])));
-    assert!(subscribe_should_mark_ready("worker", &swarm_members).await);
+    let handle = swarm_handle_from_members(swarm_members);
+    assert!(handle.member_should_mark_ready("worker").await);
 }
 
 #[tokio::test]

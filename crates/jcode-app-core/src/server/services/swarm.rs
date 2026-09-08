@@ -58,4 +58,15 @@ impl SwarmServiceHandle {
             swarm_mutation_runtime: server.swarm_mutation_runtime.clone(),
         }
     }
+
+    /// Whether a freshly arrived (or reconnecting) member should be marked
+    /// `ready` after subscribe: `true` unless the member is currently mid-turn
+    /// (`running`). Moving this read behind the swarm service keeps session
+    /// lifecycle code from reaching into the raw membership map.
+    pub(crate) async fn member_should_mark_ready(&self, session_id: &str) -> bool {
+        let members = self.swarm_state.members.read().await;
+        members
+            .get(session_id)
+            .is_none_or(|member| member.status != "running")
+    }
 }

@@ -446,6 +446,11 @@ pub(super) async fn handle_client(
     // preserving every downstream reference. This is Slice 3 of the server
     // service split: callers pass typed handles instead of a 28-arg positional
     // list, while the handler body is unchanged.
+    // Swarm-domain operations in the session lifecycle functions take the
+    // handle by reference (server service split, Slice 4). Clone it up front so
+    // the flat-local destructuring below can still move the swarm fields out of
+    // the original while the handle stays available to route through.
+    let swarm_service_handle = swarm_service.clone();
     let sessions = session_service.sessions;
     let provider_template = client_service.provider;
     let global_session_id = session_service.session_id;
@@ -1666,17 +1671,9 @@ pub(super) async fn handle_client(
                                 &agent,
                                 &registry,
                                 swarm_enabled,
-                                &swarm_members,
-                                &swarms_by_id,
-                                &channel_subscriptions,
-                                &channel_subscriptions_by_session,
-                                &swarm_plans,
-                                &swarm_coordinators,
+                                &swarm_service_handle,
                                 &client_event_tx,
                                 &mcp_pool,
-                                &event_history,
-                                &event_counter,
-                                &swarm_event_tx,
                             )
                             .await;
                             if let Some(snapshot) = try_available_models_snapshot(&agent) {
@@ -1706,17 +1703,9 @@ pub(super) async fn handle_client(
                             &agent,
                             &registry,
                             swarm_enabled,
-                            &swarm_members,
-                            &swarms_by_id,
-                            &channel_subscriptions,
-                            &channel_subscriptions_by_session,
-                            &swarm_plans,
-                            &swarm_coordinators,
+                            &swarm_service_handle,
                             &client_event_tx,
                             &mcp_pool,
-                            &event_history,
-                            &event_counter,
-                            &swarm_event_tx,
                         )
                         .await;
                     }
@@ -1737,17 +1726,9 @@ pub(super) async fn handle_client(
                         &agent,
                         &registry,
                         swarm_enabled,
-                        &swarm_members,
-                        &swarms_by_id,
-                        &channel_subscriptions,
-                        &channel_subscriptions_by_session,
-                        &swarm_plans,
-                        &swarm_coordinators,
+                        &swarm_service_handle,
                         &client_event_tx,
                         &mcp_pool,
-                        &event_history,
-                        &event_counter,
-                        &swarm_event_tx,
                     )
                     .await;
                     if let Some(snapshot) = try_available_models_snapshot(&agent) {

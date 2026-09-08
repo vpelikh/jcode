@@ -1,5 +1,6 @@
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
 
+use super::services::SwarmServiceHandle;
 use super::client_state::{handle_get_history, spawn_model_prefetch_update};
 use super::{
     ClientConnectionInfo, ClientDebugState, FileTouchService, SessionInterruptQueues, SwarmEvent,
@@ -603,18 +604,23 @@ pub(super) async fn handle_subscribe(
     agent: &Arc<Mutex<Agent>>,
     registry: &Registry,
     swarm_enabled: bool,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    channel_subscriptions: &ChannelSubscriptions,
-    channel_subscriptions_by_session: &ChannelSubscriptions,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
+    swarm: &SwarmServiceHandle,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
     mcp_pool: &Arc<crate::mcp::SharedMcpPool>,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
 ) {
+    // Swarm-domain state is reached through the swarm service handle. These
+    // locals keep the body single-homed on the handle's fields instead of a
+    // flat pass-through argument bag (server service split, Slice 4).
+    let swarm_members = &swarm.swarm_state.members;
+    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let swarm_plans = &swarm.swarm_state.plans;
+    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let channel_subscriptions = &swarm.channel_subscriptions;
+    let channel_subscriptions_by_session = &swarm.channel_subscriptions_by_session;
+    let event_history = &swarm.event_history;
+    let event_counter = &swarm.event_counter;
+    let swarm_event_tx = &swarm.swarm_event_tx;
+
     let subscribe_start = Instant::now();
     crate::logging::event_info(
         "SESSION_LIFECYCLE",
@@ -891,7 +897,7 @@ pub(super) async fn handle_subscribe(
         ],
     );
 
-    if subscribe_should_mark_ready(client_session_id, swarm_members).await {
+    if swarm.member_should_mark_ready(client_session_id).await {
         update_member_status(
             client_session_id,
             "ready",
@@ -929,16 +935,6 @@ fn prewarm_idle_agent(agent: &Arc<Mutex<Agent>>) -> bool {
         return false;
     };
     guard.prewarm_provider().now_or_never().is_some()
-}
-
-async fn subscribe_should_mark_ready(
-    client_session_id: &str,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-) -> bool {
-    let members = swarm_members.read().await;
-    members
-        .get(client_session_id)
-        .is_none_or(|member| member.status != "running")
 }
 
 async fn rename_swarm_member_session(
