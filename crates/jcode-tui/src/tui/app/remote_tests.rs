@@ -1502,6 +1502,90 @@ fn auto_trigger_is_suppressed_while_agent_is_working() {
     );
 }
 
+/// True end-to-end through the user-facing key path: typing a *plain* prompt
+/// (no slash command) that expresses worktree intent and pressing Enter must
+/// auto-trigger the command — create a real worktree, move the session into it,
+/// show the notice, and forward the original prompt.
+#[test]
+fn plain_typed_prompt_auto_triggers_new_worktree_via_enter_key() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    use std::process::Command;
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+
+    let home = tempfile::tempdir().expect("temp home");
+    let repo = home.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    for args in [vec!["init", "-b", "main"], vec!["add", "."]] {
+        let mut cmd = Command::new("git");
+        cmd.args(&args).current_dir(&repo);
+        if args[0] == "add" {
+            std::fs::write(repo.join("file.txt"), "hi\n").unwrap();
+        }
+        assert!(cmd.output().unwrap().status.success(), "git {args:?}");
+    }
+    let commit = Command::new("git")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .args(["commit", "-m", "init"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(commit.status.success(), "git commit failed");
+
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.remote_session_id = Some("active_sess".to_string());
+    app.session.working_dir = Some(repo.display().to_string());
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    remote.mark_history_loaded();
+    let request_id_before = remote.next_request_id_for_test();
+
+    // The user types a natural-language request, no slash prefix.
+    app.set_input_for_test("make a new worktree for \"wide-gadget\" and do the work there".to_string());
+    rt.block_on(app.handle_remote_key(KeyCode::Enter, KeyModifiers::empty(), &mut remote))
+        .expect("plain prompt with worktree intent should be handled");
+
+    // The worktree is created and the session moved into it.
+    let worktree_dir = repo.join(".worktrees").join("wide-gadget");
+    assert!(worktree_dir.exists(), "typed intent should create the worktree");
+    let branch = Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(&worktree_dir)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&branch.stdout).trim(), "feat/wide-gadget");
+    assert!(
+        remote.next_request_id_for_test() > request_id_before,
+        "typed intent must send a SetWorkingDir request"
+    );
+
+    // The auto-trigger notice is shown.
+    assert!(
+        app.display_messages()
+            .iter()
+            .any(|m| m.content.contains("Automatically started new worktree")),
+        "typed intent should show the auto-trigger notice"
+    );
+
+    let _ = Command::new("git")
+        .args([
+            "worktree",
+            "remove",
+            "--force",
+            &worktree_dir.display().to_string(),
+        ])
+        .current_dir(&repo)
+        .output();
+    let _ = Command::new("git")
+        .args(["branch", "-D", "feat/wide-gadget"])
+        .current_dir(&repo)
+        .output();
+}
+
 /// Reproduces the "stuck on loading session…" bug and verifies the watchdog
 /// recovers it: a remote connection that never receives the bootstrap History
 /// event (so `has_loaded_history()` stays false) must re-request `GetHistory`
