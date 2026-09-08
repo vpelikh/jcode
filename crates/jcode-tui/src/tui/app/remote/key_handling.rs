@@ -270,8 +270,11 @@ pub(in crate::tui::app) async fn handle_remote_key_event(
 /// trigger: create a git worktree and move the session into it in place.
 ///
 /// Enforces the same guard the slash handler used to (rejects while the agent
-/// is working). Returns the created worktree's absolute path, or `None` when
-/// the request could not be honored (an error notice is already shown).
+/// is working). Returns the created worktree's absolute path only when the
+/// session was actually moved into it (the chained `/cd` succeeded), or `None`
+/// when the request could not be fully honored — either the worktree was not
+/// created, or it was created but the session could not be moved into it (an
+/// explanatory notice is shown in both cases).
 pub(in crate::tui::app) async fn invoke_new_worktree(
     app: &mut App,
     remote: &mut RemoteConnection,
@@ -298,13 +301,15 @@ pub(in crate::tui::app) async fn invoke_new_worktree(
             } else {
                 // The worktree was created but we could not move into it; still
                 // surface the created path so the user can /cd manually if the
-                // server round-trip failed.
+                // server round-trip failed. Deliberately do NOT return the path
+                // as a completed move, so a caller (e.g. the auto-trigger)
+                // does not advertise the session as running in the worktree.
                 app.push_display_message(DisplayMessage::system(format!(
                     "Created worktree {}. The session could not be moved into it automatically; use /cd {} to switch.",
                     worktree_dir.display(),
                     worktree_dir.display()
                 )));
-                Some(worktree_dir)
+                None
             }
         }
         Err(error) => {
