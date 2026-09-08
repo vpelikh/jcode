@@ -1377,7 +1377,7 @@ fn auto_trigger_through_submit_prepared_remote_input_forwards_prompt_and_moves()
     assert!(
         app.display_messages()
             .iter()
-            .any(|m| m.role == "system" && m.content.contains("Automatically started new worktree")),
+            .any(|m| m.role == "system" && m.content.contains("moved this session into it")),
         "expected an auto-trigger notice"
     );
 
@@ -1435,7 +1435,7 @@ fn auto_trigger_is_suppressed_while_agent_is_working() {
         !app
             .display_messages()
             .iter()
-            .any(|m| m.content.contains("Automatically started")),
+            .any(|m| m.content.contains("moved this session into it")),
         "busy agent must not show a success notice"
     );
 }
@@ -1485,7 +1485,7 @@ fn plain_typed_prompt_auto_triggers_new_worktree_via_enter_key() {
     assert!(
         app.display_messages()
             .iter()
-            .any(|m| m.content.contains("Automatically started new worktree")),
+            .any(|m| m.content.contains("moved this session into it")),
         "typed intent should show the auto-trigger notice"
     );
 
@@ -1536,7 +1536,7 @@ fn plain_mention_of_worktree_does_not_auto_trigger_via_enter_key() {
         !app
             .display_messages()
             .iter()
-            .any(|m| m.content.contains("Automatically started")),
+            .any(|m| m.content.contains("moved this session into it")),
         "a mention must not show an auto-trigger notice"
     );
 }

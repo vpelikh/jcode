@@ -566,13 +566,13 @@ mod worktree {
     }
 
     #[test]
-    fn create_git_worktree_rejects_already_existing_branch_and_cleans_empty_dir() {
+    fn create_git_worktree_attaches_an_existing_branch() {
         use crate::tui::app::tests::create_test_app;
         use std::process::Command;
 
         // Throwaway repo with a pre-existing `feat/used` branch so that
-        // `git worktree add -b feat/used <dir>` fails partway (branch
-        // collision) and must clean up the empty target dir it created.
+        // `git worktree add -b feat/used <dir>` fails on the branch-collision;
+        // the helper must fall back to attaching the existing branch.
         let home = tempfile::tempdir().expect("temp home");
         let repo = home.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -596,16 +596,29 @@ mod worktree {
         let mut app = create_test_app();
         app.session.working_dir = Some(repo.display().to_string());
 
-        // A worktree name whose default branch already exists must fail...
+        // A worktree name whose default branch already exists succeeds by
+        // attaching the existing branch rather than failing.
         let spec = super::parse_worktree_spec("used").unwrap();
-        let err = super::create_git_worktree(&app, &spec).unwrap_err();
-        assert!(!err.is_empty(), "branch collision must be reported");
+        let wt_path = super::create_git_worktree(&app, &spec).expect("should attach existing branch");
+        assert_eq!(wt_path, repo.join(".worktrees").join("used"));
+        assert!(wt_path.join("file.txt").exists(), "worktree should be populated");
 
-        // ...and must NOT leave a partial empty dir behind.
-        let leftover = repo.join(".worktrees").join("used");
-        assert!(
-            !leftover.exists(),
-            "failed worktree creation must clean up its empty target dir"
-        );
+        // The checked-out branch is the pre-existing one.
+        let branch = Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(&wt_path)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&branch.stdout).trim(), "feat/used");
+
+        // Cleanup.
+        let _ = Command::new("git")
+            .args(["worktree", "remove", "--force", &wt_path.display().to_string()])
+            .current_dir(&repo)
+            .output();
+        let _ = Command::new("git")
+            .args(["branch", "-D", "feat/used"])
+            .current_dir(&repo)
+            .output();
     }
 }

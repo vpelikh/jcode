@@ -147,12 +147,12 @@ pub(in crate::tui::app) async fn submit_prepared_remote_input(
     // "make a new worktree for X and work there") that should be honored before
     // the message is forwarded to the agent. This is the generic hook so new
     // auto-invocable commands only need a rule in `app::intent`.
-    if let Some((id, label, command)) = app_mod::intent::detect_intent(&prepared.expanded)
-        && dispatch_intent_command(app, remote, command).await.is_ok()
+    if let Some((id, _label, command)) = app_mod::intent::detect_intent(&prepared.expanded)
+        && let Ok(created_display) = dispatch_intent_command(app, remote, command).await
     {
         app.push_display_message(DisplayMessage {
             role: "system".to_string(),
-            content: app_mod::intent::intent_notice(label),
+            content: app_mod::intent::intent_notice(&created_display),
             tool_calls: vec![],
             duration_secs: None,
             title: None,
@@ -182,17 +182,19 @@ pub(in crate::tui::app) async fn submit_prepared_remote_input(
 ///
 /// This is the generic bridge between the natural-language intent layer
 /// (`app::intent`) and the command execution shared with slash commands
-/// (`invoke_new_worktree`). It returns an error only when the command could
-/// not be honored; a user-visible error notice is already pushed in that case.
+/// (`invoke_new_worktree`). On success it returns the user-facing path of the
+/// created worktree (the session was moved into it). It returns an error only
+/// when the command could not be honored; a user-visible error notice is
+/// already pushed in that case.
 pub(in crate::tui::app) async fn dispatch_intent_command(
     app: &mut App,
     remote: &mut RemoteConnection,
     command: app_mod::intent::IntentCommand,
-) -> Result<(), ()> {
+) -> Result<String, ()> {
     match command {
         app_mod::intent::IntentCommand::NewWorktree(spec) => {
             match super::invoke_new_worktree(app, remote, spec).await {
-                Some(_) => Ok(()),
+                Some(path) => Ok(path.display().to_string()),
                 None => Err(()),
             }
         }

@@ -1714,24 +1714,52 @@ pub(super) fn create_git_worktree_at(
     // bytes. `git` takes the target path as a byte string; rather than silently
     // passing an empty string on a lossy conversion, surface a clear error so
     // the user knows the worktree was not created.
-    let worktree_dir_str = worktree_dir
-        .to_str()
-        .ok_or_else(|| format!("Cannot create worktree at a non-UTF-8 path: {}", worktree_dir.display()))?;
-
-    run_git_command(
-        &repo_root,
-        &["worktree", "add", "-b", &branch, "-q", worktree_dir_str],
-    )
-    .inspect_err(|_error| {
-        // `git worktree add` creates the target dir while preparing; if it
-        // fails partway (e.g. branch name collision) it may leave an empty dir
-        // behind. Clean it up so a retry with a corrected name is clean.
-        if worktree_dir.read_dir().map(|mut it| it.next().is_none()).unwrap_or(false) {
-            let _ = std::fs::remove_dir(&worktree_dir);
-        }
+    let worktree_dir_str = worktree_dir.to_str().ok_or_else(|| {
+        format!("Cannot create worktree at a non-UTF-8 path: {}", worktree_dir.display())
     })?;
 
-    Ok(worktree_dir)
+    // Try to create a new branch for the worktree. If the branch already exists
+    // (a common case when re-running or when the user supplied `-b <branch>` for
+    // a branch that is already checked out/created), git refuses to create it
+    // with `-b`. Rather than fail, fall back to attaching that existing branch
+    // to the worktree.
+    let first = run_git_command(
+        &repo_root,
+        &["worktree", "add", "-b", &branch, "-q", worktree_dir_str],
+    );
+    match first {
+        Ok(_) => Ok(worktree_dir),
+        Err(error) => {
+            // `git worktree add` creates the target dir while preparing; if it
+            // fails partway (e.g. branch name collision) it may leave an empty
+            // dir behind. Clean it up before retrying so the fallback starts
+            // from a clean path.
+            if worktree_dir.read_dir().map(|mut it| it.next().is_none()).unwrap_or(false) {
+                let _ = std::fs::remove_dir(&worktree_dir);
+            }
+
+            let looks_like_branch_exists = ["already exists", "already used", "already checked out"]
+                .iter()
+                .any(|needle| error.to_lowercase().contains(needle));
+
+            if looks_like_branch_exists {
+                // Attach the existing branch instead of creating a new one.
+                return run_git_command(
+                    &repo_root,
+                    &["worktree", "add", "-q", worktree_dir_str, &branch],
+                )
+                .map_err(|retry_error| {
+                    format!(
+                        "Branch '{branch}' already exists and could not be attached \
+                         ({retry_error}). Original error: {error}"
+                    )
+                })
+                .map(|_| worktree_dir);
+            }
+
+            Err(error)
+        }
+    }
 }
 
 /// Resolve the session's working directory for git operations.

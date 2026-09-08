@@ -59,9 +59,13 @@ pub(super) fn detect_intent(prompt: &str) -> Option<(&'static str, &'static str,
         .find_map(|rule| (rule.match_fn)(prompt).map(|command| (rule.id, rule.label, command)))
 }
 
-/// Human-readable notice shown when a trigger is about to run.
-pub(super) fn intent_notice(label: &str) -> String {
-    format!("Automatically started {label} for this session.")
+/// Precise success notice for an auto-triggered command.
+///
+/// `created_display` is the user-facing path of the worktree that was created
+/// and into which the session was moved. This is shown only after a real
+/// create + move, so the wording states both facts accurately.
+pub(super) fn intent_notice(created_display: &str) -> String {
+    format!("Created worktree {created_display} and moved this session into it.")
 }
 
 /// Match a plain prompt that asks to begin work in a new worktree, deriving
@@ -112,38 +116,22 @@ fn detect_new_worktree(prompt: &str) -> Option<IntentCommand> {
     Some(IntentCommand::NewWorktree(spec))
 }
 
-/// Single-token subjects that are too weak to name a feature (articles,
-/// pronouns, generic determiners). A `for <x>` / `called <x>` extraction that
-/// yields one of these is treated as "no usable name", so the trigger stays
-/// silent rather than creating a worktree named `my` or `this`.
-fn is_weak_single_token(name: &str) -> bool {
-    matches!(
-        name.to_lowercase().as_str(),
-        "a" | "an"
-            | "the"
-            | "my"
-            | "our"
-            | "your"
-            | "this"
-            | "that"
-            | "these"
-            | "those"
-            | "some"
-            | "any"
-            | "each"
-            // Generic single adjectives/nouns that are poor worktree names on
-            // their own; a phrase like "for the new feature UI" must not yield
-            // a worktree named "new".
-            | "new"
-            | "next"
-            | "upcoming"
-            | "feature"
-            | "features"
-            | "work"
-            | "works"
-            | "project"
-            | "projects"
-    )
+/// Whether `name` is "identifier-like" enough to safely auto-derive a worktree
+/// name from natural language.
+///
+/// A bare single lowercase English word (e.g. `analysis`, `ui`, `project`) is
+/// ambiguous — it is usually part of a larger phrase ("for the analysis work"),
+/// so auto-naming a worktree after it is a guess. We only auto-derive when the
+/// subject is clearly a feature identifier: it contains a digit, a separator
+/// (`-`, `_`, `.`), or an uppercase letter (camelCase / an acronym like `UI`).
+/// Quoted names always qualify.
+///
+/// This is a *principled* precision rule rather than a denylist, so it cannot
+/// drift as the codebase enumerates more generic words.
+fn is_identifier_like(name: &str) -> bool {
+    name.chars().any(|c| {
+        c.is_ascii_digit() || c == '-' || c == '_' || c == '.' || c.is_uppercase()
+    })
 }
 
 /// Extract a concise worktree/feature name from a prompt, or `None`.
@@ -153,9 +141,9 @@ fn is_weak_single_token(name: &str) -> bool {
 ///  2. `called <x>` / `named <x>` → the following token.
 ///  3. `for <x>` → the following token (the subject).
 ///
-/// The name must be a single safe path segment (validated by
-/// [`parse_worktree_spec`]); if parsing rejects it, or the subject is only a
-/// weak word like "the", the trigger stays silent.
+/// The name must be a single safe path segment that is unambiguously
+/// identifier-like (quoted, or contains a digit/separator/uppercase); otherwise
+/// the trigger stays silent and defers to a manual `/worktree`.
 fn extract_worktree_name(prompt: &str) -> Option<String> {
     static QUOTED: OnceLock<Regex> = OnceLock::new();
     let quoted = QUOTED.get_or_init(|| {
@@ -172,15 +160,11 @@ fn extract_worktree_name(prompt: &str) -> Option<String> {
         )
         .expect("subject name regex")
     });
-    let name = subject
+    subject
         .captures(prompt)
         .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_string())?;
-    // A weak single-token subject ("for my project") must not name a worktree.
-    if is_weak_single_token(&name) {
-        return None;
-    }
-    Some(name)
+        .map(|m| m.as_str().to_string())
+        .filter(|name| is_identifier_like(name))
 }
 
 #[cfg(test)]
@@ -280,6 +264,38 @@ mod tests {
         ] {
             let got = detect_intent(prompt);
             assert!(got.is_none(), "{prompt:?} should not trigger, got {got:?}");
+        }
+    }
+
+    #[test]
+    fn bare_lowercase_subject_defer_to_manual_worktree() {
+        // A subject that is a single all-lowercase English word is ambiguous
+        // ("for the analysis work" reads the subject as "analysis"), so it must
+        // not auto-derive a name. The user runs /worktree to name it precisely.
+        for prompt in [
+            "create a worktree for the analysis",
+            "create a worktree for panel",
+            "make a worktree for project",
+        ] {
+            let got = detect_intent(prompt);
+            assert!(got.is_none(), "{prompt:?} should not trigger, got {got:?}");
+        }
+    }
+
+    #[test]
+    fn identifier_like_subjects_derive_a_name() {
+        // A subject that is clearly an identifier (hyphen, digit, or camelCase)
+        // is a safe auto-derived worktree name.
+        for (prompt, expected) in [
+            ("create a worktree for panel-settings", "panel-settings"),
+            ("make a worktree for server2", "server2"),
+            ("create a worktree for the APIClient work", "APIClient"),
+        ] {
+            let (_, _, got) = detect_intent(prompt).expect("should trigger: {prompt}");
+            let IntentCommand::NewWorktree(spec) = got else {
+                panic!("expected NewWorktree");
+            };
+            assert_eq!(spec.name, expected, "for prompt {prompt:?}");
         }
     }
 }
