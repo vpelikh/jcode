@@ -49,6 +49,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use compass_core::{build_graph_with_layers, BuildOptions, BuildPurpose};
+use compass_model::provenance::SourceAnchor;
 use compass_model::query_contract::{CodeQueryLimits, SearchRequest};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -276,6 +277,7 @@ impl Tool for CompassQueryTool {
             params.path.as_deref(),
             effective_limit,
             params.intent.as_deref().unwrap_or("search"),
+            &working_dir,
         );
 
         let reported_limit = effective_limit;
@@ -1291,6 +1293,7 @@ fn execute_query(
     path_filter: Option<&str>,
     limit: usize,
     intent: &str,
+    working_dir: &Path,
 ) -> Result<String, anyhow::Error> {
     let request = SearchRequest {
         query: query.to_string(),
@@ -1304,24 +1307,64 @@ fn execute_query(
 
     let response = engine.search(request).map_err(|e| anyhow!("{}", e))?;
 
-    // Resolve each hit's node + source file, then apply the optional path filter.
-    let mut rows: Vec<(String, Option<String>, f64, Vec<String>)> = Vec::new();
+    // Resolve each row's node + source file, then apply the optional path filter.
+    // We keep the node's source anchor so we can render a code snippet for each
+    // result (see `format_query_output`), read from disk so the model sees the
+    // declaration, not just a bare ranked name list. Showing real source is what
+    // makes compass a genuine substitute for grep on symbol/declaration lookups
+    // (and is why the escape hatch has historically been over-used).
+    let mut rows: Vec<ResultRow> = Vec::new();
     for hit in &response.results {
         let node = response.nodes.iter().find(|n| n.id == hit.node_id);
-        let name = node
-            .map(|n| n.qualified_name.as_str())
-            .unwrap_or(hit.node_id.as_str())
-            .to_string();
-        let file = node.and_then(|n| n.source.as_ref()).map(|s| s.file.clone());
+        let Some(node) = node else {
+            continue;
+        };
+        let name = node.qualified_name.clone();
+        let file = node.source.as_ref().map(|s| s.file.clone());
         // Apply path filter (substring match on the resolved file path).
-        if let (Some(filter), Some(file)) = (path_filter, &file)
-            && !file.contains(filter)
+        if let (Some(filter), Some(path)) = (path_filter, &file)
+            && !path.contains(filter)
         {
             continue;
         }
-        rows.push((name, file, hit.score, hit.matched_fields.clone()));
+        rows.push(ResultRow {
+            name,
+            file,
+            score: hit.score,
+            matched: hit.matched_fields.clone(),
+            // Capture the source anchor so we can map it to `response.files`.
+            source: node.source.clone(),
+            kind: node.kind.as_str().to_string(),
+        });
     }
 
+    Ok(format_query_output(&query, intent, limit, path_filter, &rows, working_dir))
+}
+
+/// One ranked search result, plus the source anchor and kind needed to render a
+/// code snippet alongside it.
+struct ResultRow {
+    name: String,
+    file: Option<String>,
+    score: f64,
+    matched: Vec<String>,
+    source: Option<SourceAnchor>,
+    kind: String,
+}
+
+/// Render the model-ready report for a query. Includes a compact source snippet
+/// for each result, read from disk relative to the session working directory,
+/// so a code or declaration lookup surfaces the actual code without a separate
+/// `read`/`agentgrep` step. Source reads are best-effort: a missing or
+/// unreadable file simply renders no snippet rather than failing the query.
+fn format_query_output(
+    query: &str,
+    intent: &str,
+    limit: usize,
+    path_filter: Option<&str>,
+    rows: &[ResultRow],
+    working_dir: &Path,
+) -> String {
     let mut output = String::new();
     output.push_str(&format!("# Compass query: {}\n\n", query));
     output.push_str(&format!("**Intent:** {}\n", intent));
@@ -1331,19 +1374,142 @@ fn execute_query(
     }
     output.push_str(&format!("\n**Found {} result(s)**\n\n", rows.len()));
 
-    for (i, (name, file, score, matched)) in rows.iter().enumerate() {
-        output.push_str(&format!("## {}. {}\n\n", i + 1, name));
-        if let Some(file) = file {
+    for (i, row) in rows.iter().enumerate() {
+        output.push_str(&format!("## {}. {}\n\n", i + 1, row.name));
+        if let Some(file) = &row.file {
             output.push_str(&format!("**File:** {}\n", file));
         }
-        output.push_str(&format!("**Score:** {:.3}\n", score));
-        if !matched.is_empty() {
-            output.push_str(&format!("**Matched:** {}\n", matched.join(", ")));
+        output.push_str(&format!("**Kind:** {}\n", row.kind));
+        output.push_str(&format!("**Score:** {:.3}\n", row.score));
+        if !row.matched.is_empty() {
+            output.push_str(&format!("**Matched:** {}\n", row.matched.join(", ")));
+        }
+        // Render a source snippet for nodes that carry a source anchor. The
+        // anchor's `file` is repo-root relative, so we resolve it against the
+        // session working directory and read the current source from disk.
+        // Anchor end_line is exclusive per compass, so we render
+        // [start_line, end_line).
+        if let Some(anchor) = &row.source
+            && let Some(text) = read_source_snippet(working_dir, anchor)
+        {
+            output.push_str("\n```\n");
+            output.push_str(&text);
+            output.push_str("```\n");
         }
         output.push('\n');
     }
 
-    Ok(output)
+    output
+}
+
+/// Extract a source line-range from `text` (1-based, `end` exclusive), trimming
+/// to valid line bounds. Renders with a leading line-number gutter so the model
+/// can anchor line references if it needs to.
+fn extract_snippet(text: &str, start_line: u32, end_line: u32) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let line_count = lines.len() as u32;
+    let start = start_line.max(1);
+    if start > line_count {
+        return String::new();
+    }
+    // Cap the rendered span so a huge node cannot balloon the context window.
+    // The anchor end_line is exclusive; clamp it to the file end. A fold marker
+    // is only emitted when we genuinely cut a long node short (end_line extends
+    // beyond the span cap) — never when the anchor merely runs past EOF, where
+    // we render every remaining line with nothing hidden.
+    let requested_end = end_line.max(start + 1);
+    let capped_end = requested_end.min(start + 8);
+    let render_end = capped_end.min(line_count + 1);
+    let fold = requested_end > capped_end.min(line_count + 1) && capped_end <= line_count;
+    let mut out = String::new();
+    let digits = render_end.saturating_sub(1).to_string().len().max(1);
+    for (idx, line) in lines
+        .iter()
+        .enumerate()
+        .take_while(|(i, _)| ((*i as u32) + 1) < render_end)
+        .skip((start.saturating_sub(1)) as usize)
+    {
+        let lno = (idx as u32) + 1;
+        out.push_str(&format!("{:width$}| {}\n", lno, line, width = digits));
+    }
+    if fold {
+        out.push_str("...\n");
+    }
+    out
+}
+
+/// Read a source snippet for a node anchor from disk, resolving the anchor's
+/// repository-relative `file` against the session working directory and, as a
+/// fallback, the enclosing git worktree root. Compass stores `source.file`
+/// relative to the repository root it was indexed from, which is the git top
+/// for a repo (the same identity `resolve_compass_cache` uses). When a session
+/// is bound to a subdirectory of the repo, `working_dir` alone is not enough,
+/// so we also try the git toplevel. Returns `None` (rather than an error) when
+/// the file is missing, outside the working tree, or unreadable, so a snippet
+/// is a best-effort enrichment that never fails the query. Guards against path
+/// traversal: an absolute or `..`-escaping `file` is refused.
+fn read_source_snippet(working_dir: &Path, anchor: &SourceAnchor) -> Option<String> {
+    let rel = Path::new(&anchor.file);
+    if rel.is_absolute() || rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return None;
+    }
+    // Bound effort: rendering a multi-thousand-line node body is already capped
+    // inside `extract_snippet`, but refuse pathological anchor values outright.
+    if anchor.start_line == 0 || anchor.end_line < anchor.start_line {
+        return None;
+    }
+    let bases: Vec<PathBuf> = std::iter::once(working_dir.to_path_buf())
+        .chain(git_toplevel_cached(working_dir).map(PathBuf::from))
+        .collect();
+    for base in &bases {
+        if let Some(text) = std::fs::read_to_string(base.join(rel)).ok() {
+            return Some(extract_snippet(&text, anchor.start_line, anchor.end_line));
+        }
+    }
+    None
+}
+
+/// How long a resolved git worktree toplevel is reused. The toplevel is stable
+/// for a given working dir, so a short per-process cache avoids re-forking git
+/// for every snippet row in one query.
+const GIT_TOPLEVEL_CACHE_TTL: Duration = Duration::from_secs(60);
+
+static LAST_GIT_TOPLEVEL: OnceLock<Mutex<HashMap<PathBuf, (SystemTime, String)>>> =
+    OnceLock::new();
+
+/// Resolve the git worktree toplevel for `working_dir` (cached), or `None` when
+/// it is not inside a git repo / git is unavailable. This is the repo-relative
+/// base for Compass source paths. Distinct from `current_git_top_cached`, which
+/// returns the git *common dir* (a stable shared-cache key but not the checkout
+/// root: for a linked worktree the common dir is the main repo's `.git`, while
+/// the toplevel is the worktree's own root).
+fn git_toplevel_cached(working_dir: &Path) -> Option<String> {
+    let map = LAST_GIT_TOPLEVEL.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let guard = lock_cached(map);
+        if let Some((t, top)) = guard.get(working_dir)
+            && t.elapsed().map(|d| d < GIT_TOPLEVEL_CACHE_TTL).unwrap_or(false)
+        {
+            return Some(top.clone());
+        }
+    }
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(working_dir)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    let result = if s.is_empty() { None } else { Some(s) };
+    if let Some(top) = &result {
+        lock_cached(map).insert(
+            working_dir.to_path_buf(),
+            (SystemTime::now(), top.clone()),
+        );
+    }
+    result
 }
 
 #[cfg(test)]
@@ -1820,6 +1986,171 @@ mod tests {
         );
     }
 
+    #[test]
+    fn extract_snippet_renders_line_range_with_gutter() {
+        let text = "line1\nline2\nline3\nline4\nline5\n";
+        let out = extract_snippet(text, 2, 5);
+        assert_eq!(out, "2| line2\n3| line3\n4| line4\n");
+    }
+
+    #[test]
+    fn extract_snippet_clamps_out_of_range_and_folds_long_nodes() {
+        let text = "a\nb\nc\n";
+        // end beyond file length clamps to last line; start clamps to >=1.
+        let out = extract_snippet(text, 0, 100);
+        assert_eq!(out, "1| a\n2| b\n3| c\n");
+    }
+
+    #[test]
+    fn extract_snippet_folds_very_long_anchor() {
+        let mut text = String::new();
+        for i in 1..=40 {
+            text.push_str(&format!("line{i}\n"));
+        }
+        let out = extract_snippet(&text, 1, 40);
+        // Span is capped at start+8 lines (lines 1..=8), then a fold marker.
+        assert!(out.starts_with("1| line1\n2| line2\n"), "got: {out}");
+        assert!(
+            out.contains("8| line8\n"),
+            "the capped span should end at line 8: {out}"
+        );
+        assert!(
+            !out.contains("9| line9\n"),
+            "long node must be folded before line 9: {out}"
+        );
+        assert!(out.contains("...\n"), "long node should be folded: {out}");
+    }
+
+    #[test]
+    fn format_query_output_renders_source_snippets_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            "fn main() {\n    let x = 1;\n}\n",
+        )
+        .unwrap();
+        let rows = vec![ResultRow {
+            name: "jcode::main".to_string(),
+            file: Some("src/main.rs".to_string()),
+            score: 123.0,
+            matched: vec!["struct".to_string()],
+            source: Some(SourceAnchor {
+                file: "src/main.rs".to_string(),
+                start_byte: 0,
+                end_byte: 10,
+                start_line: 1,
+                start_column: 0,
+                end_line: 3,
+                end_column: 0,
+            }),
+            kind: "struct".to_string(),
+        }];
+        let rendered = format_query_output("main", "search", 20, None, &rows, dir.path());
+        assert!(rendered.contains("## 1. jcode::main"), "got: {rendered}");
+        assert!(rendered.contains("**Kind:** struct"), "got: {rendered}");
+        assert!(
+            rendered.contains("1| fn main() {"),
+            "snippet must render source, got: {rendered}"
+        );
+        assert!(rendered.contains("```"), "snippet must be fenced, got: {rendered}");
+    }
+
+    #[test]
+    fn format_query_output_omits_snippet_when_file_missing_or_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/real.rs"), "fn real() {}\n").unwrap();
+        // Missing file: no snippet, still renders the row.
+        let rows = vec![ResultRow {
+            name: "missing".to_string(),
+            file: Some("src/nope.rs".to_string()),
+            score: 1.0,
+            matched: vec![],
+            source: Some(SourceAnchor {
+                file: "src/nope.rs".to_string(),
+                start_byte: 0,
+                end_byte: 1,
+                start_line: 1,
+                start_column: 0,
+                end_line: 2,
+                end_column: 0,
+            }),
+            kind: "struct".to_string(),
+        }];
+        let rendered = format_query_output("q", "search", 20, None, &rows, dir.path());
+        assert!(rendered.contains("## 1. missing"));
+        assert!(
+            !rendered.contains("```"),
+            "missing file must render no snippet: {rendered}"
+        );
+        // Absolute / traversal path: refused without reading outside cwd.
+        let traversal = ResultRow {
+            name: "trav".to_string(),
+            file: Some("../etc/passwd".to_string()),
+            score: 1.0,
+            matched: vec![],
+            source: Some(SourceAnchor {
+                file: "../etc/passwd".to_string(),
+                start_byte: 0,
+                end_byte: 1,
+                start_line: 1,
+                start_column: 0,
+                end_line: 2,
+                end_column: 0,
+            }),
+            kind: "struct".to_string(),
+        };
+        let rendered = format_query_output("q", "search", 20, None, &[traversal], dir.path());
+        assert!(
+            !rendered.contains("root:"),
+            "traversal path must not be read: {rendered}"
+        );
+    }
+
+    #[test]
+    fn read_source_snippet_resolves_via_git_toplevel_for_subdir_working_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Init a real git repo so `git rev-parse --show-toplevel` resolves.
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init"]) {
+            return; // git not available; nothing to exercise.
+        }
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("main.rs"), "fn one() {}\nfn two() {}\n").unwrap();
+        git(&["add", "."]);
+        if !git(&["commit", "-m", "init"]) {
+            return;
+        }
+        let anchor = SourceAnchor {
+            file: "main.rs".to_string(),
+            start_byte: 0,
+            end_byte: 4,
+            start_line: 1,
+            start_column: 0,
+            end_line: 2,
+            end_column: 0,
+        };
+        // Working dir is the `sub` subdirectory; the source file lives at the
+        // repo toplevel, so resolution must fall back to the git toplevel.
+        let snippet = read_source_snippet(&root.join("sub"), &anchor)
+            .expect("snippet should resolve via git toplevel");
+        assert!(
+            snippet.contains("1| fn one() {}"),
+            "expected toplevel-resolved snippet, got: {snippet}"
+        );
+    }
+
     // A pathological limit above u32::MAX must not wrap to 0 (which would violate
     // CodeQueryLimits::is_valid) and fail the query.
     #[test]
@@ -1830,8 +2161,15 @@ mod tests {
         let engine = compass_query::open(&graph_path, None, &output_dir).expect("open after build");
 
         // u32::MAX + 1 would wrap to 0 under a naive `as u32`.
-        let out = execute_query(&engine, "authentication", None, u64::MAX as usize, "search")
-            .expect("query with clamped limit must succeed");
+        let out = execute_query(
+            &engine,
+            "authentication",
+            None,
+            u64::MAX as usize,
+            "search",
+            &root,
+        )
+        .expect("query with clamped limit must succeed");
         assert!(
             out.contains("result(s)"),
             "expected a result report, got: {out}"
