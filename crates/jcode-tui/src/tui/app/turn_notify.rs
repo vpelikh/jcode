@@ -10,8 +10,6 @@ use super::App;
 use crate::todo::TodoItem;
 #[cfg(any(target_os = "macos", test))]
 use base64::Engine as _;
-#[cfg(target_os = "macos")]
-use std::io::Write;
 
 /// Maximum characters of assistant text shown in the notification body.
 /// Notification banners truncate aggressively; keep the payload tight.
@@ -158,10 +156,12 @@ fn send_originating_terminal_notification(
         return false;
     };
 
-    // This runs on the TUI event thread, after the completed turn has rendered,
-    // so one atomic write and flush cannot interleave with a frame draw.
-    let mut stdout = std::io::stdout().lock();
-    stdout.write_all(sequence.as_bytes()).is_ok() && stdout.flush().is_ok()
+    // Route through the serialized terminal writer. This runs on the TUI event
+    // thread after a render, while the render writer thread drains frame bytes
+    // asynchronously; a direct `io::stdout()` write here could otherwise
+    // interleave with that stream and corrupt both (see write_serialized).
+    crate::tui::terminal_writer::write_serialized(sequence.as_bytes());
+    true
 }
 
 #[cfg(not(target_os = "macos"))]

@@ -131,11 +131,16 @@ fn keyboard_enhancement_flags() -> crossterm::event::KeyboardEnhancementFlags {
 /// Returns true if successfully enabled, false if the terminal doesn't support it.
 pub fn enable_keyboard_enhancement() -> bool {
     use crossterm::event::PushKeyboardEnhancementFlags;
-    let result = crossterm::execute!(
-        std::io::stdout(),
+    let mut buf = Vec::new();
+    let result = crossterm::queue!(
+        &mut buf,
         PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
     )
-    .is_ok();
+    .is_ok()
+        && {
+            crate::tui::terminal_writer::write_serialized(&buf);
+            true
+        };
     crate::logging::info(&format!(
         "Kitty keyboard protocol: {}",
         if result { "enabled" } else { "FAILED" }
@@ -145,10 +150,9 @@ pub fn enable_keyboard_enhancement() -> bool {
 
 /// Disable Kitty keyboard protocol, restoring default key reporting.
 pub fn disable_keyboard_enhancement() {
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::event::PopKeyboardEnhancementFlags
-    );
+    let mut buf = Vec::new();
+    let _ = crossterm::queue!(&mut buf, crossterm::event::PopKeyboardEnhancementFlags);
+    crate::tui::terminal_writer::write_serialized(&buf);
 }
 
 /// Reassert terminal modes that terminals may clear while the TUI remains alive.
@@ -183,13 +187,18 @@ pub(crate) fn reapply_terminal_modes_to(
 
 pub(crate) fn reapply_configured_terminal_modes() {
     let policy = crate::perf::tui_policy();
+    let mut buf = Vec::new();
     if let Err(error) = reapply_terminal_modes_to(
-        &mut std::io::stdout(),
+        &mut buf,
         policy.enable_mouse_capture,
         policy.enable_keyboard_enhancement,
         policy.enable_focus_change,
     ) {
         crate::logging::warn(&format!("failed to reapply terminal modes: {error}"));
+    } else {
+        // Serialize with the render writer so mode re-apply (on FocusGained,
+        // mid-render) cannot interleave with frame bytes on the same terminal.
+        crate::tui::terminal_writer::write_serialized(&buf);
     }
 }
 

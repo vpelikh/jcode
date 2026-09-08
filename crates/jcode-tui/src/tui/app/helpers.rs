@@ -550,16 +550,19 @@ pub(super) fn copy_to_clipboard(text: &str) -> bool {
 /// (with `set -g set-clipboard on`). Returns false if stdout is not a TTY.
 fn copy_to_clipboard_osc52(text: &str) -> bool {
     use base64::Engine as _;
-    use std::io::{IsTerminal, Write};
+    use std::io::IsTerminal;
 
-    let mut out = std::io::stdout();
-    if !out.is_terminal() {
+    if !std::io::stdout().is_terminal() {
         return false;
     }
     let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
     // OSC 52: ESC ] 52 ; c ; <base64> BEL
     let seq = format!("\x1b]52;c;{}\x07", encoded);
-    out.write_all(seq.as_bytes()).is_ok() && out.flush().is_ok()
+    // Route through the serialized writer so the OSC-52 sequence cannot
+    // interleave with a concurrently-draining frame's cell bytes (which would
+    // otherwise corrupt both on the terminal).
+    crate::tui::terminal_writer::write_serialized(seq.as_bytes());
+    true
 }
 
 pub(super) fn effort_display_label(effort: &str) -> &str {

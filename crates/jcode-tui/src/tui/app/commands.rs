@@ -3098,12 +3098,14 @@ fn suspend_terminal_for_editor() {
 
     // These commands are safe even when a mode was not enabled. Disable them
     // before leaving the alternate screen so the child receives normal input.
-    let _ = crossterm::execute!(
-        std::io::stdout(),
+    let mut buf = Vec::new();
+    let _ = crossterm::queue!(
+        &mut buf,
         DisableBracketedPaste,
         DisableFocusChange,
         DisableMouseCapture
     );
+    crate::tui::terminal_writer::write_serialized(&buf);
     crate::tui::disable_keyboard_enhancement();
     jcode_tui_style::restore_terminal_quietly();
 }
@@ -3115,13 +3117,15 @@ fn resume_terminal_after_editor() {
     // ratatui Terminal remains usable and the next loop iteration redraws it.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(ratatui::init));
     let policy = crate::perf::tui_policy();
-    let _ = crossterm::execute!(std::io::stdout(), EnableBracketedPaste);
+    let mut buf = Vec::new();
+    let _ = crossterm::queue!(&mut buf, EnableBracketedPaste);
     if policy.enable_focus_change {
-        let _ = crossterm::execute!(std::io::stdout(), EnableFocusChange);
+        let _ = crossterm::queue!(&mut buf, EnableFocusChange);
     }
     if policy.enable_mouse_capture {
-        let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+        let _ = crossterm::queue!(&mut buf, EnableMouseCapture);
     }
+    crate::tui::terminal_writer::write_serialized(&buf);
     if policy.enable_keyboard_enhancement {
         crate::tui::enable_keyboard_enhancement();
     }

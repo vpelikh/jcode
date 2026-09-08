@@ -82,6 +82,91 @@ pub fn resync_pending() -> bool {
     RESYNC_REQUESTED.load(Ordering::Acquire)
 }
 
+/// A registered live terminal writer that auxiliary output can enqueue into.
+///
+/// Auxiliary output (window titles, OSC-52 clipboard, turn notifications,
+/// terminal-mode re-apply) must be serialized with the render writer thread's
+/// frame bytes, otherwise its multi-byte escape sequences interleave with a
+/// frame's cell writes on the same terminal and corrupt the stream — the real
+/// screen then shows stray glyphs that a later full repaint clears. Routing
+/// these writes through the *same* writer thread channel gives one ordered byte
+/// stream and keeps them non-blocking (they drop on a wedged pty rather than
+/// park). Registered in [`TerminalWriter::stdout`] (and the non-unix stdout
+/// path) and cleared on shutdown.
+struct LiveWriter {
+    tx: Sender<Chunk>,
+    inner: Arc<WriterInner>,
+}
+
+static LIVE_WRITER: Mutex<Option<LiveWriter>> = Mutex::new(None);
+
+fn register_live_writer(tx: Sender<Chunk>, inner: Arc<WriterInner>) {
+    *LIVE_WRITER.lock().unwrap() = Some(LiveWriter { tx, inner });
+}
+
+/// Enqueue auxiliary terminal-output bytes through the live writer thread so
+/// they are serialized with frame output. Returns `false` if no live writer is
+/// registered (caller should fall back to writing `io::stdout()` directly),
+/// or if the write would exceed the wedged-pty backlog cap (dropped, no
+/// resync: auxiliary bytes are not cell diffs, so dropping them never
+/// desynchronizes ratatui's model).
+///
+/// Never blocks: sending into the unbounded channel is non-blocking.
+pub fn write_auxiliary(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return true;
+    }
+    let guard = LIVE_WRITER.lock().unwrap();
+    let Some(live) = guard.as_ref() else {
+        return false;
+    };
+    let len = bytes.len();
+    let mut prev = live.inner.buffered.load(Ordering::Relaxed);
+    loop {
+        if prev >= QUEUE_CAPACITY_BYTES {
+            // Wedged pty; drop the auxiliary bytes rather than block.
+            return true;
+        }
+        let Some(next) = prev.checked_add(len) else {
+            return true;
+        };
+        match live
+            .inner
+            .buffered
+            .compare_exchange(prev, next, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => break,
+            Err(cur) => prev = cur,
+        }
+    }
+    let body: Box<[u8]> = bytes.to_vec().into_boxed_slice();
+    match live.tx.send(Chunk::Data(body)) {
+        Ok(()) => true,
+        Err(_) => {
+            live.inner.buffered.fetch_sub(len, Ordering::Relaxed);
+            false
+        }
+    }
+}
+
+/// Write auxiliary terminal-output bytes, serialized with the render writer
+/// when a live writer is registered, else directly to stdout.
+///
+/// This is the single entry point for non-frame terminal output (window titles,
+/// OSC-52 clipboard, turn notifications, mode re-apply). Using it guarantees
+/// these escape sequences never interleave with frame bytes on the same
+/// terminal. When no writer is live (startup, session picker, teardown) it
+/// falls back to `io::stdout()`, where there is no concurrent render writer to
+/// race with.
+pub fn write_serialized(bytes: &[u8]) {
+    if write_auxiliary(bytes) {
+        return;
+    }
+    let mut out = io::stdout();
+    let _ = out.write_all(bytes);
+    let _ = out.flush();
+}
+
 enum Chunk {
     Data(Box<[u8]>),
     Shutdown,
@@ -135,6 +220,30 @@ impl TerminalWriter {
         Self { tx: Some(tx), inner, pending: Vec::new() }
     }
 
+    /// Register this writer as the process's live terminal writer so auxiliary
+    /// output (`write_auxiliary`/`write_serialized`) is serialized with its
+    /// frame bytes. There is at most one live writer at a time; a later
+    /// terminal's construction re-registers over it, and `shutdown` clears it.
+    fn register_as_live(&self) {
+        if let Some(tx) = self.tx.as_ref() {
+            register_live_writer(tx.clone(), Arc::clone(&self.inner));
+        }
+    }
+
+    /// Clear the global live writer only if `self` is the currently-registered
+    /// one. Other writers (e.g. plain `new()`-constructed writers used in
+    /// tests, or a superseded terminal) must not clobber the live writer's
+    /// registration while it is still serving output.
+    fn unregister_live_writer(&self) {
+        let mut guard = LIVE_WRITER.lock().unwrap();
+        if guard
+            .as_ref()
+            .is_some_and(|live| Arc::ptr_eq(&live.inner, &self.inner))
+        {
+            *guard = None;
+        }
+    }
+
     /// Create a writer thread over a `dup` of fd 1 (stdout) that does not
     /// participate in the process-wide [`Stdout`] lock.
     ///
@@ -160,10 +269,15 @@ impl TerminalWriter {
         // `File` has no user-space locking, so the writer thread's blocking
         // `write(2)` holds no process-wide lock.
         let file = unsafe { std::fs::File::from_raw_fd(dup) };
-        Ok(Self::new(file))
+        let writer = Self::new(file);
+        writer.register_as_live();
+        Ok(writer)
     }
 
     fn shutdown(&mut self) {
+        // Stop routing auxiliary output to this writer (it is shutting down);
+        // a later terminal's `new` will re-register its own writer.
+        self.unregister_live_writer();
         // Flush any coalesced-but-not-yet-enqueued bytes so Drop loses nothing.
         let _ = self.flush();
         let tx = self.tx.take();
@@ -295,7 +409,20 @@ pub type AppTerminal = ratatui::Terminal<ratatui::backend::CrosstermBackend<Term
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
+    /// Serializes the tests that install a live writer into the process-global
+    /// [`LIVE_WRITER`] (the auxiliary-write test and the unix `stdout()` dup
+    /// test), so they cannot race each other's global registration.
+    static LIVE_WRITER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Acquire the live-writer test lock, tolerating a poison from a sibling
+    /// test's panic (the state is just a guard; the guard's panic must not
+    /// cascade into `PoisonError` on every other test).
+    fn live_writer_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        LIVE_WRITER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     /// A writer that forwards each write to a channel so a test can read the
     /// exact ordered bytes the real pty would receive.
@@ -754,6 +881,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn stdout_dup_constructor_writes_and_drops_cleanly() {
+        let _guard = live_writer_test_guard();
         let mut shim = TerminalWriter::stdout().expect("stdout() dup failed");
         // Write a harmless, zero-width terminal sequence (a Bell). Writing to the
         // real stdout is safe here and verifies the dup'd fd actually carries bytes.
@@ -765,6 +893,127 @@ mod tests {
         assert!(
             start.elapsed() < std::time::Duration::from_secs(1),
             "stdout() writer drop hung"
+        );
+    }
+
+    /// Auxiliary output (`write_auxiliary`) must be serialized with frame writes
+    /// through the *same* writer thread channel, arriving in enqueue order as
+    /// atomic chunks. This is the contract that prevents escape sequences written
+    /// from the event loop (window title, OSC-52 clipboard, turn notification,
+    /// mode re-apply) from interleaving with render frame bytes on the terminal.
+    #[test]
+    fn auxiliary_writes_are_serialized_in_order_with_frames() {
+        let _guard = live_writer_test_guard();
+        let (t, wrx) = mpsc::channel::<Vec<u8>>();
+        let mut shim = TerminalWriter::new(ChannelWriter { tx: t });
+        shim.register_as_live();
+
+        // A frame chunk: coalesced writes flushed as one atomic unit.
+        shim.write_all(b"\x1b[1;1Hcell").unwrap();
+        shim.write_all(b"-bytes").unwrap();
+        shim.flush().unwrap();
+
+        // Auxiliary bytes enqueued while a writer is registered must land in the
+        // same ordered stream, not on a side channel.
+        assert!(
+            write_auxiliary(b"\x1b]0;title\x07"),
+            "auxiliary write should be accepted while a writer is live"
+        );
+
+        // Another frame chunk.
+        shim.write_all(b"\x1b[2;1Hnext").unwrap();
+        shim.flush().unwrap();
+
+        // Unregister happens on drop; after that, auxiliary writes fall back to
+        // stdout (return false because no live writer is registered).
+        drop(shim);
+        #[cfg(unix)]
+        {
+            assert!(
+                !write_auxiliary(b"\x07"),
+                "auxiliary write must be rejected when no live writer is registered"
+            );
+        }
+
+        let mut got = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match wrx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(chunk) => got.push_str(std::str::from_utf8(&chunk).unwrap()),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        // Frame 1 (one chunk), aux title, frame 2 (one chunk) — byte-exact order.
+        assert_eq!(
+            got, "\x1b[1;1Hcell-bytes\x1b]0;title\x07\x1b[2;1Hnext",
+            "frame+aux stream must be serialized and ordered: {got:?}"
+        );
+    }
+
+    /// Integration boundary: drive the real `Terminal<CrosstermBackend<TerminalWriter>>`
+    /// (the production `AppTerminal` type), interleave an auxiliary `write_serialized`
+    /// escape between two full draws, and assert the auxiliary sequence reaches the
+    /// downstream writer intact — never split by a frame's cell bytes.
+    ///
+    /// Before the fix, auxiliary output went to `io::stdout()` (fd 1) while the
+    /// render writer drained a lock-free `dup` into the same terminal, so an aux
+    /// multi-byte escape could be cut by a concurrently-emitted frame's `MoveTo`
+    /// / cell sequence, leaving garbage on screen. Now the aux bytes go through
+    /// the same single writer thread channel and are always emitted as one
+    /// contiguous run between frame chunks.
+    #[cfg(unix)]
+    #[test]
+    fn real_terminal_keeps_interleaved_aux_write_intact() {
+        let _guard = live_writer_test_guard();
+        let (t, wrx) = mpsc::channel::<Vec<u8>>();
+        let writer = TerminalWriter::new(ChannelWriter { tx: t });
+        writer.register_as_live();
+        let backend = ratatui::backend::CrosstermBackend::new(writer);
+        // This is the production AppTerminal shape: ratatui over the writer.
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+
+        // Draw a first frame.
+        terminal
+            .draw(|frame| {
+                let p = ratatui::widgets::Paragraph::new(ratatui::text::Text::from("alpha line"));
+                frame.render_widget(p, frame.area());
+            })
+            .expect("draw 1");
+        terminal.flush().expect("flush 1");
+
+        // Auxiliary write interleaved on the event thread (window title).
+        crate::tui::terminal_writer::write_serialized(b"\x1b]0;jcode-title\x07");
+
+        // Draw a second frame.
+        terminal
+            .draw(|frame| {
+                let p = ratatui::widgets::Paragraph::new(ratatui::text::Text::from("beta line"));
+                frame.render_widget(p, frame.area());
+            })
+            .expect("draw 2");
+        terminal.flush().expect("flush 2");
+
+        drop(terminal); // drains the writer channel to `t`.
+
+        // Reconstruct the full downstream byte stream.
+        let mut got = String::new();
+        while let Ok(chunk) = wrx.recv_timeout(std::time::Duration::from_millis(300)) {
+            got.push_str(std::str::from_utf8(&chunk).expect("utf8 on test bytes"));
+        }
+
+        // ratatui emits a paragraph's cells as separate MoveTo+text runs (not one
+        // contiguous line), so assert on the individual cell runs reaching the
+        // downstream writer...
+        assert!(got.contains("alpha"), "frame 1 cells lost: {got:?}");
+        assert!(got.contains("line"), "frame 1 cells lost: {got:?}");
+        assert!(got.contains("beta"), "frame 2 cells lost: {got:?}");
+        // ...and — the actual regression — the auxiliary OSC-0 window-title escape
+        // arrives byte-intact as one contiguous run, never split by a frame's
+        // cell/command bytes.
+        assert!(
+            got.contains("\x1b]0;jcode-title\x07"),
+            "auxiliary escape was split or lost: {got:?}"
         );
     }
 }
