@@ -1,5 +1,6 @@
 use super::*;
 use crate::message::ToolDefinition;
+use crate::session::ToolCallId;
 
 impl App {
     pub(super) fn append_current_turn_system_reminder(
@@ -241,7 +242,7 @@ impl App {
             let mut call_output_tokens_seen: u64 = 0;
             let mut interleaved = false; // Track if we interleaved a message mid-stream
             // Track tool results from provider (already executed by Claude Code CLI)
-            let mut sdk_tool_results: std::collections::HashMap<String, (String, bool)> =
+            let mut sdk_tool_results: std::collections::HashMap<ToolCallId, (String, bool)> =
                 std::collections::HashMap::new();
             let provider_name = self.provider.name().to_string();
             let store_reasoning_content =
@@ -901,7 +902,7 @@ impl App {
                                         // Reset status back to Streaming
                                         self.status = ProcessingStatus::Streaming;
 
-                                        sdk_tool_results.insert(tool_use_id.to_string(), (content, is_error));
+                                        sdk_tool_results.insert(tool_use_id, (content, is_error));
                                     }
                                     StreamEvent::GeneratedImage {
                                         id,
@@ -1200,7 +1201,7 @@ impl App {
                     .unwrap_or_else(|| self.session.id.clone());
 
                 // Check if SDK already executed this tool
-                if let Some((sdk_content, sdk_is_error)) = sdk_tool_results.remove(&tc.id.to_string()) {
+                if let Some((sdk_content, sdk_is_error)) = sdk_tool_results.remove(&tc.id) {
                     // Use SDK result
                     Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
                         session_id: self.session.id.clone(),
