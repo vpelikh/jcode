@@ -1338,7 +1338,7 @@ fn execute_query(
         });
     }
 
-    Ok(format_query_output(&query, intent, limit, path_filter, &rows, working_dir))
+    Ok(format_query_output(query, intent, limit, path_filter, &rows, working_dir))
 }
 
 /// One ranked search result, plus the source anchor and kind needed to render a
@@ -1462,7 +1462,7 @@ fn read_source_snippet(working_dir: &Path, anchor: &SourceAnchor) -> Option<Stri
         .chain(git_toplevel_cached(working_dir).map(PathBuf::from))
         .collect();
     for base in &bases {
-        if let Some(text) = std::fs::read_to_string(base.join(rel)).ok() {
+        if let Ok(text) = std::fs::read_to_string(base.join(rel)) {
             return Some(extract_snippet(&text, anchor.start_line, anchor.end_line));
         }
     }
@@ -2022,6 +2022,16 @@ mod tests {
     }
 
     #[test]
+    fn extract_snippet_empty_or_out_of_range_start_returns_empty() {
+        // Empty-ish inputs: a start past the file end renders nothing, and an
+        // empty file renders nothing (no fold marker) rather than panicking.
+        assert_eq!(extract_snippet("a\nb\n", 5, 9), "", "start past EOF");
+        assert_eq!(extract_snippet("", 1, 2), "", "empty file");
+        // A degenerate single-line anchor with 0-length span is fine.
+        assert_eq!(extract_snippet("only\n", 1, 1), "1| only\n");
+    }
+
+    #[test]
     fn format_query_output_renders_source_snippets_from_disk() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
@@ -2105,6 +2115,29 @@ mod tests {
         assert!(
             !rendered.contains("root:"),
             "traversal path must not be read: {rendered}"
+        );
+        // Absolute path is a separate guard branch (`is_absolute`) from `..`
+        // traversal; cover it explicitly.
+        let absolute = ResultRow {
+            name: "abs".to_string(),
+            file: Some(dir.path().join("src/real.rs").display().to_string()),
+            score: 1.0,
+            matched: vec![],
+            source: Some(SourceAnchor {
+                file: dir.path().join("src/real.rs").display().to_string(),
+                start_byte: 0,
+                end_byte: 1,
+                start_line: 1,
+                start_column: 0,
+                end_line: 2,
+                end_column: 0,
+            }),
+            kind: "struct".to_string(),
+        };
+        let rendered = format_query_output("q", "search", 20, None, &[absolute], dir.path());
+        assert!(
+            !rendered.contains("fn real"),
+            "absolute source path must be refused: {rendered}"
         );
     }
 
