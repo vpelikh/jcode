@@ -4441,6 +4441,9 @@ fn render_tool_message_compass_query_output_hidden_when_disabled() {
         !rendered.contains("cfg::load"),
         "compass result must not render when flag is off: {rendered}"
     );
+    // Restore the default (on) so a leftover override value can't leak into a
+    // later test that doesn't set it.
+    crate::tui::ui::tools_ui::tests_show_compass_query_output_override::set(true);
 }
 
 /// With `show_compass_query_output` on (the default), the compass_query
@@ -4464,7 +4467,9 @@ fn render_tool_message_compass_query_output_shows_when_enabled() {
         rendered.contains("cfg::load"),
         "compass result must render when flag is on: {rendered}"
     );
-    crate::tui::ui::tools_ui::tests_show_compass_query_output_override::set(false);
+    // Restore the default (on) so a leftover override value can't leak into a
+    // later test that doesn't set it.
+    crate::tui::ui::tools_ui::tests_show_compass_query_output_override::set(true);
 }
 
 /// A `batch` that contains a `compass_query` sub-call renders the query on the
