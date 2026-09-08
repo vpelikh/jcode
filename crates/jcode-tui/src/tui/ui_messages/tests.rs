@@ -3811,6 +3811,56 @@ fn render_compass_query_output_body_caps_huge_output() {
     assert!(last.contains("more lines"), "last={last}");
 }
 
+/// A realistic multi-result compass response keeps every field on its own
+/// visual row (the hard-break behavior) and still renders legibly at a narrow
+/// transcript width (the wrap behavior). Guards the interplay between
+/// `preserve_hard_line_breaks_for_markdown` and `wrap_lines`.
+#[test]
+fn render_compass_query_output_body_multi_result_and_narrow_width() {
+    let content = "# Compass query: config handler\n\n\
+        **Intent:** discovery\n\
+        **Limit:** 20\n\n\
+        **Found 2 result(s)**\n\n\
+        ## 1. app::config::load\n\n\
+        **File:** crates/app/src/config.rs\n\
+        **Score:** 100.000\n\n\
+        ## 2. app::config::Config\n\n\
+        **File:** crates/app/src/config/structs.rs\n\
+        **Score:** 98.500\n";
+
+    for width in [40u16, 80, 120] {
+        let lines = super::render_compass_query_output_body(content, width as usize);
+        let rendered = lines
+            .iter()
+            .map(extract_line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("app::config::load") && rendered.contains("app::config::Config"),
+            "width {width}: both results must render: {rendered}"
+        );
+        // Each result's "File:" field must survive (single newline after a
+        // bold label is preserved as a hard break, not dropped).
+        assert!(
+            rendered.contains("crates/app/src/config.rs")
+                && rendered.contains("crates/app/src/config/structs.rs"),
+            "width {width}: file paths must render: {rendered}"
+        );
+
+        // No rendered line may exceed the requested width (except the cap note).
+        for line in render_compass_query_output_body(content, width as usize) {
+            let text = extract_line_text(&line);
+            if !text.contains("more lines") {
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(text.as_str()) <= width as usize,
+                    "width {width}: line exceeds width: {text:?}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn render_assistant_message_plan_card_wraps_instead_of_truncating() {
     let saved = crate::tui::markdown::center_code_blocks();
