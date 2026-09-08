@@ -494,9 +494,11 @@ lifecycle functions (`handle_subscribe`, `handle_clear_session`,
 swarm-domain argument bag, and the membership operations have moved onto
 `SwarmServiceHandle` methods (`member_should_mark_ready`,
 `rename_member_session`, `ensure_member` for join-swarm registration, and
-`take_session_membership` for `/clear` teardown). The remaining work is the
-ownership-move slices still pending (`monitor_bus` to service APIs, debug
-snapshots).
+`take_session_membership` for `/clear` teardown). On `monitor_bus`, the dead
+`_swarm_plans`/`_swarm_coordinators`/`_shared_context` arguments were removed
+(full simplification to service APIs is a separate maintenance-service move).
+The remaining work is the ownership-move slices still pending (`monitor_bus` to
+service APIs, debug snapshots).
 
 ---
 
