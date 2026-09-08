@@ -257,6 +257,10 @@ pub(super) async fn handle_debug_client(
 ) -> Result<()> {
     // Destructure the service handles back into the flat locals the body uses,
     // preserving every downstream reference (Slice 3 of the server service split).
+    // Clone the swarm handle so the debug read/write hops can route through it
+    // (Slice 4) even though the flat-local destructuring moves its fields out of
+    // the original.
+    let swarm_service_handle = swarm_service.clone();
     let sessions = session_service.sessions;
     let is_processing = session_service.is_processing;
     let session_id = session_service.session_id;
@@ -479,13 +483,7 @@ pub(super) async fn handle_debug_client(
                         } else if let Some(output) = maybe_handle_swarm_read_command(
                             cmd,
                             &sessions,
-                            &swarm_members,
-                            &swarms_by_id,
-                            &shared_context,
-                            &swarm_plans,
-                            &swarm_coordinators,
-                            &file_touch,
-                            &channel_subscriptions,
+                            &swarm_service_handle,
                             &server_identity,
                         )
                         .await?
