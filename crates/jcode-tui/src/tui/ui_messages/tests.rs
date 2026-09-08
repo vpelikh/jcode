@@ -4280,6 +4280,70 @@ fn render_tool_message_compass_query_row_shows_query() {
     );
 }
 
+fn compass_query_output_msg(content: &str) -> DisplayMessage {
+    DisplayMessage {
+        role: "tool".to_string(),
+        content: content.to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_compass_inline".to_string(),
+            name: "compass_query".to_string(),
+            input: serde_json::json!({ "query": "fn config" }),
+            intent: None,
+            thought_signature: None,
+        }),
+    }
+}
+
+/// With `show_compass_query_output` off (default), the compass_query card stays
+/// compact: the search-result body must NOT render inline.
+#[test]
+fn render_tool_message_compass_query_output_hidden_by_default() {
+    crate::tui::ui::tools_ui::tests_show_compass_query_output_override::set(false);
+    let content = "# Compass query: fn config\n\n**Found 1 result(s)**\n\n## 1. cfg::load\n";
+    let msg = compass_query_output_msg(content);
+    let rendered = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        !rendered.contains("Found 1 result(s)"),
+        "compass body must not render when flag is off: {rendered}"
+    );
+    assert!(
+        !rendered.contains("cfg::load"),
+        "compass result must not render when flag is off: {rendered}"
+    );
+}
+
+/// With `show_compass_query_output` on, the compass_query search-result body
+/// renders inline beneath the one-line summary.
+#[test]
+fn render_tool_message_compass_query_output_shows_when_enabled() {
+    crate::tui::ui::tools_ui::tests_show_compass_query_output_override::set(true);
+    let content = "# Compass query: fn config\n\n**Found 1 result(s)**\n\n## 1. cfg::load\n";
+    let msg = compass_query_output_msg(content);
+    let rendered = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        rendered.contains("Found 1 result(s)"),
+        "compass body must render when flag is on: {rendered}"
+    );
+    assert!(
+        rendered.contains("cfg::load"),
+        "compass result must render when flag is on: {rendered}"
+    );
+    crate::tui::ui::tools_ui::tests_show_compass_query_output_override::set(false);
+}
+
 /// A `batch` that contains a `compass_query` sub-call renders the query on the
 /// sub-call row (it routes through get_tool_summary_with_budget), not an empty
 /// label. Without an intent, the query is the row's summary.

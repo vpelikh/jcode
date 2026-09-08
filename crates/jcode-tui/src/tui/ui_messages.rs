@@ -4395,7 +4395,7 @@ pub(crate) fn render_tool_message(
     // false) so most users keep the compact one-line summary. The output is
     // structured markdown, so it renders through the markdown pipeline.
     if tools_ui::canonical_tool_name(&tc.name) == "compass_query"
-        && crate::config::config().display.show_compass_query_output
+        && tools_ui::show_compass_query_output()
         && !msg.content.trim().is_empty()
     {
         for line in render_compass_query_output_body(&msg.content, row_width) {
