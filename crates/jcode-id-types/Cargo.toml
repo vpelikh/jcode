@@ -1,0 +1,12 @@
+[package]
+name = "jcode-id-types"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Branded identity types (SessionId, ToolCallId, JobId, EventId, MessageId, CompactionId) and the branded_id! macro."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

@@ -37,7 +37,9 @@ use std::collections::HashSet;
 use std::path::Path;
 pub mod event_types;
 mod branded;
-pub use branded::{CompactionId, EventId, MessageId};
+pub use branded::{
+    CompactionId, EventId, JobId, MessageId, SessionId, ToolCallId,
+};
 pub use invariants::{
     CompactionBracket, InvariantLog, InvariantRegistry, InvariantViolation, LogInvariant,
     LogProjection, MessageCountProjection, fold_projection, project_map,

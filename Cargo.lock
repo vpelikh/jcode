@@ -4540,6 +4540,7 @@ dependencies = [
  "jcode-core",
  "jcode-embedding",
  "jcode-gateway-types",
+ "jcode-id-types",
  "jcode-import-core",
  "jcode-logging",
  "jcode-memory-types",
@@ -4722,6 +4723,14 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "jcode-id-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
