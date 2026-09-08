@@ -1309,7 +1309,7 @@ fn execute_query(
 
     // Resolve each row's node + source file, then apply the optional path filter.
     // We keep the node's source anchor so we can render a code snippet for each
-    // result (see `format_query_output`), read from disk so the model sees the
+    // result (see `format_query`), read from disk so the model sees the
     // declaration, not just a bare ranked name list. Showing real source is what
     // makes compass a genuine substitute for grep on symbol/declaration lookups
     // (and is why the escape hatch has historically been over-used).
@@ -1332,7 +1332,8 @@ fn execute_query(
             file,
             score: hit.score,
             matched: hit.matched_fields.clone(),
-            // Capture the source anchor so we can map it to `response.files`.
+            // Capture the source anchor so `format_query` can resolve the node's
+            // source file (via `SourceCache`) and render a snippet from disk.
             source: node.source.clone(),
             kind: node.kind.as_str().to_string(),
         });
@@ -1397,10 +1398,9 @@ fn format_query(
         if !row.matched.is_empty() {
             output.push_str(&format!("**Matched:** {}\n", row.matched.join(", ")));
         }
-        // Only the top `MAX_SNIPPET_ROWS` results get a fenced source snippet;
-        // the rest stay as lean name/file rows to bound context cost. Rows past
-        // the cap still resolve their file (via the shared cache) so the 
-        // metadata stays correct even though we skip the snippet block.
+        // Only the top `MAX_SNIPPET_ROWS` results get a fenced source snippet (and a
+        // file read); the rest stay as lean name/file/kind rows so a wide query
+        // cannot tile many fences (or trigger many reads) into the report.
         if i < MAX_SNIPPET_ROWS
             && let Some(anchor) = &row.source
             && let Some(text) = cache.snippet(working_dir, anchor)

@@ -49,8 +49,9 @@ Snippet details:
 - Best-effort: a missing/unreadable file, an `..`-escaping or absolute path, or
   an out-of-range anchor renders no snippet without failing the query (see
   `tool::compass_query::resolve_source_text`).
-- Only the rendered line window is read from disk: memory and I/O scale with
-  the ≤8 displayed lines, not the whole file.
+- Reads are bounded: only the top 8 results trigger any file read, each unique
+  file is read at most once, and only that file's line windows are materialized
+  into the report (never the whole file body).
 
 ## Cache locations
 
