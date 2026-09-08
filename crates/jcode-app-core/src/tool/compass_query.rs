@@ -2097,6 +2097,38 @@ mod tests {
     }
 
     #[test]
+    fn source_cache_reads_each_file_once_across_rows() {
+        // A wide query can have many rows in one file; the cache must resolve
+        // that file exactly once and serve every row's window from the single
+        // read (this is the #2 dedupe guarantee).
+        let (dir, _rel) = temp_src(
+            "fn a() {}\nfn b() {}\nfn c() {}\nfn d() {}\n",
+            "sub/many.rs",
+        );
+        let file = "sub/many.rs";
+        let mut cache = SourceCache::default();
+        // Request four different line windows in the same file.
+        for ln in 1..=4 {
+            let s = cache.snippet(dir.path(), &anchor(file, ln, ln + 1)).expect("snippet");
+            assert!(s.contains(&format!("{ln}| fn")), "row {ln} window: {s}");
+        }
+        // Exactly one resolved text for the file (deduped), no re-read per row.
+        assert_eq!(cache.text_by_file.len(), 1, "file must be resolved exactly once");
+        assert!(
+            cache.text_by_file.get(file).unwrap().is_some(),
+            "resolved text must be cached"
+        );
+        // A missing file is cached as a miss too, so a later row in that file
+        // does not re-attempt the read.
+        cache.snippet(dir.path(), &anchor("sub/absent.rs", 1, 2));
+        assert_eq!(cache.text_by_file.len(), 2, "missed file must also be cached");
+        assert!(
+            cache.text_by_file.get("sub/absent.rs").unwrap().is_none(),
+            "missed file cached as None"
+        );
+    }
+
+    #[test]
     fn format_query_renders_source_snippets_from_disk() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
