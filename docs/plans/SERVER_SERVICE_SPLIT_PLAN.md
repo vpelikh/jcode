@@ -531,3 +531,30 @@ without risking the runtime model. It is deliberately a **slice**, not a PR:
 
 Each slice is independently reviewable and behavior-preserving; none is gated on
 the rest.
+---
+
+### Design decision on Slice 4 execution (landed 2026-09)
+
+Two credible ways to route `client_session.rs` through the swarm service were
+considered:
+
+- **A. Thread `&SwarmServiceHandle` in and bind flat locals in the body**
+  (chosen). The session function takes one `&SwarmServiceHandle`; the body binds
+  `let swarm_members = &swarm.swarm_state.members;` etc. and keeps every in-body
+  reference. This removed ~29 flat swarm params across the three functions for
+  near-zero churn and a byte-identical body.
+- **B. Extract every remaining in-body swarm mutation into handle methods all at
+  once** (rejected). Files like `handle_subscribe` and `handle_resume_session`
+  also orchestrate coordinator handoff, plan-participant rename, persistence,
+  channel cleanup, and status broadcasts that are interleaved with session
+  logic. Hoisting all of that behind methods in one slice would be a much larger,
+  single, hard-to-review diff with higher risk of a subtle ordering/borrow change.
+
+A won because it delivers the plan's immediate goal (stop the flat argument
+bag, give the swarm state a typed home) at low risk, in reviewable commits, and
+it leaves the door open to keep pulling specific operations onto the handle (as
+was then done for `member_should_mark_ready`, `rename_member_session`, and
+`ensure_member`). Its cost is that some body code still reaches the maps through
+handle-bound locals rather than calling a dedicated handle method; the residual
+direct access is concentrated in the few orchestration-heavy subscribe/resume
+paths, which remain candidates for a later, narrowly-scoped extraction.
