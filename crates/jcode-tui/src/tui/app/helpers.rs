@@ -560,9 +560,10 @@ fn copy_to_clipboard_osc52(text: &str) -> bool {
     let seq = format!("\x1b]52;c;{}\x07", encoded);
     // Route through the serialized writer so the OSC-52 sequence cannot
     // interleave with a concurrently-draining frame's cell bytes (which would
-    // otherwise corrupt both on the terminal).
-    crate::tui::terminal_writer::write_serialized(seq.as_bytes());
-    true
+    // otherwise corrupt both on the terminal). Report whether the bytes were
+    // actually handed off, so a failed write is not reported as a successful
+    // copy.
+    crate::tui::terminal_writer::write_serialized(seq.as_bytes())
 }
 
 pub(super) fn effort_display_label(effort: &str) -> &str {

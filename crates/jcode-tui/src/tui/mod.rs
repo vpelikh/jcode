@@ -192,10 +192,11 @@ pub(crate) fn reapply_configured_terminal_modes() {
         policy.enable_focus_change,
     ) {
         crate::logging::warn(&format!("failed to reapply terminal modes: {error}"));
-    } else {
+    } else if !crate::tui::terminal_writer::write_serialized(&buf) {
         // Serialize with the render writer so mode re-apply (on FocusGained,
         // mid-render) cannot interleave with frame bytes on the same terminal.
-        crate::tui::terminal_writer::write_serialized(&buf);
+        // A false return means the bytes were not handed off anywhere.
+        crate::logging::warn("failed to write re-applied terminal modes");
     }
 }
 

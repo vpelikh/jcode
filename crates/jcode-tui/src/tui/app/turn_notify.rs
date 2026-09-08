@@ -160,8 +160,9 @@ fn send_originating_terminal_notification(
     // thread after a render, while the render writer thread drains frame bytes
     // asynchronously; a direct `io::stdout()` write here could otherwise
     // interleave with that stream and corrupt both (see write_serialized).
-    crate::tui::terminal_writer::write_serialized(sequence.as_bytes());
-    true
+    // Report whether the bytes were handed off so a failed terminal write falls
+    // through to the caller's desktop-notification fallback.
+    crate::tui::terminal_writer::write_serialized(sequence.as_bytes())
 }
 
 #[cfg(not(target_os = "macos"))]

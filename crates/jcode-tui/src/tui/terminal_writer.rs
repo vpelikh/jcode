@@ -116,12 +116,19 @@ pub fn write_auxiliary(bytes: &[u8]) -> bool {
     if bytes.is_empty() {
         return true;
     }
-    let guard = LIVE_WRITER.lock().unwrap();
-    let Some(live) = guard.as_ref() else {
-        return false;
+    // Copy the live writer's handles out from under the lock so we never hold
+    // the global registration lock across the CAS reservation, the allocation,
+    // or the channel send. Those can be contended, and the lock should protect
+    // registration state only, not the per-writer send path.
+    let (tx, inner) = {
+        let guard = LIVE_WRITER.lock().unwrap();
+        let Some(live) = guard.as_ref() else {
+            return false;
+        };
+        (live.tx.clone(), Arc::clone(&live.inner))
     };
     let len = bytes.len();
-    let mut prev = live.inner.buffered.load(Ordering::Relaxed);
+    let mut prev = inner.buffered.load(Ordering::Relaxed);
     loop {
         if prev >= QUEUE_CAPACITY_BYTES {
             // Wedged pty; drop the auxiliary bytes rather than block.
@@ -130,8 +137,7 @@ pub fn write_auxiliary(bytes: &[u8]) -> bool {
         let Some(next) = prev.checked_add(len) else {
             return true;
         };
-        match live
-            .inner
+        match inner
             .buffered
             .compare_exchange(prev, next, Ordering::Relaxed, Ordering::Relaxed)
         {
@@ -140,10 +146,10 @@ pub fn write_auxiliary(bytes: &[u8]) -> bool {
         }
     }
     let body: Box<[u8]> = bytes.to_vec().into_boxed_slice();
-    match live.tx.send(Chunk::Data(body)) {
+    match tx.send(Chunk::Data(body)) {
         Ok(()) => true,
         Err(_) => {
-            live.inner.buffered.fetch_sub(len, Ordering::Relaxed);
+            inner.buffered.fetch_sub(len, Ordering::Relaxed);
             false
         }
     }
