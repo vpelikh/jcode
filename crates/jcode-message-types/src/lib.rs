@@ -604,6 +604,29 @@ impl ToolCall {
     pub fn refresh_intent_from_input(&mut self) {
         self.intent = Self::intent_from_input(&self.input);
     }
+
+    /// Construct a `ToolCall` for test fixtures without writing the brand
+    /// conversion at every site.
+    ///
+    /// `id` is any `impl Into<ToolCallId>` (a `&str` or `String`), `name` is the
+    /// tool name, and `input`/`intent`/`thought_signature` are filled with
+    /// neutral defaults (`{}`, `None`, `None`) that tests can override via a
+    /// struct-literal copy when they need specific values. Keep it a plain
+    /// constructor (not `#[cfg(test)]`) so crates that depend on
+    /// `jcode-message-types` can use it from their own `#[cfg(test)]` code.
+    pub fn test(
+        id: impl Into<ToolCallId>,
+        name: impl Into<String>,
+        input: serde_json::Value,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            input,
+            intent: None,
+            thought_signature: None,
+        }
+    }
 }
 
 fn json_value_kind(value: &serde_json::Value) -> &'static str {
