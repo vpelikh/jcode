@@ -3098,6 +3098,13 @@ fn suspend_terminal_for_editor() {
 
     // These commands are safe even when a mode was not enabled. Disable them
     // before leaving the alternate screen so the child receives normal input.
+    //
+    // Write them synchronously to fd 1 (not through the async render writer):
+    // the very next step (`ratatui::try_restore` in `restore_terminal_quietly`)
+    // restores the terminal by writing directly to stdout, so these disables
+    // must land *before* the restore to preserve ordering. No frames are being
+    // drawn during this teardown, so there is no interleaving risk to serialize
+    // against.
     let mut buf = Vec::new();
     let _ = crossterm::queue!(
         &mut buf,
@@ -3105,7 +3112,9 @@ fn suspend_terminal_for_editor() {
         DisableFocusChange,
         DisableMouseCapture
     );
-    crate::tui::terminal_writer::write_serialized(&buf);
+    use std::io::Write as _;
+    let _ = std::io::stdout().write_all(&buf);
+    let _ = std::io::stdout().flush();
     crate::tui::disable_keyboard_enhancement();
     jcode_tui_style::restore_terminal_quietly();
 }

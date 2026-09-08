@@ -147,9 +147,16 @@ pub fn enable_keyboard_enhancement() -> bool {
 
 /// Disable Kitty keyboard protocol, restoring default key reporting.
 pub fn disable_keyboard_enhancement() {
+    use std::io::Write as _;
+    // Write synchronously to fd 1. Both call sites are terminal teardown
+    // sequences that immediately restore via `ratatui::try_restore` (which
+    // writes directly to stdout), so the pop must land before that restore
+    // rather than ride the async render writer, and no frames are being drawn
+    // concurrently to serialize against.
     let mut buf = Vec::new();
     let _ = crossterm::queue!(&mut buf, crossterm::event::PopKeyboardEnhancementFlags);
-    crate::tui::terminal_writer::write_serialized(&buf);
+    let _ = std::io::stdout().write_all(&buf);
+    let _ = std::io::stdout().flush();
 }
 
 /// Reassert terminal modes that terminals may clear while the TUI remains alive.
