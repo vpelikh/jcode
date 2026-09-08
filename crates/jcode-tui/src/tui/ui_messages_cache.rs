@@ -24,6 +24,7 @@ where
                 .wrapping_add(crate::tui::mermaid::mermaid_inline_expand_epoch()),
             mermaid_aspect_bucket: crate::tui::mermaid::current_preferred_aspect_ratio_bucket(),
             show_agentgrep_output: crate::config::config().display.show_agentgrep_output,
+            show_compass_query_output: crate::config::config().display.show_compass_query_output,
             show_bash_output: crate::config::config().display.show_bash_output,
             tool_call_details: crate::config::config().display.tool_call_details,
         },

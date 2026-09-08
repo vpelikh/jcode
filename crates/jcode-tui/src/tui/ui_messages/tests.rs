@@ -3770,6 +3770,48 @@ fn render_agentgrep_output_body_caps_huge_output() {
 }
 
 #[test]
+fn render_compass_query_output_body_renders_markdown() {
+    let content = "# Compass query: fn config\n\n\
+        **Intent:** discovery\n\
+        **Limit:** 20\n\n\
+        **Found 1 result(s)**\n\n\
+        ## 1. jcode_app_core::tool::mod\n\n\
+        **File:** crates/jcode-app-core/src/tool/mod.rs\n\
+        **Score:** 116100.000\n";
+    let lines = super::render_compass_query_output_body(content, 120);
+    let rendered = lines
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(rendered.contains("Compass query: fn config"), "rendered={rendered}");
+    assert!(
+        rendered.contains("jcode_app_core::tool::mod"),
+        "rendered={rendered}"
+    );
+    assert!(
+        rendered.contains("crates/jcode-app-core/src/tool/mod.rs"),
+        "rendered={rendered}"
+    );
+}
+
+#[test]
+fn render_compass_query_output_body_caps_huge_output() {
+    // Markdown headings produce one rendered line each; generate enough to
+    // exceed the cap.
+    let content = (0..600)
+        .map(|i| format!("## {i}. result {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let lines = super::render_compass_query_output_body(&content, 120);
+    // 400-line cap plus a single truncation summary line.
+    assert_eq!(lines.len(), 401, "should cap the body and add a summary");
+    let last = extract_line_text(&lines[lines.len() - 1]);
+    assert!(last.contains("more lines"), "last={last}");
+}
+
+#[test]
 fn render_assistant_message_plan_card_wraps_instead_of_truncating() {
     let saved = crate::tui::markdown::center_code_blocks();
     crate::tui::markdown::set_center_code_blocks(false);

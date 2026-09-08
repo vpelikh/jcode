@@ -570,6 +570,31 @@ fn render_agentgrep_output_body(content: &str, row_width: usize) -> Vec<Line<'st
     out
 }
 
+/// Render the full `compass_query` search output inline in the transcript.
+///
+/// `compass_query` returns structured markdown (headings, bold labels, list
+/// items), so unlike `agentgrep` we render it through the markdown pipeline to
+/// keep the search results scannable. The output is capped so a very large
+/// result set cannot balloon a single transcript row.
+fn render_compass_query_output_body(content: &str, row_width: usize) -> Vec<Line<'static>> {
+    const MAX_BODY_LINES: usize = 400;
+
+    // Single newlines inside compass output separate fields on one result and
+    // should be kept as hard breaks rather than reflowed into one paragraph.
+    let preserved = preserve_hard_line_breaks_for_markdown(content);
+    let width = row_width.saturating_sub(4).max(1);
+    let rendered = markdown::render_markdown_with_width(&preserved, Some(width));
+    let mut lines = markdown::wrap_lines(rendered, width);
+    if lines.len() > MAX_BODY_LINES {
+        lines.truncate(MAX_BODY_LINES);
+        lines.push(Line::from(Span::styled(
+            format!("    … {} more lines …", MAX_BODY_LINES),
+            Style::default().fg(dim_color()),
+        )));
+    }
+    lines
+}
+
 pub(crate) fn render_system_message(
     msg: &DisplayMessage,
     width: u16,
@@ -4361,6 +4386,19 @@ pub(crate) fn render_tool_message(
         && !msg.content.trim().is_empty()
     {
         for line in render_agentgrep_output_body(&msg.content, row_width) {
+            lines.push(line);
+        }
+    }
+
+    // Optionally render the full compass_query search output inline in the
+    // transcript. Gated behind `display.show_compass_query_output` (default
+    // false) so most users keep the compact one-line summary. The output is
+    // structured markdown, so it renders through the markdown pipeline.
+    if tools_ui::canonical_tool_name(&tc.name) == "compass_query"
+        && crate::config::config().display.show_compass_query_output
+        && !msg.content.trim().is_empty()
+    {
+        for line in render_compass_query_output_body(&msg.content, row_width) {
             lines.push(line);
         }
     }

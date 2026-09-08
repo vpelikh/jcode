@@ -266,6 +266,18 @@ impl Config {
         Ok(())
     }
 
+    /// Update the persisted show-compass-query-output preference.
+    pub fn set_show_compass_query_output(show: bool) -> anyhow::Result<()> {
+        let mut cfg = Self::load_for_update()?;
+        cfg.display.show_compass_query_output = show;
+        cfg.save()?;
+        crate::logging::info(&format!(
+            "Saved display.show_compass_query_output to config: {}",
+            show
+        ));
+        Ok(())
+    }
+
     /// Update the persisted tool-call-details preference.
     pub fn set_tool_call_details(show: bool) -> anyhow::Result<()> {
         let mut cfg = Self::load_for_update()?;

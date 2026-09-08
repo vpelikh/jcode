@@ -62,6 +62,7 @@ impl Config {
 - Redraw FPS: {}
 - Copy badge Alt label: {}
 - Show agentgrep output: {}
+- Show compass query output: {}
 - Tool call details: {}
 - Theme: {}
 - Custom colors: {}
@@ -202,6 +203,7 @@ impl Config {
                 self.display.copy_badge_alt_label.trim()
             },
             self.display.show_agentgrep_output,
+            self.display.show_compass_query_output,
             self.display.tool_call_details,
             if self.display.theme.trim().is_empty() {
                 "auto"
