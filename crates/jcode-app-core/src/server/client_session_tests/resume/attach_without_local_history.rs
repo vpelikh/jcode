@@ -73,7 +73,6 @@ async fn handle_resume_session_allows_attach_without_local_history() -> Result<(
     let client_debug_state = Arc::new(RwLock::new(ClientDebugState::default()));
     let swarm_members = Arc::new(RwLock::new(HashMap::<String, SwarmMember>::new()));
     let swarms_by_id = Arc::new(RwLock::new(HashMap::<String, HashSet<String>>::new()));
-    let file_touch = FileTouchService::new();
     let channel_subscriptions = Arc::new(RwLock::new(HashMap::<
         String,
         HashMap<String, HashSet<String>>,

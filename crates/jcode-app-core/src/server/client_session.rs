@@ -1,6 +1,6 @@
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
 
-use super::services::SwarmServiceHandle;
+use super::services::{MemberIdentity, SwarmServiceHandle};
 use super::client_state::{handle_get_history, spawn_model_prefetch_update};
 use super::{
     ClientConnectionInfo, ClientDebugState, FileTouchService, SessionInterruptQueues, SwarmMember,
@@ -152,9 +152,6 @@ pub(super) async fn handle_clear_session(
     let swarm_members = &swarm.swarm_state.members;
     let swarms_by_id = &swarm.swarm_state.swarms_by_id;
     let swarm_plans = &swarm.swarm_state.plans;
-    let channel_subscriptions = &swarm.channel_subscriptions;
-    let channel_subscriptions_by_session = &swarm.channel_subscriptions_by_session;
-    let file_touch = &swarm.file_touch;
     let event_history = &swarm.event_history;
     let event_counter = &swarm.event_counter;
     let swarm_event_tx = &swarm.swarm_event_tx;
@@ -235,30 +232,14 @@ pub(super) async fn handle_clear_session(
 
     // `/clear` creates a genuinely fresh session. Do not migrate the old
     // session's swarm membership or plan participation to the replacement:
-    // doing so lets a subsequent plan snapshot repopulate the cleared UI.
-    let (swarm_id_for_update, swarm_enabled, friendly_name) = {
-        let mut members = swarm_members.write().await;
-        match members.remove(client_session_id) {
-            Some(member) => (member.swarm_id, member.swarm_enabled, member.friendly_name),
-            None => (None, false, None),
-        }
-    };
-    if let Some(ref swarm_id) = swarm_id_for_update {
-        let mut swarms = swarms_by_id.write().await;
-        if let Some(swarm) = swarms.get_mut(swarm_id) {
-            swarm.remove(client_session_id);
-            if swarm.is_empty() {
-                swarms.remove(swarm_id);
-            }
-        }
-    }
-    file_touch.clear_session(client_session_id).await;
-    remove_session_channel_subscriptions(
-        client_session_id,
-        channel_subscriptions,
-        channel_subscriptions_by_session,
-    )
-    .await;
+    // doing so lets a subsequent plan snapshot repopulate the cleared UI. The
+    // swarm side effects (members, swarms_by_id, file-touch, channels) are
+    // owned by the swarm service and run via the handle.
+    let MemberIdentity {
+        swarm_id: swarm_id_for_update,
+        swarm_enabled,
+        friendly_name,
+    } = swarm.take_session_membership(client_session_id).await;
     // The connection remains subscribed across `/clear`, so there is no later
     // subscribe request to register the replacement session. Register it as a
     // fresh root while deliberately leaving the old swarm and plan behind.

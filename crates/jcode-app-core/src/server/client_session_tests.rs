@@ -282,6 +282,62 @@ async fn ensure_member_refresh_existing_member_adds_connection_without_reinserti
 }
 
 #[tokio::test]
+async fn take_session_membership_removes_member_and_returns_identity() {
+    let session_id = "session-teardown";
+    let swarm_members = Arc::new(RwLock::new(HashMap::from([(
+        session_id.to_string(),
+        test_swarm_member(session_id, "ready"),
+    )])));
+    let swarms_by_id = Arc::new(RwLock::new(HashMap::from([(
+        "swarm-test".to_string(),
+        HashSet::from([session_id.to_string()]),
+    )])));
+    let channel_subscriptions = Arc::new(RwLock::new(HashMap::<
+        String,
+        HashMap<String, HashSet<String>>,
+    >::new()));
+    let channel_subscriptions_by_session =
+        Arc::new(RwLock::new(HashMap::from([(
+            session_id.to_string(),
+            HashMap::from([(
+                "swarm-test".to_string(),
+                HashSet::from(["chan-a".to_string()]),
+            )]),
+        )])));
+    let (tx, _rx) = mpsc::unbounded_channel::<ServerEvent>();
+    let handle = {
+        let h = swarm_handle_full(
+            Arc::clone(&swarm_members),
+            Arc::clone(&swarms_by_id),
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::clone(&channel_subscriptions),
+            Arc::clone(&channel_subscriptions_by_session),
+            Arc::new(RwLock::new(VecDeque::new())),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            broadcast::channel(8).0,
+        );
+        // ensure a member is registered so teardown has a membership to remove
+        h.ensure_member(session_id, "conn-x", None, None, Some("swarm-test".to_string()), true, &tx)
+            .await;
+        h
+    };
+
+    let identity = handle.take_session_membership(session_id).await;
+    assert_eq!(identity.swarm_id.as_deref(), Some("swarm-test"));
+    assert!(identity.swarm_enabled);
+    assert_eq!(identity.friendly_name.as_deref(), Some(session_id));
+
+    assert!(swarm_members.read().await.is_empty());
+    let swarms = swarms_by_id.read().await;
+    assert!(
+        !swarms.contains_key("swarm-test"),
+        "empty swarm should be removed from swarms_by_id"
+    );
+    assert!(channel_subscriptions_by_session.read().await.is_empty());
+}
+
+#[tokio::test]
 async fn resume_rename_releases_member_lock_before_waiting_for_swarm_map() {
     let old_session_id = "session-old";
     let new_session_id = "session-new";

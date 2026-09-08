@@ -76,7 +76,6 @@ async fn handle_resume_session_registers_live_events_before_history_replay() -> 
         },
     )])));
     let swarms_by_id = Arc::new(RwLock::new(HashMap::<String, HashSet<String>>::new()));
-    let file_touch = FileTouchService::new();
     let channel_subscriptions = Arc::new(RwLock::new(HashMap::<
         String,
         HashMap<String, HashSet<String>>,
@@ -110,7 +109,6 @@ async fn handle_resume_session_registers_live_events_before_history_replay() -> 
         let client_debug_state = Arc::clone(&client_debug_state);
         let swarm_members = Arc::clone(&swarm_members);
         let swarms_by_id = Arc::clone(&swarms_by_id);
-        let file_touch = file_touch.clone();
         let channel_subscriptions = Arc::clone(&channel_subscriptions);
         let channel_subscriptions_by_session = Arc::clone(&channel_subscriptions_by_session);
         let swarm_plans = Arc::clone(&swarm_plans);

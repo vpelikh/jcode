@@ -46,6 +46,15 @@ pub(crate) struct SwarmServiceHandle {
     pub(crate) swarm_mutation_runtime: SwarmMutationRuntime,
 }
 
+/// Identity carried by a session's swarm membership, returned when a `/clear`
+/// tears the old member down so the caller can re-register the fresh root with
+/// the same swarm intent.
+pub(crate) struct MemberIdentity {
+    pub(crate) swarm_id: Option<String>,
+    pub(crate) swarm_enabled: bool,
+    pub(crate) friendly_name: Option<String>,
+}
+
 impl SwarmServiceHandle {
     pub(crate) fn from_server(server: &Server) -> Self {
         Self {
@@ -222,5 +231,48 @@ impl SwarmServiceHandle {
                 swarm.insert(new_session_id.to_string());
             }
         }
+    }
+
+    /// Tear down a session's swarm membership on `/clear`: remove the member
+    /// from `members` and `swarms_by_id`, clear its file-touch tracking, and
+    /// drop its channel subscriptions. Returns the member's identity so the
+    /// caller can re-register the fresh replacement session with the same swarm
+    /// intent. No-op (returns an empty identity) when no member was present.
+    pub(crate) async fn take_session_membership(
+        &self,
+        client_session_id: &str,
+    ) -> MemberIdentity {
+        let identity = {
+            let mut members = self.swarm_state.members.write().await;
+            match members.remove(client_session_id) {
+                Some(member) => MemberIdentity {
+                    swarm_id: member.swarm_id,
+                    swarm_enabled: member.swarm_enabled,
+                    friendly_name: member.friendly_name,
+                },
+                None => MemberIdentity {
+                    swarm_id: None,
+                    swarm_enabled: false,
+                    friendly_name: None,
+                },
+            }
+        };
+        if let Some(ref swarm_id) = identity.swarm_id {
+            let mut swarms = self.swarm_state.swarms_by_id.write().await;
+            if let Some(swarm) = swarms.get_mut(swarm_id) {
+                swarm.remove(client_session_id);
+                if swarm.is_empty() {
+                    swarms.remove(swarm_id);
+                }
+            }
+        }
+        self.file_touch.clear_session(client_session_id).await;
+        super::super::swarm_channels::remove_session_channel_subscriptions(
+            client_session_id,
+            &self.channel_subscriptions,
+            &self.channel_subscriptions_by_session,
+        )
+        .await;
+        identity
     }
 }
