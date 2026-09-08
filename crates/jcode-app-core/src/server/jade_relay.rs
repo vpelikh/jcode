@@ -1,13 +1,13 @@
 use super::client_lifecycle::process_message_streaming_mpsc;
+use super::services::SessionServiceHandle;
 use super::state::{
-    SessionControlHandle, SessionInterruptQueues, queue_soft_interrupt_for_session,
-    session_event_fanout_sender,
+    SessionControlHandle, session_event_fanout_sender,
 };
 use super::{SessionAgents, SwarmMember};
 use crate::config::SafetyConfig;
 use crate::session::Session;
 use anyhow::{Context, Result};
-use jcode_agent_runtime::{InterruptSignal, SoftInterruptSource};
+use jcode_agent_runtime::SoftInterruptSource;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -20,8 +20,6 @@ const ERROR_BACKOFF: Duration = Duration::from_secs(10);
 const LAUNCH_SESSION_WAIT: Duration = Duration::from_secs(45);
 const MAX_RESPONSE_CHARS: usize = 12_000;
 const CANCEL_SIGNAL_RESET: Duration = Duration::from_secs(5);
-
-type SessionCancelSignals = Arc<RwLock<HashMap<String, InterruptSignal>>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RelayApiConfig {
@@ -143,9 +141,7 @@ fn default_device_id() -> String {
 
 pub(super) fn spawn_if_configured(
     safety: &SafetyConfig,
-    sessions: SessionAgents,
-    soft_interrupt_queues: SessionInterruptQueues,
-    shutdown_signals: SessionCancelSignals,
+    session: &SessionServiceHandle,
     swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>>,
 ) {
     if let Some(config) = RelayListenerConfig::from_safety(safety) {
@@ -154,20 +150,11 @@ pub(super) fn spawn_if_configured(
             config.session_id,
             config.api.user_id.as_deref().unwrap_or("<token-default>")
         ));
-        let session_sessions = Arc::clone(&sessions);
-        let session_interrupts = Arc::clone(&soft_interrupt_queues);
-        let session_shutdown_signals = Arc::clone(&shutdown_signals);
+        let session = session.clone();
         let session_swarm = Arc::clone(&swarm_members);
         tokio::spawn(async move {
             let client = RelayClient::new(config);
-            client
-                .run(
-                    session_sessions,
-                    session_interrupts,
-                    session_shutdown_signals,
-                    session_swarm,
-                )
-                .await;
+            client.run(session, session_swarm).await;
         });
     }
 
@@ -177,16 +164,11 @@ pub(super) fn spawn_if_configured(
             config.api.device_id,
             config.api.user_id.as_deref().unwrap_or("<token-default>")
         ));
+        let session = session.clone();
+        let session_swarm = Arc::clone(&swarm_members);
         tokio::spawn(async move {
             let client = RelayLauncherClient::new(config);
-            client
-                .run(
-                    sessions,
-                    soft_interrupt_queues,
-                    shutdown_signals,
-                    swarm_members,
-                )
-                .await;
+            client.run(session, session_swarm).await;
         });
     }
 }
@@ -214,9 +196,7 @@ impl RelayClient {
 
     async fn run(
         &self,
-        sessions: SessionAgents,
-        soft_interrupt_queues: SessionInterruptQueues,
-        shutdown_signals: SessionCancelSignals,
+        session: SessionServiceHandle,
         swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>>,
     ) {
         let after = if self.config.process_existing_prompts {
@@ -230,22 +210,13 @@ impl RelayClient {
                 }
             }
         };
-        self.run_from_after(
-            after,
-            sessions,
-            soft_interrupt_queues,
-            shutdown_signals,
-            swarm_members,
-        )
-        .await;
+        self.run_from_after(after, session, swarm_members).await;
     }
 
     async fn run_from_after(
         &self,
         mut after: i64,
-        sessions: SessionAgents,
-        soft_interrupt_queues: SessionInterruptQueues,
-        shutdown_signals: SessionCancelSignals,
+        session: SessionServiceHandle,
         swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>>,
     ) {
         let mut last_heartbeat = Instant::now()
@@ -271,20 +242,13 @@ impl RelayClient {
                             "prompt" => {
                                 self.handle_prompt(
                                     event,
-                                    &sessions,
-                                    &soft_interrupt_queues,
+                                    &session,
                                     Arc::clone(&swarm_members),
                                 )
                                 .await
                             }
                             "cancel" => {
-                                self.handle_cancel(
-                                    event,
-                                    &sessions,
-                                    &soft_interrupt_queues,
-                                    &shutdown_signals,
-                                )
-                                .await
+                                self.handle_cancel(event, &session).await
                             }
                             other => {
                                 crate::logging::debug(&format!(
@@ -388,8 +352,7 @@ impl RelayClient {
     async fn handle_prompt(
         &self,
         event: RelayEvent,
-        sessions: &SessionAgents,
-        soft_interrupt_queues: &SessionInterruptQueues,
+        session: &SessionServiceHandle,
         swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>>,
     ) -> Result<()> {
         let text = event.text.unwrap_or_default();
@@ -420,8 +383,7 @@ impl RelayClient {
         match deliver_to_session(
             &self.config.session_id,
             text,
-            sessions,
-            soft_interrupt_queues,
+            session,
             swarm_members,
         )
         .await
@@ -476,10 +438,11 @@ impl RelayClient {
     async fn handle_cancel(
         &self,
         event: RelayEvent,
-        sessions: &SessionAgents,
-        soft_interrupt_queues: &SessionInterruptQueues,
-        shutdown_signals: &SessionCancelSignals,
+        session: &SessionServiceHandle,
     ) -> Result<()> {
+        let sessions = &session.sessions;
+        let soft_interrupt_queues = &session.soft_interrupt_queues;
+        let shutdown_signals = &session.shutdown_signals;
         let reason = event
             .text
             .as_deref()
@@ -530,15 +493,14 @@ impl RelayClient {
             });
             ("signalled", Some(CANCEL_SIGNAL_RESET.as_millis() as u64))
         } else if live_agent {
-            if queue_soft_interrupt_for_session(
-                &self.config.session_id,
-                interrupt,
-                true,
-                SoftInterruptSource::User,
-                soft_interrupt_queues,
-                sessions,
-            )
-            .await
+            if session
+                .queue_soft_interrupt(
+                    &self.config.session_id,
+                    interrupt,
+                    true,
+                    SoftInterruptSource::User,
+                )
+                .await
             {
                 ("queued_no_signal", None)
             } else {
@@ -547,15 +509,14 @@ impl RelayClient {
                     self.config.session_id
                 )
             }
-        } else if queue_soft_interrupt_for_session(
-            &self.config.session_id,
-            interrupt,
-            true,
-            SoftInterruptSource::User,
-            soft_interrupt_queues,
-            sessions,
-        )
-        .await
+        } else if session
+            .queue_soft_interrupt(
+                &self.config.session_id,
+                interrupt,
+                true,
+                SoftInterruptSource::User,
+            )
+            .await
         {
             ("queued_offline", None)
         } else {
@@ -604,9 +565,7 @@ impl RelayLauncherClient {
 
     async fn run(
         &self,
-        sessions: SessionAgents,
-        soft_interrupt_queues: SessionInterruptQueues,
-        shutdown_signals: SessionCancelSignals,
+        session: SessionServiceHandle,
         swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>>,
     ) {
         let mut after = match self.poll_launches(0, 0).await {
@@ -640,9 +599,7 @@ impl RelayLauncherClient {
                         if let Err(error) = self
                             .handle_launch(
                                 event,
-                                &sessions,
-                                &soft_interrupt_queues,
-                                &shutdown_signals,
+                                &session,
                                 Arc::clone(&swarm_members),
                             )
                             .await
@@ -786,11 +743,10 @@ impl RelayLauncherClient {
     async fn handle_launch(
         &self,
         event: RelayEvent,
-        sessions: &SessionAgents,
-        soft_interrupt_queues: &SessionInterruptQueues,
-        shutdown_signals: &SessionCancelSignals,
+        session: &SessionServiceHandle,
         swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>>,
     ) -> Result<()> {
+        let sessions = &session.sessions;
         let request =
             LaunchRequest::from_event(&event, self.config.default_working_dir.as_deref())?;
         crate::logging::info(&format!(
@@ -825,14 +781,7 @@ impl RelayLauncherClient {
             .await;
 
         if request.text.trim().is_empty() {
-            self.spawn_session_listener(
-                session_id,
-                0,
-                sessions,
-                soft_interrupt_queues,
-                shutdown_signals,
-                swarm_members,
-            );
+            self.spawn_session_listener(session_id, 0, session, swarm_members);
             return Ok(());
         }
 
@@ -967,14 +916,7 @@ impl RelayLauncherClient {
             }
         };
 
-        self.spawn_session_listener(
-            session_id,
-            after,
-            sessions,
-            soft_interrupt_queues,
-            shutdown_signals,
-            swarm_members,
-        );
+        self.spawn_session_listener(session_id, after, session, swarm_members);
         Ok(())
     }
 
@@ -982,9 +924,7 @@ impl RelayLauncherClient {
         &self,
         session_id: String,
         after: i64,
-        sessions: &SessionAgents,
-        soft_interrupt_queues: &SessionInterruptQueues,
-        shutdown_signals: &SessionCancelSignals,
+        session: &SessionServiceHandle,
         swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>>,
     ) {
         let config = RelayListenerConfig {
@@ -992,23 +932,13 @@ impl RelayLauncherClient {
             session_id: session_id.clone(),
             process_existing_prompts: false,
         };
-        let sessions = Arc::clone(sessions);
-        let soft_interrupt_queues = Arc::clone(soft_interrupt_queues);
-        let shutdown_signals = Arc::clone(shutdown_signals);
+        let session = session.clone();
         tokio::spawn(async move {
             crate::logging::info(&format!(
                 "Starting Jade relay listener for launched session {session_id} after seq {after}"
             ));
             let client = RelayClient::new(config);
-            client
-                .run_from_after(
-                    after,
-                    sessions,
-                    soft_interrupt_queues,
-                    shutdown_signals,
-                    swarm_members,
-                )
-                .await;
+            client.run_from_after(after, session, swarm_members).await;
         });
     }
 }
@@ -1186,10 +1116,10 @@ async fn wait_for_live_session(
 async fn deliver_to_session(
     session_id: &str,
     text: &str,
-    sessions: &SessionAgents,
-    soft_interrupt_queues: &SessionInterruptQueues,
+    session: &SessionServiceHandle,
     swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>>,
 ) -> Result<String> {
+    let sessions = &session.sessions;
     let agent = {
         let guard = sessions.read().await;
         guard.get(session_id).cloned()
@@ -1199,15 +1129,14 @@ async fn deliver_to_session(
     };
 
     if agent.try_lock().is_err() {
-        let queued = queue_soft_interrupt_for_session(
-            session_id,
-            format!("[jade relay message from user]\n{text}"),
-            false,
-            SoftInterruptSource::User,
-            soft_interrupt_queues,
-            sessions,
-        )
-        .await;
+        let queued = session
+            .queue_soft_interrupt(
+                session_id,
+                format!("[jade relay message from user]\n{text}"),
+                false,
+                SoftInterruptSource::User,
+            )
+            .await;
         if queued {
             return Ok("Message queued for the running session.".to_string());
         }
