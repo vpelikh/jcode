@@ -547,4 +547,68 @@ mod worktree {
             .current_dir(&repo)
             .output();
     }
+
+    #[test]
+    fn create_git_worktree_in_non_git_dir_reports_no_repo() {
+        use crate::tui::app::tests::create_test_app;
+
+        // A temp dir that is not inside a git repository.
+        let home = tempfile::tempdir().expect("temp home");
+        let non_repo = home.path().join("not-a-repo");
+        std::fs::create_dir_all(&non_repo).unwrap();
+
+        let mut app = create_test_app();
+        app.session.working_dir = Some(non_repo.display().to_string());
+
+        let spec = super::parse_worktree_spec("panel").unwrap();
+        let err = super::create_git_worktree(&app, &spec).unwrap_err();
+        assert!(
+            err.contains("No git repository found") || err.contains("not accessible"),
+            "expected a missing-repo error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn create_git_worktree_rejects_already_existing_branch_and_cleans_empty_dir() {
+        use crate::tui::app::tests::create_test_app;
+        use std::process::Command;
+
+        // Throwaway repo with a pre-existing `feat/used` branch so that
+        // `git worktree add -b feat/used <dir>` fails partway (branch
+        // collision) and must clean up the empty target dir it created.
+        let home = tempfile::tempdir().expect("temp home");
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for (args, envs) in [
+            (vec!["init", "-b", "main"], vec![]),
+            (vec!["add", "."], vec![]),
+            (vec!["commit", "-m", "init"], vec![("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")]),
+            (vec!["branch", "feat/used"], vec![]),
+        ] {
+            let mut cmd = Command::new("git");
+            cmd.args(&args).current_dir(&repo);
+            for (k, v) in envs {
+                cmd.env(k, v);
+            }
+            if args[0] == "add" {
+                std::fs::write(repo.join("file.txt"), "hi\n").unwrap();
+            }
+            assert!(cmd.output().unwrap().status.success(), "git {args:?}");
+        }
+
+        let mut app = create_test_app();
+        app.session.working_dir = Some(repo.display().to_string());
+
+        // A worktree name whose default branch already exists must fail...
+        let spec = super::parse_worktree_spec("used").unwrap();
+        let err = super::create_git_worktree(&app, &spec).unwrap_err();
+        assert!(!err.is_empty(), "branch collision must be reported");
+
+        // ...and must NOT leave a partial empty dir behind.
+        let leftover = repo.join(".worktrees").join("used");
+        assert!(
+            !leftover.exists(),
+            "failed worktree creation must clean up its empty target dir"
+        );
+    }
 }

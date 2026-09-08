@@ -112,6 +112,28 @@ fn detect_new_worktree(prompt: &str) -> Option<IntentCommand> {
     Some(IntentCommand::NewWorktree(spec))
 }
 
+/// Single-token subjects that are too weak to name a feature (articles,
+/// pronouns, generic determiners). A `for <x>` / `called <x>` extraction that
+/// yields one of these is treated as "no usable name", so the trigger stays
+/// silent rather than creating a worktree named `my` or `this`.
+fn is_weak_single_token(name: &str) -> bool {
+    matches!(
+        name.to_lowercase().as_str(),
+        "a" | "an"
+            | "the"
+            | "my"
+            | "our"
+            | "your"
+            | "this"
+            | "that"
+            | "these"
+            | "those"
+            | "some"
+            | "any"
+            | "each"
+    )
+}
+
 /// Extract a concise worktree/feature name from a prompt, or `None`.
 ///
 /// Order of preference:
@@ -119,7 +141,8 @@ fn detect_new_worktree(prompt: &str) -> Option<IntentCommand> {
 ///  2. `called <x>` / `named <x>` → the following token.
 ///  3. `for <x>` → the following token (the subject).
 /// The name must be a single safe path segment (validated by
-/// [`parse_worktree_spec`]); if parsing rejects it the trigger stays silent.
+/// [`parse_worktree_spec`]); if parsing rejects it, or the subject is only a
+/// weak word like "the", the trigger stays silent.
 fn extract_worktree_name(prompt: &str) -> Option<String> {
     static QUOTED: OnceLock<Regex> = OnceLock::new();
     let quoted = QUOTED.get_or_init(|| {
@@ -136,10 +159,15 @@ fn extract_worktree_name(prompt: &str) -> Option<String> {
         )
         .expect("subject name regex")
     });
-    subject
+    let name = subject
         .captures(prompt)
         .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_string())
+        .map(|m| m.as_str().to_string())?;
+    // A weak single-token subject ("for my project") must not name a worktree.
+    if is_weak_single_token(&name) {
+        return None;
+    }
+    Some(name)
 }
 
 #[cfg(test)]
@@ -211,5 +239,19 @@ mod tests {
         assert!(detect_intent("").is_none());
         assert!(detect_intent("   ").is_none());
         assert!(detect_intent("hi").is_none());
+    }
+
+    #[test]
+    fn directive_without_a_derivable_name_does_not_trigger() {
+        // An explicit worktree directive with no quoted/named/for name must
+        // stay silent (no best-guess name), leaving the user to /worktree.
+        for prompt in [
+            "make a new worktree for my project work",
+            "create a worktree please",
+            "work in a new worktree",
+        ] {
+            let got = detect_intent(prompt);
+            assert!(got.is_none(), "{prompt:?} should not trigger, got {got:?}");
+        }
     }
 }
