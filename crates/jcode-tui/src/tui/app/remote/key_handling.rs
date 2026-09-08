@@ -288,8 +288,24 @@ pub(in crate::tui::app) async fn invoke_new_worktree(
         return None;
     }
 
-    match app_mod::commands::create_git_worktree(app, &spec) {
-        Ok(worktree_dir) => {
+    // Resolve the owned working dir first (cheap), then offload the blocking
+    // `git worktree add` to a worker thread so a slow git call never stalls the
+    // async event loop.
+    let work_dir = match app_mod::commands::session_work_dir(app) {
+        Ok(dir) => dir,
+        Err(error) => {
+            app.push_display_message(DisplayMessage::error(error));
+            return None;
+        }
+    };
+    let spec_for_task = spec.clone();
+    let created = tokio::task::spawn_blocking(move || {
+        app_mod::commands::create_git_worktree_at(work_dir, &spec_for_task)
+    })
+    .await;
+
+    match created {
+        Ok(Ok(worktree_dir)) => {
             // Chain a /cd into the fresh worktree so the session's
             // tools/skills/AGENTS.md/git widget re-scope to it.
             if remote
@@ -312,8 +328,14 @@ pub(in crate::tui::app) async fn invoke_new_worktree(
                 None
             }
         }
-        Err(error) => {
+        Ok(Err(error)) => {
             app.push_display_message(DisplayMessage::error(error));
+            None
+        }
+        Err(join_error) => {
+            app.push_display_message(DisplayMessage::error(format!(
+                "Worktree creation task failed: {join_error}"
+            )));
             None
         }
     }

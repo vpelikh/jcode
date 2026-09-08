@@ -1661,18 +1661,15 @@ pub(super) fn parse_worktree_spec(rest: &str) -> Result<WorktreeSpec, String> {
     Ok(WorktreeSpec { name, branch })
 }
 
-/// Resolve the main repo root that owns the session working directory.
+/// Resolve the main repo root owning `work_dir`.
 ///
 /// Works from the main checkout or any linked worktree: the git common dir
 /// (`.git` for the main repo / the superproject) is always the same, and the
-/// main checkout is its direct parent. Returns an error when the session's
-/// working directory is not inside a git repository reachable from this client
-/// (paths resolve on the server, so a non-local remote session cannot create
-/// worktrees without a resolvable working directory).
-fn main_repo_root(app: &App) -> Result<PathBuf, String> {
-    let work_dir = git_command_repo_dir(app)?;
+/// main checkout is its direct parent. Returns an error when `work_dir` is not
+/// inside a git repository reachable from this client.
+fn main_repo_root_for_work_dir(work_dir: &std::path::Path) -> Result<PathBuf, String> {
     let common_dir =
-        run_git_command(&work_dir, &["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        run_git_command(work_dir, &["rev-parse", "--path-format=absolute", "--git-common-dir"])
             .map_err(|error| {
                 format!(
                     "No git repository found for {}: {}",
@@ -1687,14 +1684,18 @@ fn main_repo_root(app: &App) -> Result<PathBuf, String> {
     Ok(root.to_path_buf())
 }
 
-/// Create a new git worktree for the session and return its absolute path.
+/// Create a new git worktree and return its absolute path.
 ///
-/// The worktree is created at `<repo>/.worktrees/<name>` on a new branch
-/// (`feat/<name>` by default, or the `<branch>` given via `-b`). Empty dirs
-/// are created as needed. This only creates the worktree; callers are
-/// responsible for moving the session into it (e.g. chaining a `/cd`).
-pub(super) fn create_git_worktree(app: &App, spec: &WorktreeSpec) -> Result<PathBuf, String> {
-    let repo_root = main_repo_root(app)?;
+/// Pure computation (no `App` borrow): resolves the repo root from `work_dir`,
+/// creates `<repo>/.worktrees/<name>` on a new branch (`feat/<name>` by default,
+/// or the `<branch>` given via `-b`), and cleans up any empty target dir left
+/// behind on a partial failure. This is the blocking git path, so async callers
+/// run it on a blocking thread (see `invoke_new_worktree`).
+pub(super) fn create_git_worktree_at(
+    work_dir: PathBuf,
+    spec: &WorktreeSpec,
+) -> Result<PathBuf, String> {
+    let repo_root = main_repo_root_for_work_dir(&work_dir)?;
     let branch = match &spec.branch {
         Some(branch) => branch.clone(),
         None => format!("feat/{}", spec.name),
@@ -1731,6 +1732,24 @@ pub(super) fn create_git_worktree(app: &App, spec: &WorktreeSpec) -> Result<Path
     })?;
 
     Ok(worktree_dir)
+}
+
+/// Resolve the session's working directory for git operations.
+///
+/// Exposed so async callers can grab the owned dir before offloading the
+/// blocking git work to a worker thread.
+pub(super) fn session_work_dir(app: &App) -> Result<PathBuf, String> {
+    git_command_repo_dir(app)
+}
+
+/// [`create_git_worktree_at`] using the session working directory.
+///
+/// Test-only: async callers use [`session_work_dir`] + `spawn_blocking`
+/// (`create_git_worktree_at`) so the blocking git call runs on a worker thread.
+#[cfg(test)]
+pub(super) fn create_git_worktree(app: &App, spec: &WorktreeSpec) -> Result<PathBuf, String> {
+    let work_dir = git_command_repo_dir(app)?;
+    create_git_worktree_at(work_dir, spec)
 }
 
 fn transcript_opened_message(path: &std::path::Path) -> String {

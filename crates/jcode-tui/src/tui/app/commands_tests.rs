@@ -1,7 +1,7 @@
 use super::ensure_swarm_prompt_edit_path;
 use super::parse_diff_mode_name;
 use super::parse_manual_subagent_spec;
-use super::{create_git_worktree, main_repo_root, parse_worktree_spec};
+use super::{create_git_worktree, main_repo_root_for_work_dir, parse_worktree_spec};
 
 #[test]
 fn parse_diff_mode_name_maps_known_aliases() {
@@ -501,7 +501,6 @@ mod worktree {
 
     #[test]
     fn main_repo_root_from_a_linked_worktree_points_to_the_main_checkout() {
-        use crate::tui::app::tests::create_test_app;
         use std::process::Command;
 
         let home = tempfile::tempdir().expect("temp home");
@@ -533,9 +532,7 @@ mod worktree {
             .unwrap();
         assert!(ok.status.success(), "seed worktree failed");
 
-        let mut app = create_test_app();
-        app.session.working_dir = Some(linked.display().to_string());
-        let root = super::main_repo_root(&app).unwrap();
+        let root = super::main_repo_root_for_work_dir(&linked).unwrap();
         assert_eq!(root, repo);
 
         let _ = Command::new("git")
