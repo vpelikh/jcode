@@ -42,7 +42,11 @@ Snippet details:
   lines with a `...` fold marker for longer nodes (bounding context-window cost).
 - Best-effort: a missing/unreadable file, an `..`-escaping or absolute path, or
   an out-of-range anchor renders no snippet without failing the query (see
-  `tool::compass_query::read_source_snippet`).
+  `tool::compass_query::read_source_snippet`; the line window itself is read
+  via `stream_snippet_from_file` so a result pointing at a large
+  generated/minified file is never fully loaded into memory).
+- Only the rendered line window is read from disk: memory and I/O scale with
+  the ≤8 displayed lines, not the whole file.
 
 ## Cache locations
 
