@@ -621,4 +621,62 @@ mod worktree {
             .current_dir(&repo)
             .output();
     }
+
+    #[test]
+    fn create_git_worktree_reports_branch_checked_out_elsewhere() {
+        use crate::tui::app::tests::create_test_app;
+        use std::process::Command;
+
+        // Throwaway repo with a branch checked out in a linked worktree, so the
+        // branch exists but cannot be attached to a new worktree.
+        let home = tempfile::tempdir().expect("temp home");
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for (args, envs) in [
+            (vec!["init", "-b", "main"], vec![]),
+            (vec!["add", "."], vec![]),
+            (vec!["commit", "-m", "init"], vec![("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")]),
+        ] {
+            let mut cmd = Command::new("git");
+            cmd.args(&args).current_dir(&repo);
+            for (k, v) in envs {
+                cmd.env(k, v);
+            }
+            if args[0] == "add" {
+                std::fs::write(repo.join("file.txt"), "hi\n").unwrap();
+            }
+            assert!(cmd.output().unwrap().status.success(), "git {args:?}");
+        }
+        // Create a linked worktree that checks out `feat/taken`.
+        let taken = repo.join(".worktrees").join("taken");
+        let ok = Command::new("git")
+            .args(["worktree", "add", "-b", "feat/taken", &taken.display().to_string()])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(ok.status.success(), "seed worktree failed");
+
+        let mut app = create_test_app();
+        app.session.working_dir = Some(repo.display().to_string());
+
+        // A worktree named `new-slot` whose requested branch (`feat/taken`) is
+        // checked out in the linked worktree must report a clear error. The dir
+        // `repo/.worktrees/new-slot` does not exist, so the branch-check runs.
+        let spec = super::parse_worktree_spec("new-slot -b feat/taken").unwrap();
+        let err = super::create_git_worktree(&app, &spec).unwrap_err();
+        assert!(
+            err.contains("already checked out in another worktree"),
+            "expected a checked-out-elsewhere error, got: {err}"
+        );
+
+        // Cleanup.
+        let _ = Command::new("git")
+            .args(["worktree", "remove", "--force", &taken.display().to_string()])
+            .current_dir(&repo)
+            .output();
+        let _ = Command::new("git")
+            .args(["branch", "-D", "feat/taken"])
+            .current_dir(&repo)
+            .output();
+    }
 }

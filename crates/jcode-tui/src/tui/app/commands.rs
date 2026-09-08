@@ -1684,6 +1684,43 @@ fn main_repo_root_for_work_dir(work_dir: &std::path::Path) -> Result<PathBuf, St
     Ok(root.to_path_buf())
 }
 
+/// Whether a fully-qualified git ref exists.
+///
+/// Runs `git rev-parse --verify --quiet <ref>` and reports success (the ref
+/// exists) without printing anything, so a missing ref is silently `false` and
+/// the shell does not leak errors to stderr.
+fn git_ref_exists(repo_root: &std::path::Path, full_ref: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", full_ref])
+        .current_dir(repo_root)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Whether `branch` is currently checked out in a linked worktree (i.e. not the
+/// main checkout).
+///
+/// In `git worktree list --porcelain` the first entry is the main checkout and
+/// every entry after a blank line is a linked worktree. A linked worktree whose
+/// `branch refs/heads/<branch>` matches means attaching `branch` to a new
+/// worktree would be refused by git because it is checked out elsewhere.
+fn branch_checked_out_elsewhere(repo_root: &std::path::Path, branch: &str) -> Result<bool, String> {
+    let porcelain = run_git_command(repo_root, &["worktree", "list", "--porcelain"])?;
+    let wanted = format!("branch refs/heads/{branch}");
+
+    let mut blocks = porcelain.split("\n\n");
+    // Skip the main-checkout block (the first one); only linked worktrees are
+    // "elsewhere".
+    let _main = blocks.next();
+    for block in blocks {
+        if block.lines().any(|line| line.trim() == wanted) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Create a new git worktree and return its absolute path.
 ///
 /// Pure computation (no `App` borrow): resolves the repo root from `work_dir`,
@@ -1718,48 +1755,49 @@ pub(super) fn create_git_worktree_at(
         format!("Cannot create worktree at a non-UTF-8 path: {}", worktree_dir.display())
     })?;
 
-    // Try to create a new branch for the worktree. If the branch already exists
-    // (a common case when re-running or when the user supplied `-b <branch>` for
-    // a branch that is already checked out/created), git refuses to create it
-    // with `-b`. Rather than fail, fall back to attaching that existing branch
-    // to the worktree.
-    let first = run_git_command(
+    // Try to create a new branch for the worktree, or attach an existing one.
+    //
+    // Three cases:
+    //  - The branch does not exist yet -> create it with `-b`.
+    //  - The branch exists but is not checked out in a linked worktree -> attach
+    //    it (`git worktree add <dir> <branch>`), which is what a user means by
+    //    re-running or reusing a branch.
+    //  - The branch exists and is checked out in another (linked) worktree ->
+    //    git cannot check the same branch into two worktrees; give a clear error.
+    let branch_ref = format!("refs/heads/{branch}");
+    if git_ref_exists(&repo_root, &branch_ref) {
+        if branch_checked_out_elsewhere(&repo_root, &branch)? {
+            return Err(format!(
+                "Branch '{branch}' is already checked out in another worktree; \
+                 pick a different branch or worktree name."
+            ));
+        }
+        // Attach the existing branch to the new worktree.
+        run_git_command(
+            &repo_root,
+            &["worktree", "add", "-q", worktree_dir_str, &branch],
+        )
+        .map_err(|error| {
+            format!("Branch '{branch}' exists but could not be attached: {error}")
+        })?;
+        return Ok(worktree_dir);
+    }
+
+    // The branch does not exist yet: create it and check it out in the worktree.
+    run_git_command(
         &repo_root,
         &["worktree", "add", "-b", &branch, "-q", worktree_dir_str],
-    );
-    match first {
-        Ok(_) => Ok(worktree_dir),
-        Err(error) => {
-            // `git worktree add` creates the target dir while preparing; if it
-            // fails partway (e.g. branch name collision) it may leave an empty
-            // dir behind. Clean it up before retrying so the fallback starts
-            // from a clean path.
-            if worktree_dir.read_dir().map(|mut it| it.next().is_none()).unwrap_or(false) {
-                let _ = std::fs::remove_dir(&worktree_dir);
-            }
-
-            let looks_like_branch_exists = ["already exists", "already used", "already checked out"]
-                .iter()
-                .any(|needle| error.to_lowercase().contains(needle));
-
-            if looks_like_branch_exists {
-                // Attach the existing branch instead of creating a new one.
-                return run_git_command(
-                    &repo_root,
-                    &["worktree", "add", "-q", worktree_dir_str, &branch],
-                )
-                .map_err(|retry_error| {
-                    format!(
-                        "Branch '{branch}' already exists and could not be attached \
-                         ({retry_error}). Original error: {error}"
-                    )
-                })
-                .map(|_| worktree_dir);
-            }
-
-            Err(error)
+    )
+    .inspect_err(|_error| {
+        // `git worktree add` creates the target dir while preparing; if it
+        // fails partway it may leave an empty dir behind. Clean it up so a retry
+        // with a corrected name is clean.
+        if worktree_dir.read_dir().map(|mut it| it.next().is_none()).unwrap_or(false) {
+            let _ = std::fs::remove_dir(&worktree_dir);
         }
-    }
+    })?;
+
+    Ok(worktree_dir)
 }
 
 /// Resolve the session's working directory for git operations.
