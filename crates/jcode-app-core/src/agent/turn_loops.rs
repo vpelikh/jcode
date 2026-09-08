@@ -1,4 +1,5 @@
 use super::*;
+use crate::session::ToolCallId;
 use crate::{terminal_eprintln as eprintln, terminal_print as print, terminal_println as println};
 use crate::tool::ToolOutput;
 
@@ -263,7 +264,7 @@ impl Agent {
             let mut reasoning_signature = String::new();
             let mut openai_reasoning_items: Vec<ContentBlock> = Vec::new();
             // Track tool results from provider (already executed by Claude Code CLI)
-            let mut sdk_tool_results: std::collections::HashMap<String, (String, bool)> =
+            let mut sdk_tool_results: std::collections::HashMap<ToolCallId, (String, bool)> =
                 std::collections::HashMap::new();
             let mut openai_native_compaction: Option<(String, usize)> = None;
 
@@ -812,7 +813,7 @@ impl Agent {
             }
             for tc in &tool_calls {
                 content_blocks.push(ContentBlock::ToolUse {
-                    id: tc.id.clone(),
+                    id: tc.id.clone().to_string(),
                     name: tc.name.clone(),
                     input: tc.input.clone(),
                     thought_signature: tc.thought_signature.clone(),
@@ -968,7 +969,7 @@ impl Agent {
                     Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
                         session_id: self.session.id.clone(),
                         message_id: message_id.clone(),
-                        tool_call_id: tc.id.clone(),
+                        tool_call_id: tc.id.clone().to_string(),
                         tool_name: tc.name.clone(),
                         status: ToolStatus::Error,
                         intent: tc.intent.clone(),
@@ -980,7 +981,7 @@ impl Agent {
                     self.add_message(
                         Role::User,
                         vec![ContentBlock::ToolResult {
-                            tool_use_id: tc.id,
+                            tool_use_id: tc.id.to_string(),
                             content: error_msg,
                             is_error: Some(true),
                         }],
@@ -1025,7 +1026,7 @@ impl Agent {
                         Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
                             session_id: self.session.id.clone(),
                             message_id: message_id.clone(),
-                            tool_call_id: tc.id.clone(),
+                            tool_call_id: tc.id.clone().to_string(),
                             tool_name: tc.name.clone(),
                             status: if sdk_is_error {
                                 ToolStatus::Error
@@ -1039,7 +1040,7 @@ impl Agent {
                         self.add_message(
                             Role::User,
                             vec![ContentBlock::ToolResult {
-                                tool_use_id: tc.id.clone(),
+                                tool_use_id: tc.id.clone().to_string(),
                                 content: sdk_content,
                                 is_error: if sdk_is_error { Some(true) } else { None },
                             }],
@@ -1062,7 +1063,7 @@ impl Agent {
                 let ctx = ToolContext {
                     session_id: self.session.id.clone(),
                     message_id: message_id.clone(),
-                    tool_call_id: tc.id.clone(),
+                    tool_call_id: tc.id.clone().to_string(),
                     working_dir: self.working_dir().map(PathBuf::from),
                     stdin_request_tx: self.stdin_request_tx.clone(),
                     graceful_shutdown_signal: Some(self.graceful_shutdown.clone()),
@@ -1163,7 +1164,7 @@ impl Agent {
             Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
                 session_id: self.session.id.clone(),
                 message_id: message_id.clone(),
-                tool_call_id: tc.id.clone(),
+                tool_call_id: tc.id.clone().to_string(),
                 tool_name: tc.name.clone(),
                 status: ToolStatus::Running,
                 intent: tc.intent.clone(),
@@ -1219,7 +1220,7 @@ impl Agent {
         Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
             session_id: self.session.id.clone(),
             message_id: message_id.clone(),
-            tool_call_id: tc.id.clone(),
+            tool_call_id: tc.id.clone().to_string(),
             tool_name: tc.name.clone(),
             status: ToolStatus::Running,
             intent: tc.intent.clone(),
@@ -1277,7 +1278,7 @@ impl Agent {
                 Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
                     session_id: self.session.id.clone(),
                     message_id: message_id.clone(),
-                    tool_call_id: tc.id.clone(),
+                    tool_call_id: tc.id.clone().to_string(),
                     tool_name: tc.name.clone(),
                     status: ToolStatus::Completed,
                     intent: tc.intent.clone(),
@@ -1299,7 +1300,7 @@ impl Agent {
                     println!("{}", preview.lines().next().unwrap_or("(done)"));
                 }
 
-                let blocks = tool_output_to_content_blocks(tc.id, output);
+                let blocks = tool_output_to_content_blocks(tc.id.to_string(), output);
                 self.add_message_with_duration(
                     Role::User,
                     blocks,
@@ -1311,7 +1312,7 @@ impl Agent {
                 Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
                     session_id: self.session.id.clone(),
                     message_id: message_id.clone(),
-                    tool_call_id: tc.id.clone(),
+                    tool_call_id: tc.id.clone().to_string(),
                     tool_name: tc.name.clone(),
                     status: ToolStatus::Error,
                     intent: tc.intent.clone(),
@@ -1331,7 +1332,7 @@ impl Agent {
                 self.add_message_with_duration(
                     Role::User,
                     vec![ContentBlock::ToolResult {
-                        tool_use_id: tc.id,
+                        tool_use_id: tc.id.to_string(),
                         content: error_msg,
                         is_error: Some(true),
                     }],

@@ -695,7 +695,7 @@ pub(in crate::tui::app) fn handle_server_event(
             }
             app.status = ProcessingStatus::RunningTool(name.clone());
             app.streaming_tool_calls.push(ToolCall {
-                id,
+                id: id.into(),
                 name,
                 input: serde_json::Value::Null,
                 intent: None,
@@ -714,7 +714,7 @@ pub(in crate::tui::app) fn handle_server_event(
             app.pause_streaming_tps(true);
             let parsed_input = remote.get_current_tool_input();
             let tool_call = ToolCall {
-                id: id.clone(),
+                id: id.clone().into(),
                 name: name.clone(),
                 input: parsed_input.clone(),
                 intent: ToolCall::intent_from_input(&parsed_input),
@@ -726,7 +726,7 @@ pub(in crate::tui::app) fn handle_server_event(
             if tool_call.name == "swarm" {
                 app.maybe_surface_swarm_config_hint();
             }
-            if let Some(tc) = app.streaming_tool_calls.iter_mut().find(|tc| tc.id == id) {
+            if let Some(tc) = app.streaming_tool_calls.iter_mut().find(|tc| tc.id == id.clone().into()) {
                 tc.input = parsed_input;
                 tc.refresh_intent_from_input();
             }

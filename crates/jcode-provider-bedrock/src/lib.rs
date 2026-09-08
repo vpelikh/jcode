@@ -1249,7 +1249,12 @@ impl Provider for BedrockProvider {
                                 let id = tool.tool_use_id().to_string();
                                 let name = tool.name().to_string();
                                 current_tool = Some((id.clone(), name.clone(), String::new()));
-                                let _ = tx.send(Ok(StreamEvent::ToolUseStart { id, name })).await;
+                                let _ = tx
+                                    .send(Ok(StreamEvent::ToolUseStart {
+                                        id: id.clone().into(),
+                                        name,
+                                    }))
+                                    .await;
                             }
                         }
                         ConverseStreamOutput::ContentBlockDelta(delta) => {

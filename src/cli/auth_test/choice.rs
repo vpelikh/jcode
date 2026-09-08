@@ -363,7 +363,7 @@ fn validate_auth_test_tool_smoke_transcript(
         anyhow::bail!("tool smoke emitted tool call with empty id");
     }
     let tool_call = crate::message::ToolCall {
-        id: tool_id.to_string(),
+        id: tool_id.to_string().into(),
         name: tool_name.to_string(),
         input: input.clone(),
         intent: None, thought_signature: None, };

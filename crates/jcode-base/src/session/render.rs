@@ -227,7 +227,7 @@ fn image_anchor_for_message(
 ) -> Option<RenderedImageAnchor> {
     if let Some(tool) = tool {
         return Some(RenderedImageAnchor::ToolCall {
-            id: tool.id.clone(),
+            id: tool.id.clone().to_string(),
         });
     }
     if rendered_role == "user" {
@@ -475,7 +475,7 @@ pub fn render_messages_and_images_with_compacted_history(
                     thought_signature,
                 } => {
                     let tool_call = ToolCall {
-                        id: id.clone(),
+                        id: id.clone().into(),
                         name: name.clone(),
                         input: input.clone(),
                         intent: ToolCall::intent_from_input(input),
@@ -507,7 +507,7 @@ pub fn render_messages_and_images_with_compacted_history(
 
                     let tool_data = tool_map.get(tool_use_id).cloned().or_else(|| {
                         Some(ToolCall {
-                            id: tool_use_id.clone(),
+                            id: tool_use_id.clone().into(),
                             name: "tool".to_string(),
                             input: serde_json::Value::Null,
                             intent: None,

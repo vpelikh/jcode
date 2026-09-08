@@ -68,7 +68,7 @@ fn ordered_batch_subcalls(
         .iter()
         .map(|(i, tool_name, parameters)| {
             let tool_call = running.get(i).cloned().unwrap_or_else(|| ToolCall {
-                id: format!("batch-{}-{}", i + 1, tool_name),
+                id: format!("batch-{}-{}", i + 1, tool_name).into(),
                 name: tool_name.clone(),
                 input: parameters.clone(),
                 intent: ToolCall::intent_from_input(parameters),
@@ -279,7 +279,7 @@ impl Tool for BatchTool {
                 (
                     *i,
                     ToolCall {
-                        id: format!("batch-{}-{}", i + 1, tool_name),
+                        id: format!("batch-{}-{}", i + 1, tool_name).into(),
                         name: tool_name.clone(),
                         input: parameters.clone(),
                         intent: ToolCall::intent_from_input(parameters),

@@ -2571,7 +2571,7 @@ fn process_sse_event(
                             input_json: String::new(),
                         });
                         events.push(StreamEvent::ToolUseStart {
-                            id,
+                            id: id.into(),
                             name: mapped_name,
                         });
                     }

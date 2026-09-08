@@ -543,7 +543,7 @@ async fn emit_response(
         }
         let id = next_tool_call_id();
         tx.send(Ok(StreamEvent::ToolUseStart {
-            id,
+            id: id.into(),
             name: parsed.name,
         }))
         .await

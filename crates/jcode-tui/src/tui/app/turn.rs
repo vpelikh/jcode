@@ -328,7 +328,7 @@ impl App {
                                             }
                                             for tc in &tool_calls {
                                                 content_blocks.push(ContentBlock::ToolUse {
-                                                    id: tc.id.clone(),
+                                                    id: tc.id.clone().to_string(),
                                                     name: tc.name.clone(),
                                                     input: tc.input.clone(), thought_signature: None, });
                                             }
@@ -396,7 +396,7 @@ impl App {
                                             }
                                             for tc in &tool_calls {
                                                 content_blocks.push(ContentBlock::ToolUse {
-                                                    id: tc.id.clone(),
+                                                    id: tc.id.clone().to_string(),
                                                     name: tc.name.clone(),
                                                     input: tc.input.clone(), thought_signature: None, });
                                             }
@@ -518,7 +518,7 @@ impl App {
                                         self.resume_streaming_tps();
                                         self.clear_active_experimental_feature_notice();
                                         self.broadcast_debug(crate::tui::backend::DebugEvent::ToolStart {
-                                            id: id.clone(),
+                                            id: id.clone().to_string(),
                                             name: name.clone(),
                                         });
                                         // Close any open reasoning region before committing the
@@ -535,7 +535,7 @@ impl App {
                                             );
                                         }
                                         self.streaming_tool_calls.push(ToolCall {
-                                            id: id.clone(),
+                                            id: id.clone().into(),
                                             name: name.clone(),
                                             input: serde_json::Value::Null,
                                             intent: None, thought_signature: None, });
@@ -580,7 +580,7 @@ impl App {
                                                 streaming_tool.intent = tool.intent.clone();
                                             }
                                             self.broadcast_debug(crate::tui::backend::DebugEvent::ToolExec {
-                                                id: tool.id.clone(),
+                                                id: tool.id.clone().to_string(),
                                                 name: tool.name.clone(),
                                             });
                                             self.commit_pending_streaming_assistant_message();
@@ -872,7 +872,7 @@ impl App {
                                     }
                                     StreamEvent::ToolResult { tool_use_id, content, is_error } => {
                                         // SDK already executed this tool
-                                        self.tool_result_ids.insert(tool_use_id.clone());
+                                        self.tool_result_ids.insert(tool_use_id.clone().to_string());
                                         // Find the tool name from our tracking
                                         let tool_name = self.streaming_tool_calls
                                             .iter()
@@ -881,7 +881,7 @@ impl App {
                                             .unwrap_or_default();
 
                                         self.broadcast_debug(crate::tui::backend::DebugEvent::ToolDone {
-                                            id: tool_use_id.clone(),
+                                            id: tool_use_id.clone().to_string(),
                                             name: tool_name.clone(),
                                             output: content.clone(),
                                             is_error,
@@ -901,7 +901,7 @@ impl App {
                                         // Reset status back to Streaming
                                         self.status = ProcessingStatus::Streaming;
 
-                                        sdk_tool_results.insert(tool_use_id, (content, is_error));
+                                        sdk_tool_results.insert(tool_use_id.to_string(), (content, is_error));
                                     }
                                     StreamEvent::GeneratedImage {
                                         id,
@@ -919,7 +919,7 @@ impl App {
                                             revised_prompt.as_deref(),
                                         );
                                         let tool_call = ToolCall {
-                                            id: id.clone(),
+                                            id: id.clone().into(),
                                             name: crate::message::GENERATED_IMAGE_TOOL_NAME.to_string(),
                                             input,
                                             intent: Some("OpenAI native image generation".to_string()), thought_signature: None, };
@@ -1081,7 +1081,7 @@ impl App {
             }
             for tc in &tool_calls {
                 content_blocks.push(ContentBlock::ToolUse {
-                    id: tc.id.clone(),
+                    id: tc.id.clone().to_string(),
                     name: tc.name.clone(),
                     input: tc.input.clone(),
                     thought_signature: None,
@@ -1100,7 +1100,7 @@ impl App {
                 let message_id = self.session.add_message(Role::Assistant, content_clone);
                 let _ = self.session.save();
                 for tc in &tool_calls {
-                    self.tool_result_ids.insert(tc.id.clone());
+                    self.tool_result_ids.insert(tc.id.clone().to_string());
                 }
                 Some(message_id)
             } else {
@@ -1200,12 +1200,12 @@ impl App {
                     .unwrap_or_else(|| self.session.id.clone());
 
                 // Check if SDK already executed this tool
-                if let Some((sdk_content, sdk_is_error)) = sdk_tool_results.remove(&tc.id) {
+                if let Some((sdk_content, sdk_is_error)) = sdk_tool_results.remove(&tc.id.to_string()) {
                     // Use SDK result
                     Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
                         session_id: self.session.id.clone(),
                         message_id: message_id.clone(),
-                        tool_call_id: tc.id.clone(),
+                        tool_call_id: tc.id.clone().to_string(),
                         tool_name: tc.name.clone(),
                         status: if sdk_is_error {
                             ToolStatus::Error
@@ -1226,7 +1226,7 @@ impl App {
                     } else {
                         sdk_content.clone()
                     };
-                    let _ = self.replace_latest_tool_display_message(&tc.id, None, display_output);
+                    let _ = self.replace_latest_tool_display_message(&tc.id.to_string(), None, display_output);
 
                     self.observe_tool_result(&tc, &sdk_content, sdk_is_error, None);
                     self.note_tool_completed(&tc, sdk_is_error);
@@ -1235,7 +1235,7 @@ impl App {
                     self.add_provider_message(Message {
                         role: Role::User,
                         content: vec![ContentBlock::ToolResult {
-                            tool_use_id: tc.id.clone(),
+                            tool_use_id: tc.id.clone().to_string(),
                             content: sdk_content,
                             is_error: if sdk_is_error { Some(true) } else { None },
                         }],
@@ -1245,7 +1245,7 @@ impl App {
                     self.session.add_message(
                         Role::User,
                         vec![ContentBlock::ToolResult {
-                            tool_use_id: tc.id.clone(),
+                            tool_use_id: tc.id.clone().to_string(),
                             content: String::new(), // Already added to messages above
                             is_error: if sdk_is_error { Some(true) } else { None },
                         }],
@@ -1258,7 +1258,7 @@ impl App {
                 let ctx = ToolContext {
                     session_id: self.session.id.clone(),
                     message_id: message_id.clone(),
-                    tool_call_id: tc.id.clone(),
+                    tool_call_id: tc.id.clone().to_string(),
                     working_dir: self.session.working_dir.as_deref().map(PathBuf::from),
                     stdin_request_tx: None,
                     graceful_shutdown_signal: None,
@@ -1268,7 +1268,7 @@ impl App {
                 Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
                     session_id: self.session.id.clone(),
                     message_id: message_id.clone(),
-                    tool_call_id: tc.id.clone(),
+                    tool_call_id: tc.id.clone().to_string(),
                     tool_name: tc.name.clone(),
                     status: ToolStatus::Running,
                     intent: tc.intent.clone(),
@@ -1414,7 +1414,7 @@ impl App {
                         Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
                             session_id: self.session.id.clone(),
                             message_id: message_id.clone(),
-                            tool_call_id: tc.id.clone(),
+                            tool_call_id: tc.id.clone().to_string(),
                             tool_name: tc.name.clone(),
                             status: ToolStatus::Completed,
                             intent: tc.intent.clone(),
@@ -1426,7 +1426,7 @@ impl App {
                         Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
                             session_id: self.session.id.clone(),
                             message_id: message_id.clone(),
-                            tool_call_id: tc.id.clone(),
+                            tool_call_id: tc.id.clone().to_string(),
                             tool_name: tc.name.clone(),
                             status: ToolStatus::Error,
                             intent: tc.intent.clone(),
@@ -1438,13 +1438,13 @@ impl App {
 
                 // Update the tool's DisplayMessage with the output
                 let _ = self.replace_latest_tool_display_message(
-                    &tc.id,
+                    &tc.id.to_string(),
                     tool_title.clone(),
                     output.clone(),
                 );
 
                 self.add_provider_message(Message::tool_result_with_duration(
-                    &tc.id,
+                    &tc.id.to_string(),
                     &output,
                     is_error,
                     Some(tool_duration_ms),
@@ -1452,7 +1452,7 @@ impl App {
                 self.session.add_message_with_duration(
                     Role::User,
                     vec![ContentBlock::ToolResult {
-                        tool_use_id: tc.id.clone(),
+                        tool_use_id: tc.id.clone().to_string(),
                         content: output.clone(),
                         is_error: if is_error { Some(true) } else { None },
                     }],

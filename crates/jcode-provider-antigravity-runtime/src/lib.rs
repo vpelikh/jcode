@@ -691,7 +691,7 @@ impl Provider for AntigravityProvider {
                         let call_id = jcode_message_types::sanitize_tool_id(&raw_call_id);
                         let _ = tx
                             .send(Ok(StreamEvent::ToolUseStart {
-                                id: call_id,
+                                id: call_id.clone().into(),
                                 name: function_call.name,
                             }))
                             .await;

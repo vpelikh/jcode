@@ -1728,14 +1728,14 @@ pub(super) fn summarize_batch_running_tools_compact(running: &[ToolCall]) -> Opt
 
     let mut running_sorted = running.to_vec();
     running_sorted.sort_by(|a, b| {
-        batch_subcall_index(&a.id)
+        batch_subcall_index(a.id.as_str())
             .unwrap_or(usize::MAX)
-            .cmp(&batch_subcall_index(&b.id).unwrap_or(usize::MAX))
+            .cmp(&batch_subcall_index(b.id.as_str()).unwrap_or(usize::MAX))
             .then_with(|| a.id.cmp(&b.id))
     });
 
     let first = &running_sorted[0];
-    let label = match batch_subcall_index(&first.id) {
+    let label = match batch_subcall_index(first.id.as_str()) {
         Some(idx) => format!("#{} {}", idx, first.name),
         None => first.name.clone(),
     };

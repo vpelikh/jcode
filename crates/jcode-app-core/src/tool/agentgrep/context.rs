@@ -117,7 +117,7 @@ fn collect_tool_exposures(session: &Session) -> Vec<ToolExposureObservation> {
                     tool_map.insert(
                         id.clone(),
                         ToolCall {
-                            id: id.clone(),
+                            id: id.clone().into(),
                             name: name.clone(),
                             input: input.clone(),
                             intent: None,
@@ -134,7 +134,7 @@ fn collect_tool_exposures(session: &Session) -> Vec<ToolExposureObservation> {
                         .get(tool_use_id)
                         .cloned()
                         .unwrap_or_else(|| ToolCall {
-                            id: tool_use_id.clone(),
+                            id: tool_use_id.clone().into(),
                             name: "tool".to_string(),
                             input: Value::Null,
                             intent: None,

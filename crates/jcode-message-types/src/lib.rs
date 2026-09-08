@@ -1,9 +1,9 @@
-use jcode_id_types::SessionId;
+use jcode_id_types::{SessionId, ToolCallId};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
     #[serde(default)]
-    pub id: String,
+    pub id: ToolCallId,
     #[serde(default)]
     pub name: String,
     #[serde(default)]
@@ -670,7 +670,7 @@ pub enum StreamEvent {
     /// Text content delta
     TextDelta(String),
     /// Tool use started
-    ToolUseStart { id: String, name: String },
+    ToolUseStart { id: ToolCallId, name: String },
     /// Tool input delta (JSON fragment)
     ToolInputDelta(String),
     /// Tool use complete
@@ -681,7 +681,7 @@ pub enum StreamEvent {
     ToolUseSignature(String),
     /// Tool result from provider (provider already executed the tool)
     ToolResult {
-        tool_use_id: String,
+        tool_use_id: ToolCallId,
         content: String,
         is_error: bool,
     },
@@ -924,5 +924,57 @@ mod tests {
             _ => unreachable!(),
         };
         assert_eq!(sid.as_str(), "s1");
+    }
+
+    #[test]
+    fn tool_call_carries_branded_tool_call_id() {
+        // ToolCall.id is a branded ToolCallId (deepseek-harness #12). A String
+        // flips in via .into(); the wire form stays a bare string (#[serde
+        // (transparent)]), and as_str() restores the original value.
+        let tc = ToolCall {
+            id: "call_abc".into(),
+            name: "bash".to_string(),
+            input: serde_json::Value::Null,
+            intent: None,
+            thought_signature: None,
+        };
+        assert_eq!(tc.id.as_str(), "call_abc");
+        // Round-trips through serde as a bare string.
+        let json = serde_json::to_string(&tc).unwrap();
+        let back: ToolCall = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, tc);
+        assert_eq!(back.id.as_str(), "call_abc");
+    }
+
+    #[test]
+    fn stream_event_tool_use_start_id_is_branded() {
+        let event = StreamEvent::ToolUseStart {
+            id: "call_xyz".into(),
+            name: "read".to_string(),
+        };
+        match event {
+            StreamEvent::ToolUseStart { id, name } => {
+                assert_eq!(id.as_str(), "call_xyz");
+                assert_eq!(name, "read");
+            }
+            _ => panic!("expected ToolUseStart"),
+        }
+        let result = StreamEvent::ToolResult {
+            tool_use_id: "call_xyz".into(),
+            content: "ok".to_string(),
+            is_error: false,
+        };
+        match result {
+            StreamEvent::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => {
+                assert_eq!(tool_use_id.as_str(), "call_xyz");
+                assert_eq!(content, "ok");
+                assert!(!is_error);
+            }
+            _ => panic!("expected ToolResult"),
+        }
     }
 }

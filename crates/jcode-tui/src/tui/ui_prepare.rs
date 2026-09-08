@@ -1575,7 +1575,7 @@ fn render_message_into(
                         expandable,
                     ));
                 }
-                if let Some(items) = ctx.anchored_images.by_tool.get(&tc.id) {
+                if let Some(items) = ctx.anchored_images.by_tool.get(tc.id.as_str()) {
                     for line in super::inline_image_ui::anchored_image_lines(
                         items,
                         width,

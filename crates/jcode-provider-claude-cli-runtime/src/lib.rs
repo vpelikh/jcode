@@ -389,7 +389,7 @@ impl ClaudeEventTranslator {
                 ContentBlockInfo::ToolUse { id, name } => {
                     self.in_tool_use_block = true;
                     vec![StreamEvent::ToolUseStart {
-                        id,
+                        id: id.into(),
                         name: to_internal_tool_name(&name),
                     }]
                 }
@@ -499,7 +499,7 @@ impl CliOutputParser {
                         SdkContentBlock::ToolUse { id, name, input } => {
                             if !self.saw_stream_events {
                                 events.push(StreamEvent::ToolUseStart {
-                                    id,
+                                    id: id.into(),
                                     name: to_internal_tool_name(&name),
                                 });
                                 events.push(StreamEvent::ToolInputDelta(
@@ -523,7 +523,7 @@ impl CliOutputParser {
                                 })
                                 .unwrap_or_default();
                             events.push(StreamEvent::ToolResult {
-                                tool_use_id,
+                                tool_use_id: tool_use_id.into(),
                                 content: content_str,
                                 is_error: is_error.unwrap_or(false),
                             });
@@ -559,7 +559,7 @@ impl CliOutputParser {
                             })
                             .unwrap_or_default();
                         events.push(StreamEvent::ToolResult {
-                            tool_use_id,
+                            tool_use_id: tool_use_id.into(),
                             content: content_str,
                             is_error: is_error.unwrap_or(false),
                         });

@@ -1,4 +1,5 @@
 use super::*;
+use crate::session::ToolCallId;
 
 /// Largest byte index `<= index` that is a UTF-8 char boundary in `text`.
 /// Equivalent to the unstable `str::floor_char_boundary`, reimplemented so the
@@ -350,7 +351,7 @@ impl Agent {
             let mut usage_cache_creation: Option<u64> = None;
             let mut saw_message_end = false;
             let mut stop_reason: Option<String> = None;
-            let mut sdk_tool_results: std::collections::HashMap<String, (String, bool)> =
+            let mut sdk_tool_results: std::collections::HashMap<ToolCallId, (String, bool)> =
                 std::collections::HashMap::new();
             let provider_name = self.provider.name().to_string();
             let store_reasoning_content =
@@ -367,7 +368,7 @@ impl Agent {
             let mut hidden_activity_last = Instant::now();
             let mut openai_reasoning_items: Vec<ContentBlock> = Vec::new();
             let mut openai_native_compaction: Option<(String, usize, Option<u64>)> = None;
-            let mut tool_id_to_name: std::collections::HashMap<String, String> =
+            let mut tool_id_to_name: std::collections::HashMap<ToolCallId, String> =
                 std::collections::HashMap::new();
 
             let mut retry_after_compaction = false;
@@ -571,7 +572,7 @@ impl Agent {
                             });
                         }
                         let _ = event_tx.send(ServerEvent::ToolStart {
-                            id: id.clone(),
+                            id: id.clone().to_string(),
                             name: name.clone(),
                         });
                         tool_id_to_name.insert(id.clone(), name.clone());
@@ -597,7 +598,7 @@ impl Agent {
                             tool.refresh_intent_from_input();
 
                             let _ = event_tx.send(ServerEvent::ToolExec {
-                                id: tool.id.clone(),
+                                id: tool.id.clone().to_string(),
                                 name: tool.name.clone(),
                             });
 
@@ -624,7 +625,7 @@ impl Agent {
                             .cloned()
                             .unwrap_or_default();
                         let _ = event_tx.send(ServerEvent::ToolDone {
-                            id: tool_use_id.clone(),
+                            id: tool_use_id.clone().to_string(),
                             name: tool_name,
                             output: content.clone(),
                             error: if is_error {
@@ -1040,13 +1041,13 @@ impl Agent {
             if !had_tool_calls_before
                 && !tool_calls.is_empty()
                 && let Some(tc) = tool_calls.last()
-                && tc.id.starts_with("fallback_text_call_")
+                && tc.id.as_str().starts_with("fallback_text_call_")
             {
                 let _ = event_tx.send(ServerEvent::TextReplace {
                     text: text_content.clone(),
                 });
                 let _ = event_tx.send(ServerEvent::ToolStart {
-                    id: tc.id.clone(),
+                    id: tc.id.clone().to_string(),
                     name: tc.name.clone(),
                 });
                 tool_id_to_name.insert(tc.id.clone(), tc.name.clone());
@@ -1054,7 +1055,7 @@ impl Agent {
                     delta: tc.input.to_string(),
                 });
                 let _ = event_tx.send(ServerEvent::ToolExec {
-                    id: tc.id.clone(),
+                    id: tc.id.clone().to_string(),
                     name: tc.name.clone(),
                 });
             }
@@ -1079,7 +1080,7 @@ impl Agent {
             }
             for tc in &tool_calls {
                 content_blocks.push(ContentBlock::ToolUse {
-                    id: tc.id.clone(),
+                    id: tc.id.clone().to_string(),
                     name: tc.name.clone(),
                     input: tc.input.clone(),
                     thought_signature: None,
@@ -1241,7 +1242,7 @@ impl Agent {
                     self.add_message(
                         Role::User,
                         vec![ContentBlock::ToolResult {
-                            tool_use_id: tc.id.clone(),
+                            tool_use_id: tc.id.clone().to_string(),
                             content: "[Skipped - server reloading]".to_string(),
                             is_error: Some(true),
                         }],
@@ -1284,7 +1285,7 @@ impl Agent {
                         self.add_message(
                             Role::User,
                             vec![ContentBlock::ToolResult {
-                                tool_use_id: skipped_tc.id.clone(),
+                                tool_use_id: skipped_tc.id.clone().to_string(),
                                 content: "[Skipped: user interrupted]".to_string(),
                                 is_error: Some(true),
                             }],
@@ -1322,7 +1323,7 @@ impl Agent {
                 if let Some(error_msg) = tc.validation_error() {
                     logging::warn(&error_msg);
                     let _ = event_tx.send(ServerEvent::ToolDone {
-                        id: tc.id.clone(),
+                        id: tc.id.clone().to_string(),
                         name: tc.name.clone(),
                         output: error_msg.clone(),
                         error: Some(error_msg.clone()),
@@ -1330,7 +1331,7 @@ impl Agent {
                     self.add_message(
                         Role::User,
                         vec![ContentBlock::ToolResult {
-                            tool_use_id: tc.id.clone(),
+                            tool_use_id: tc.id.clone().to_string(),
                             content: error_msg,
                             is_error: Some(true),
                         }],
@@ -1350,7 +1351,7 @@ impl Agent {
                         self.add_message(
                             Role::User,
                             vec![ContentBlock::ToolResult {
-                                tool_use_id: tc.id.clone(),
+                                tool_use_id: tc.id.clone().to_string(),
                                 content: sdk_content,
                                 is_error: if sdk_is_error { Some(true) } else { None },
                             }],
@@ -1367,7 +1368,7 @@ impl Agent {
                 let ctx = ToolContext {
                     session_id: self.session.id.clone(),
                     message_id: message_id.clone(),
-                    tool_call_id: tc.id.clone(),
+                    tool_call_id: tc.id.clone().to_string(),
                     working_dir: self.working_dir().map(PathBuf::from),
                     stdin_request_tx: self.stdin_request_tx.clone(),
                     graceful_shutdown_signal: Some(self.graceful_shutdown.clone()),
@@ -1464,14 +1465,14 @@ impl Agent {
                         Ok(output) => {
                             let output = cap_tool_output_for_history(&tc.name, output);
                             let _ = event_tx.send(ServerEvent::ToolDone {
-                                id: tc.id.clone(),
+                                id: tc.id.clone().to_string(),
                                 name: tc.name.clone(),
                                 output: output.output.clone(),
                                 error: None,
                             });
 
                             let side_pane_images =
-                                tool_output_side_pane_images(&tc.id, &tc.name, &tc.input, &output);
+                                tool_output_side_pane_images(&tc.id.to_string(), &tc.name, &tc.input, &output);
                             if !side_pane_images.is_empty() {
                                 logging::info(&format!(
                                     "SidePaneImages: emitting {} image(s) from tool '{}' (session={})",
@@ -1485,7 +1486,7 @@ impl Agent {
                                 });
                             }
 
-                            let blocks = tool_output_to_content_blocks(tc.id.clone(), output);
+                            let blocks = tool_output_to_content_blocks(tc.id.clone().to_string(), output);
                             self.add_message_with_duration(
                                 Role::User,
                                 blocks,
@@ -1496,7 +1497,7 @@ impl Agent {
                         Err(e) => {
                             let error_msg = format!("Error: {}", e);
                             let _ = event_tx.send(ServerEvent::ToolDone {
-                                id: tc.id.clone(),
+                                id: tc.id.clone().to_string(),
                                 name: tc.name.clone(),
                                 output: error_msg.clone(),
                                 error: Some(error_msg.clone()),
@@ -1505,7 +1506,7 @@ impl Agent {
                             self.add_message_with_duration(
                                 Role::User,
                                 vec![ContentBlock::ToolResult {
-                                    tool_use_id: tc.id.clone(),
+                                    tool_use_id: tc.id.clone().to_string(),
                                     content: error_msg,
                                     is_error: Some(true),
                                 }],
@@ -1530,7 +1531,7 @@ impl Agent {
                         reload_interrupted_tool_result(tc, tool_elapsed.as_secs_f64());
 
                     let _ = event_tx.send(ServerEvent::ToolDone {
-                        id: tc.id.clone(),
+                        id: tc.id.clone().to_string(),
                         name: tc.name.clone(),
                         output: interrupted_msg.clone(),
                         error: if is_error {
@@ -1543,7 +1544,7 @@ impl Agent {
                     self.add_message_with_duration(
                         Role::User,
                         vec![ContentBlock::ToolResult {
-                            tool_use_id: tc.id.clone(),
+                            tool_use_id: tc.id.clone().to_string(),
                             content: interrupted_msg,
                             is_error: Some(is_error),
                         }],
@@ -1556,7 +1557,7 @@ impl Agent {
                         self.add_message(
                             Role::User,
                             vec![ContentBlock::ToolResult {
-                                tool_use_id: remaining_tc.id.clone(),
+                                tool_use_id: remaining_tc.id.clone().to_string(),
                                 content: "[Skipped - server reloading]".to_string(),
                                 is_error: Some(true),
                             }],
@@ -1584,7 +1585,7 @@ impl Agent {
                     );
 
                     let _ = event_tx.send(ServerEvent::ToolDone {
-                        id: tc.id.clone(),
+                        id: tc.id.clone().to_string(),
                         name: tc.name.clone(),
                         output: bg_msg.clone(),
                         error: None,
@@ -1593,7 +1594,7 @@ impl Agent {
                     self.add_message_with_duration(
                         Role::User,
                         vec![ContentBlock::ToolResult {
-                            tool_use_id: tc.id.clone(),
+                            tool_use_id: tc.id.clone().to_string(),
                             content: bg_msg,
                             is_error: None,
                         }],

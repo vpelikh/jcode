@@ -383,7 +383,7 @@ fn handle_manual_tool_completed(app: &mut App, result: ManualToolCompleted) {
     );
 
     app.add_provider_message(Message::tool_result_with_duration(
-        &result.tool_call.id,
+        &result.tool_call.id.to_string(),
         &result.output,
         result.is_error,
         Some(result.duration_ms),
@@ -391,7 +391,7 @@ fn handle_manual_tool_completed(app: &mut App, result: ManualToolCompleted) {
     app.session.add_message_with_duration(
         Role::User,
         vec![ContentBlock::ToolResult {
-            tool_use_id: result.tool_call.id.clone(),
+            tool_use_id: result.tool_call.id.clone().to_string(),
             content: result.output.clone(),
             is_error: if result.is_error { Some(true) } else { None },
         }],

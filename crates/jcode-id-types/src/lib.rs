@@ -58,7 +58,7 @@ macro_rules! branded_id {
     ) => {
         $(#[doc = $doc])*
         #[doc = $impl_doc]
-        #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[derive(Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
         #[repr(transparent)]
         #[serde(transparent)]
         pub struct $name(pub(crate) String);
