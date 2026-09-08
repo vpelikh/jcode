@@ -1586,6 +1586,76 @@ fn plain_typed_prompt_auto_triggers_new_worktree_via_enter_key() {
         .output();
 }
 
+/// Negative end-to-end: a plain prompt that merely *mentions* worktrees (not an
+/// explicit worktree-creating directive) must NOT auto-trigger. It is forwarded
+/// to the agent normally, and no worktree is created and no SetWorkingDir sent.
+#[test]
+fn plain_mention_of_worktree_does_not_auto_trigger_via_enter_key() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    use std::process::Command;
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+
+    let home = tempfile::tempdir().expect("temp home");
+    let repo = home.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    for args in [vec!["init", "-b", "main"], vec!["add", "."]] {
+        let mut cmd = Command::new("git");
+        cmd.args(&args).current_dir(&repo);
+        if args[0] == "add" {
+            std::fs::write(repo.join("file.txt"), "hi\n").unwrap();
+        }
+        assert!(cmd.output().unwrap().status.success(), "git {args:?}");
+    }
+    let commit = Command::new("git")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .args(["commit", "-m", "init"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(commit.status.success(), "git commit failed");
+
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.remote_session_id = Some("active_sess".to_string());
+    app.session.working_dir = Some(repo.display().to_string());
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    remote.mark_history_loaded();
+    let request_id_before = remote.next_request_id_for_test();
+
+    // A question about worktrees, not a directive to create one.
+    app.set_input_for_test("explain what a git worktree is used for".to_string());
+    rt.block_on(app.handle_remote_key(KeyCode::Enter, KeyModifiers::empty(), &mut remote))
+        .expect("a plain mention should be handled");
+
+    // No worktree was created.
+    assert!(
+        !repo.join(".worktrees").join("explain").exists(),
+        "a mention must not create a worktree"
+    );
+
+    // No SetWorkingDir was sent (the prompt itself is an ordinary send, so the
+    // request id advances by exactly one for the forwarded message).
+    assert_eq!(
+        remote.next_request_id_for_test(),
+        request_id_before + 1,
+        "a mention must only forward the prompt, not move the session"
+    );
+
+    // No auto-trigger notice.
+    assert!(
+        !app
+            .display_messages()
+            .iter()
+            .any(|m| m.content.contains("Automatically started")),
+        "a mention must not show an auto-trigger notice"
+    );
+}
+
 /// Reproduces the "stuck on loading session…" bug and verifies the watchdog
 /// recovers it: a remote connection that never receives the bootstrap History
 /// event (so `has_loaded_history()` stays false) must re-request `GetHistory`
