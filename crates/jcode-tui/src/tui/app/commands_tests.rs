@@ -365,8 +365,6 @@ mod colors {
 /// Unit tests for the `/worktree` helpers: argument parsing and worktree
 /// creation.
 mod worktree {
-    use super::*;
-
     #[test]
     fn parse_worktree_spec_takes_a_name_and_defaults_the_branch() {
         let spec = super::parse_worktree_spec("panel-settings").unwrap();

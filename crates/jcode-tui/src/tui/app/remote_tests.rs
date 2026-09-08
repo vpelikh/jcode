@@ -1330,6 +1330,178 @@ fn auto_trigger_new_worktree_intent_creates_and_moves_the_session() {
         .output();
 }
 
+/// End-to-end through the public submit funnel (`submit_prepared_remote_input`),
+/// not the internal `dispatch_intent_command` bridge: a plain worktree-intent
+/// prompt must (a) create the worktree, (b) send a SetWorkingDir request to
+/// move the session into it, (c) show the automatic trigger notice, and
+/// (d) still forward the user's original prompt to the agent.
+#[test]
+fn auto_trigger_through_submit_prepared_remote_input_forwards_prompt_and_moves() {
+    use super::submit_prepared_remote_input;
+    use crate::tui::app::input::PreparedInput;
+    use std::process::Command;
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+
+    let home = tempfile::tempdir().expect("temp home");
+    let repo = home.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    for args in [vec!["init", "-b", "main"], vec!["add", "."]] {
+        let mut cmd = Command::new("git");
+        cmd.args(&args).current_dir(&repo);
+        if args[0] == "add" {
+            std::fs::write(repo.join("file.txt"), "hi\n").unwrap();
+        }
+        assert!(cmd.output().unwrap().status.success(), "git {args:?}");
+    }
+    let commit = Command::new("git")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .args(["commit", "-m", "init"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(commit.status.success(), "git commit failed");
+
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.remote_session_id = Some("active_sess".to_string());
+    app.session.working_dir = Some(repo.display().to_string());
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    remote.mark_history_loaded();
+    let request_id_before = remote.next_request_id_for_test();
+
+    let prompt = "make a new worktree for \"feature-x\" and do the work there".to_string();
+    rt.block_on(submit_prepared_remote_input(
+        &mut app,
+        &mut remote,
+        PreparedInput {
+            raw_input: prompt.clone(),
+            expanded: prompt.clone(),
+            images: vec![],
+        },
+    ))
+    .expect("submit should succeed");
+
+    // (a) The worktree exists on the default branch.
+    let worktree_dir = repo.join(".worktrees").join("feature-x");
+    assert!(worktree_dir.exists(), "worktree should be created");
+    let branch = Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(&worktree_dir)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&branch.stdout).trim(), "feat/feature-x");
+
+    // (b) A SetWorkingDir request was issued.
+    assert!(
+        remote.next_request_id_for_test() > request_id_before,
+        "auto-trigger must send a SetWorkingDir request"
+    );
+
+    // (c) The automatic-trigger notice is present.
+    assert!(
+        app.display_messages()
+            .iter()
+            .any(|m| m.role == "system" && m.content.contains("Automatically started new worktree")),
+        "expected an auto-trigger notice"
+    );
+
+    // (d) The user's original prompt is still echoed as a user message (it is
+    // forwarded to the agent after the trigger).
+    assert!(
+        app.display_messages()
+            .iter()
+            .any(|m| m.role == "user" && m.content == prompt),
+        "the original prompt must be forwarded"
+    );
+
+    let _ = Command::new("git")
+        .args([
+            "worktree",
+            "remove",
+            "--force",
+            &worktree_dir.display().to_string(),
+        ])
+        .current_dir(&repo)
+        .output();
+    let _ = Command::new("git")
+        .args(["branch", "-D", "feat/feature-x"])
+        .current_dir(&repo)
+        .output();
+}
+
+/// Failure mode: while the agent is busy, the auto-trigger must NOT create a
+/// worktree or send a SetWorkingDir request, and no success notice appears.
+#[test]
+fn auto_trigger_is_suppressed_while_agent_is_working() {
+    use super::submit_prepared_remote_input;
+    use crate::tui::app::input::PreparedInput;
+    use std::process::Command;
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+
+    let home = tempfile::tempdir().expect("temp home");
+    let repo = home.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    for args in [vec!["init", "-b", "main"], vec!["add", "."]] {
+        let mut cmd = Command::new("git");
+        cmd.args(&args).current_dir(&repo);
+        if args[0] == "add" {
+            std::fs::write(repo.join("file.txt"), "hi\n").unwrap();
+        }
+        assert!(cmd.output().unwrap().status.success(), "git {args:?}");
+    }
+    let commit = Command::new("git")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .args(["commit", "-m", "init"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(commit.status.success(), "git commit failed");
+
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.remote_session_id = Some("active_sess".to_string());
+    app.is_processing = true; // agent is busy
+    app.session.working_dir = Some(repo.display().to_string());
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    remote.mark_history_loaded();
+
+    let prompt = "make a new worktree for \"feature-y\" and do the work there".to_string();
+    rt.block_on(submit_prepared_remote_input(
+        &mut app,
+        &mut remote,
+        PreparedInput {
+            raw_input: prompt.clone(),
+            expanded: prompt.clone(),
+            images: vec![],
+        },
+    ))
+    .expect("submit should succeed");
+
+    // No worktree was created.
+    let worktree_dir = repo.join(".worktrees").join("feature-y");
+    assert!(!worktree_dir.exists(), "busy agent must not create a worktree");
+
+    // No success notice (the prompt is still forwarded to the agent, which is
+    // an ordinary send, not the suppressed worktree creation).
+    assert!(
+        !app
+            .display_messages()
+            .iter()
+            .any(|m| m.content.contains("Automatically started")),
+        "busy agent must not show a success notice"
+    );
+}
+
 /// Reproduces the "stuck on loading session…" bug and verifies the watchdog
 /// recovers it: a remote connection that never receives the bootstrap History
 /// event (so `has_loaded_history()` stays false) must re-request `GetHistory`
