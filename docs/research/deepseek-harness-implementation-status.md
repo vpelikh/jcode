@@ -105,13 +105,12 @@ at log-inspection time.
   and re-derive the transcript + compaction correctly.
 
   **Interpretation noted.** Takeaway #12's shortlist mentions branding
-  session/tool-call/job/compaction ids broadly. Branding is scoped to the
+  session/tool-call/job/compaction ids broadly. Branding was first scoped to the
   **event-sourced-session-log identity domain** (event / message / compaction
   ids) — the subsystem this plan's prior work (`#3/#4/#5/#7/#13`) has been
   focused on — rather than sprawling `Branded` newtypes across every `String` id
-  in the codebase (`SessionId`, `ToolCallId`, `JobId`, … remain `String`).
-  Extending the same `branded_id!` macro to those domains is a per-domain
-  follow-up (see F3 below).
+  in the codebase. The broader per-domain extension to `SessionId`, `ToolCallId`,
+  and `JobId` is now delivered as **F3** (see below).
 
   **Tightened surface (no backcompat constraint).** Branding was refined to
   remove the remaining ergonomics trade-offs:
@@ -148,7 +147,29 @@ These are explicitly open and are tracked as follow-ups, not delivered work:
   seam, #11 durable inbox, #14 waterfall hooks; P3 #15 goals domain, #17
   layered config, #18 postmortem culture. These are large, cross-cutting, and
   benefit from a steer before work begins.
-- **F3 — extend `branded_id!` beyond the event log.** The `branded_id!` macro
-  now exists in `jcode-base`; applying it to `SessionId`, `ToolCallId`, `JobId`
-  would carry takeaway #12's protection wider. Per-id, mechanical, benefits from
-  a steer on scope.
+- **F3 — extend `branded_id!` beyond the event log.** ✅ **Delivered.** The
+  `branded_id!` macro moved out of `jcode-base` into a new minimal leaf crate
+  `crates/jcode-id-types`, so the identity-bearing `-types` crates can depend on
+  it without a dependency cycle (`jcode-base` already depends on several of
+  them). All six branded identities now live there and `jcode-base` re-exports
+  them unchanged:
+
+  - **infra** — `jcode-id-types` hosts `branded_id!` + `EventId`, `MessageId`,
+    `CompactionId`, `SessionId`, `ToolCallId`, `JobId`; 4 unit tests.
+  - **SessionId** — `StreamEvent::SessionId` now carries `SessionId`; all
+    provider producers and app-core/TUI consumers updated; 2 message-types tests.
+  - **JobId** — `DebugJob.id` and the shared `HashMap<JobId, DebugJob>` jobs map
+    are branded; 1 app-core test.
+  - **ToolCallId** — `ToolCall.id`, `StreamEvent::ToolUseStart.id`, and
+    `StreamEvent::ToolResult.tool_use_id` carry `ToolCallId`; app-core keys
+    `sdk_tool_results`/`tool_id_to_name` by `ToolCallId`; every provider runtime,
+    jcode-base `render`, jcode-tui, and the root CLI convert at the boundary. The
+    `branded_id!` macro gained a `Default` impl (empty string) so `#[serde(
+    default)]`-backed ids still deserialize an omitted field exactly as the prior
+    `String` default did. 2 new message-types tests.
+
+  Every wrapper is `#[serde(transparent)]`, so the on-wire/on-disk format is the
+  same bare string and persisted data round-trips unchanged. The full workspace
+  (`cargo build --workspace`) and the `jcode-app-core` lib test cfg both compile;
+  `jcode-id-types`, `jcode-message-types`, and the `jcode-app-core` `debug_job`
+  suites pass.
