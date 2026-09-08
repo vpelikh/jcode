@@ -147,18 +147,18 @@ pub(in crate::tui::app) async fn submit_prepared_remote_input(
     // "make a new worktree for X and work there") that should be honored before
     // the message is forwarded to the agent. This is the generic hook so new
     // auto-invocable commands only need a rule in `app::intent`.
-    if let Some((id, label, command)) = app_mod::intent::detect_intent(&prepared.expanded) {
-        if dispatch_intent_command(app, remote, command).await.is_ok() {
-            app.push_display_message(DisplayMessage {
-                role: "system".to_string(),
-                content: app_mod::intent::intent_notice(label),
-                tool_calls: vec![],
-                duration_secs: None,
-                title: None,
-                tool_data: None,
-            });
-            crate::telemetry::record_command_family(&format!("auto/{}", id));
-        }
+    if let Some((id, label, command)) = app_mod::intent::detect_intent(&prepared.expanded)
+        && dispatch_intent_command(app, remote, command).await.is_ok()
+    {
+        app.push_display_message(DisplayMessage {
+            role: "system".to_string(),
+            content: app_mod::intent::intent_notice(label),
+            tool_calls: vec![],
+            duration_secs: None,
+            title: None,
+            tool_data: None,
+        });
+        crate::telemetry::record_command_family(&format!("auto/{}", id));
     }
 
     // Remember the typed prompt so we can restore it to the input box if this turn

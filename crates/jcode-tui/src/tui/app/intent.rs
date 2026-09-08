@@ -140,6 +140,7 @@ fn is_weak_single_token(name: &str) -> bool {
 ///  1. Quoted name: `"foo-bar"` or `'foo'`.
 ///  2. `called <x>` / `named <x>` → the following token.
 ///  3. `for <x>` → the following token (the subject).
+///
 /// The name must be a single safe path segment (validated by
 /// [`parse_worktree_spec`]); if parsing rejects it, or the subject is only a
 /// weak word like "the", the trigger stays silent.
