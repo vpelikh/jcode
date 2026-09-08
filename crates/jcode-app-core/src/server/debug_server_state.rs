@@ -4,6 +4,7 @@ use super::{
     SessionInterruptQueues, SharedContext, SwarmEvent, SwarmMember,
 };
 use crate::agent::Agent;
+use crate::session::JobId;
 use anyhow::Result;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -96,7 +97,7 @@ pub(super) async fn maybe_handle_server_state_command(
     client_debug_state: &Arc<RwLock<ClientDebugState>>,
     server_identity: &ServerIdentity,
     server_start_time: Instant,
-    debug_jobs: &Arc<RwLock<HashMap<String, DebugJob>>>,
+    debug_jobs: &Arc<RwLock<HashMap<JobId, DebugJob>>>,
     shutdown_signals: &Arc<RwLock<HashMap<String, jcode_agent_runtime::InterruptSignal>>>,
     soft_interrupt_queues: &SessionInterruptQueues,
 ) -> Result<Option<String>> {
@@ -752,7 +753,7 @@ async fn build_server_memory_payload(
     client_debug_state: &Arc<RwLock<ClientDebugState>>,
     server_identity: &ServerIdentity,
     server_start_time: Instant,
-    debug_jobs: &Arc<RwLock<HashMap<String, DebugJob>>>,
+    debug_jobs: &Arc<RwLock<HashMap<JobId, DebugJob>>>,
     shutdown_signals: &Arc<RwLock<HashMap<String, jcode_agent_runtime::InterruptSignal>>>,
     soft_interrupt_queues: &SessionInterruptQueues,
 ) -> serde_json::Value {
@@ -1230,7 +1231,7 @@ fn estimate_file_access_bytes(access: &FileAccess) -> usize {
 }
 
 fn estimate_debug_job_bytes(job: &DebugJob) -> usize {
-    job.id.len()
+    job.id.as_str().len()
         + job.command.len()
         + job
             .session_id

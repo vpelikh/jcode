@@ -1,6 +1,7 @@
 mod tests {
     use super::super::*;
     use crate::server::debug_jobs::{DebugJob, DebugJobStatus};
+    use crate::session::JobId;
 
     #[test]
     fn client_debug_state_registers_unregisters_and_falls_back() {
@@ -26,7 +27,7 @@ mod tests {
     fn debug_job_payloads_include_expected_fields() {
         let now = Instant::now();
         let job = DebugJob {
-            id: "job_123".to_string(),
+            id: "job_123".into(),
             status: DebugJobStatus::Completed,
             command: "message:hello".to_string(),
             session_id: Some("session_abc".to_string()),
@@ -93,6 +94,38 @@ mod tests {
             parse_namespaced_command("server:state"),
             ("server", "state")
         );
+    }
+
+    #[test]
+    fn debug_job_id_is_branded_and_keyed_by_job_id() {
+        // A DebugJob's id is a branded JobId (deepseek-harness #12). The jobs
+        // map is keyed by JobId, so a lookup must be given a JobId, not a bare
+        // String — the compiler rejects mixing them. Construction from a &str or
+        // String flips into the branded type; the summary payload still renders
+        // the id as the same bare string.
+        let id = JobId::from("job_vivid".to_string());
+        let job = DebugJob {
+            id: id.clone(),
+            status: DebugJobStatus::Queued,
+            command: "message:hi".to_string(),
+            session_id: None,
+            created_at: Instant::now(),
+            started_at: None,
+            finished_at: None,
+            output: None,
+            error: None,
+        };
+
+        let mut jobs: std::collections::HashMap<JobId, DebugJob> =
+            std::collections::HashMap::new();
+        jobs.insert(id.clone(), job);
+
+        // Only a JobId key resolves; a String key would not compile.
+        assert!(jobs.contains_key(&id));
+        assert!(jobs.contains_key(&JobId::from("job_vivid")));
+
+        let payload = jobs.get(&id).unwrap().summary_payload();
+        assert_eq!(payload.get("id").and_then(|v| v.as_str()), Some("job_vivid"));
     }
 }
 

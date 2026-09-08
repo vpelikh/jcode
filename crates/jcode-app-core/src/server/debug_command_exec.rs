@@ -3,6 +3,7 @@
 use super::debug_jobs::{DebugJob, maybe_start_async_debug_job};
 use super::{ServerIdentity, SessionControlHandle, SessionInterruptQueues};
 use crate::agent::Agent;
+use crate::session::JobId;
 use crate::build;
 use crate::mcp::McpConfig;
 use anyhow::Result;
@@ -117,7 +118,7 @@ pub(super) async fn run_debug_message_with_timeout(
 pub(super) async fn execute_debug_command(
     agent: Arc<Mutex<Agent>>,
     command: &str,
-    debug_jobs: Arc<RwLock<HashMap<String, DebugJob>>>,
+    debug_jobs: Arc<RwLock<HashMap<JobId, DebugJob>>>,
     server_identity: Option<&ServerIdentity>,
     interrupt_context: Option<DebugInterruptContext>,
 ) -> Result<String> {
