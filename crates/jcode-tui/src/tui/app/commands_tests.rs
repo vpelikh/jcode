@@ -427,7 +427,34 @@ mod worktree {
     #[test]
     fn parse_worktree_spec_rejects_option_like_branch() {
         let err = super::parse_worktree_spec("widgets -b -x").unwrap_err();
-        assert!(err.contains("expected a branch name"), "{err}");
+        assert!(
+            err.contains("not a valid git branch name") || err.contains("valid"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn parse_worktree_spec_rejects_invalid_worktree_name_for_branch() {
+        // A name that fails as a git branch component (would become feat/<name>)
+        // must be rejected up front.
+        for bad in ["foo..bar", "foo@{x", "leading-dot.", "trailing~"] {
+            let err = super::parse_worktree_spec(bad).unwrap_err();
+            assert!(
+                err.contains("invalid git branch"),
+                "{bad}: expected a git-branch error, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_worktree_spec_rejects_invalid_explicit_branch() {
+        for bad in ["bad..branch", "colon:name", "@", "-dash"] {
+            let err = super::parse_worktree_spec(&format!("widgets -b {bad}")).unwrap_err();
+            assert!(
+                err.contains("not a valid git branch name"),
+                "{bad}: expected a git-branch error, got: {err}"
+            );
+        }
     }
 
     /// Real `git worktree add` against a throwaway repo: proves the helper

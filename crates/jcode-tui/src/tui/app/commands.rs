@@ -1608,6 +1608,34 @@ pub(super) struct WorktreeSpec {
     pub branch: Option<String>,
 }
 
+/// Whether `branch` is a valid git branch name (a single ref component).
+///
+/// The worktree name is used to derive `feat/<name>` by default and the `-b`
+/// value is used directly, so both must be acceptable to `git check-ref-format`.
+/// We reject the common invalid forms here to give a clear error instead of a
+/// bare git failure. Since names cannot contain `/`, a single valid component is
+/// enough; this also rules out git-invalid sequences like `..`, `@{`, `~`, `^`,
+/// `:`, and trailing `.` / `.lock`.
+fn is_valid_branch_component(branch: &str) -> bool {
+    if branch.is_empty()
+        || branch == "."
+        || branch.ends_with('.')
+        || branch.ends_with(".lock")
+        || branch.starts_with('-')
+        || branch.starts_with('.')
+    {
+        return false;
+    }
+    !branch
+        .chars()
+        .any(|c| matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\' | ' ' | '\t'))
+        && !branch.contains("..")
+        // `@` alone is invalid; `@{` is reserved (reflog). A lone `@` is caught
+        // by the `@{` check plus an exact-match guard below.
+        && !branch.contains("@{")
+        && branch != "@"
+}
+
 /// Parse the arguments of a `/worktree` command.
 pub(super) fn parse_worktree_spec(rest: &str) -> Result<WorktreeSpec, String> {
     let tokens: Vec<&str> = rest.split_whitespace().collect();
@@ -1635,6 +1663,13 @@ pub(super) fn parse_worktree_spec(rest: &str) -> Result<WorktreeSpec, String> {
             "Invalid worktree name '{name}': a name cannot start with '-'."
         ));
     }
+    // The name becomes `feat/<name>` by default, so it must be a valid git
+    // branch component; otherwise `git worktree add` fails with a ref error.
+    if !is_valid_branch_component(&name) {
+        return Err(format!(
+            "Invalid worktree name '{name}': it would form an invalid git branch (feat/{name})."
+        ));
+    }
 
     let mut branch = None;
     let mut i = 1;
@@ -1644,8 +1679,10 @@ pub(super) fn parse_worktree_spec(rest: &str) -> Result<WorktreeSpec, String> {
                 let value = tokens.get(i + 1).ok_or_else(|| {
                     "Usage: /worktree <name> -b <branch>  (branch missing after -b)".to_string()
                 })?;
-                if value.starts_with('-') {
-                    return Err(format!("Invalid branch '{value}': expected a branch name."));
+                if !is_valid_branch_component(value) {
+                    return Err(format!(
+                        "Invalid branch '{value}': not a valid git branch name."
+                    ));
                 }
                 branch = Some(value.to_string());
                 i += 2;
