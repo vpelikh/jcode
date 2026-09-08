@@ -1,13 +1,16 @@
 //! Swarm service handle.
 
+use crate::protocol::ServerEvent;
 use crate::server::{
-    AwaitMembersRuntime, FileTouchService, Server, SharedContext, SwarmEvent, SwarmMutationRuntime,
-    SwarmState,
+    AwaitMembersRuntime, FileTouchService, Server, SharedContext, SwarmEvent, SwarmEventType,
+    SwarmMember, SwarmMutationRuntime, SwarmState,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::AtomicU64;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{RwLock, broadcast};
+use std::sync::atomic::AtomicU64;
+use std::time::Instant;
+use tokio::sync::{RwLock, broadcast, mpsc};
 
 /// Channel subscriptions (swarm_id -> channel -> session_ids).
 type ChannelSubscriptions = Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
@@ -57,6 +60,117 @@ impl SwarmServiceHandle {
             await_members_runtime: server.await_members_runtime.clone(),
             swarm_mutation_runtime: server.swarm_mutation_runtime.clone(),
         }
+    }
+
+    /// Register (or refresh) a session as a swarm member, mirroring
+    /// `SwarmServiceHandle`'s downstream clients. Idempotent: an existing
+    /// member is refreshed with the connection's event senders and the resolved
+    /// identity, a new one is inserted with a fresh `ready` status. When the
+    /// member is brand new and swarm-enabled, it is added to `swarms_by_id` and
+    /// a `joined` member-change event is recorded.
+    ///
+    /// The session identity values (`working_dir`, `derived_swarm_id`,
+    /// `member_name`) are resolved by the caller from the agent so swarm
+    /// ownership stays here while session owns its agent. Returns whether a new
+    /// member was inserted.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "registering a swarm member carries session identity, connection identity, resolved working dir / swarm id, and event senders"
+    )]
+    pub(crate) async fn ensure_member(
+        &self,
+        client_session_id: &str,
+        client_connection_id: &str,
+        member_name: Option<String>,
+        working_dir: Option<PathBuf>,
+        derived_swarm_id: Option<String>,
+        swarm_enabled: bool,
+        client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+    ) -> bool {
+        let mut inserted = false;
+        {
+            let mut members = self.swarm_state.members.write().await;
+            if let Some(member) = members.get_mut(client_session_id) {
+                member.event_tx = client_event_tx.clone();
+                member
+                    .event_txs
+                    .insert(client_connection_id.to_string(), client_event_tx.clone());
+                member.swarm_enabled = swarm_enabled;
+                member.is_headless = false;
+                if member_name.is_some() {
+                    member.friendly_name = member_name.clone();
+                }
+            } else {
+                let now = Instant::now();
+                members.insert(
+                    client_session_id.to_string(),
+                    SwarmMember {
+                        session_id: client_session_id.to_string(),
+                        event_tx: client_event_tx.clone(),
+                        event_txs: HashMap::from([(
+                            client_connection_id.to_string(),
+                            client_event_tx.clone(),
+                        )]),
+                        working_dir: working_dir.clone(),
+                        swarm_id: derived_swarm_id.clone(),
+                        swarm_enabled,
+                        status: "ready".to_string(),
+                        detail: None,
+                        task_label: None,
+                        friendly_name: member_name.clone(),
+                        report_back_to_session_id: None,
+                        latest_completion_report: None,
+                        role: "agent".to_string(),
+                        joined_at: now,
+                        last_status_change: now,
+                        is_headless: false,
+                        output_tail: None,
+                        todo_progress: None,
+                        todo_items: Vec::new(),
+                        runtime: crate::protocol::SwarmMemberRuntime::default(),
+                    },
+                );
+                inserted = true;
+            }
+        }
+
+        if inserted && let Some(ref swarm_id_ref) = derived_swarm_id {
+            let mut swarms = self.swarm_state.swarms_by_id.write().await;
+            swarms
+                .entry(swarm_id_ref.to_string())
+                .or_insert_with(HashSet::new)
+                .insert(client_session_id.to_string());
+            drop(swarms);
+            super::super::swarm::record_swarm_event(
+                &self.event_history,
+                &self.event_counter,
+                &self.swarm_event_tx,
+                client_session_id.to_string(),
+                member_name,
+                Some(swarm_id_ref.to_string()),
+                SwarmEventType::MemberChange {
+                    action: "joined".to_string(),
+                },
+            )
+            .await;
+        }
+
+        crate::logging::event_info(
+            "SESSION_LIFECYCLE",
+            vec![
+                ("phase", "swarm_member_registered".to_string()),
+                ("session_id", client_session_id.to_string()),
+                ("client_connection_id", client_connection_id.to_string()),
+                ("inserted", inserted.to_string()),
+                ("swarm_enabled", swarm_enabled.to_string()),
+                (
+                    "swarm_id",
+                    derived_swarm_id.unwrap_or_else(|| "none".to_string()),
+                ),
+            ],
+        );
+
+        inserted
     }
 
     /// Whether a freshly arrived (or reconnecting) member should be marked

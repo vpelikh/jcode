@@ -196,6 +196,92 @@ async fn subscribe_marks_non_running_member_ready() {
 }
 
 #[tokio::test]
+async fn ensure_member_registers_new_member_and_eager_swarm_access() {
+    let swarm_members = Arc::new(RwLock::new(HashMap::new()));
+    let swarms_by_id = Arc::new(RwLock::new(HashMap::new()));
+    let (event_tx, _event_rx) = mpsc::unbounded_channel::<ServerEvent>();
+    let handle = swarm_handle_full(
+        Arc::clone(&swarm_members),
+        Arc::clone(&swarms_by_id),
+        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(RwLock::new(VecDeque::new())),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        broadcast::channel(8).0,
+    );
+
+    let inserted = handle
+        .ensure_member(
+            "session-a",
+            "conn-a",
+            Some("Session A".to_string()),
+            Some(std::path::PathBuf::from("/tmp/a")),
+            Some("swarm-a".to_string()),
+            true,
+            &event_tx,
+        )
+        .await;
+    assert!(inserted, "a brand-new member should report inserted=true");
+
+    let member = swarm_members
+        .read()
+        .await
+        .get("session-a")
+        .cloned()
+        .expect("member should be registered");
+    assert_eq!(member.status, "ready");
+    assert_eq!(member.friendly_name.as_deref(), Some("Session A"));
+    assert_eq!(member.swarm_id.as_deref(), Some("swarm-a"));
+
+    let swarm = swarms_by_id.read().await;
+    assert_eq!(swarm.get("swarm-a").map(|s| s.len()), Some(1));
+    assert!(swarm.get("swarm-a").unwrap().contains("session-a"));
+}
+
+#[tokio::test]
+async fn ensure_member_refresh_existing_member_adds_connection_without_reinsertion() {
+    let swarm_members = Arc::new(RwLock::new(HashMap::from([(
+        "session-b".to_string(),
+        test_swarm_member("session-b", "ready"),
+    )])));
+    let swarms_by_id: Arc<RwLock<HashMap<String, HashSet<String>>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+    let (event_tx, _event_rx) = mpsc::unbounded_channel::<ServerEvent>();
+    let handle = swarm_handle_full(
+        Arc::clone(&swarm_members),
+        Arc::clone(&swarms_by_id),
+        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(RwLock::new(VecDeque::new())),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        broadcast::channel(8).0,
+    );
+
+    let inserted = handle
+        .ensure_member(
+            "session-b",
+            "conn-b",
+            None,
+            None,
+            None,
+            false,
+            &event_tx,
+        )
+        .await;
+    assert!(!inserted, "an existing member should not be re-inserted");
+
+    let member = swarm_members.read().await;
+    let member = member.get("session-b").expect("member remains present");
+    assert!(member.event_txs.contains_key("conn-b"));
+    assert_eq!(member.swarm_enabled, false);
+    assert!(swarms_by_id.read().await.is_empty());
+}
+
+#[tokio::test]
 async fn resume_rename_releases_member_lock_before_waiting_for_swarm_map() {
     let old_session_id = "session-old";
     let new_session_id = "session-new";
