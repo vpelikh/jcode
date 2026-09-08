@@ -493,9 +493,10 @@ lifecycle functions (`handle_subscribe`, `handle_clear_session`,
 `handle_resume_session`) now take the `SwarmServiceHandle` instead of a flat
 swarm-domain argument bag, and the membership operations have moved onto
 `SwarmServiceHandle` methods (`member_should_mark_ready`,
-`rename_member_session`, and `ensure_member` for join-swarm registration). The
-remaining work is the ownership-move slices still pending (`monitor_bus` to
-service APIs, debug snapshots).
+`rename_member_session`, `ensure_member` for join-swarm registration, and
+`take_session_membership` for `/clear` teardown). The remaining work is the
+ownership-move slices still pending (`monitor_bus` to service APIs, debug
+snapshots).
 
 ---
 
@@ -527,7 +528,7 @@ without risking the runtime model. It is deliberately a **slice**, not a PR:
   readers. Each is mechanical now that the handles exist. *(partially landed:
   `handle_subscribe`/`handle_clear_session`/`handle_resume_session` now take the
   `SwarmServiceHandle`, and `member_should_mark_ready` / `rename_member_session`
-  / `ensure_member` live on the handle)*
+  / `ensure_member` / `take_session_membership` live on the handle)*
 
 Each slice is independently reviewable and behavior-preserving; none is gated on
 the rest.
