@@ -131,6 +131,18 @@ fn is_weak_single_token(name: &str) -> bool {
             | "some"
             | "any"
             | "each"
+            // Generic single adjectives/nouns that are poor worktree names on
+            // their own; a phrase like "for the new feature UI" must not yield
+            // a worktree named "new".
+            | "new"
+            | "next"
+            | "upcoming"
+            | "feature"
+            | "features"
+            | "work"
+            | "works"
+            | "project"
+            | "projects"
     )
 }
 
@@ -250,6 +262,21 @@ mod tests {
             "make a new worktree for my project work",
             "create a worktree please",
             "work in a new worktree",
+        ] {
+            let got = detect_intent(prompt);
+            assert!(got.is_none(), "{prompt:?} should not trigger, got {got:?}");
+        }
+    }
+
+    #[test]
+    fn generic_subject_words_do_not_become_worktree_names() {
+        // "create a worktree for the new feature UI" must not yield a worktree
+        // named "new" — a generic adjective is a poor auto-derived name, so it
+        // stays silent and defers to /worktree.
+        for prompt in [
+            "create a worktree for the new feature UI",
+            "make a worktree for the next milestone",
+            "set up a worktree for the upcoming feature",
         ] {
             let got = detect_intent(prompt);
             assert!(got.is_none(), "{prompt:?} should not trigger, got {got:?}");
