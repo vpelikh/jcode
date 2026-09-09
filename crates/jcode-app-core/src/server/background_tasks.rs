@@ -282,11 +282,12 @@ pub(super) async fn dispatch_swarm_await_completion(
 
 pub(super) async fn dispatch_background_task_progress(
     task: &crate::bus::BackgroundTaskProgressEvent,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    swarm: &SwarmServiceHandle,
 ) {
     let notification = format_background_task_progress_markdown(task);
+    let members = &swarm.swarm_state.members;
     if fanout_session_event(
-        swarm_members,
+        members,
         &task.session_id,
         ServerEvent::Notification {
             from_session: "background_task".to_string(),
@@ -660,7 +661,7 @@ mod tests {
 
 pub(super) async fn dispatch_ui_activity(
     activity: &crate::bus::UiActivity,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    swarm: &SwarmServiceHandle,
 ) {
     if activity.message.trim().is_empty() {
         return;
@@ -669,8 +670,9 @@ pub(super) async fn dispatch_ui_activity(
         return;
     };
 
+    let members = &swarm.swarm_state.members;
     if fanout_session_event(
-        swarm_members,
+        members,
         session_id,
         ServerEvent::Notification {
             from_session: "jcode".to_string(),

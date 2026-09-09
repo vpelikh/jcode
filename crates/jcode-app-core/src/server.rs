@@ -2235,7 +2235,7 @@ impl Server {
                     dispatch_background_task_completion(&task, session, swarm).await;
                 }
                 Ok(BusEvent::BackgroundTaskProgress(task)) => {
-                    dispatch_background_task_progress(&task, &swarm_members).await;
+                    dispatch_background_task_progress(&task, swarm).await;
                 }
                 Ok(BusEvent::BackgroundTaskStalled(task)) => {
                     dispatch_background_task_stalled(&task, session, swarm).await;
@@ -2244,7 +2244,7 @@ impl Server {
                     dispatch_swarm_await_completion(&event, session, swarm).await;
                 }
                 Ok(BusEvent::UiActivity(activity)) => {
-                    dispatch_ui_activity(&activity, &swarm_members).await;
+                    dispatch_ui_activity(&activity, swarm).await;
                 }
                 Ok(BusEvent::ToolUpdated(event)) => {
                     dispatch_swarm_tool_activity(&event, swarm).await;
