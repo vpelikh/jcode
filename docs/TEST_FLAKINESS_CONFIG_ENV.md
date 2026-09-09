@@ -82,8 +82,14 @@ parallel runs of `cargo test -p jcode-app-core --lib tool::bash::tests`.
 ## Residual known flake (not fixed)
 
 `channel::tests::test_session_picker_menu_flow` intermittently fails under full
-parallel load (`/list` returns a non-empty text reply), even though it holds
-`lock_test_env()` and passes in isolation and in a 3x module run. It appears only
-in the ~1400-test full parallel suite and is a low-probability load/timing flake
-in the Telegram-mock/recent-session path, unrelated to the two bugs above. It was
-already catalogued in `docs/research/deepseek-harness-implementation-status.md`.
+parallel load. The observed failure was at `assert_eq!(keyboard.len(), 1, ...)`
+(line ~2852): the `/list` picker rendered more than one keyboard row, i.e. the
+recent-session index returned extra sessions beyond the single one the test
+inserts. (An earlier note that described this as "`/list` returns a non-empty
+text reply" was inaccurate: that branch always returns `String::new()`.) The
+exact leak mechanism is undiagnosed; it happens even though the test holds
+`lock_test_env()`, and it passes in isolation and in a 3x module run, appearing
+only in the ~1400-test full parallel suite under load, so it is best treated as
+a low-probability cross-test recent-session-index state leak rather than a
+deterministic bug. It was already catalogued in
+`docs/research/deepseek-harness-implementation-status.md`.
