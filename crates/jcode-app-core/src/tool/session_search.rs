@@ -136,12 +136,27 @@ impl SessionSearchTool {
     /// stalling the whole session.
     ///
     /// Cancellation safety: the scan is **read-only and idempotent**. On
-    /// timeout the turn returns immediately; the `spawn_blocking` scan keeps
-    /// running in the background for at most a bounded window and performs no
-    /// external side effects (it only reads and deserializes session files), so
-    /// no work is corrupted or orphaned. This is why a deadline is safe here even
-    /// though the join block does not abort the underlying scan.
+    /// timeout the turn returns immediately with the model-visible timeout
+    /// error, while the already-spawned `spawn_blocking` work continues to
+    /// completion in the background. That work only reads and deserializes
+    /// session files (no writes, no external side effects), so nothing is
+    /// corrupted or orphaned; a default-scope scan is additionally bounded by
+    /// the session-file cap. The cost is that the blocking threads are not
+    /// reclaimed early — the acknowledged trade-off, tracked as Part A
+    /// (abortable scan loop) in the deepseek-harness status doc. This is why a
+    /// deadline is safe here even though the join block does not abort the
+    /// underlying scan.
     pub const EXECUTION_TIMEOUT_SECS: u64 = 60;
+
+    /// Whole-call budget for an expanded scope (takeaway #7, Part B).
+    ///
+    /// `exhaustive` scans every available session instead of the indexed recent
+    /// subset, and an explicit `max_scan_sessions` above the default also opens
+    /// up far more of the stores. Both warrant a larger budget than the default
+    /// scope. The budget is input-dependent: the registry asks
+    /// `execution_timeout(&input)`, and the tool scales up to this value when
+    /// the call requests either.
+    pub const EXHAUSTIVE_EXECUTION_TIMEOUT_SECS: u64 = 120;
 
     pub fn new() -> Self {
         Self
@@ -315,8 +330,41 @@ impl Tool for SessionSearchTool {
         "Search past chat sessions. Current session and tool noise hidden by default."
     }
 
-    fn execution_timeout(&self) -> Option<std::time::Duration> {
-        Some(std::time::Duration::from_secs(Self::EXECUTION_TIMEOUT_SECS))
+    fn execution_timeout(&self, input: &Value) -> Option<std::time::Duration> {
+        // Scale the budget to the requested scan scope (takeaway #7, Part B).
+        // Two inputs expand the work beyond the default indexed subset and both
+        // warrant the larger budget: an `exhaustive` scan, or an explicit
+        // `max_scan_sessions` above the default. A minimal, all-optional input
+        // read lets us honor these even when the full `SearchInput` (which
+        // requires `query`) is unavailable; a malformed call falls back to the
+        // base budget.
+        #[derive(serde::Deserialize)]
+        struct TimeoutInput {
+            #[serde(default)]
+            exhaustive: Option<bool>,
+            #[serde(default)]
+            max_scan_sessions: Option<i64>,
+        }
+        let parsed = serde_json::from_value::<TimeoutInput>(input.clone()).ok();
+        let exhaustive = parsed
+            .as_ref()
+            .and_then(|params| params.exhaustive)
+            .unwrap_or(false);
+        let raised_scan_cap = parsed
+            .as_ref()
+            .and_then(|params| params.max_scan_sessions)
+            // Signed comparison: a negative/invalid `max_scan_sessions` is not
+            // "expanded scope" (execute would reject it via bounded validation);
+            // comparing as signed avoids casting a negative i64 to a huge usize.
+            .map(|value| value > DEFAULT_MAX_SCAN_SESSIONS as i64)
+            .unwrap_or(false);
+        let expanded_scope = exhaustive || raised_scan_cap;
+        let secs = if expanded_scope {
+            Self::EXHAUSTIVE_EXECUTION_TIMEOUT_SECS
+        } else {
+            Self::EXECUTION_TIMEOUT_SECS
+        };
+        Some(std::time::Duration::from_secs(secs))
     }
 
     fn parameters_schema(&self) -> Value {

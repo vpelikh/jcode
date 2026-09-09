@@ -903,7 +903,7 @@ impl Registry {
 
         let started_at = std::time::Instant::now();
         let result = jcode_tool_core::execute_with_deadline(
-            tool.execution_timeout(),
+            tool.execution_timeout(&input),
             resolved_name,
             tool.execute(input.clone(), ctx.clone()),
         )

@@ -238,10 +238,10 @@ These are explicitly open and are tracked as follow-ups, not delivered work:
 
 Two parallel timeout systems exist today:
 
-- **Shared seam (takeaway #7):** `Tool::execution_timeout()` is wrapped by
-  `Registry::execute` with `tokio::time::timeout`; on expiry it **hard-drops**
-  the future and returns a model-visible "timed out after Ns" error. Currently
-  only `websearch` opts in.
+- **Shared seam (takeaway #7):** `Tool::execution_timeout(&self, input)` is wrapped
+  by `Registry::execute` with `tokio::time::timeout`; on expiry it **hard-drops**
+  the future and returns a model-visible "timed out after Ns" error. `websearch`
+  and `session_search` both opt in (the latter input-aware, see below).
 - **Native self-managed timeouts:** `bash`, `bg`, and `webfetch` do **not**
   override `execution_timeout()`. They implement their own internal timeout
   inside `execute()`. Notably `bash` **promotes a timed-out command to a
@@ -257,12 +257,14 @@ behavior-changing, cross-cutting change (touches the tool trait, the registry,
 bash/bg, and the background manager's adoption API) and should get its own
 dedicated session with a steering decision on the default for each tool.
 
-**Related (the `None`-fallback half is now DONE):** broaden the opt-in to the
-cancellable I/O tools that don't self-manage a timeout. The TUI info-widget
-`background_info` `None`-session fallback was changed to show no indicator
-instead of a global aggregate (backward compat is not a goal), with an
-integration-test assertion covering the resolved-and-idle and unresolved-`None`
-cases.
+**Related (the TUI-info-widget half is done; the tool-timeout broadening is
+partial):** the `None`-fallback half of the F8 note covers two distinct items.
+The TUI info-widget `background_info` `None`-session fallback was changed to
+show no indicator instead of a global aggregate (backward compat is not a goal),
+with an integration-test assertion covering the resolved-and-idle and
+unresolved-`None` cases. Separately, broadening the tool-timeout opt-in to the
+cancellable I/O tools is only partially delivered — session_search opts in (see
+below); gmail/conversation_search/ambient remain documented non-opt-ins.
 
 ### Broadening the opt-in: session_search (partial)
 
@@ -276,22 +278,64 @@ The concrete `None`-fallback half — give more tools a declared
   exhaustive scan can otherwise hold the turn indefinitely. The scan is
   **read-only and idempotent**, so when the registry wrap point times it out the
   turn returns a clean model-visible "timed out after Ns" error immediately and
-  the underlying scan finishes harmlessly in the background (wasted CPU only,
-  no side effects or corrupted state). Two tests pin the declared constant and
-  the model-visible error contract via the shared `execute_with_deadline` wrap.
+  the already-spawned `spawn_blocking` work finishes in the background (wasted
+  CPU only, no side effects or corrupted state; default-scope scans are bounded
+  by the session-file cap). Tests pin the declared constant, the model-visible
+  error contract via the shared `execute_with_deadline` wrap, and the
+  input-dependent scale-up (including the raised scan-cap case and the
+  negative-cap fallback).
 
 - **Deliberately not opted in (documented, not a gap):**
-  - `gmail` — the whole-tool `execution_timeout()` cannot distinguish the
+  - `gmail` — a whole-tool `execution_timeout()` cannot distinguish the
     `connect` action's self-managed ~5-minute browser-approval poll (150×2s)
     from the unbounded HTTP body reads on the other actions. A deadline short
     enough to bind the reads would break `connect`; one long enough for
-    `connect` would not bound the reads. Splitting this needs an
-    action-scoped deadline, which is out of scope for the one-deadline seam.
+    `connect` would not bound the reads. Part B now makes an *action-scoped*
+    deadline possible (the budget is input-aware), but gmail does not yet opt
+    in — wiring an action-specific budget for the non-connect reads is a
+    separate, contained follow-up rather than part of the session_search scope
+    here.
   - `conversation_search` — sync-dominant (`Session::load` + in-memory search),
     almost no `await` points, so a `tokio::time::timeout` cannot meaningfully
     interrupt it; a declared timeout would be a misleading claim.
   - `ambient`/`schedule` — synchronous queue mutations and runner nudges, no
     network/scan I/O that can hang; no hang risk to bound.
+
+### Seam improvement (Part B): input-dependent budget
+
+The shared takeaway #7 seam was made **input-aware** so a tool can scale its
+deadline to the work the call actually requests, instead of one fixed budget per
+tool:
+
+- `Tool::execution_timeout(&self)` → `execution_timeout(&self, input: &Value)`.
+  The single `Registry::execute` call site passes the raw input it already has.
+  The default implementation ignores `input` and returns `None`. `websearch`
+  keeps its fixed 30s (its work doesn't scale with input); only `session_search`
+  and its overrides were touched (2 override sites, 1 call site, tests), so the
+  change is contained to the two crates that implement timeouts.
+- **`session_search` scales by scope:** a default-scope call uses 60s
+  (`EXECUTION_TIMEOUT_SECS`); an `exhaustive` call (every session, not the
+  indexed subset) or an explicit `max_scan_sessions` above the default uses
+  120s (`EXHAUSTIVE_EXECUTION_TIMEOUT_SECS`). This removes the earlier
+  trade-off that a single fixed budget could not distinguish small from
+  expanded scans. Tests pin the scale-up for both the `exhaustive` case and a
+  raised scan cap; existing timeout and model-visible-error tests still pass.
+- **Rationale:** this is the actual seam fix that addresses the F8 note's
+  earlier observation that `execution_timeout()` alone was "too thin" — each
+  tool no longer has to re-derive "how do I pick one fixed number."
+
+### Deferred (Part A): abortable scan loop
+
+The other session_search trade-off — on timeout the read-only scan continues to
+completion in the background rather than being stopped early — is
+**deferred by explicit steering choice**. Options were evaluated: adding a
+per-call deadline/cancel token to `ToolContext` was rejected because
+`ToolContext` is constructed at **96 sites** across the workspace, making a
+struct-field addition invasive for a single tool's benefit. The right shape is a
+**tool-internal** cooperative-cancel loop (a cancel flag checked in the scan
+iteration) that works with `execute_with_deadline` dropping the outer future.
+This is a per-tool change, not a seam-wide one, and is tracked as a separate
+follow-up.
 
 The core F8 "promote-on-timeout" seam for `bash`/`bg`/`webfetch` remains a
 separate, behavior-changing follow-up as described above.

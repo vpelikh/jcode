@@ -189,17 +189,23 @@ pub trait Tool: Send + Sync {
     /// exceeding this bound returns a clear, model-visible timeout error
     /// instead of stalling the whole session indefinitely.
     ///
+    /// `input` is the raw tool-call input (the same value passed to
+    /// [`execute`](Self::execute)), so a tool can scale its budget to the
+    /// amount of work the call actually requests (e.g. a larger scan scope
+    /// warrants a larger budget). The default implementation ignores it and
+    /// returns `None`.
+    ///
     /// The default is `None` (no timeout): most tools run quickly and are not
     /// candidates for wrapping. Only override it for tools whose execution is
     /// both externally cancellable and allowed to be interrupted.
-    fn execution_timeout(&self) -> Option<std::time::Duration> {
+    fn execution_timeout(&self, _input: &Value) -> Option<std::time::Duration> {
         None
     }
 }
 
 /// Execute `tool` with its declared per-call timeout, if any (takeaway #7).
 ///
-/// When `tool.execution_timeout()` returns `Some(bound)`, the call is run under
+/// When `tool.execution_timeout(input)` returns `Some(bound)`, the call is run under
 /// `tokio::time::timeout`; a call exceeding the bound is cancelled and mapped to
 /// a clear, model-visible timeout error. When the tool declares no timeout, it
 /// runs uncapped exactly as before.
@@ -263,7 +269,11 @@ mod tests {
         // The per-call timeout is opt-in (takeaway #7). A tool that does not
         // override `execution_timeout` must run uncapped, so we never wrap
         // arbitrary tools in an implicit deadline they did not declare.
-        assert!(MarkerTool.execution_timeout().is_none());
+        assert!(
+            MarkerTool
+                .execution_timeout(&serde_json::json!({}))
+                .is_none()
+        );
     }
 
     #[test]

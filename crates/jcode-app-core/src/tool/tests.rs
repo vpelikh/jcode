@@ -573,6 +573,72 @@ async fn registry_execute_pre_tool_hook_blocks_and_allows() {
     assert!(allowed.is_ok(), "non-matching input should pass the gate");
 }
 
+/// A tool that declares a very short execution timeout and then hangs. Used to
+/// prove `Registry::execute` threads `execution_timeout(&input)` through the
+/// `execute_with_deadline` wrap point end-to-end (takeaway #7, Part B).
+struct HangingTimeoutTool;
+
+#[async_trait]
+impl Tool for HangingTimeoutTool {
+    fn name(&self) -> &str {
+        "hanging_timeout"
+    }
+
+    fn description(&self) -> &str {
+        "Test-only tool that declares a short timeout and never returns."
+    }
+
+    /// No `parameters_schema` honors a `timeout_ms` field; the timeout is
+    /// input-independent here but must still be consulted by the registry.
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({ "type": "object" })
+    }
+
+    /// A 20ms whole-call budget so the test completes quickly.
+    fn execution_timeout(&self, _input: &Value) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_millis(20))
+    }
+
+    async fn execute(&self, _input: Value, _ctx: ToolContext) -> Result<ToolOutput> {
+        std::future::pending::<()>().await;
+        Ok(ToolOutput::new("never"))
+    }
+}
+
+#[tokio::test]
+async fn registry_execute_honors_input_aware_execution_timeout() {
+    // Registry::execute is the single production dispatch path that applies
+    // `execution_timeout(&input)` via `execute_with_deadline`. Pin that a hung
+    // tool which declares a timeout surfaces the model-visible timeout error
+    // rather than stalling the caller forever.
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+    registry
+        .register("hanging_timeout".to_string(), Arc::new(HangingTimeoutTool))
+        .await;
+
+    let ctx = ToolContext {
+        session_id: "test-timeout".to_string(),
+        message_id: "test".to_string(),
+        tool_call_id: "test".to_string(),
+        working_dir: Some(std::env::temp_dir()),
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: ToolExecutionMode::AgentTurn,
+    };
+
+    let err = registry
+        .execute("hanging_timeout", serde_json::json!({}), ctx)
+        .await
+        .expect_err("a hung tool with a declared timeout must time out, not hang");
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("timed out after"),
+        "expected a model-visible timeout error through Registry::execute, got: {text}"
+    );
+}
+
 #[tokio::test]
 async fn test_definitions_keep_batch_schema_generic() {
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
