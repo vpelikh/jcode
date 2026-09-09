@@ -637,10 +637,23 @@ call-site migrations with tests green:
   method (Seam D progress). Each body binds the membership map from the handle
   as a local so the mutation logic is byte-identical.
 
+- **`dispatch_background_task_completion` / `_stalled` /
+  `dispatch_swarm_await_completion` route through the swarm handle.** The three
+  `monitor_bus` task/await delivery functions each carried the raw five-field
+  swarm bag (`swarm_members` / `swarms_by_id` / `event_history` /
+  `event_counter` / `swarm_event_tx`). They now take `&SwarmServiceHandle`
+  (plus `&SessionServiceHandle`) and bind the flat maps as body locals, so
+  `monitor_bus` hands every swarm-domain bus event to the dispatchers via the
+  typed handle instead of five positional arcs. This also dropped the now-unfulfilled
+  `#[expect(clippy::too_many_arguments)]` attributes on all three, clearing those
+  three lint warnings. Tests gained a `test_swarm_service_handle` helper for the
+  three `dispatch_background_task_completion` call sites.
+
 The remaining free-function call sites for `update_member_status` /
 `broadcast_swarm_status` in `server.rs` maintenance paths,
 `client_lifecycle.rs`, `comm_control.rs`, `comm_session.rs`, `headless.rs`,
-`client_session.rs`, and `debug_session_admin.rs` are still open; as are the
-`dispatch_background_task_completion`/`_stalled`/`dispatch_swarm_await_completion`
-five-field bags and the `LiveTurnSwarmContext` flat-field wrapper. They remain
-separate, mechanical follow-ups per the "cosmetic, high-churn" note above.
+`client_session.rs`, and `debug_session_admin.rs` are still open; as is the
+`LiveTurnSwarmContext` flat-field wrapper (its callers in `background_tasks.rs`,
+`client_comm_message.rs`, `client_actions.rs`, and `tests.rs` do not yet carry a
+handle, so converting it would cascade). They remain separate, mechanical
+follow-ups per the "cosmetic, high-churn" note above.
