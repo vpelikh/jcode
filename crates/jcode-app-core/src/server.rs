@@ -649,8 +649,8 @@ pub use self::state::{
     SwarmState,
 };
 use self::state::{
-    fanout_live_client_event, fanout_session_event, queue_soft_interrupt_for_session,
-    register_background_tool_signal, register_session_event_sender, register_session_interrupt_queue,
+    fanout_live_client_event, fanout_session_event, register_background_tool_signal,
+    register_session_event_sender, register_session_interrupt_queue,
     remove_background_tool_signal, remove_session_interrupt_queue, rename_background_tool_signal,
     rename_session_interrupt_queue, session_event_fanout_sender, unregister_session_event_sender,
 };
