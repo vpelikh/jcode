@@ -1,12 +1,12 @@
 #![cfg_attr(test, allow(clippy::items_after_test_module))]
 
 use super::client_lifecycle::process_message_streaming_mpsc;
-use super::services::SessionServiceHandle;
+use super::services::{SessionServiceHandle, SwarmServiceHandle};
 use super::{
     ClientConnectionInfo, SwarmEvent, SwarmMember, SwarmState,
     VersionedPlan, broadcast_swarm_status, fanout_session_event, persist_swarm_state_for,
-    remove_session_channel_subscriptions,
-    remove_session_from_swarm, swarm_id_for_session, truncate_detail, update_member_status,
+    remove_session_channel_subscriptions, remove_session_from_swarm, swarm_id_for_session,
+    truncate_detail,
 };
 use crate::agent::Agent;
 use crate::protocol::{FeatureToggle, NotificationType, ServerEvent};
@@ -1215,11 +1215,7 @@ pub(super) async fn handle_stdin_response(
 
 pub(super) struct AgentTaskContext<'a> {
     pub(super) client_event_tx: &'a mpsc::UnboundedSender<ServerEvent>,
-    pub(super) swarm_members: &'a Arc<RwLock<HashMap<String, SwarmMember>>>,
-    pub(super) swarms_by_id: &'a Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    pub(super) event_history: &'a Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    pub(super) event_counter: &'a Arc<std::sync::atomic::AtomicU64>,
-    pub(super) swarm_event_tx: &'a broadcast::Sender<SwarmEvent>,
+    pub(super) swarm: &'a SwarmServiceHandle,
 }
 
 pub(super) async fn handle_agent_task(
@@ -1229,17 +1225,9 @@ pub(super) async fn handle_agent_task(
     agent: &Arc<Mutex<Agent>>,
     ctx: &AgentTaskContext<'_>,
 ) {
-    update_member_status(
-        client_session_id,
-        "running",
-        Some(truncate_detail(&task, 120)),
-        ctx.swarm_members,
-        ctx.swarms_by_id,
-        Some(ctx.event_history),
-        Some(ctx.event_counter),
-        Some(ctx.swarm_event_tx),
-    )
-    .await;
+    ctx.swarm
+        .set_member_status(client_session_id, "running", Some(truncate_detail(&task, 120)))
+        .await;
 
     let result = process_message_streaming_mpsc(
         Arc::clone(agent),
@@ -1251,31 +1239,19 @@ pub(super) async fn handle_agent_task(
     .await;
     match result {
         Ok(()) => {
-            update_member_status(
-                client_session_id,
-                "completed",
-                None,
-                ctx.swarm_members,
-                ctx.swarms_by_id,
-                Some(ctx.event_history),
-                Some(ctx.event_counter),
-                Some(ctx.swarm_event_tx),
-            )
-            .await;
+            ctx.swarm
+                .set_member_status(client_session_id, "completed", None)
+                .await;
             let _ = ctx.client_event_tx.send(ServerEvent::Done { id });
         }
         Err(e) => {
-            update_member_status(
-                client_session_id,
-                "failed",
-                Some(truncate_detail(&e.to_string(), 120)),
-                ctx.swarm_members,
-                ctx.swarms_by_id,
-                Some(ctx.event_history),
-                Some(ctx.event_counter),
-                Some(ctx.swarm_event_tx),
-            )
-            .await;
+            ctx.swarm
+                .set_member_status(
+                    client_session_id,
+                    "failed",
+                    Some(truncate_detail(&e.to_string(), 120)),
+                )
+                .await;
             let retry_after_secs = e
                 .downcast_ref::<StreamError>()
                 .and_then(|stream_error| stream_error.retry_after_secs);
