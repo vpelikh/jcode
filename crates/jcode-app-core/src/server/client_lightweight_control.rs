@@ -17,7 +17,7 @@ use super::comm_sync::{
     CommResyncPlanContext, handle_comm_plan_status, handle_comm_read_context,
     handle_comm_resync_plan, handle_comm_status, handle_comm_summary,
 };
-use super::services::SessionServiceHandle;
+use super::services::{SessionServiceHandle, SwarmServiceHandle};
 use super::{
     AwaitMembersRuntime, ChannelSubscriptions, ClientConnectionInfo, FileTouchService,
     SessionAgents, SessionInterruptQueues, SharedContext, SwarmEvent, SwarmMember,
@@ -57,6 +57,7 @@ pub(super) fn parse_swarm_spawn_mode(
 
 pub(super) struct LightweightControlContext<'a> {
     pub(super) session: &'a SessionServiceHandle,
+    pub(super) swarm: &'a SwarmServiceHandle,
     pub(super) sessions: &'a SessionAgents,
     pub(super) global_session_id: &'a Arc<RwLock<String>>,
     pub(super) provider_template: &'a Arc<dyn Provider>,
@@ -85,6 +86,7 @@ pub(super) async fn handle_lightweight_control_request(
 ) -> Result<()> {
     let LightweightControlContext {
         session,
+        swarm,
         sessions,
         global_session_id,
         provider_template,
@@ -474,15 +476,7 @@ pub(super) async fn handle_lightweight_control_request(
                 force.unwrap_or(false),
                 &client_event_tx,
                 sessions,
-                swarm_members,
-                swarms_by_id,
-                swarm_coordinators,
-                swarm_plans,
-                channel_subscriptions,
-                channel_subscriptions_by_session,
-                event_history,
-                event_counter,
-                swarm_event_tx,
+                swarm,
                 soft_interrupt_queues,
                 swarm_mutation_runtime,
             )
