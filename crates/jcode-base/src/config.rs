@@ -222,6 +222,11 @@ impl ConfigCacheFingerprint {
 struct ConfigCache {
     config: &'static Config,
     fingerprint: ConfigCacheFingerprint,
+    // Env-only fingerprint, compared on every config() call (in-memory, cheap)
+    // so env-driven changes to jcode runtime config are picked up immediately
+    // rather than after the file-stat throttle elapses. The config-file part of
+    // `fingerprint` (path/metadata via fs::metadata) is still throttled.
+    env_fingerprint: Vec<(String, String)>,
     last_checked: Instant,
     force_reload: bool,
 }
@@ -232,6 +237,7 @@ static CONFIG_CACHE: LazyLock<RwLock<ConfigCache>> = LazyLock::new(|| {
     // (e.g. copilot_premium -> JCODE_COPILOT_PREMIUM), and fingerprinting
     // first would guarantee a spurious full reload on the next check.
     let fingerprint = ConfigCacheFingerprint::current();
+    let env_fingerprint = config_env_fingerprint();
     // Seed the global context-limit cache from named provider configs on first
     // load so every codepath (TUI info widget, compaction budget, model
     // switching) sees user-configured `context_window` values from the start.
@@ -241,6 +247,7 @@ static CONFIG_CACHE: LazyLock<RwLock<ConfigCache>> = LazyLock::new(|| {
     RwLock::new(ConfigCache {
         config,
         fingerprint,
+        env_fingerprint,
         last_checked: Instant::now(),
         force_reload: false,
     })
@@ -267,9 +274,17 @@ fn populate_context_limits_from_config_ref(cfg: &Config) {
 /// reloads config.toml and invalidates dependent auth/model caches. Older
 /// references remain valid for the duration of any in-flight operation.
 pub fn config() -> &'static Config {
+    // The env fingerprint is cheap to compute (in-memory scan of process env,
+    // no file I/O), so it is compared on *every* call regardless of the
+    // file-stat throttle. Env-driven runtime config (e.g. JCODE_WAKE_MODE,
+    // JCODE_ANIMATION_FPS) must be observed immediately after it changes; the
+    // CONFIG_CACHE_CHECK_INTERVAL throttle exists only to avoid re-statting the
+    // config file on every read.
+    let current_env = config_env_fingerprint();
     let now = Instant::now();
     if let Ok(cache) = CONFIG_CACHE.read()
         && !cache.force_reload
+        && cache.env_fingerprint == current_env
         && now.duration_since(cache.last_checked) < CONFIG_CACHE_CHECK_INTERVAL
     {
         return cache.config;
@@ -283,6 +298,7 @@ pub fn config() -> &'static Config {
 
         let now = Instant::now();
         if !cache.force_reload
+            && cache.env_fingerprint == current_env
             && now.duration_since(cache.last_checked) < CONFIG_CACHE_CHECK_INTERVAL
         {
             return cache.config;
@@ -290,7 +306,8 @@ pub fn config() -> &'static Config {
 
         let fingerprint = ConfigCacheFingerprint::current();
         cache.last_checked = now;
-        if cache.force_reload || cache.fingerprint != fingerprint {
+        let env_changed = cache.env_fingerprint != current_env;
+        if cache.force_reload || env_changed || cache.fingerprint != fingerprint {
             reload_reason = Some(describe_config_reload(
                 cache.force_reload,
                 &cache.fingerprint,
@@ -302,6 +319,7 @@ pub fn config() -> &'static Config {
             // Re-fingerprint after the load so those self-inflicted env changes
             // don't trigger a guaranteed second reload on the next check.
             cache.fingerprint = ConfigCacheFingerprint::current();
+            cache.env_fingerprint = config_env_fingerprint();
             cache.force_reload = false;
         }
         cache.config
