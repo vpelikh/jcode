@@ -210,7 +210,8 @@ These are explicitly open and are tracked as follow-ups, not delivered work:
   is registered on the tool registry and has a side-panel Goals view. This
   satisfies the doc's separation of a steered objective from the user's task
   list; the spelling differs ("initiative" vs "goal") but the domain intended by
-  #15 is present.- **F7 — #10 session/background-running projection (the concrete slice of the
+  #15 is present.
+- **F7 — #10 session/background-running projection (the concrete slice of the
   jobs seam that powers the busy indicator).** ✅ **Delivered.**
   `BackgroundTaskManager::running_snapshot_for_session(session_id)` gives the
   per-session **live** count of background jobs, derived from each task's
@@ -221,8 +222,12 @@ These are explicitly open and are tracked as follow-ups, not delivered work:
   focused session's busy indicator). Both the global and the new per-session
   snapshot now filter by live `Running`, and the TUI info widget shows the
   focused session's live count (falling back to global only when no session is
-  focused). One test covers session scoping and terminal-status exclusion.
-  `jcode-base` background suite: 21 passed, 0 failed. This bounds #10 to the
-  background-running projection the takeaway names; a *unified multi-executor
-  `jobs` registry* spanning bash `&` + terminal + subagent remains broad
-  follow-up, tracked under F2's remaining items.
+  focused). A unit test covers session scoping and terminal-status exclusion,
+  and an end-to-end TUI integration test exercises the real global background
+  manager + `TuiState::info_widget_data`: a spawned live task surfaces as the
+  focused session's `background_info.running_count`, does not leak into a
+  different session either direction, and an idle session shows no background
+  indicator. `jcode-base` background suite: 21 passed, 0 failed. This bounds
+  #10 to the background-running projection the takeaway names; a *unified
+  multi-executor `jobs` registry* spanning bash `&` + terminal + subagent
+  remains broad follow-up, tracked under F2's remaining items.
