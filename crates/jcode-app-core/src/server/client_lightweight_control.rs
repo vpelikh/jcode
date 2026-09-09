@@ -17,6 +17,7 @@ use super::comm_sync::{
     CommResyncPlanContext, handle_comm_plan_status, handle_comm_read_context,
     handle_comm_resync_plan, handle_comm_status, handle_comm_summary,
 };
+use super::services::SessionServiceHandle;
 use super::{
     AwaitMembersRuntime, ChannelSubscriptions, ClientConnectionInfo, FileTouchService,
     SessionAgents, SessionInterruptQueues, SharedContext, SwarmEvent, SwarmMember,
@@ -55,6 +56,7 @@ pub(super) fn parse_swarm_spawn_mode(
 }
 
 pub(super) struct LightweightControlContext<'a> {
+    pub(super) session: &'a SessionServiceHandle,
     pub(super) sessions: &'a SessionAgents,
     pub(super) global_session_id: &'a Arc<RwLock<String>>,
     pub(super) provider_template: &'a Arc<dyn Provider>,
@@ -82,6 +84,7 @@ pub(super) async fn handle_lightweight_control_request(
     context: LightweightControlContext<'_>,
 ) -> Result<()> {
     let LightweightControlContext {
+        session,
         sessions,
         global_session_id,
         provider_template,
@@ -263,8 +266,7 @@ pub(super) async fn handle_lightweight_control_request(
                 shared_context,
                 swarm_plans,
                 swarm_coordinators,
-                sessions,
-                soft_interrupt_queues,
+                session,
                 event_history,
                 event_counter,
                 swarm_event_tx,
@@ -287,8 +289,7 @@ pub(super) async fn handle_lightweight_control_request(
                 shared_context,
                 swarm_plans,
                 swarm_coordinators,
-                sessions,
-                soft_interrupt_queues,
+                session,
                 event_history,
                 event_counter,
                 swarm_event_tx,
@@ -311,8 +312,7 @@ pub(super) async fn handle_lightweight_control_request(
                 swarm_members,
                 shared_context,
                 swarm_coordinators,
-                sessions,
-                soft_interrupt_queues,
+                session,
                 event_history,
                 event_counter,
                 swarm_event_tx,

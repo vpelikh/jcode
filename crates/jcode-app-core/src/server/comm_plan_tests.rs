@@ -6,6 +6,7 @@
 //! and silently wedges dependent work, so these handlers must validate
 //! acyclicity too.
 
+use crate::server::services::SessionServiceHandle;
 use super::{handle_comm_approve_plan, handle_comm_propose_plan, plan_cycle_error};
 use crate::plan::PlanItem;
 use crate::protocol::ServerEvent;
@@ -94,8 +95,8 @@ struct PlanFixture {
     worker: String,
     client_tx: mpsc::UnboundedSender<ServerEvent>,
     client_rx: mpsc::UnboundedReceiver<ServerEvent>,
-    sessions: crate::server::SessionAgents,
     soft_interrupt_queues: crate::server::SessionInterruptQueues,
+    session_handle: SessionServiceHandle,
     swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>>,
     swarms_by_id: Arc<RwLock<HashMap<String, HashSet<String>>>>,
     shared_context: Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
@@ -128,14 +129,24 @@ fn plan_fixture(swarm_id: &str, coord: &str, worker: &str) -> PlanFixture {
         swarm_id.clone(),
         coord.clone(),
     )])));
+    let sessions = crate::server::SessionAgents::default();
+    let soft_interrupt_queues: crate::server::SessionInterruptQueues =
+        Arc::new(RwLock::new(HashMap::new()));
+    let session_handle = SessionServiceHandle {
+        sessions: Arc::clone(&sessions),
+        session_id: Arc::new(RwLock::new(String::new())),
+        is_processing: Arc::new(RwLock::new(false)),
+        shutdown_signals: Arc::new(RwLock::new(HashMap::new())),
+        soft_interrupt_queues: Arc::clone(&soft_interrupt_queues),
+    };
     PlanFixture {
         swarm_id,
         coord,
         worker,
         client_tx,
         client_rx,
-        sessions: Arc::new(RwLock::new(HashMap::new())),
-        soft_interrupt_queues: Arc::new(RwLock::new(HashMap::new())),
+        soft_interrupt_queues,
+        session_handle,
         swarm_members,
         swarms_by_id,
         shared_context: Arc::new(RwLock::new(HashMap::new())),
@@ -160,8 +171,7 @@ impl PlanFixture {
             &self.shared_context,
             &self.swarm_plans,
             &self.swarm_coordinators,
-            &self.sessions,
-            &self.soft_interrupt_queues,
+            &self.session_handle,
             &self.event_history,
             &self.event_counter,
             &self.swarm_event_tx,
@@ -181,8 +191,7 @@ impl PlanFixture {
             &self.shared_context,
             &self.swarm_plans,
             &self.swarm_coordinators,
-            &self.sessions,
-            &self.soft_interrupt_queues,
+            &self.session_handle,
             &self.event_history,
             &self.event_counter,
             &self.swarm_event_tx,

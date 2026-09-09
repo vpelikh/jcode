@@ -1,22 +1,20 @@
+use super::services::SessionServiceHandle;
 use super::swarm_mutation_state::{
     PersistedSwarmMutationResponse, SwarmMutationRuntime, begin_or_replay, finish_request,
     request_key,
 };
 use super::{
-    SessionInterruptQueues, SharedContext, SwarmEvent, SwarmEventType, SwarmMember, SwarmState,
-    VersionedPlan, broadcast_swarm_plan, persist_swarm_state_for, queue_soft_interrupt_for_session,
+    SharedContext, SwarmEvent, SwarmEventType, SwarmMember, SwarmState,
+    VersionedPlan, broadcast_swarm_plan, persist_swarm_state_for,
     record_swarm_event, summarize_plan_items,
 };
-use crate::agent::Agent;
 use crate::plan::PlanItem;
 use crate::protocol::{NotificationType, ServerEvent};
 use jcode_agent_runtime::SoftInterruptSource;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
-
-type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
+use tokio::sync::{RwLock, broadcast, mpsc};
 
 /// Reject plans whose dependency graph contains a cycle. Cyclic items can never
 /// become runnable (`summarize_plan_graph` parks them in `blocked_ids` forever),
@@ -50,8 +48,7 @@ pub(super) async fn handle_comm_propose_plan(
     shared_context: &Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
     swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
     swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-    sessions: &SessionAgents,
-    soft_interrupt_queues: &SessionInterruptQueues,
+    session: &SessionServiceHandle,
     event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
     event_counter: &Arc<std::sync::atomic::AtomicU64>,
     swarm_event_tx: &broadcast::Sender<SwarmEvent>,
@@ -152,15 +149,14 @@ pub(super) async fn handle_comm_propose_plan(
                     message: notification_msg.clone(),
                 });
             }
-            let _ = queue_soft_interrupt_for_session(
-                &sid,
-                notification_msg.clone(),
-                false,
-                SoftInterruptSource::System,
-                soft_interrupt_queues,
-                sessions,
-            )
-            .await;
+            let _ = session
+ .queue_soft_interrupt(
+ &sid,
+ notification_msg.clone(),
+ false,
+ SoftInterruptSource::System,
+ )
+ .await;
         }
 
         let swarm_state = SwarmState {
@@ -274,15 +270,14 @@ pub(super) async fn handle_comm_propose_plan(
             proposal_key: proposal_key.clone(),
         });
     }
-    let _ = queue_soft_interrupt_for_session(
-        &coordinator_id,
-        notification_msg.clone(),
-        false,
-        SoftInterruptSource::System,
-        soft_interrupt_queues,
-        sessions,
-    )
-    .await;
+    let _ = session
+ .queue_soft_interrupt(
+ &coordinator_id,
+ notification_msg.clone(),
+ false,
+ SoftInterruptSource::System,
+ )
+ .await;
 
     let proposer_confirmation = "Plan proposal sent to coordinator (not yet applied).".to_string();
     if let Some(member) = members.get(&req_session_id) {
@@ -297,15 +292,14 @@ pub(super) async fn handle_comm_propose_plan(
             message: proposer_confirmation.clone(),
         });
     }
-    let _ = queue_soft_interrupt_for_session(
-        &req_session_id,
-        proposer_confirmation,
-        false,
-        SoftInterruptSource::System,
-        soft_interrupt_queues,
-        sessions,
-    )
-    .await;
+    let _ = session
+ .queue_soft_interrupt(
+ &req_session_id,
+ proposer_confirmation,
+ false,
+ SoftInterruptSource::System,
+ )
+ .await;
 
     let _ = client_event_tx.send(ServerEvent::Done { id });
 }
@@ -324,8 +318,7 @@ pub(super) async fn handle_comm_approve_plan(
     shared_context: &Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
     swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
     swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-    sessions: &SessionAgents,
-    soft_interrupt_queues: &SessionInterruptQueues,
+    session: &SessionServiceHandle,
     event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
     event_counter: &Arc<std::sync::atomic::AtomicU64>,
     swarm_event_tx: &broadcast::Sender<SwarmEvent>,
@@ -509,15 +502,14 @@ pub(super) async fn handle_comm_approve_plan(
                     message: message.clone(),
                 });
 
-                let _ = queue_soft_interrupt_for_session(
-                    &sid,
-                    message.clone(),
-                    false,
-                    SoftInterruptSource::System,
-                    soft_interrupt_queues,
-                    sessions,
-                )
-                .await;
+                let _ = session
+ .queue_soft_interrupt(
+ &sid,
+ message.clone(),
+ false,
+ SoftInterruptSource::System,
+ )
+ .await;
             }
         }
 
@@ -551,8 +543,7 @@ pub(super) async fn handle_comm_reject_plan(
     swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
     shared_context: &Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
     swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-    sessions: &SessionAgents,
-    soft_interrupt_queues: &SessionInterruptQueues,
+    session: &SessionServiceHandle,
     event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
     event_counter: &Arc<std::sync::atomic::AtomicU64>,
     swarm_event_tx: &broadcast::Sender<SwarmEvent>,
@@ -648,15 +639,14 @@ pub(super) async fn handle_comm_reject_plan(
             message: message.clone(),
         });
 
-        let _ = queue_soft_interrupt_for_session(
-            &proposer_session,
-            message,
-            false,
-            SoftInterruptSource::System,
-            soft_interrupt_queues,
-            sessions,
-        )
-        .await;
+        let _ = session
+ .queue_soft_interrupt(
+ &proposer_session,
+ message,
+ false,
+ SoftInterruptSource::System,
+ )
+ .await;
     }
     record_swarm_event(
         event_history,
