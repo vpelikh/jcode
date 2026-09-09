@@ -221,8 +221,10 @@ These are explicitly open and are tracked as follow-ups, not delivered work:
   state, and was global (it mixed every session's background work into the
   focused session's busy indicator). Both the global and the new per-session
   snapshot now filter by live `Running`, and the TUI info widget shows the
-  focused session's live count (falling back to global only when no session is
-  focused). A unit test covers session scoping and terminal-status exclusion,
+  focused session's live count — and, when there is no focused session (a brief
+  remote-startup window), the indicator is hidden rather than showing a
+  misleading global aggregate. A unit test covers session scoping and
+  terminal-status exclusion,
   and an end-to-end TUI integration test exercises the real global background
   manager + `TuiState::info_widget_data`: a spawned live task surfaces as the
   focused session's `background_info.running_count`, does not leak into a
