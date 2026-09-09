@@ -23,15 +23,21 @@ Fully implemented, tested, and committed.
 - **repeat-tool reminder guard.** New pure `crates/jcode-app-core/src/agent/guard.rs`: canonical (order-insensitive recursive JSON-key) tool-call signature, consecutive-identical-tail detector, `repeat_reminder_from_transcript`. Wired into the streaming loop's Injection Point D and the headless `run_turn`. 9 unit tests. Model-free, no API cost.
 - **opt-in per-call tool timeout.** `jcode-tool-core::Tool::execution_timeout()` (default `None`), `execute_with_deadline()` mapping a hung call to a readable `"timed out after Ns"` error. Wired at the single `Registry::execute` choke point in `jcode-app-core/src/tool/mod.rs` (no per-construction-site bloat). tokio `time` feature. 4 unit tests incl. model-visible timeout.
 
-  **Review note (2026-09-06):** the per-call timeout *capability* is delivered,
-  tested, and wired, but it is currently **dormant in production** — no tool
-  overrides `execution_timeout()`, so every live call passes `None` and no
-  deadline is ever applied. This was a deliberate call: the tools most likely to
-  hang (`bash`, `bg`) already manage their own timeout/background-resume flows,
-  and a registry-level deadline would conflict with them. To realize the benefit,
-  a specific tool whose execution is externally cancellable must opt in with a
-  declared `execution_timeout()`. Until then, the capability is a tested
-  extension point, not an active guard.
+  **Review note (updated 2026-09-09):** the per-call timeout *capability* is
+  delivered, tested, and wired. It was previously **dormant** — no tool
+  overrode `execution_timeout()`, so every live call passed `None`. That gap is
+  now closed for a real, hang-prone tool: **`websearch` opts in** with a 30s
+  whole-call deadline (`WebSearchTool::EXECUTION_TIMEOUT_SECS`, documented on
+  `execution_timeout()`). This is a deliberate, targeted opt-in and still
+  respects the original call: the tools most likely to *run long or background*
+  (`bash`, `bg`) are **not** wrapped, because they already manage their own
+  timeout/background-resume flows and a registry deadline would conflict. Only
+  tools whose execution is externally cancellable and which otherwise have no
+  whole-call bound should opt in. `websearch` qualifies: its engine requests
+  rely only on the shared client's 15s connect timeout with no bound on the
+  body read, and the async reqwest futures drop cleanly on cancellation. Two
+  new tests pin the declared timeout and the model-visible timeout error
+  contract.
 
 ## Takeaway #5 (live bracket)
 
