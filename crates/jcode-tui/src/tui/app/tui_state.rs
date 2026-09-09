@@ -1507,9 +1507,7 @@ impl crate::tui::TuiState for App {
             (running_count > 0).then(|| crate::tui::info_widget::BackgroundInfo {
                 running_count,
                 running_tasks,
-                progress_summary: progress
-                    .as_ref()
-                    .map(|progress| progress.label.clone()),
+                progress_summary: progress.as_ref().map(|progress| progress.label.clone()),
                 progress_detail: progress
                     .as_ref()
                     .and_then(|progress| progress.detail.clone()),

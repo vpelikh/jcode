@@ -1646,7 +1646,10 @@ impl BackgroundTaskManager {
                 rows.push(RunningBackgroundProgress {
                     task_id: task.task_id.clone(),
                     tool_name: task.tool_name.clone(),
-                    label: task.display_name.clone().unwrap_or_else(|| task.tool_name.clone()),
+                    label: task
+                        .display_name
+                        .clone()
+                        .unwrap_or_else(|| task.tool_name.clone()),
                     detail: None,
                 });
                 continue;

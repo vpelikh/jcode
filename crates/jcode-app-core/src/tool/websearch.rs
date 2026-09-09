@@ -874,7 +874,10 @@ mod tests {
             WebSearchTool::EXECUTION_TIMEOUT_SECS,
             "declared timeout must match the documented constant"
         );
-        assert!(timeout.as_secs() > 15, "must exceed the client's 15s connect timeout");
+        assert!(
+            timeout.as_secs() > 15,
+            "must exceed the client's 15s connect timeout"
+        );
     }
 
     #[tokio::test]

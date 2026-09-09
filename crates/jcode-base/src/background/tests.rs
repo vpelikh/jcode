@@ -910,8 +910,7 @@ async fn running_snapshot_for_session_filters_by_session_and_live_status() -> Re
 
     // Mark one of session-A's tasks as Completed by rewriting its status file.
     let path = a1.status_file;
-    let mut status: super::TaskStatusFile =
-        serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    let mut status: super::TaskStatusFile = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
     assert_eq!(status.session_id, "session-A");
     status.status = crate::bus::BackgroundTaskStatus::Completed;
     status.completed_at = Some(chrono::Utc::now().to_rfc3339());
@@ -920,9 +919,15 @@ async fn running_snapshot_for_session_filters_by_session_and_live_status() -> Re
     // Even though the completed task is still in the in-memory map, it must not
     // be counted as running. Global drops to 2, session-A to 1, session-B stays 1.
     let (global, _, _) = manager.running_snapshot();
-    assert_eq!(global, 2, "terminal task must not be counted as live globally");
+    assert_eq!(
+        global, 2,
+        "terminal task must not be counted as live globally"
+    );
     let (a_count, _, _) = manager.running_snapshot_for_session("session-A");
-    assert_eq!(a_count, 1, "terminal task must not be counted for its session");
+    assert_eq!(
+        a_count, 1,
+        "terminal task must not be counted for its session"
+    );
     let (b_count, _, _) = manager.running_snapshot_for_session("session-B");
     assert_eq!(b_count, 1, "session B unaffected by session A completion");
 
