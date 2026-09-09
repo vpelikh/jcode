@@ -1,5 +1,5 @@
 use super::live_turn::{LiveTurnSwarmContext, run_live_turn_if_idle};
-use super::services::SessionServiceHandle;
+use super::services::{SessionServiceHandle, SwarmServiceHandle};
 use super::state::SwarmEvent;
 use super::{SwarmMember, fanout_session_event};
 use crate::message::{
@@ -325,11 +325,11 @@ pub(super) async fn dispatch_background_task_progress(
 /// already capped by the producer; we only store and fan it out.
 pub(super) async fn dispatch_swarm_output_tail(
     tail: &crate::bus::SwarmOutputTail,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    swarm: &SwarmServiceHandle,
 ) {
+    let members = &swarm.swarm_state.members;
     let swarm_id = {
-        let mut members = swarm_members.write().await;
+        let mut members = members.write().await;
         let Some(member) = members.get_mut(&tail.session_id) else {
             return;
         };
@@ -337,7 +337,7 @@ pub(super) async fn dispatch_swarm_output_tail(
         member.swarm_id.clone()
     };
     if let Some(swarm_id) = swarm_id {
-        super::swarm::broadcast_swarm_status(&swarm_id, swarm_members, swarms_by_id).await;
+        swarm.broadcast_swarm_status(&swarm_id).await;
     }
 }
 
@@ -348,9 +348,9 @@ pub(super) async fn dispatch_swarm_output_tail(
 /// counts and capped display essentials cross the swarm boundary.
 pub(super) async fn dispatch_swarm_todo_progress(
     event: &crate::bus::TodoEvent,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    swarm: &SwarmServiceHandle,
 ) {
+    let members = &swarm.swarm_state.members;
     let total = event.todos.len() as u32;
     let completed = event
         .todos
@@ -365,7 +365,7 @@ pub(super) async fn dispatch_swarm_todo_progress(
     let mut items = compact_todo_items(&event.todos);
 
     let swarm_id = {
-        let mut members = swarm_members.write().await;
+        let mut members = members.write().await;
         let Some(member) = members.get_mut(&event.session_id) else {
             return;
         };
@@ -389,7 +389,7 @@ pub(super) async fn dispatch_swarm_todo_progress(
         member.swarm_id.clone()
     };
     if let Some(swarm_id) = swarm_id {
-        super::swarm::broadcast_swarm_status(&swarm_id, swarm_members, swarms_by_id).await;
+        swarm.broadcast_swarm_status(&swarm_id).await;
     }
 }
 
@@ -397,11 +397,11 @@ pub(super) async fn dispatch_swarm_todo_progress(
 /// active todo. Running/completed/error events update the same correlated row.
 pub(super) async fn dispatch_swarm_tool_activity(
     event: &crate::bus::ToolEvent,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    swarm: &SwarmServiceHandle,
 ) {
+    let members = &swarm.swarm_state.members;
     let swarm_id = {
-        let mut members = swarm_members.write().await;
+        let mut members = members.write().await;
         let Some(member) = members.get_mut(&event.session_id) else {
             return;
         };
@@ -412,15 +412,15 @@ pub(super) async fn dispatch_swarm_tool_activity(
     };
 
     if let Some(swarm_id) = swarm_id {
-        super::swarm::broadcast_swarm_status(&swarm_id, swarm_members, swarms_by_id).await;
+        swarm.broadcast_swarm_status(&swarm_id).await;
     }
 }
 
 pub(super) async fn dispatch_swarm_runtime_status(
     event: &crate::bus::SubagentStatus,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    swarm: &SwarmServiceHandle,
 ) {
+    let members = &swarm.swarm_state.members;
     let Some(model) = event
         .model
         .as_ref()
@@ -429,7 +429,7 @@ pub(super) async fn dispatch_swarm_runtime_status(
         return;
     };
     let swarm_id = {
-        let mut members = swarm_members.write().await;
+        let mut members = members.write().await;
         let Some(member) = members.get_mut(&event.session_id) else {
             return;
         };
@@ -440,20 +440,20 @@ pub(super) async fn dispatch_swarm_runtime_status(
         member.swarm_id.clone()
     };
     if let Some(swarm_id) = swarm_id {
-        super::swarm::broadcast_swarm_status(&swarm_id, swarm_members, swarms_by_id).await;
+        swarm.broadcast_swarm_status(&swarm_id).await;
     }
 }
 
 pub(super) async fn dispatch_swarm_batch_progress(
     progress: &crate::bus::BatchProgress,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    swarm: &SwarmServiceHandle,
 ) {
     if progress.total == 0 {
         return;
     }
+    let members = &swarm.swarm_state.members;
     let swarm_id = {
-        let mut members = swarm_members.write().await;
+        let mut members = members.write().await;
         let Some(member) = members.get_mut(&progress.session_id) else {
             return;
         };
@@ -463,7 +463,7 @@ pub(super) async fn dispatch_swarm_batch_progress(
         member.swarm_id.clone()
     };
     if let Some(swarm_id) = swarm_id {
-        super::swarm::broadcast_swarm_status(&swarm_id, swarm_members, swarms_by_id).await;
+        swarm.broadcast_swarm_status(&swarm_id).await;
     }
 }
 

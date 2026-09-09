@@ -2274,22 +2274,22 @@ impl Server {
                     dispatch_ui_activity(&activity, &swarm_members).await;
                 }
                 Ok(BusEvent::ToolUpdated(event)) => {
-                    dispatch_swarm_tool_activity(&event, &swarm_members, &swarms_by_id).await;
+                    dispatch_swarm_tool_activity(&event, swarm).await;
                 }
                 Ok(BusEvent::SubagentStatus(event)) => {
-                    dispatch_swarm_runtime_status(&event, &swarm_members, &swarms_by_id).await;
+                    dispatch_swarm_runtime_status(&event, swarm).await;
                 }
                 Ok(BusEvent::BatchProgress(progress)) => {
-                    dispatch_swarm_batch_progress(&progress, &swarm_members, &swarms_by_id).await;
+                    dispatch_swarm_batch_progress(&progress, swarm).await;
                 }
                 // Session todos are private to the session's transcript, but the
                 // Compact todo names and progress are surfaced on the inline
                 // swarm strip so a coordinator can see each managed agent's work.
                 Ok(BusEvent::TodoUpdated(event)) => {
-                    dispatch_swarm_todo_progress(&event, &swarm_members, &swarms_by_id).await;
+                    dispatch_swarm_todo_progress(&event, swarm).await;
                 }
                 Ok(BusEvent::SwarmOutputTail(tail)) => {
-                    dispatch_swarm_output_tail(&tail, &swarm_members, &swarms_by_id).await;
+                    dispatch_swarm_output_tail(&tail, swarm).await;
                 }
                 Ok(_) => {
                     // Ignore other events

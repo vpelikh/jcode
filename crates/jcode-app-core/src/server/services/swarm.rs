@@ -371,4 +371,17 @@ impl SwarmServiceHandle {
         )
         .await;
     }
+
+    /// Rebroadcast the current membership of a swarm to its channel
+    /// subscribers/builds. Routes through the swarm service so callers do not
+    /// reach into the raw membership and swarm maps. Deferred to
+    /// `swarm::broadcast_swarm_status`.
+    pub(crate) async fn broadcast_swarm_status(&self, swarm_id: &str) {
+        super::super::swarm::broadcast_swarm_status(
+            swarm_id,
+            &self.swarm_state.members,
+            &self.swarm_state.swarms_by_id,
+        )
+        .await;
+    }
 }
