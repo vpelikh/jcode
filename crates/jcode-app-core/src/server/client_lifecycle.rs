@@ -451,6 +451,10 @@ pub(super) async fn handle_client(
     // the flat-local destructuring below can still move the swarm fields out of
     // the original while the handle stays available to route through.
     let swarm_service_handle = swarm_service.clone();
+    // The session service handle is also kept alive by reference for
+    // NotifySessionContext routing below; clone it up front so the flat-local
+    // destructuring can move the session fields out of the original.
+    let session_service_handle = session_service.clone();
     let sessions = session_service.sessions;
     let provider_template = client_service.provider;
     let global_session_id = session_service.session_id;
@@ -2160,8 +2164,7 @@ pub(super) async fn handle_client(
                     session_id,
                     message,
                     NotifySessionContext {
-                        sessions: &sessions,
-                        soft_interrupt_queues: &soft_interrupt_queues,
+                        session: &session_service_handle,
                         client_connections: &client_connections,
                         swarm_members: &swarm_members,
                         swarms_by_id: &swarms_by_id,

@@ -36,6 +36,21 @@ fn empty_swarm_status_state() -> (
     )
 }
 
+/// A minimal session service handle for tests that only exercise the soft-interrupt
+/// delivery path. The other handle fields are inert defaults.
+fn session_handle_for_test(
+    sessions: crate::server::SessionAgents,
+    soft_interrupt_queues: crate::server::SessionInterruptQueues,
+) -> crate::server::services::SessionServiceHandle {
+    crate::server::services::SessionServiceHandle {
+        sessions,
+        session_id: Arc::new(RwLock::new(String::new())),
+        is_processing: Arc::new(RwLock::new(false)),
+        shutdown_signals: Arc::new(RwLock::new(HashMap::new())),
+        soft_interrupt_queues,
+    }
+}
+
 struct MockProvider;
 
 #[derive(Clone, Default)]
@@ -562,13 +577,14 @@ async fn notify_session_runs_scheduled_task_immediately_for_idle_live_session() 
     let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
 
     let (swarms_by_id, event_history, event_counter, swarm_event_tx) = empty_swarm_status_state();
+    let session_service =
+        session_handle_for_test(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
     handle_notify_session(
         77,
         session_id.clone(),
         "[Scheduled task]\nTask: Follow up".to_string(),
         NotifySessionContext {
-            sessions: &sessions,
-            soft_interrupt_queues: &soft_interrupt_queues,
+            session: &session_service,
             client_connections: &client_connections,
             swarm_members: &swarm_members,
             swarms_by_id: &swarms_by_id,
@@ -682,13 +698,14 @@ async fn notify_session_queues_soft_interrupt_when_live_session_is_busy() {
     let _busy_guard = agent.lock().await;
 
     let (swarms_by_id, event_history, event_counter, swarm_event_tx) = empty_swarm_status_state();
+    let session_service =
+        session_handle_for_test(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
     handle_notify_session(
         88,
         session_id.clone(),
         "[Scheduled task]\nTask: Follow up while busy".to_string(),
         NotifySessionContext {
-            sessions: &sessions,
-            soft_interrupt_queues: &soft_interrupt_queues,
+            session: &session_service,
             client_connections: &client_connections,
             swarm_members: &swarm_members,
             swarms_by_id: &swarms_by_id,
