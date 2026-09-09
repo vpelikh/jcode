@@ -83,7 +83,7 @@ pub fn build_chat_messages(
         if let Role::User = msg.role {
             for block in &msg.content {
                 if let ContentBlock::ToolResult { tool_use_id, .. } = block {
-                    tool_result_last_pos.insert(tool_use_id.clone(), idx);
+                    tool_result_last_pos.insert(tool_use_id.to_string(), idx);
                 }
             }
         }
@@ -150,7 +150,7 @@ pub fn build_chat_messages(
                                 }));
                             }
 
-                            if used_tool_results.contains(tool_use_id) {
+                            if used_tool_results.contains(tool_use_id.as_str()) {
                                 skipped_results += 1;
                                 continue;
                             }
@@ -159,17 +159,17 @@ pub fn build_chat_messages(
                             } else {
                                 content.clone()
                             };
-                            if tool_calls_seen.contains(tool_use_id) {
+                            if tool_calls_seen.contains(tool_use_id.as_str()) {
                                 api_messages.push(serde_json::json!({
                                     "role": "tool",
-                                    "tool_call_id": sanitize_tool_id(tool_use_id),
+                                    "tool_call_id": sanitize_tool_id(tool_use_id.as_str()),
                                     "content": output
                                 }));
-                                used_tool_results.insert(tool_use_id.clone());
-                            } else if pending_tool_results.contains_key(tool_use_id) {
+                                used_tool_results.insert(tool_use_id.to_string());
+                            } else if pending_tool_results.contains_key(tool_use_id.as_str()) {
                                 skipped_results += 1;
                             } else {
-                                pending_tool_results.insert(tool_use_id.clone(), output);
+                                pending_tool_results.insert(tool_use_id.to_string(), output);
                                 delayed_results += 1;
                             }
                         }
@@ -211,7 +211,7 @@ pub fn build_chat_messages(
                                 "{}".to_string()
                             };
                             let mut tool_call = serde_json::json!({
-                                "id": sanitize_tool_id(id),
+                                "id": sanitize_tool_id(id.as_str()),
                                 "type": "function",
                                 "function": {
                                     "name": name,
@@ -224,18 +224,18 @@ pub fn build_chat_messages(
                                 });
                             }
                             tool_calls.push(tool_call);
-                            tool_calls_seen.insert(id.clone());
-                            if let Some(output) = pending_tool_results.remove(id) {
-                                post_tool_outputs.push((id.clone(), output));
-                                used_tool_results.insert(id.clone());
+                            tool_calls_seen.insert(id.to_string());
+                            if let Some(output) = pending_tool_results.remove(id.as_str()) {
+                                post_tool_outputs.push((id.to_string(), output));
+                                used_tool_results.insert(id.to_string());
                             } else {
                                 let has_future_output = tool_result_last_pos
-                                    .get(id)
+                                     .get(id.as_str())
                                     .map(|pos| *pos > idx)
                                     .unwrap_or(false);
                                 if !has_future_output {
-                                    missing_tool_outputs.push(id.clone());
-                                    used_tool_results.insert(id.clone());
+                                    missing_tool_outputs.push(id.to_string());
+                                    used_tool_results.insert(id.to_string());
                                 }
                             }
                         }
@@ -462,7 +462,7 @@ pub fn build_chat_messages(
             for call in tool_calls {
                 if let Some(id) = call.get("id").and_then(|v| v.as_str()) {
                     let has_after = tool_output_positions
-                        .get(id)
+                         .get(id)
                         .map(|pos| *pos > idx)
                         .unwrap_or(false);
                     if !has_after {
@@ -585,7 +585,7 @@ mod request_tests {
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
-                    id: id.to_string(),
+                    id: id.to_string().into(),
                     name: "read".to_string(),
                     input: json!({"path": output}),
                     thought_signature: None,
@@ -634,7 +634,7 @@ mod request_tests {
         let signed_turn = |id: &str, signature: &str| Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
-                id: id.to_string(),
+                id: id.to_string().into(),
                 name: "read".to_string(),
                 input: json!({"path": format!("{id}.txt")}),
                 thought_signature: Some(signature.to_string()),

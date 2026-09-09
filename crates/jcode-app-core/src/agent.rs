@@ -211,9 +211,9 @@ pub struct Agent {
     /// Not persisted to session history.
     current_turn_system_reminder: Option<String>,
     /// Tool call ids observed in the current session transcript.
-    tool_call_ids: HashSet<String>,
+    tool_call_ids: HashSet<crate::session::ToolCallId>,
     /// Tool result ids observed in the current session transcript.
-    tool_result_ids: HashSet<String>,
+    tool_result_ids: HashSet<crate::session::ToolCallId>,
     /// Number of stored session messages already indexed for missing tool-output repair.
     tool_output_scan_index: usize,
     /// Soft interrupt queue: messages to inject at next safe point without cancelling
@@ -921,7 +921,7 @@ impl Agent {
 
         let scan_start = self.tool_output_scan_index;
         let mut new_result_ids = Vec::new();
-        let mut assistant_tool_uses: Vec<(usize, Vec<String>)> = Vec::new();
+        let mut assistant_tool_uses: Vec<(usize, Vec<crate::session::ToolCallId>)> = Vec::new();
 
         for (index, msg) in messages.iter().enumerate().skip(scan_start) {
             match msg.role {
@@ -950,7 +950,7 @@ impl Agent {
 
         self.tool_result_ids.extend(new_result_ids);
 
-        let mut missing_repairs: Vec<(usize, Vec<String>)> = Vec::new();
+        let mut missing_repairs: Vec<(usize, Vec<crate::session::ToolCallId>)> = Vec::new();
         for (index, tool_uses) in assistant_tool_uses {
             let mut missing_for_message = Vec::new();
             for id in tool_uses {
@@ -962,7 +962,7 @@ impl Agent {
                 // its real result is on the way, and synthesizing a
                 // placeholder now produces a duplicate tool_result that
                 // Anthropic rejects outright. See `tool::inflight`.
-                if crate::tool::inflight::is_tool_in_flight(&id) {
+                if crate::tool::inflight::is_tool_in_flight(id.as_str()) {
                     logging::info(&format!(
                         "Skipping missing tool-output repair for {id}: tool is still executing"
                     ));

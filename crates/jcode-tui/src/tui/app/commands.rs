@@ -671,7 +671,7 @@ fn launch_manual_subagent(app: &mut App, spec: ManualSubagentSpec) {
     });
 
     let content_blocks = vec![ContentBlock::ToolUse {
-        id: tool_call.id.clone().to_string(),
+        id: tool_call.id.clone(),
         name: tool_call.name.clone(),
         input: tool_call.input.clone(),
         thought_signature: None,

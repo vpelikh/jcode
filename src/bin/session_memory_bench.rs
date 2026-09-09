@@ -179,7 +179,7 @@ fn build_synthetic_session(turns: usize, tool_input_kib: usize, tool_output_kib:
                     1024 + (idx % 7) * 96,
                 )),
                 ContentBlock::ToolUse {
-                    id: format!("tool_{idx}"),
+                    id: format!("tool_{idx}").into(),
                     name: "bash".to_string(),
                     input: serde_json::json!({
                         "command": make_blob(&format!("printf 'turn {idx}' && # "), tool_input_bytes),
@@ -190,7 +190,7 @@ fn build_synthetic_session(turns: usize, tool_input_kib: usize, tool_output_kib:
         session.add_message(
             Role::User,
             vec![ContentBlock::ToolResult {
-                tool_use_id: format!("tool_{idx}"),
+                tool_use_id: format!("tool_{idx}").into(),
                 content: make_blob(&format!("tool output {idx} - "), tool_output_bytes),
                 is_error: None,
             }],

@@ -69,7 +69,7 @@ fn build_cli_prompt(system: &str, messages: &[Message]) -> String {
                     is_error,
                 } => {
                     out.push_str("[tool_result ");
-                    out.push_str(tool_use_id);
+                    out.push_str(tool_use_id.as_str());
                     out.push_str(" is_error=");
                     out.push_str(if is_error.unwrap_or(false) {
                         "true"

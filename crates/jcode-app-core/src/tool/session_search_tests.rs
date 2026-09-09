@@ -87,7 +87,7 @@ fn tool_use_input_is_hidden_by_default_and_searchable_when_requested() {
             vec![(
                 Role::Assistant,
                 vec![ContentBlock::ToolUse {
-                    id: "tool-1".to_string(),
+                    id: "tool-1".to_string().into(),
                     name: "websearch".to_string(),
                     input: json!({
                         "query": "best time post hackernews visibility upvotes"

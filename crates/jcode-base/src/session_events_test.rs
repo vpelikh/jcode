@@ -1477,7 +1477,7 @@ fn test_strip_and_truncate_keep_event_log_consistent() {
         id: "msg2".to_string(),
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
-            tool_use_id: "tool1".to_string(),
+            tool_use_id: "tool1".to_string().into(),
             content: "very long tool result that will be truncated".repeat(200),
             is_error: None,
         }],
@@ -1503,7 +1503,7 @@ fn test_remove_tool_use_blocks_keeps_event_log_consistent() {
         role: Role::Assistant,
         content: vec![
             ContentBlock::Text { text: "Before tool".to_string(), cache_control: None },
-            ContentBlock::ToolUse { id: "tool1".to_string(), name: "test_tool".to_string(), input: json!({"arg": "value"}), thought_signature: None },
+            ContentBlock::ToolUse { id: "tool1".to_string().into(), name: "test_tool".to_string(), input: json!({"arg": "value"}), thought_signature: None },
             ContentBlock::Text { text: "After tool".to_string(), cache_control: None },
         ],
         display_role: None,
@@ -2495,7 +2495,7 @@ fn test_in_place_mutation_reflects_in_derived_and_provider_view() {
         role: Role::Assistant,
         content: vec![
             ContentBlock::Text { text: "before".to_string(), cache_control: None },
-            ContentBlock::ToolUse { id: "t1".to_string(), name: "tool".to_string(), input: json!({"a":1}), thought_signature: None },
+            ContentBlock::ToolUse { id: "t1".to_string().into(), name: "tool".to_string(), input: json!({"a":1}), thought_signature: None },
         ],
         display_role: None,
         timestamp: None,
@@ -2617,8 +2617,8 @@ fn test_multi_insert_repair_pattern_stays_consistent() {
         id: "asst".to_string(),
         role: Role::Assistant,
         content: vec![
-            ContentBlock::ToolUse { id: "t1".to_string(), name: "tool".to_string(), input: json!({"a":1}), thought_signature: None },
-            ContentBlock::ToolUse { id: "t2".to_string(), name: "tool".to_string(), input: json!({"b":2}), thought_signature: None },
+            ContentBlock::ToolUse { id: "t1".to_string().into(), name: "tool".to_string(), input: json!({"a":1}), thought_signature: None },
+            ContentBlock::ToolUse { id: "t2".to_string().into(), name: "tool".to_string(), input: json!({"b":2}), thought_signature: None },
         ],
         display_role: None,
         timestamp: None,
@@ -2636,7 +2636,7 @@ fn test_multi_insert_repair_pattern_stays_consistent() {
         let stored = StoredMessage {
             id: format!("result_{tid}"),
             role: Role::User,
-            content: vec![ContentBlock::ToolResult { tool_use_id: tid.to_string(), content: "ok".to_string(), is_error: Some(false) }],
+            content: vec![ContentBlock::ToolResult { tool_use_id: tid.to_string().into(), content: "ok".to_string(), is_error: Some(false) }],
             display_role: None,
             timestamp: None,
             tool_duration_ms: None,

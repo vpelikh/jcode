@@ -341,7 +341,7 @@ fn tool_output_to_content_blocks_preserves_labeled_images() {
             content,
             is_error,
         } => {
-            assert_eq!(tool_use_id, "call_1");
+            assert_eq!(tool_use_id.as_str(), "call_1");
             assert_eq!(content, "Image ready");
             assert_eq!(*is_error, None);
         }
@@ -974,8 +974,8 @@ fn seed_transient_session_state(agent: &mut Agent) {
     );
     agent.background_tool_signal.fire();
     agent.request_graceful_shutdown();
-    agent.tool_call_ids.insert("tool_call_old".to_string());
-    agent.tool_result_ids.insert("tool_result_old".to_string());
+    agent.tool_call_ids.insert("tool_call_old".to_string().into());
+    agent.tool_result_ids.insert("tool_result_old".to_string().into());
     agent.tool_output_scan_index = 7;
     agent.last_upstream_provider = Some("upstream_old".to_string());
     agent.last_connection_type = Some("websocket".to_string());
@@ -1168,7 +1168,7 @@ async fn build_memory_prompt_nonblocking_defers_pending_memory_during_tool_loop(
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
-                id: "call_1".to_string(),
+                id: "call_1".to_string().into(),
                 name: "bash".to_string(),
                 input: serde_json::json!({}),
                 thought_signature: None,

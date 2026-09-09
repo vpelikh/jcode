@@ -149,7 +149,7 @@ pub enum ContentBlock {
         status: Option<String>,
     },
     ToolUse {
-        id: String,
+        id: ToolCallId,
         name: String,
         input: serde_json::Value,
         /// Gemini 3 "thought signature" for this function call. The Antigravity
@@ -161,7 +161,7 @@ pub enum ContentBlock {
         thought_signature: Option<String>,
     },
     ToolResult {
-        tool_use_id: String,
+        tool_use_id: ToolCallId,
         content: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
@@ -219,12 +219,12 @@ impl Message {
         }
     }
 
-    pub fn tool_result(tool_use_id: &str, content: &str, is_error: bool) -> Self {
+    pub fn tool_result(tool_use_id: impl Into<ToolCallId>, content: &str, is_error: bool) -> Self {
         Self::tool_result_with_duration(tool_use_id, content, is_error, None)
     }
 
     pub fn tool_result_with_duration(
-        tool_use_id: &str,
+        tool_use_id: impl Into<ToolCallId>,
         content: &str,
         is_error: bool,
         tool_duration_ms: Option<u64>,
@@ -232,7 +232,7 @@ impl Message {
         Self {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
-                tool_use_id: tool_use_id.to_string(),
+                tool_use_id: tool_use_id.into(),
                 content: content.to_string(),
                 is_error: if is_error { Some(true) } else { None },
             }],

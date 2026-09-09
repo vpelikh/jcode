@@ -168,7 +168,7 @@ fn build_contents_replays_thought_signature_on_function_call() {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
-                id: "call_sig".to_string(),
+                id: "call_sig".to_string().into(),
                 name: "read".to_string(),
                 input: json!({"path":"README.md"}),
                 thought_signature: Some("SIGNATURE_ABC".to_string()),
@@ -179,7 +179,7 @@ fn build_contents_replays_thought_signature_on_function_call() {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
-                id: "call_nosig".to_string(),
+                id: "call_nosig".to_string().into(),
                 name: "bash".to_string(),
                 input: json!({"command":"ls"}),
                 thought_signature: None,
@@ -217,7 +217,7 @@ fn build_contents_replays_every_signature_across_multi_tool_history() {
         messages.push(Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
-                id: format!("call_{idx}"),
+                id: format!("call_{idx}").into(),
                 name: "bash".to_string(),
                 input: json!({ "command": format!("echo {idx}") }),
                 thought_signature: Some(sig.to_string()),
@@ -228,7 +228,7 @@ fn build_contents_replays_every_signature_across_multi_tool_history() {
         messages.push(Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
-                tool_use_id: format!("call_{idx}"),
+                tool_use_id: format!("call_{idx}").into(),
                 content: format!("out {idx}"),
                 is_error: Some(false),
             }],
@@ -264,19 +264,19 @@ fn build_contents_carries_first_signature_onto_unsigned_same_turn_siblings() {
         role: Role::Assistant,
         content: vec![
             ContentBlock::ToolUse {
-                id: "call_todo".to_string(),
+                id: "call_todo".to_string().into(),
                 name: "todo".to_string(),
                 input: json!({ "items": ["a", "b"] }),
                 thought_signature: Some("SIG_TURN_1".to_string()),
             },
             ContentBlock::ToolUse {
-                id: "call_bash".to_string(),
+                id: "call_bash".to_string().into(),
                 name: "bash".to_string(),
                 input: json!({ "command": "ls" }),
                 thought_signature: None,
             },
             ContentBlock::ToolUse {
-                id: "call_write".to_string(),
+                id: "call_write".to_string().into(),
                 name: "write".to_string(),
                 input: json!({ "path": "a.txt", "content": "hi" }),
                 thought_signature: None,
@@ -313,7 +313,7 @@ fn build_contents_carries_signature_forward_across_turns_for_unsigned_calls() {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
-                id: "turn1".to_string(),
+                id: "turn1".to_string().into(),
                 name: "read".to_string(),
                 input: json!({ "path": "README.md" }),
                 thought_signature: Some("SIG_TURN_1".to_string()),
@@ -324,7 +324,7 @@ fn build_contents_carries_signature_forward_across_turns_for_unsigned_calls() {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
-                tool_use_id: "turn1".to_string(),
+                tool_use_id: "turn1".to_string().into(),
                 content: "ok".to_string(),
                 is_error: Some(false),
             }],
@@ -334,7 +334,7 @@ fn build_contents_carries_signature_forward_across_turns_for_unsigned_calls() {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
-                id: "turn2".to_string(),
+                id: "turn2".to_string().into(),
                 name: "bash".to_string(),
                 input: json!({ "command": "ls" }),
                 thought_signature: None,
@@ -364,7 +364,7 @@ fn build_contents_leaves_unsigned_calls_unsigned_when_no_prior_signature_exists(
     let messages = vec![Message {
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
-            id: "call".to_string(),
+            id: "call".to_string().into(),
             name: "bash".to_string(),
             input: json!({ "command": "ls" }),
             thought_signature: None,
@@ -386,7 +386,7 @@ fn build_contents_preserves_tool_calls_and_results() {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
-                id: "call_1".to_string(),
+                id: "call_1".to_string().into(),
                 name: "read".to_string(),
                 input: json!({"path":"README.md"}),
                 thought_signature: None,
@@ -397,7 +397,7 @@ fn build_contents_preserves_tool_calls_and_results() {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
-                tool_use_id: "call_1".to_string(),
+                tool_use_id: "call_1".to_string().into(),
                 content: "ok".to_string(),
                 is_error: None,
             }],
@@ -429,7 +429,7 @@ fn build_contents_normalizes_non_object_tool_call_args_for_gemini_struct() {
     let messages = vec![Message {
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
-            id: "call_primitive".to_string(),
+            id: "call_primitive".to_string().into(),
             name: "read".to_string(),
             input: json!(20),
             thought_signature: None,
@@ -808,7 +808,7 @@ fn unsigned_tool_history() -> Vec<Message> {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
-                id: "call1".to_string(),
+                id: "call1".to_string().into(),
                 name: "bash".to_string(),
                 input: json!({ "command": "ls" }),
                 thought_signature: None,
@@ -819,7 +819,7 @@ fn unsigned_tool_history() -> Vec<Message> {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
-                tool_use_id: "call1".to_string(),
+                tool_use_id: "call1".to_string().into(),
                 content: "total 0".to_string(),
                 is_error: Some(false),
             }],

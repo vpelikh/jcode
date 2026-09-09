@@ -70,7 +70,7 @@ fn dangling_tool_use_repair_already_ends_on_user_and_is_not_double_patched() {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
-                id: "toolu_1".to_string(),
+                id: "toolu_1".to_string().into(),
                 name: "bash".to_string(),
                 input: json!({"command": "ls"}),
                 thought_signature: None,

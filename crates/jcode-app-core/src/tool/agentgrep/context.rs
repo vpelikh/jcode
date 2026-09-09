@@ -106,7 +106,7 @@ fn build_harness_context(
 
 fn collect_tool_exposures(session: &Session) -> Vec<ToolExposureObservation> {
     let mut observations = Vec::new();
-    let mut tool_map: HashMap<String, ToolCall> = HashMap::new();
+    let mut tool_map: HashMap<crate::session::ToolCallId, ToolCall> = HashMap::new();
 
     for (message_index, msg) in session.messages.iter().enumerate() {
         for block in &msg.content {
@@ -117,7 +117,7 @@ fn collect_tool_exposures(session: &Session) -> Vec<ToolExposureObservation> {
                     tool_map.insert(
                         id.clone(),
                         ToolCall {
-                            id: id.clone().into(),
+                            id: id.clone(),
                             name: name.clone(),
                             input: input.clone(),
                             intent: None,
@@ -134,7 +134,7 @@ fn collect_tool_exposures(session: &Session) -> Vec<ToolExposureObservation> {
                         .get(tool_use_id)
                         .cloned()
                         .unwrap_or_else(|| ToolCall {
-                            id: tool_use_id.clone().into(),
+                            id: tool_use_id.clone(),
                             name: "tool".to_string(),
                             input: Value::Null,
                             intent: None,

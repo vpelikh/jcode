@@ -712,7 +712,7 @@ fn kimi_for_coding_tool_call_message_includes_reasoning_content() {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
-                id: "call_1".to_string(),
+                id: "call_1".to_string().into(),
                 name: "bash".to_string(),
                 input: serde_json::json!({"command": "ls"}),
                 thought_signature: None,
@@ -723,7 +723,7 @@ fn kimi_for_coding_tool_call_message_includes_reasoning_content() {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
-                tool_use_id: "call_1".to_string(),
+                tool_use_id: "call_1".to_string().into(),
                 content: "a.txt\nb.txt".to_string(),
                 is_error: None,
             }],
@@ -808,7 +808,7 @@ fn direct_compatible_deepseek_tool_call_replays_reasoning_content() {
                     text: "I should inspect the workspace first.".to_string(),
                 },
                 ContentBlock::ToolUse {
-                    id: "call_1".to_string(),
+                    id: "call_1".to_string().into(),
                     name: "bash".to_string(),
                     input: serde_json::json!({"command": "ls"}),
                     thought_signature: None,
@@ -820,7 +820,7 @@ fn direct_compatible_deepseek_tool_call_replays_reasoning_content() {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
-                tool_use_id: "call_1".to_string(),
+                tool_use_id: "call_1".to_string().into(),
                 content: "a.txt\nb.txt".to_string(),
                 is_error: None,
             }],

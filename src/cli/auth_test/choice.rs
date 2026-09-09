@@ -613,14 +613,14 @@ mod auth_tool_smoke_tests {
             stored_message(
                 crate::message::Role::Assistant,
                 vec![crate::message::ContentBlock::ToolUse {
-                    id: "call_1".to_string(),
+                    id: "call_1".to_string().into(),
                     name: AUTH_TEST_TOOL_NAME.to_string(),
                     input: serde_json::json!({"command": AUTH_TEST_TOOL_COMMAND}), thought_signature: None, }],
             ),
             stored_message(
                 crate::message::Role::User,
                 vec![crate::message::ContentBlock::ToolResult {
-                    tool_use_id: "call_1".to_string(),
+                    tool_use_id: "call_1".to_string().into(),
                     content: format!("{}\n", AUTH_TEST_TOOL_OUTPUT_MARKER),
                     is_error: None,
                 }],

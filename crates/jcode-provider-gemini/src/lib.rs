@@ -351,7 +351,7 @@ pub fn build_contents_with_signature_policy(
                             function_call: Some(GeminiFunctionCall {
                                 name: name.clone(),
                                 args: ToolCall::input_as_object(input),
-                                id: Some(id.clone()),
+                                id: Some(id.to_string()),
                             }),
                             thought_signature: signature,
                             ..Default::default()
@@ -373,7 +373,7 @@ pub fn build_contents_with_signature_policy(
                             parts.push(GeminiPart {
                                 text: Some(format!(
                                     "[{label}] {}: {content}",
-                                    tool_name_from_tool_result(tool_use_id, messages)
+                                    tool_name_from_tool_result(tool_use_id.as_str(), messages)
                                 )),
                                 ..Default::default()
                             });
@@ -381,13 +381,13 @@ pub fn build_contents_with_signature_policy(
                         }
                         parts.push(GeminiPart {
                             function_response: Some(GeminiFunctionResponse {
-                                name: tool_name_from_tool_result(tool_use_id, messages),
+                                name: tool_name_from_tool_result(tool_use_id.as_str(), messages),
                                 response: if is_error.unwrap_or(false) {
                                     json!({ "error": content })
                                 } else {
                                     json!({ "content": content })
                                 },
-                                id: Some(tool_use_id.clone()),
+                                id: Some(tool_use_id.to_string()),
                             }),
                             ..Default::default()
                         });
@@ -420,7 +420,7 @@ fn tool_name_from_tool_result(tool_use_id: &str, messages: &[Message]) -> String
     for message in messages.iter().rev() {
         for block in &message.content {
             if let ContentBlock::ToolUse { id, name, .. } = block
-                && id == tool_use_id
+                && id.as_str() == tool_use_id
             {
                 return name.clone();
             }

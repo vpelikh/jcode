@@ -1270,9 +1270,9 @@ pub struct App {
     /// Sim-time at which processing started (video replay only)
     replay_processing_started_ms: Option<f64>,
     // Remember tool call ids that have appeared in the provider transcript
-    tool_call_ids: HashSet<String>,
+    tool_call_ids: HashSet<crate::session::ToolCallId>,
     // Remember tool call ids that already have outputs
-    tool_result_ids: HashSet<String>,
+    tool_result_ids: HashSet<crate::session::ToolCallId>,
     // Number of provider messages already indexed for missing tool-output repair
     tool_output_scan_index: usize,
     // Current session ID (from server in remote mode)

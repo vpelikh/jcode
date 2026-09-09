@@ -367,7 +367,7 @@ mod tests {
             .content
             .iter()
             .map(|block| match block {
-                ContentBlock::ToolResult { tool_use_id, .. } => tool_use_id.clone(),
+                ContentBlock::ToolResult { tool_use_id, .. } => tool_use_id.to_string(),
                 other => panic!("expected ToolResult, got {other:?}"),
             })
             .collect();
@@ -1089,7 +1089,7 @@ pub async fn run_live_claude_native_tool_smoke(
     followup.push(Message {
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
-            id: tool_call.id.clone(),
+            id: tool_call.id.clone().into(),
             name: tool_call.name.clone(),
             input: parsed_arguments.clone(),
             thought_signature: None,
@@ -1100,7 +1100,7 @@ pub async fn run_live_claude_native_tool_smoke(
     followup.push(Message {
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
-            tool_use_id: tool_call.id.clone(),
+            tool_use_id: tool_call.id.clone().into(),
             content: "TOOL_RESULT_TOKEN=42. Report this token back to confirm you read it."
                 .to_string(),
             is_error: Some(false),
@@ -1957,7 +1957,7 @@ fn assistant_tool_use(call: &NativeClaudeToolCall, arguments: &serde_json::Value
     Message {
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
-            id: call.id.clone(),
+            id: call.id.clone().into(),
             name: call.name.clone(),
             input: arguments.clone(),
             thought_signature: call.thought_signature.clone(),
@@ -1973,7 +1973,7 @@ fn tool_result_then_text(tool_use_id: &str, result: &str) -> Message {
     Message {
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
-            tool_use_id: tool_use_id.to_string(),
+            tool_use_id: tool_use_id.to_string().into(),
             content: result.to_string(),
             is_error: Some(false),
         }],
@@ -1991,7 +1991,7 @@ fn assistant_parallel_tool_uses(calls: &[NativeClaudeToolCall]) -> Message {
     let content = calls
         .iter()
         .map(|call| ContentBlock::ToolUse {
-            id: call.id.clone(),
+            id: call.id.clone().into(),
             name: call.name.clone(),
             input: parse_tool_arguments(&call.input_json),
             thought_signature: call.thought_signature.clone(),
@@ -2013,7 +2013,7 @@ fn parallel_tool_results(calls: &[NativeClaudeToolCall]) -> Message {
         .iter()
         .enumerate()
         .map(|(index, call)| ContentBlock::ToolResult {
-            tool_use_id: call.id.clone(),
+            tool_use_id: call.id.clone().into(),
             content: format!("Contents of file {}: token_{index}.", index + 1),
             is_error: Some(false),
         })

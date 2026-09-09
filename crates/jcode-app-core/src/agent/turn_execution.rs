@@ -598,7 +598,7 @@ impl Agent {
         let message_id = self.add_message(
             Role::Assistant,
             vec![ContentBlock::ToolUse {
-                id: tool_call_id,
+                id: tool_call_id.into(),
                 name: tool_name,
                 input,
                 thought_signature: None,
@@ -610,7 +610,7 @@ impl Agent {
 
     pub fn add_manual_tool_result(
         &mut self,
-        tool_call_id: String,
+        tool_call_id: impl Into<crate::session::ToolCallId>,
         output: crate::tool::ToolOutput,
         duration_ms: u64,
     ) -> Result<()> {
@@ -622,14 +622,14 @@ impl Agent {
 
     pub fn add_manual_tool_error(
         &mut self,
-        tool_call_id: String,
+        tool_call_id: impl Into<crate::session::ToolCallId>,
         error: String,
         duration_ms: u64,
     ) -> Result<()> {
         self.add_message_with_duration(
             Role::User,
             vec![ContentBlock::ToolResult {
-                tool_use_id: tool_call_id,
+                tool_use_id: tool_call_id.into(),
                 content: error,
                 is_error: Some(true),
             }],

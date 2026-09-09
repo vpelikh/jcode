@@ -75,11 +75,11 @@ pub(super) fn tool_output_side_pane_images(
 }
 
 pub(super) fn tool_output_to_content_blocks(
-    tool_use_id: String,
+    tool_use_id: impl Into<crate::session::ToolCallId>,
     output: ToolOutput,
 ) -> Vec<ContentBlock> {
     let mut blocks = vec![ContentBlock::ToolResult {
-        tool_use_id,
+        tool_use_id: tool_use_id.into(),
         content: output.output,
         is_error: None,
     }];

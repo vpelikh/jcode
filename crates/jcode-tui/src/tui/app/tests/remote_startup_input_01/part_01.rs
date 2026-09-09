@@ -206,7 +206,7 @@ fn test_prepare_review_spawned_session_uses_visible_transcript_for_judge_session
                         cache_control: None,
                     },
                     ContentBlock::ToolUse {
-                        id: tool_id.clone(),
+                        id: tool_id.clone().into(),
                         name: "bash".to_string(),
                         input: serde_json::json!({"command": "git diff --stat"}),
                         thought_signature: None,
@@ -216,7 +216,7 @@ fn test_prepare_review_spawned_session_uses_visible_transcript_for_judge_session
             parent.add_message(
                 Role::User,
                 vec![ContentBlock::ToolResult {
-                    tool_use_id: tool_id.clone(),
+                    tool_use_id: tool_id.clone().into(),
                     content: "SECRET_TOOL_OUTPUT_SHOULD_NOT_APPEAR".to_string(),
                     is_error: None,
                 }],

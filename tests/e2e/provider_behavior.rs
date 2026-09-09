@@ -178,7 +178,7 @@ async fn test_resume_restores_model_and_tool_history() -> Result<()> {
                 cache_control: None,
             },
             jcode::message::ContentBlock::ToolUse {
-                id: "tool-1".to_string(),
+                id: "tool-1".to_string().into(),
                 name: "bash".to_string(),
                 input: serde_json::json!({"cmd": "echo hi"}),
                 thought_signature: None,
@@ -188,7 +188,7 @@ async fn test_resume_restores_model_and_tool_history() -> Result<()> {
     session.add_message(
         jcode::message::Role::User,
         vec![jcode::message::ContentBlock::ToolResult {
-            tool_use_id: "tool-1".to_string(),
+            tool_use_id: "tool-1".to_string().into(),
             content: "hi\n".to_string(),
             is_error: None,
         }],
@@ -505,7 +505,7 @@ async fn test_resume_session_reports_reload_interruption_for_peer_sessions() -> 
     session.add_message(
         jcode::message::Role::User,
         vec![jcode::message::ContentBlock::ToolResult {
-            tool_use_id: "tool_bash_1".to_string(),
+            tool_use_id: "tool_bash_1".to_string().into(),
             content: "[Tool 'bash' interrupted by server reload after 0.2s]".to_string(),
             is_error: Some(true),
         }],

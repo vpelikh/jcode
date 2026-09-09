@@ -474,7 +474,7 @@ fn cached_imported_session_preserves_existing_history_verbatim() {
         id: "assistant-tool".to_string(),
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
-            id: "legacy/call".to_string(),
+            id: "legacy/call".to_string().into(),
             name: "legacy:tool".to_string(),
             input: serde_json::json!({"value": 1}),
             thought_signature: None,
@@ -488,7 +488,7 @@ fn cached_imported_session_preserves_existing_history_verbatim() {
         id: "user-result".to_string(),
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
-            tool_use_id: "legacy/call".to_string(),
+            tool_use_id: "legacy/call".to_string().into(),
             content: "done".to_string(),
             is_error: Some(false),
         }],

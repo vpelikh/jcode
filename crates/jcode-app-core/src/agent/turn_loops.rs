@@ -813,7 +813,7 @@ impl Agent {
             }
             for tc in &tool_calls {
                 content_blocks.push(ContentBlock::ToolUse {
-                    id: tc.id.clone().to_string(),
+                    id: tc.id.clone(),
                     name: tc.name.clone(),
                     input: tc.input.clone(),
                     thought_signature: tc.thought_signature.clone(),
@@ -981,7 +981,7 @@ impl Agent {
                     self.add_message(
                         Role::User,
                         vec![ContentBlock::ToolResult {
-                            tool_use_id: tc.id.to_string(),
+                            tool_use_id: tc.id.clone(),
                             content: error_msg,
                             is_error: Some(true),
                         }],
@@ -1040,7 +1040,7 @@ impl Agent {
                         self.add_message(
                             Role::User,
                             vec![ContentBlock::ToolResult {
-                                tool_use_id: tc.id.clone().to_string(),
+                                tool_use_id: tc.id.clone(),
                                 content: sdk_content,
                                 is_error: if sdk_is_error { Some(true) } else { None },
                             }],
@@ -1332,7 +1332,7 @@ impl Agent {
                 self.add_message_with_duration(
                     Role::User,
                     vec![ContentBlock::ToolResult {
-                        tool_use_id: tc.id.to_string(),
+                        tool_use_id: tc.id.clone(),
                         content: error_msg,
                         is_error: Some(true),
                     }],
@@ -1382,7 +1382,7 @@ mod tests {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
-                tool_use_id: id.to_string(),
+                tool_use_id: id.clone().into(),
                 content: content.to_string(),
                 is_error: None,
             }],

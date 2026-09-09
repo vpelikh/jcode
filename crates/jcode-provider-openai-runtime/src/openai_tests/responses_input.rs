@@ -2,7 +2,7 @@ fn assistant_tool_use(id: &str, name: &str, input: serde_json::Value) -> ChatMes
     ChatMessage {
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
-            id: id.to_string(),
+            id: id.to_string().into(),
             name: name.to_string(),
             input, thought_signature: None, }],
         timestamp: None,
@@ -141,7 +141,7 @@ fn test_build_responses_input_keeps_image_context_after_tool_output() {
             role: Role::User,
             content: vec![
                 ContentBlock::ToolResult {
-                    tool_use_id: "call_1".to_string(),
+                    tool_use_id: "call_1".to_string().into(),
                     content: "Image: screenshot.png\nImage sent to model for vision analysis."
                         .to_string(),
                     is_error: None,

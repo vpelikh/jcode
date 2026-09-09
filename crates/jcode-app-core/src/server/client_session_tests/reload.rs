@@ -25,7 +25,7 @@ fn detects_reload_interrupted_tool_result() {
         id: "msg_2".to_string(),
         role: crate::message::Role::User,
         content: vec![ContentBlock::ToolResult {
-            tool_use_id: "tool_1".to_string(),
+            tool_use_id: "tool_1".to_string().into(),
             content: "[Tool 'bash' interrupted by server reload after 0.2s]".to_string(),
             is_error: Some(true),
         }],
@@ -44,7 +44,7 @@ fn detects_reload_skipped_tool_result() {
         id: "msg_3".to_string(),
         role: crate::message::Role::User,
         content: vec![ContentBlock::ToolResult {
-            tool_use_id: "tool_2".to_string(),
+            tool_use_id: "tool_2".to_string().into(),
             content: "[Skipped - server reloading]".to_string(),
             is_error: Some(true),
         }],
@@ -63,7 +63,7 @@ fn detects_selfdev_reload_tool_result_even_when_not_marked_error() {
         id: "msg_3b".to_string(),
         role: crate::message::Role::User,
         content: vec![ContentBlock::ToolResult {
-            tool_use_id: "tool_2b".to_string(),
+            tool_use_id: "tool_2b".to_string().into(),
             content: "Reload initiated. Process restarting...".to_string(),
             is_error: Some(false),
         }],
@@ -82,7 +82,7 @@ fn ignores_normal_tool_errors() {
         id: "msg_4".to_string(),
         role: crate::message::Role::User,
         content: vec![ContentBlock::ToolResult {
-            tool_use_id: "tool_3".to_string(),
+            tool_use_id: "tool_3".to_string().into(),
             content: "Error: file not found".to_string(),
             is_error: Some(true),
         }],

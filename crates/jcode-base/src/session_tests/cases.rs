@@ -379,13 +379,13 @@ fn test_debug_memory_profile_reports_messages_and_provider_cache() {
         Role::Assistant,
         vec![
             ContentBlock::ToolUse {
-                id: "tool_1".to_string(),
+                id: "tool_1".to_string().into(),
                 name: "bash".to_string(),
                 input: serde_json::json!({"command": "echo hi"}),
                 thought_signature: None,
             },
             ContentBlock::ToolResult {
-                tool_use_id: "tool_1".to_string(),
+                tool_use_id: "tool_1".to_string().into(),
                 content: "hi".to_string(),
                 is_error: None,
             },
@@ -1158,7 +1158,7 @@ fn test_save_persists_full_session_content() -> Result<()> {
     session.add_message(
         Role::User,
         vec![ContentBlock::ToolResult {
-            tool_use_id: "tool_1".to_string(),
+            tool_use_id: "tool_1".to_string().into(),
             content: "OPENROUTER_API_KEY=sk-or-v1-abcdefghijklmnopqrstuvwxyz0123456789".to_string(),
             is_error: None,
         }],
@@ -1167,7 +1167,7 @@ fn test_save_persists_full_session_content() -> Result<()> {
     session.add_message(
         Role::Assistant,
         vec![ContentBlock::ToolUse {
-            id: "tool_2".to_string(),
+            id: "tool_2".to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({
                 "command": "echo ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123"
@@ -1648,7 +1648,7 @@ fn test_redacted_for_export_redacts_tool_result_and_tool_input() -> Result<()> {
     session.add_message(
         Role::User,
         vec![ContentBlock::ToolResult {
-            tool_use_id: "tool_1".to_string(),
+            tool_use_id: "tool_1".to_string().into(),
             content: "OPENROUTER_API_KEY=sk-or-v1-abcdefghijklmnopqrstuvwxyz0123456789".to_string(),
             is_error: None,
         }],
@@ -1657,7 +1657,7 @@ fn test_redacted_for_export_redacts_tool_result_and_tool_input() -> Result<()> {
     session.add_message(
         Role::Assistant,
         vec![ContentBlock::ToolUse {
-            id: "tool_2".to_string(),
+            id: "tool_2".to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({
                 "command": "echo ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123",
@@ -1783,7 +1783,7 @@ fn test_summarize_tool_calls_includes_tool_only_assistant_messages() {
     session.add_message(
         Role::Assistant,
         vec![ContentBlock::ToolUse {
-            id: "tool_1".to_string(),
+            id: "tool_1".to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({
                 "command": "pwd"
@@ -2501,13 +2501,13 @@ fn test_render_messages_and_images_share_tool_resolution_and_labels() {
         Role::Assistant,
         vec![
             ContentBlock::ToolUse {
-                id: "tool_img_1".to_string(),
+                id: "tool_img_1".to_string().into(),
                 name: "view_image".to_string(),
                 input: serde_json::json!({"file_path": "/tmp/screenshot.png"}),
                 thought_signature: None,
             },
             ContentBlock::ToolResult {
-                tool_use_id: "tool_img_1".to_string(),
+                tool_use_id: "tool_img_1".to_string().into(),
                 content: "rendered image".to_string(),
                 is_error: None,
             },
@@ -2638,7 +2638,7 @@ fn test_render_images_anchors_tool_and_user_images() {
     session.add_message(
         Role::Assistant,
         vec![ContentBlock::ToolUse {
-            id: "tool-call-1".to_string(),
+            id: "tool-call-1".to_string().into(),
             name: "read".to_string(),
             input: serde_json::json!({"file_path": "shot.png"}),
             thought_signature: None,
@@ -2649,7 +2649,7 @@ fn test_render_images_anchors_tool_and_user_images() {
         Role::User,
         vec![
             ContentBlock::ToolResult {
-                tool_use_id: "tool-call-1".to_string(),
+                tool_use_id: "tool-call-1".to_string().into(),
                 content: "read image".to_string(),
                 is_error: None,
             },
@@ -2689,7 +2689,7 @@ fn test_render_images_attached_label_message_does_not_shift_prompt_ordinals() {
     session.add_message(
         Role::Assistant,
         vec![ContentBlock::ToolUse {
-            id: "tool-call-2".to_string(),
+            id: "tool-call-2".to_string().into(),
             name: "read".to_string(),
             input: serde_json::json!({"file_path": "shot.png"}),
             thought_signature: None,
@@ -2699,7 +2699,7 @@ fn test_render_images_attached_label_message_does_not_shift_prompt_ordinals() {
         Role::User,
         vec![
             ContentBlock::ToolResult {
-                tool_use_id: "tool-call-2".to_string(),
+                tool_use_id: "tool-call-2".to_string().into(),
                 content: "read image".to_string(),
                 is_error: None,
             },
@@ -2842,7 +2842,7 @@ fn test_rewind_targets_match_rendered_transcript_numbering() {
     session.add_message(
         Role::Assistant,
         vec![ContentBlock::ToolUse {
-            id: "tool_1".to_string(),
+            id: "tool_1".to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({"command": "ls"}),
             thought_signature: None,
@@ -2853,7 +2853,7 @@ fn test_rewind_targets_match_rendered_transcript_numbering() {
     session.add_message(
         Role::User,
         vec![ContentBlock::ToolResult {
-            tool_use_id: "tool_1".to_string(),
+            tool_use_id: "tool_1".to_string().into(),
             content: "file-a file-b".to_string(),
             is_error: None,
         }],

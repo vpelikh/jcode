@@ -626,7 +626,7 @@ mod tests {
         session.add_message(
             Role::Assistant,
             vec![ContentBlock::ToolUse {
-                id: "tool_1".to_string(),
+                id: "tool_1".to_string().into(),
                 name: "read".to_string(),
                 input: serde_json::json!({"file_path": "src/tui/session_picker.rs"}),
                 thought_signature: None,

@@ -481,7 +481,7 @@ pub fn render_messages_and_images_with_compacted_history(
                         intent: ToolCall::intent_from_input(input),
                         thought_signature: thought_signature.clone(),
                     };
-                    tool_map.insert(id.clone(), tool_call);
+                    tool_map.insert(id.to_string(), tool_call);
                     tool_calls.push(name.clone());
                 }
                 ContentBlock::ToolResult {
@@ -505,7 +505,7 @@ pub fn render_messages_and_images_with_compacted_history(
                         });
                     }
 
-                    let tool_data = tool_map.get(tool_use_id).cloned().or_else(|| {
+                    let tool_data = tool_map.get(tool_use_id.as_str()).cloned().or_else(|| {
                         Some(ToolCall {
                             id: tool_use_id.clone().into(),
                             name: "tool".to_string(),

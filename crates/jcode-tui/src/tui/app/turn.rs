@@ -329,7 +329,7 @@ impl App {
                                             }
                                             for tc in &tool_calls {
                                                 content_blocks.push(ContentBlock::ToolUse {
-                                                    id: tc.id.clone().to_string(),
+                                                    id: tc.id.clone(),
                                                     name: tc.name.clone(),
                                                     input: tc.input.clone(), thought_signature: None, });
                                             }
@@ -397,7 +397,7 @@ impl App {
                                             }
                                             for tc in &tool_calls {
                                                 content_blocks.push(ContentBlock::ToolUse {
-                                                    id: tc.id.clone().to_string(),
+                                                    id: tc.id.clone(),
                                                     name: tc.name.clone(),
                                                     input: tc.input.clone(), thought_signature: None, });
                                             }
@@ -873,7 +873,7 @@ impl App {
                                     }
                                     StreamEvent::ToolResult { tool_use_id, content, is_error } => {
                                         // SDK already executed this tool
-                                        self.tool_result_ids.insert(tool_use_id.clone().to_string());
+                                        self.tool_result_ids.insert(tool_use_id.clone());
                                         // Find the tool name from our tracking
                                         let tool_name = self.streaming_tool_calls
                                             .iter()
@@ -1082,7 +1082,7 @@ impl App {
             }
             for tc in &tool_calls {
                 content_blocks.push(ContentBlock::ToolUse {
-                    id: tc.id.clone().to_string(),
+                    id: tc.id.clone(),
                     name: tc.name.clone(),
                     input: tc.input.clone(),
                     thought_signature: None,
@@ -1101,7 +1101,7 @@ impl App {
                 let message_id = self.session.add_message(Role::Assistant, content_clone);
                 let _ = self.session.save();
                 for tc in &tool_calls {
-                    self.tool_result_ids.insert(tc.id.clone().to_string());
+                    self.tool_result_ids.insert(tc.id.clone());
                 }
                 Some(message_id)
             } else {
@@ -1236,7 +1236,7 @@ impl App {
                     self.add_provider_message(Message {
                         role: Role::User,
                         content: vec![ContentBlock::ToolResult {
-                            tool_use_id: tc.id.clone().to_string(),
+                            tool_use_id: tc.id.clone(),
                             content: sdk_content,
                             is_error: if sdk_is_error { Some(true) } else { None },
                         }],
@@ -1246,7 +1246,7 @@ impl App {
                     self.session.add_message(
                         Role::User,
                         vec![ContentBlock::ToolResult {
-                            tool_use_id: tc.id.clone().to_string(),
+                            tool_use_id: tc.id.clone(),
                             content: String::new(), // Already added to messages above
                             is_error: if sdk_is_error { Some(true) } else { None },
                         }],
@@ -1445,7 +1445,7 @@ impl App {
                 );
 
                 self.add_provider_message(Message::tool_result_with_duration(
-                    &tc.id.to_string(),
+                    tc.id.as_str(),
                     &output,
                     is_error,
                     Some(tool_duration_ms),
@@ -1453,7 +1453,7 @@ impl App {
                 self.session.add_message_with_duration(
                     Role::User,
                     vec![ContentBlock::ToolResult {
-                        tool_use_id: tc.id.clone().to_string(),
+                        tool_use_id: tc.id.clone(),
                         content: output.clone(),
                         is_error: if is_error { Some(true) } else { None },
                     }],

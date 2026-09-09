@@ -367,13 +367,13 @@ mod tests {
             Role::Assistant,
             vec![
                 ContentBlock::ToolUse {
-                    id: "tool_1".to_string(),
+                    id: "tool_1".to_string().into(),
                     name: "bash".to_string(),
                     input: serde_json::json!({"command": "printf 'hello'"}),
                     thought_signature: None,
                 },
                 ContentBlock::ToolResult {
-                    tool_use_id: "tool_1".to_string(),
+                    tool_use_id: "tool_1".to_string().into(),
                     content: "hello from tool".to_string(),
                     is_error: None,
                 },

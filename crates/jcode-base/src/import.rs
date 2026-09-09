@@ -403,7 +403,7 @@ fn convert_content_blocks(content: &ClaudeCodeContent) -> Vec<ContentBlock> {
                 }
                 ClaudeCodeContentBlock::ToolUse { id, name, input } => {
                     Some(ContentBlock::ToolUse {
-                        id: id.clone(),
+                        id: id.clone().into(),
                         name: name.clone(),
                         input: input.clone(),
                         thought_signature: None,
@@ -414,7 +414,7 @@ fn convert_content_blocks(content: &ClaudeCodeContent) -> Vec<ContentBlock> {
                     content,
                     is_error,
                 } => Some(ContentBlock::ToolResult {
-                    tool_use_id: tool_use_id.clone(),
+                    tool_use_id: tool_use_id.clone().into(),
                     content: content.clone(),
                     is_error: *is_error,
                 }),

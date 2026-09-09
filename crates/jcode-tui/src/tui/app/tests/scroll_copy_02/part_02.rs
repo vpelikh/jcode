@@ -1053,7 +1053,7 @@ fn test_real_draw_click_on_body_anchored_image_label_cycles_level() {
     app.session.add_message(
         Role::Assistant,
         vec![ContentBlock::ToolUse {
-            id: TOOL_ID.to_string(),
+            id: TOOL_ID.to_string().into(),
             name: "read".to_string(),
             input: serde_json::json!({"file_path": "shot.png"}),
             thought_signature: None,
@@ -1063,7 +1063,7 @@ fn test_real_draw_click_on_body_anchored_image_label_cycles_level() {
         Role::User,
         vec![
             ContentBlock::ToolResult {
-                tool_use_id: TOOL_ID.to_string(),
+                tool_use_id: TOOL_ID.to_string().into(),
                 content: "read image".to_string(),
                 is_error: None,
             },
@@ -1207,7 +1207,7 @@ fn test_real_draw_never_emits_inline_image_marker_text() {
     app.session.add_message(
         Role::Assistant,
         vec![ContentBlock::ToolUse {
-            id: TOOL_ID.to_string(),
+            id: TOOL_ID.to_string().into(),
             name: "read".to_string(),
             input: serde_json::json!({"file_path": "shot.png"}),
             thought_signature: None,
@@ -1217,7 +1217,7 @@ fn test_real_draw_never_emits_inline_image_marker_text() {
         Role::User,
         vec![
             ContentBlock::ToolResult {
-                tool_use_id: TOOL_ID.to_string(),
+                tool_use_id: TOOL_ID.to_string().into(),
                 content: "read image".to_string(),
                 is_error: None,
             },
