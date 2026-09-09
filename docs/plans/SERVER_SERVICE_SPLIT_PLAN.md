@@ -500,8 +500,11 @@ swarm-domain argument bag, and the membership operations have moved onto
 `SwarmServiceHandle` methods (`member_should_mark_ready`,
 `rename_member_session`, `ensure_member` for join-swarm registration,
 `take_session_membership` for `/clear` teardown, `set_member_status` for status
-updates, and `remove_plan_participant` / `rename_plan_participant` for plan
-participant edits). On `monitor_bus`, the dead
+updates, `remove_plan_participant` / `rename_plan_participant` for plan
+participant edits, and `remove_session_from_swarm` / `record_swarm_event` /
+`remove_session_channel_subscriptions` for teardown). `handle_comm_stop` now
+takes `&SwarmServiceHandle` and routes its depart teardown through the handle
+instead of the raw swarm maps. On `monitor_bus`, the dead
 `_swarm_plans`/`_swarm_coordinators`/`_shared_context` arguments were removed
 (full simplification to service APIs is a separate maintenance-service move).
 Debug now routes all of its swarm-state interaction through the
