@@ -611,3 +611,36 @@ was then done for `member_should_mark_ready`, `rename_member_session`, and
 handle-bound locals rather than calling a dedicated handle method; the residual
 direct access is concentrated in the few orchestration-heavy subscribe/resume
 paths, which remain candidates for a later, narrowly-scoped extraction.
+
+---
+
+### Further client-request and bus-dispatch routing landed (2026-09)
+
+Two more slices landed in the same ownership direction, both thin wrapper +
+call-site migrations with tests green:
+
+- **`AgentTaskContext` collapsed onto the swarm handle.** `handle_agent_task`
+  (`client_actions.rs`) previously carried six flat swarm fields on its
+  context and called the free `swarm::update_member_status` with each. Its
+  `AgentTaskContext` now holds the `SwarmServiceHandle` (plus the client event
+  sender), and the `running`/`completed`/`failed` member-status updates route
+  through the existing `swarm.set_member_status`. This narrows the client
+  request router's flat-field fanout (Seam B) and drops the direct
+  `update_member_status` use in `client_actions.rs`.
+- **Five `monitor_bus` swarm dispatchers route through the swarm handle.** The
+  `dispatch_swarm_output_tail` / `_todo_progress` / `_tool_activity` /
+  `_runtime_status` / `_batch_progress` functions (all called only from
+  `monitor_bus`, no test call sites) each carried the raw
+  `swarm_members`/`swarms_by_id` pair and called the free
+  `swarm::broadcast_swarm_status`. They now take `&SwarmServiceHandle` and
+  route the rebroadcast through a new `swarm.broadcast_swarm_status(swarm_id)`
+  method (Seam D progress). Each body binds the membership map from the handle
+  as a local so the mutation logic is byte-identical.
+
+The remaining free-function call sites for `update_member_status` /
+`broadcast_swarm_status` in `server.rs` maintenance paths,
+`client_lifecycle.rs`, `comm_control.rs`, `comm_session.rs`, `headless.rs`,
+`client_session.rs`, and `debug_session_admin.rs` are still open; as are the
+`dispatch_background_task_completion`/`_stalled`/`dispatch_swarm_await_completion`
+five-field bags and the `LiveTurnSwarmContext` flat-field wrapper. They remain
+separate, mechanical follow-ups per the "cosmetic, high-churn" note above.
