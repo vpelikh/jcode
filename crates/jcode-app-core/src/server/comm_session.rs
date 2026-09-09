@@ -9,9 +9,8 @@ use super::{
     SessionInterruptQueues, SwarmEvent, SwarmEventType, SwarmMember, SwarmState, VersionedPlan,
     append_swarm_completion_report_instructions, broadcast_swarm_plan, broadcast_swarm_status,
     create_headless_session, fanout_session_event, persist_swarm_state_for,
-    record_swarm_event_for_session, remove_background_tool_signal,
-    remove_session_interrupt_queue, set_member_task_label, truncate_detail, update_member_status,
-    update_member_status_with_report,
+    record_swarm_event_for_session, remove_background_tool_signal, remove_session_interrupt_queue,
+    set_member_task_label, truncate_detail, update_member_status, update_member_status_with_report,
 };
 use crate::agent::Agent;
 use crate::config::SwarmSpawnMode;
@@ -1143,7 +1142,9 @@ pub(super) async fn handle_comm_stop(
                 },
             )
             .await;
-        swarm.remove_session_from_swarm(&target_session, swarm_id).await;
+        swarm
+            .remove_session_from_swarm(&target_session, swarm_id)
+            .await;
     }
     swarm
         .remove_session_channel_subscriptions(&target_session)

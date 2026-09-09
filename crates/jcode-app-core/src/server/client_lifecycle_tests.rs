@@ -2,8 +2,8 @@ use super::*;
 use crate::message::{ContentBlock, Message, StreamEvent, ToolDefinition};
 use crate::provider::{EventStream, Provider};
 use crate::server::{
-    AwaitMembersRuntime, ClientDebugState, FileTouchService, SessionInterruptQueues, SwarmState,
-    SwarmMutationRuntime,
+    AwaitMembersRuntime, ClientDebugState, FileTouchService, SessionInterruptQueues,
+    SwarmMutationRuntime, SwarmState,
 };
 use async_trait::async_trait;
 use futures::stream;

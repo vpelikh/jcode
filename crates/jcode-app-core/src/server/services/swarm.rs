@@ -238,10 +238,7 @@ impl SwarmServiceHandle {
     /// drop its channel subscriptions. Returns the member's identity so the
     /// caller can re-register the fresh replacement session with the same swarm
     /// intent. No-op (returns an empty identity) when no member was present.
-    pub(crate) async fn take_session_membership(
-        &self,
-        client_session_id: &str,
-    ) -> MemberIdentity {
+    pub(crate) async fn take_session_membership(&self, client_session_id: &str) -> MemberIdentity {
         let identity = {
             let mut members = self.swarm_state.members.write().await;
             match members.remove(client_session_id) {
@@ -303,12 +300,8 @@ impl SwarmServiceHandle {
     /// swarm service so session-lifecycle code does not reach into the raw plans
     /// map. Deferred to `swarm::remove_plan_participant`.
     pub(crate) async fn remove_plan_participant(&self, swarm_id: &str, session_id: &str) {
-        super::super::swarm::remove_plan_participant(
-            swarm_id,
-            session_id,
-            &self.swarm_state.plans,
-        )
-        .await;
+        super::super::swarm::remove_plan_participant(swarm_id, session_id, &self.swarm_state.plans)
+            .await;
     }
 
     /// Rename a session in a swarm plan's participant set when its session id

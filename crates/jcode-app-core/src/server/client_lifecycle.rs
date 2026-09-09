@@ -50,9 +50,9 @@ use super::services::{
 };
 use super::{
     ClientConnectionInfo, SessionControlHandle, SessionInterruptQueues, SwarmEvent, SwarmMember,
-    format_structured_completion_report, register_session_interrupt_queue, send_swarm_plan_to_session,
-    truncate_detail, update_member_status, update_member_status_with_report,
-    update_member_status_with_report_tldr,
+    format_structured_completion_report, register_session_interrupt_queue,
+    send_swarm_plan_to_session, truncate_detail, update_member_status,
+    update_member_status_with_report, update_member_status_with_report_tldr,
 };
 use crate::agent::Agent;
 use crate::bus::{Bus, BusEvent};
