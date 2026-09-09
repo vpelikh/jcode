@@ -47,11 +47,12 @@ The env fingerprint is an in-memory scan of the process environment (no file
 I/O), so compare it on **every** `config()` call, independently of the throttle.
 Keep the throttle only for the config-file `fs::metadata` stat.
 
-- `ConfigCache` gained an `env_fingerprint: Vec<(String, String)>` field.
-- `config()` computes `config_env_fingerprint()` up front and compares it to the
-  cache's snapshot. If it changed, the fast-path throttle is bypassed and the
+- `config()` computes `config_env_fingerprint()` up front and compares it to
+  `ConfigCacheFingerprint.env` (the env snapshot already stored in the cache's
+  `fingerprint`). If it changed, the fast-path throttle is bypassed and the
   config reloads immediately.
-- After reloading, both `fingerprint` and `env_fingerprint` are refreshed.
+- After reloading, `fingerprint` is refreshed (which re-reads the env snapshot),
+  so the next comparison sees the post-load environment.
 
 Preserves the throttle's purpose (avoid re-statting config.toml on every read)
 while making env-driven runtime config immediate, which is the correct behavior
