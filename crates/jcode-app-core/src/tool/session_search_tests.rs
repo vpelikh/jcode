@@ -712,3 +712,49 @@ fn review_loop_record_surfaces_in_session_search() {
         assert!(snippet.contains("review") || snippet.contains("off by one"));
     });
 }
+
+#[test]
+fn session_search_declares_a_whole_call_execution_timeout() {
+    // takeaway #7 opt-in: a cross-session scan can block for a long time on a
+    // large or slow session store, and `session_search` declares no
+    // self-managed bound of its own. Assert it declares a deadline the registry
+    // wrap point can honor.
+    let timeout = SessionSearchTool::new()
+        .execution_timeout()
+        .expect("session_search must declare an execution_timeout");
+
+    assert_eq!(
+        timeout.as_secs(),
+        SessionSearchTool::EXECUTION_TIMEOUT_SECS,
+        "declared timeout must match the documented constant"
+    );
+    assert!(
+        timeout.as_secs() > 0,
+        "declared timeout must be a positive, bounded duration"
+    );
+}
+
+#[tokio::test]
+async fn session_search_deadline_is_model_visible_on_hang() {
+    // The registry wrap point (`execute_with_deadline`) is what turns the
+    // declared timeout into a model-visible error. Pin that a call exceeding
+    // the bound surfaces a "timed out after Ns" error rather than returning a
+    // value. (The real execute does blocking read-only I/O on spawn_blocking;
+    // we exercise the shared wrap point with a hung future to prove the error
+    // contract.)
+    let err = jcode_tool_core::execute_with_deadline(
+        Some(std::time::Duration::from_millis(20)),
+        SessionSearchTool::new().name(),
+        async {
+            std::future::pending::<()>().await;
+            Ok::<_, anyhow::Error>(())
+        },
+    )
+    .await
+    .expect_err("a hung session_search must time out, not hang");
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("timed out after"),
+        "expected a model-visible timeout error, got: {text}"
+    );
+}

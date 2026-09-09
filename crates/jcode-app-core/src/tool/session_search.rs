@@ -125,6 +125,24 @@ struct SearchInput {
 pub struct SessionSearchTool;
 
 impl SessionSearchTool {
+    /// Whole-call budget for a cross-session search (takeaway #7).
+    ///
+    /// `session_search` scans and deserializes up to `MAX_MAX_SCAN_SESSIONS`
+    /// (10k) session snapshots/journals on `spawn_blocking` threads. A slow
+    /// disk or a pathological exhaustive scan can otherwise hold the session
+    /// turn indefinitely, and the tool declares no self-managed bound of its
+    /// own. The registry wrap point (`execute_with_deadline`) turns a call that
+    /// exceeds this budget into a clear, model-visible timeout error instead of
+    /// stalling the whole session.
+    ///
+    /// Cancellation safety: the scan is **read-only and idempotent**. On
+    /// timeout the turn returns immediately; the `spawn_blocking` scan keeps
+    /// running in the background for at most a bounded window and performs no
+    /// external side effects (it only reads and deserializes session files), so
+    /// no work is corrupted or orphaned. This is why a deadline is safe here even
+    /// though the join block does not abort the underlying scan.
+    pub const EXECUTION_TIMEOUT_SECS: u64 = 60;
+
     pub fn new() -> Self {
         Self
     }
@@ -295,6 +313,10 @@ impl Tool for SessionSearchTool {
 
     fn description(&self) -> &str {
         "Search past chat sessions. Current session and tool noise hidden by default."
+    }
+
+    fn execution_timeout(&self) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_secs(Self::EXECUTION_TIMEOUT_SECS))
     }
 
     fn parameters_schema(&self) -> Value {
