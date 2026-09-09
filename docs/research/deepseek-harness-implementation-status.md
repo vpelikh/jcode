@@ -231,3 +231,32 @@ These are explicitly open and are tracked as follow-ups, not delivered work:
   #10 to the background-running projection the takeaway names; a *unified
   multi-executor `jobs` registry* spanning bash `&` + terminal + subagent
   remains broad follow-up, tracked under F2's remaining items.
+
+## F8 — unify tool timeouts on the shared seam (follow-up, parked)
+
+Two parallel timeout systems exist today:
+
+- **Shared seam (takeaway #7):** `Tool::execution_timeout()` is wrapped by
+  `Registry::execute` with `tokio::time::timeout`; on expiry it **hard-drops**
+  the future and returns a model-visible "timed out after Ns" error. Currently
+  only `websearch` opts in.
+- **Native self-managed timeouts:** `bash`, `bg`, and `webfetch` do **not**
+  override `execution_timeout()`. They implement their own internal timeout
+  inside `execute()`. Notably `bash` **promotes a timed-out command to a
+  background task** (dedicated task, own process group, progress handoff,
+  `kill_on_drop`) so long work is continued, not killed.
+
+**Follow-up intent:** make the *shared* seam support the richer "promote on
+timeout" behavior so `bash`/`bg` can opt in without losing their semantics —
+rather than leaving two parallel systems. A concrete design is an opt-in
+on-timeout strategy on the `Tool` trait (hard-drop vs promote-to-background)
+that routes through the same `Registry::execute` wrap point. This is a
+behavior-changing, cross-cutting change (touches the tool trait, the registry,
+bash/bg, and the background manager's adoption API) and should get its own
+dedicated session with a steering decision on the default for each tool.
+
+**Related (also parked as a small follow-up):** broaden the opt-in to the
+cancellable I/O tools that don't self-manage a timeout
+(`conversation_search`, `session_search`, `ambient`/schedule, `gmail`), and
+change the TUI info-widget `background_info` `None`-session fallback to show no
+indicator instead of a global aggregate (backward compat is not a goal).
