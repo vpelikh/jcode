@@ -66,6 +66,7 @@ async fn assign_task_without_target_picks_ready_agent() {
     let (swarm_event_tx, _swarm_event_rx) = broadcast::channel(32);
     let mutation_runtime = SwarmMutationRuntime::default();
 
+    let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
     handle_comm_assign_task(
         99,
         requester.to_string(),
@@ -73,8 +74,7 @@ async fn assign_task_without_target_picks_ready_agent() {
         None,
         Some("Pick a task and worker".to_string()),
         &client_tx,
-        &sessions,
-        &soft_interrupt_queues,
+        &session_h,
         &client_connections,
         &swarm_members,
         &swarms_by_id,

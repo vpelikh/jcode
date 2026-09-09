@@ -1,6 +1,7 @@
 #![cfg_attr(test, allow(clippy::items_after_test_module))]
 
 use super::append_swarm_completion_report_instructions;
+use super::services::SessionServiceHandle;
 use super::swarm::{
     now_unix_ms, swarm_task_heartbeat_interval, swarm_task_stale_after, touch_swarm_task_progress,
 };
@@ -13,7 +14,7 @@ use super::{
     ClientConnectionInfo, SwarmEvent, SwarmEventType, SwarmMember, SwarmMutationRuntime,
     SwarmState, SwarmTaskProgress, VersionedPlan, broadcast_swarm_plan,
     broadcast_swarm_plan_with_previous, broadcast_swarm_status, fanout_session_event,
-    persist_swarm_state_for, queue_soft_interrupt_for_session, record_swarm_event,
+    persist_swarm_state_for, record_swarm_event,
     set_member_task_label, truncate_detail, update_member_status, update_member_status_with_report,
 };
 use crate::agent::Agent;
@@ -1395,8 +1396,7 @@ pub(super) async fn handle_comm_assign_task(
     task_id: Option<String>,
     message: Option<String>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
-    sessions: &SessionAgents,
-    soft_interrupt_queues: &super::SessionInterruptQueues,
+    session: &SessionServiceHandle,
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
     swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
     swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
@@ -1415,8 +1415,7 @@ pub(super) async fn handle_comm_assign_task(
         message,
         AssignDedupMode::ReplayFinal,
         client_event_tx,
-        sessions,
-        soft_interrupt_queues,
+        session,
         client_connections,
         swarm_members,
         swarms_by_id,
@@ -1442,8 +1441,7 @@ async fn handle_comm_assign_task_with_mode(
     message: Option<String>,
     dedup_mode: AssignDedupMode,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
-    sessions: &SessionAgents,
-    soft_interrupt_queues: &super::SessionInterruptQueues,
+    session: &SessionServiceHandle,
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
     swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
     swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
@@ -1454,6 +1452,7 @@ async fn handle_comm_assign_task_with_mode(
     swarm_event_tx: &broadcast::Sender<SwarmEvent>,
     swarm_mutation_runtime: &SwarmMutationRuntime,
 ) {
+    let sessions = &session.sessions;
     let requested_target_session = target_session.and_then(|target| {
         let trimmed = target.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_string())
@@ -1753,15 +1752,14 @@ async fn handle_comm_assign_task_with_mode(
         let agent_sessions = sessions.read().await;
         agent_sessions.get(&target_session).cloned()
     };
-    let _ = queue_soft_interrupt_for_session(
-        &target_session,
-        queued_task_prompt,
-        false,
-        SoftInterruptSource::System,
-        soft_interrupt_queues,
-        sessions,
-    )
-    .await;
+    let _ = session
+        .queue_soft_interrupt(
+            &target_session,
+            queued_task_prompt,
+            false,
+            SoftInterruptSource::System,
+        )
+        .await;
     if let Some(member) = swarm_members.read().await.get(&target_session) {
         let _ = member.event_tx.send(ServerEvent::Notification {
             from_session: req_session_id.clone(),
@@ -1857,10 +1855,9 @@ pub(super) async fn handle_comm_assign_next(
     model: Option<String>,
     effort: Option<String>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
-    sessions: &SessionAgents,
+    session: &SessionServiceHandle,
     global_session_id: &Arc<RwLock<String>>,
     provider_template: &Arc<dyn crate::provider::Provider>,
-    soft_interrupt_queues: &super::SessionInterruptQueues,
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
     swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
     swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
@@ -1872,6 +1869,8 @@ pub(super) async fn handle_comm_assign_next(
     mcp_pool: &Arc<crate::mcp::SharedMcpPool>,
     swarm_mutation_runtime: &SwarmMutationRuntime,
 ) {
+    let sessions = &session.sessions;
+    let soft_interrupt_queues = &session.soft_interrupt_queues;
     if target_session.is_none() {
         let swarm_id = match require_plan_driver_swarm(
             id,
@@ -1951,8 +1950,7 @@ pub(super) async fn handle_comm_assign_next(
                         Some(selected_task_id),
                         message,
                         client_event_tx,
-                        sessions,
-                        soft_interrupt_queues,
+                        session,
                         client_connections,
                         swarm_members,
                         swarms_by_id,
@@ -1986,8 +1984,7 @@ pub(super) async fn handle_comm_assign_next(
                     Some(selected_task_id),
                     message,
                     client_event_tx,
-                    sessions,
-                    soft_interrupt_queues,
+                    session,
                     client_connections,
                     swarm_members,
                     swarms_by_id,
@@ -2022,8 +2019,7 @@ pub(super) async fn handle_comm_assign_next(
         None,
         message,
         client_event_tx,
-        sessions,
-        soft_interrupt_queues,
+        session,
         client_connections,
         swarm_members,
         swarms_by_id,
@@ -2049,8 +2045,7 @@ pub(super) async fn handle_comm_task_control(
     target_session: Option<String>,
     message: Option<String>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
-    sessions: &SessionAgents,
-    soft_interrupt_queues: &super::SessionInterruptQueues,
+    session: &SessionServiceHandle,
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
     swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
     swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
@@ -2061,6 +2056,7 @@ pub(super) async fn handle_comm_task_control(
     swarm_event_tx: &broadcast::Sender<SwarmEvent>,
     swarm_mutation_runtime: &SwarmMutationRuntime,
 ) {
+    let sessions = &session.sessions;
     let Some(action) = TaskControlAction::parse(&action) else {
         let _ = client_event_tx.send(ServerEvent::Error {
             id,
@@ -2281,15 +2277,14 @@ pub(super) async fn handle_comm_task_control(
                     "Coordinator requested you wake and continue task '{}'.\n\n{}",
                     task_id, assignment_text
                 );
-                let _ = queue_soft_interrupt_for_session(
-                    &assignee,
-                    wake_message,
-                    false,
-                    SoftInterruptSource::System,
-                    soft_interrupt_queues,
-                    sessions,
-                )
-                .await;
+                let _ = session
+                    .queue_soft_interrupt(
+                        &assignee,
+                        wake_message,
+                        false,
+                        SoftInterruptSource::System,
+                    )
+                    .await;
                 let summary = plan_graph_status_for(&swarm_id, swarm_plans).await;
                 let _ = client_event_tx.send(ServerEvent::CommTaskControlResponse {
                     id,
@@ -2339,8 +2334,7 @@ pub(super) async fn handle_comm_task_control(
                 Some(retry_note),
                 AssignDedupMode::AlwaysDispatch,
                 client_event_tx,
-                sessions,
-                soft_interrupt_queues,
+                session,
                 client_connections,
                 swarm_members,
                 swarms_by_id,
@@ -2466,8 +2460,7 @@ pub(super) async fn handle_comm_task_control(
                 forwarded_message,
                 AssignDedupMode::AlwaysDispatch,
                 client_event_tx,
-                sessions,
-                soft_interrupt_queues,
+                session,
                 client_connections,
                 swarm_members,
                 swarms_by_id,
@@ -2504,15 +2497,14 @@ pub(super) async fn handle_comm_task_control(
                     displaced_new_target,
                     action.as_str()
                 );
-                let _ = queue_soft_interrupt_for_session(
-                    &assignee,
-                    stand_down.clone(),
-                    true,
-                    SoftInterruptSource::System,
-                    soft_interrupt_queues,
-                    sessions,
-                )
-                .await;
+                let _ = session
+                    .queue_soft_interrupt(
+                        &assignee,
+                        stand_down.clone(),
+                        true,
+                        SoftInterruptSource::System,
+                    )
+                    .await;
                 if let Some(member) = swarm_members.read().await.get(&assignee) {
                     let _ = member.event_tx.send(ServerEvent::Notification {
                         from_session: displaced_req_session,

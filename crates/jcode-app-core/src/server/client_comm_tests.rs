@@ -3,6 +3,7 @@ use crate::agent::Agent;
 use crate::message::{Message, ToolDefinition};
 use crate::protocol::{CommDeliveryMode, NotificationType, ServerEvent};
 use crate::provider::{EventStream, Provider};
+use crate::server::services::SessionServiceHandle;
 use crate::server::{ClientConnectionInfo, SessionInterruptQueues, SwarmEvent, SwarmMember};
 use crate::tool::Registry;
 use anyhow::Result;
@@ -41,6 +42,21 @@ async fn test_agent() -> Arc<Mutex<Agent>> {
     let provider: Arc<dyn Provider> = Arc::new(TestProvider);
     let registry = Registry::new(provider.clone()).await;
     Arc::new(Mutex::new(Agent::new(provider, registry)))
+}
+
+/// A minimal session service handle for soft-interrupt tests. The non-delivery
+/// handle fields are inert defaults.
+fn session_handle(
+    sessions: crate::server::SessionAgents,
+    soft_interrupt_queues: crate::server::SessionInterruptQueues,
+) -> SessionServiceHandle {
+    SessionServiceHandle {
+        sessions,
+        session_id: Arc::new(RwLock::new(String::new())),
+        is_processing: Arc::new(RwLock::new(false)),
+        shutdown_signals: Arc::new(RwLock::new(HashMap::new())),
+        soft_interrupt_queues,
+    }
 }
 
 #[tokio::test]
@@ -146,6 +162,7 @@ async fn comm_message_default_does_not_queue_soft_interrupt_for_connected_sessio
         },
     )])));
 
+    let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
     handle_comm_message(
         1,
         sender_id.clone(),
@@ -156,8 +173,7 @@ async fn comm_message_default_does_not_queue_soft_interrupt_for_connected_sessio
         None,
         None,
         &client_event_tx,
-        &sessions,
-        &soft_interrupt_queues,
+        &session_h,
         &swarm_members,
         &swarms_by_id,
         &channel_subscriptions,
@@ -306,6 +322,7 @@ async fn comm_message_with_wake_queues_soft_interrupt_for_busy_connected_session
 
     let _busy_guard = target.lock().await;
 
+    let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
     tokio::time::timeout(
         Duration::from_secs(2),
         handle_comm_message(
@@ -318,8 +335,7 @@ async fn comm_message_with_wake_queues_soft_interrupt_for_busy_connected_session
             None,
             None,
             &client_event_tx,
-            &sessions,
-            &soft_interrupt_queues,
+            &session_h,
             &swarm_members,
             &swarms_by_id,
             &channel_subscriptions,
@@ -551,6 +567,7 @@ async fn comm_message_accepts_friendly_name_dm_target() {
     let (swarm_event_tx, _) = broadcast::channel(16);
     let client_connections = Arc::new(RwLock::new(HashMap::new()));
 
+    let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
     handle_comm_message(
         1,
         sender_id.clone(),
@@ -561,8 +578,7 @@ async fn comm_message_accepts_friendly_name_dm_target() {
         None,
         None,
         &client_event_tx,
-        &sessions,
-        &soft_interrupt_queues,
+        &session_h,
         &swarm_members,
         &swarms_by_id,
         &channel_subscriptions,
@@ -715,6 +731,7 @@ async fn comm_message_rejects_ambiguous_friendly_name_dm_target() {
     let (swarm_event_tx, _) = broadcast::channel(16);
     let client_connections = Arc::new(RwLock::new(HashMap::new()));
 
+    let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
     handle_comm_message(
         1,
         sender_id,
@@ -725,8 +742,7 @@ async fn comm_message_rejects_ambiguous_friendly_name_dm_target() {
         None,
         None,
         &client_event_tx,
-        &sessions,
-        &soft_interrupt_queues,
+        &session_h,
         &swarm_members,
         &swarms_by_id,
         &channel_subscriptions,
@@ -826,6 +842,7 @@ async fn comm_broadcast_reaches_only_senders_spawned_subtree() {
     let client_connections = Arc::new(RwLock::new(HashMap::new()));
     let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
 
+    let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
     handle_comm_message(
         1,
         "sender".to_string(),
@@ -836,8 +853,7 @@ async fn comm_broadcast_reaches_only_senders_spawned_subtree() {
         None,
         None,
         &client_event_tx,
-        &sessions,
-        &soft_interrupt_queues,
+        &session_h,
         &swarm_members,
         &swarms_by_id,
         &channel_subscriptions,
@@ -867,6 +883,7 @@ async fn comm_broadcast_reaches_only_senders_spawned_subtree() {
     assert!(coord_rx.try_recv().is_err());
 
     // Coordinator broadcast still reaches the whole swarm.
+    let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
     handle_comm_message(
         2,
         "coord".to_string(),
@@ -877,8 +894,7 @@ async fn comm_broadcast_reaches_only_senders_spawned_subtree() {
         None,
         None,
         &client_event_tx,
-        &sessions,
-        &soft_interrupt_queues,
+        &session_h,
         &swarm_members,
         &swarms_by_id,
         &channel_subscriptions,

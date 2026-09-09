@@ -46,6 +46,7 @@ async fn task_control_wake_returns_structured_response_with_plan_summary() {
     let (swarm_event_tx, _swarm_event_rx) = broadcast::channel(32);
     let mutation_runtime = SwarmMutationRuntime::default();
 
+    let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
     handle_comm_task_control(
         101,
         requester.to_string(),
@@ -54,8 +55,7 @@ async fn task_control_wake_returns_structured_response_with_plan_summary() {
         Some(worker.to_string()),
         Some("continue".to_string()),
         &client_tx,
-        &sessions,
-        &soft_interrupt_queues,
+        &session_h,
         &client_connections,
         &swarm_members,
         &swarms_by_id,
@@ -137,6 +137,7 @@ async fn task_control_resume_without_task_id_uses_unique_target_assignment() {
     let (swarm_event_tx, _swarm_event_rx) = broadcast::channel(32);
     let mutation_runtime = SwarmMutationRuntime::default();
 
+    let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
     handle_comm_task_control(
         102,
         requester.to_string(),
@@ -145,8 +146,7 @@ async fn task_control_resume_without_task_id_uses_unique_target_assignment() {
         Some(worker.to_string()),
         None,
         &client_tx,
-        &sessions,
-        &soft_interrupt_queues,
+        &session_h,
         &client_connections,
         &swarm_members,
         &swarms_by_id,
@@ -224,6 +224,7 @@ async fn task_control_without_task_id_rejects_ambiguous_target_assignments() {
     let (swarm_event_tx, _swarm_event_rx) = broadcast::channel(32);
     let mutation_runtime = SwarmMutationRuntime::default();
 
+    let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
     handle_comm_task_control(
         103,
         requester.to_string(),
@@ -232,8 +233,7 @@ async fn task_control_without_task_id_rejects_ambiguous_target_assignments() {
         Some(worker.to_string()),
         None,
         &client_tx,
-        &sessions,
-        &soft_interrupt_queues,
+        &session_h,
         &client_connections,
         &swarm_members,
         &swarms_by_id,
@@ -324,6 +324,7 @@ async fn task_control_resume_busy_agent_rejects_without_mutating_plan() {
     // Hold the agent lock so the resume path sees the worker as busy.
     let _busy_guard = worker_agent.lock().await;
 
+    let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
     handle_comm_task_control(
         104,
         requester.to_string(),
@@ -332,8 +333,7 @@ async fn task_control_resume_busy_agent_rejects_without_mutating_plan() {
         None,
         None,
         &client_tx,
-        &sessions,
-        &soft_interrupt_queues,
+        &session_h,
         &client_connections,
         &swarm_members,
         &swarms_by_id,
@@ -532,6 +532,7 @@ async fn task_control_retry_re_dispatches_after_recent_identical_retry() {
         let swarm_event_tx = swarm_event_tx.clone();
         let mutation_runtime = mutation_runtime.clone();
         async move {
+            let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
             handle_comm_task_control(
                 id,
                 requester,
@@ -540,8 +541,7 @@ async fn task_control_retry_re_dispatches_after_recent_identical_retry() {
                 None,
                 None,
                 &client_tx,
-                &sessions,
-                &soft_interrupt_queues,
+                &session_h,
                 &client_connections,
                 &swarm_members,
                 &swarms_by_id,

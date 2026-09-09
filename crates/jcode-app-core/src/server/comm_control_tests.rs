@@ -5,6 +5,7 @@ use crate::plan::PlanItem;
 use crate::protocol::ServerEvent;
 use crate::provider::{EventStream, Provider};
 use crate::server::comm_await::{CommAwaitMembersContext, handle_comm_await_members};
+use crate::server::services::SessionServiceHandle;
 use crate::server::{
     AwaitMembersRuntime, SwarmEvent, SwarmEventType, SwarmMember, SwarmMutationRuntime,
     VersionedPlan,
@@ -141,6 +142,21 @@ async fn test_agent() -> Arc<Mutex<Agent>> {
     let provider: Arc<dyn Provider> = Arc::new(TestProvider);
     let registry = Registry::new(provider.clone()).await;
     Arc::new(Mutex::new(Agent::new(provider, registry)))
+}
+
+/// A minimal session service handle for soft-interrupt tests. The non-delivery
+/// handle fields are inert defaults.
+fn session_handle(
+    sessions: crate::server::SessionAgents,
+    soft_interrupt_queues: crate::server::SessionInterruptQueues,
+) -> SessionServiceHandle {
+    SessionServiceHandle {
+        sessions,
+        session_id: Arc::new(RwLock::new(String::new())),
+        is_processing: Arc::new(RwLock::new(false)),
+        shutdown_signals: Arc::new(RwLock::new(HashMap::new())),
+        soft_interrupt_queues,
+    }
 }
 
 include!("comm_control_tests/assign_task.rs");

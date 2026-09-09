@@ -45,6 +45,7 @@ async fn assign_task_without_task_id_picks_highest_priority_runnable_task() {
     let (swarm_event_tx, _swarm_event_rx) = broadcast::channel(32);
     let mutation_runtime = SwarmMutationRuntime::default();
 
+    let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
     handle_comm_assign_task(
         77,
         requester.to_string(),
@@ -52,8 +53,7 @@ async fn assign_task_without_task_id_picks_highest_priority_runnable_task() {
         None,
         Some("Pick the next task".to_string()),
         &client_tx,
-        &sessions,
-        &soft_interrupt_queues,
+        &session_h,
         &client_connections,
         &swarm_members,
         &swarms_by_id,
@@ -150,6 +150,7 @@ async fn assign_task_marks_completed_worker_queued_before_returning() {
     let (swarm_event_tx, _swarm_event_rx) = broadcast::channel(32);
     let mutation_runtime = SwarmMutationRuntime::default();
 
+    let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
     handle_comm_assign_task(
         78,
         requester.to_string(),
@@ -157,8 +158,7 @@ async fn assign_task_marks_completed_worker_queued_before_returning() {
         Some("next".to_string()),
         None,
         &client_tx,
-        &sessions,
-        &soft_interrupt_queues,
+        &session_h,
         &client_connections,
         &swarm_members,
         &swarms_by_id,

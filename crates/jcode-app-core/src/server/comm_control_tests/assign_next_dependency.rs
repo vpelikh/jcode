@@ -61,6 +61,7 @@ async fn assign_next_prefers_worker_with_dependency_context() {
     let global_session_id = Arc::new(RwLock::new(String::new()));
     let mcp_pool = Arc::new(crate::mcp::SharedMcpPool::from_default_config());
 
+    let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
     handle_comm_assign_next(
         102,
         requester.to_string(),
@@ -72,10 +73,9 @@ async fn assign_next_prefers_worker_with_dependency_context() {
         None,
         None,
         &client_tx,
-        &sessions,
+        &session_h,
         &global_session_id,
         &provider,
-        &soft_interrupt_queues,
         &client_connections,
         &swarm_members,
         &swarms_by_id,
