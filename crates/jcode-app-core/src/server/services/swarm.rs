@@ -298,4 +298,33 @@ impl SwarmServiceHandle {
         )
         .await;
     }
+
+    /// Remove a session from a swarm plan's participant set. Routes through the
+    /// swarm service so session-lifecycle code does not reach into the raw plans
+    /// map. Deferred to `swarm::remove_plan_participant`.
+    pub(crate) async fn remove_plan_participant(&self, swarm_id: &str, session_id: &str) {
+        super::super::swarm::remove_plan_participant(
+            swarm_id,
+            session_id,
+            &self.swarm_state.plans,
+        )
+        .await;
+    }
+
+    /// Rename a session in a swarm plan's participant set when its session id
+    /// changes (resume under a new id). Deferred to `swarm::rename_plan_participant`.
+    pub(crate) async fn rename_plan_participant(
+        &self,
+        swarm_id: &str,
+        old_session_id: &str,
+        new_session_id: &str,
+    ) {
+        super::super::swarm::rename_plan_participant(
+            swarm_id,
+            old_session_id,
+            new_session_id,
+            &self.swarm_state.plans,
+        )
+        .await;
+    }
 }

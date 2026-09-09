@@ -6,9 +6,9 @@ use super::{
     ClientConnectionInfo, ClientDebugState, FileTouchService, SessionInterruptQueues, SwarmMember,
     SwarmState, VersionedPlan, broadcast_swarm_status, fanout_live_client_event,
     persist_swarm_state_for, register_background_tool_signal, register_session_event_sender,
-    register_session_interrupt_queue, remove_background_tool_signal, remove_plan_participant,
+    register_session_interrupt_queue, remove_background_tool_signal,
     remove_session_channel_subscriptions, remove_session_from_swarm,
-    remove_session_interrupt_queue, rename_background_tool_signal, rename_plan_participant,
+    remove_session_interrupt_queue, rename_background_tool_signal,
     rename_session_interrupt_queue, send_swarm_plan_to_session, swarm_id_for_session,
     unregister_session_event_sender,
 };
@@ -149,8 +149,6 @@ pub(super) async fn handle_clear_session(
     // Swarm-domain state is reached through the swarm service handle. These
     // locals keep the body single-homed on the handle's fields instead of a
     // flat pass-through argument bag (server service split, Slice 4).
-    let swarm_plans = &swarm.swarm_state.plans;
-
     let clear_start = Instant::now();
     let old_session_id = client_session_id.clone();
     crate::logging::event_info(
@@ -250,7 +248,7 @@ pub(super) async fn handle_clear_session(
     .await;
     swarm.set_member_status(&new_id, "ready", None).await;
     if let Some(ref swarm_id) = swarm_id_for_update {
-        remove_plan_participant(swarm_id, client_session_id, swarm_plans).await;
+        swarm.remove_plan_participant(swarm_id, client_session_id).await;
     }
 
     *client_session_id = new_id.clone();
@@ -692,7 +690,7 @@ pub(super) async fn handle_subscribe(
 
         if let Some(old_id) = old_swarm_id.clone() {
             if updated_swarm_id.as_ref() != Some(&old_id) {
-                remove_plan_participant(&old_id, client_session_id, swarm_plans).await;
+                swarm.remove_plan_participant(&old_id, client_session_id).await;
                 let swarm_state = SwarmState {
                     members: Arc::clone(swarm_members),
                     swarms_by_id: Arc::clone(swarms_by_id),
@@ -1496,7 +1494,7 @@ pub(super) async fn handle_resume_session(
                     .get(&session_id)
                     .and_then(|member| member.swarm_id.clone())
             } {
-                rename_plan_participant(&swarm_id, &old_session_id, &session_id, swarm_plans).await;
+                swarm.rename_plan_participant(&swarm_id, &old_session_id, &session_id).await;
                 let swarm_state = SwarmState {
                     members: Arc::clone(swarm_members),
                     swarms_by_id: Arc::clone(swarms_by_id),

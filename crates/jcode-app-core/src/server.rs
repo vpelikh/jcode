@@ -66,7 +66,7 @@ use self::swarm::{
     MAX_SWARM_MEMBERS, broadcast_swarm_plan, broadcast_swarm_plan_with_previous,
     broadcast_swarm_status, expired_terminal_member_ids, member_consumes_swarm_capacity,
     record_swarm_event, record_swarm_event_for_session, refresh_swarm_task_staleness,
-    remove_plan_participant, remove_session_from_swarm, rename_plan_participant, run_swarm_message,
+    remove_session_from_swarm, run_swarm_message,
     send_swarm_plan_to_session, set_member_task_label, swarm_is_self_or_ancestor,
     update_member_status, update_member_status_with_report, update_member_status_with_report_tldr,
 };
