@@ -1300,7 +1300,7 @@ impl Agent {
                     println!("{}", preview.lines().next().unwrap_or("(done)"));
                 }
 
-                let blocks = tool_output_to_content_blocks(tc.id.to_string(), output);
+                let blocks = tool_output_to_content_blocks(tc.id, output);
                 self.add_message_with_duration(
                     Role::User,
                     blocks,
