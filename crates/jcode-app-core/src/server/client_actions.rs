@@ -3,8 +3,8 @@
 use super::client_lifecycle::process_message_streaming_mpsc;
 use super::services::{SessionServiceHandle, SwarmServiceHandle};
 use super::{
-    ClientConnectionInfo, SwarmEvent, SwarmMember, SwarmState,
-    VersionedPlan, broadcast_swarm_status, fanout_session_event, persist_swarm_state_for,
+    ClientConnectionInfo, SwarmEvent, SwarmMember, SwarmState, VersionedPlan,
+    broadcast_swarm_status, fanout_session_event, persist_swarm_state_for,
     remove_session_channel_subscriptions, remove_session_from_swarm, swarm_id_for_session,
     truncate_detail,
 };
@@ -1226,7 +1226,11 @@ pub(super) async fn handle_agent_task(
     ctx: &AgentTaskContext<'_>,
 ) {
     ctx.swarm
-        .set_member_status(client_session_id, "running", Some(truncate_detail(&task, 120)))
+        .set_member_status(
+            client_session_id,
+            "running",
+            Some(truncate_detail(&task, 120)),
+        )
         .await;
 
     let result = process_message_streaming_mpsc(
