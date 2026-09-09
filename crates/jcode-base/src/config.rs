@@ -262,10 +262,12 @@ fn populate_context_limits_from_config_ref(cfg: &Config) {
 /// Get the global config instance.
 ///
 /// The returned reference is backed by a reloadable process cache. Calls check
-/// the config file path/metadata and relevant environment overrides on a short
-/// throttle, not every frame. When those inputs change, the next checked call
-/// reloads config.toml and invalidates dependent auth/model caches. Older
-/// references remain valid for the duration of any in-flight operation.
+/// the relevant environment overrides on every call (cheap, in-memory) so an env
+/// change is honored immediately, while the config-file path/metadata is checked
+/// on a short throttle to avoid re-statting config.toml every frame. When either
+/// input changes, the next checked call reloads config.toml and invalidates
+/// dependent auth/model caches. Older references remain valid for the duration
+/// of any in-flight operation.
 pub fn config() -> &'static Config {
     // Ensure CONFIG_CACHE is initialized before snapshotting the environment so
     // the snapshot matches the env Config::load() produced during init.
