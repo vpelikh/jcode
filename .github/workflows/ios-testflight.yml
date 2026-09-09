@@ -2,6 +2,9 @@ name: iOS TestFlight
 
 env:
   JCODE_CI: "1"
+  BUNDLE_ID: com.jcode.mobile
+  SCHEME: JCodeMobile
+  TEAM_ID: TAS6ARKDN7
 
 on:
   workflow_dispatch:
@@ -14,11 +17,6 @@ on:
 concurrency:
   group: ios-testflight-${{ github.ref }}
   cancel-in-progress: true
-
-env:
-  BUNDLE_ID: com.jcode.mobile
-  SCHEME: JCodeMobile
-  TEAM_ID: TAS6ARKDN7
 
 jobs:
   test:
