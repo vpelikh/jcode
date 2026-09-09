@@ -1,16 +1,14 @@
 use super::live_turn::{LiveTurnSwarmContext, run_live_turn_if_idle};
 use super::services::{SessionServiceHandle, SwarmServiceHandle};
-use super::state::SwarmEvent;
 use super::{SwarmMember, fanout_session_event};
 use crate::message::{
     format_background_task_notification_markdown, format_background_task_progress_markdown,
 };
 use crate::protocol::{NotificationType, ServerEvent};
 use jcode_agent_runtime::SoftInterruptSource;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::RwLock;
 
 async fn emit_external_wake(
     session_id: &str,
@@ -34,20 +32,17 @@ async fn emit_external_wake(
     true
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "background task completion needs session, interrupt, and swarm status state"
-)]
 pub(super) async fn dispatch_background_task_completion(
     task: &crate::bus::BackgroundTaskCompleted,
     session: &SessionServiceHandle,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    event_history: &Arc<RwLock<VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
+    swarm: &SwarmServiceHandle,
 ) {
     let sessions = &session.sessions;
+    let swarm_members = &swarm.swarm_state.members;
+    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let event_history = &swarm.event_history;
+    let event_counter = &swarm.event_counter;
+    let swarm_event_tx = &swarm.swarm_event_tx;
     let notification = format_background_task_notification_markdown(task);
 
     if task.notify
@@ -120,20 +115,17 @@ pub(super) async fn dispatch_background_task_completion(
 /// Mirrors completion delivery: optionally notify attached clients, then wake
 /// an idle agent or queue a soft interrupt for a busy one. The task is still
 /// running; the message tells the agent to inspect and decide.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "background task stall delivery needs session, interrupt, and swarm status state"
-)]
 pub(super) async fn dispatch_background_task_stalled(
     task: &crate::bus::BackgroundTaskStalled,
     session: &SessionServiceHandle,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    event_history: &Arc<RwLock<VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
+    swarm: &SwarmServiceHandle,
 ) {
     let sessions = &session.sessions;
+    let swarm_members = &swarm.swarm_state.members;
+    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let event_history = &swarm.event_history;
+    let event_counter = &swarm.event_counter;
+    let swarm_event_tx = &swarm.swarm_event_tx;
     let notification = crate::message::format_background_task_stalled_markdown(task);
 
     if task.notify
@@ -205,20 +197,17 @@ pub(super) async fn dispatch_background_task_stalled(
 /// requesting session. Mirrors background-task completion delivery: optionally
 /// notify attached clients, then wake an idle agent or queue a soft interrupt
 /// for a busy one.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "swarm await completion needs session, interrupt, and swarm status state"
-)]
 pub(super) async fn dispatch_swarm_await_completion(
     event: &crate::bus::SwarmAwaitCompleted,
     session: &SessionServiceHandle,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    event_history: &Arc<RwLock<VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
+    swarm: &SwarmServiceHandle,
 ) {
     let sessions = &session.sessions;
+    let swarm_members = &swarm.swarm_state.members;
+    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let event_history = &swarm.event_history;
+    let event_counter = &swarm.event_counter;
+    let swarm_event_tx = &swarm.swarm_event_tx;
     if event.notify
         && fanout_session_event(
             swarm_members,

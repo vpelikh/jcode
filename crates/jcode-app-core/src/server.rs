@@ -2232,43 +2232,16 @@ impl Server {
                     }
                 }
                 Ok(BusEvent::BackgroundTaskCompleted(task)) => {
-                    dispatch_background_task_completion(
-                        &task,
-                        session,
-                        &swarm_members,
-                        &swarms_by_id,
-                        &event_history,
-                        &event_counter,
-                        &swarm_event_tx,
-                    )
-                    .await;
+                    dispatch_background_task_completion(&task, session, swarm).await;
                 }
                 Ok(BusEvent::BackgroundTaskProgress(task)) => {
                     dispatch_background_task_progress(&task, &swarm_members).await;
                 }
                 Ok(BusEvent::BackgroundTaskStalled(task)) => {
-                    dispatch_background_task_stalled(
-                        &task,
-                        session,
-                        &swarm_members,
-                        &swarms_by_id,
-                        &event_history,
-                        &event_counter,
-                        &swarm_event_tx,
-                    )
-                    .await;
+                    dispatch_background_task_stalled(&task, session, swarm).await;
                 }
                 Ok(BusEvent::SwarmAwaitCompleted(event)) => {
-                    dispatch_swarm_await_completion(
-                        &event,
-                        session,
-                        &swarm_members,
-                        &swarms_by_id,
-                        &event_history,
-                        &event_counter,
-                        &swarm_event_tx,
-                    )
-                    .await;
+                    dispatch_swarm_await_completion(&event, session, swarm).await;
                 }
                 Ok(BusEvent::UiActivity(activity)) => {
                     dispatch_ui_activity(&activity, &swarm_members).await;
