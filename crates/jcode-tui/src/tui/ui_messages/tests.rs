@@ -3781,7 +3781,7 @@ fn render_tool_message_agentgrep_output_hidden_when_disabled() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_agentgrep_inline".to_string(),
+            id: "call_agentgrep_inline".to_string().into(),
             name: "agentgrep".to_string(),
             input: serde_json::json!({ "mode": "grep", "query": "fn bar" }),
             intent: None,
@@ -3812,7 +3812,7 @@ fn render_tool_message_agentgrep_output_shows_when_enabled() {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_agentgrep_inline".to_string(),
+            id: "call_agentgrep_inline".to_string().into(),
             name: "agentgrep".to_string(),
             input: serde_json::json!({ "mode": "grep", "query": "fn bar" }),
             intent: None,
@@ -4411,7 +4411,7 @@ fn compass_query_output_msg(content: &str) -> DisplayMessage {
         duration_secs: None,
         title: None,
         tool_data: Some(crate::message::ToolCall {
-            id: "call_compass_inline".to_string(),
+            id: "call_compass_inline".to_string().into(),
             name: "compass_query".to_string(),
             input: serde_json::json!({ "query": "fn config" }),
             intent: None,
