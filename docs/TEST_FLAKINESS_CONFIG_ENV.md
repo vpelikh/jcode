@@ -66,19 +66,26 @@ for both tests and live process env overrides.
 
 ## Second issue: HOME mutation race in bash gate tests
 
-`crates/jcode-app-core/src/tool/bash_tests.rs` had two tests that mutate the
-process `HOME` env var via `std::env::set_var` without taking the shared
-test-env lock:
+Three tests mutate the process `HOME` env var via `std::env::set_var` without
+taking the shared test-env lock, so under the default parallel harness another
+test that reads `HOME` can observe a mid-mutation value:
 
-- `bash_refuses_to_delete_the_home_directory`
-- `indirect_dispatch_paths_cannot_bypass_the_gate`
+- `crates/jcode-app-core/src/tool/bash_tests.rs`:
+  `bash_refuses_to_delete_the_home_directory`,
+  `indirect_dispatch_paths_cannot_bypass_the_gate`
+- `crates/jcode-app-core/src/tool/apply_patch_tests.rs`:
+  `apply_patch_refuses_to_delete_a_protected_path` (same Issue #604 gate class)
+- `crates/jcode-app-core/src/agent/provider.rs`:
+  `resolve_working_dir_tests::tilde_expands_to_home`
 
-Under the default parallel harness another test can read `HOME` mid-mutation, so
-the gate detects the wrong HOME and the test intermittently fails. Every other
-HOME/`JCODE_HOME`-mutating test in the crate takes
-`crate::storage::lock_test_env()`; these two were the exceptions. Fixed by adding
-the lock to both, matching the established convention. Validated: 3 clean
-parallel runs of `cargo test -p jcode-app-core --lib tool::bash::tests`.
+Each now takes `crate::storage::lock_test_env()`, matching the established
+convention used by every other HOME/`JCODE_HOME`-mutating test in the crate.
+Validated: clean parallel runs of the affected modules and of
+`cargo test -p jcode-app-core --lib server::tests:: -- --test-threads=1`.
+
+Note: `jcode-base/src/auth/tests.rs` also mutates `HOME`/`JCODE_HOME`, but there
+the mutation lives in a helper invoked only by tests that already hold
+`lock_test_env()`, so no change was needed there.
 
 ## Residual known flake (not fixed)
 

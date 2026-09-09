@@ -502,6 +502,7 @@ mod resolve_working_dir_tests {
 
     #[test]
     fn tilde_expands_to_home() {
+        let _env_lock = crate::storage::lock_test_env();
         let home = std::env::temp_dir().join("jcode-wd-home-test");
         let sub = home.join("subdir");
         std::fs::create_dir_all(&sub).unwrap();
