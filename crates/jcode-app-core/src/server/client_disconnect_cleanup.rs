@@ -1,8 +1,9 @@
+use super::services::SwarmServiceHandle;
 use super::{
-    ClientConnectionInfo, ClientDebugState, FileTouchService, SessionInterruptQueues, SwarmEvent,
-    SwarmEventType, SwarmMember, VersionedPlan, record_swarm_event, remove_background_tool_signal,
-    remove_session_channel_subscriptions, remove_session_from_swarm,
-    remove_session_interrupt_queue, unregister_session_event_sender, update_member_status,
+    ClientConnectionInfo, ClientDebugState, FileTouchService, SessionInterruptQueues, SwarmEventType,
+    SwarmMember,
+    remove_background_tool_signal, remove_session_interrupt_queue,
+    unregister_session_event_sender,
 };
 use crate::agent::Agent;
 use anyhow::Result;
@@ -10,7 +11,7 @@ use jcode_agent_runtime::InterruptSignal;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 
 type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
 type ChannelSubscriptions = Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
@@ -89,25 +90,21 @@ pub(super) async fn cleanup_client_connection(
     client_is_processing: bool,
     processing_task: &mut Option<tokio::task::JoinHandle<()>>,
     event_handle: tokio::task::JoinHandle<()>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
+    swarm: &SwarmServiceHandle,
     file_touch: &FileTouchService,
-    channel_subscriptions: &ChannelSubscriptions,
-    channel_subscriptions_by_session: &ChannelSubscriptions,
     client_debug_state: &Arc<RwLock<ClientDebugState>>,
     client_debug_id: &str,
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
     client_connection_id: &str,
     shutdown_signals: &Arc<RwLock<HashMap<String, InterruptSignal>>>,
     soft_interrupt_queues: &SessionInterruptQueues,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
     client_event_tx: &mpsc::UnboundedSender<crate::protocol::ServerEvent>,
     idle_reconnect_grace: Duration,
 ) -> Result<()> {
+    // Swarm-domain state is reached through the swarm service handle. The
+    // members map is bound for the mid-body membership reads and the member
+    // removal; all other swarm teardown routes through the handle.
+    let swarm_members = &swarm.swarm_state.members;
     let disposition = disconnect_disposition(disconnected_while_processing(
         client_is_processing,
         processing_task.as_ref(),
@@ -282,17 +279,9 @@ pub(super) async fn cleanup_client_connection(
                 ("stopped", Some("server reload in progress".to_string()))
             }
         };
-        update_member_status(
-            client_session_id,
-            status,
-            detail,
-            swarm_members,
-            swarms_by_id,
-            Some(event_history),
-            Some(event_counter),
-            Some(swarm_event_tx),
-        )
-        .await;
+        swarm
+            .set_member_status(client_session_id, status, detail)
+            .await;
 
         let (swarm_id, removed_name) = {
             let mut members = swarm_members.write().await;
@@ -306,34 +295,19 @@ pub(super) async fn cleanup_client_connection(
         crate::session_effort::forget_session_effort(client_session_id);
 
         if let Some(ref swarm_id) = swarm_id {
-            record_swarm_event(
-                event_history,
-                event_counter,
-                swarm_event_tx,
-                client_session_id.to_string(),
-                removed_name.clone(),
-                Some(swarm_id.clone()),
-                SwarmEventType::MemberChange {
-                    action: "left".to_string(),
-                },
-            )
-            .await;
-            remove_session_from_swarm(
-                client_session_id,
-                swarm_id,
-                swarm_members,
-                swarms_by_id,
-                swarm_coordinators,
-                swarm_plans,
-            )
-            .await;
+            swarm
+                .record_swarm_event(
+                    client_session_id.to_string(),
+                    removed_name.clone(),
+                    Some(swarm_id.clone()),
+                    SwarmEventType::MemberChange {
+                        action: "left".to_string(),
+                    },
+                )
+                .await;
+            swarm.remove_session_from_swarm(client_session_id, swarm_id).await;
         }
-        remove_session_channel_subscriptions(
-            client_session_id,
-            channel_subscriptions,
-            channel_subscriptions_by_session,
-        )
-        .await;
+        swarm.remove_session_channel_subscriptions(client_session_id).await;
         file_touch.clear_session(client_session_id).await;
     }
 

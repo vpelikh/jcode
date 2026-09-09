@@ -3,6 +3,7 @@
 use super::*;
 use crate::protocol::ServerEvent;
 use crate::provider::{EventStream, Provider};
+use crate::server::services::SwarmServiceHandle;
 use crate::session::{Session, SessionStatus};
 use crate::tool::Registry;
 use async_trait::async_trait;
@@ -116,7 +117,24 @@ impl Fixture {
     }
 
     async fn cleanup(&self, processing: bool, grace: Duration) {
-        let (swarm_events, _) = broadcast::channel(8);
+        let (swarm_events, _) = tokio::sync::broadcast::channel(8);
+        let swarm = SwarmServiceHandle {
+            swarm_state: crate::server::SwarmState {
+                members: Arc::clone(&self.members),
+                swarms_by_id: Arc::new(RwLock::new(HashMap::new())),
+                plans: Arc::new(RwLock::new(HashMap::new())),
+                coordinators: Arc::new(RwLock::new(HashMap::new())),
+            },
+            shared_context: Arc::new(RwLock::new(HashMap::new())),
+            file_touch: FileTouchService::new(),
+            channel_subscriptions: Arc::new(RwLock::new(HashMap::new())),
+            channel_subscriptions_by_session: Arc::new(RwLock::new(HashMap::new())),
+            event_history: Arc::new(RwLock::new(std::collections::VecDeque::new())),
+            event_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            swarm_event_tx: swarm_events.clone(),
+            await_members_runtime: crate::server::AwaitMembersRuntime::default(),
+            swarm_mutation_runtime: crate::server::SwarmMutationRuntime::default(),
+        };
         let mut task = None;
         cleanup_client_connection(
             &self.sessions,
@@ -124,22 +142,14 @@ impl Fixture {
             processing,
             &mut task,
             tokio::spawn(std::future::pending()),
-            &self.members,
-            &Arc::new(RwLock::new(HashMap::new())),
-            &Arc::new(RwLock::new(HashMap::new())),
-            &Arc::new(RwLock::new(HashMap::new())),
+            &swarm,
             &FileTouchService::new(),
-            &Arc::new(RwLock::new(HashMap::new())),
-            &Arc::new(RwLock::new(HashMap::new())),
             &Arc::new(RwLock::new(ClientDebugState::default())),
             "debug-original",
             &self.connections,
             "original",
             &Arc::new(RwLock::new(HashMap::new())),
             &Arc::new(RwLock::new(HashMap::new())),
-            &Arc::new(RwLock::new(std::collections::VecDeque::new())),
-            &Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            &swarm_events,
             &self.events,
             grace,
         )
