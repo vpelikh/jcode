@@ -149,11 +149,11 @@ These are explicitly open and are tracked as follow-ups, not delivered work:
   vector. It is a separate, riskier, cross-crate change and is deliberately
   parked pending steering.
 - **F2 — remaining plan items (large refactors).** P1 #2+#8 execution-world seam +
-  fail-closed sandbox (confinement, not just classification); P2 #10 jobs
-  seam, #11 durable inbox, #14 waterfall hooks; P3 #17 layered config. These are
-  large, cross-cutting, and benefit from a steer before work begins. **#18
-  postmortem culture and #15 goals domain are no longer open here** — see F5
-  and F6 below.
+  fail-closed sandbox (confinement, not just classification); P2 #11 durable
+  inbox, #14 waterfall hooks; P3 #17 layered config. These are large,
+  cross-cutting, and benefit from a steer before work begins. **#18 postmortem
+  culture, #15 goals domain, and the #10 session/background-running slice are no
+  longer open here** — see F5, F6 and F7 below.
 - **F3 — extend `branded_id!` beyond the event log.** ✅ **Delivered.** The
   `branded_id!` macro moved out of `jcode-base` into a new minimal leaf crate
   `crates/jcode-id-types`, so the identity-bearing `-types` crates can depend on
@@ -210,4 +210,19 @@ These are explicitly open and are tracked as follow-ups, not delivered work:
   is registered on the tool registry and has a side-panel Goals view. This
   satisfies the doc's separation of a steered objective from the user's task
   list; the spelling differs ("initiative" vs "goal") but the domain intended by
-  #15 is present.
+  #15 is present.- **F7 — #10 session/background-running projection (the concrete slice of the
+  jobs seam that powers the busy indicator).** ✅ **Delivered.**
+  `BackgroundTaskManager::running_snapshot_for_session(session_id)` gives the
+  per-session **live** count of background jobs, derived from each task's
+  status-file `Running` status rather than from the in-memory map size. It
+  also fixes a latent over-count: before this, `running_snapshot()` returned
+  `tasks.len()` regardless of whether a task had already reached a terminal
+  state, and was global (it mixed every session's background work into the
+  focused session's busy indicator). Both the global and the new per-session
+  snapshot now filter by live `Running`, and the TUI info widget shows the
+  focused session's live count (falling back to global only when no session is
+  focused). One test covers session scoping and terminal-status exclusion.
+  `jcode-base` background suite: 21 passed, 0 failed. This bounds #10 to the
+  background-running projection the takeaway names; a *unified multi-executor
+  `jobs` registry* spanning bash `&` + terminal + subagent remains broad
+  follow-up, tracked under F2's remaining items.
