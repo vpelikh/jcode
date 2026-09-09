@@ -1494,33 +1494,29 @@ impl crate::tui::TuiState for App {
         };
 
         // Gather background task info
-        let background_info = {
-            // Get running background tasks count for the *focused* session
-            // (deepseek-harness takeaway #10: a per-session
-            // "background-running" projection, so the indicator reflects this
-            // session's live jobs rather than a global mix). Falls back to the
-            // global snapshot when no session is focused.
+        // deepseek-harness takeaway #10: a per-session "background-running"
+        // projection showing the focused session's live jobs rather than a
+        // global mix. When there is no focused session (e.g. a brief
+        // remote-startup window before the session id resolves) there is no
+        // meaningful session-scoped count, so the indicator is hidden instead
+        // of showing a global aggregate that would be misleading in the header.
+        let background_info = session_id.and_then(|session_id| {
             let bg_manager = crate::background::global();
-            let (running_count, running_tasks, progress) = match session_id {
-                Some(session_id) => bg_manager.running_snapshot_for_session(session_id),
-                None => bg_manager.running_snapshot(),
-            };
-
-            if running_count > 0 {
-                Some(crate::tui::info_widget::BackgroundInfo {
-                    running_count,
-                    running_tasks,
-                    progress_summary: progress.as_ref().map(|progress| progress.label.clone()),
-                    progress_detail: progress
-                        .as_ref()
-                        .and_then(|progress| progress.detail.clone()),
-                    memory_agent_active: false,
-                    memory_agent_turns: 0,
-                })
-            } else {
-                None
-            }
-        };
+            let (running_count, running_tasks, progress) =
+                bg_manager.running_snapshot_for_session(session_id);
+            (running_count > 0).then(|| crate::tui::info_widget::BackgroundInfo {
+                running_count,
+                running_tasks,
+                progress_summary: progress
+                    .as_ref()
+                    .map(|progress| progress.label.clone()),
+                progress_detail: progress
+                    .as_ref()
+                    .and_then(|progress| progress.detail.clone()),
+                memory_agent_active: false,
+                memory_agent_turns: 0,
+            })
+        });
 
         let route = self.widget_route_info(model.as_deref());
         let auth_method = self.widget_auth_method(route);
