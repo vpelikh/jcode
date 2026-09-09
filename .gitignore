@@ -24,6 +24,9 @@ captures/
 /*.mp4
 /*.png
 
+# macOS Finder metadata
+.DS_Store
+
 # JetBrains IDE workspace files
 /.idea/
 
