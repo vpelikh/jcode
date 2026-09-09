@@ -160,16 +160,22 @@ These are explicitly open and are tracked as follow-ups, not delivered work:
     provider producers and app-core/TUI consumers updated; 2 message-types tests.
   - **JobId** — `DebugJob.id` and the shared `HashMap<JobId, DebugJob>` jobs map
     are branded; 1 app-core test.
-  - **ToolCallId** — `ToolCall.id`, `StreamEvent::ToolUseStart.id`, and
-    `StreamEvent::ToolResult.tool_use_id` carry `ToolCallId`; app-core keys
-    `sdk_tool_results`/`tool_id_to_name` by `ToolCallId`; every provider runtime,
-    jcode-base `render`, jcode-tui, and the root CLI convert at the boundary. The
-    `branded_id!` macro gained a `Default` impl (empty string) so `#[serde(
-    default)]`-backed ids still deserialize an omitted field exactly as the prior
-    `String` default did. 2 new message-types tests.
+  - **ToolCallId** — `ToolCall.id`, `StreamEvent::ToolUseStart.id`,
+    `StreamEvent::ToolResult.tool_use_id`, and the persisted
+    `ContentBlock::ToolUse.id` / `ContentBlock::ToolResult.tool_use_id` all carry
+    `ToolCallId`; app-core keys `sdk_tool_results`/`tool_id_to_name` by
+    `ToolCallId`, the TUI tool-call/result tracking sets key by `ToolCallId`, and
+    every provider runtime, jcode-base `render`, jcode-tui, and the root CLI
+    convert at the wire/`ServerEvent` boundary. The `branded_id!` macro gained a
+    `Default` impl (empty string) so `#[serde(default)]`-backed ids still
+    deserialize an omitted field exactly as the prior `String` default did. A
+    `ToolCall::test()` fixture helper and a `compile_fail` doctest lock the
+    cross-type rejection. message-types + id-types tests cover the branding.
 
   Every wrapper is `#[serde(transparent)]`, so the on-wire/on-disk format is the
-  same bare string and persisted data round-trips unchanged. The full workspace
-  (`cargo build --workspace`) and the `jcode-app-core` lib test cfg both compile;
-  `jcode-id-types`, `jcode-message-types`, and the `jcode-app-core` `debug_job`
-  suites pass.
+  same bare string and persisted data round-trips unchanged (the legacy raw-string
+  journal loads verbatim through real persistence). `cargo check --all-targets
+  --all-features` and `cargo test --workspace --no-run` are both green;
+  `jcode-base` (1554 lib tests, incl. wire-format legacy-load), `jcode-app-core`
+  (1446 lib tests; the only failures are the documented pre-existing timing
+  flakes), and the provider/compaction suites all pass.
