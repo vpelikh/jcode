@@ -51,6 +51,10 @@ Keep the throttle only for the config-file `fs::metadata` stat.
   `ConfigCacheFingerprint.env` (the env snapshot already stored in the cache's
   `fingerprint`). If it changed, the fast-path throttle is bypassed and the
   config reloads immediately.
+- The snapshot is taken only after `CONFIG_CACHE` is initialized
+  (`LazyLock::force`). Config::load() can set env vars itself (e.g.
+  copilot_premium -> JCODE_COPILOT_PREMIUM); snapshotting before init would
+  miss those and spuriously reload on the very first `config()` call.
 - After reloading, `fingerprint` is refreshed (which re-reads the env snapshot),
   so the next comparison sees the post-load environment.
 

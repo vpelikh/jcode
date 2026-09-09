@@ -267,6 +267,12 @@ fn populate_context_limits_from_config_ref(cfg: &Config) {
 /// reloads config.toml and invalidates dependent auth/model caches. Older
 /// references remain valid for the duration of any in-flight operation.
 pub fn config() -> &'static Config {
+    // Ensure CONFIG_CACHE is initialized before snapshotting the environment so
+    // the snapshot matches the env Config::load() produced during init.
+    // Config::load() can set env vars itself (e.g. copilot_premium propagates
+    // to JCODE_COPILOT_PREMIUM). Computing the env snapshot before init would
+    // miss those and spuriously reload on the very first call.
+    let _ = LazyLock::force(&CONFIG_CACHE);
     // The env fingerprint is cheap to compute (in-memory scan of process env,
     // no file I/O), so it is compared on *every* call regardless of the
     // file-stat throttle. Env-driven runtime config (e.g. JCODE_WAKE_MODE,
