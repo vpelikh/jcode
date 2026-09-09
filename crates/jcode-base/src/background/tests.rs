@@ -878,3 +878,53 @@ async fn cancel_adopted_task_kills_inner_child_process() -> Result<()> {
     );
     Ok(())
 }
+
+/// deepseek-harness takeaway #10: the "session/background-running" projection
+/// must (a) reflect a single session's live jobs (not a global mix) and (b)
+/// derive the live count from the status file's actual `Running` status, so a
+/// task that has already reached a terminal state is never shown as running.
+#[tokio::test]
+async fn running_snapshot_for_session_filters_by_session_and_live_status() -> Result<()> {
+    let tmp = tempdir()?;
+    let manager = BackgroundTaskManager::with_output_dir(tmp.path().to_path_buf());
+
+    // Two tasks for "session-A", one for "session-B". Using real (harmless)
+    // spawned handles that stay alive keeps the manager's in-memory map full of
+    // live tasks; the status file is then used to simulate a task that has
+    // already gone terminal.
+    fn spawn_alive() -> tokio::task::JoinHandle<Result<jcode_tool_types::ToolOutput>> {
+        tokio::spawn(std::future::pending::<Result<jcode_tool_types::ToolOutput>>())
+    }
+
+    let a1 = manager.adopt("bash", "session-A", spawn_alive()).await;
+    manager.adopt("read", "session-A", spawn_alive()).await;
+    manager.adopt("bash", "session-B", spawn_alive()).await;
+
+    // All three live -> global count 3, per-session A = 2, B = 1.
+    let (global, _, _) = manager.running_snapshot();
+    assert_eq!(global, 3, "global snapshot should count all live tasks");
+    let (a_count, _, _) = manager.running_snapshot_for_session("session-A");
+    assert_eq!(a_count, 2, "session A has exactly two live tasks");
+    let (b_count, _, _) = manager.running_snapshot_for_session("session-B");
+    assert_eq!(b_count, 1, "session B has exactly one live task");
+
+    // Mark one of session-A's tasks as Completed by rewriting its status file.
+    let path = a1.status_file;
+    let mut status: super::TaskStatusFile =
+        serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    assert_eq!(status.session_id, "session-A");
+    status.status = crate::bus::BackgroundTaskStatus::Completed;
+    status.completed_at = Some(chrono::Utc::now().to_rfc3339());
+    std::fs::write(&path, serde_json::to_string_pretty(&status)?)?;
+
+    // Even though the completed task is still in the in-memory map, it must not
+    // be counted as running. Global drops to 2, session-A to 1, session-B stays 1.
+    let (global, _, _) = manager.running_snapshot();
+    assert_eq!(global, 2, "terminal task must not be counted as live globally");
+    let (a_count, _, _) = manager.running_snapshot_for_session("session-A");
+    assert_eq!(a_count, 1, "terminal task must not be counted for its session");
+    let (b_count, _, _) = manager.running_snapshot_for_session("session-B");
+    assert_eq!(b_count, 1, "session B unaffected by session A completion");
+
+    Ok(())
+}

@@ -1495,9 +1495,16 @@ impl crate::tui::TuiState for App {
 
         // Gather background task info
         let background_info = {
-            // Get running background tasks count
+            // Get running background tasks count for the *focused* session
+            // (deepseek-harness takeaway #10: a per-session
+            // "background-running" projection, so the indicator reflects this
+            // session's live jobs rather than a global mix). Falls back to the
+            // global snapshot when no session is focused.
             let bg_manager = crate::background::global();
-            let (running_count, running_tasks, progress) = bg_manager.running_snapshot();
+            let (running_count, running_tasks, progress) = match session_id {
+                Some(session_id) => bg_manager.running_snapshot_for_session(session_id),
+                None => bg_manager.running_snapshot(),
+            };
 
             if running_count > 0 {
                 Some(crate::tui::info_widget::BackgroundInfo {

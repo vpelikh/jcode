@@ -1596,19 +1596,68 @@ impl BackgroundTaskManager {
     /// Best-effort synchronous snapshot of currently running tasks.
     /// This avoids async calls in render paths.
     pub fn running_snapshot(&self) -> (usize, Vec<String>, Option<RunningBackgroundProgress>) {
+        self.running_snapshot_filtered(None)
+    }
+
+    /// Best-effort synchronous snapshot of currently running tasks scoped to a
+    /// single session (deepseek-harness takeaway #10's "session/
+    /// background-running" projection).
+    ///
+    /// `"there are N background jobs in this session"` — the per-session live
+    /// count that a busy indicator should show for the *focused* session, not a
+    /// global count that mixes in background work from every other session.
+    pub fn running_snapshot_for_session(
+        &self,
+        session_id: &str,
+    ) -> (usize, Vec<String>, Option<RunningBackgroundProgress>) {
+        self.running_snapshot_filtered(Some(session_id))
+    }
+
+    /// Shared implementation of [`running_snapshot`]. The registry may contain a
+    /// task whose status file has already transitioned to a terminal state
+    /// (`Completed`, `Failed`, `Superseded`) while it is still being reaped out
+    /// of the in-memory map, so the live count is derived from the status file's
+    /// actual `Running` status, not from `tasks.len()`. Filtering by `Running`
+    /// keeps the "X jobs running" indicator honest and never shows a finished
+    /// job as live.
+    fn running_snapshot_filtered(
+        &self,
+        session_id: Option<&str>,
+    ) -> (usize, Vec<String>, Option<RunningBackgroundProgress>) {
         let Ok(tasks) = self.tasks.try_read() else {
             return (0, Vec::new(), None);
         };
 
         let mut rows: Vec<RunningBackgroundProgress> = Vec::new();
         for task in tasks.values() {
+            if let Some(session_id) = session_id
+                && task.session_id != session_id
+            {
+                continue;
+            }
             let status = std::fs::read_to_string(&task.status_path)
                 .ok()
                 .and_then(|content| serde_json::from_str::<TaskStatusFile>(&content).ok());
-            let progress = status.as_ref().and_then(|status| status.progress.clone());
+            // A task still in the map but already terminal is not running.
+            // When the status file cannot be read the task is conservatively
+            // treated as live (it is still in the map and its handle is alive),
+            // preserving the previous behavior for the in-memory live set.
+            let Some(status) = status else {
+                rows.push(RunningBackgroundProgress {
+                    task_id: task.task_id.clone(),
+                    tool_name: task.tool_name.clone(),
+                    label: task.display_name.clone().unwrap_or_else(|| task.tool_name.clone()),
+                    detail: None,
+                });
+                continue;
+            };
+            if status.status != BackgroundTaskStatus::Running {
+                continue;
+            }
+            let progress = status.progress.clone();
             let label = status
-                .as_ref()
-                .and_then(|status| status.display_name.clone())
+                .display_name
+                .clone()
                 .or_else(|| task.display_name.clone())
                 .unwrap_or_else(|| task.tool_name.clone());
 
@@ -1624,7 +1673,7 @@ impl BackgroundTaskManager {
         let latest = rows.iter().find(|row| row.detail.is_some()).cloned();
 
         (
-            tasks.len(),
+            rows.len(),
             rows.iter().map(|row| row.label.clone()).collect(),
             latest,
         )
