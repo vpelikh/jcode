@@ -44,6 +44,15 @@ policy and report so every consumer stays in lockstep.
   `prune_transcript(PrunePolicy::payload_413())` instead of tracing
   `strip_oversized_images` then `emergency_truncate_tool_results`. The policy
   and escalation order now live in exactly one place.
+- **`/prune` slash command.** `jcode-tui` `commands.rs` + `input_help.rs`: runs
+  the model-free `PrunePolicy::node_caps()` pass on demand, reports
+  `PruneReport`, and is discoverable via `/help prune`. 2 dispatch tests.
+- **Scheduled per-step prune.** Wired at the streaming loop's Injection Point D
+  (`agent/turn_streaming_mpsc.rs`) and the headless `run_turn`
+  (`agent/turn_loops.rs`): each step runs the cheap node-caps pass before the
+  next API call, so an oversized tool result / screenshot added this batch is
+  shrunk immediately instead of surviving to re-summarization. No-op when within
+  caps (the run-every-step cadence takeaway #6 calls for).
 
 **Verification:** `jcode-compaction-core` 27 tests green (incl. 5 new `prune`
 tests). `jcode-base` **full lib 1556 green** (0 failed; incl. new
@@ -86,12 +95,16 @@ prune change:
   is not touched by the prune commits either; it is an environment-dependent
   SSH/hang in the same pre-existing class as the others.
 
-**Interpretation noted (deviation from the literal doc).** The doc's literal
-recommendation is about scheduling: run `prune` *on a cheap cadence* (every step)
-and `summarize` less often. This deliverable built the **seam and policy** and
-wired the existing on-demand recovery paths through it, but it did **not** add a
-scheduled run-every-step prune at a turn boundary (a loop/behavior change). A
-scheduled prune is a documented follow-up; the seam is the deliverable here.
+**Interpretation noted (scheduled prune now delivered).** The doc's literal
+recommendation is to run `prune` *on a cheap cadence* (every step). This is now
+delivered: a scheduled per-step prune using `PrunePolicy::node_caps()` runs at
+the streaming loop's Injection Point D and in the headless `run_turn`, before
+each next API call, shrinking any oversized node added this batch. A `/prune`
+slash command exposes the same node-caps pass on demand. It remains a cheap,
+model-free per-node-cap pass (no aggregate surgery) and a no-op when within
+caps. The build-level and token-accounting interaction with the summarizer on
+very large sessions is flagged as an observation follow-up, not an unimplemented
+recommendation.
 
 ## Takeaway #7 (loop hygiene)
 
