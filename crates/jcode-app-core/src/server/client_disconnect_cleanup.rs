@@ -270,7 +270,7 @@ pub(super) async fn cleanup_client_connection(
                         DisconnectDisposition::Reloading => "reloading",
                     };
                     let _ = crate::handoff::capture(
-                        &client_session_id,
+                        client_session_id,
                         handoff_working_dir.as_deref().map(std::path::Path::new),
                         disposition_str,
                         handoff_transcript.as_deref(),

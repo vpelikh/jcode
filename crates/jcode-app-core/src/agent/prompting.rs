@@ -125,14 +125,14 @@ impl Agent {
         // Inject a compact handoff from the most recent prior session in this
         // project, but only at the start of a fresh conversation (so it does
         // not re-announce itself on every turn of an already-running session).
-        if self.message_count() == 0 {
-            if let Some(handoff) = crate::handoff::render_boot_context(working_dir.as_deref()) {
-                if split.dynamic_part.is_empty() {
-                    split.dynamic_part = handoff;
-                } else {
-                    split.dynamic_part.push_str("\n\n");
-                    split.dynamic_part.push_str(&handoff);
-                }
+        if self.message_count() == 0
+            && let Some(handoff) = crate::handoff::render_boot_context(working_dir.as_deref())
+        {
+            if split.dynamic_part.is_empty() {
+                split.dynamic_part = handoff;
+            } else {
+                split.dynamic_part.push_str("\n\n");
+                split.dynamic_part.push_str(&handoff);
             }
         }
 
