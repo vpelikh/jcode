@@ -296,6 +296,56 @@ impl SwarmServiceHandle {
         .await;
     }
 
+    /// Update a member's status including a completion report, routing through
+    /// the swarm service. Deferred to
+    /// `swarm::update_member_status_with_report`.
+    pub(crate) async fn set_member_status_with_report(
+        &self,
+        session_id: &str,
+        status: &str,
+        detail: Option<String>,
+        completion_report: Option<String>,
+    ) {
+        super::super::swarm::update_member_status_with_report(
+            session_id,
+            status,
+            detail,
+            completion_report,
+            &self.swarm_state.members,
+            &self.swarm_state.swarms_by_id,
+            Some(&self.event_history),
+            Some(&self.event_counter),
+            Some(&self.swarm_event_tx),
+        )
+        .await;
+    }
+
+    /// Update a member's status including a completion report and a tldr,
+    /// routing through the swarm service. Deferred to
+    /// `swarm::update_member_status_with_report_tldr`.
+    pub(crate) async fn set_member_status_with_report_tldr(
+        &self,
+        session_id: &str,
+        status: &str,
+        detail: Option<String>,
+        completion_report: Option<String>,
+        report_tldr: Option<String>,
+    ) {
+        super::super::swarm::update_member_status_with_report_tldr(
+            session_id,
+            status,
+            detail,
+            completion_report,
+            report_tldr,
+            &self.swarm_state.members,
+            &self.swarm_state.swarms_by_id,
+            Some(&self.event_history),
+            Some(&self.event_counter),
+            Some(&self.swarm_event_tx),
+        )
+        .await;
+    }
+
     /// Remove a session from a swarm plan's participant set. Routes through the
     /// swarm service so session-lifecycle code does not reach into the raw plans
     /// map. Deferred to `swarm::remove_plan_participant`.

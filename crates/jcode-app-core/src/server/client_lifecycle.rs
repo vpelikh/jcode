@@ -49,10 +49,9 @@ use super::services::{
     ClientServiceHandle, DebugServiceHandle, SessionServiceHandle, SwarmServiceHandle,
 };
 use super::{
-    ClientConnectionInfo, SessionControlHandle, SessionInterruptQueues, SwarmEvent, SwarmMember,
+    ClientConnectionInfo, SessionControlHandle, SessionInterruptQueues, SwarmMember,
     format_structured_completion_report, register_session_interrupt_queue,
-    send_swarm_plan_to_session, truncate_detail, update_member_status,
-    update_member_status_with_report, update_member_status_with_report_tldr,
+    send_swarm_plan_to_session, truncate_detail,
 };
 use crate::agent::Agent;
 use crate::bus::{Bus, BusEvent};
@@ -63,7 +62,7 @@ use crate::transport::Stream;
 use anyhow::Result;
 use futures::FutureExt;
 use jcode_agent_runtime::{InterruptSignal, SoftInterruptSource, StreamError};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{
     Arc,
@@ -71,7 +70,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 
 type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
 const RELOAD_STARTING_GUARD_MAX_AGE: Duration = Duration::from_secs(30);
@@ -186,11 +185,7 @@ struct ProcessingState<'a> {
 }
 
 struct SwarmStatusRefs<'a> {
-    members: &'a Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &'a Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    event_history: &'a Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &'a Arc<std::sync::atomic::AtomicU64>,
-    event_tx: &'a broadcast::Sender<SwarmEvent>,
+    swarm: &'a SwarmServiceHandle,
 }
 
 fn should_start_idle_soft_interrupt(
@@ -858,12 +853,8 @@ pub(super) async fn handle_client(
                     record_processing_completion(
                         done_session.as_deref(), result, completion_report,
                         &SwarmStatusRefs {
-                            members: &swarm_members,
-                            swarms_by_id: &swarms_by_id,
-                            event_history: &event_history,
-                            event_counter: &event_counter,
-                            event_tx: &swarm_event_tx,
-                        },
+                            swarm: &swarm_service_handle,
+                            },
                     ).await;
                 } else {
                     break;
@@ -1066,12 +1057,8 @@ pub(super) async fn handle_client(
                 &session_control,
                 &client_event_tx,
                 &SwarmStatusRefs {
-                    members: &swarm_members,
-                    swarms_by_id: &swarms_by_id,
-                    event_history: &event_history,
-                    event_counter: &event_counter,
-                    event_tx: &swarm_event_tx,
-                },
+                    swarm: &swarm_service_handle,
+                    },
                 Some(id),
                 Some(request_decoded_at),
             )
@@ -1242,12 +1229,8 @@ pub(super) async fn handle_client(
                     &processing_done_tx,
                     active_terminal_env.clone(),
                     &SwarmStatusRefs {
-                        members: &swarm_members,
-                        swarms_by_id: &swarms_by_id,
-                        event_history: &event_history,
-                        event_counter: &event_counter,
-                        event_tx: &swarm_event_tx,
-                    },
+                        swarm: &swarm_service_handle,
+                        },
                 )
                 .await;
             }
@@ -1263,12 +1246,8 @@ pub(super) async fn handle_client(
                     &session_control,
                     &client_event_tx,
                     &SwarmStatusRefs {
-                        members: &swarm_members,
-                        swarms_by_id: &swarms_by_id,
-                        event_history: &event_history,
-                        event_counter: &event_counter,
-                        event_tx: &swarm_event_tx,
-                    },
+                        swarm: &swarm_service_handle,
+                        },
                     Some(id),
                     Some(request_decoded_at),
                 )
@@ -1336,12 +1315,8 @@ pub(super) async fn handle_client(
                         &processing_done_tx,
                         active_terminal_env.clone(),
                         &SwarmStatusRefs {
-                            members: &swarm_members,
-                            swarms_by_id: &swarms_by_id,
-                            event_history: &event_history,
-                            event_counter: &event_counter,
-                            event_tx: &swarm_event_tx,
-                        },
+                            swarm: &swarm_service_handle,
+                            },
                     )
                     .await;
                     if !client_is_processing {
@@ -2647,19 +2622,15 @@ pub(super) async fn handle_client(
                     follow_up.as_deref(),
                 );
                 let detail = Some(truncate_detail(&message, 160));
-                update_member_status_with_report_tldr(
-                    &req_session_id,
-                    &status,
-                    detail,
-                    Some(report),
-                    tldr,
-                    &swarm_members,
-                    &swarms_by_id,
-                    Some(&event_history),
-                    Some(&event_counter),
-                    Some(&swarm_event_tx),
-                )
-                .await;
+                swarm_service_handle
+                    .set_member_status_with_report_tldr(
+                        &req_session_id,
+                        &status,
+                        detail,
+                        Some(report),
+                        tldr,
+                    )
+                    .await;
                 let _ = client_event_tx.send(ServerEvent::CommReportResponse {
                     id,
                     status,
@@ -3017,12 +2988,8 @@ pub(super) async fn handle_client(
                         result,
                         report,
                         &SwarmStatusRefs {
-                            members: &swarm_members,
-                            swarms_by_id: &swarms_by_id,
-                            event_history: &event_history,
-                            event_counter: &event_counter,
-                            event_tx: &swarm_event_tx,
-                        },
+                            swarm: &swarm_service_handle,
+                            },
                     )
                     .await;
                 }
@@ -3074,33 +3041,27 @@ async fn record_processing_completion(
     match result {
         Ok(()) => {
             if let Some(session_id) = done_session {
-                update_member_status_with_report(
-                    session_id,
-                    "ready",
-                    None,
-                    completion_report,
-                    swarm.members,
-                    swarm.swarms_by_id,
-                    Some(swarm.event_history),
-                    Some(swarm.event_counter),
-                    Some(swarm.event_tx),
-                )
-                .await;
+                swarm
+                    .swarm
+                    .set_member_status_with_report(
+                        session_id,
+                        "ready",
+                        None,
+                        completion_report,
+                    )
+                    .await;
             }
         }
         Err(e) => {
             if let Some(session_id) = done_session {
-                update_member_status(
-                    session_id,
-                    "failed",
-                    Some(truncate_detail(&e.to_string(), 120)),
-                    swarm.members,
-                    swarm.swarms_by_id,
-                    Some(swarm.event_history),
-                    Some(swarm.event_counter),
-                    Some(swarm.event_tx),
-                )
-                .await;
+                swarm
+                    .swarm
+                    .set_member_status(
+                        session_id,
+                        "failed",
+                        Some(truncate_detail(&e.to_string(), 120)),
+                    )
+                    .await;
             }
             let retry_after_secs = e
                 .downcast_ref::<StreamError>()
@@ -3227,17 +3188,14 @@ async fn start_processing_message(
         ));
     }
 
-    update_member_status(
-        client_session_id,
-        "running",
-        Some(truncate_detail(&content, 120)),
-        swarm.members,
-        swarm.swarms_by_id,
-        Some(swarm.event_history),
-        Some(swarm.event_counter),
-        Some(swarm.event_tx),
-    )
-    .await;
+    swarm
+        .swarm
+        .set_member_status(
+            client_session_id,
+            "running",
+            Some(truncate_detail(&content, 120)),
+        )
+        .await;
 
     let start_message_index = {
         let agent_guard = agent.lock().await;
@@ -3247,7 +3205,7 @@ async fn start_processing_message(
     let report_agent = Arc::clone(&agent);
     let tx = super::state::session_event_fanout_sender_with_fallback(
         client_session_id.to_string(),
-        Arc::clone(swarm.members),
+        Arc::clone(&swarm.swarm.swarm_state.members),
         client_event_tx.clone(),
     );
     let done_tx = processing_done_tx.clone();
@@ -3394,17 +3352,10 @@ async fn cancel_processing_message(
         *state.task = None;
         *state.client_is_processing = false;
         if let Some(session_id) = state.session_id.take() {
-            update_member_status(
-                &session_id,
-                "stopped",
-                Some("cancelled".to_string()),
-                swarm.members,
-                swarm.swarms_by_id,
-                Some(swarm.event_history),
-                Some(swarm.event_counter),
-                Some(swarm.event_tx),
-            )
-            .await;
+            swarm
+                .swarm
+                .set_member_status(&session_id, "stopped", Some("cancelled".to_string()))
+                .await;
         }
         if let Some(message_id) = state.message_id.take() {
             let _ = client_event_tx.send(ServerEvent::Interrupted);
@@ -3462,17 +3413,14 @@ async fn cancel_processing_message(
             .session_id
             .take()
             .unwrap_or_else(|| session_control.session_id.clone());
-        update_member_status(
-            &status_session_id,
-            "stopped",
-            Some("cancelled".to_string()),
-            swarm.members,
-            swarm.swarms_by_id,
-            Some(swarm.event_history),
-            Some(swarm.event_counter),
-            Some(swarm.event_tx),
-        )
-        .await;
+        swarm
+            .swarm
+            .set_member_status(
+                &status_session_id,
+                "stopped",
+                Some("cancelled".to_string()),
+            )
+            .await;
         let _ = client_event_tx.send(ServerEvent::Interrupted);
         if let Some(message_id) = state.message_id.take() {
             let _ = client_event_tx.send(ServerEvent::Done { id: message_id });
