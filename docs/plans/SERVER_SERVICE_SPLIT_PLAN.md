@@ -649,10 +649,53 @@ call-site migrations with tests green:
   three lint warnings. Tests gained a `test_swarm_service_handle` helper for the
   three `dispatch_background_task_completion` call sites.
 
+### client_session, handle_set_feature, and live-turn status routing landed (2026-09)
+
+Four more slices landed in the same ownership direction, all thin wrapper +
+call-site migrations with tests green after each.
+
+- **`handle_subscribe` swarm-status rebroadcast routes through the handle.**
+  The two `broadcast_swarm_status` calls in `client_session.rs::handle_subscribe`
+  (swarm-id rename / membership-change rebroadcast) now go through the existing
+  `swarm.broadcast_swarm_status(&id)`, dropping the free-function import.
+- **`client_session.rs` teardown/channel cleanup collapses onto the handle.**
+  `handle_subscribe` and `handle_resume_session` now call
+  `swarm.remove_session_channel_subscriptions`; the private
+  `cleanup_detached_source_session_if_unused` helper collapsed its flat 8-arg
+  swarm bag (`members` + `swarms_by_id` + `coordinators` + `plans` +
+  `channel_subscriptions` x2) onto `&SwarmServiceHandle`, routing
+  `remove_session_channel_subscriptions` and `remove_session_from_swarm`
+  through the handle. Drops the now-unused `ChannelSubscriptions` type alias,
+  the `VersionedPlan` import, four flat swarm params on the helper, and its
+  `too_many_arguments` allow.
+- **`handle_set_feature` swarm toggle routes through the handle.** The
+  `client_actions.rs` Swarm toggle (the only remaining direct free-function
+  `update_member_status`-adjacent swarm mutator in that file) now takes
+  `&SwarmServiceHandle` instead of a flat 7-arg bag, binding the
+  members/swarms/coordinators/plans maps as body locals and routing
+  `remove_session_from_swarm`, `remove_session_channel_subscriptions`, and
+  `broadcast_swarm_status` through handle methods. The `client_lifecycle`
+  router passes `&swarm_service_handle`; the toggle test builds a minimal
+  handle. Drops the `ChannelSubscriptions` alias, the 
+  `remove_session_*`/`broadcast_swarm_status` imports, and the fulfilled
+  `too_many_arguments` attr.
+- **Live-turn member status routes through the handle.** The flat 5-field
+  `SwarmStatusRefs` wrapper in `client_lifecycle.rs` now carries
+  `&SwarmServiceHandle`, and the three live/cancel helpers
+  (`record_processing_completion`, `start_processing_message`,
+  `cancel_processing_message`) route their member-status updates through three
+  new handle methods: `set_member_status`, `set_member_status_with_report`, and
+  `set_member_status_with_report_tldr`. All six `SwarmStatusRefs` construction
+  sites in `handle_client` pass `&swarm_service_handle`, and the `CommReport`
+  tldr path routes through the handle too (making all three variants used).
+  Drops the now-unused `update_member_status*` imports, `HashSet`,
+  `broadcast`, and `SwarmEvent` in `client_lifecycle.rs`. Tests build the
+  handle via a new `test_swarm_status_handle` helper.
+
 The remaining free-function call sites for `update_member_status` /
 `broadcast_swarm_status` in `server.rs` maintenance paths,
-`client_lifecycle.rs`, `comm_control.rs`, `comm_session.rs`, `headless.rs`,
-`client_session.rs`, and `debug_session_admin.rs` are still open; as is the
+`comm_control.rs`, `comm_session.rs`, `headless.rs`, and
+`debug_session_admin.rs` are still open; as is the
 `LiveTurnSwarmContext` flat-field wrapper (its callers in `background_tasks.rs`,
 `client_comm_message.rs`, `client_actions.rs`, and `tests.rs` do not yet carry a
 handle, so converting it would cascade). They remain separate, mechanical
