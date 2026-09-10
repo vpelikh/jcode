@@ -47,7 +47,7 @@ the whole transcript or requiring the user to re-explain.
 | Module registration | `crates/jcode-base/src/lib.rs` |
 | Session-close hook | `crates/jcode-app-core/src/server/client_disconnect_cleanup.rs::cleanup_client_connection` |
 | Session-start system-prompt injection | `crates/jcode-app-core/src/agent/prompting.rs::build_system_prompt_split` |
-| Unit tests | `crates/jcode-base/src/handoff_tests.rs` |
+| Unit + integration tests | `crates/jcode-base/src/handoff_tests.rs` |
 
 ### Storage
 
@@ -69,6 +69,22 @@ the whole transcript or requiring the user to re-explain.
   "initiative_id": null
 }
 ```
+
+## Validation
+
+Behavior is exercised through the public `handoff` API with an isolated
+`JCODE_HOME` (`crates/jcode-base/src/handoff_tests.rs`):
+
+- **Main workflow end to end** (`full_workflow_capture_boot_render_promote`):
+  capture on close → boot-render from a *different* checkout of the same repo →
+  promote into a project-scoped initiative loadable from the other checkout.
+- **Integration boundary / portability** (`same_git_origin_buckets_across_paths`):
+  two checkouts with the same git origin land in one project bucket; a different
+  origin differs.
+- **Failure mode** (`corrupt_index_does_not_fail_capture`): a corrupt `index.json`
+  resets cleanly and still records — it never panics or aborts the close path.
+- **Edge cases**: no handoff when all todos are completed/cancelled; path-based
+  fallback when git is absent; assistant-text tail extraction.
 
 ## Slices 2+ (future)
 
