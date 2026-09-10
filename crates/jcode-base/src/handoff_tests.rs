@@ -3,14 +3,7 @@ use super::*;
 /// project_key prefers the git remote URL for portability across machines.
 #[test]
 fn project_key_prefers_git_remote() {
-    let timeout = std::time::Duration::from_secs(3);
-    if std::process::Command::new("git")
-        .args(["--version"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-        != true
-    {
+    if !git_available() {
         return;
     }
     let dir = tempfile::TempDir::new().expect("tempdir");
@@ -29,14 +22,19 @@ fn project_key_prefers_git_remote() {
         .args(["remote", "add", "origin", "https://example.com/acme/widget.git"])
         .output()
         .ok();
-    let key = project_key(Some(dir.path()));
-    // Give git a moment to have written the config synchronously (it has).
     assert_eq!(
-        key.as_deref(),
+        project_key(Some(dir.path())).as_deref(),
         Some("git:https://example.com/acme/widget.git"),
         "project key should be the git origin URL"
     );
-    let _ = timeout;
+}
+
+fn git_available() -> bool {
+    std::process::Command::new("git")
+        .args(["--version"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// Fallback: a file-less path hashes to the path form even without git.
@@ -191,6 +189,54 @@ async fn promote_to_initiative_creates_a_goal() {
     crate::env::remove_var("JCODE_HOME");
 }
 
+/// A session with an attached project-scoped goal must record that goal id in
+/// its handoff (F1: previously `load_attached_initiative` passed no working_dir,
+/// so project-scoped attachments never resolved).
+#[tokio::test]
+async fn build_snapshot_records_attached_project_initiative() {
+    let _guard = crate::storage::lock_test_env();
+    let home = tempfile::TempDir::new().expect("tempdir");
+    crate::env::set_var("JCODE_HOME", home.path());
+    let cwd = std::env::temp_dir().join("jcode-initiative-id-test");
+    std::fs::create_dir_all(&cwd).ok();
+
+    crate::todo::save_todos(
+        "s-ini",
+        &[TodoItem {
+            id: "i".into(),
+            content: "open work".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: None,
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .expect("todos");
+
+    // Create a project-scoped goal and attach it to the session.
+    let goal = crate::goal::create_goal(
+        crate::goal::GoalCreateInput {
+            id: Some("split-server-goal".into()),
+            title: "Split the server".into(),
+            scope: crate::goal::GoalScope::Project,
+            ..Default::default()
+        },
+        Some(&cwd),
+    )
+    .expect("create goal");
+    crate::goal::attach_goal_to_session("s-ini", &goal, Some(&cwd)).expect("attach");
+
+    let snap = build_snapshot("s-ini", Some(&cwd), "closed", None).expect("snapshot");
+    assert_eq!(
+        snap.initiative_id.as_deref(),
+        Some(goal.id.as_str()),
+        "the attached project initiative must be recorded in the handoff"
+    );
+
+    crate::env::remove_var("JCODE_HOME");
+}
+
 /// render_boot_context emits a compact block when a handoff exists.
 #[tokio::test]
 async fn render_boot_context_produces_block() {
@@ -250,12 +296,7 @@ fn git_repo_with_remote(dir: &std::path::Path, url: &str) {
 fn same_git_origin_buckets_across_paths() {
     let _guard = crate::storage::lock_test_env();
     // Skip when git is unavailable.
-    if !std::process::Command::new("git")
-        .args(["--version"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-    {
+    if !git_available() {
         return;
     }
     let checkout_a = tempfile::TempDir::new().expect("a");
@@ -393,12 +434,7 @@ fn boot_context_is_present_for_fresh_session_with_handoff() {
 #[tokio::test]
 async fn full_workflow_capture_boot_render_promote() {
     let _guard = crate::storage::lock_test_env();
-    if !std::process::Command::new("git")
-        .args(["--version"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-    {
+    if !git_available() {
         return;
     }
     let home = tempfile::TempDir::new().expect("tempdir");

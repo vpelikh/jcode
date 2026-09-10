@@ -138,7 +138,7 @@ pub fn build_snapshot(
         intent: plan.user_intention,
         open_todos,
         last_assistant_text,
-        initiative_id: load_attached_initiative(session_id),
+        initiative_id: load_attached_initiative(session_id, working_dir),
     })
 }
 
@@ -402,8 +402,8 @@ fn extract_last_assistant_text(transcript: &str) -> Option<String> {
 }
 
 /// Load the initiative id attached to a session, if any.
-fn load_attached_initiative(session_id: &str) -> Option<String> {
-    crate::goal::load_attached_goal(session_id, None)
+fn load_attached_initiative(session_id: &str, working_dir: Option<&Path>) -> Option<String> {
+    crate::goal::load_attached_goal(session_id, working_dir)
         .ok()
         .flatten()
         .map(|g| g.id)

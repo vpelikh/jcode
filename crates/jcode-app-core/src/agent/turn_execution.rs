@@ -135,7 +135,6 @@ impl Agent {
             .as_deref()
             .and_then(|wd| crate::handoff::render_boot_context(Some(std::path::Path::new(wd))));
         if is_first_visible_message
-            && blocks.is_empty()
             && let Some(handoff) = handoff
         {
             text = format!("{handoff}\n\n{text}");
