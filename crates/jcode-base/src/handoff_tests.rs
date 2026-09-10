@@ -316,3 +316,84 @@ fn corrupt_index_does_not_fail_capture() {
     );
     crate::env::remove_var("JCODE_HOME");
 }
+
+fn repo_with_remote(dir: &std::path::Path) {
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["init", "-q"])
+        .output();
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["remote", "add", "origin", "https://example.com/acme/widget.git"])
+        .output();
+}
+
+/// End-to-end through the public API over the real storage layout: capture on
+/// close, boot-render from a *different* checkout path of the same project
+/// (proves cross-path injection), and promote to an initiative.
+#[tokio::test]
+async fn full_workflow_capture_boot_render_promote() {
+    let _guard = crate::storage::lock_test_env();
+    if !std::process::Command::new("git")
+        .args(["--version"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let home = tempfile::TempDir::new().expect("tempdir");
+    crate::env::set_var("JCODE_HOME", home.path());
+
+    // Session A works in checkout A, captures with open work.
+    let checkout_a = tempfile::TempDir::new().expect("a");
+    repo_with_remote(checkout_a.path());
+    crate::todo::save_todos(
+        "s-a",
+        &[TodoItem {
+            id: "t1".into(),
+            content: "move mutation behind service handle".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: Some("split".into()),
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .expect("todos");
+    crate::todo::save_plan(
+        "s-a",
+        &crate::todo::TodoPlan {
+            user_intention: Some("split server into services".into()),
+            ..Default::default()
+        },
+    )
+    .expect("plan");
+    let snap = capture("s-a", Some(checkout_a.path()), "closed", None)
+        .expect("session A capture");
+    assert_eq!(snap.open_todos.len(), 1);
+
+    // A later session on a *different* checkout (= another machine/path) of the
+    // same repo boots with the handoff injected, without re-explaining.
+    let checkout_b = tempfile::TempDir::new().expect("b");
+    repo_with_remote(checkout_b.path());
+    let block = render_boot_context(Some(checkout_b.path()))
+        .expect("boot context from cross-path checkout");
+    assert!(block.contains("split server into services"), "{block}");
+    assert!(block.contains("move mutation behind service handle"), "{block}");
+
+    // The durable handoff promotes into a project-scoped initiative.
+    let goal_id = promote_to_initiative("s-a", Some(checkout_b.path()))
+        .expect("promote from cross-path checkout")
+        .expect("goal id");
+    assert!(
+        crate::goal::load_goal(&goal_id, Some(crate::goal::GoalScope::Project), Some(checkout_b.path()))
+            .expect("load")
+            .is_some(),
+        "promoted initiative should be loadable from the other checkout"
+    );
+
+    crate::env::remove_var("JCODE_HOME");
+}
