@@ -21,7 +21,7 @@ use jcode_message_types::ContentBlock;
 use crate::{
     EMERGENCY_IMAGE_MAX_CHARS, EMERGENCY_TOOL_RESULT_MAX_CHARS,
     PAYLOAD_IMAGE_EMERGENCY_CHAR_BUDGET, PAYLOAD_TOOL_RESULT_CHAR_BUDGET,
-    emergency_truncate_tool_results_in_contents, emergency_truncated_tool_result,
+    prune_truncate_tool_results_in_contents, prune_truncated_tool_result,
     strip_large_images_in_contents,
 };
 
@@ -58,6 +58,25 @@ impl PrunePolicy {
         Self {
             image_max_chars: Some(EMERGENCY_IMAGE_MAX_CHARS),
             tool_result_max_chars: Some(EMERGENCY_TOOL_RESULT_MAX_CHARS),
+            image_total_budget: None,
+            tool_result_total_budget: None,
+        }
+    }
+
+    /// Per-node caps from explicit values (e.g. loaded from config). Falls back
+    /// to the built-in defaults when a value is zero. Keeps aggregate budgets
+    /// off, exactly like [`Self::node_caps`], so it never performs surgery.
+    pub fn node_caps_with(
+        tool_result_max_chars: usize,
+        image_max_chars: usize,
+    ) -> Self {
+        let tool_result_max_chars =
+            if tool_result_max_chars == 0 { EMERGENCY_TOOL_RESULT_MAX_CHARS } else { tool_result_max_chars };
+        let image_max_chars =
+            if image_max_chars == 0 { EMERGENCY_IMAGE_MAX_CHARS } else { image_max_chars };
+        Self {
+            image_max_chars: Some(image_max_chars),
+            tool_result_max_chars: Some(tool_result_max_chars),
             image_total_budget: None,
             tool_result_total_budget: None,
         }
@@ -135,7 +154,7 @@ pub fn prune_contents(
     if report.images_stripped == 0 {
         if let Some(budget) = policy.tool_result_total_budget {
             report.tool_results_truncated +=
-                emergency_truncate_tool_results_in_contents(contents, budget);
+                prune_truncate_tool_results_in_contents(contents, budget);
         }
     }
 
@@ -190,7 +209,7 @@ fn truncate_oversized_tool_results_node(
         for block in content.iter_mut() {
             if let ContentBlock::ToolResult { content: text, .. } = block {
                 if text.len() > max_chars {
-                    *text = emergency_truncated_tool_result(text, max_chars);
+                    *text = prune_truncated_tool_result(text, max_chars);
                     truncated += 1;
                 }
             }

@@ -3811,7 +3811,10 @@ pub(super) fn handle_config_command(app: &mut App, trimmed: &str) -> bool {
         // `/compact` (which collapses older turns via a model summary).
         let report = app
             .session
-            .prune_transcript(&crate::compaction::prune::PrunePolicy::node_caps());
+            .prune_transcript(&crate::compaction::prune::PrunePolicy::node_caps_with(
+                crate::config::config().compaction.prune_tool_result_max_chars,
+                crate::config::config().compaction.prune_image_max_chars,
+            ));
         if report.is_empty() {
             app.push_display_message(DisplayMessage::system(
                 "Prune: nothing oversized to shrink (context already within per-node caps).".to_string(),

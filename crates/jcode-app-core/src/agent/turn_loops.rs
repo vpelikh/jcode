@@ -1147,7 +1147,10 @@ impl Agent {
             // turn. Cheap (per-node caps, no model call), no-op when within caps.
             let pruned =
                 self.session
-                    .prune_transcript(&crate::compaction::prune::PrunePolicy::node_caps());
+                    .prune_transcript(&crate::compaction::prune::PrunePolicy::node_caps_with(
+                        crate::config::config().compaction.prune_tool_result_max_chars,
+                        crate::config::config().compaction.prune_image_max_chars,
+                    ));
             if !pruned.is_empty() {
                 logging::info(&format!(
                     "[prune] per-step shrink in headless turn for session {}: {} image(s), {} tool result(s)",

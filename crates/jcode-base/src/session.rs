@@ -1727,7 +1727,7 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         let mut contents: Vec<&mut Vec<ContentBlock>> =
             self.messages.iter_mut().map(|m| &mut m.content).collect();
         let truncated =
-            jcode_compaction_core::emergency_truncate_tool_results_in_contents(
+            jcode_compaction_core::prune_truncate_tool_results_in_contents(
                 &mut contents,
                 target_total_chars,
             );

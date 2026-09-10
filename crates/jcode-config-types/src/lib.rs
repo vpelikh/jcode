@@ -381,6 +381,16 @@ pub struct CompactionConfig {
 
     /// [semantic] Number of recent turns to look at for building the "current goal" embedding
     pub goal_window_turns: usize,
+
+    /// [prune] Per-tool-result character cap for the deterministic prune stage.
+    /// A single tool result larger than this is truncated to its head+tail.
+    /// (`PrunePolicy::node_caps` default.)
+    pub prune_tool_result_max_chars: usize,
+
+    /// [prune] Per-image base64 character cap for the deterministic prune stage.
+    /// A single inline image larger than this is replaced with a text marker.
+    /// (`PrunePolicy::node_caps` default.)
+    pub prune_image_max_chars: usize,
 }
 
 impl Default for CompactionConfig {
@@ -396,6 +406,8 @@ impl Default for CompactionConfig {
             topic_shift_threshold: 0.45,
             relevance_keep_threshold: 0.65,
             goal_window_turns: 5,
+            prune_tool_result_max_chars: 4000,
+            prune_image_max_chars: 1024,
         }
     }
 }

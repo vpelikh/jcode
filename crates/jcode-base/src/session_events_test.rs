@@ -4313,4 +4313,25 @@ fn test_prune_transcript_uses_policy_and_keeps_event_log_consistent() {
     // ReplaceMessages event to keep the log the source of truth.
     assert_eq!(session.messages.len(), before_msgs);
     assert_eq!(session.event_map.events.len(), before_events + 1);
+
+    // The single appended event must be a ReplaceMessages carrying the pruned
+    // transcript, so replaying the event log reconstructs the pruned state.
+    let last = session.event_map.events.last().expect("one event appended");
+    match &last.op {
+        SessionEventOp::ReplaceMessages { start_index, messages, .. } => {
+            assert_eq!(*start_index, 0);
+            // messages[0] is the oversized image (appended first); it must have
+            // been replaced with a prune text marker in the replayed event.
+            let image = &messages[0].content[0];
+            assert!(
+                matches!(image, ContentBlock::Text { text, .. } if text.contains("Image omitted during context pruning")),
+                "replayed ReplaceMessages must contain the prune marker"
+            );
+        }
+        other => panic!("expected ReplaceMessages event, got {:?}", other),
+    }
+    // Event-log replay stays consistent with the legacy vector.
+    session
+        .rederive_all_checked()
+        .expect("event log must agree with legacy vector after prune");
 }

@@ -574,7 +574,7 @@ pub fn emergency_truncate_tool_results(messages: &mut [Message], max_chars: usiz
         for block in msg.content.iter_mut() {
             match block {
                 ContentBlock::ToolResult { content, .. } if content.len() > max_chars => {
-                    *content = emergency_truncated_tool_result(content, max_chars);
+                    *content = prune_truncated_tool_result(content, max_chars);
                     truncated += 1;
                 }
                 _ => {}
@@ -595,7 +595,7 @@ pub fn emergency_truncate_tool_results(messages: &mut [Message], max_chars: usiz
 /// image blocks), each oversized tool result is shortened to keep its head and
 /// tail so the model retains the beginning and end of the content. Returns the
 /// number of tool results that were truncated.
-pub fn emergency_truncate_tool_results_in_contents(
+pub fn prune_truncate_tool_results_in_contents(
     contents: &mut [&mut Vec<ContentBlock>],
     target_total_chars: usize,
 ) -> usize {
@@ -635,7 +635,7 @@ pub fn emergency_truncate_tool_results_in_contents(
         let block = &mut contents[ci][bi];
         if let ContentBlock::ToolResult { content, .. } = block {
             if content.len() > per_result_cap {
-                let shortened = emergency_truncated_tool_result(content, per_result_cap);
+                let shortened = prune_truncated_tool_result(content, per_result_cap);
                 total = total.saturating_sub(content.len()).saturating_add(shortened.len());
                 *content = shortened;
                 truncated += 1;
@@ -659,7 +659,7 @@ pub fn emergency_truncate_large_payloads(
                 ContentBlock::ToolResult { content, .. }
                     if content.len() > max_tool_result_chars =>
                 {
-                    *content = emergency_truncated_tool_result(content, max_tool_result_chars);
+                    *content = prune_truncated_tool_result(content, max_tool_result_chars);
                     truncated += 1;
                 }
                 ContentBlock::Image { media_type, data } if data.len() > max_image_chars => {
@@ -779,7 +779,7 @@ pub fn strip_large_images_in_contents(
     stripped
 }
 
-pub fn emergency_truncated_tool_result(content: &str, max_chars: usize) -> String {
+pub fn prune_truncated_tool_result(content: &str, max_chars: usize) -> String {
     let original_len = content.len();
     let keep_head = max_chars / 2;
     let keep_tail = max_chars / 4;
@@ -1019,7 +1019,7 @@ mod tests {
     #[test]
     fn emergency_truncation_is_utf8_safe() {
         let original = format!("{}middle{}", "é".repeat(20), "尾".repeat(20));
-        let truncated = emergency_truncated_tool_result(&original, 25);
+        let truncated = prune_truncated_tool_result(&original, 25);
         assert!(truncated.contains("chars truncated for context recovery"));
         assert!(truncated.is_char_boundary(truncated.len()));
     }
@@ -1105,7 +1105,7 @@ mod tests {
             .map(|m| &mut m.content)
             .collect();
 
-        let truncated = emergency_truncate_tool_results_in_contents(&mut contents, 9000);
+        let truncated = prune_truncate_tool_results_in_contents(&mut contents, 9000);
         assert!(truncated > 0);
 
         // The total remaining tool-result payload must fit the budget.
@@ -1128,7 +1128,7 @@ mod tests {
             .map(|m| &mut m.content)
             .collect();
 
-        let truncated = emergency_truncate_tool_results_in_contents(&mut contents, 5000);
+        let truncated = prune_truncate_tool_results_in_contents(&mut contents, 5000);
         assert_eq!(truncated, 0);
         assert!(matches!(messages[0].content[0], ContentBlock::ToolResult { .. }));
     }
@@ -1143,7 +1143,7 @@ mod tests {
             .map(|m| &mut m.content)
             .collect();
 
-        let truncated = emergency_truncate_tool_results_in_contents(&mut contents, 2000);
+        let truncated = prune_truncate_tool_results_in_contents(&mut contents, 2000);
         assert_eq!(truncated, 1);
         if let ContentBlock::ToolResult { content, .. } = &messages[0].content[0] {
             assert!(content.len() <= 2000, "content stayed {} chars", content.len());
