@@ -691,11 +691,22 @@ call-site migrations with tests green after each.
   Drops the now-unused `update_member_status*` imports, `HashSet`,
   `broadcast`, and `SwarmEvent` in `client_lifecycle.rs`. Tests build the
   handle via a new `test_swarm_status_handle` helper.
+- **`server.rs` headless-recovery member-status routes through the handle
+  (Seam D).** `recover_headless_sessions_on_startup` now builds
+  `SwarmServiceHandle::from_server(self)` once and routes all four
+  `update_member_status` maintenance-path calls (the `failed` load-failure,
+  the `ready` skipped-recovery, and inside the spawned continuation task the
+  `running` resume and the `ready`/`failed` completion) through
+  `swarm.set_member_status`, cloning the handle into the `tokio::spawn`
+  closure. Drops the now-unused `recover_swarms_by_id` and three
+  `recover_event_*` clones from the closure (only `recover_swarm_members` and
+  `recover_swarm_state` remain for the persistence read). The
+  `update_member_status*` imports stay because submodules re-export them via
+  `super::`; only the maintenance path's free call sites are gone.
 
 The remaining free-function call sites for `update_member_status` /
-`broadcast_swarm_status` in `server.rs` maintenance paths,
-`comm_control.rs`, `comm_session.rs`, `headless.rs`, and
-`debug_session_admin.rs` are still open; as is the
+`broadcast_swarm_status` in `comm_control.rs`, `comm_session.rs`, `headless.rs`,
+and `debug_session_admin.rs` are still open; as is the
 `LiveTurnSwarmContext` flat-field wrapper (its callers in `background_tasks.rs`,
 `client_comm_message.rs`, `client_actions.rs`, and `tests.rs` do not yet carry a
 handle, so converting it would cascade). They remain separate, mechanical
