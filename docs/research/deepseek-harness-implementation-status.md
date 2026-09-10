@@ -46,9 +46,24 @@ policy and report so every consumer stays in lockstep.
   and escalation order now live in exactly one place.
 
 **Verification:** `jcode-compaction-core` 27 tests green (incl. 5 new `prune`
-tests). `jcode-base` new `test_prune_transcript_uses_policy_and_keeps_event_log_consistent`
-passes. `cargo build` green for `jcode-compaction-core`, `jcode-base`,
-`jcode-app-core`, and `jcode-tui`.
+tests). `jcode-base` **full lib 1556 green** (0 failed; incl. new
+`test_prune_transcript_uses_policy_and_keeps_event_log_consistent`).
+`jcode-app-core` full lib 1465 passed, 0 regressions — the only two failures are
+environment-load timing flakes that pass in isolation (see flake note below).
+`cargo build` green for `jcode-compaction-core`, `jcode-base`, `jcode-app-core`,
+`jcode-tui`, and the full `jcode` binary (which links all prune-consuming
+crates and runs).
+
+**Flake note (the full-suite run surfaced a 4th timing-sensitive test).** Under
+parallel load the app-core suite is missing 2 (not 3) timeout wall-clock tests,
+both pre-existing and unrelated to prune/compaction. The previously-documented
+three (`channel::session_picker_menu_flow`,
+`server::external_background_task_wake…`, `tool::bash::test_detached_promoted_command_…`)
+plus a fourth, `server::debug_command_exec::tests::
+debug_tool_selfdev_reload_returns_promptly_for_direct_execution` (asserts a
+selfdev/reload signal is acked within a 2-second wall clock). It passes in
+isolation (~0.4 s) and exercises none of the prune paths. No action needed for
+this work; flagged so a future full-suite run is not mistaken for a regression.
 
 **Interpretation noted (deviation from the literal doc).** The doc's literal
 recommendation is about scheduling: run `prune` *on a cheap cadence* (every step)
