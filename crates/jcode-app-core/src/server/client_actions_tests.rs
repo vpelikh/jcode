@@ -367,17 +367,28 @@ async fn enabling_swarm_does_not_auto_elect_coordinator() {
     )])));
     let swarms_by_id = Arc::new(RwLock::new(HashMap::<String, HashSet<String>>::new()));
     let swarm_coordinators = Arc::new(RwLock::new(HashMap::<String, String>::new()));
-    let channel_subscriptions = Arc::new(RwLock::new(HashMap::<
-        String,
-        HashMap<String, HashSet<String>>,
-    >::new()));
-    let channel_subscriptions_by_session = Arc::new(RwLock::new(HashMap::<
-        String,
-        HashMap<String, HashSet<String>>,
-    >::new()));
     let swarm_plans = Arc::new(RwLock::new(HashMap::new()));
     let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
     let mut swarm_enabled = false;
+
+    let (swarm_event_tx, _swarm_event_rx) = tokio::sync::broadcast::channel(16);
+    let swarm_handle = crate::server::services::SwarmServiceHandle {
+        swarm_state: crate::server::SwarmState {
+            members: Arc::clone(&swarm_members),
+            swarms_by_id: Arc::clone(&swarms_by_id),
+            plans: Arc::clone(&swarm_plans),
+            coordinators: Arc::clone(&swarm_coordinators),
+        },
+        shared_context: Arc::new(RwLock::new(HashMap::new())),
+        file_touch: crate::server::FileTouchService::new(),
+        channel_subscriptions: Arc::new(RwLock::new(HashMap::new())),
+        channel_subscriptions_by_session: Arc::new(RwLock::new(HashMap::new())),
+        event_history: Arc::new(RwLock::new(VecDeque::new())),
+        event_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        swarm_event_tx,
+        await_members_runtime: crate::server::AwaitMembersRuntime::default(),
+        swarm_mutation_runtime: crate::server::SwarmMutationRuntime::default(),
+    };
 
     handle_set_feature(
         42,
@@ -387,12 +398,7 @@ async fn enabling_swarm_does_not_auto_elect_coordinator() {
         session_id,
         &Some("duck".to_string()),
         &mut swarm_enabled,
-        &swarm_members,
-        &swarms_by_id,
-        &swarm_coordinators,
-        &channel_subscriptions,
-        &channel_subscriptions_by_session,
-        &swarm_plans,
+        &swarm_handle,
         &client_event_tx,
     )
     .await;

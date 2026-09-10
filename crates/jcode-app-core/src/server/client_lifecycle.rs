@@ -2069,12 +2069,7 @@ pub(super) async fn handle_client(
                     &client_session_id,
                     &friendly_name,
                     &mut swarm_enabled,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &swarm_coordinators,
-                    &channel_subscriptions,
-                    &channel_subscriptions_by_session,
-                    &swarm_plans,
+                    &swarm_service_handle,
                     &client_event_tx,
                 )
                 .await;
