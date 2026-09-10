@@ -1,7 +1,7 @@
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
 
-use super::state::{queue_soft_interrupt_for_session, register_session_interrupt_queue};
 use super::SessionInterruptQueues;
+use super::state::{queue_soft_interrupt_for_session, register_session_interrupt_queue};
 use crate::agent::Agent;
 use crate::message::{Message, ToolDefinition};
 use crate::provider::{EventStream, Provider};
