@@ -65,6 +65,20 @@ selfdev/reload signal is acked within a 2-second wall clock). It passes in
 isolation (~0.4 s) and exercises none of the prune paths. No action needed for
 this work; flagged so a future full-suite run is not mistaken for a regression.
 
+**Full TUI suite (also surfaced pre-existing failures, none prune-related).**
+A full `jcode-tui` lib run shows 3 failures, all confirmed unrelated to the
+prune change:
+- `helpers_tests::build_resume_command_uses_imported_jcode_session_for_codex`
+  — passes in isolation (env-home / parallel-load flake).
+- `commands::tests::worktree::main_repo_root_from_a_linked_worktree_points_to_the_main_checkout`
+  — passes in isolation (shells out to real `git`; host/env parallel-load flake).
+- `idle_self_drive_debounces_rapid_repeats` — fails **deterministically and
+  identically on a clean `master` worktree at the base commit `ec676907e`**
+  (`0 passed, 1 failed`, "first idle poll must run"), so it is a pre-existing
+  review-loop failure, independent of this branch. The prune change touches no
+  review-loop code (`git show --name-only` of both prune commits lists no
+  `review_loop*`/`commands_review*` file).
+
 **Interpretation noted (deviation from the literal doc).** The doc's literal
 recommendation is about scheduling: run `prune` *on a cheap cadence* (every step)
 and `summarize` less often. This deliverable built the **seam and policy** and
