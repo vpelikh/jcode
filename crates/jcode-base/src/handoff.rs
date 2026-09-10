@@ -268,6 +268,72 @@ pub fn render_boot_context(working_dir: Option<&Path>) -> Option<String> {
     Some(out)
 }
 
+/// Promote a handoff snapshot into a durable project-scoped `initiative` goal.
+///
+/// This is the bridge from transient handoff scratch to the curated `goals/`
+/// store: once a handoff proves durable across sessions (a big plan the user
+/// intends to track), it graduates into an initiative. The snapshot's intent
+/// becomes the goal title/description, open todos become initial next steps,
+/// and the snapshot is recorded as a first checkpoint.
+///
+/// Returns the created goal's id, or an error if creation fails.
+pub fn promote_to_initiative(
+    session_id: &str,
+    working_dir: Option<&Path>,
+) -> anyhow::Result<Option<String>> {
+    let Some(snapshot) = load_snapshot(session_id) else {
+        return Ok(None);
+    };
+    let title = snapshot
+        .intent
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("Continue from session {}", session_id));
+    let next_steps: Vec<String> = snapshot
+        .open_todos
+        .iter()
+        .map(|t| t.content.clone())
+        .collect();
+    let description = snapshot
+        .last_assistant_text
+        .clone()
+        .filter(|s| !s.trim().is_empty());
+    let goal = crate::goal::create_goal(
+        crate::goal::GoalCreateInput {
+            id: None,
+            title: title.clone(),
+            scope: crate::goal::GoalScope::Project,
+            description,
+            why: Some(format!(
+                "Promoted from handoff of session {} ({})",
+                snapshot.session_id, snapshot.ended_at
+            )),
+            success_criteria: Vec::new(),
+            milestones: Vec::new(),
+            next_steps,
+            blockers: Vec::new(),
+            current_milestone_id: None,
+            progress_percent: Some(0),
+        },
+        working_dir,
+    )?;
+    // Record the handoff itself as the opening checkpoint.
+    let _ = crate::goal::update_goal(
+        &goal.id,
+        Some(crate::goal::GoalScope::Project),
+        working_dir,
+        crate::goal::GoalUpdateInput {
+            checkpoint_summary: Some(format!(
+                "Adopted handoff from session {} with {} open item(s).",
+                snapshot.session_id,
+                snapshot.open_todos.len()
+            )),
+            ..Default::default()
+        },
+    );
+    Ok(Some(goal.id))
+}
+
 /// Get the git remote `origin` URL for a directory, if any. Shells out to git,
 /// which is acceptable here: capture runs once per session close.
 fn git_remote_url(dir: &Path) -> Option<String> {

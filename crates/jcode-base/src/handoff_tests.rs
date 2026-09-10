@@ -146,6 +146,51 @@ fn open_filter_drops_completed_and_cancelled() {
     crate::env::remove_var("JCODE_HOME");
 }
 
+/// promote_to_initiative creates a project goal from a handoff snapshot.
+#[tokio::test]
+async fn promote_to_initiative_creates_a_goal() {
+    let _guard = crate::storage::lock_test_env();
+    let home = tempfile::TempDir::new().expect("tempdir");
+    crate::env::set_var("JCODE_HOME", home.path());
+    let cwd = std::env::temp_dir().join("jcode-promote-test");
+    std::fs::create_dir_all(&cwd).ok();
+
+    crate::todo::save_todos(
+        "s-promote",
+        &[TodoItem {
+            id: "p1".into(),
+            content: "finish slice 2".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: Some("handoff".into()),
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .expect("todos");
+    crate::todo::save_plan(
+        "s-promote",
+        &crate::todo::TodoPlan {
+            user_intention: Some("continue server split".into()),
+            ..Default::default()
+        },
+    )
+    .expect("plan");
+    capture("s-promote", Some(&cwd), "closed", None).expect("capture");
+
+    let goal_id = promote_to_initiative("s-promote", Some(&cwd))
+        .expect("promote should succeed")
+        .expect("promote should create a goal");
+    assert!(
+        crate::goal::load_goal(&goal_id, Some(crate::goal::GoalScope::Project), Some(&cwd))
+            .expect("load")
+            .is_some(),
+        "promoted goal should be loadable"
+    );
+
+    crate::env::remove_var("JCODE_HOME");
+}
+
 /// render_boot_context emits a compact block when a handoff exists.
 #[tokio::test]
 async fn render_boot_context_produces_block() {

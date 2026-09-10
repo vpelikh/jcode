@@ -72,7 +72,7 @@ the whole transcript or requiring the user to re-explain.
 
 ## Slices 2+ (future)
 
-- `promote to initiative` action on a handoff (bridge into `goal`).
+- ~~`promote to initiative` action on a handoff (bridge into `goal`)~~ — **done** (`handoff::promote_to_initiative`).
 - `/handoff` picker for manual selection, plus `/handoffres` command in the TUI.
 - Pruning policy (e.g. keep last N per project) beyond the index cap.
 - Optional degraded-mode fallback for `REMOTE_HANDOFF.md`: read handoff files on
