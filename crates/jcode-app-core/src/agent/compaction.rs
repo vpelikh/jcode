@@ -87,6 +87,28 @@ impl Agent {
         }
     }
 
+    /// Run a deterministic, model-free prune over the session transcript
+    /// (takeaway #6): shrink any oversized tool result / inline image under the
+    /// per-node caps, without invoking the summarizer. Returns a report of what
+    /// was pruned and a human-readable message.
+    pub fn request_manual_prune(&mut self) -> (crate::compaction::prune::PruneReport, String) {
+        let report = self
+            .session
+            .prune_transcript(&crate::compaction::prune::PrunePolicy::node_caps_with(
+                crate::config::config().compaction.prune_tool_result_max_chars,
+                crate::config::config().compaction.prune_image_max_chars,
+            ));
+        let message = if report.is_empty() {
+            "Prune: nothing oversized to shrink (context already within per-node caps).".to_string()
+        } else {
+            format!(
+                "Pruned transcript: replaced {} oversized image(s) and truncated {} oversized tool result(s).",
+                report.images_stripped, report.tool_results_truncated
+            )
+        };
+        (report, message)
+    }
+
     fn is_context_limit_error(error: &str) -> bool {
         let lower = error.to_lowercase();
         lower.contains("context length")

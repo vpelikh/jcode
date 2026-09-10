@@ -1,6 +1,6 @@
 use super::available_models_dedup::available_models_dedup_key;
 use super::client_actions::{
-    AgentTaskContext, NotifySessionContext, handle_agent_task, handle_compact, handle_input_shell,
+    AgentTaskContext, NotifySessionContext, handle_agent_task, handle_compact, handle_input_shell, handle_prune,
     handle_notify_session, handle_rename_session, handle_run_subagent, handle_set_feature,
     handle_set_handoff_resume, handle_set_subagent_model, handle_set_working_dir, handle_split,
     handle_stdin_response, handle_transfer, handle_trigger_memory_extraction,
@@ -2080,6 +2080,10 @@ pub(super) async fn handle_client(
 
             Request::Compact { id } => {
                 handle_compact(id, &agent, &client_event_tx);
+            }
+
+            Request::Prune { id } => {
+                handle_prune(id, &agent, &client_event_tx);
             }
 
             Request::TriggerMemoryExtraction { id } => {

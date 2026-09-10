@@ -1205,6 +1205,44 @@ pub(super) fn handle_compact(
     });
 }
 
+pub(super) fn handle_prune(
+    id: u64,
+    agent: &Arc<Mutex<Agent>>,
+    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+) {
+    let agent = Arc::clone(agent);
+    let tx = client_event_tx.clone();
+    tokio::spawn(async move {
+        let mut agent_guard = agent.lock().await;
+        let session_id = agent_guard.session_id().to_string();
+        let (report, message) = agent_guard.request_manual_prune();
+        drop(agent_guard);
+
+        if !report.is_empty() {
+            crate::runtime_memory_log::emit_event(
+                crate::runtime_memory_log::RuntimeMemoryLogEvent::new(
+                    "manual_prune_requested",
+                    "manual_prune_applied",
+                )
+                .with_session_id(session_id)
+                .with_detail(format!(
+                    "images_stripped={},tool_results_truncated={}",
+                    report.images_stripped, report.tool_results_truncated
+                ))
+                .force_attribution(),
+            );
+        }
+
+        let result = ServerEvent::PruneResult {
+            id,
+            images_stripped: report.images_stripped,
+            tool_results_truncated: report.tool_results_truncated,
+            message,
+        };
+        let _ = tx.send(result);
+    });
+}
+
 pub(super) async fn handle_stdin_response(
     id: u64,
     request_id: String,

@@ -2972,6 +2972,20 @@ pub(in crate::tui::app) fn handle_server_event(
             }
             false
         }
+        ServerEvent::PruneResult {
+            images_stripped,
+            tool_results_truncated,
+            message,
+            ..
+        } => {
+            app.push_display_message(DisplayMessage::system(message));
+            app.set_status_notice(if images_stripped == 0 && tool_results_truncated == 0 {
+                "Nothing to prune".to_string()
+            } else {
+                format!("Pruned ({images_stripped} img, {tool_results_truncated} result)")
+            });
+            false
+        }
         ServerEvent::ResumeAllResult {
             resumed, message, ..
         } => {

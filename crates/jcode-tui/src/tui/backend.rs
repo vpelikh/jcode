@@ -1040,6 +1040,16 @@ impl RemoteConnection {
         Ok(id)
     }
 
+    /// Trigger manual deterministic prune on the server (takeaway #6): the
+    /// model-free counterpart to compaction that never summarizes.
+    pub async fn prune(&mut self) -> Result<u64> {
+        let id = self.next_request_id;
+        let request = Request::Prune { id };
+        self.next_request_id += 1;
+        self.send_request(request).await?;
+        Ok(id)
+    }
+
     /// Trigger immediate memory extraction on the server for the active session.
     pub async fn trigger_memory_extraction(&mut self) -> Result<()> {
         let id = self.next_request_id;

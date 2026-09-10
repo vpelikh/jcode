@@ -2299,6 +2299,14 @@ async fn handle_remote_key_internal(
                     return Ok(());
                 }
 
+                if trimmed == "/prune" {
+                    app.push_display_message(DisplayMessage::system(
+                        "Requesting prune...".to_string(),
+                    ));
+                    remote.prune().await?;
+                    return Ok(());
+                }
+
                 if trimmed == "/compact mode" || trimmed == "/compact mode status" {
                     let mode = app
                         .remote_compaction_mode
