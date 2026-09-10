@@ -703,10 +703,21 @@ call-site migrations with tests green after each.
   `recover_swarm_state` remain for the persistence read). The
   `update_member_status*` imports stay because submodules re-export them via
   `super::`; only the maintenance path's free call sites are gone.
+- **`debug_session_admin.rs` session-admin commands route through the handle.**
+  `maybe_handle_session_admin_command` collapsed its flat 8-arg swarm bag
+  (`members` + `swarms_by_id` + `coordinators` + `plans` + `event_history` +
+  `event_counter` + `event_tx`) onto `&SwarmServiceHandle`, binding the maps as
+  body locals and routing the `destroy_session:` teardown's two
+  `record_swarm_event` calls and its `broadcast_swarm_status` through handle
+  methods. Its sole caller `handle_debug_client` passes its existing
+  `swarm_service_handle` and drops the now-unused `swarms_by_id` / `swarm_plans`
+  / `swarm_coordinators` / `event_counter` locals plus the too_many_arguments
+  attr (now 7 params). `create_headless_session` keeps its own flat bag
+  (separate cascade).
 
 The remaining free-function call sites for `update_member_status` /
-`broadcast_swarm_status` in `comm_control.rs`, `comm_session.rs`, `headless.rs`,
-and `debug_session_admin.rs` are still open; as is the
+`broadcast_swarm_status` in `comm_control.rs`, `comm_session.rs`, and
+`headless.rs` are still open; as is the
 `LiveTurnSwarmContext` flat-field wrapper (its callers in `background_tasks.rs`,
 `client_comm_message.rs`, `client_actions.rs`, and `tests.rs` do not yet carry a
 handle, so converting it would cascade). They remain separate, mechanical
