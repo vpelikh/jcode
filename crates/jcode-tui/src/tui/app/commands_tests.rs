@@ -924,4 +924,17 @@ mod prune {
             "expected a no-op report, got: {text}"
         );
     }
+
+    #[test]
+    fn prune_is_discoverable_via_help() {
+        let app = create_test_app();
+        let help = app
+            .command_help("prune")
+            .expect("/prune should have detailed help");
+        assert!(
+            help.to_lowercase().contains("no model call")
+                && help.contains("/prune"),
+            "prune help should describe the model-free nature and command, got: {help}"
+        );
+    }
 }
