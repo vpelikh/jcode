@@ -567,7 +567,7 @@ pub fn log_path() -> Option<PathBuf> {
     Some(log_dir.join(format!("jcode-{}.log", date)))
 }
 
-/// Remove daily `jcode-*.log` / `jcode-desktop-*.log` files older than 7 days.
+/// Remove daily `jcode-*.log` files older than 7 days.
 ///
 /// Scoped deliberately to the date-stamped log files this logger produces. The
 /// log directory also holds non-log data (e.g. `memory/`, `memory-events-*.jsonl`)
@@ -589,8 +589,7 @@ fn cleanup_old_logs_in(log_dir: &std::path::Path, now: chrono::DateTime<Local>) 
         // Only consider our own date-stamped log files.
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let is_jcode_log = (name.starts_with("jcode-") || name.starts_with("jcode-desktop-"))
-            && name.ends_with(".log");
+        let is_jcode_log = name.starts_with("jcode-") && name.ends_with(".log");
         if !is_jcode_log {
             continue;
         }
@@ -766,9 +765,11 @@ mod tests {
             path
         };
 
-        // Old log files that SHOULD be deleted.
+        // Old log files that SHOULD be deleted. The shared logger writes
+        // `jcode-<date>.log`, and any desktop-named log (`jcode-desktop2-*`)
+        // is covered by the same `jcode-` prefix.
         let old_log = write("jcode-2000-01-01.log", true);
-        let old_desktop = write("jcode-desktop-2000-01-01.log", true);
+        let old_desktop = write("jcode-desktop2-2000-01-01.log", true);
         // Recent log file that SHOULD survive.
         let new_log = write("jcode-2099-01-01.log", false);
         // Non-log data that SHOULD survive even though it is old.
@@ -781,7 +782,7 @@ mod tests {
         cleanup_old_logs_in(&dir, Local::now());
 
         assert!(!old_log.exists(), "old jcode log should be deleted");
-        assert!(!old_desktop.exists(), "old desktop log should be deleted");
+        assert!(!old_desktop.exists(), "old desktop2 log should be deleted");
         assert!(new_log.exists(), "recent jcode log must survive");
         assert!(old_memory.exists(), "memory-events jsonl must survive");
         assert!(old_other.exists(), "unrelated files must survive");
