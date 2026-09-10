@@ -4,7 +4,7 @@ use super::services::{MemberIdentity, SwarmServiceHandle};
 use super::client_state::{handle_get_history, spawn_model_prefetch_update};
 use super::{
     ClientConnectionInfo, ClientDebugState, FileTouchService, SessionInterruptQueues, SwarmMember,
-    SwarmState, VersionedPlan, broadcast_swarm_status, fanout_live_client_event,
+    SwarmState, VersionedPlan, fanout_live_client_event,
     persist_swarm_state_for, register_background_tool_signal, register_session_event_sender,
     register_session_interrupt_queue, remove_background_tool_signal,
     remove_session_channel_subscriptions, remove_session_from_swarm,
@@ -699,12 +699,12 @@ pub(super) async fn handle_subscribe(
                 };
                 persist_swarm_state_for(&old_id, &swarm_state).await;
             }
-            broadcast_swarm_status(&old_id, swarm_members, swarms_by_id).await;
+            swarm.broadcast_swarm_status(&old_id).await;
         }
         if let Some(new_id) = updated_swarm_id
             && old_swarm_id.as_ref() != Some(&new_id)
         {
-            broadcast_swarm_status(&new_id, swarm_members, swarms_by_id).await;
+            swarm.broadcast_swarm_status(&new_id).await;
         }
     }
 
