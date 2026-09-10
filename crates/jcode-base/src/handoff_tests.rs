@@ -330,25 +330,26 @@ fn repo_with_remote(dir: &std::path::Path) {
         .output();
 }
 
-/// The boot-injection gate: inject only on a fresh conversation with a handoff.
+/// The first-user-message injection consumes `render_boot_context`: it must
+/// yield the compact block exactly when a fresh session (empty conversation)
+/// has a handoff for the working dir, and none otherwise.
 #[test]
-fn should_inject_gates_on_fresh_conversation_and_handoff() {
+fn boot_context_is_present_for_fresh_session_with_handoff() {
     let _guard = crate::storage::lock_test_env();
     let before = std::env::var_os("JCODE_HOME");
     let home = tempfile::TempDir::new().expect("tempdir");
     crate::env::set_var("JCODE_HOME", home.path());
-    let cwd = std::env::temp_dir().join("jcode-gate-test");
-
-    // No handoff yet -> never inject.
-    assert!(!should_inject(true, Some(&cwd)));
-    assert!(!should_inject(false, Some(&cwd)));
-
-    // Create a handoff.
+    let cwd = std::env::temp_dir().join("jcode-boot-context-test");
     std::fs::create_dir_all(&cwd).ok();
+
+    // No handoff yet -> no boot context.
+    assert!(render_boot_context(Some(&cwd)).is_none());
+
+    // An already-running project with open work produces a handoff on close.
     crate::todo::save_todos(
-        "s-gate",
+        "s-bootctx",
         &[TodoItem {
-            id: "g".into(),
+            id: "bc".into(),
             content: "open work".into(),
             status: "in_progress".into(),
             priority: "high".into(),
@@ -358,19 +359,27 @@ fn should_inject_gates_on_fresh_conversation_and_handoff() {
         }],
     )
     .expect("todos");
-    capture("s-gate", Some(&cwd), "closed", None).expect("capture");
+    crate::todo::save_plan(
+        "s-bootctx",
+        &crate::todo::TodoPlan {
+            user_intention: Some("resume the split".into()),
+            ..Default::default()
+        },
+    )
+    .expect("plan");
+    capture("s-bootctx", Some(&cwd), "closed", None).expect("capture");
 
-    // With a handoff: fresh conversation injects, an ongoing one does not.
-    assert!(should_inject(true, Some(&cwd)), "fresh session should inject");
-    assert!(
-        !should_inject(false, Some(&cwd)),
-        "an already-running session must not re-inject"
-    );
+    // A fresh session in the same working dir now has boot context to consume.
+    let block = render_boot_context(Some(&cwd)).expect("boot context present");
+    assert!(block.contains("[Handoff from previous session]"));
+    assert!(block.contains("resume the split"));
+    assert!(block.contains("open work"));
 
-    // A different (unrelated) project never injects from another's handoff.
-    let unrelated = std::env::temp_dir().join("jcode-gate-other");
+    // The injection consumes this once; a later session in a different dir must
+    // not inherit it.
+    let unrelated = std::env::temp_dir().join("jcode-bootctx-other");
     std::fs::create_dir_all(&unrelated).ok();
-    assert!(!should_inject(true, Some(&unrelated)));
+    assert!(render_boot_context(Some(&unrelated)).is_none());
 
     match before {
         Some(value) => crate::env::set_var("JCODE_HOME", value),

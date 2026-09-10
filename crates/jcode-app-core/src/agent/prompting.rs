@@ -122,27 +122,6 @@ impl Agent {
             self.provider.reasoning_effort().as_deref(),
         );
 
-        // Inject a compact handoff from the most recent prior session in this
-        // project, but only at the start of a fresh conversation (so it does
-        // not re-announce itself on every turn of an already-running session).
-        // Use the *visible* conversation count, not the raw stored message
-        // count: a fresh session carries a session-context header and internal
-        // system reminders in `messages`, so `message_count()` can be > 0 while
-        // there is no actual user/assistant conversation yet (issue surfaced by
-        // the handoff gate).
-        if crate::handoff::should_inject(
-            self.visible_conversation_message_count() == 0,
-            working_dir.as_deref(),
-        ) && let Some(handoff) = crate::handoff::render_boot_context(working_dir.as_deref())
-        {
-            if split.dynamic_part.is_empty() {
-                split.dynamic_part = handoff;
-            } else {
-                split.dynamic_part.push_str("\n\n");
-                split.dynamic_part.push_str(&handoff);
-            }
-        }
-
         split
     }
 

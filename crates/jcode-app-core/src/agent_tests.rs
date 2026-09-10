@@ -3415,3 +3415,107 @@ async fn streaming_turn_recovers_from_413_payload_too_large_and_retries() {
         "recovery must have hard-compacted older messages to shrink the payload"
     );
 }
+
+/// The handoff integration: a fresh agent with a working dir that has a prior
+/// handoff prepends the compact block to its very first user message, and does
+/// not re-inject it on subsequent messages.
+#[tokio::test]
+async fn first_user_message_injects_handoff_once() {
+    let _guard = crate::storage::lock_test_env();
+    let home = tempfile::TempDir::new().expect("temp home");
+    crate::env::set_var("JCODE_HOME", home.path());
+    let wd = std::env::temp_dir().join("jcode-agent-inject-test");
+    std::fs::create_dir_all(&wd).unwrap();
+
+    // Seed a handoff for this working dir from a "previous" session.
+    crate::todo::save_todos(
+        "prev-session",
+        &[crate::todo::TodoItem {
+            id: "p".into(),
+            content: "resume the split".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: None,
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    crate::todo::save_plan(
+        "prev-session",
+        &crate::todo::TodoPlan {
+            user_intention: Some("continue server split".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    crate::handoff::capture("prev-session", Some(&wd), "closed", None).expect("capture");
+
+    // Build a fresh agent in that working dir.
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent =
+        Agent::new_with_initial_working_dir(provider, registry, Some(wd.to_str().unwrap()));
+
+    // First message gets the handoff prepended by the injection path.
+    agent
+        .append_user_context_message("continue now", Vec::new())
+        .expect("first message");
+    let first_text = agent
+        .session
+        .messages
+        .iter()
+        .filter_map(|m| match m.role {
+            Role::User => Some(m),
+            _ => None,
+        })
+        .last()
+        .expect("a user message");
+    let first_str = first_text
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        first_str.contains("[Handoff from previous session]"),
+        "first user message should carry the handoff, got: {first_str}"
+    );
+    assert!(first_str.contains("continue now"), "original text preserved");
+
+    // Second message must not re-inject (conversation is no longer fresh).
+    agent
+        .append_user_context_message("next step", Vec::new())
+        .expect("second message");
+    let second_text = agent
+        .session
+        .messages
+        .iter()
+        .filter_map(|m| match m.role {
+            Role::User => Some(m),
+            _ => None,
+        })
+        .last()
+        .expect("a second user message");
+    let second_str = second_text
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        !second_str.contains("[Handoff from previous session]"),
+        "second user message must not re-inject the handoff, got: {second_str}"
+    );
+
+    match std::env::var_os("JCODE_HOME") {
+        Some(_) => crate::env::remove_var("JCODE_HOME"),
+        None => {}
+    }
+}

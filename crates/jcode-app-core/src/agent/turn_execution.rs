@@ -120,8 +120,29 @@ impl Agent {
             .into_iter()
             .map(|(media_type, data)| ContentBlock::Image { media_type, data })
             .collect();
+
+        // Prepend the previous session's handoff to the very first user message
+        // of a fresh conversation, so the model sees "where the last session
+        // stopped" on turn one. This must happen here, before the message is
+        // added: `build_system_prompt_split` runs only *after* the user message
+        // is already in the session, so gating on message count there can never
+        // see an empty conversation for the first turn.
+        let mut text = user_message.to_string();
+        let is_first_visible_message = self.visible_conversation_message_count() == 0;
+        let handoff = self
+            .session
+            .working_dir
+            .as_deref()
+            .and_then(|wd| crate::handoff::render_boot_context(Some(std::path::Path::new(wd))));
+        if is_first_visible_message
+            && blocks.is_empty()
+            && let Some(handoff) = handoff
+        {
+            text = format!("{handoff}\n\n{text}");
+        }
+
         blocks.push(ContentBlock::Text {
-            text: user_message.to_string(),
+            text,
             cache_control: None,
         });
 
