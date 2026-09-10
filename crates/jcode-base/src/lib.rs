@@ -41,6 +41,7 @@ pub mod generated_image;
 pub mod github;
 pub mod gmail;
 pub mod goal;
+pub mod handoff;
 pub mod hooks;
 pub mod id;
 pub mod import;

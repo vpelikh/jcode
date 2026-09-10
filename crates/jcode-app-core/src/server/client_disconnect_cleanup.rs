@@ -250,6 +250,8 @@ pub(super) async fn cleanup_client_connection(
                     .with_session_id(sid.clone())
                     .force_attribution();
                     crate::runtime_memory_log::emit_event(event);
+                    let handoff_transcript = transcript.clone();
+                    let handoff_working_dir = working_dir.clone();
                     if let Some(transcript) = transcript {
                         crate::memory_agent::trigger_final_extraction_with_dir(
                             transcript,
@@ -257,6 +259,22 @@ pub(super) async fn cleanup_client_connection(
                             working_dir,
                         );
                     }
+                    // Capture a lightweight per-session handoff so a later
+                    // session in the same project can boot from where we left
+                    // off, without re-reading the whole transcript. This is
+                    // mechanical (todo plan + noise-free snapshot) and must
+                    // never block or fail the cleanup path.
+                    let disposition_str = match disposition {
+                        DisconnectDisposition::Closed => "closed",
+                        DisconnectDisposition::Crashed => "crashed",
+                        DisconnectDisposition::Reloading => "reloading",
+                    };
+                    let _ = crate::handoff::capture(
+                        &client_session_id,
+                        handoff_working_dir.as_deref().map(std::path::Path::new),
+                        disposition_str,
+                        handoff_transcript.as_deref(),
+                    );
                 }
                 Err(_) => {
                     crate::logging::warn(&format!(
