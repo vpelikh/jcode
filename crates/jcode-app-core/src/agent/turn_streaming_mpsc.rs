@@ -1658,6 +1658,26 @@ impl Agent {
                     self.session.id
                 ));
             }
+
+            // Scheduled per-step prune (deepseek-harness takeaway #6): before the
+            // next API call, shrink any oversized node added this batch so a
+            // pathological single tool result or screenshot does not survive to
+            // re-summarization or dominate the prompt. This is the cheap,
+            // model-free counterpart to the repeat-tool guard above; it is a
+            // per-node-cap pass (no aggregate surgery) and costs no model call.
+            // It runs on every step and is a no-op when everything is within caps.
+            let pruned =
+                self.session
+                    .prune_transcript(&crate::compaction::prune::PrunePolicy::node_caps());
+            if !pruned.is_empty() {
+                crate::logging::info(&format!(
+                    "[prune] per-step shrink for session {}: {} image(s), {} tool result(s)",
+                    self.session.id,
+                    pruned.images_stripped,
+                    pruned.tool_results_truncated,
+                ));
+                self.session.save()?;
+            }
         }
 
         Ok(())

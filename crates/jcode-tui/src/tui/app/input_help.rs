@@ -22,6 +22,9 @@ impl App {
             "fix" => {
                 "/fix\nRun recovery actions when the model cannot continue.\nRepairs missing tool outputs, resets provider session state, and starts compaction when possible."
             }
+            "prune" => {
+                "/prune\nShrink oversized context deterministically (no model call).\nTruncates oversized tool results to their head+tail and replaces oversized inline screenshots with short text markers, so a single pathological node no longer dominates the prompt.\nComplements /compact (which collapses older turns via a model summary); /prune never summarizes."
+            }
             "rewind" => {
                 "/rewind\nShow numbered conversation history.\n\n/rewind N\nRewind to message N (drops everything after it and resets provider session).\n\n/rewind undo\nUndo the most recent rewind and restore the removed messages."
             }

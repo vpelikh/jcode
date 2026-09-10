@@ -1140,6 +1140,28 @@ impl Agent {
                     ));
                 }
             }
+
+            // Scheduled per-step prune (deepseek-harness takeaway #6): mirror the
+            // streaming loop's Point-D prune so the headless turn also shrinks any
+            // oversized tool result / screenshot before requesting the next model
+            // turn. Cheap (per-node caps, no model call), no-op when within caps.
+            let pruned =
+                self.session
+                    .prune_transcript(&crate::compaction::prune::PrunePolicy::node_caps());
+            if !pruned.is_empty() {
+                logging::info(&format!(
+                    "[prune] per-step shrink in headless turn for session {}: {} image(s), {} tool result(s)",
+                    self.session.id,
+                    pruned.images_stripped,
+                    pruned.tool_results_truncated,
+                ));
+                if let Err(err) = self.session.save() {
+                    logging::warn(&format!(
+                        "Failed to persist per-step prune for session {}: {}",
+                        self.session.id, err
+                    ));
+                }
+            }
         }
 
         Ok(final_text)
