@@ -4,10 +4,9 @@ use super::services::{MemberIdentity, SwarmServiceHandle};
 use super::client_state::{handle_get_history, spawn_model_prefetch_update};
 use super::{
     ClientConnectionInfo, ClientDebugState, FileTouchService, SessionInterruptQueues, SwarmMember,
-    SwarmState, VersionedPlan, fanout_live_client_event,
+    SwarmState, fanout_live_client_event,
     persist_swarm_state_for, register_background_tool_signal, register_session_event_sender,
     register_session_interrupt_queue, remove_background_tool_signal,
-    remove_session_channel_subscriptions, remove_session_from_swarm,
     remove_session_interrupt_queue, rename_background_tool_signal,
     rename_session_interrupt_queue, send_swarm_plan_to_session, swarm_id_for_session,
     unregister_session_event_sender,
@@ -28,7 +27,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, mpsc};
 
 type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
-type ChannelSubscriptions = Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
 const RELOAD_RESTORE_MARKER_MAX_AGE: Duration = Duration::from_secs(60);
 
 pub(super) fn session_was_interrupted_by_reload(agent: &Agent) -> bool {
@@ -506,8 +504,6 @@ pub(super) async fn handle_subscribe(
     let swarms_by_id = &swarm.swarm_state.swarms_by_id;
     let swarm_plans = &swarm.swarm_state.plans;
     let swarm_coordinators = &swarm.swarm_state.coordinators;
-    let channel_subscriptions = &swarm.channel_subscriptions;
-    let channel_subscriptions_by_session = &swarm.channel_subscriptions_by_session;
 
     let subscribe_start = Instant::now();
     crate::logging::event_info(
@@ -598,12 +594,7 @@ pub(super) async fn handle_subscribe(
 
         if let Some(ref old_id) = old_swarm_id {
             if updated_swarm_id.as_ref() != Some(old_id) {
-                remove_session_channel_subscriptions(
-                    client_session_id,
-                    channel_subscriptions,
-                    channel_subscriptions_by_session,
-                )
-                .await;
+                swarm.remove_session_channel_subscriptions(client_session_id).await;
             }
             let mut swarms = swarms_by_id.write().await;
             if let Some(swarm) = swarms.get_mut(old_id) {
@@ -904,7 +895,6 @@ pub(super) async fn handle_reload(
     let _ = client_event_tx.send(ServerEvent::Done { id });
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn cleanup_detached_source_session_if_unused(
     old_session_id: &str,
     client_connection_id: &str,
@@ -913,14 +903,10 @@ async fn cleanup_detached_source_session_if_unused(
     shutdown_signals: &Arc<RwLock<HashMap<String, InterruptSignal>>>,
     soft_interrupt_queues: &SessionInterruptQueues,
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    swarm: &SwarmServiceHandle,
     file_touch: &FileTouchService,
-    channel_subscriptions: &ChannelSubscriptions,
-    channel_subscriptions_by_session: &ChannelSubscriptions,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
 ) {
+    let swarm_members = &swarm.swarm_state.members;
     unregister_session_event_sender(swarm_members, old_session_id, client_connection_id).await;
 
     if !remove_detached_source_if_unclaimed(
@@ -946,12 +932,7 @@ async fn cleanup_detached_source_session_if_unused(
     }
     remove_background_tool_signal(old_session_id);
     remove_session_interrupt_queue(soft_interrupt_queues, old_session_id).await;
-    remove_session_channel_subscriptions(
-        old_session_id,
-        channel_subscriptions,
-        channel_subscriptions_by_session,
-    )
-    .await;
+    swarm.remove_session_channel_subscriptions(old_session_id).await;
     file_touch.clear_session(old_session_id).await;
 
     let removed_swarm_id = {
@@ -961,15 +942,9 @@ async fn cleanup_detached_source_session_if_unused(
             .and_then(|member| member.swarm_id)
     };
     if let Some(swarm_id) = removed_swarm_id {
-        remove_session_from_swarm(
-            old_session_id,
-            &swarm_id,
-            swarm_members,
-            swarms_by_id,
-            swarm_coordinators,
-            swarm_plans,
-        )
-        .await;
+        swarm
+            .remove_session_from_swarm(old_session_id, &swarm_id)
+            .await;
     }
 }
 
@@ -1064,8 +1039,6 @@ pub(super) async fn handle_resume_session(
     let swarms_by_id = &swarm.swarm_state.swarms_by_id;
     let swarm_plans = &swarm.swarm_state.plans;
     let swarm_coordinators = &swarm.swarm_state.coordinators;
-    let channel_subscriptions = &swarm.channel_subscriptions;
-    let channel_subscriptions_by_session = &swarm.channel_subscriptions_by_session;
     let file_touch = &swarm.file_touch;
 
     let resume_start = Instant::now();
@@ -1141,13 +1114,8 @@ pub(super) async fn handle_resume_session(
             shutdown_signals,
             soft_interrupt_queues,
             client_connections,
-            swarm_members,
-            swarms_by_id,
+            swarm,
             file_touch,
-            channel_subscriptions,
-            channel_subscriptions_by_session,
-            swarm_plans,
-            swarm_coordinators,
         )
         .await;
 
@@ -1472,12 +1440,7 @@ pub(super) async fn handle_resume_session(
             }
 
             swarm.rename_member_session(&old_session_id, &session_id).await;
-            remove_session_channel_subscriptions(
-                &old_session_id,
-                channel_subscriptions,
-                channel_subscriptions_by_session,
-            )
-            .await;
+            swarm.remove_session_channel_subscriptions(&old_session_id).await;
             file_touch.clear_session(&old_session_id).await;
             {
                 let mut coordinators = swarm_coordinators.write().await;
