@@ -26,8 +26,10 @@ use crate::todo::{TodoItem, load_plan, load_todos};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 /// A single session's handoff snapshot, written on session close.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,16 +84,32 @@ const MAX_INDEX_ENTRIES: usize = 64;
 /// Prefers the git remote URL (stable across clones/machines) and falls back to
 /// the absolute working directory. Returns `None` when neither yields anything
 /// meaningful.
+///
+/// The git remote lookup runs a `git` subprocess. Because the URL is a constant
+/// for a given directory within a process, the result is cached so the hot
+/// first-message injection path does not spawn git on every session.
 pub fn project_key(working_dir: Option<&Path>) -> Option<String> {
     let dir = working_dir?;
-    // The git remote URL is the most portable identity across machines.
-    if let Some(url) = git_remote_url(dir) {
-        return Some(format!("git:{}", url));
+    let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let cache = PROJECT_KEY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(cached) = cache.lock().ok().and_then(|m| m.get(&canonical).cloned()) {
+        return cached;
     }
-    // Fall back to the absolute path (only stable if the same path is reused).
-    let abs = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-    Some(format!("path:{}", abs.display()))
+    // The git remote URL is the most portable identity across machines.
+    let key = if let Some(url) = git_remote_url(&canonical) {
+        Some(format!("git:{}", url))
+    } else {
+        // Fall back to the absolute path (only stable if the same path is
+        // reused across sessions).
+        Some(format!("path:{}", canonical.display()))
+    };
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(canonical, key.clone());
+    }
+    key
 }
+
+static PROJECT_KEY_CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<String>>>> = OnceLock::new();
 
 /// Build a handoff snapshot for a closing session, sans writing to disk.
 ///
