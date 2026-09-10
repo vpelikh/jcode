@@ -54,6 +54,15 @@ policy and report so every consumer stays in lockstep.
   shrunk immediately instead of surviving to re-summarization. No-op when within
   caps (the run-every-step cadence takeaway #6 calls for).
 
+  **Scope note on `/prune` (local-only vs remote `/compact`).** `/compact` works
+  over SSH/remote because it is a server-side operation (`Request::Compact` →
+  `ServerEvent::CompactResult`). `/prune` is implemented as a local TUI session
+  mutation (`app.session.prune_transcript`) with no server route, so it is
+  reachable only for a locally-connected session. The scheduled per-step prune
+  (the higher-impact part) runs server-side in the agent loop regardless of
+  client. A remote `/prune` mirror (server `Request::Prune` + `ServerEvent::
+  PruneResult`) is a real follow-up if parity with `/compact` is wanted.
+
 **Verification:** `jcode-compaction-core` 27 tests green (incl. 5 new `prune`
 tests). `jcode-base` **full lib 1556 green** (0 failed; incl. new
 `test_prune_transcript_uses_policy_and_keeps_event_log_consistent`).
