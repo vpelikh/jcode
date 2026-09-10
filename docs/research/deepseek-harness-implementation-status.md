@@ -76,8 +76,15 @@ prune change:
   identically on a clean `master` worktree at the base commit `ec676907e`**
   (`0 passed, 1 failed`, "first idle poll must run"), so it is a pre-existing
   review-loop failure, independent of this branch. The prune change touches no
-  review-loop code (`git show --name-only` of both prune commits lists no
+  review-loop code (`git show --name-only` of the prune commits lists no
   `review_loop*`/`commands_review*` file).
+
+  Note: the *full* TUI run also stalls indefinitely on
+  `ssh_remote_startup_ignores_colliding_local_session_and_onboarding`
+  (`crates/jcode-tui/src/tui/app/tests/ssh_remote.rs`, "has been running for
+  over 60 seconds"), blocking the suite from emitting a final line. That file
+  is not touched by the prune commits either; it is an environment-dependent
+  SSH/hang in the same pre-existing class as the others.
 
 **Interpretation noted (deviation from the literal doc).** The doc's literal
 recommendation is about scheduling: run `prune` *on a cheap cadence* (every step)
