@@ -358,19 +358,6 @@ fn corrupt_index_does_not_fail_capture() {
     crate::env::remove_var("JCODE_HOME");
 }
 
-fn repo_with_remote(dir: &std::path::Path) {
-    let _ = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["init", "-q"])
-        .output();
-    let _ = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["remote", "add", "origin", "https://example.com/acme/widget.git"])
-        .output();
-}
-
 /// The first-user-message injection consumes `render_boot_context`: it must
 /// yield the compact block exactly when a fresh session (empty conversation)
 /// has a handoff for the working dir, and none otherwise.
@@ -442,7 +429,7 @@ async fn full_workflow_capture_boot_render_promote() {
 
     // Session A works in checkout A, captures with open work.
     let checkout_a = tempfile::TempDir::new().expect("a");
-    repo_with_remote(checkout_a.path());
+    git_repo_with_remote(checkout_a.path(), "https://example.com/acme/widget.git");
     crate::todo::save_todos(
         "s-a",
         &[TodoItem {
@@ -471,7 +458,7 @@ async fn full_workflow_capture_boot_render_promote() {
     // A later session on a *different* checkout (= another machine/path) of the
     // same repo boots with the handoff injected, without re-explaining.
     let checkout_b = tempfile::TempDir::new().expect("b");
-    repo_with_remote(checkout_b.path());
+    git_repo_with_remote(checkout_b.path(), "https://example.com/acme/widget.git");
     let block = render_boot_context(Some(checkout_b.path()))
         .expect("boot context from cross-path checkout");
     assert!(block.contains("split server into services"), "{block}");
