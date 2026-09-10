@@ -189,6 +189,14 @@ dsh's own priority.
 
 **What this gives us.** A 4000-character tool result that survives compaction because the emergency cap kicks in still gets re-summarized on every later compaction cycle. If pruning and summarization are separate, you can run `prune` on a cheap schedule (every step) and `summarize` less often (every 5 steps), because the prune is cheap and deterministic. It also makes the summarizer's job smaller — it doesn't need to handle edge cases around tool result sizes, just about summarizing the remaining history.
 
+**Current status (2026-09-09).** The **prune** stage is now a distinct, named model-free layer in `jcode-compaction-core/src/prune.rs`, separate from the summarizer:
+- `PrunePolicy` (`node_caps()` for the run-every-step per-node caps; `payload_413()` for the aggregate byte-budget recovery) and `PruneReport` (`images_stripped`, `tool_results_truncated`) are the seam's inputs/outputs.
+- `prune_contents(&mut [&mut Vec<ContentBlock>], &PrunePolicy)` runs the deterministic replacements in a fixed order: aggregate image budget (oldest-first) → aggregate tool-result budget (largest-first, only if no image was reclaimed) → per-node caps. It reuses the existing low-level `strip_large_images_in_contents` / `emergency_truncate_tool_results_in_contents` as building blocks, so behavior is preserved.
+- The session layer exposes `Session::prune_transcript(&PrunePolicy) -> PruneReport` (re-exported through `jcode_base::compaction::prune`), which records the mutation as a single `ReplaceMessages` event so the event-sourced log stays the source of truth.
+- The three previously duplicated HTTP 413 recovery call sites (`jcode-app-core` agent compaction, and both `jcode-tui` model-context sites) now call `prune_transcript(PrunePolicy::payload_413())` instead of hand-orchestrating `strip_oversized_images` then `emergency_truncate_tool_results`, so the policy and escalation order live in one place and every call site stays in lockstep.
+
+**Still open (deliberately not forced).** A *scheduled* run-every-step prune (as opposed to the on-demand 413 recovery) is not yet wired into a turn boundary; that is a behavior/loop change and is tracked as follow-up rather than part of the seam deliverable. The seam and the shared policy are the payoff; the schedule is a consumer decision.
+
 ## 7. Loop-hygiene guards: repeat-tool reminder + per-call timeout
 
 - **dsh:** `guard/` ships two tiny plugins in the base bundle:

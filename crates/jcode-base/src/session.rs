@@ -1739,6 +1739,34 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         truncated
     }
 
+    /// Run a deterministic **prune** pass (takeaway #6) over the stored
+    /// transcript.
+    ///
+    /// The prune stage is the model-free, per-node reclamation layer distinct
+    /// from the model-driven summarizer: it shrinks oversized tool results and
+    /// replaces oversized inline images with descriptive text markers, exactly
+    /// as the HTTP 413 recovery path needs, but with a policy that can be tuned
+    /// for a run-every-step cadence (`PrunePolicy::node_caps`) or for the
+    /// aggregate-body budget case (`PrunePolicy::payload_413`).
+    ///
+    /// Mutates and persists the authoritative transcript and invalidates the
+    /// provider-message cache when anything changed. Returns a report of what
+    /// was pruned.
+    pub fn prune_transcript(
+        &mut self,
+        policy: &jcode_compaction_core::prune::PrunePolicy,
+    ) -> jcode_compaction_core::prune::PruneReport {
+        let mut contents: Vec<&mut Vec<ContentBlock>> =
+            self.messages.iter_mut().map(|m| &mut m.content).collect();
+        let report = jcode_compaction_core::prune::prune_contents(&mut contents, policy);
+        if !report.is_empty() {
+            self.mark_memory_profile_dirty();
+            self.mark_messages_full_dirty();
+            self.record_transcript_replacement();
+        }
+        report
+    }
+
     pub fn visible_conversation_message_count(&self) -> usize {
         self.messages
             .iter()

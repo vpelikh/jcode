@@ -267,22 +267,17 @@ impl Agent {
             return false;
         }
 
-        // Phase 1: drop oversized inline images (the classic 413 driver). Use
-        // the tighter emergency budget: once a request has been rejected as too
-        // large, prioritize getting a retry through over preserving screenshots.
-        let stripped = self
+        // Run the deterministic prune stage (takeaway #6) with the shared
+        // HTTP 413 policy: strip images oldest-first to the emergency image
+        // budget, and only if that reclaims no image, trim tool results to the
+        // payload tool-result budget. The single `prune_contents` entrypoint
+        // preserves the historical escalation order and report; the policy
+        // lives in one place so every 413 call site stays in lockstep.
+        let report = self
             .session
-            .strip_oversized_images(crate::compaction::PAYLOAD_IMAGE_EMERGENCY_CHAR_BUDGET);
-
-        // Phase 2: if images couldn't get us under budget (e.g. the oversized
-        // payload is accumulated tool-result text, not images), truncate large
-        // tool results so the next request body fits.
-        let truncated = if stripped == 0 {
-            self.session
-                .emergency_truncate_tool_results(crate::compaction::PAYLOAD_TOOL_RESULT_CHAR_BUDGET)
-        } else {
-            0
-        };
+            .prune_transcript(&crate::compaction::prune::PrunePolicy::payload_413());
+        let stripped = report.images_stripped;
+        let truncated = report.tool_results_truncated;
 
         if stripped == 0 && truncated == 0 {
             logging::warn(

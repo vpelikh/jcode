@@ -973,19 +973,15 @@ impl App {
 
         if is_request_payload_too_large_error(&error) {
             // 413 is a request body-size rejection driven by inline images and/or
-            // accumulated large tool outputs. Strip oversized images now; if there
-            // are none, truncate large tool results so a manual resubmit (or
-            // auto-poke retry) goes through, and keep auto-poke alive.
-            let stripped = self
+            // accumulated large tool outputs. Run the shared deterministic prune
+            // stage (image-strip then tool-result trim under the payload policy)
+            // so a manual resubmit (or auto-poke retry) goes through, and keep
+            // auto-poke alive.
+            let report = self
                 .session
-                .strip_oversized_images(crate::compaction::PAYLOAD_IMAGE_EMERGENCY_CHAR_BUDGET);
-            let truncated = if stripped == 0 {
-                self.session.emergency_truncate_tool_results(
-                    crate::compaction::PAYLOAD_TOOL_RESULT_CHAR_BUDGET,
-                )
-            } else {
-                0
-            };
+                .prune_transcript(&crate::compaction::prune::PrunePolicy::payload_413());
+            let stripped = report.images_stripped;
+            let truncated = report.tool_results_truncated;
             if stripped > 0 || truncated > 0 {
                 self.messages.clear();
                 self.reseed_compaction_from_provider_messages();
@@ -1113,16 +1109,11 @@ impl App {
             return false;
         }
 
-        let stripped = self
+        let report = self
             .session
-            .strip_oversized_images(crate::compaction::PAYLOAD_IMAGE_EMERGENCY_CHAR_BUDGET);
-        let truncated = if stripped == 0 {
-            self.session.emergency_truncate_tool_results(
-                crate::compaction::PAYLOAD_TOOL_RESULT_CHAR_BUDGET,
-            )
-        } else {
-            0
-        };
+            .prune_transcript(&crate::compaction::prune::PrunePolicy::payload_413());
+        let stripped = report.images_stripped;
+        let truncated = report.tool_results_truncated;
         if stripped == 0 && truncated == 0 {
             // No single oversized image or tool result drove the 413. The body
             // is likely large because of accumulated message volume, so fall
