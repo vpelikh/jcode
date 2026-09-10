@@ -216,6 +216,20 @@ pub async fn run_bridge_stdio(legacy_socket: PathBuf) -> Result<()> {
     run_bridge_stream(input, tokio::io::stdout(), legacy_socket).await
 }
 
+/// Whether a bridge client should declare that disconnecting it owns a crash.
+///
+/// This maps to the legacy `crash_on_disconnect` hint on the session subscribe.
+/// Note the current daemon ignores that field (`crash_on_disconnect: _` in
+/// `client_lifecycle.rs`); whether a disconnect crashes a session is decided by
+/// the daemon's `disconnect_disposition`, based on whether a turn was
+/// interrupted. So this wiring is correctness/hygiene only: it routes the hint
+/// from the interactive desktop client (`jcode-desktop2/<version>`), which owns
+/// the session the user sees, rather than from the short-lived background
+/// helpers (`jcode-desktop2-<role>/...`), which do not own it.
+fn desktop_client_crash_on_disconnect(client_name: &str) -> bool {
+    client_name.starts_with("jcode-desktop2/")
+}
+
 /// Serve one stable API connection over a duplex byte stream, including SSH
 /// stdio. No API listener or filesystem socket is created for this connection.
 pub async fn run_bridge_stream<R, W>(
@@ -297,8 +311,11 @@ where
     let (legacy_read, mut legacy_write) = legacy.into_split();
     let mut legacy_reader = BufReader::new(legacy_read);
 
-    let mut state =
-        translate::BridgeState::with_crash_on_disconnect(client_name.starts_with("jcode-desktop-"));
+    // Route the crash hint from the interactive desktop client, not the
+    // short-lived background helpers.
+    let mut state = translate::BridgeState::with_crash_on_disconnect(
+        desktop_client_crash_on_disconnect(client_name),
+    );
 
     // 3. Pump both directions in one select loop so translation state stays
     //    single-threaded.
@@ -652,5 +669,39 @@ mod socket_permission_tests {
             "API socket must be owner-only (0600); a wider mode exposes every \
              session behind the bridge to other local users"
         );
+    }
+}
+
+#[cfg(test)]
+mod desktop_crash_tests {
+    use super::desktop_client_crash_on_disconnect;
+
+    #[test]
+    fn interactive_desktop_client_crashes_owned_session() {
+        assert!(desktop_client_crash_on_disconnect("jcode-desktop2/0.83.0"));
+        assert!(desktop_client_crash_on_disconnect("jcode-desktop2/0.1.0"));
+        // Any version shape, with nothing after the slash, still matches.
+        assert!(desktop_client_crash_on_disconnect("jcode-desktop2/"));
+    }
+
+    #[test]
+    fn background_and_other_clients_do_not_crash_the_session() {
+        // Background helper connections must not crash the interactive session.
+        assert!(!desktop_client_crash_on_disconnect(
+            "jcode-desktop2-sessions/0.83.0"
+        ));
+        assert!(!desktop_client_crash_on_disconnect(
+            "jcode-desktop2-preview/0.83.0"
+        ));
+        assert!(!desktop_client_crash_on_disconnect(
+            "jcode-desktop2-profile/0.83.0"
+        ));
+        assert!(!desktop_client_crash_on_disconnect(
+            "jcode-desktop2-check/0.83.0"
+        ));
+        // Other clients are unrelated.
+        assert!(!desktop_client_crash_on_disconnect("jcode-cli"));
+        assert!(!desktop_client_crash_on_disconnect("jcode-sdk-rs/0.83.0"));
+        assert!(!desktop_client_crash_on_disconnect(""));
     }
 }

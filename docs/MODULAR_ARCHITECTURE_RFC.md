@@ -77,7 +77,7 @@ Current workspace members from `Cargo.toml` are grouped roughly as follows:
 - heavy or optional integrations: `jcode-embedding`, `jcode-pdf`, `jcode-notify-email`
 - auth and providers: `jcode-azure-auth`, `jcode-provider-core`, `jcode-provider-metadata`, `jcode-provider-openrouter`, `jcode-provider-gemini`
 - TUI extraction seams: `jcode-tui-core`, `jcode-tui-markdown`, `jcode-tui-mermaid`, `jcode-tui-render`, `jcode-tui-workspace`
-- product surfaces outside the main TUI binary: `jcode-desktop`
+- product surfaces outside the main TUI binary: `jcode-desktop2`
 
 ### What the root crate still owns
 
@@ -135,7 +135,7 @@ These splits already exist and should be treated as real architectural footholds
 | `jcode-tui-render` | reusable TUI layout/render helpers |
 | `jcode-tui-workspace` | workspace-map data/model/widget rendering |
 | `jcode-terminal-launch` | terminal process launch helpers |
-| `jcode-desktop` | desktop app surface and session/workspace rendering experiments |
+| `jcode-desktop2` | desktop app surface and session/workspace rendering experiments |
 
 These are already aligned with the compile-performance plan's strategy: isolate heavy dependencies and stable helper surfaces first.
 
@@ -359,7 +359,7 @@ Target crates:
 
 - `jcode-cli`: parsing and command dispatch if CLI keeps growing.
 - `jcode-tui`: app state, reducers, key handling, command/input handling, UI orchestration.
-- `jcode-desktop`: already a separate surface.
+- `jcode-desktop2`: already a separate surface.
 - `jcode-selfdev`: self-dev build/reload/customization workflows if they remain a substantial product surface.
 
 Compile-time reason:
