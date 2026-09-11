@@ -119,6 +119,39 @@ Public-API and integration coverage validates capture, index, portability,
 module wiring, first-message injection and disconnect persistence. A fresh
 interactive TUI end-to-end workflow was not exercised in this pass.
 
+### Acceptance follow-through and alternatives
+
+On 2026-09-11, an actual `debug_socket tester:spawn` attempt was refused:
+`Debug control is disabled. Set JCODE_DEBUG_CONTROL=1, enable
+ display.debug_socket, or start the shared server from a self-dev session.`
+Thus live TUI acceptance is externally blocked by server configuration. This
+pass did not restart the user's shared daemon or claim a tester ran.
+
+Three production-boundary tests were rerun individually with Cargo status
+preserved, all passing: disconnect cleanup persisted a readable handoff,
+first-message injection consumed it only once, and the public API workflow
+captured, rendered from a second checkout, and promoted into an initiative.
+These observations establish automatic carry-forward at the integration
+boundaries rather than merely inspecting code. They do not establish a live
+TUI or model's successful continuation of unfinished work.
+
+Alternatives evaluated against the current design:
+
+- **LLM summary at close:** offers richer decisions and rationale than a todo
+  snapshot, but introduces a provider dependency, token cost and variable close
+  latency. Mechanical capture wins for predictable offline persistence. Its
+  cost is incomplete context when todos or the last assistant text omit facts.
+- **Absolute-path-only identity:** simpler and avoids git lookup, but cannot
+  satisfy the passing cross-checkout portability scenario. Origin-based keys
+  retain that behavior at the cost of collapsing branches of the same origin
+  and treating distinct URL spellings as distinct identities.
+- **Uncached git lookup on every session:** sees origin changes immediately,
+  unlike the chosen process cache. Caching avoids repeated subprocess work
+  after warmup, at the cost of stale identity until restart after origin edits,
+  per-directory memory growth and a still-synchronous cold lookup. Concurrent
+  cold misses can duplicate lookups. No latency benchmark was performed, so
+  this pass does not claim a measured speedup or exactly one subprocess.
+
 ## Slices 2+ (future)
 
 - ~~`promote to initiative` action on a handoff (bridge into `goal`)~~ — **done** (`handoff::promote_to_initiative`).
