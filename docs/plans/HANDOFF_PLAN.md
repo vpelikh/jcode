@@ -119,6 +119,26 @@ Public-API and integration coverage validates capture, index, portability,
 module wiring, first-message injection and disconnect persistence. A fresh
 interactive TUI end-to-end workflow was not exercised in this pass.
 
+### Requirement-to-observation matrix
+
+| Explicit requirement / changed output | Concrete check | Observed result |
+| --- | --- | --- |
+| Per-session JSON and project-keyed index | `capture_only_writes_when_open_todos_exist`, `full_workflow_capture_boot_render_promote` | Passed: open todo and intent survive capture, index resolves session, persisted snapshot can be promoted |
+| Close hook alongside final extraction | `cleanup_persists_handoff_for_session_with_open_todos` | Passed through production cleanup: readable handoff persisted |
+| Session-start context for current project | `first_user_message_injects_handoff_once`, `boot_context_is_present_for_fresh_session_with_handoff` | Passed: first message includes block, subsequent message does not, unrelated directory has no block. Implemented as first-user-message context, not system-prompt mutation |
+| Module registration and dependencies | Full base suite plus compiled app-core integration tests | Passed compilation and public API resolution |
+| Capture/index/portability tests | All 12 `handoff::tests` | Passed, including same-origin cross-path identity and different-origin separation |
+| TUI build, plan, commit | Prior successful `selfdev build-reload`; installed binary version `d71d290b8`; committed plan | Build/reload tool reported restart, installed version matches implementation; not proof of running process identity |
+| Terminal todo filtering | `open_filter_drops_completed_and_cancelled`, empty capture case | Passed: no snapshot for terminal-only or empty work |
+| Corrupt index recovery | `corrupt_index_does_not_fail_capture` | Passed: new capture registers after corrupt index |
+| Rendered context text | `render_boot_context_produces_block`, `extracts_last_assistant_text` | Passed: marker, intent, open item and extracted assistant tail match assertions |
+| Attached initiative and promotion | `build_snapshot_records_attached_project_initiative`, `promote_to_initiative_creates_a_goal` | Passed: attachment ID retained and promoted project goal loadable |
+| Cached project identity | Existing origin/path/portability and injection tests | Passed functional outputs; subprocess count and latency are not measured |
+| Live TUI continuation | Actual `debug_socket tester:spawn` | Blocked: debug control disabled. No end-user completion claim |
+
+The table maps the requested slice and its public outputs, including explicit
+limits rather than treating blocked or unmeasured checks as successes.
+
 ### Acceptance follow-through and alternatives
 
 On 2026-09-11, an actual `debug_socket tester:spawn` attempt was refused:
