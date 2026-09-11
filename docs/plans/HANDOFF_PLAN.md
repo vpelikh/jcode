@@ -96,6 +96,29 @@ Behavior is exercised through the public `handoff` API with an isolated
   in `crates/jcode-app-core/src/server/client_disconnect_grace_tests.rs`): the
   real `cleanup_client_connection` close path persists a readable handoff.
 
+### Final validation pass (2026-09-11)
+
+Validated implementation commit `d71d290b8`:
+
+- `cargo test -p jcode-base --lib`: 1567 passed, 0 failed, 2 ignored.
+- Handoff-filtered tests: 12 base tests and 6 app-core tests passed. The latter
+  includes the actual disconnect cleanup and first-message injection tests
+  (and four unrelated reload/socket tests matching the filter).
+- Full app-core run: 1468 passed, 1 failed, 24 ignored. The failure was
+  `channel::tests::test_session_picker_menu_flow` (four rows instead of one).
+  Its exact isolated rerun passed. This is a known order-dependent shared-state
+  failure, not evidence of a fully green full-suite run or a random flake.
+- Base and isolated picker reruns preserved Cargo exit status and both exited 0.
+  The earlier full-suite shell pipeline masked Cargo failure with `tail` exit 0,
+  so the test summary above, not that shell status, is authoritative.
+- The current-channel binary reported `d71d290b8`, matching implementation HEAD,
+  and the shared-server symlink resolved to that version. These checks verify
+  installed artifacts, not a live process's executable or a fresh TUI workflow.
+
+Public-API and integration coverage validates capture, index, portability,
+module wiring, first-message injection and disconnect persistence. A fresh
+interactive TUI end-to-end workflow was not exercised in this pass.
+
 ## Slices 2+ (future)
 
 - ~~`promote to initiative` action on a handoff (bridge into `goal`)~~ — **done** (`handoff::promote_to_initiative`).
