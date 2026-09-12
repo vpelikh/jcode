@@ -1,5 +1,13 @@
 # Session Handoff Plan
 
+## Status
+
+**Core functionality implemented and integration-tested.** Capture, project
+indexing, first-message injection, and initiative promotion are complete. The
+TUI build passes. Live TUI end-to-end validation remains outstanding.
+
+**Planned:** manual selection, snapshot pruning, and remote fallback.
+
 ## Purpose
 
 Preserve unfinished work across sessions without requiring the user to repeat
