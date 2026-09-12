@@ -66,14 +66,17 @@ impl PrunePolicy {
     /// Per-node caps from explicit values (e.g. loaded from config). Falls back
     /// to the built-in defaults when a value is zero. Keeps aggregate budgets
     /// off, exactly like [`Self::node_caps`], so it never performs surgery.
-    pub fn node_caps_with(
-        tool_result_max_chars: usize,
-        image_max_chars: usize,
-    ) -> Self {
-        let tool_result_max_chars =
-            if tool_result_max_chars == 0 { EMERGENCY_TOOL_RESULT_MAX_CHARS } else { tool_result_max_chars };
-        let image_max_chars =
-            if image_max_chars == 0 { EMERGENCY_IMAGE_MAX_CHARS } else { image_max_chars };
+    pub fn node_caps_with(tool_result_max_chars: usize, image_max_chars: usize) -> Self {
+        let tool_result_max_chars = if tool_result_max_chars == 0 {
+            EMERGENCY_TOOL_RESULT_MAX_CHARS
+        } else {
+            tool_result_max_chars
+        };
+        let image_max_chars = if image_max_chars == 0 {
+            EMERGENCY_IMAGE_MAX_CHARS
+        } else {
+            image_max_chars
+        };
         Self {
             image_max_chars: Some(image_max_chars),
             tool_result_max_chars: Some(tool_result_max_chars),
@@ -209,7 +212,22 @@ fn truncate_oversized_tool_results_node(
         for block in content.iter_mut() {
             if let ContentBlock::ToolResult { content: text, .. } = block {
                 if text.len() > max_chars {
-                    *text = prune_truncated_tool_result(text, max_chars);
+                    let mut shortened = prune_truncated_tool_result(text, max_chars);
+                    if shortened.len() > max_chars {
+                        // Tiny configured caps cannot hold the recovery marker.
+                        // Use a compact marker and reserve its bytes first so
+                        // the next scheduled pass is a true no-op.
+                        let marker = crate::truncate_str_boundary("[pruned]", max_chars);
+                        let remaining = max_chars - marker.len();
+                        let head_bytes = remaining - remaining / 3;
+                        shortened = format!(
+                            "{}{}{}",
+                            crate::truncate_str_boundary(text, head_bytes),
+                            marker,
+                            crate::tail_str_boundary(text, remaining / 3),
+                        );
+                    }
+                    *text = shortened;
                     truncated += 1;
                 }
             }
@@ -307,6 +325,41 @@ mod tests {
         assert_eq!(report.images_stripped, 0);
         // The two 9 MB results are trimmed under the 8 MiB tool budget.
         assert!(report.tool_results_truncated > 0);
+    }
+
+    #[test]
+    fn configured_caps_and_zero_fallback_match_policy() {
+        let custom = PrunePolicy::node_caps_with(256, 2048);
+        assert_eq!(custom.tool_result_max_chars, Some(256));
+        assert_eq!(custom.image_max_chars, Some(2048));
+        assert_eq!(custom.image_total_budget, None);
+        assert_eq!(custom.tool_result_total_budget, None);
+        let fallback = PrunePolicy::node_caps_with(0, 0);
+        let defaults = PrunePolicy::node_caps();
+        assert_eq!(
+            fallback.tool_result_max_chars,
+            defaults.tool_result_max_chars
+        );
+        assert_eq!(fallback.image_max_chars, defaults.image_max_chars);
+    }
+
+    #[test]
+    fn configured_small_caps_are_bounded_and_idempotent() {
+        for cap in [1, 2, 3, 16, 64, 128, 4000] {
+            let mut blocks = vec![vec![ContentBlock::ToolResult {
+                tool_use_id: "utf8".into(),
+                content: "尾é".repeat(2000),
+                is_error: None,
+            }]];
+            let policy = PrunePolicy::node_caps_with(cap, 1024);
+            let report = prune_contents(&mut to_contents(&mut blocks), &policy);
+            assert_eq!(report.tool_results_truncated, 1);
+            let ContentBlock::ToolResult { content, .. } = &blocks[0][0] else {
+                panic!("tool result must be preserved");
+            };
+            assert!(content.len() <= cap, "cap {cap}, actual {}", content.len());
+            assert!(prune_contents(&mut to_contents(&mut blocks), &policy).is_empty());
+        }
     }
 
     #[test]

@@ -3819,3 +3819,40 @@ async fn stale_manual_handoff_override_falls_back_to_auto_inject() {
         "stale override must be consumed after one injection, got: {second_str}"
     );
 }
+
+#[tokio::test]
+async fn manual_prune_updates_provider_view_and_is_idempotent() {
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+    agent.add_message(
+        Role::User,
+        vec![ContentBlock::ToolResult {
+            tool_use_id: "manual-prune-tool".into(),
+            content: "x".repeat(10_000),
+            is_error: None,
+        }],
+    );
+    let _cached = agent.provider_messages();
+    let (report, message) = agent.request_manual_prune();
+    assert_eq!(report.tool_results_truncated, 1, "{message}");
+    assert_eq!(report.images_stripped, 0);
+    let messages = agent.provider_messages();
+    let result = messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .find_map(|block| {
+            if let ContentBlock::ToolResult { content, .. } = block {
+                Some(content)
+            } else {
+                None
+            }
+        })
+        .expect("tool result preserved");
+    assert!(result.len() <= 4000);
+    agent
+        .session
+        .rederive_all_checked()
+        .expect("pruned event log replays");
+    assert!(agent.request_manual_prune().0.is_empty());
+}
