@@ -195,6 +195,7 @@ pub(super) async fn cleanup_client_connection(
         return Ok(());
     }
 
+    let mut handoff_capture = None;
     {
         if let Some(agent_arc) = super::remove_session_entry(sessions, client_session_id).await {
             let lock_result =
@@ -262,19 +263,19 @@ pub(super) async fn cleanup_client_connection(
                     // Capture a lightweight per-session handoff so a later
                     // session in the same project can boot from where we left
                     // off, without re-reading the whole transcript. This is
-                    // mechanical (todo plan + noise-free snapshot) and must
-                    // never block or fail the cleanup path.
+                    // mechanical. Defer disk/git work until after releasing
+                    // the global connections lock, then use the blocking pool.
                     let disposition_str = match disposition {
                         DisconnectDisposition::Closed => "closed",
                         DisconnectDisposition::Crashed => "crashed",
                         DisconnectDisposition::Reloading => "reloading",
                     };
-                    let _ = crate::handoff::capture(
-                        client_session_id,
-                        handoff_working_dir.as_deref().map(std::path::Path::new),
+                    handoff_capture = Some((
+                        client_session_id.to_string(),
+                        handoff_working_dir,
                         disposition_str,
-                        handoff_transcript.as_deref(),
-                    );
+                        handoff_transcript,
+                    ));
                 }
                 Err(_) => {
                     crate::logging::warn(&format!(
@@ -341,6 +342,21 @@ pub(super) async fn cleanup_client_connection(
 
     drop(connections);
     event_handle.abort();
+    // Await persistence so a completed cleanup is a reliable handoff
+    // boundary, without blocking the executor or other clients' attaches.
+    if let Some((sid, working_dir, disposition, transcript)) = handoff_capture
+        && let Err(error) = tokio::task::spawn_blocking(move || {
+            crate::handoff::capture(
+                &sid,
+                working_dir.as_deref().map(std::path::Path::new),
+                disposition,
+                transcript.as_deref(),
+            )
+        })
+        .await
+    {
+        crate::logging::warn(&format!("Handoff capture task failed: {error}"));
+    }
     Ok(())
 }
 

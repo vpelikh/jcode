@@ -3423,8 +3423,18 @@ async fn streaming_turn_recovers_from_413_payload_too_large_and_retries() {
 async fn first_user_message_injects_handoff_once() {
     let _guard = crate::storage::lock_test_env();
     let home = tempfile::TempDir::new().expect("temp home");
+    struct RestoreHome(Option<std::ffi::OsString>);
+    impl Drop for RestoreHome {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => crate::env::set_var("JCODE_HOME", value),
+                None => crate::env::remove_var("JCODE_HOME"),
+            }
+        }
+    }
+    let _restore = RestoreHome(std::env::var_os("JCODE_HOME"));
     crate::env::set_var("JCODE_HOME", home.path());
-    let wd = std::env::temp_dir().join("jcode-agent-inject-test");
+    let wd = home.path().join("project");
     std::fs::create_dir_all(&wd).unwrap();
 
     // Seed a handoff for this working dir from a "previous" session.
@@ -3484,7 +3494,10 @@ async fn first_user_message_injects_handoff_once() {
         first_str.contains("[Handoff from previous session]"),
         "first user message should carry the handoff, got: {first_str}"
     );
-    assert!(first_str.contains("continue now"), "original text preserved");
+    assert!(
+        first_str.contains("continue now"),
+        "original text preserved"
+    );
 
     // Second message must not re-inject (conversation is no longer fresh).
     agent
@@ -3513,9 +3526,21 @@ async fn first_user_message_injects_handoff_once() {
         !second_str.contains("[Handoff from previous session]"),
         "second user message must not re-inject the handoff, got: {second_str}"
     );
-
-    match std::env::var_os("JCODE_HOME") {
-        Some(_) => crate::env::remove_var("JCODE_HOME"),
-        None => {}
-    }
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut image_agent =
+        Agent::new_with_initial_working_dir(provider, registry, Some(wd.to_str().unwrap()));
+    image_agent
+        .append_user_context_message("", vec![("image/png".into(), "AA==".into())])
+        .unwrap();
+    let message = image_agent.session.messages.last().unwrap();
+    assert!(
+        message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Image { .. }))
+    );
+    assert!(message.content.iter().any(|block| matches!(block,
+        ContentBlock::Text { text, .. } if text.contains("[Handoff from previous session]")
+    )));
 }

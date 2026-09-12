@@ -129,13 +129,11 @@ impl Agent {
         // see an empty conversation for the first turn.
         let mut text = user_message.to_string();
         let is_first_visible_message = self.visible_conversation_message_count() == 0;
-        let handoff = self
-            .session
-            .working_dir
-            .as_deref()
-            .and_then(|wd| crate::handoff::render_boot_context(Some(std::path::Path::new(wd))));
         if is_first_visible_message
-            && let Some(handoff) = handoff
+            && let Some(handoff) =
+                self.session.working_dir.as_deref().and_then(|wd| {
+                    crate::handoff::render_boot_context(Some(std::path::Path::new(wd)))
+                })
         {
             text = format!("{handoff}\n\n{text}");
         }

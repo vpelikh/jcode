@@ -236,14 +236,14 @@ async fn interrupted_session_does_not_wait_for_reconnect_grace() {
 /// Integration boundary through the real close path: `cleanup_client_connection`
 /// runs the handoff hook, so closing a live session with open todos must
 /// actually persist a readable, loadable handoff for that project.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cleanup_persists_handoff_for_session_with_open_todos() {
     let _lock = crate::storage::lock_test_env();
     let _home = Home::new();
     crate::server::clear_reload_marker();
 
-    let fixture = Fixture::new(false).await;
-    let wd = std::env::temp_dir().join("jcode-close-handoff-test");
+    let fixture = Arc::new(Fixture::new(false).await);
+    let wd = _home._dir.path().join("project");
     std::fs::create_dir_all(&wd).unwrap();
     let sid = fixture.agent.lock().await.session_id().to_string();
 
@@ -278,12 +278,36 @@ async fn cleanup_persists_handoff_for_session_with_open_todos() {
 
     // No handoff yet; run the real close path, which triggers handoff capture.
     assert!(crate::handoff::load_snapshot(&sid).is_none());
-    timeout(
-        Duration::from_secs(5),
-        fixture.cleanup(true, Duration::from_secs(30)),
-    )
+    let store = _home._dir.path().join("handoffs");
+    std::fs::create_dir_all(&store).unwrap();
+    let store_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(store.join(".lock"))
+        .unwrap();
+    store_lock.lock().unwrap();
+    let closing = fixture.clone();
+    let cleanup = tokio::spawn(async move {
+        closing.cleanup(true, Duration::from_secs(30)).await;
+    });
+    timeout(Duration::from_secs(5), async {
+        while fixture.sessions.read().await.contains_key(&sid) {
+            tokio::task::yield_now().await;
+        }
+        // Persistence is blocked by our file lock. Other clients must still
+        // be able to acquire the global connections lock.
+        let connections = fixture.connections.write().await;
+        assert!(connections.is_empty());
+    })
     .await
-    .unwrap();
+    .expect("storage wait must not hold the connections lock");
+    drop(store_lock);
+    timeout(Duration::from_secs(5), cleanup)
+        .await
+        .unwrap()
+        .unwrap();
 
     // The close path persisted a readable handoff for the agent's session.
     let loaded = crate::handoff::load_snapshot(&sid).expect("close path wrote a handoff");

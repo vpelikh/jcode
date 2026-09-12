@@ -19,7 +19,12 @@ fn project_key_prefers_git_remote() {
     std::process::Command::new("git")
         .arg("-C")
         .arg(dir.path())
-        .args(["remote", "add", "origin", "https://example.com/acme/widget.git"])
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "https://example.com/acme/widget.git",
+        ])
         .output()
         .ok();
     assert_eq!(
@@ -40,12 +45,20 @@ fn git_available() -> bool {
 /// Fallback: a file-less path hashes to the path form even without git.
 #[test]
 fn project_key_falls_back_to_path() {
-    let dir = std::env::temp_dir().join(format!("jcode-handoff-u{}", std::process::id()));
-    std::fs::create_dir_all(&dir).ok();
-    let key = project_key(Some(&dir));
+    let dir = tempfile::tempdir().unwrap();
+    let key = project_key(Some(dir.path()));
     let key = key.expect("path fallback should yield a key");
     assert!(key.starts_with("path:"), "expected path: prefix, got {key}");
-    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn missing_relative_project_uses_absolute_fallback() {
+    let relative = PathBuf::from(format!("missing-handoff-{}", uuid::Uuid::new_v4()));
+    let expected = std::env::current_dir().unwrap().join(&relative);
+    assert_eq!(
+        project_key(Some(&relative)),
+        Some(format!("path:{}", expected.display()))
+    );
 }
 
 /// A transcript's last assistant text block is isolated from tool markers and
@@ -66,9 +79,9 @@ fn extracts_last_assistant_text() {
 #[tokio::test]
 async fn capture_only_writes_when_open_todos_exist() {
     let _guard = crate::storage::lock_test_env();
-    let home = tempfile::TempDir::new().expect("tempdir");
-    crate::env::set_var("JCODE_HOME", home.path());
-    let cwd = std::env::temp_dir().join("jcode-capture-test");
+    let env = HandoffTestEnv::new();
+    let home = &env._home;
+    let cwd = home.path().join("project");
     std::fs::create_dir_all(&cwd).ok();
 
     // No open todos -> nothing captured.
@@ -106,16 +119,14 @@ async fn capture_only_writes_when_open_todos_exist() {
     // Index knows about it.
     let latest = latest_handoff_for_project(Some(&cwd));
     assert_eq!(latest.as_deref(), Some("s-work"));
-
-    crate::env::remove_var("JCODE_HOME");
 }
 
 /// build_snapshot filters out completed/cancelled todos.
 #[test]
 fn open_filter_drops_completed_and_cancelled() {
     let _guard = crate::storage::lock_test_env();
-    let dir = tempfile::TempDir::new().expect("tempdir");
-    crate::env::set_var("JCODE_HOME", dir.path());
+    let env = HandoffTestEnv::new();
+    let dir = &env._home;
     let cwd = dir.path().join("proj");
     std::fs::create_dir_all(&cwd).ok();
 
@@ -141,16 +152,15 @@ fn open_filter_drops_completed_and_cancelled() {
         build_snapshot("s-done", Some(&cwd), "closed", None).is_none(),
         "only-completed/cancelled sessions must not produce a handoff"
     );
-    crate::env::remove_var("JCODE_HOME");
 }
 
 /// promote_to_initiative creates a project goal from a handoff snapshot.
 #[tokio::test]
 async fn promote_to_initiative_creates_a_goal() {
     let _guard = crate::storage::lock_test_env();
-    let home = tempfile::TempDir::new().expect("tempdir");
-    crate::env::set_var("JCODE_HOME", home.path());
-    let cwd = std::env::temp_dir().join("jcode-promote-test");
+    let env = HandoffTestEnv::new();
+    let home = &env._home;
+    let cwd = home.path().join("project");
     std::fs::create_dir_all(&cwd).ok();
 
     crate::todo::save_todos(
@@ -185,8 +195,6 @@ async fn promote_to_initiative_creates_a_goal() {
             .is_some(),
         "promoted goal should be loadable"
     );
-
-    crate::env::remove_var("JCODE_HOME");
 }
 
 /// A session with an attached project-scoped goal must record that goal id in
@@ -195,9 +203,9 @@ async fn promote_to_initiative_creates_a_goal() {
 #[tokio::test]
 async fn build_snapshot_records_attached_project_initiative() {
     let _guard = crate::storage::lock_test_env();
-    let home = tempfile::TempDir::new().expect("tempdir");
-    crate::env::set_var("JCODE_HOME", home.path());
-    let cwd = std::env::temp_dir().join("jcode-initiative-id-test");
+    let env = HandoffTestEnv::new();
+    let home = &env._home;
+    let cwd = home.path().join("project");
     std::fs::create_dir_all(&cwd).ok();
 
     crate::todo::save_todos(
@@ -233,17 +241,15 @@ async fn build_snapshot_records_attached_project_initiative() {
         Some(goal.id.as_str()),
         "the attached project initiative must be recorded in the handoff"
     );
-
-    crate::env::remove_var("JCODE_HOME");
 }
 
 /// render_boot_context emits a compact block when a handoff exists.
 #[tokio::test]
 async fn render_boot_context_produces_block() {
     let _guard = crate::storage::lock_test_env();
-    let home = tempfile::TempDir::new().expect("tempdir");
-    crate::env::set_var("JCODE_HOME", home.path());
-    let cwd = std::env::temp_dir().join("jcode-boot-test");
+    let env = HandoffTestEnv::new();
+    let home = &env._home;
+    let cwd = home.path().join("project");
     std::fs::create_dir_all(&cwd).ok();
 
     crate::todo::save_todos(
@@ -273,7 +279,6 @@ async fn render_boot_context_produces_block() {
     assert!(block.contains("[Handoff from previous session]"));
     assert!(block.contains("persist cross-session work"));
     assert!(block.contains("finish slice"));
-    crate::env::remove_var("JCODE_HOME");
 }
 
 fn git_repo_with_remote(dir: &std::path::Path, url: &str) {
@@ -324,13 +329,15 @@ fn same_git_origin_buckets_across_paths() {
 #[test]
 fn corrupt_index_does_not_fail_capture() {
     let _guard = crate::storage::lock_test_env();
-    let home = tempfile::TempDir::new().expect("tempdir");
-    crate::env::set_var("JCODE_HOME", home.path());
-    let cwd = std::env::temp_dir().join("jcode-corrupt-index");
+    let env = HandoffTestEnv::new();
+    let home = &env._home;
+    let cwd = home.path().join("project");
     std::fs::create_dir_all(&cwd).ok();
 
     // Write garbage over the index path.
-    let dir = crate::storage::jcode_dir().expect("jcode dir").join("handoffs");
+    let dir = crate::storage::jcode_dir()
+        .expect("jcode dir")
+        .join("handoffs");
     std::fs::create_dir_all(&dir).ok();
     std::fs::write(dir.join("index.json"), "{{{ not json").ok();
 
@@ -355,7 +362,6 @@ fn corrupt_index_does_not_fail_capture() {
         Some("s-corrupt"),
         "a fresh capture after a corrupt index should still register"
     );
-    crate::env::remove_var("JCODE_HOME");
 }
 
 /// The first-user-message injection consumes `render_boot_context`: it must
@@ -364,10 +370,9 @@ fn corrupt_index_does_not_fail_capture() {
 #[test]
 fn boot_context_is_present_for_fresh_session_with_handoff() {
     let _guard = crate::storage::lock_test_env();
-    let before = std::env::var_os("JCODE_HOME");
-    let home = tempfile::TempDir::new().expect("tempdir");
-    crate::env::set_var("JCODE_HOME", home.path());
-    let cwd = std::env::temp_dir().join("jcode-boot-context-test");
+    let env = HandoffTestEnv::new();
+    let home = &env._home;
+    let cwd = home.path().join("project");
     std::fs::create_dir_all(&cwd).ok();
 
     // No handoff yet -> no boot context.
@@ -405,14 +410,9 @@ fn boot_context_is_present_for_fresh_session_with_handoff() {
 
     // The injection consumes this once; a later session in a different dir must
     // not inherit it.
-    let unrelated = std::env::temp_dir().join("jcode-bootctx-other");
+    let unrelated = home.path().join("other");
     std::fs::create_dir_all(&unrelated).ok();
     assert!(render_boot_context(Some(&unrelated)).is_none());
-
-    match before {
-        Some(value) => crate::env::set_var("JCODE_HOME", value),
-        None => crate::env::remove_var("JCODE_HOME"),
-    }
 }
 
 /// End-to-end through the public API over the real storage layout: capture on
@@ -424,8 +424,7 @@ async fn full_workflow_capture_boot_render_promote() {
     if !git_available() {
         return;
     }
-    let home = tempfile::TempDir::new().expect("tempdir");
-    crate::env::set_var("JCODE_HOME", home.path());
+    let _env = HandoffTestEnv::new();
 
     // Session A works in checkout A, captures with open work.
     let checkout_a = tempfile::TempDir::new().expect("a");
@@ -451,8 +450,7 @@ async fn full_workflow_capture_boot_render_promote() {
         },
     )
     .expect("plan");
-    let snap = capture("s-a", Some(checkout_a.path()), "closed", None)
-        .expect("session A capture");
+    let snap = capture("s-a", Some(checkout_a.path()), "closed", None).expect("session A capture");
     assert_eq!(snap.open_todos.len(), 1);
 
     // A later session on a *different* checkout (= another machine/path) of the
@@ -462,18 +460,236 @@ async fn full_workflow_capture_boot_render_promote() {
     let block = render_boot_context(Some(checkout_b.path()))
         .expect("boot context from cross-path checkout");
     assert!(block.contains("split server into services"), "{block}");
-    assert!(block.contains("move mutation behind service handle"), "{block}");
+    assert!(
+        block.contains("move mutation behind service handle"),
+        "{block}"
+    );
 
     // The durable handoff promotes into a project-scoped initiative.
     let goal_id = promote_to_initiative("s-a", Some(checkout_b.path()))
         .expect("promote from cross-path checkout")
         .expect("goal id");
     assert!(
-        crate::goal::load_goal(&goal_id, Some(crate::goal::GoalScope::Project), Some(checkout_b.path()))
-            .expect("load")
-            .is_some(),
+        crate::goal::load_goal(
+            &goal_id,
+            Some(crate::goal::GoalScope::Project),
+            Some(checkout_b.path())
+        )
+        .expect("load")
+        .is_some(),
         "promoted initiative should be loadable from the other checkout"
     );
+}
+fn fixture(session: &str, project: &str) -> HandoffSnapshot {
+    HandoffSnapshot {
+        session_id: session.into(),
+        project_key: project.into(),
+        ended_at: Utc::now(),
+        disposition: "closed".into(),
+        working_dir: None,
+        intent: None,
+        open_todos: vec![HandoffTodo {
+            id: "t".into(),
+            content: "work".into(),
+            status: "pending".into(),
+            group: None,
+            confidence: None,
+        }],
+        last_assistant_text: None,
+        initiative_id: None,
+    }
+}
 
-    crate::env::remove_var("JCODE_HOME");
+#[test]
+fn rejects_reserved_and_colliding_session_paths() {
+    let dir = Path::new("unused");
+    assert!(file_path(dir, "index").is_err());
+    assert!(file_path(dir, "a/b").is_err());
+    assert!(file_path(dir, "").is_err());
+    assert!(file_path(dir, "a_b").is_ok());
+}
+
+#[test]
+fn older_snapshot_cannot_replace_newer_project_entry() {
+    let _guard = crate::storage::lock_test_env();
+    let _env = HandoffTestEnv::new();
+    let newer = fixture("new", "project");
+    let mut older = fixture("old", "project");
+    older.ended_at = newer.ended_at - chrono::Duration::seconds(10);
+    write_snapshot(&newer).unwrap();
+    write_snapshot(&older).unwrap();
+    assert_eq!(load_index().latest[0].session_id, "new");
+}
+
+#[test]
+fn concurrent_writers_preserve_every_project() {
+    let _guard = crate::storage::lock_test_env();
+    let _env = HandoffTestEnv::new();
+    let barrier = std::sync::Barrier::new(24);
+    std::thread::scope(|scope| {
+        for n in 0..24 {
+            let barrier = &barrier;
+            scope.spawn(move || {
+                barrier.wait();
+                write_snapshot(&fixture(&format!("session-{n}"), &format!("project-{n}"))).unwrap();
+            });
+        }
+    });
+    let index = load_index();
+    assert_eq!(index.latest.len(), 24);
+    for entry in index.latest {
+        assert_eq!(
+            load_snapshot(&entry.session_id).unwrap().project_key,
+            entry.project_key
+        );
+    }
+}
+
+#[test]
+fn completed_recapture_retires_only_its_own_index_entry() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let cwd = env._home.path();
+    crate::todo::save_todos(
+        "resumed",
+        &[TodoItem {
+            id: "t".into(),
+            content: "finish".into(),
+            status: "pending".into(),
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    capture("resumed", Some(cwd), "closed", None).unwrap();
+    crate::todo::save_todos(
+        "resumed",
+        &[TodoItem {
+            id: "t".into(),
+            content: "finish".into(),
+            status: "completed".into(),
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    assert!(capture("resumed", Some(cwd), "closed", None).is_none());
+    assert!(render_boot_context(Some(cwd)).is_none());
+    // Retirement must not discard a newer handoff belonging to someone else.
+    write_snapshot(&fixture("other", &project_key(Some(cwd)).unwrap())).unwrap();
+    assert!(capture("resumed", Some(cwd), "closed", None).is_none());
+    assert_eq!(
+        latest_handoff_for_project(Some(cwd)).as_deref(),
+        Some("other")
+    );
+}
+
+#[test]
+fn moved_session_does_not_leak_context_to_old_project() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let a = env._home.path().join("a");
+    let b = env._home.path().join("b");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    crate::todo::save_todos(
+        "moving",
+        &[TodoItem {
+            id: "t".into(),
+            content: "work".into(),
+            status: "pending".into(),
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    capture("moving", Some(&a), "closed", None).unwrap();
+    let old_index = load_index();
+    capture("moving", Some(&b), "closed", None).unwrap();
+    assert!(latest_handoff_for_project(Some(&a)).is_none());
+    assert!(render_boot_context(Some(&b)).is_some());
+    // Even a stale index restored after a crash must not inject another project.
+    crate::storage::write_json_fast(&index_path().unwrap(), &old_index).unwrap();
+    assert!(render_boot_context(Some(&a)).is_none());
+}
+
+#[test]
+fn project_key_observes_origin_changes_in_same_process() {
+    assert!(git_available(), "git required for portability regression");
+    let dir = tempfile::tempdir().unwrap();
+    assert!(project_key(Some(dir.path())).unwrap().starts_with("path:"));
+    git_repo_with_remote(dir.path(), "https://example.com/first.git");
+    assert_eq!(
+        project_key(Some(dir.path())).as_deref(),
+        Some("git:https://example.com/first.git")
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args([
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.com/second.git"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        project_key(Some(dir.path())).as_deref(),
+        Some("git:https://example.com/second.git")
+    );
+}
+
+#[test]
+fn rendered_context_is_bounded_and_rejects_mismatched_snapshot() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let cwd = env._home.path();
+    let mut snapshot = fixture("large", &project_key(Some(cwd)).unwrap());
+    snapshot.intent = Some("界".repeat(5000));
+    snapshot.open_todos = (0..100)
+        .map(|n| HandoffTodo {
+            id: n.to_string(),
+            content: "界".repeat(1000),
+            status: "pending".into(),
+            group: None,
+            confidence: None,
+        })
+        .collect();
+    write_snapshot(&snapshot).unwrap();
+    let rendered = render_boot_context(Some(cwd)).unwrap();
+    assert!(rendered.len() <= 8192);
+    assert!(rendered.contains("Handoff truncated"));
+    snapshot.session_id = "wrong".into();
+    crate::storage::write_json_fast(
+        &file_path(&handoffs_dir().unwrap(), "large").unwrap(),
+        &snapshot,
+    )
+    .unwrap();
+    assert!(load_snapshot("large").is_none());
+    assert!(render_boot_context(Some(cwd)).is_none());
+}
+
+struct HandoffTestEnv {
+    before: Option<std::ffi::OsString>,
+    _home: tempfile::TempDir,
+}
+impl HandoffTestEnv {
+    fn new() -> Self {
+        let before = std::env::var_os("JCODE_HOME");
+        let home = tempfile::tempdir().unwrap();
+        crate::env::set_var("JCODE_HOME", home.path());
+        Self {
+            before,
+            _home: home,
+        }
+    }
+}
+impl Drop for HandoffTestEnv {
+    fn drop(&mut self) {
+        match &self.before {
+            Some(value) => crate::env::set_var("JCODE_HOME", value),
+            None => crate::env::remove_var("JCODE_HOME"),
+        }
+    }
 }

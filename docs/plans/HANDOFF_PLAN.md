@@ -1,7 +1,35 @@
 # Session Handoff Plan
 
-Status: **Slice 1 implemented** (2026-09-10). Automatic per-session handoff capture
-and boot injection are live.
+Status: **Slice 1 implemented** (2026-09-10), under branch review (2026-09-11).
+Automatic per-session handoff capture and boot injection are integration-tested.
+Live TUI acceptance has not yet been demonstrated.
+
+## Branch review (2026-09-12)
+
+The review fixes supersede the earlier cache design and validation snapshots below.
+
+| Finding | Fix / regression check |
+| --- | --- |
+| Concurrent index writers can lose projects | Cross-process store file lock serializes read/modify/write. `concurrent_writers_preserve_every_project` checks 24 simultaneous writers. |
+| `index` session ID overwrites the index and lossy sanitization aliases IDs | Reject reserved/invalid IDs instead of rewriting them. `rejects_reserved_and_colliding_session_paths`. |
+| Older writes replace the newest project handoff | Compare timestamps before replacement. `older_snapshot_cannot_replace_newer_project_entry`. |
+| Completing a resumed session leaves stale automatic context | Retire only that session's index entries after confirmed terminal todos. `completed_recapture_retires_only_its_own_index_entry`. |
+| Moving a session between projects can leak context | Remove old project entries and verify loaded snapshot identity/project. `moved_session_does_not_leak_context_to_old_project`. |
+| Permanent origin cache survives git init/origin edits | Remove the cache. `project_key_observes_origin_changes_in_same_process`. Missing relative directories now get an absolute fallback, tested separately. |
+| Every message performs unnecessary handoff reads | Gate lookup itself on the first visible message. Injection test covers text-first, image-first, and no repeated context. |
+| Synchronous capture blocks the executor under the global connection lock | Run capture on the blocking pool after releasing the lock, await completion. Cleanup integration test deliberately holds the store lock and proves other clients can acquire the connection lock before persistence completes. |
+| Unbounded handoff context expands the first model request | Bound rendered context to 8192 bytes with a truncation notice and cap stored assistant tail. `rendered_context_is_bounded_and_rejects_mismatched_snapshot`. |
+| Promotion silently ignores checkpoint errors | Propagate the checkpoint error to the caller. Existing promotion workflow tests cover success. |
+| Tests clobber `JCODE_HOME` and reuse fixed directories | Restore prior environment via RAII and use unique temporary projects. |
+
+Trade-offs: a store file lock preserves the existing portable JSON layout without
+introducing a database/migration, but serializes writes. A process-only mutex
+would not protect multiple daemons. Resolving origin afresh costs a local git
+lookup on first-message/capture calls, but avoids stale routing after repository
+changes. A TTL cache was considered but would still misroute within its TTL and
+add invalidation complexity. Later messages now perform no handoff lookup.
+Awaiting blocking-pool capture makes cleanup completion meaningful for callers,
+unlike fire-and-forget persistence, while keeping global client locks free.
 
 ## Problem
 
@@ -106,8 +134,9 @@ Validated implementation commit `d71d290b8`:
   (and four unrelated reload/socket tests matching the filter).
 - Full app-core run: 1468 passed, 1 failed, 24 ignored. The failure was
   `channel::tests::test_session_picker_menu_flow` (four rows instead of one).
-  Its exact isolated rerun passed. This is a known order-dependent shared-state
-  failure, not evidence of a fully green full-suite run or a random flake.
+  Its exact isolated rerun passed, suggesting order-dependent or shared-state
+  interference. The root cause was not established in that pass, and the
+  isolated pass is not evidence of a fully green full-suite run.
 - Base and isolated picker reruns preserved Cargo exit status and both exited 0.
   The earlier full-suite shell pipeline masked Cargo failure with `tail` exit 0,
   so the test summary above, not that shell status, is authoritative.
