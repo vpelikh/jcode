@@ -382,7 +382,8 @@ pub struct CompactionConfig {
     /// [semantic] Number of recent turns to look at for building the "current goal" embedding
     pub goal_window_turns: usize,
 
-    /// [prune] Per-tool-result character cap for the deterministic prune stage.
+    /// [prune] Per-tool-result UTF-8 byte cap for the deterministic prune stage.
+    /// The historical `_chars` field name is retained for configuration compatibility.
     /// A single tool result larger than this is truncated to its head+tail.
     /// (`PrunePolicy::node_caps` default.)
     pub prune_tool_result_max_chars: usize,

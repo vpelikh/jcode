@@ -486,3 +486,65 @@ fn history_reload_recovery_does_not_mark_delivered_until_continuation_is_accepte
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn manual_prune_handler_persists_and_reports_save_errors() {
+    let _lock = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let _env = ReloadHistoryEnvGuard::new(home.path(), runtime.path());
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider(None));
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+    agent.add_message(
+        crate::message::Role::User,
+        vec![crate::message::ContentBlock::Image {
+            media_type: "image/png".into(),
+            data: "a".repeat(5000),
+        }],
+    );
+    let session_id = agent.session_id().to_string();
+    let agent = Arc::new(Mutex::new(agent));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let request = crate::protocol::decode_request(r#"{"type":"prune","id":71}"#).unwrap();
+    let crate::protocol::Request::Prune { id } = request else {
+        panic!("prune request")
+    };
+    crate::server::client_actions::handle_prune(id, &agent, &tx);
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        event,
+        crate::protocol::ServerEvent::PruneResult {
+            id: 71,
+            images_stripped: 1,
+            tool_results_truncated: 0,
+            ..
+        }
+    ));
+    let loaded = crate::session::Session::load(&session_id).unwrap();
+    assert!(
+        !loaded
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .any(|b| matches!(b, crate::message::ContentBlock::Image { .. }))
+    );
+    loaded.rederive_all_checked().unwrap();
+
+    // A no-op still retries persistence. Failure must not emit PruneResult.
+    let sessions = home.path().join("sessions");
+    std::fs::rename(&sessions, home.path().join("saved-sessions")).unwrap();
+    std::fs::write(&sessions, "blocked").unwrap();
+    crate::server::client_actions::handle_prune(72, &agent, &tx);
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(event, crate::protocol::ServerEvent::Error { id: 72, message, .. }
+        if message.contains("failed to save session"))
+    );
+}

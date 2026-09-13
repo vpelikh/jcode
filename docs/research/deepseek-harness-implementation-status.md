@@ -50,9 +50,9 @@ policy and report so every consumer stays in lockstep.
 - **Scheduled per-step prune.** Wired at the streaming loop's Injection Point D
   (`agent/turn_streaming_mpsc.rs`) and the headless `run_turn`
   (`agent/turn_loops.rs`): each step runs the cheap node-caps pass before the
-  next API call, so an oversized tool result / screenshot added this batch is
-  shrunk immediately instead of surviving to re-summarization. No-op when within
-  caps (the run-every-step cadence takeaway #6 calls for). In the streaming
+  next API call over the prefix preceding the latest assistant response.
+  Fresh tool results, screenshots and interrupts remain intact until the model
+  has consumed them at least once. No-op when within caps. In the streaming
   loop it is gated on `tool_results_dirty` so a pure-text step skips the scan.
 - **Configurable per-node caps.** `CompactionConfig` gains
   `prune_tool_result_max_chars` / `prune_image_max_chars` (defaults 4000/1024,
@@ -60,7 +60,7 @@ policy and report so every consumer stays in lockstep.
   builds the policy from them, falling back to the built-in defaults on zero.
   Wired at all 4 live call sites (`/prune`, agent, streaming Point-D, headless).
 
-  **Scope note on `/prune` — RESOLVED (remote parity delivered).** `/compact` works
+  **Scope note on `/prune`: remote wire support delivered.** `/compact` works
   over SSH/remote via `Request::Compact` → `ServerEvent::CompactResult`. `/prune`
   now has the same parity: `Request::Prune` → `ServerEvent::PruneResult` gets a
   server-side `Agent::request_manual_prune` + `handle_prune` + lifecycle route, a
@@ -68,6 +68,39 @@ policy and report so every consumer stays in lockstep.
   handler, and iOS `Wire.swift`/`SessionReducer` mirrors. The scheduled per-step
   prune already ran server-side regardless of client; the on-demand `/prune`
   command now works locally and over SSH/remote alike.
+
+**Branch review fixes (2026-09-13):**
+
+- **Fresh content loss:** scheduled pruning previously stripped newly generated
+  screenshots and truncated tool output before the next model request. Both
+  loops now call `Session::prune_consumed_transcript`, which protects the suffix
+  starting at the latest assistant response. No assistant response means no
+  eligible prefix. The regression failed against full-transcript pruning and
+  passed after the boundary fix, including replay and idempotence checks.
+- **Manual persistence and errors:** local and server `/prune` now save changes.
+  A failed save reports an error instead of success, and a subsequent no-op
+  retries persistence. Isolated temporary-home tests exercise real disk reloads,
+  blocked storage paths, and the server handler's request-ID/error response.
+- **Stale provider sessions:** changes invalidate native provider session IDs
+  and agent cache/tool state. Local TUI pruning clears its materialized message
+  cache and reseeds the compaction view. The agent disk-reload regression checks
+  the cleared native session ID as well as the pruned transcript.
+- **Discoverability:** `/prune` was missing from the registered command catalog
+  and help overlay. Both are now populated, and autocomplete is tested.
+- Added Swift request/result codec and reducer tests. `swift test` passed all
+  73 JCodeKit tests on macOS. This is not a device/iOS app acceptance run.
+
+**Review regression gate:** `prune` filters passed 16 app-core, 6 base and 5 TUI
+ tests. Full compaction-core/config-types/protocol libraries passed 29/19/82.
+ App-core loop/streaming/compaction filters passed 39/7/7. These filters overlap
+ and include unrelated tests, so their counts must not be summed as unique
+ prune acceptance cases. Live SSH transport and device UI remain outside this
+ pass; the server handler, persistence, Rust wire and Swift reducer were tested.
+
+The review build (`scripts/dev_cargo.sh build --profile selfdev -p jcode
+--bin jcode`) and direct `target/selfdev/jcode --version` smoke check passed.
+The SSH-mode command guard test also passed with `/prune` in its allowed wire
+command list. The shared daemon was not reloaded.
 
 **Fresh validation (2026-09-11/12):**
 
@@ -93,8 +126,9 @@ policy and report so every consumer stays in lockstep.
   in this worktree. The shared daemon was not replaced or restarted, so this
   build is not a live runtime acceptance result.
 
-**Validation limits:** Live SSH command execution, iOS compilation, and
-save/restart persistence were not exercised in this pass. Wire roundtrips and
+**Earlier validation limits (superseded in part by the review above):** Live
+SSH command execution, iOS compilation, and save/restart persistence were not
+exercised in the September 11/12 pass. Wire roundtrips and
 agent-level tests provide component evidence, not proof of those workflows.
 The full-suite counts and flake descriptions below are historical observations,
 not fresh full-suite results.
@@ -135,7 +169,7 @@ prune change:
 recommendation is to run `prune` *on a cheap cadence* (every step). This is now
 delivered: a scheduled per-step prune using `PrunePolicy::node_caps()` runs at
 the streaming loop's Injection Point D and in the headless `run_turn`, before
-each next API call, shrinking any oversized node added this batch. A `/prune`
+each next API call, shrinking eligible already-consumed history. A `/prune`
 slash command exposes the same node-caps pass on demand. It remains a cheap,
 model-free per-node-cap pass (no aggregate surgery) and a no-op when within
 caps. The build-level and token-accounting interaction with the summarizer on

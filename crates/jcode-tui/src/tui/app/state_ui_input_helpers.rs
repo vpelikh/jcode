@@ -375,6 +375,7 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
             ("/compact mode semantic", "Use semantic compaction"),
         ],
     ),
+    RegisteredCommand::public("/prune", "Shrink oversized context without a model call"),
     RegisteredCommand::public("/fix", "Recover when the model cannot continue"),
     RegisteredCommand::public("/dictate", "Run configured external dictation command"),
     RegisteredCommand::public("/dictation", "Alias for /dictate"),

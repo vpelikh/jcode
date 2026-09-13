@@ -1659,22 +1659,17 @@ impl Agent {
                 ));
             }
 
-            // Scheduled per-step prune (deepseek-harness takeaway #6): before the
-            // next API call, shrink any oversized node added this batch so a
-            // pathological single tool result or screenshot does not survive to
-            // re-summarization or dominate the prompt. This is the cheap,
-            // model-free counterpart to the repeat-tool guard above; it is a
-            // per-node-cap pass (no aggregate surgery) and costs no model call.
-            // It runs only on steps that committed tool results (the sole source
-            // of unbounded per-step growth); a pure text step skips the scan.
+            // Prune already-consumed history only. New results, images and
+            // interrupts must reach the model once before becoming eligible.
             if tool_results_dirty {
                 let pruned =
                     self.session
-                        .prune_transcript(&crate::compaction::prune::PrunePolicy::node_caps_with(
+                        .prune_consumed_transcript(&crate::compaction::prune::PrunePolicy::node_caps_with(
                             crate::config::config().compaction.prune_tool_result_max_chars,
                             crate::config::config().compaction.prune_image_max_chars,
                         ));
                 if !pruned.is_empty() {
+                    self.note_compaction_applied();
                     crate::logging::info(&format!(
                         "[prune] per-step shrink for session {}: {} image(s), {} tool result(s)",
                         self.session.id,

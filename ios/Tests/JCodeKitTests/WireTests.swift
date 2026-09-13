@@ -270,3 +270,13 @@ private func encodedObject(_ request: Request) throws -> [String: Any] {
         try ServerEvent.decode(line: #"{"no_type":true}"#)
     }
 }
+
+@Test func pruneWireMatchesRustProtocol() throws {
+    let request = Request.prune(id: 42)
+    #expect(request.id == 42)
+    let object = try encodedObject(request)
+    #expect(object["type"] as? String == "prune")
+    #expect(object["id"] as? UInt64 == 42)
+    let result = try ServerEvent.decode(line: #"{"type":"prune_result","id":42,"images_stripped":2,"tool_results_truncated":3,"message":"Pruned"}"#)
+    #expect(result == .pruneResult(id: 42, imagesStripped: 2, toolResultsTruncated: 3, message: "Pruned"))
+}

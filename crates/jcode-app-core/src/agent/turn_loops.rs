@@ -1141,17 +1141,16 @@ impl Agent {
                 }
             }
 
-            // Scheduled per-step prune (deepseek-harness takeaway #6): mirror the
-            // streaming loop's Point-D prune so the headless turn also shrinks any
-            // oversized tool result / screenshot before requesting the next model
-            // turn. Cheap (per-node caps, no model call), no-op when within caps.
+            // Prune already-consumed history only. New results, images and
+            // interrupts must reach the model once before becoming eligible.
             let pruned =
                 self.session
-                    .prune_transcript(&crate::compaction::prune::PrunePolicy::node_caps_with(
+                    .prune_consumed_transcript(&crate::compaction::prune::PrunePolicy::node_caps_with(
                         crate::config::config().compaction.prune_tool_result_max_chars,
                         crate::config::config().compaction.prune_image_max_chars,
                     ));
             if !pruned.is_empty() {
+                self.note_compaction_applied();
                 logging::info(&format!(
                     "[prune] per-step shrink in headless turn for session {}: {} image(s), {} tool result(s)",
                     self.session.id,

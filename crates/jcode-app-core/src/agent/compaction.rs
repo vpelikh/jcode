@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::Context;
 
 impl Agent {
     pub(super) fn note_compaction_applied(&mut self) {
@@ -91,7 +92,7 @@ impl Agent {
     /// (takeaway #6): shrink any oversized tool result / inline image under the
     /// per-node caps, without invoking the summarizer. Returns a report of what
     /// was pruned and a human-readable message.
-    pub fn request_manual_prune(&mut self) -> (crate::compaction::prune::PruneReport, String) {
+    pub fn request_manual_prune(&mut self) -> Result<(crate::compaction::prune::PruneReport, String)> {
         let report = self
             .session
             .prune_transcript(&crate::compaction::prune::PrunePolicy::node_caps_with(
@@ -106,7 +107,14 @@ impl Agent {
                 report.images_stripped, report.tool_results_truncated
             )
         };
-        (report, message)
+        if !report.is_empty() {
+            self.note_compaction_applied();
+        }
+        // Also retry persistence on a no-op after a previous failed save.
+        self.session
+            .save()
+            .context("Prune applied in memory but failed to save session")?;
+        Ok((report, message))
     }
 
     fn is_context_limit_error(error: &str) -> bool {

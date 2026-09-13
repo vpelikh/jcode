@@ -3815,6 +3815,18 @@ pub(super) fn handle_config_command(app: &mut App, trimmed: &str) -> bool {
                 crate::config::config().compaction.prune_tool_result_max_chars,
                 crate::config::config().compaction.prune_image_max_chars,
             ));
+        if !report.is_empty() {
+            app.messages.clear();
+            app.reseed_compaction_from_provider_messages();
+            app.provider_session_id = None;
+            app.session.provider_session_id = None;
+        }
+        if let Err(error) = app.session.save() {
+            app.push_display_message(DisplayMessage::error(format!(
+                "Prune applied in memory but failed to save session: {error:#}"
+            )));
+            return true;
+        }
         if report.is_empty() {
             app.push_display_message(DisplayMessage::system(
                 "Prune: nothing oversized to shrink (context already within per-node caps).".to_string(),

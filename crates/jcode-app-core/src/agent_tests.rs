@@ -3822,6 +3822,7 @@ async fn stale_manual_handoff_override_falls_back_to_auto_inject() {
 
 #[tokio::test]
 async fn manual_prune_updates_provider_view_and_is_idempotent() {
+    let home = PruneTestHome::new();
     let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
     let registry = Registry::new(provider.clone()).await;
     let mut agent = Agent::new(provider, registry);
@@ -3834,7 +3835,10 @@ async fn manual_prune_updates_provider_view_and_is_idempotent() {
         }],
     );
     let _cached = agent.provider_messages();
-    let (report, message) = agent.request_manual_prune();
+    agent.provider_session_id = Some("stale-native-session".into());
+    agent.session.provider_session_id = agent.provider_session_id.clone();
+    agent.session.save().expect("baseline save");
+    let (report, message) = agent.request_manual_prune().expect("manual prune persists");
     assert_eq!(report.tool_results_truncated, 1, "{message}");
     assert_eq!(report.images_stripped, 0);
     let messages = agent.provider_messages();
@@ -3854,5 +3858,69 @@ async fn manual_prune_updates_provider_view_and_is_idempotent() {
         .session
         .rederive_all_checked()
         .expect("pruned event log replays");
-    assert!(agent.request_manual_prune().0.is_empty());
+    assert!(agent.request_manual_prune().unwrap().0.is_empty());
+    assert!(agent.provider_session_id.is_none());
+    let loaded = Session::load(&agent.session.id).expect("manual prune survives reload");
+    assert!(loaded.provider_session_id.is_none());
+    assert_eq!(
+        serde_json::to_value(&loaded.messages).unwrap(),
+        serde_json::to_value(&agent.session.messages).unwrap()
+    );
+
+    // Block the sessions directory, then verify errors reach the caller and a
+    // subsequent no-op retries the failed save instead of claiming success.
+    let sessions = home.home.path().join("sessions");
+    let backup = home.home.path().join("sessions-backup");
+    std::fs::rename(&sessions, &backup).unwrap();
+    std::fs::write(&sessions, "blocked").unwrap();
+    agent.add_message(
+        Role::User,
+        vec![ContentBlock::ToolResult {
+            tool_use_id: "retry".into(),
+            content: "z".repeat(10_000),
+            is_error: None,
+        }],
+    );
+    assert!(
+        agent
+            .request_manual_prune()
+            .unwrap_err()
+            .to_string()
+            .contains("failed to save")
+    );
+    std::fs::remove_file(&sessions).unwrap();
+    std::fs::rename(&backup, &sessions).unwrap();
+    assert!(agent.request_manual_prune().unwrap().0.is_empty());
+    let loaded = Session::load(&agent.session.id).unwrap();
+    assert_eq!(
+        serde_json::to_value(&loaded.messages).unwrap(),
+        serde_json::to_value(&agent.session.messages).unwrap()
+    );
+}
+
+struct PruneTestHome {
+    previous: Option<std::ffi::OsString>,
+    home: tempfile::TempDir,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+impl PruneTestHome {
+    fn new() -> Self {
+        let lock = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("JCODE_HOME");
+        crate::env::set_var("JCODE_HOME", home.path());
+        Self {
+            previous,
+            home,
+            _lock: lock,
+        }
+    }
+}
+impl Drop for PruneTestHome {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => crate::env::set_var("JCODE_HOME", value),
+            None => crate::env::remove_var("JCODE_HOME"),
+        }
+    }
 }

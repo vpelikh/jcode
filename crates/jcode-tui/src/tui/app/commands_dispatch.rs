@@ -321,6 +321,7 @@ mod tests {
             "/effort high",
             "/server-reload",
             "/compact",
+            "/prune",
             "/plan investigate",
             "/commit",
             "/rename title",

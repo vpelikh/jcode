@@ -1215,7 +1215,17 @@ pub(super) fn handle_prune(
     tokio::spawn(async move {
         let mut agent_guard = agent.lock().await;
         let session_id = agent_guard.session_id().to_string();
-        let (report, message) = agent_guard.request_manual_prune();
+        let (report, message) = match agent_guard.request_manual_prune() {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = tx.send(ServerEvent::Error {
+                    id,
+                    message: format!("{error:#}"),
+                    retry_after_secs: None,
+                });
+                return;
+            }
+        };
         drop(agent_guard);
 
         if !report.is_empty() {

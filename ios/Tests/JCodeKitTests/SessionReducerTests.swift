@@ -545,3 +545,11 @@ private func event(_ line: String) -> ConnectionOutput {
     #expect(state.errorBanner == "taken over by TUI")
     #expect(state.transcript.last?.isStreaming == false)
 }
+
+@Test func pruneResultNoticesReflectChangedAndNoopResponses() {
+    let changed = run([event(#"{"type":"prune_result","id":1,"images_stripped":2,"tool_results_truncated":3,"message":"Pruned"}"#)])
+    #expect(changed.notices.last?.message == "Pruned context (2 img, 3 result)")
+    #expect(changed.isProcessing == false)
+    let noop = run([event(#"{"type":"prune_result","id":2,"images_stripped":0,"tool_results_truncated":0,"message":"Nothing oversized"}"#)])
+    #expect(noop.notices.last?.message == "Nothing oversized")
+}
