@@ -331,6 +331,9 @@ fn split_corrupt_persisted_parent_is_not_hidden_by_live_fallback() {
 
 #[tokio::test]
 async fn enabling_swarm_does_not_auto_elect_coordinator() {
+    // Agent construction persists metadata, so it must share the test-home lock.
+    let _guard = crate::storage::lock_test_env();
+    let _home = SplitTestHome::new();
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let registry = Registry::new(provider.clone()).await;
     let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
@@ -519,6 +522,9 @@ async fn rename_session_event_uses_agent_session_id_even_when_client_id_is_stale
 
 #[tokio::test]
 async fn notify_session_runs_scheduled_task_immediately_for_idle_live_session() {
+    // Agent construction persists metadata, so it must share the test-home lock.
+    let _guard = crate::storage::lock_test_env();
+    let _home = SplitTestHome::new();
     let provider = Arc::new(StreamingMockProvider::default());
     provider.queue_response(vec![
         StreamEvent::TextDelta("Working on scheduled task.".to_string()),
@@ -638,6 +644,9 @@ async fn notify_session_runs_scheduled_task_immediately_for_idle_live_session() 
 
 #[tokio::test]
 async fn notify_session_queues_soft_interrupt_when_live_session_is_busy() {
+    // Agent construction persists metadata, so it must share the test-home lock.
+    let _guard = crate::storage::lock_test_env();
+    let _home = SplitTestHome::new();
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let registry = Registry::new(provider.clone()).await;
     let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
