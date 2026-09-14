@@ -188,7 +188,20 @@ fn strip_oversized_images_node(contents: &mut [&mut Vec<ContentBlock>], max_char
         for block in content.iter_mut() {
             if let ContentBlock::Image { media_type, data } = block {
                 if data.len() > max_chars {
-                    let marker = prune_image_marker(media_type.clone(), data.len());
+                    let mut marker = prune_image_marker(media_type.clone(), data.len());
+                    if marker.len() > max_chars {
+                        // Tiny configured caps cannot hold the descriptive
+                        // marker. Use a compact marker and reserve its bytes
+                        // first so the stored node stays <= cap.
+                        let icon = crate::truncate_str_boundary("[img]", max_chars);
+                        let remaining = max_chars - icon.len();
+                        let head_bytes = remaining - remaining / 3;
+                        let full_suffix = format!("{}B", data.len());
+                        let suffix_bytes =
+                            crate::tail_str_boundary(&full_suffix, remaining / 3).to_string();
+                        let prefix = crate::truncate_str_boundary(&media_type, head_bytes);
+                        marker = format!("{}{}{}", prefix, icon, suffix_bytes);
+                    }
                     *block = ContentBlock::Text {
                         text: marker,
                         cache_control: None,
@@ -325,6 +338,26 @@ mod tests {
         assert_eq!(report.images_stripped, 0);
         // The two 9 MB results are trimmed under the 8 MiB tool budget.
         assert!(report.tool_results_truncated > 0);
+    }
+
+    #[test]
+    fn configured_image_marker_is_bounded_and_idempotent() {
+        for cap in [1, 2, 8, 24, 64, 256, 1024, 4096] {
+            let mut blocks = vec![vec![image_block(20_000)]];
+            let policy = PrunePolicy::node_caps_with(4000, cap);
+            let report = prune_contents(&mut to_contents(&mut blocks), &policy);
+            assert_eq!(
+                report.images_stripped, 1,
+                "cap {cap} must strip the 20k image"
+            );
+            let block = &blocks[0][0];
+            let ContentBlock::Text { text, .. } = block else {
+                panic!("oversized image must be replaced with a text marker");
+            };
+            assert!(text.len() <= cap, "cap {cap}, marker {}", text.len());
+            // The replacement is Text, so a second pass is a no-op.
+            assert!(prune_contents(&mut to_contents(&mut blocks), &policy).is_empty());
+        }
     }
 
     #[test]
