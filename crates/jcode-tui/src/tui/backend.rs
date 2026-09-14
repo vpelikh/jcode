@@ -910,6 +910,18 @@ impl RemoteConnection {
         self.send_request(request).await
     }
 
+    /// Set which saved handoff this session boots from on its first message.
+    /// `Some(id)` selects a specific handoff via `/handoffres`; `None` restores
+    /// the default automatic latest-for-project injection.
+    pub async fn set_handoff_resume(&mut self, session_id: Option<String>) -> Result<()> {
+        let request = Request::SetHandoffResume {
+            id: self.next_request_id,
+            session_id,
+        };
+        self.next_request_id += 1;
+        self.send_request(request).await
+    }
+
     /// Inject externally transcribed text into the active remote TUI session.
     pub async fn send_transcript(
         &mut self,

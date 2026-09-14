@@ -350,6 +350,35 @@ pub fn render_boot_context(working_dir: Option<&Path>) -> Option<String> {
     if snapshot.project_key != key {
         return None;
     }
+    render_snapshot(&snapshot)
+}
+
+/// List the saved handoffs available for manual selection, one per project.
+///
+/// Returns the latest unfinished handoff per project from the index, newest
+/// first. These are the rows the `/handoff` picker offers, keyed by
+/// `session_id`, so manual resume can override automatic latest-for-project
+/// injection without regressing it.
+pub fn list_saved_handoffs() -> Vec<IndexEntry> {
+    let mut entries: Vec<IndexEntry> = load_index().latest;
+    entries.sort_by(|a, b| b.ended_at.cmp(&a.ended_at));
+    entries
+}
+
+/// Render a specific handoff snapshot by id as a compact markdown block, for
+/// a manually selected resume. Returns `None` when no such snapshot exists or
+/// its identity check fails.
+pub fn render_handoff(session_id: &str) -> Option<String> {
+    let snapshot = load_snapshot(session_id)?;
+    render_snapshot(&snapshot)
+}
+
+/// Render a snapshot as a compact markdown block for first-message injection.
+///
+/// Shared by automatic latest-for-project injection ([`render_boot_context`])
+/// and manual selection ([`render_handoff`]) so the rendered shape is identical
+/// and bounded regardless of how the handoff was chosen.
+fn render_snapshot(snapshot: &HandoffSnapshot) -> Option<String> {
     let mut out = String::from("[Handoff from previous session]");
     if let Some(intent) = &snapshot.intent {
         out.push_str(&format!("\nIntent: {}", truncate(intent, 2048)));

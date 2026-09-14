@@ -264,6 +264,16 @@ impl Agent {
         self.log_env_snapshot("working_dir");
     }
 
+    /// Set the handoff snapshot this session should boot from on first message.
+    ///
+    /// Overrides the automatic latest-for-project injection: when `None`, the
+    /// first visible user message uses the project's latest handoff (default);
+    /// when `Some(id)`, it boots from that specific saved handoff instead. The
+    /// override is consumed after the first injection so it never re-applies.
+    pub fn set_handoff_resume(&mut self, session_id: Option<String>) {
+        self.handoff_resume_id = session_id;
+    }
+
     /// Grouped working-directory change invoked from a user `/cd` request.
     ///
     /// Beyond [`Self::set_working_dir`], this persists the session, refreshes

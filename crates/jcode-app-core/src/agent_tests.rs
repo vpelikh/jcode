@@ -3586,3 +3586,124 @@ async fn first_user_message_injects_handoff_once() {
     }
 
 }
+
+/// Manual selection overrides the automatic latest-for-project handoff, is
+/// consumed after one injection, and does not regress the default.
+#[tokio::test]
+async fn manual_handoff_override_injects_selected_snapshot_once() {
+    let _guard = crate::storage::lock_test_env();
+    let home = tempfile::TempDir::new().expect("temp home");
+    struct RestoreHome(Option<std::ffi::OsString>);
+    impl Drop for RestoreHome {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => crate::env::set_var("JCODE_HOME", value),
+                None => crate::env::remove_var("JCODE_HOME"),
+            }
+        }
+    }
+    let _restore = RestoreHome(std::env::var_os("JCODE_HOME"));
+    crate::env::set_var("JCODE_HOME", home.path());
+    let wd = home.path().join("project");
+    std::fs::create_dir_all(&wd).unwrap();
+
+    fn seed(session_id: &str, wd: &std::path::Path, intent: &str) {
+        crate::todo::save_todos(
+            session_id,
+            &[crate::todo::TodoItem {
+                id: "t".into(),
+                content: format!("work for {intent}"),
+                status: "in_progress".into(),
+                priority: "high".into(),
+                group: None,
+                confidence: None,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        crate::todo::save_plan(
+            session_id,
+            &crate::todo::TodoPlan {
+                user_intention: Some(intent.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::handoff::capture(session_id, Some(wd), "closed", None).expect("capture");
+    }
+
+    // Newer handoff would be auto-injected by default; an older one is the
+    // manual target so we can tell which was actually used.
+    seed("older-handoff", &wd, "older intent");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    seed("newer-handoff", &wd, "newer intent");
+    assert_eq!(
+        crate::handoff::latest_handoff_for_project(Some(&wd)).as_deref(),
+        Some("newer-handoff"),
+        "default auto-inject target is the newest"
+    );
+
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent =
+        Agent::new_with_initial_working_dir(provider, registry, Some(wd.to_str().unwrap()));
+    agent.set_handoff_resume(Some("older-handoff".to_string()));
+
+    agent
+        .append_user_context_message("resume older", Vec::new())
+        .expect("first message");
+    let first_str = agent
+        .session
+        .messages
+        .iter()
+        .filter_map(|m| match m.role {
+            Role::User => Some(m),
+            _ => None,
+        })
+        .last()
+        .map(|m| {
+            m.content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    assert!(
+        first_str.contains("older intent") && !first_str.contains("newer intent"),
+        "manual selection must win over auto-inject, got: {first_str}"
+    );
+
+    // The override is consumed after the first injection, so a later first
+    // message in a fresh conversation would fall back to the default again.
+    agent
+        .append_user_context_message("next", Vec::new())
+        .expect("second message");
+    let second_str = agent
+        .session
+        .messages
+        .iter()
+        .filter_map(|m| match m.role {
+            Role::User => Some(m),
+            _ => None,
+        })
+        .last()
+        .map(|m| {
+            m.content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    assert!(
+        !second_str.contains("[Handoff from previous session]"),
+        "override must be consumed after one injection, got: {second_str}"
+    );
+}

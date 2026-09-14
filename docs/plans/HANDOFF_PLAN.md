@@ -11,7 +11,7 @@ a fresh session's first message receives the saved handoff exactly once.
 Live model continuation was exercised end to end with a working provider: a
 fresh session recovered the exact pending marker from the saved handoff.
 
-**Planned:** manual selection, snapshot pruning, and remote fallback.
+**Planned:** snapshot pruning and remote fallback.
 
 ## Purpose
 
@@ -26,10 +26,28 @@ can use on its first turn.
 - A project-keyed index for finding the latest unfinished handoff.
 - First-message context injection, including image-first conversations.
 - Promotion of a saved handoff into a durable project initiative.
+- A `/handoff` picker that lists saved handoffs (latest per project) and a
+  `/handoffres <session_id>` command that boots a fresh conversation from a
+  selected handoff, overriding the automatic latest-for-project injection.
 
-Manual selection, snapshot pruning, and remote fallback are future work.
+Manual selection is implemented. Snapshot pruning and remote fallback remain
+future work.
 
 ## Lifecycle
+
+### Manual selection
+
+`handoff::list_saved_handoffs()` reads the index (newest first, one per
+project) for the `/handoff` picker, and `handoff::render_handoff(id)` renders a
+specific snapshot for `list_saved_handoffs`-driven resume. The selected
+snapshot is carried from the TUI to the server via the `set_handoff_resume`
+protocol request and stored as a transient, one-shot override on the agent.
+
+At first-message injection ([`render_first_message_handoff`]), the override is
+honored if present and consumed immediately; otherwise the default
+latest-for-project handoff is used. Because the override applies only to the
+first visible message and is cleared after injection, manual selection never
+regresses the automatic behavior on a later turn or session.
 
 ### Capture
 
@@ -133,18 +151,21 @@ for choosing among multiple work streams.
 
 | Component | Location |
 | --- | --- |
-| Capture, identity, index, rendering, promotion | `crates/jcode-base/src/handoff.rs` |
+| Capture, identity, index, rendering, promotion, listing, specific render | `crates/jcode-base/src/handoff.rs` |
 | Module registration | `crates/jcode-base/src/lib.rs` |
 | Disconnect hook | `crates/jcode-app-core/src/server/client_disconnect_cleanup.rs` |
-| First-message injection | `crates/jcode-app-core/src/agent/turn_execution.rs` |
+| First-message injection and manual override | `crates/jcode-app-core/src/agent/turn_execution.rs` |
+| `set_handoff_resume` protocol + server handler | `crates/jcode-protocol/src/wire.rs`, `crates/jcode-app-core/src/server/client_actions.rs`, `client_lifecycle.rs` |
+| TUI `/handoff` and `/handoffres` commands | `crates/jcode-tui/src/tui/app/remote/key_handling.rs`, `backend.rs`, `state_ui_input_helpers.rs` |
 | Storage and public-API tests | `crates/jcode-base/src/handoff_tests.rs` |
-| Injection tests | `crates/jcode-app-core/src/agent_tests.rs` |
+| Injection + override tests | `crates/jcode-app-core/src/agent_tests.rs` |
 | Disconnect integration tests | `crates/jcode-app-core/src/server/client_disconnect_grace_tests.rs` |
 
 ## Testing
 
 ```bash
 cargo test -p jcode-base --lib handoff::tests
+cargo test -p jcode-app-core --lib manual_handoff_override_injects_selected_snapshot_once
 cargo test -p jcode-app-core --lib first_user_message_injects_handoff_once
 cargo test -p jcode-app-core --lib cleanup_persists_handoff_for_session_with_open_todos
 ```
@@ -152,12 +173,14 @@ cargo test -p jcode-app-core --lib cleanup_persists_handoff_for_session_with_ope
 Coverage includes capture and index persistence, concurrent writers, timestamp
 ordering, terminal-todo retirement, cross-checkout portability, origin changes,
 project isolation, invalid filenames, corrupt-index recovery, bounded rendering,
-initiative promotion, text/image-first injection, and cleanup lock release.
-Tests use temporary storage and restore the prior environment.
+initiative promotion, text/image-first injection, cleanup lock release, picker
+listing (latest per project, newest first), specific-snapshot rendering, manual
+override beating auto-inject, and a no-regression guard that a manual selection
+does not disturb the default. Tests use temporary storage and restore the prior
+environment.
 
 ## Future work
 
-- A `/handoff` picker and `/handoffres` command for manual selection.
 - Snapshot pruning beyond the index's project-entry cap.
 - Optional fallback after a failed live-session migration, using handoff files
   already available on the target host.

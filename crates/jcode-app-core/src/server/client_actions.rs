@@ -701,6 +701,54 @@ pub(super) async fn handle_set_working_dir(
     }
 }
 
+/// Set which saved handoff this session boots from on its first message.
+///
+/// `Some(session_id)` selects a specific handoff via `/handoffres`; `None`
+/// restores the default automatic latest-for-project injection. The override is
+/// consumed server-side once it has been injected, so a fresh session later
+/// uses the default again.
+pub(super) async fn handle_set_handoff_resume(
+    id: u64,
+    session_id: Option<String>,
+    agent: &Arc<Mutex<Agent>>,
+    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+) {
+    let started = Instant::now();
+    if let Some(session_id) = session_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+    {
+        match crate::handoff::load_snapshot(session_id) {
+            Some(_) => {
+                let mut agent_guard = agent.lock().await;
+                agent_guard.set_handoff_resume(Some(session_id.to_string()));
+                crate::logging::event_info(
+                    "SESSION_LIFECYCLE",
+                    vec![
+                        ("phase", "handoff_resume_set".to_string()),
+                        ("request_id", id.to_string()),
+                        ("session_id", agent_guard.session_id().to_string()),
+                        ("handoff", session_id.to_string()),
+                        ("elapsed_ms", started.elapsed().as_millis().to_string()),
+                    ],
+                );
+            }
+            None => {
+                let _ = client_event_tx.send(ServerEvent::Error {
+                    id,
+                    message: format!("no saved handoff with id {session_id:?}"),
+                    retry_after_secs: None,
+                });
+                return;
+            }
+        }
+    } else {
+        let mut agent_guard = agent.lock().await;
+        agent_guard.set_handoff_resume(None);
+    }
+    let _ = client_event_tx.send(ServerEvent::Done { id });
+}
+
 pub(super) async fn handle_trigger_memory_extraction(
     id: u64,
     agent: &Arc<Mutex<Agent>>,

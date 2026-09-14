@@ -99,6 +99,23 @@ impl Agent {
         self.append_user_context_message_with_display_role(user_message, images, None)
     }
 
+    /// Resolve the handoff context block for the first visible user message.
+    ///
+    /// Honors an explicit manual selection ([`Self::handoff_resume_id`]) set by
+    /// `/handoffres`; otherwise falls back to the automatic latest-for-project
+    /// handoff. A manually selected snapshot is consumed here so it applies once
+    /// and never re-injects on a later turn or session, keeping manual selection
+    /// from regressing the default auto-injection at the next session start.
+    fn render_first_message_handoff(&mut self) -> Option<String> {
+        let override_id = self.handoff_resume_id.take();
+        if let Some(session_id) = override_id.as_deref() {
+            return crate::handoff::render_handoff(session_id);
+        }
+        self.session.working_dir.as_deref().and_then(|wd| {
+            crate::handoff::render_boot_context(Some(std::path::Path::new(wd)))
+        })
+    }
+
     fn append_user_context_message_with_display_role(
         &mut self,
         user_message: &str,
@@ -119,10 +136,7 @@ impl Agent {
         let mut text = user_message.to_string();
         let is_first_visible_message = self.visible_conversation_message_count() == 0;
         if is_first_visible_message
-            && let Some(handoff) =
-                self.session.working_dir.as_deref().and_then(|wd| {
-                    crate::handoff::render_boot_context(Some(std::path::Path::new(wd)))
-                })
+            && let Some(handoff) = self.render_first_message_handoff()
         {
             text = format!("{handoff}\n\n{text}");
         }

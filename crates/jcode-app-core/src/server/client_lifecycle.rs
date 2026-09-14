@@ -2,8 +2,8 @@ use super::available_models_dedup::available_models_dedup_key;
 use super::client_actions::{
     AgentTaskContext, NotifySessionContext, handle_agent_task, handle_compact, handle_input_shell,
     handle_notify_session, handle_rename_session, handle_run_subagent, handle_set_feature,
-    handle_set_subagent_model, handle_set_working_dir, handle_split, handle_stdin_response,
-    handle_transfer, handle_trigger_memory_extraction,
+    handle_set_handoff_resume, handle_set_subagent_model, handle_set_working_dir, handle_split,
+    handle_stdin_response, handle_transfer, handle_trigger_memory_extraction,
 };
 use super::client_comm::{
     handle_comm_channel_members, handle_comm_list, handle_comm_list_channels, handle_comm_message,
@@ -1986,6 +1986,20 @@ pub(super) async fn handle_client(
                     &client_event_tx,
                 )
                 .await;
+            }
+
+            Request::SetHandoffResume { id, session_id } => {
+                if reject_if_agent_busy_for_request(
+                    id,
+                    "set_handoff_resume",
+                    &client_session_id,
+                    client_is_processing,
+                    &agent,
+                    &client_event_tx,
+                ) {
+                    continue;
+                }
+                handle_set_handoff_resume(id, session_id, &agent, &client_event_tx).await;
             }
 
             Request::NotifyAuthChanged {

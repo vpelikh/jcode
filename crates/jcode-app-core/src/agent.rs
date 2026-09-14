@@ -244,6 +244,10 @@ pub struct Agent {
     mcp_late_register_resolved: bool,
     /// Override system prompt (used by ambient mode to inject a custom prompt)
     system_prompt_override: Option<String>,
+    /// When set, the first visible user message boots from this specific saved
+    /// handoff instead of the automatic latest-for-project one. Cleared after
+    /// it is consumed so it cannot re-inject on a later turn or session.
+    handoff_resume_id: Option<String>,
     /// AGENTS.md is session bootstrap input. Keep the captured text stable so
     /// tool writes do not mutate the provider's cacheable prefix mid-session.
     agents_md_snapshot: (Option<String>, crate::prompt::ContextInfo),
@@ -336,6 +340,7 @@ impl Agent {
             locked_tools: None,
             mcp_late_register_resolved: false,
             system_prompt_override: None,
+            handoff_resume_id: None,
             agents_md_snapshot,
             memory_enabled: crate::config::config().features.memory,
             rewind_undo_snapshot: None,

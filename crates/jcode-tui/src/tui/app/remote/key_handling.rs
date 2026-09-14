@@ -31,6 +31,96 @@ pub(in crate::tui::app) async fn send_interleave_now(
     }
 }
 
+/// Set which saved handoff this session boots from on its first message.
+///
+/// `/handoffres <session_id>` clears the conversation in place on the server
+/// (so the next user message is the first visible one), then tells the server
+/// which handoff to inject. The selection is resolved locally first so an
+/// unknown id fails fast client-side.
+async fn handle_handoff_resume_command(
+    app: &mut App,
+    remote: &mut RemoteConnection,
+    trimmed: &str,
+) -> Result<()> {
+    if app.is_processing {
+        app.push_display_message(DisplayMessage::error(
+            "The agent is currently working. Wait for it to finish, then run /handoffres again.".to_string(),
+        ));
+        return Ok(());
+    }
+    let session_id = trimmed.strip_prefix("/handoffres").unwrap_or_default().trim();
+    if session_id.is_empty() {
+        app.push_display_message(DisplayMessage::error(
+            "Usage: /handoffres <session_id>  (list ids with /handoff)".to_string(),
+        ));
+        return Ok(());
+    }
+    // Resolve and preview the target before telling the server, so an unknown
+    // id fails fast client-side.
+    let preview = match crate::handoff::render_handoff(session_id) {
+        Some(block) => block,
+        None => {
+            app.push_display_message(DisplayMessage::error(format!(
+                "No saved handoff with id {session_id:?}. List them with /handoff."
+            )));
+            return Ok(());
+        }
+    };
+    let selected = session_id.to_string();
+    // Clear the conversation in place on the server (same session id, like
+    // `/clear`) so the next user message is the first visible one — exactly
+    // when the server injects the override. Using `remote.clear()` keeps the
+    // client and server on the same agent, so the override set immediately
+    // after lands on the right session.
+    remote.clear().await?;
+    remote.set_handoff_resume(Some(selected.clone())).await?;
+    app.clear_provider_messages();
+    app.clear_display_messages();
+    app.is_processing = false;
+    app.push_display_message(DisplayMessage::system(format!(
+        "Handoff ready: {selected}\n{}",
+        preview.lines().next().unwrap_or("[Handoff from previous session]")
+    )));
+    app.set_status_notice("Handoff selected");
+    Ok(())
+}
+
+/// `/handoff` lists the saved handoffs the user can resume from, newest first,
+/// one per project. Each row carries the `session_id` the user should pass to
+/// `/handoffres`.
+fn handle_handoff_command(app: &mut App, _trimmed: &str) -> Result<()> {
+    let entries = crate::handoff::list_saved_handoffs();
+    if entries.is_empty() {
+        app.push_display_message(DisplayMessage::system(
+            "No saved handoffs. A handoff is captured when a session ends with unfinished work; run /handoffres <id> once one exists.".to_string(),
+        ));
+        return Ok(());
+    }
+    let mut msg = format!(
+        "{} saved handoff(s) (latest per project). Resume with /handoffres <id>:\n",
+        entries.len()
+    );
+    for entry in entries.iter().take(16) {
+        let when = entry.ended_at.format("%Y-%m-%d %H:%M");
+        let summary: String = entry
+            .summary
+            .as_deref()
+            .unwrap_or("<no intent>")
+            .chars()
+            .take(80)
+            .collect();
+        msg.push_str(&format!(
+            "- {}  [{}] {}\n    ended {when}\n",
+            entry.session_id, entry.project_key, summary
+        ));
+    }
+    if entries.len() > 16 {
+        msg.push_str(&format!("...and {} more.\n", entries.len() - 16));
+    }
+    app.push_display_message(DisplayMessage::system(msg));
+    Ok(())
+}
+
 pub(in crate::tui::app) async fn handle_remote_update_command(
     app: &mut App,
     remote: &mut RemoteConnection,
@@ -1946,6 +2036,14 @@ async fn handle_remote_key_internal(
                 if trimmed == "/active" {
                     app.open_active_sessions_picker();
                     return Ok(());
+                }
+
+                if trimmed == "/handoff" || trimmed.starts_with("/handoff ") {
+                    return handle_handoff_command(app, trimmed);
+                }
+
+                if trimmed == "/handoffres" || trimmed.starts_with("/handoffres ") {
+                    return handle_handoff_resume_command(app, remote, trimmed).await;
                 }
 
                 if trimmed == "/save" || trimmed.starts_with("/save ") {

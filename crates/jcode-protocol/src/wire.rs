@@ -331,6 +331,17 @@ pub enum Request {
         working_dir: String,
     },
 
+    /// Set the handoff snapshot this session boots from on first message.
+    ///
+    /// `Some(session_id)` overrides the automatic latest-for-project handoff
+    /// with a specific saved handoff; `None` restores the default auto-injection.
+    #[serde(rename = "set_handoff_resume")]
+    SetHandoffResume {
+        id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
+
     /// Split the current session — clone conversation into a new session
     #[serde(rename = "split")]
     Split { id: u64 },
