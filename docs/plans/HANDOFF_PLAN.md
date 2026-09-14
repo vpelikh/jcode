@@ -2,9 +2,14 @@
 
 ## Status
 
-**Core functionality implemented and integration-tested.** Capture, project
-indexing, first-message injection, and initiative promotion are complete. The
-TUI build passes. Live TUI end-to-end validation remains outstanding.
+**Core functionality implemented and validated.** Capture, project indexing,
+first-message injection, and initiative promotion are complete. The full
+`jcode-app-core` suite passes (1469 tests), the TUI build and reload succeed,
+and an isolated real daemon confirmed that disconnect persists pending work and
+a fresh session's first message receives the saved handoff exactly once.
+`jcode run` and captured turns are included in that first-message injection.
+Live model continuation was exercised end to end with a working provider: a
+fresh session recovered the exact pending marker from the saved handoff.
 
 **Planned:** manual selection, snapshot pruning, and remote fallback.
 
