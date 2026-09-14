@@ -21,6 +21,29 @@ struct DelayedProvider {
 
 struct NativeAutoCompactionProvider;
 
+struct HandoffFailureProvider;
+
+#[async_trait]
+impl Provider for HandoffFailureProvider {
+    async fn complete(
+        &self,
+        _: &[Message],
+        _: &[ToolDefinition],
+        _: &str,
+        _: Option<&str>,
+    ) -> Result<EventStream> {
+        anyhow::bail!("stop after persisting input")
+    }
+
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(Self)
+    }
+}
+
 struct NativeCompactionStreamProvider;
 
 #[derive(Clone)]
@@ -3543,4 +3566,23 @@ async fn first_user_message_injects_handoff_once() {
     assert!(message.content.iter().any(|block| matches!(block,
         ContentBlock::Text { text, .. } if text.contains("[Handoff from previous session]")
     )));
+    for capture in [false, true] {
+        let provider: Arc<dyn Provider> = Arc::new(HandoffFailureProvider);
+        let registry = Registry::new(provider.clone()).await;
+        let mut agent = Agent::new_with_initial_working_dir(provider, registry, Some(wd.to_str().unwrap()));
+        agent.set_memory_enabled(false);
+        for text in ["first CLI message", "second CLI message"] {
+            let result = if capture {
+                agent.run_once_capture(text).await.map(|_| ())
+            } else {
+                agent.run_once(text).await
+            };
+            assert!(result.is_err(), "test provider stops after input persistence");
+            let messages = serde_json::to_string(&agent.session.messages).unwrap();
+            assert_eq!(messages.matches("[Handoff from previous session]").count(), 1,
+                "capture={capture}: all turn entry points must inject exactly once");
+            assert!(messages.contains(text), "original user text retained");
+        }
+    }
+
 }

@@ -4,14 +4,7 @@ use crate::{terminal_eprintln as eprintln, terminal_println as println};
 impl Agent {
     /// Run a single turn with the given user message
     pub async fn run_once(&mut self, user_message: &str) -> Result<()> {
-        self.add_message(
-            Role::User,
-            vec![ContentBlock::Text {
-                text: user_message.to_string(),
-                cache_control: None,
-            }],
-        );
-        self.session.save()?;
+        self.append_user_context_message(user_message, Vec::new())?;
         if trace_enabled() {
             eprintln!("[trace] session_id {}", self.session.id);
         }
@@ -29,15 +22,11 @@ impl Agent {
         user_message: &str,
         display_role: Option<crate::session::StoredDisplayRole>,
     ) -> Result<String> {
-        self.add_message_with_display_role(
-            Role::User,
-            vec![ContentBlock::Text {
-                text: user_message.to_string(),
-                cache_control: None,
-            }],
+        self.append_user_context_message_with_display_role(
+            user_message,
+            Vec::new(),
             display_role,
-        );
-        self.session.save()?;
+        )?;
         if trace_enabled() {
             eprintln!("[trace] session_id {}", self.session.id);
         }
