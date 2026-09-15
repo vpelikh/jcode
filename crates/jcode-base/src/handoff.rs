@@ -202,7 +202,9 @@ pub fn capture(
     };
     match write_snapshot_locked(&snapshot) {
         Ok(()) => {
-            prune_archived_snapshots();
+            // Already holding the store lock from the top of `capture`, so run
+            // the unlocked body directly (avoiding a self-deadlock).
+            prune_archived_snapshots_locked();
             Some(snapshot)
         }
         Err(err) => {
@@ -495,6 +497,9 @@ pub fn import_handoff(
     let session_id = snapshot.session_id.clone();
     crate::storage::write_json_fast(&file_path(&dir, &session_id).ok()?, &snapshot).ok()?;
     upsert_index(&snapshot).ok()?;
+    // Keep the archive bounded during import-heavy flows, consistent with
+    // capture (which also prunes after a write). The lock is already held.
+    prune_archived_snapshots_locked();
     Some(session_id)
 }
 
@@ -541,7 +546,25 @@ fn sanitize_import_source(source: &str) -> String {
 /// [`sweep_stale_handoffs`]). Removals and a per-run summary are logged.
 /// Failures to read or delete individual files are ignored (best-effort), and
 /// a missing or unreadable store is a no-op.
+///
+/// Acquires the store lock so it is safe to call concurrently with captures.
+/// Internal callers that already hold the lock use [`prune_archived_snapshots_locked`].
 pub fn prune_archived_snapshots() {
+    let _lock = match lock_store() {
+        Ok(lock) => lock,
+        Err(error) => {
+            crate::logging::warn(&format!(
+                "[handoff] cannot lock store for prune: {error}"
+            ));
+            return;
+        }
+    };
+    prune_archived_snapshots_locked();
+}
+
+/// The pruning body, run with the store lock already held (by [`capture`] via
+/// `prune_archived_snapshots_locked` or by [`prune_archived_snapshots`]).
+fn prune_archived_snapshots_locked() {
     let Ok(index) = load_index_opt() else {
         return;
     };
