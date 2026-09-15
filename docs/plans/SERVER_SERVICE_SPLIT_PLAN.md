@@ -715,6 +715,19 @@ call-site migrations with tests green after each.
   attr (now 7 params). `create_headless_session` keeps its own flat bag
   (separate cascade).
 
+- **Role assignment routes through the handle.** `handle_comm_assign_role`
+  collapsed its flat 7-arg swarm bag (`members` + `swarms_by_id` +
+  `coordinators` + `plans` + `event_history` + `event_counter` + `event_tx`)
+  onto `&SwarmServiceHandle`, binding the maps as body locals and routing
+  `persist_swarm_state_for`, `broadcast_swarm_status`, and `record_swarm_event`
+  through handle methods. Both routers (`client_lifecycle.rs::handle_client`
+  and `client_lightweight_control.rs::handle_lightweight_control_request`) pass
+  `&swarm_service_handle` / `swarm`. Drops the now-unused
+  `broadcast_swarm_status` import. Restored the
+  `clippy::too_many_arguments` expectations on `handle_set_feature`
+  (`client_actions.rs`) and `cleanup_detached_source_session_if_unused`
+  (`client_session.rs`), both still over the 7-arg threshold.
+
 The remaining free-function call sites for `update_member_status` /
 `broadcast_swarm_status` in `comm_control.rs`, `comm_session.rs`, and
 `headless.rs` are still open; as is the
