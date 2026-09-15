@@ -699,8 +699,7 @@ impl Drop for HandoffTestEnv {
 #[test]
 fn list_saved_handoffs_returns_latest_per_project_newest_first() {
     let _guard = crate::storage::lock_test_env();
-    let env = HandoffTestEnv::new();
-    let home = env._home.path();
+    let _env = HandoffTestEnv::new();
 
     let mut a1 = fixture("proj-a-1", "git:https://example.com/a.git");
     a1.ended_at = Utc::now() - chrono::Duration::hours(2);
@@ -725,7 +724,6 @@ fn list_saved_handoffs_returns_latest_per_project_newest_first() {
         .find(|e| e.project_key == "git:https://example.com/a.git")
         .expect("project A present");
     assert_eq!(a_entry.session_id, "proj-a-2", "latest A wins");
-    let _ = &home;
 }
 
 /// render_handoff renders a specific snapshot regardless of project, while

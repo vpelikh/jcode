@@ -501,7 +501,7 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/session", "Alias for /resume"),
     RegisteredCommand::public(
         "/handoff",
-        "List saved handoffs (latest per project) to resume from",
+        "List saved handoffs (all snapshots, newest first) to resume from",
     ),
     RegisteredCommand::public(
         "/handoffres",

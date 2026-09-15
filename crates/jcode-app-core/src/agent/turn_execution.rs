@@ -109,7 +109,13 @@ impl Agent {
     fn render_first_message_handoff(&mut self) -> Option<String> {
         let override_id = self.handoff_resume_id.take();
         if let Some(session_id) = override_id.as_deref() {
-            return crate::handoff::render_handoff(session_id);
+            // The manual selection is consumed even on a failed render (a stale
+            // or retired snapshot must not re-trigger on a later turn). When it
+            // cannot be rendered, fall back to the automatic latest-for-project
+            // handoff rather than booting with no context.
+            if let Some(rendered) = crate::handoff::render_handoff(session_id) {
+                return Some(rendered);
+            }
         }
         self.session.working_dir.as_deref().and_then(|wd| {
             crate::handoff::render_boot_context(Some(std::path::Path::new(wd)))

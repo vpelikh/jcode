@@ -1953,22 +1953,21 @@ pub(super) fn handle_git_status_completed(app: &mut App, completed: GitStatusCom
     }
 }
 
-/// Local fallback for `/handoff`: list saved handoffs. This path runs without a
-/// live server connection (disconnected/SSH), so it reads the shared handoff
-/// store directly, mirroring the same output the remote dispatcher produces.
-pub(super) fn handle_handoff_list_local(app: &mut App, _trimmed: &str) -> bool {
+/// Build the `/handoff` listing text from the shared handoff store.
+///
+/// Shared by the remote and local dispatchers so their output cannot drift.
+/// Lists every persisted snapshot newest-first (archived ones marked), with a
+/// hint on how to resume.
+pub(super) fn handoff_listing_message() -> String {
     let snapshots = crate::handoff::list_all_handoffs();
     if snapshots.is_empty() {
-        app.push_display_message(DisplayMessage::system(
-            "No saved handoffs. A handoff is captured when a session ends with unfinished work; once one exists, connect to a server and run /handoffres <id>.".to_string(),
-        ));
-        return true;
+        return "No saved handoffs. A handoff is captured when a session ends with unfinished work; once one exists, run /handoffres <id> (list with /handoff).".to_string();
     }
     let latest = crate::handoff::list_saved_handoffs();
     let latest_ids: std::collections::HashSet<&str> =
         latest.iter().map(|e| e.session_id.as_str()).collect();
     let mut msg = format!(
-        "{} saved handoff(s), newest first. Connect to a server, then /handoffres <id> (or /clear via /handoff-clear):\n",
+        "{} saved handoff(s), newest first. Resume with /handoffres <id>; clear with /handoff-clear:\n",
         snapshots.len()
     );
     for snapshot in snapshots.iter().take(24) {
@@ -1993,7 +1992,15 @@ pub(super) fn handle_handoff_list_local(app: &mut App, _trimmed: &str) -> bool {
     if snapshots.len() > 24 {
         msg.push_str(&format!("...and {} more.\n", snapshots.len() - 24));
     }
-    app.push_display_message(DisplayMessage::system(msg));
+    msg
+}
+
+/// Local fallback for `/handoff`: list saved handoffs. This path runs without a
+/// live server connection (disconnected/SSH), so it reads the shared handoff
+/// store directly, mirroring what the remote dispatcher produces via the shared
+/// [`handoff_listing_message`].
+pub(super) fn handle_handoff_list_local(app: &mut App, _trimmed: &str) -> bool {
+    app.push_display_message(DisplayMessage::system(handoff_listing_message()));
     true
 }
 

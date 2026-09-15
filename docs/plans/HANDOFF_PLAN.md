@@ -26,9 +26,9 @@ can use on its first turn.
 - A project-keyed index for finding the latest unfinished handoff.
 - First-message context injection, including image-first conversations.
 - Promotion of a saved handoff into a durable project initiative.
-- A `/handoff` picker that lists saved handoffs (latest per project) and a
-  `/handoffres <session_id>` command that boots a fresh conversation from a
-  selected handoff, overriding the automatic latest-for-project injection.
+- A `/handoff` picker that lists saved handoffs (all snapshots, newest first)
+  and a `/handoffres <session_id>` command that boots a fresh conversation from
+  a selected handoff, overriding the automatic latest-for-project injection.
 
 Manual selection is implemented. Snapshot pruning and remote fallback remain
 future work.
@@ -180,6 +180,7 @@ for choosing among multiple work streams.
 ```bash
 cargo test -p jcode-base --lib handoff::tests
 cargo test -p jcode-app-core --lib manual_handoff_override_injects_selected_snapshot_once
+cargo test -p jcode-app-core --lib stale_manual_handoff_override_falls_back_to_auto_inject
 cargo test -p jcode-app-core --lib handle_set_handoff_resume_overrides_auto_inject_and_errors_on_unknown
 cargo test -p jcode-app-core --lib first_user_message_injects_handoff_once
 cargo test -p jcode-app-core --lib cleanup_persists_handoff_for_session_with_open_todos
@@ -192,11 +193,13 @@ project isolation, invalid filenames, corrupt-index recovery, bounded rendering,
 initiative promotion, text/image-first injection, cleanup lock release, picker
 listing (latest per project, newest first), archive listing (`list_all_handoffs`
 surfaces superseded snapshots), specific-snapshot rendering, manual override
-beating auto-inject, the `set_handoff_resume` server handler (valid set replies
-`Done` and wins over auto-inject; unknown id replies `Error`), a no-regression
-guard that a manual selection does not disturb the default, and the TUI local
-`/handoff` fallback (surfaces archived handoffs; `/handoffres` explains a server
-is needed). Tests use temporary storage and restore the prior environment.
+beating auto-inject, a stale-override fallback (a retired snapshot falls back to
+auto-inject instead of booting context-less, and the stale id is consumed), the
+`set_handoff_resume` server handler (valid set replies `Done` and wins over
+auto-inject; unknown id replies `Error`), a no-regression guard that a manual
+selection does not disturb the default, and the TUI local `/handoff` fallback
+(surfaces archived handoffs; `/handoffres` explains a server is needed). Tests
+use temporary storage and restore the prior environment.
 
 ## Future work
 

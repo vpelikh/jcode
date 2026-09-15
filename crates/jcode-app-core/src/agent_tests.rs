@@ -3707,3 +3707,115 @@ async fn manual_handoff_override_injects_selected_snapshot_once() {
         "override must be consumed after one injection, got: {second_str}"
     );
 }
+
+/// A stale manual override (a snapshot that no longer exists) must not fall
+/// through to a context-less boot: the first message should instead fall back
+/// to the automatic latest-for-project handoff, and the stale id must be
+/// consumed so it never re-triggers.
+#[tokio::test]
+async fn stale_manual_handoff_override_falls_back_to_auto_inject() {
+    let _guard = crate::storage::lock_test_env();
+    let home = tempfile::TempDir::new().expect("temp home");
+    struct RestoreHome(Option<std::ffi::OsString>);
+    impl Drop for RestoreHome {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => crate::env::set_var("JCODE_HOME", value),
+                None => crate::env::remove_var("JCODE_HOME"),
+            }
+        }
+    }
+    let _restore = RestoreHome(std::env::var_os("JCODE_HOME"));
+    crate::env::set_var("JCODE_HOME", home.path());
+    let wd = home.path().join("project");
+    std::fs::create_dir_all(&wd).unwrap();
+
+    // Seed the project's current handoff so auto-injection has a target.
+    crate::todo::save_todos(
+        "current-handoff",
+        &[crate::todo::TodoItem {
+            id: "t".into(),
+            content: "auto work".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: None,
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    crate::todo::save_plan(
+        "current-handoff",
+        &crate::todo::TodoPlan {
+            user_intention: Some("auto intent".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    crate::handoff::capture("current-handoff", Some(&wd), "closed", None).expect("capture");
+
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent =
+        Agent::new_with_initial_working_dir(provider, registry, Some(wd.to_str().unwrap()));
+    // Point the override at a snapshot that does not exist.
+    agent.set_handoff_resume(Some("retired-handoff".to_string()));
+
+    agent
+        .append_user_context_message("continue", Vec::new())
+        .expect("first message");
+    let first_str = agent
+        .session
+        .messages
+        .iter()
+        .filter_map(|m| match m.role {
+            Role::User => Some(m),
+            _ => None,
+        })
+        .last()
+        .map(|m| {
+            m.content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    assert!(
+        first_str.contains("auto intent"),
+        "stale override should fall back to auto-inject, got: {first_str}"
+    );
+
+    // The stale override was consumed; a later first message still uses the
+    // default and does not inject the missing snapshot.
+    agent
+        .append_user_context_message("next", Vec::new())
+        .expect("second message");
+    let second_str = agent
+        .session
+        .messages
+        .iter()
+        .filter_map(|m| match m.role {
+            Role::User => Some(m),
+            _ => None,
+        })
+        .last()
+        .map(|m| {
+            m.content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    assert!(
+        !second_str.contains("[Handoff from previous session]"),
+        "stale override must be consumed after one injection, got: {second_str}"
+    );
+}
