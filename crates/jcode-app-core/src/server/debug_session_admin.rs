@@ -1,8 +1,7 @@
 use super::services::SwarmServiceHandle;
 use super::{
-    SessionInterruptQueues, SwarmEventType, SwarmState,
-    create_headless_session, persist_swarm_state_for,
-    remove_background_tool_signal, remove_session_interrupt_queue,
+    SessionInterruptQueues, SwarmEventType, SwarmState, create_headless_session,
+    persist_swarm_state_for, remove_background_tool_signal, remove_session_interrupt_queue,
 };
 use crate::agent::Agent;
 use crate::provider::Provider;
@@ -75,10 +74,7 @@ pub(super) async fn maybe_handle_session_admin_command(
             session_id,
             provider,
             &create_command,
-            swarm_members,
-            swarms_by_id,
-            swarm_coordinators,
-            swarm_plans,
+            swarm,
             soft_interrupt_queues,
             selfdev_requested,
             None,

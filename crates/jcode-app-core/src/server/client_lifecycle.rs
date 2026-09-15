@@ -2497,18 +2497,9 @@ pub(super) async fn handle_client(
                     &sessions,
                     &global_session_id,
                     &provider_template,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &swarm_coordinators,
-                    &swarm_plans,
-                    &channel_subscriptions,
-                    &channel_subscriptions_by_session,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
+                    &swarm_service_handle,
                     &mcp_pool,
                     &soft_interrupt_queues,
-                    &swarm_mutation_runtime,
                     &client_connections,
                 )
                 .await;
@@ -2704,14 +2695,7 @@ pub(super) async fn handle_client(
                     &client_event_tx,
                     &session_service_handle,
                     &client_connections,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &swarm_plans,
-                    &swarm_coordinators,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
-                    &swarm_mutation_runtime,
+                    &swarm_service_handle,
                 )
                 .await;
             }
@@ -2742,15 +2726,8 @@ pub(super) async fn handle_client(
                     &global_session_id,
                     &provider_template,
                     &client_connections,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &swarm_plans,
-                    &swarm_coordinators,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
+                    &swarm_service_handle,
                     &mcp_pool,
-                    &swarm_mutation_runtime,
                 )
                 .await;
             }
@@ -2773,14 +2750,7 @@ pub(super) async fn handle_client(
                     &client_event_tx,
                     &session_service_handle,
                     &client_connections,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &swarm_plans,
-                    &swarm_coordinators,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
-                    &swarm_mutation_runtime,
+                    &swarm_service_handle,
                 )
                 .await;
             }
@@ -2987,7 +2957,7 @@ pub(super) async fn handle_client(
                         report,
                         &SwarmStatusRefs {
                             swarm: &swarm_service_handle,
-                            },
+                        },
                     )
                     .await;
                 }
@@ -3041,12 +3011,7 @@ async fn record_processing_completion(
             if let Some(session_id) = done_session {
                 swarm
                     .swarm
-                    .set_member_status_with_report(
-                        session_id,
-                        "ready",
-                        None,
-                        completion_report,
-                    )
+                    .set_member_status_with_report(session_id, "ready", None, completion_report)
                     .await;
             }
         }
@@ -3413,11 +3378,7 @@ async fn cancel_processing_message(
             .unwrap_or_else(|| session_control.session_id.clone());
         swarm
             .swarm
-            .set_member_status(
-                &status_session_id,
-                "stopped",
-                Some("cancelled".to_string()),
-            )
+            .set_member_status(&status_session_id, "stopped", Some("cancelled".to_string()))
             .await;
         let _ = client_event_tx.send(ServerEvent::Interrupted);
         if let Some(message_id) = state.message_id.take() {

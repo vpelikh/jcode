@@ -6,11 +6,11 @@ use super::swarm_mutation_state::{
     request_key,
 };
 use super::{
-    SessionInterruptQueues, SwarmEvent, SwarmEventType, SwarmMember, SwarmState, VersionedPlan,
-    append_swarm_completion_report_instructions, broadcast_swarm_plan, broadcast_swarm_status,
-    create_headless_session, fanout_session_event, persist_swarm_state_for,
-    record_swarm_event_for_session, remove_background_tool_signal, remove_session_interrupt_queue,
-    set_member_task_label, truncate_detail, update_member_status, update_member_status_with_report,
+    SessionInterruptQueues, SwarmEventType, SwarmMember, SwarmState,
+    append_swarm_completion_report_instructions, broadcast_swarm_plan, create_headless_session,
+    fanout_session_event, persist_swarm_state_for, record_swarm_event_for_session,
+    remove_background_tool_signal, remove_session_interrupt_queue, set_member_task_label,
+    truncate_detail,
 };
 use crate::agent::Agent;
 use crate::config::SwarmSpawnMode;
@@ -21,10 +21,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::Instant;
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 
 type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
-type ChannelSubscriptions = Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
 type ClientConnections = Arc<RwLock<HashMap<String, ClientConnectionInfo>>>;
 
 /// Serialize spawn admission through member registration within one swarm.
@@ -470,22 +469,19 @@ where
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "visible spawn registration updates swarm state, event history, and UI delivery metadata together"
-)]
 async fn register_visible_spawned_member(
     session_id: &str,
     swarm_id: &str,
     working_dir: Option<&str>,
     has_startup_message: bool,
     report_back_to_session_id: Option<&str>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
+    swarm: &SwarmServiceHandle,
 ) {
+    let swarm_members = &swarm.swarm_state.members;
+    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let event_history = &swarm.event_history;
+    let event_counter = &swarm.event_counter;
+    let swarm_event_tx = &swarm.swarm_event_tx;
     let (event_tx, _event_rx) = mpsc::unbounded_channel();
     let now = Instant::now();
     let friendly_name = crate::id::extract_session_name(session_id)
@@ -545,7 +541,7 @@ async fn register_visible_spawned_member(
         swarm_event_tx,
     )
     .await;
-    broadcast_swarm_status(swarm_id, swarm_members, swarms_by_id).await;
+    swarm.broadcast_swarm_status(swarm_id).await;
 }
 
 #[expect(
@@ -582,17 +578,18 @@ pub(super) async fn spawn_swarm_agent(
     sessions: &SessionAgents,
     global_session_id: &Arc<RwLock<String>>,
     provider_template: &Arc<dyn Provider>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
+    swarm: &SwarmServiceHandle,
     mcp_pool: &Arc<crate::mcp::SharedMcpPool>,
     soft_interrupt_queues: &SessionInterruptQueues,
     client_connections: &ClientConnections,
 ) -> anyhow::Result<String> {
+    let swarm_members = &swarm.swarm_state.members;
+    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let swarm_plans = &swarm.swarm_state.plans;
+    let event_history = &swarm.event_history;
+    let event_counter = &swarm.event_counter;
+    let swarm_event_tx = &swarm.swarm_event_tx;
     let resolved_working_dir =
         resolve_spawn_working_dir(working_dir, req_session_id, sessions, swarm_members).await;
     let coordinator = resolve_coordinator_spawn_identity(req_session_id, sessions).await;
@@ -680,10 +677,7 @@ pub(super) async fn spawn_swarm_agent(
                 global_session_id,
                 provider_template,
                 &cmd,
-                swarm_members,
-                swarms_by_id,
-                swarm_coordinators,
-                swarm_plans,
+                swarm,
                 soft_interrupt_queues,
                 coordinator_is_canary,
                 spawn_model.clone(),
@@ -736,11 +730,7 @@ pub(super) async fn spawn_swarm_agent(
             resolved_working_dir.as_deref(),
             startup_message.is_some(),
             Some(req_session_id),
-            swarm_members,
-            swarms_by_id,
-            event_history,
-            event_counter,
-            swarm_event_tx,
+            swarm,
         )
         .await;
     }
@@ -780,23 +770,16 @@ pub(super) async fn spawn_swarm_agent(
         };
         if let Some(agent_arc) = agent_arc {
             let sid_clone = new_session_id.clone();
+            let swarm2 = swarm.clone();
             let swarm_members2 = Arc::clone(swarm_members);
-            let swarms_by_id2 = Arc::clone(swarms_by_id);
-            let event_history2 = Arc::clone(event_history);
-            let event_counter2 = Arc::clone(event_counter);
-            let swarm_event_tx2 = swarm_event_tx.clone();
             tokio::spawn(async move {
-                update_member_status(
-                    &sid_clone,
-                    "running",
-                    Some(truncate_detail(&initial_msg, 120)),
-                    &swarm_members2,
-                    &swarms_by_id2,
-                    Some(&event_history2),
-                    Some(&event_counter2),
-                    Some(&swarm_event_tx2),
-                )
-                .await;
+                swarm2
+                    .set_member_status(
+                        &sid_clone,
+                        "running",
+                        Some(truncate_detail(&initial_msg, 120)),
+                    )
+                    .await;
                 let event_tx = super::session_event_fanout_sender(
                     sid_clone.clone(),
                     Arc::clone(&swarm_members2),
@@ -823,18 +806,14 @@ pub(super) async fn spawn_swarm_agent(
                     Ok(()) => ("ready", None),
                     Err(ref error) => ("failed", Some(truncate_detail(&error.to_string(), 120))),
                 };
-                update_member_status_with_report(
-                    &sid_clone,
-                    new_status,
-                    new_detail,
-                    completion_report,
-                    &swarm_members2,
-                    &swarms_by_id2,
-                    Some(&event_history2),
-                    Some(&event_counter2),
-                    Some(&swarm_event_tx2),
-                )
-                .await;
+                swarm2
+                    .set_member_status_with_report(
+                        &sid_clone,
+                        new_status,
+                        new_detail,
+                        completion_report,
+                    )
+                    .await;
             });
         }
     }
@@ -857,20 +836,13 @@ pub(super) async fn handle_comm_spawn(
     sessions: &SessionAgents,
     global_session_id: &Arc<RwLock<String>>,
     provider_template: &Arc<dyn Provider>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    _channel_subscriptions: &ChannelSubscriptions,
-    _channel_subscriptions_by_session: &ChannelSubscriptions,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
+    swarm: &SwarmServiceHandle,
     mcp_pool: &Arc<crate::mcp::SharedMcpPool>,
     soft_interrupt_queues: &SessionInterruptQueues,
-    swarm_mutation_runtime: &SwarmMutationRuntime,
     client_connections: &ClientConnections,
 ) {
+    let swarm_members = &swarm.swarm_state.members;
+    let swarm_mutation_runtime = &swarm.swarm_mutation_runtime;
     // Hold this swarm's admission through member registration so concurrent
     // recursive requests cannot all pass the population check against stale
     // state. Unrelated swarms retain independent spawn throughput.
@@ -886,10 +858,7 @@ pub(super) async fn handle_comm_spawn(
         id,
         &req_session_id,
         client_event_tx,
-        swarm_members,
-        swarms_by_id,
-        swarm_coordinators,
-        swarm_plans,
+        swarm,
         crate::config::config().agents.swarm_max_concurrent_agents,
     )
     .await
@@ -939,13 +908,7 @@ pub(super) async fn handle_comm_spawn(
         sessions,
         global_session_id,
         provider_template,
-        swarm_members,
-        swarms_by_id,
-        swarm_coordinators,
-        swarm_plans,
-        event_history,
-        event_counter,
-        swarm_event_tx,
+        swarm,
         mcp_pool,
         soft_interrupt_queues,
         client_connections,
@@ -1236,12 +1199,13 @@ async fn ensure_spawn_coordinator_swarm(
     id: u64,
     req_session_id: &str,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
+    swarm: &SwarmServiceHandle,
     configured_live_agent_limit: usize,
 ) -> Option<String> {
+    let swarm_members = &swarm.swarm_state.members;
+    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let swarm_plans = &swarm.swarm_state.plans;
     let (
         swarm_id,
         from_name,
@@ -1412,7 +1376,7 @@ async fn ensure_spawn_coordinator_swarm(
                     coordinators: Arc::clone(swarm_coordinators),
                 };
                 persist_swarm_state_for(&swarm_id, &swarm_state).await;
-                broadcast_swarm_status(&swarm_id, swarm_members, swarms_by_id).await;
+                swarm.broadcast_swarm_status(&swarm_id).await;
                 let _ = client_event_tx.send(ServerEvent::Notification {
                     from_session: req_session_id.to_string(),
                     from_name,

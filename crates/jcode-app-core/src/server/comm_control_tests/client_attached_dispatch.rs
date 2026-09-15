@@ -84,6 +84,16 @@ async fn assign_task_to_client_attached_session_skips_server_side_run() {
     let mutation_runtime = SwarmMutationRuntime::default();
 
     let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
+    let swarm = swarm_handle(
+        &swarm_members,
+        &swarms_by_id,
+        &swarm_plans,
+        &swarm_coordinators,
+        &event_history,
+        &event_counter,
+        &swarm_event_tx,
+        &mutation_runtime,
+    );
     handle_comm_assign_task(
         91,
         requester.to_string(),
@@ -93,14 +103,7 @@ async fn assign_task_to_client_attached_session_skips_server_side_run() {
         &client_tx,
         &session_h,
         &client_connections,
-        &swarm_members,
-        &swarms_by_id,
-        &swarm_plans,
-        &swarm_coordinators,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
-        &mutation_runtime,
+        &swarm,
     )
     .await;
 

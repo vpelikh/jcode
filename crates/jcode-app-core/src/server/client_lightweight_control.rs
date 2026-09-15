@@ -433,18 +433,9 @@ pub(super) async fn handle_lightweight_control_request(
                 sessions,
                 global_session_id,
                 provider_template,
-                swarm_members,
-                swarms_by_id,
-                swarm_coordinators,
-                swarm_plans,
-                channel_subscriptions,
-                channel_subscriptions_by_session,
-                event_history,
-                event_counter,
-                swarm_event_tx,
+                swarm,
                 mcp_pool,
                 soft_interrupt_queues,
-                swarm_mutation_runtime,
                 client_connections,
             )
             .await;
@@ -628,14 +619,7 @@ pub(super) async fn handle_lightweight_control_request(
                 &client_event_tx,
                 session,
                 client_connections,
-                swarm_members,
-                swarms_by_id,
-                swarm_plans,
-                swarm_coordinators,
-                event_history,
-                event_counter,
-                swarm_event_tx,
-                swarm_mutation_runtime,
+                swarm,
             )
             .await;
         }
@@ -665,15 +649,8 @@ pub(super) async fn handle_lightweight_control_request(
                 global_session_id,
                 provider_template,
                 client_connections,
-                swarm_members,
-                swarms_by_id,
-                swarm_plans,
-                swarm_coordinators,
-                event_history,
-                event_counter,
-                swarm_event_tx,
+                swarm,
                 mcp_pool,
-                swarm_mutation_runtime,
             )
             .await;
         }
@@ -695,14 +672,7 @@ pub(super) async fn handle_lightweight_control_request(
                 &client_event_tx,
                 session,
                 client_connections,
-                swarm_members,
-                swarms_by_id,
-                swarm_plans,
-                swarm_coordinators,
-                event_history,
-                event_counter,
-                swarm_event_tx,
-                swarm_mutation_runtime,
+                swarm,
             )
             .await;
         }

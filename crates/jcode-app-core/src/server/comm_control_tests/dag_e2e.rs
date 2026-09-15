@@ -40,6 +40,7 @@ struct GraphFixture {
     event_counter: Arc<AtomicU64>,
     swarm_event_tx: broadcast::Sender<SwarmEvent>,
     mutation_runtime: SwarmMutationRuntime,
+    swarm: crate::server::services::SwarmServiceHandle,
 }
 
 async fn graph_fixture() -> GraphFixture {
@@ -83,6 +84,20 @@ async fn graph_fixture_named(swarm_id: &str, coord: &str, worker: &str) -> Graph
         swarm_id.clone(),
         coord.clone(),
     )])));
+    let event_history = Arc::new(RwLock::new(VecDeque::new()));
+    let event_counter = Arc::new(AtomicU64::new(1));
+    let (swarm_event_tx, _swarm_event_rx) = broadcast::channel(64);
+    let mutation_runtime = SwarmMutationRuntime::default();
+    let swarm = swarm_handle(
+        &swarm_members,
+        &swarms_by_id,
+        &swarm_plans,
+        &swarm_coordinators,
+        &event_history,
+        &event_counter,
+        &swarm_event_tx,
+        &mutation_runtime,
+    );
     GraphFixture {
         swarm_id,
         coord,
@@ -97,10 +112,11 @@ async fn graph_fixture_named(swarm_id: &str, coord: &str, worker: &str) -> Graph
         swarms_by_id,
         swarm_plans,
         swarm_coordinators,
-        event_history: Arc::new(RwLock::new(VecDeque::new())),
-        event_counter: Arc::new(AtomicU64::new(1)),
-        swarm_event_tx: broadcast::channel(64).0,
-        mutation_runtime: SwarmMutationRuntime::default(),
+        event_history,
+        event_counter,
+        swarm_event_tx,
+        mutation_runtime,
+        swarm,
     }
 }
 
@@ -285,16 +301,23 @@ async fn e2e_identical_seed_replay_succeeds_without_version_or_node_churn() {
     drop(plans);
     let events: Vec<_> = std::iter::from_fn(|| fx.client_rx.try_recv().ok()).collect();
     assert!(
-        events.iter().all(|event| !matches!(event, ServerEvent::Error { .. })),
+        events
+            .iter()
+            .all(|event| !matches!(event, ServerEvent::Error { .. })),
         "an identical replay must acknowledge success: {events:?}"
     );
-    assert!(events.iter().any(|event| matches!(event, ServerEvent::Done { .. })));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ServerEvent::Done { .. }))
+    );
 }
 
 #[tokio::test]
 async fn e2e_seed_rejects_conflicting_existing_definition_without_mutation() {
     let (_env, _runtime) = RuntimeEnvGuard::new();
-    let mut fx = graph_fixture_named("swarm-seed-conflict", "coord-conflict", "worker-conflict").await;
+    let mut fx =
+        graph_fixture_named("swarm-seed-conflict", "coord-conflict", "worker-conflict").await;
     fx.seed("light", vec![node_spec("shared", "explore", &[])])
         .await;
     while fx.client_rx.try_recv().is_ok() {}
@@ -383,14 +406,7 @@ async fn e2e_deep_expand_inserts_gate_in_live_plan() {
         &fx.client_tx,
         &fx.session_handle,
         &fx.client_connections,
-        &fx.swarm_members,
-        &fx.swarms_by_id,
-        &fx.swarm_plans,
-        &fx.swarm_coordinators,
-        &fx.event_history,
-        &fx.event_counter,
-        &fx.swarm_event_tx,
-        &fx.mutation_runtime,
+        &fx.swarm,
     )
     .await;
 
@@ -468,14 +484,7 @@ async fn e2e_deep_assignment_carries_fanout_and_artifact_contract() {
         &fx.client_tx,
         &fx.session_handle,
         &fx.client_connections,
-        &fx.swarm_members,
-        &fx.swarms_by_id,
-        &fx.swarm_plans,
-        &fx.swarm_coordinators,
-        &fx.event_history,
-        &fx.event_counter,
-        &fx.swarm_event_tx,
-        &fx.mutation_runtime,
+        &fx.swarm,
     )
     .await;
 
@@ -516,14 +525,7 @@ async fn e2e_deep_assignment_carries_fanout_and_artifact_contract() {
         &lfx.client_tx,
         &lfx.session_handle,
         &lfx.client_connections,
-        &lfx.swarm_members,
-        &lfx.swarms_by_id,
-        &lfx.swarm_plans,
-        &lfx.swarm_coordinators,
-        &lfx.event_history,
-        &lfx.event_counter,
-        &lfx.swarm_event_tx,
-        &lfx.mutation_runtime,
+        &lfx.swarm,
     )
     .await;
     let light_prompt = {
@@ -629,14 +631,7 @@ async fn e2e_deep_gate_assignment_carries_inject_gap_contract() {
         &fx.client_tx,
         &fx.session_handle,
         &fx.client_connections,
-        &fx.swarm_members,
-        &fx.swarms_by_id,
-        &fx.swarm_plans,
-        &fx.swarm_coordinators,
-        &fx.event_history,
-        &fx.event_counter,
-        &fx.swarm_event_tx,
-        &fx.mutation_runtime,
+        &fx.swarm,
     )
     .await;
 
@@ -689,14 +684,7 @@ async fn e2e_complete_flows_artifact_to_downstream_assignment() {
         &fx.client_tx,
         &fx.session_handle,
         &fx.client_connections,
-        &fx.swarm_members,
-        &fx.swarms_by_id,
-        &fx.swarm_plans,
-        &fx.swarm_coordinators,
-        &fx.event_history,
-        &fx.event_counter,
-        &fx.swarm_event_tx,
-        &fx.mutation_runtime,
+        &fx.swarm,
     )
     .await;
     {
@@ -752,14 +740,7 @@ async fn e2e_complete_flows_artifact_to_downstream_assignment() {
         &fx.client_tx,
         &fx.session_handle,
         &fx.client_connections,
-        &fx.swarm_members,
-        &fx.swarms_by_id,
-        &fx.swarm_plans,
-        &fx.swarm_coordinators,
-        &fx.event_history,
-        &fx.event_counter,
-        &fx.swarm_event_tx,
-        &fx.mutation_runtime,
+        &fx.swarm,
     )
     .await;
 
@@ -944,6 +925,16 @@ async fn e2e_solo_seeder_is_elected_coordinator_and_can_assign() {
 
     // And it can now drive the graph: assign the ready node to the worker.
     let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
+    let swarm = swarm_handle(
+        &swarm_members,
+        &swarms_by_id,
+        &swarm_plans,
+        &swarm_coordinators,
+        &event_history,
+        &event_counter,
+        &swarm_event_tx,
+        &mutation_runtime,
+    );
     handle_comm_assign_task(
         2,
         seeder.clone(),
@@ -953,14 +944,7 @@ async fn e2e_solo_seeder_is_elected_coordinator_and_can_assign() {
         &client_tx,
         &session_h,
         &client_connections,
-        &swarm_members,
-        &swarms_by_id,
-        &swarm_plans,
-        &swarm_coordinators,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
-        &mutation_runtime,
+        &swarm,
     )
     .await;
 
@@ -1075,14 +1059,7 @@ async fn e2e_deep_participant_can_assign_without_being_coordinator() {
         &fx.client_tx,
         &fx.session_handle,
         &fx.client_connections,
-        &fx.swarm_members,
-        &fx.swarms_by_id,
-        &fx.swarm_plans,
-        &fx.swarm_coordinators,
-        &fx.event_history,
-        &fx.event_counter,
-        &fx.swarm_event_tx,
-        &fx.mutation_runtime,
+        &fx.swarm,
     )
     .await;
 
@@ -1123,14 +1100,7 @@ async fn e2e_light_non_coordinator_participant_cannot_assign() {
         &fx.client_tx,
         &fx.session_handle,
         &fx.client_connections,
-        &fx.swarm_members,
-        &fx.swarms_by_id,
-        &fx.swarm_plans,
-        &fx.swarm_coordinators,
-        &fx.event_history,
-        &fx.event_counter,
-        &fx.swarm_event_tx,
-        &fx.mutation_runtime,
+        &fx.swarm,
     )
     .await;
 
@@ -1316,7 +1286,10 @@ async fn e2e_seed_rejects_light_downgrade_of_nonempty_deep_plan() {
 
     let plans = fx.swarm_plans.read().await;
     let plan = &plans[&fx.swarm_id];
-    assert_eq!(plan.mode, "deep", "deep plan must not be downgraded to light");
+    assert_eq!(
+        plan.mode, "deep",
+        "deep plan must not be downgraded to light"
+    );
     assert!(
         plan.items.iter().all(|i| i.id != "b"),
         "the downgrade seed must be rejected wholesale"

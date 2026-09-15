@@ -10,7 +10,8 @@ use crate::agent::Agent;
 use crate::message::{Message, ToolDefinition};
 use crate::protocol::{NotificationType, ServerEvent};
 use crate::provider::{EventStream, Provider};
-use crate::server::{SwarmEventType, SwarmMember, VersionedPlan};
+use crate::server::services::SwarmServiceHandle;
+use crate::server::{SwarmEventType, SwarmMember, SwarmMutationRuntime, SwarmState, VersionedPlan};
 use crate::tool::Registry;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -85,6 +86,37 @@ async fn test_agent_with_working_dir(session_id: &str, working_dir: &str) -> Arc
     let mut agent = Agent::new_with_session(provider, registry, session, None);
     agent.set_working_dir(working_dir);
     Arc::new(Mutex::new(agent))
+}
+
+/// A minimal swarm service handle sharing the supplied maps/sinks. Only the
+/// fields the spawn/register paths reach are populated; the rest are inert.
+#[allow(clippy::too_many_arguments)]
+fn swarm_handle(
+    swarm_members: &Arc<RwLock<HashMap<String, crate::server::SwarmMember>>>,
+    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
+    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
+    event_history: &Arc<RwLock<VecDeque<crate::server::SwarmEvent>>>,
+    event_counter: &Arc<AtomicU64>,
+    swarm_event_tx: &broadcast::Sender<crate::server::SwarmEvent>,
+) -> SwarmServiceHandle {
+    SwarmServiceHandle {
+        swarm_state: SwarmState {
+            members: Arc::clone(swarm_members),
+            swarms_by_id: Arc::clone(swarms_by_id),
+            plans: Arc::clone(swarm_plans),
+            coordinators: Arc::clone(swarm_coordinators),
+        },
+        shared_context: Arc::new(RwLock::new(HashMap::new())),
+        file_touch: crate::server::FileTouchService::new(),
+        channel_subscriptions: Arc::new(RwLock::new(HashMap::new())),
+        channel_subscriptions_by_session: Arc::new(RwLock::new(HashMap::new())),
+        event_history: Arc::clone(event_history),
+        event_counter: Arc::clone(event_counter),
+        swarm_event_tx: swarm_event_tx.clone(),
+        await_members_runtime: crate::server::AwaitMembersRuntime::default(),
+        swarm_mutation_runtime: SwarmMutationRuntime::default(),
+    }
 }
 
 #[tokio::test]
@@ -195,9 +227,20 @@ async fn stop_target_rejects_ambiguous_friendly_name() {
 async fn register_visible_spawned_member_marks_startup_as_running() {
     let swarm_members = Arc::new(RwLock::new(HashMap::new()));
     let swarms_by_id = Arc::new(RwLock::new(HashMap::new()));
+    let swarm_coordinators = Arc::new(RwLock::new(HashMap::new()));
+    let swarm_plans = Arc::new(RwLock::new(HashMap::new()));
     let event_history = Arc::new(RwLock::new(VecDeque::new()));
     let event_counter = Arc::new(AtomicU64::new(0));
     let (swarm_event_tx, _swarm_event_rx) = broadcast::channel(8);
+    let swarm = swarm_handle(
+        &swarm_members,
+        &swarms_by_id,
+        &swarm_coordinators,
+        &swarm_plans,
+        &event_history,
+        &event_counter,
+        &swarm_event_tx,
+    );
 
     register_visible_spawned_member(
         "child-1",
@@ -205,11 +248,7 @@ async fn register_visible_spawned_member_marks_startup_as_running() {
         Some("/tmp/worktree"),
         true,
         Some("owner"),
-        &swarm_members,
-        &swarms_by_id,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
+        &swarm,
     )
     .await;
 
@@ -824,17 +863,19 @@ async fn spawn_bootstraps_coordinator_when_swarm_has_none() {
         .insert("req".to_string(), req_member);
     let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
 
-    let swarm_id = ensure_spawn_coordinator_swarm(
-        1,
-        "req",
-        &client_event_tx,
+    let _event_history = Arc::new(RwLock::new(VecDeque::new()));
+    let _event_counter = Arc::new(AtomicU64::new(0));
+    let (_swarm_event_tx, _swarm_event_rx2) = broadcast::channel(8);
+    let swarm = swarm_handle(
         &swarm_members,
         &swarms_by_id,
         &swarm_coordinators,
         &swarm_plans,
-        32,
-    )
-    .await;
+        &_event_history,
+        &_event_counter,
+        &_swarm_event_tx,
+    );
+    let swarm_id = ensure_spawn_coordinator_swarm(1, "req", &client_event_tx, &swarm, 32).await;
 
     assert_eq!(swarm_id.as_deref(), Some("swarm-1"));
     assert_eq!(
@@ -894,17 +935,20 @@ async fn nested_agent_cannot_spawn_when_root_is_light_or_normal() {
         drop(members);
         let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
 
-        let refused = ensure_spawn_coordinator_swarm(
-            2,
-            &child_id,
-            &client_event_tx,
+        let _event_history = Arc::new(RwLock::new(VecDeque::new()));
+        let _event_counter = Arc::new(AtomicU64::new(0));
+        let (_swarm_event_tx, _swarm_event_rx2) = broadcast::channel(8);
+        let swarm = swarm_handle(
             &swarm_members,
             &swarms_by_id,
             &swarm_coordinators,
             &swarm_plans,
-            32,
-        )
-        .await;
+            &_event_history,
+            &_event_counter,
+            &_swarm_event_tx,
+        );
+        let refused =
+            ensure_spawn_coordinator_swarm(2, &child_id, &client_event_tx, &swarm, 32).await;
 
         crate::session_effort::forget_session_effort(root_id);
         assert!(refused.is_none());
@@ -957,17 +1001,20 @@ async fn nested_agent_can_spawn_when_root_is_deep() {
     drop(members);
     let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
 
-    let allowed = ensure_spawn_coordinator_swarm(
-        3,
-        "deep-child",
-        &client_event_tx,
+    let _event_history = Arc::new(RwLock::new(VecDeque::new()));
+    let _event_counter = Arc::new(AtomicU64::new(0));
+    let (_swarm_event_tx, _swarm_event_rx2) = broadcast::channel(8);
+    let swarm = swarm_handle(
         &swarm_members,
         &swarms_by_id,
         &swarm_coordinators,
         &swarm_plans,
-        32,
-    )
-    .await;
+        &_event_history,
+        &_event_counter,
+        &_swarm_event_tx,
+    );
+    let allowed =
+        ensure_spawn_coordinator_swarm(3, "deep-child", &client_event_tx, &swarm, 32).await;
 
     crate::session_effort::forget_session_effort(root_id);
     assert_eq!(allowed.as_deref(), Some("swarm-deep"));
@@ -1008,17 +1055,19 @@ async fn spawn_allowed_at_arbitrary_depth_without_depth_cap() {
 
     // `f` is deeply nested but the swarm is far below the member cap, so spawning
     // is allowed.
-    let allowed = ensure_spawn_coordinator_swarm(
-        7,
-        "f",
-        &client_event_tx,
+    let _event_history = Arc::new(RwLock::new(VecDeque::new()));
+    let _event_counter = Arc::new(AtomicU64::new(0));
+    let (_swarm_event_tx, _swarm_event_rx2) = broadcast::channel(8);
+    let swarm = swarm_handle(
         &swarm_members,
         &swarms_by_id,
         &swarm_coordinators,
         &swarm_plans,
-        32,
-    )
-    .await;
+        &_event_history,
+        &_event_counter,
+        &_swarm_event_tx,
+    );
+    let allowed = ensure_spawn_coordinator_swarm(7, "f", &client_event_tx, &swarm, 32).await;
     crate::session_effort::forget_session_effort(root_id);
     assert_eq!(allowed.as_deref(), Some("swarm-1"));
 }
@@ -1049,17 +1098,19 @@ async fn spawn_rejected_when_member_limit_reached() {
     }
     let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
 
-    let refused = ensure_spawn_coordinator_swarm(
-        7,
-        "root",
-        &client_event_tx,
+    let _event_history = Arc::new(RwLock::new(VecDeque::new()));
+    let _event_counter = Arc::new(AtomicU64::new(0));
+    let (_swarm_event_tx, _swarm_event_rx2) = broadcast::channel(8);
+    let swarm = swarm_handle(
         &swarm_members,
         &swarms_by_id,
         &swarm_coordinators,
         &swarm_plans,
-        0,
-    )
-    .await;
+        &_event_history,
+        &_event_counter,
+        &_swarm_event_tx,
+    );
+    let refused = ensure_spawn_coordinator_swarm(7, "root", &client_event_tx, &swarm, 0).await;
     assert!(refused.is_none());
     assert!(matches!(
         client_event_rx.recv().await,
@@ -1098,17 +1149,19 @@ async fn terminal_members_do_not_consume_spawn_capacity() {
     }
     let (client_event_tx, _client_event_rx) = mpsc::unbounded_channel();
 
-    let allowed = ensure_spawn_coordinator_swarm(
-        7,
-        "root",
-        &client_event_tx,
+    let _event_history = Arc::new(RwLock::new(VecDeque::new()));
+    let _event_counter = Arc::new(AtomicU64::new(0));
+    let (_swarm_event_tx, _swarm_event_rx2) = broadcast::channel(8);
+    let swarm = swarm_handle(
         &swarm_members,
         &swarms_by_id,
         &swarm_coordinators,
         &swarm_plans,
-        32,
-    )
-    .await;
+        &_event_history,
+        &_event_counter,
+        &_swarm_event_tx,
+    );
+    let allowed = ensure_spawn_coordinator_swarm(7, "root", &client_event_tx, &swarm, 32).await;
 
     assert_eq!(allowed.as_deref(), Some("swarm-1"));
 }
@@ -1135,17 +1188,19 @@ async fn spawn_rejected_at_configured_live_agent_limit() {
     }
     let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
 
-    let refused = ensure_spawn_coordinator_swarm(
-        7,
-        "root",
-        &client_event_tx,
+    let _event_history = Arc::new(RwLock::new(VecDeque::new()));
+    let _event_counter = Arc::new(AtomicU64::new(0));
+    let (_swarm_event_tx, _swarm_event_rx2) = broadcast::channel(8);
+    let swarm = swarm_handle(
         &swarm_members,
         &swarms_by_id,
         &swarm_coordinators,
         &swarm_plans,
-        2,
-    )
-    .await;
+        &_event_history,
+        &_event_counter,
+        &_swarm_event_tx,
+    );
+    let refused = ensure_spawn_coordinator_swarm(7, "root", &client_event_tx, &swarm, 2).await;
 
     assert!(refused.is_none());
     assert!(matches!(
