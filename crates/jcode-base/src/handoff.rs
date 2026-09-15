@@ -469,12 +469,52 @@ pub fn import_handoff(
 
     let _lock = lock_store().ok()?;
     let dir = handoffs_dir().ok()?;
-    // A fresh session id avoids overwriting a local snapshot for the same id.
-    let session_id = format!("import-{}", uuid::Uuid::new_v4());
-    snapshot.session_id = session_id.clone();
+    // A fresh, human-meaningful session id avoids overwriting a local snapshot
+    // for the same id while staying recognizable: `import-<source>[-<suffix>]`
+    // mirrors the source session so `/handoffres <id>` is not an opaque UUID.
+    let source = snapshot.session_id.clone();
+    let base = format!(
+        "import-{}",
+        sanitize_import_source(&source)
+    );
+    if file_path(&dir, &base).is_ok() && load_snapshot(&base).is_none() {
+        snapshot.session_id = base.clone();
+    } else {
+        // Collision (a previous import or a local session sharing the id):
+        // disambiguate with a short suffix while keeping the readable stem.
+        let short = uuid::Uuid::new_v4().simple().to_string();
+        snapshot.session_id = if short.len() > 8 {
+            format!("{}-{}", base, &short[..8])
+        } else {
+            format!("{}-{}", base, short)
+        };
+    }
+    let session_id = snapshot.session_id.clone();
     crate::storage::write_json_fast(&file_path(&dir, &session_id).ok()?, &snapshot).ok()?;
     upsert_index(&snapshot).ok()?;
     Some(session_id)
+}
+
+/// Make a session id safe to embed in an `import-<source>` filename. The
+/// regular filenames are already restricted to `[a-z0-9_-]`, so out-of-band
+/// payloads could contain anything; lower-case and drop characters that
+/// `file_path` rejects so the readable stem never aliases another session.
+fn sanitize_import_source(source: &str) -> String {
+    let mut out = String::new();
+    for ch in source.chars() {
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_' {
+            out.push(ch);
+        }
+        // Truncate so the readable stem stays bounded even for pathological
+        // sources, and to leave room for an optional disambiguator suffix.
+        if out.len() >= 96 {
+            break;
+        }
+    }
+    if out.is_empty() {
+        out.push_str("handoff");
+    }
+    out
 }
 
 /// Prune archived handoff snapshot files so the store does not grow without
@@ -492,9 +532,11 @@ pub fn import_handoff(
 ///   regardless of count.
 ///
 /// Live handoffs — the latest per project, as held by the index — are never
-/// pruned; only superseded archived snapshots are eligible. This runs after a
-/// successful [`capture`] write. Failures to read or delete individual files
-/// are ignored (best-effort), and a missing or unreadable store is a no-op.
+/// pruned; only superseded archived snapshots are eligible. Runs after a
+/// successful [`capture`] write and on a host startup sweep (see
+/// [`sweep_stale_handoffs`]). Removals and a per-run summary are logged.
+/// Failures to read or delete individual files are ignored (best-effort), and
+/// a missing or unreadable store is a no-op.
 pub fn prune_archived_snapshots() {
     let Ok(index) = load_index_opt() else {
         return;
@@ -550,6 +592,7 @@ pub fn prune_archived_snapshots() {
 
     let now = Utc::now();
     let age_limit = chrono::Duration::days(MAX_ARCHIVED_SNAPSHOT_AGE_DAYS);
+    let mut removed = 0usize;
     for snapshots in by_project.values_mut() {
         // Oldest first so we trim the least-recently-finished first.
         snapshots.sort_by(|a, b| a.ended_at.cmp(&b.ended_at));
@@ -559,9 +602,34 @@ pub fn prune_archived_snapshots() {
             if !too_old && !over_cap {
                 break;
             }
-            delete_snapshot(&snapshot.session_id);
+            if delete_snapshot(&snapshot.session_id) {
+                crate::logging::debug(&format!(
+                    "[handoff] pruned archived snapshot {} (project {}) ended {} reason={}",
+                    snapshot.session_id,
+                    snapshot.project_key,
+                    snapshot.ended_at,
+                    if too_old { "age" } else { "count-cap" },
+                ));
+                removed += 1;
+            }
         }
     }
+    if removed > 0 {
+        crate::logging::info(&format!(
+            "[handoff] pruned {removed} archived handoff snapshot(s)"
+        ));
+    }
+}
+
+/// Run the archived-snapshot retention sweep once at host startup.
+///
+/// Fixes the event-driven gap in [`prune_archived_snapshots`]: that path only
+/// runs after a [`capture`] write, so between captures stale archived files can
+/// accumulate indefinitely. Calling this once during server/agent boot turns
+/// the retention policy into a startup invariant rather than something that
+/// only fires opportunistically. Best-effort; a missing store is a no-op.
+pub fn sweep_stale_handoffs() {
+    prune_archived_snapshots();
 }
 
 /// Load the handoff index, surfacing IO/path failures as `Err` so callers can

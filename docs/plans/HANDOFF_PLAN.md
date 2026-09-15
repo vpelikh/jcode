@@ -102,7 +102,9 @@ state, while initiatives represent durable, curated goals.
 
 `handoff::prune_archived_snapshots()` enforces a retention policy over the
 archived snapshot files, which the index's `MAX_INDEX_ENTRIES` cap alone does not
-cover. It runs after every successful `handoff::capture` write.
+cover. It runs after every successful `handoff::capture` write, and
+`handoff::sweep_stale_handoffs()` runs the same sweep once at host (server)
+startup so stale files do not linger between captures.
 
 - Per project, at most `MAX_ARCHIVED_SNAPSHOTS_PER_PROJECT` (16) archived
   snapshots are kept; older ones are deleted oldest-first.
@@ -112,7 +114,8 @@ cover. It runs after every successful `handoff::capture` write.
 Live handoffs — the latest per project that the index still references — are
 never pruned, even if old. Only superseded (archived) snapshots are eligible.
 Pruning is best-effort: unreadable or missing files are ignored and a missing
-store is a no-op, so it never breaks capture.
+store is a no-op, so it never breaks capture. Each removal (and a per-run
+summary) is logged.
 
 ### Portability (export / import)
 
@@ -123,12 +126,16 @@ future work, letting a captured snapshot be shipped to a target host and become
 the live handoff for that host's project.
 
 Import is intentionally explicit and retirement-safe: it rekeys the snapshot to
-the caller's working-directory project, writes it under a fresh `import-<uuid>`
-session id, and registers it as that project's latest handoff in the index. A
-blanket on-disk scan was rejected precisely because it cannot distinguish a
-genuinely-remote handoff file from a *retired* local snapshot (whose file must
-never reinject). Because import mints a new id and deliberately indexes the
-snapshot, it never resurrects a retired source session.
+the caller's working-directory project and *explicitly* registers it with the
+project in the index. A blanket on-disk scan was rejected precisely because it
+cannot distinguish a genuinely-remote handoff file from a *retired* local
+snapshot (whose file must never reinject). Because import mints a new id and
+deliberately indexes the snapshot, it never resurrects a retired source session.
+
+The adopted session id is human-meaningful — `import-<source-session>`, with a
+short disambiguating suffix only on collision — rather than an opaque UUID, so
+`/handoffres <id>` stays recognizable. Pathological source ids (uppercase, dots,
+slashes) are sanitized into a valid, bounded filename stem.
 
 ## Project identity
 

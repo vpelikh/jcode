@@ -2300,6 +2300,11 @@ impl Server {
             )),
         }
 
+        // Run the handoff retention sweep once at boot so stale archived
+        // snapshots don't linger between captures (pruning is otherwise
+        // event-driven off capture writes).
+        crate::handoff::sweep_stale_handoffs();
+
         // Restrict socket files to owner-only so other local users cannot connect.
         let _ = crate::platform::set_permissions_owner_only(&self.socket_path);
         let _ = crate::platform::set_permissions_owner_only(&self.debug_socket_path);
