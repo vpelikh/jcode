@@ -13,6 +13,9 @@ use std::sync::{Arc, atomic::AtomicU64};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 
+/// Channel subscriptions forward index (swarm_id -> channel -> session_ids).
+type ChannelSubscriptions = Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
+
 struct TestProvider;
 
 #[async_trait]
@@ -65,9 +68,7 @@ fn session_handle(
 fn swarm_handle(
     swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>>,
     swarms_by_id: Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    channel_subscriptions: Arc<
-        RwLock<HashMap<String, HashMap<String, HashSet<String>>>>,
-    >,
+    channel_subscriptions: ChannelSubscriptions,
     event_history: Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
     event_counter: Arc<AtomicU64>,
     swarm_event_tx: broadcast::Sender<SwarmEvent>,
