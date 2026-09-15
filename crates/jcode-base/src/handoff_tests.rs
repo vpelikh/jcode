@@ -1255,7 +1255,11 @@ fn import_sanitizes_pathological_source_id() {
     };
     let imported = import_handoff(&payload, Some(&cwd), "closed").unwrap();
     assert!(imported.starts_with("import-"), "sane prefix");
-    // The stem is sanitized: only [a-z0-9_-] plus the import- prefix.
+    // The stem is sanitized: lowercase + safe [a-z0-9_-] only.
+    assert_eq!(
+        imported, "import-weirdsessionname",
+        "pathological source id is lowercased and stripped to a safe stem"
+    );
     assert!(
         imported
             .chars()
