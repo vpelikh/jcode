@@ -47,16 +47,16 @@ async fn task_control_wake_returns_structured_response_with_plan_summary() {
     let mutation_runtime = SwarmMutationRuntime::default();
 
     let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
-    let swarm = swarm_handle(
-        &swarm_members,
-        &swarms_by_id,
-        &swarm_plans,
-        &swarm_coordinators,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
-        &mutation_runtime,
-    );
+    let swarm = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .swarms_by_id(Arc::clone(&swarms_by_id))
+        .plans(Arc::clone(&swarm_plans))
+        .coordinators(Arc::clone(&swarm_coordinators))
+        .event_history(Arc::clone(&event_history))
+        .event_counter(Arc::clone(&event_counter))
+        .swarm_event_tx(swarm_event_tx.clone())
+        .swarm_mutation_runtime(mutation_runtime.clone())
+        .build();
     handle_comm_task_control(
         101,
         requester.to_string(),
@@ -141,16 +141,16 @@ async fn task_control_resume_without_task_id_uses_unique_target_assignment() {
     let mutation_runtime = SwarmMutationRuntime::default();
 
     let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
-    let swarm = swarm_handle(
-        &swarm_members,
-        &swarms_by_id,
-        &swarm_plans,
-        &swarm_coordinators,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
-        &mutation_runtime,
-    );
+    let swarm = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .swarms_by_id(Arc::clone(&swarms_by_id))
+        .plans(Arc::clone(&swarm_plans))
+        .coordinators(Arc::clone(&swarm_coordinators))
+        .event_history(Arc::clone(&event_history))
+        .event_counter(Arc::clone(&event_counter))
+        .swarm_event_tx(swarm_event_tx.clone())
+        .swarm_mutation_runtime(mutation_runtime.clone())
+        .build();
     handle_comm_task_control(
         102,
         requester.to_string(),
@@ -231,16 +231,16 @@ async fn task_control_without_task_id_rejects_ambiguous_target_assignments() {
     let mutation_runtime = SwarmMutationRuntime::default();
 
     let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
-    let swarm = swarm_handle(
-        &swarm_members,
-        &swarms_by_id,
-        &swarm_plans,
-        &swarm_coordinators,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
-        &mutation_runtime,
-    );
+    let swarm = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .swarms_by_id(Arc::clone(&swarms_by_id))
+        .plans(Arc::clone(&swarm_plans))
+        .coordinators(Arc::clone(&swarm_coordinators))
+        .event_history(Arc::clone(&event_history))
+        .event_counter(Arc::clone(&event_counter))
+        .swarm_event_tx(swarm_event_tx.clone())
+        .swarm_mutation_runtime(mutation_runtime.clone())
+        .build();
     handle_comm_task_control(
         103,
         requester.to_string(),
@@ -334,16 +334,16 @@ async fn task_control_resume_busy_agent_rejects_without_mutating_plan() {
     let _busy_guard = worker_agent.lock().await;
 
     let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
-    let swarm = swarm_handle(
-        &swarm_members,
-        &swarms_by_id,
-        &swarm_plans,
-        &swarm_coordinators,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
-        &mutation_runtime,
-    );
+    let swarm = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .swarms_by_id(Arc::clone(&swarms_by_id))
+        .plans(Arc::clone(&swarm_plans))
+        .coordinators(Arc::clone(&swarm_coordinators))
+        .event_history(Arc::clone(&event_history))
+        .event_counter(Arc::clone(&event_counter))
+        .swarm_event_tx(swarm_event_tx.clone())
+        .swarm_mutation_runtime(mutation_runtime.clone())
+        .build();
     handle_comm_task_control(
         104,
         requester.to_string(),
@@ -544,17 +544,18 @@ async fn task_control_retry_re_dispatches_after_recent_identical_retry() {
         let swarm_event_tx = swarm_event_tx.clone();
         let mutation_runtime = mutation_runtime.clone();
         async move {
-            let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
-            let swarm = swarm_handle(
-                &swarm_members,
-                &swarms_by_id,
-                &swarm_plans,
-                &swarm_coordinators,
-                &event_history,
-                &event_counter,
-                &swarm_event_tx,
-                &mutation_runtime,
-            );
+            let session_h =
+                session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
+            let swarm = crate::server::test_util::TestSwarmBuilder::default()
+                .members(Arc::clone(&swarm_members))
+                .swarms_by_id(Arc::clone(&swarms_by_id))
+                .plans(Arc::clone(&swarm_plans))
+                .coordinators(Arc::clone(&swarm_coordinators))
+                .event_history(Arc::clone(&event_history))
+                .event_counter(Arc::clone(&event_counter))
+                .swarm_event_tx(swarm_event_tx.clone())
+                .swarm_mutation_runtime(mutation_runtime.clone())
+                .build();
             handle_comm_task_control(
                 id,
                 requester,

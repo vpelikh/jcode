@@ -84,16 +84,16 @@ async fn assign_task_to_client_attached_session_skips_server_side_run() {
     let mutation_runtime = SwarmMutationRuntime::default();
 
     let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
-    let swarm = swarm_handle(
-        &swarm_members,
-        &swarms_by_id,
-        &swarm_plans,
-        &swarm_coordinators,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
-        &mutation_runtime,
-    );
+    let swarm = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .swarms_by_id(Arc::clone(&swarms_by_id))
+        .plans(Arc::clone(&swarm_plans))
+        .coordinators(Arc::clone(&swarm_coordinators))
+        .event_history(Arc::clone(&event_history))
+        .event_counter(Arc::clone(&event_counter))
+        .swarm_event_tx(swarm_event_tx.clone())
+        .swarm_mutation_runtime(mutation_runtime.clone())
+        .build();
     handle_comm_assign_task(
         91,
         requester.to_string(),

@@ -1,35 +1,3 @@
-/// A minimal swarm service handle mirroring `test_swarm_status_handle` in the
-/// live-turn tests, but seeded with pre-existing coordinator membership so a
-/// test can exercise `handle_comm_assign_role`'s authorization and mutation
-/// paths end to end. The returned handle shares the provided maps.
-#[allow(clippy::too_many_arguments)]
-fn assign_role_swarm_handle(
-    swarm_members: &Arc<RwLock<HashMap<String, crate::server::SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    coordinators: &Arc<RwLock<HashMap<String, String>>>,
-    event_history: &Arc<RwLock<VecDeque<crate::server::SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<crate::server::SwarmEvent>,
-) -> crate::server::services::SwarmServiceHandle {
-    crate::server::services::SwarmServiceHandle {
-        swarm_state: SwarmState {
-            members: Arc::clone(swarm_members),
-            swarms_by_id: Arc::clone(swarms_by_id),
-            plans: Arc::new(RwLock::new(HashMap::new())),
-            coordinators: Arc::clone(coordinators),
-        },
-        shared_context: Arc::new(RwLock::new(HashMap::new())),
-        file_touch: FileTouchService::new(),
-        channel_subscriptions: Arc::new(RwLock::new(HashMap::new())),
-        channel_subscriptions_by_session: Arc::new(RwLock::new(HashMap::new())),
-        event_history: Arc::clone(event_history),
-        event_counter: Arc::clone(event_counter),
-        swarm_event_tx: swarm_event_tx.clone(),
-        await_members_runtime: AwaitMembersRuntime::default(),
-        swarm_mutation_runtime: SwarmMutationRuntime::default(),
-    }
-}
-
 #[tokio::test]
 async fn coordinator_can_assign_role_to_worker() {
     let (_env, _runtime) = RuntimeEnvGuard::new();
@@ -40,14 +8,11 @@ async fn coordinator_can_assign_role_to_worker() {
     let sessions = Arc::new(RwLock::new(HashMap::new()));
 
     let swarm_members = Arc::new(RwLock::new(HashMap::from([
-        (
-            coordinator.to_string(),
-            {
-                let mut member = member(coordinator, swarm_id, "ready");
-                member.role = "coordinator".to_string();
-                member
-            },
-        ),
+        (coordinator.to_string(), {
+            let mut member = member(coordinator, swarm_id, "ready");
+            member.role = "coordinator".to_string();
+            member
+        }),
         (worker.to_string(), member(worker, swarm_id, "ready")),
     ])));
     let swarms_by_id = Arc::new(RwLock::new(HashMap::from([(
@@ -61,14 +26,14 @@ async fn coordinator_can_assign_role_to_worker() {
     let history = Arc::new(RwLock::new(VecDeque::new()));
     let event_counter = Arc::new(AtomicU64::new(0));
     let (swarm_event_tx, _ev_rx) = broadcast::channel(16);
-    let swarm = assign_role_swarm_handle(
-        &swarm_members,
-        &swarms_by_id,
-        &coordinators,
-        &history,
-        &event_counter,
-        &swarm_event_tx,
-    );
+    let swarm = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .swarms_by_id(Arc::clone(&swarms_by_id))
+        .coordinators(Arc::clone(&coordinators))
+        .event_history(Arc::clone(&history))
+        .event_counter(Arc::clone(&event_counter))
+        .swarm_event_tx(swarm_event_tx.clone())
+        .build();
 
     handle_comm_assign_role(
         1,
@@ -129,15 +94,15 @@ async fn non_coordinator_is_rejected() {
     let sessions = Arc::new(RwLock::new(HashMap::new()));
 
     let swarm_members = Arc::new(RwLock::new(HashMap::from([
+        (coordinator.to_string(), {
+            let mut member = member(coordinator, swarm_id, "ready");
+            member.role = "coordinator".to_string();
+            member
+        }),
         (
-            coordinator.to_string(),
-            {
-                let mut member = member(coordinator, swarm_id, "ready");
-                member.role = "coordinator".to_string();
-                member
-            },
+            plain_member.to_string(),
+            member(plain_member, swarm_id, "ready"),
         ),
-        (plain_member.to_string(), member(plain_member, swarm_id, "ready")),
     ])));
     let swarms_by_id = Arc::new(RwLock::new(HashMap::from([(
         swarm_id.to_string(),
@@ -150,14 +115,14 @@ async fn non_coordinator_is_rejected() {
     let history = Arc::new(RwLock::new(VecDeque::new()));
     let event_counter = Arc::new(AtomicU64::new(0));
     let (swarm_event_tx, _ev_rx) = broadcast::channel(16);
-    let swarm = assign_role_swarm_handle(
-        &swarm_members,
-        &swarms_by_id,
-        &coordinators,
-        &history,
-        &event_counter,
-        &swarm_event_tx,
-    );
+    let swarm = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .swarms_by_id(Arc::clone(&swarms_by_id))
+        .coordinators(Arc::clone(&coordinators))
+        .event_history(Arc::clone(&history))
+        .event_counter(Arc::clone(&event_counter))
+        .swarm_event_tx(swarm_event_tx.clone())
+        .build();
 
     handle_comm_assign_role(
         2,

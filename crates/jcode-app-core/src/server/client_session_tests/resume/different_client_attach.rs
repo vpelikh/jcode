@@ -112,17 +112,17 @@ async fn handle_resume_session_allows_attach_from_different_client_instance() ->
         &soft_interrupt_queues,
         &client_connections,
         &client_debug_state,
-        &swarm_handle_full(
-            swarm_members.clone(),
-            swarms_by_id.clone(),
-            swarm_plans.clone(),
-            swarm_coordinators.clone(),
-            channel_subscriptions.clone(),
-            channel_subscriptions_by_session.clone(),
-            event_history.clone(),
-            event_counter.clone(),
-            swarm_event_tx.clone(),
-        ),
+        &crate::server::test_util::TestSwarmBuilder::default()
+            .members(swarm_members.clone())
+            .swarms_by_id(swarms_by_id.clone())
+            .plans(swarm_plans.clone())
+            .coordinators(swarm_coordinators.clone())
+            .channel_subscriptions(channel_subscriptions.clone())
+            .channel_subscriptions_by_session(channel_subscriptions_by_session.clone())
+            .event_history(event_history.clone())
+            .event_counter(event_counter.clone())
+            .swarm_event_tx(swarm_event_tx.clone())
+            .build(),
         &client_count,
         &writer,
         "test-server",

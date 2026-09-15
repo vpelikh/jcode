@@ -117,17 +117,17 @@ async fn handle_resume_session_allows_live_attach_when_existing_agent_is_busy() 
         &soft_interrupt_queues,
         &client_connections,
         &Arc::new(RwLock::new(ClientDebugState::default())),
-        &swarm_handle_full(
-            swarm_members.clone(),
-            swarms_by_id.clone(),
-            swarm_plans.clone(),
-            swarm_coordinators.clone(),
-            channel_subscriptions.clone(),
-            channel_subscriptions_by_session.clone(),
-            event_history.clone(),
-            event_counter.clone(),
-            swarm_event_tx.clone(),
-        ),
+        &crate::server::test_util::TestSwarmBuilder::default()
+            .members(swarm_members.clone())
+            .swarms_by_id(swarms_by_id.clone())
+            .plans(swarm_plans.clone())
+            .coordinators(swarm_coordinators.clone())
+            .channel_subscriptions(channel_subscriptions.clone())
+            .channel_subscriptions_by_session(channel_subscriptions_by_session.clone())
+            .event_history(event_history.clone())
+            .event_counter(event_counter.clone())
+            .swarm_event_tx(swarm_event_tx.clone())
+            .build(),
         &client_count,
         &writer,
         "test-server",
@@ -157,17 +157,17 @@ async fn handle_resume_session_allows_live_attach_when_existing_agent_is_busy() 
             &existing_agent,
             &new_registry,
             true,
-            &swarm_handle_full(
-                swarm_members.clone(),
-                swarms_by_id.clone(),
-                swarm_plans.clone(),
-                swarm_coordinators.clone(),
-                channel_subscriptions.clone(),
-                channel_subscriptions_by_session.clone(),
-                event_history.clone(),
-                event_counter.clone(),
-                swarm_event_tx.clone(),
-            ),
+            &crate::server::test_util::TestSwarmBuilder::default()
+                .members(swarm_members.clone())
+                .swarms_by_id(swarms_by_id.clone())
+                .plans(swarm_plans.clone())
+                .coordinators(swarm_coordinators.clone())
+                .channel_subscriptions(channel_subscriptions.clone())
+                .channel_subscriptions_by_session(channel_subscriptions_by_session.clone())
+                .event_history(event_history.clone())
+                .event_counter(event_counter.clone())
+                .swarm_event_tx(swarm_event_tx.clone())
+                .build(),
             &client_event_tx,
             &mcp_pool,
         ),
@@ -229,7 +229,6 @@ async fn handle_resume_session_allows_live_attach_when_existing_agent_is_busy() 
     restore_runtime_dir(prev_runtime);
     Ok(())
 }
-
 
 #[tokio::test]
 async fn subscribe_preserves_working_dir_when_client_has_local_history() -> Result<()> {
@@ -298,17 +297,17 @@ async fn subscribe_preserves_working_dir_when_client_has_local_history() -> Resu
         &agent,
         &registry,
         false,
-        &swarm_handle_full(
-            swarm_members.clone(),
-            swarms_by_id.clone(),
-            swarm_plans.clone(),
-            swarm_coordinators.clone(),
-            channel_subscriptions.clone(),
-            channel_subscriptions_by_session.clone(),
-            event_history.clone(),
-            event_counter.clone(),
-            swarm_event_tx.clone(),
-        ),
+        &crate::server::test_util::TestSwarmBuilder::default()
+            .members(swarm_members.clone())
+            .swarms_by_id(swarms_by_id.clone())
+            .plans(swarm_plans.clone())
+            .coordinators(swarm_coordinators.clone())
+            .channel_subscriptions(channel_subscriptions.clone())
+            .channel_subscriptions_by_session(channel_subscriptions_by_session.clone())
+            .event_history(event_history.clone())
+            .event_counter(event_counter.clone())
+            .swarm_event_tx(swarm_event_tx.clone())
+            .build(),
         &client_event_tx,
         &mcp_pool,
     )

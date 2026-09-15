@@ -53,35 +53,6 @@ fn session_handle_for_test(
     }
 }
 
-/// A minimal swarm service handle for tests. The members/swarms maps are shared
-/// so the code under test sees each test's seeded membership; the remaining
-/// state is inert defaults.
-fn swarm_handle(
-    swarm_members: Arc<RwLock<HashMap<String, crate::server::SwarmMember>>>,
-    swarms_by_id: Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    event_history: Arc<RwLock<VecDeque<crate::server::SwarmEvent>>>,
-    event_counter: Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: tokio::sync::broadcast::Sender<crate::server::SwarmEvent>,
-) -> crate::server::services::SwarmServiceHandle {
-    crate::server::services::SwarmServiceHandle {
-        swarm_state: crate::server::SwarmState {
-            members: swarm_members,
-            swarms_by_id,
-            plans: Arc::new(RwLock::new(HashMap::new())),
-            coordinators: Arc::new(RwLock::new(HashMap::new())),
-        },
-        shared_context: Arc::new(RwLock::new(HashMap::new())),
-        file_touch: crate::server::FileTouchService::new(),
-        channel_subscriptions: Arc::new(RwLock::new(HashMap::new())),
-        channel_subscriptions_by_session: Arc::new(RwLock::new(HashMap::new())),
-        event_history,
-        event_counter,
-        swarm_event_tx,
-        await_members_runtime: crate::server::AwaitMembersRuntime::default(),
-        swarm_mutation_runtime: crate::server::SwarmMutationRuntime::default(),
-    }
-}
-
 struct MockProvider;
 
 #[derive(Clone, Default)]
@@ -404,23 +375,13 @@ async fn enabling_swarm_does_not_auto_elect_coordinator() {
     let mut swarm_enabled = false;
 
     let (swarm_event_tx, _swarm_event_rx) = tokio::sync::broadcast::channel(16);
-    let swarm_handle = crate::server::services::SwarmServiceHandle {
-        swarm_state: crate::server::SwarmState {
-            members: Arc::clone(&swarm_members),
-            swarms_by_id: Arc::clone(&swarms_by_id),
-            plans: Arc::clone(&swarm_plans),
-            coordinators: Arc::clone(&swarm_coordinators),
-        },
-        shared_context: Arc::new(RwLock::new(HashMap::new())),
-        file_touch: crate::server::FileTouchService::new(),
-        channel_subscriptions: Arc::new(RwLock::new(HashMap::new())),
-        channel_subscriptions_by_session: Arc::new(RwLock::new(HashMap::new())),
-        event_history: Arc::new(RwLock::new(VecDeque::new())),
-        event_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        swarm_event_tx,
-        await_members_runtime: crate::server::AwaitMembersRuntime::default(),
-        swarm_mutation_runtime: crate::server::SwarmMutationRuntime::default(),
-    };
+    let swarm_handle = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .swarms_by_id(Arc::clone(&swarms_by_id))
+        .plans(Arc::clone(&swarm_plans))
+        .coordinators(Arc::clone(&swarm_coordinators))
+        .swarm_event_tx(swarm_event_tx)
+        .build();
 
     handle_set_feature(
         42,
@@ -630,13 +591,13 @@ async fn notify_session_runs_scheduled_task_immediately_for_idle_live_session() 
         NotifySessionContext {
             session: &session_service,
             client_connections: &client_connections,
-            swarm: &swarm_handle(
-                Arc::clone(&swarm_members),
-                Arc::clone(&swarms_by_id),
-                Arc::clone(&event_history),
-                Arc::clone(&event_counter),
-                swarm_event_tx.clone(),
-            ),
+            swarm: &crate::server::test_util::TestSwarmBuilder::default()
+                .members(Arc::clone(&swarm_members))
+                .swarms_by_id(Arc::clone(&swarms_by_id))
+                .event_history(Arc::clone(&event_history))
+                .event_counter(Arc::clone(&event_counter))
+                .swarm_event_tx(swarm_event_tx.clone())
+                .build(),
             client_event_tx: &client_event_tx,
         },
     )
@@ -756,13 +717,13 @@ async fn notify_session_queues_soft_interrupt_when_live_session_is_busy() {
         NotifySessionContext {
             session: &session_service,
             client_connections: &client_connections,
-            swarm: &swarm_handle(
-                Arc::clone(&swarm_members),
-                Arc::clone(&swarms_by_id),
-                Arc::clone(&event_history),
-                Arc::clone(&event_counter),
-                swarm_event_tx.clone(),
-            ),
+            swarm: &crate::server::test_util::TestSwarmBuilder::default()
+                .members(Arc::clone(&swarm_members))
+                .swarms_by_id(Arc::clone(&swarms_by_id))
+                .event_history(Arc::clone(&event_history))
+                .event_counter(Arc::clone(&event_counter))
+                .swarm_event_tx(swarm_event_tx.clone())
+                .build(),
             client_event_tx: &client_event_tx,
         },
     )
@@ -874,13 +835,13 @@ async fn resume_all_continues_interrupted_idle_live_session() {
     handle_resume_all_sessions(
         91,
         &sessions,
-        &swarm_handle(
-            Arc::clone(&swarm_members),
-            Arc::clone(&swarms_by_id),
-            Arc::clone(&event_history),
-            Arc::clone(&event_counter),
-            swarm_event_tx.clone(),
-        ),
+        &crate::server::test_util::TestSwarmBuilder::default()
+            .members(Arc::clone(&swarm_members))
+            .swarms_by_id(Arc::clone(&swarms_by_id))
+            .event_history(Arc::clone(&event_history))
+            .event_counter(Arc::clone(&event_counter))
+            .swarm_event_tx(swarm_event_tx.clone())
+            .build(),
         &client_event_tx,
     )
     .await;
@@ -978,13 +939,13 @@ async fn resume_all_skips_session_with_completed_turn() {
     handle_resume_all_sessions(
         92,
         &sessions,
-        &swarm_handle(
-            Arc::clone(&swarm_members),
-            Arc::clone(&swarms_by_id),
-            Arc::clone(&event_history),
-            Arc::clone(&event_counter),
-            swarm_event_tx.clone(),
-        ),
+        &crate::server::test_util::TestSwarmBuilder::default()
+            .members(Arc::clone(&swarm_members))
+            .swarms_by_id(Arc::clone(&swarms_by_id))
+            .event_history(Arc::clone(&event_history))
+            .event_counter(Arc::clone(&event_counter))
+            .swarm_event_tx(swarm_event_tx.clone())
+            .build(),
         &client_event_tx,
     )
     .await;
@@ -1114,7 +1075,9 @@ async fn set_working_dir_updates_agent_and_fans_out_event() -> Result<()> {
 
     // The swarm member record must be kept coherent with the new bound dir.
     let member_dir = swarm_members.read().await;
-    let member = member_dir.get(&agent_session_id).expect("swarm member exists");
+    let member = member_dir
+        .get(&agent_session_id)
+        .expect("swarm member exists");
     assert_eq!(
         member.working_dir.as_ref(),
         Some(&new_dir.canonicalize().expect("canonical")),
@@ -1586,7 +1549,13 @@ async fn handle_set_handoff_resume_overrides_auto_inject_and_errors_on_unknown()
     }
 
     let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
-    handle_set_handoff_resume(11, Some("target-handoff".to_string()), &agent, &client_event_tx).await;
+    handle_set_handoff_resume(
+        11,
+        Some("target-handoff".to_string()),
+        &agent,
+        &client_event_tx,
+    )
+    .await;
     assert!(
         timeout(Duration::from_secs(2), client_event_rx.recv())
             .await

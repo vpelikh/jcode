@@ -77,7 +77,9 @@ fn active_assignment_conflict_detects_only_assigned_and_fresh_items() {
 
     // Assigned with no progress record or no timestamps -> allow (treated
     // stale, mirroring refresh_swarm_task_staleness).
-    assert!(super::active_assignment_conflict("running", Some("snail"), None, now, window).is_none());
+    assert!(
+        super::active_assignment_conflict("running", Some("snail"), None, now, window).is_none()
+    );
     assert!(
         super::active_assignment_conflict(
             "running",
@@ -96,13 +98,26 @@ fn active_assignment_conflict_detects_only_assigned_and_fresh_items() {
         ..Default::default()
     };
     assert!(
-        super::active_assignment_conflict("queued", Some("snail"), Some(&just_assigned), now, window)
-            .is_some(),
+        super::active_assignment_conflict(
+            "queued",
+            Some("snail"),
+            Some(&just_assigned),
+            now,
+            window
+        )
+        .is_some(),
         "an assignment made moments ago is active even before its first heartbeat"
     );
 
     // running_stale and terminal statuses -> allow (existing recovery paths).
-    for status in ["running_stale", "failed", "stopped", "crashed", "completed", "done"] {
+    for status in [
+        "running_stale",
+        "failed",
+        "stopped",
+        "crashed",
+        "completed",
+        "done",
+    ] {
         assert!(
             super::active_assignment_conflict(
                 status,
@@ -217,16 +232,16 @@ async fn assign_task_rejects_double_assignment_of_actively_worked_task() {
     let mutation_runtime = SwarmMutationRuntime::default();
 
     let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
-    let swarm = swarm_handle(
-        &swarm_members,
-        &swarms_by_id,
-        &swarm_plans,
-        &swarm_coordinators,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
-        &mutation_runtime,
-    );
+    let swarm = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .swarms_by_id(Arc::clone(&swarms_by_id))
+        .plans(Arc::clone(&swarm_plans))
+        .coordinators(Arc::clone(&swarm_coordinators))
+        .event_history(Arc::clone(&event_history))
+        .event_counter(Arc::clone(&event_counter))
+        .swarm_event_tx(swarm_event_tx.clone())
+        .swarm_mutation_runtime(mutation_runtime.clone())
+        .build();
     handle_comm_assign_task(
         91,
         requester.to_string(),
@@ -304,16 +319,16 @@ async fn assign_task_allows_taking_over_stale_assignment() {
     let mutation_runtime = SwarmMutationRuntime::default();
 
     let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
-    let swarm = swarm_handle(
-        &swarm_members,
-        &swarms_by_id,
-        &swarm_plans,
-        &swarm_coordinators,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
-        &mutation_runtime,
-    );
+    let swarm = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .swarms_by_id(Arc::clone(&swarms_by_id))
+        .plans(Arc::clone(&swarm_plans))
+        .coordinators(Arc::clone(&swarm_coordinators))
+        .event_history(Arc::clone(&event_history))
+        .event_counter(Arc::clone(&event_counter))
+        .swarm_event_tx(swarm_event_tx.clone())
+        .swarm_mutation_runtime(mutation_runtime.clone())
+        .build();
     handle_comm_assign_task(
         92,
         requester.to_string(),
@@ -396,16 +411,16 @@ async fn task_control_reassign_tells_displaced_worker_to_stand_down() {
     let mutation_runtime = SwarmMutationRuntime::default();
 
     let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
-    let swarm = swarm_handle(
-        &swarm_members,
-        &swarms_by_id,
-        &swarm_plans,
-        &swarm_coordinators,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
-        &mutation_runtime,
-    );
+    let swarm = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .swarms_by_id(Arc::clone(&swarms_by_id))
+        .plans(Arc::clone(&swarm_plans))
+        .coordinators(Arc::clone(&swarm_coordinators))
+        .event_history(Arc::clone(&event_history))
+        .event_counter(Arc::clone(&event_counter))
+        .swarm_event_tx(swarm_event_tx.clone())
+        .swarm_mutation_runtime(mutation_runtime.clone())
+        .build();
     handle_comm_task_control(
         93,
         requester.to_string(),
@@ -454,8 +469,7 @@ async fn task_control_reassign_tells_displaced_worker_to_stand_down() {
             })
         })
     };
-    let stand_down =
-        stand_down.expect("displaced worker must receive a stand-down soft interrupt");
+    let stand_down = stand_down.expect("displaced worker must receive a stand-down soft interrupt");
     assert!(
         stand_down.contains("'contested'") && stand_down.contains("'penguin'"),
         "stand-down order must name the task and the new assignee: {stand_down}"

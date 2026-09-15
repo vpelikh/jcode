@@ -102,17 +102,16 @@ async fn handle_clear_session_replaces_runtime_handles_and_updates_shutdown_regi
         &shutdown_signals,
         &soft_interrupt_queues,
         &client_connections,
-        &swarm_handle_full(
-            swarm_members.clone(),
-            swarms_by_id.clone(),
-            swarm_plans.clone(),
-            Arc::new(RwLock::new(HashMap::new())),
-            channel_subscriptions.clone(),
-            channel_subscriptions_by_session.clone(),
-            event_history.clone(),
-            event_counter.clone(),
-            swarm_event_tx.clone(),
-        ),
+        &crate::server::test_util::TestSwarmBuilder::default()
+            .members(swarm_members.clone())
+            .swarms_by_id(swarms_by_id.clone())
+            .plans(swarm_plans.clone())
+            .channel_subscriptions(channel_subscriptions.clone())
+            .channel_subscriptions_by_session(channel_subscriptions_by_session.clone())
+            .event_history(event_history.clone())
+            .event_counter(event_counter.clone())
+            .swarm_event_tx(swarm_event_tx.clone())
+            .build(),
         &client_event_tx,
     )
     .await;

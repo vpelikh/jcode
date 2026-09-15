@@ -80,17 +80,9 @@ async fn restore_for_concurrency_test(
         &Arc::new(RwLock::new(HashMap::new())),
         &connections,
         &Arc::new(RwLock::new(ClientDebugState::default())),
-        &swarm_handle_full(
-            Arc::new(RwLock::new(HashMap::new())),
-            Arc::new(RwLock::new(HashMap::new())),
-            Arc::new(RwLock::new(HashMap::new())),
-            Arc::new(RwLock::new(HashMap::new())),
-            Arc::new(RwLock::new(HashMap::new())),
-            Arc::new(RwLock::new(HashMap::new())),
-            Arc::new(RwLock::new(VecDeque::new())),
-            Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            swarm_event_tx.clone(),
-        ),
+        &crate::server::test_util::TestSwarmBuilder::default()
+            .swarm_event_tx(swarm_event_tx.clone())
+            .build(),
         &Arc::new(RwLock::new(1)),
         &writer,
         "test-server",
