@@ -47,13 +47,17 @@ policy and report so every consumer stays in lockstep.
 - **`/prune` slash command.** `jcode-tui` `commands.rs` + `input_help.rs`: runs
   the model-free node-caps pass on demand (policy built from the configurable
   caps), reports `PruneReport`, and is discoverable via `/help prune`. 2 dispatch tests.
-- **Scheduled per-step prune.** Wired at the streaming loop's Injection Point D
-  (`agent/turn_streaming_mpsc.rs`) and the headless `run_turn`
-  (`agent/turn_loops.rs`): each step runs the cheap node-caps pass before the
-  next API call over the prefix preceding the latest assistant response.
-  Fresh tool results, screenshots and interrupts remain intact until the model
-  has consumed them at least once. No-op when within caps. In the streaming
-  loop it is gated on `tool_results_dirty` so a pure-text step skips the scan.
+- **Scheduled per-step prune.** Wired at the top of both agent loops
+  (`agent/turn_streaming_mpsc.rs`, `agent/turn_loops.rs`), before each next API
+  call, over the prefix preceding the latest assistant response. Fresh tool
+  results, screenshots and interrupts appended after the latest assistant are
+  in the unconsumed suffix and remain intact until the model has read them once.
+  The **tool-result** cap is gated on whether the prior batch added tool results
+  (`tool_results_dirty`), so a pure-text step skips that scan. The **image** cap
+  runs on **every** step: a consumed oversized image from a prior turn must be
+  reclaimed even on pure-text follow-ups, or it leaks for the whole session.
+  No-op when within caps. A prune invalidates the provider session/cache but
+  preserves the locked tool surface (`note_prune_applied`).
 - **Configurable per-node caps.** `CompactionConfig` gains
   `prune_tool_result_max_bytes` / `prune_image_max_bytes` (defaults 4000/1024,
   `#[serde(default)]` so existing configs parse) and `PrunePolicy::node_caps_with`

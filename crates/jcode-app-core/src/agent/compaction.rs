@@ -9,6 +9,19 @@ impl Agent {
         self.session.provider_session_id = None;
     }
 
+    /// Invalidate provider context after a deterministic prune. Unlike a real
+    /// compaction, a prune does not change tool definitions, so it preserves
+    /// the locked tool surface (which `note_compaction_applied` clears). It
+    /// still resets the provider session and cache, because the shrunk
+    /// transcript no longer matches what the provider cached. This path runs
+    /// on the frequent scheduled per-step prune, so preserving `locked_tools`
+    /// avoids churning the tool surface mid-turn.
+    pub(super) fn note_prune_applied(&mut self) {
+        self.cache_tracker.reset();
+        self.provider_session_id = None;
+        self.session.provider_session_id = None;
+    }
+
     pub fn poll_compaction_completion_event(&mut self) -> Option<CompactionEvent> {
         let provider_messages = self.session.messages_for_provider();
         let compaction = self.registry.compaction();

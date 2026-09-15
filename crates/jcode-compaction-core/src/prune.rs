@@ -63,6 +63,42 @@ impl PrunePolicy {
         }
     }
 
+    /// Per-node caps with only the image pass enabled (tool-result pass off).
+    /// Used by the scheduled per-step prune to reclaim consumed oversized images
+    /// on every step, independent of tool-result growth. Falls back to the
+    /// built-in image default when the value is zero.
+    pub fn node_caps_image_only(image_max_bytes: usize) -> Self {
+        let image_max_chars = if image_max_bytes == 0 {
+            EMERGENCY_IMAGE_MAX_CHARS
+        } else {
+            image_max_bytes
+        };
+        Self {
+            image_max_chars: Some(image_max_chars),
+            tool_result_max_chars: None,
+            image_total_budget: None,
+            tool_result_total_budget: None,
+        }
+    }
+
+    /// Per-node caps with only the tool-result pass enabled (image pass off).
+    /// Used by the scheduled per-step prune to truncate consumed oversized tool
+    /// results only on steps that committed tool results. Falls back to the
+    /// built-in tool-result default when the value is zero.
+    pub fn node_caps_tool_only(tool_result_max_bytes: usize) -> Self {
+        let tool_result_max_chars = if tool_result_max_bytes == 0 {
+            EMERGENCY_TOOL_RESULT_MAX_CHARS
+        } else {
+            tool_result_max_bytes
+        };
+        Self {
+            image_max_chars: None,
+            tool_result_max_chars: Some(tool_result_max_chars),
+            image_total_budget: None,
+            tool_result_total_budget: None,
+        }
+    }
+
     /// Per-node caps from explicit values (e.g. loaded from config). Falls back
     /// to the built-in defaults when a value is zero. Keeps aggregate budgets
     /// off, exactly like [`Self::node_caps`], so it never performs surgery.
@@ -374,6 +410,29 @@ mod tests {
             defaults.tool_result_max_chars
         );
         assert_eq!(fallback.image_max_chars, defaults.image_max_chars);
+    }
+
+    #[test]
+    fn image_only_policy_prunes_images_but_not_tool_results() {
+        let mut blocks = vec![vec![image_block(5000), tool_block(9000)]];
+        let mut v = to_contents(&mut blocks);
+        let report = prune_contents(&mut v, &PrunePolicy::node_caps_image_only(1024));
+        assert_eq!(report.images_stripped, 1);
+        assert_eq!(report.tool_results_truncated, 0, "tool pass must be disabled");
+        let tool_len = match &blocks[0][1] {
+            ContentBlock::ToolResult { content, .. } => content.len(),
+            _ => 0,
+        };
+        assert_eq!(tool_len, 9000, "tool result must survive an image-only pass");
+    }
+
+    #[test]
+    fn tool_only_policy_only_truncates_tool_results_not_images() {
+        let mut blocks = vec![vec![image_block(5000), tool_block(9000)]];
+        let mut v = to_contents(&mut blocks);
+        let report = prune_contents(&mut v, &PrunePolicy::node_caps_tool_only(4000));
+        assert_eq!(report.images_stripped, 0, "image pass must be disabled");
+        assert_eq!(report.tool_results_truncated, 1);
     }
 
     #[test]

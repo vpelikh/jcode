@@ -3926,9 +3926,45 @@ impl Drop for PruneTestHome {
 }
 
 
+/// Provider that on EVERY call emits only text (an assistant continuation with NO
+/// tool call). Drives the streaming loop on a pure-text path so the scheduled
+/// prune's image pass is exercised without tool results.
+#[derive(Clone, Default)]
+struct TextOnlyStreamProvider;
+
+#[async_trait]
+impl Provider for TextOnlyStreamProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        let (tx, rx) = tokio_mpsc::channel::<Result<StreamEvent>>(4);
+        tokio::spawn(async move {
+            let _ = tx.send(Ok(StreamEvent::TextDelta("ok".to_string()))).await;
+            let _ = tx
+                .send(Ok(StreamEvent::MessageEnd {
+                    stop_reason: Some("end_turn".to_string()),
+                }))
+                .await;
+        });
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    fn name(&self) -> &str {
+        "text-only"
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(TextOnlyStreamProvider)
+    }
+}
+
 /// Provider that on call 1 invokes `bash` producing an oversized tool result, and on
 /// call 2 ends the turn. Drives the REAL streaming loop so the scheduled per-step
-/// prune (turn_streaming_mpsc.rs Point D) runs after the tool result is appended.
+/// prune runs after the tool result is appended.
 #[derive(Clone, Default)]
 struct OversizedToolStreamProvider {
     calls: Arc<std::sync::Mutex<usize>>,
@@ -4062,5 +4098,52 @@ async fn scheduled_prune_preserves_fresh_oversized_results_at_runtime() {
     assert!(
         consumed_image.is_some(),
         "consumed oversized image must be pruned by scheduled prune"
+    );
+}
+/// A pure-text continuation turn (no tool results) must STILL prune a previously
+/// consumed oversized image; gating the image pass on tool_results_dirty would
+/// leak it for the whole session.
+#[tokio::test]
+async fn text_only_turn_prunes_consumed_oversized_image() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(TextOnlyStreamProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // A consumed oversized image: the image (User), then an assistant ack.
+    agent.session.append_stored_message(crate::session::StoredMessage {
+        id: "txt-img".into(),
+        role: crate::message::Role::User,
+        content: vec![ContentBlock::Image {
+            media_type: "image/png".into(),
+            data: "a".repeat(5000),
+        }],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    agent.session.add_message(
+        crate::message::Role::Assistant,
+        vec![ContentBlock::Text {
+            text: "ack".into(),
+            cache_control: None,
+        }],
+    );
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    agent
+        .run_once_streaming_mpsc("continue", Vec::new(), None, tx)
+        .await
+        .unwrap();
+
+    // The consumed oversized image must have been pruned even though this turn
+    // added no tool results (regression for the text-only image leak).
+    let marker = agent.session.messages.iter().flat_map(|m| &m.content).find(|b| {
+        matches!(b, ContentBlock::Text { text, .. } if text.contains("Image omitted during context pruning"))
+    });
+    assert!(
+        marker.is_some(),
+        "consumed oversized image must be pruned on a text-only turn"
     );
 }
