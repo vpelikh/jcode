@@ -466,6 +466,13 @@ pub fn import_handoff(
 ) -> Option<String> {
     let project = project_key(working_dir)?;
     let mut snapshot: HandoffSnapshot = serde_json::from_str(payload).ok()?;
+    // A handoff is only meaningful when it carries unfinished work; reject a
+    // payload with no open todos, matching capture's contract (a captured
+    // snapshot always has open work). This also prevents importing a malformed
+    // or empty snapshot as a "live" handoff that auto-injects nothing useful.
+    if snapshot.open_todos.is_empty() {
+        return None;
+    }
     // Re-key to this host's project identity so lookup and injection find it.
     snapshot.project_key = project.clone();
     snapshot.disposition = disposition.to_string();
@@ -492,6 +499,11 @@ pub fn import_handoff(
             short.as_str()
         };
         candidate = format!("{}-{}", base, suffix);
+    }
+    // If every suffix still collided (effectively impossible), fall back to the
+    // full UUID which is guaranteed not to exist, so we never overwrite a file.
+    if load_snapshot(&candidate).is_some() {
+        candidate = format!("{}-{}", base, uuid::Uuid::new_v4().simple());
     }
     snapshot.session_id = candidate;
     let session_id = snapshot.session_id.clone();

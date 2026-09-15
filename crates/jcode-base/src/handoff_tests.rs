@@ -1383,3 +1383,44 @@ fn sweep_reconciles_dangling_index_entry() {
         "no latest for the project once its only file is gone"
     );
 }
+
+/// Fix: import rejects a payload with no open todos, matching capture's
+/// contract that a handoff carries unfinished work.
+#[test]
+fn import_rejects_empty_open_todos() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let cwd = env._home.path();
+    std::fs::create_dir_all(&cwd).ok();
+
+    let mut empty = fixture("empty", "git:https://example.com/e.git");
+    empty.open_todos = Vec::new();
+    let payload = serde_json::to_string(&empty).unwrap();
+
+    assert!(
+        import_handoff(&payload, Some(&cwd), "closed").is_none(),
+        "a payload with no open work must not be imported as a live handoff"
+    );
+    assert!(list_all_handoffs().is_empty(), "nothing adopted");
+}
+
+/// Fix: repeatedly importing the same payload never overwrites an existing
+/// snapshot — each import mints a distinct, loadable id.
+#[test]
+fn repeated_import_never_overwrites() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let cwd = env._home.path();
+    std::fs::create_dir_all(&cwd).ok();
+    let key = project_key(Some(&cwd)).unwrap();
+
+    write_snapshot(&fixture("repeat", &key)).unwrap();
+    let payload = export_handoff("repeat").expect("export");
+
+    let mut ids = std::collections::HashSet::new();
+    for _ in 0..12 {
+        let id = import_handoff(&payload, Some(&cwd), "closed").unwrap();
+        assert!(ids.insert(id.clone()), "imported id {id} must be unique");
+        assert!(load_snapshot(&id).is_some(), "imported snapshot {id} loads");
+    }
+}
