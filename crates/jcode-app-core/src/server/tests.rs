@@ -706,14 +706,9 @@ async fn wake_turn_holds_reservation_until_terminal_status_is_published() {
         swarm_event_tx.clone(),
     );
 
-    let started = super::live_turn::run_live_turn_if_idle(
-        &session_id,
-        "first wake",
-        None,
-        &sessions,
-        &swarm,
-    )
-    .await;
+    let started =
+        super::live_turn::run_live_turn_if_idle(&session_id, "first wake", None, &sessions, &swarm)
+            .await;
     assert!(started);
 
     // Wait for the terminal Done fanout.

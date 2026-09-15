@@ -3,9 +3,8 @@
 use super::client_lifecycle::process_message_streaming_mpsc;
 use super::services::{SessionServiceHandle, SwarmServiceHandle};
 use super::{
-    ClientConnectionInfo, SwarmMember, SwarmState,
-    fanout_session_event, persist_swarm_state_for, swarm_id_for_session,
-    truncate_detail,
+    ClientConnectionInfo, SwarmMember, SwarmState, fanout_session_event, persist_swarm_state_for,
+    swarm_id_for_session, truncate_detail,
 };
 use crate::agent::Agent;
 use crate::protocol::{FeatureToggle, NotificationType, ServerEvent};
@@ -100,13 +99,8 @@ pub(super) async fn handle_notify_session(
     };
 
     let ran_immediately = if target_has_client {
-        super::live_turn::run_live_system_turn_if_idle(
-            &session_id,
-            &message,
-            sessions,
-            ctx.swarm,
-        )
-        .await
+        super::live_turn::run_live_system_turn_if_idle(&session_id, &message, sessions, ctx.swarm)
+            .await
     } else {
         false
     };

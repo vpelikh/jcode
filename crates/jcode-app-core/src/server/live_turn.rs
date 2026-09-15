@@ -150,7 +150,8 @@ pub(super) async fn run_live_turn_if_idle(
     sessions: &SessionAgents,
     swarm: &SwarmServiceHandle,
 ) -> bool {
-    let Some(agent) = idle_live_agent(session_id, sessions, &swarm.swarm_state.members).await else {
+    let Some(agent) = idle_live_agent(session_id, sessions, &swarm.swarm_state.members).await
+    else {
         return false;
     };
     let detail = Some(truncate_detail(message, 120)).filter(|detail| !detail.is_empty());
@@ -173,7 +174,8 @@ pub(super) async fn run_live_system_turn_if_idle(
     sessions: &SessionAgents,
     swarm: &SwarmServiceHandle,
 ) -> bool {
-    let Some(agent) = idle_live_agent(session_id, sessions, &swarm.swarm_state.members).await else {
+    let Some(agent) = idle_live_agent(session_id, sessions, &swarm.swarm_state.members).await
+    else {
         return false;
     };
     let detail = Some(truncate_detail(message, 120)).filter(|detail| !detail.is_empty());
