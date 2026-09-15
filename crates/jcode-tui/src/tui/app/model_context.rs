@@ -983,6 +983,10 @@ impl App {
             let stripped = report.images_stripped;
             let truncated = report.tool_results_truncated;
             if stripped > 0 || truncated > 0 {
+                // Persist the prune immediately so the in-memory mutation is
+                // not lost if the user does not resubmit (the retry path also
+                // saves, but this manual-resubmit branch returns here).
+                let _ = self.session.save();
                 self.messages.clear();
                 self.reseed_compaction_from_provider_messages();
                 self.push_display_message(DisplayMessage::error(format!(
@@ -1160,6 +1164,10 @@ impl App {
             }
             return false;
         }
+
+        // Persist the prune so the in-memory mutation is not lost if the
+        // retry fails or the user closes before a later save.
+        let _ = self.session.save();
 
         // Transcript changed: drop the local materialized scratch copy so the
         // next API call rebuilds from the reduced session, and reseed compaction

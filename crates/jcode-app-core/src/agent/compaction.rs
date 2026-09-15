@@ -329,6 +329,15 @@ impl Agent {
             return false;
         }
 
+        // Persist the prune immediately so the mutation survives even if the
+        // retry is interrupted; the caller also saves on a successful retry.
+        if let Err(err) = self.session.save() {
+            logging::warn(&format!(
+                "Failed to persist 413 prune for session {}: {}",
+                self.session.id, err
+            ));
+        }
+
         // The transcript changed; reseed compaction bookkeeping and reset
         // provider session/cache state so the retry sends the reduced payload.
         let compaction = self.registry.compaction();
