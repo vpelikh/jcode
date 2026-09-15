@@ -39,9 +39,23 @@ future work.
 
 `handoff::list_saved_handoffs()` reads the index (newest first, one per
 project) for the `/handoff` picker, and `handoff::render_handoff(id)` renders a
-specific snapshot for `list_saved_handoffs`-driven resume. The selected
-snapshot is carried from the TUI to the server via the `set_handoff_resume`
-protocol request and stored as a transient, one-shot override on the agent.
+specific snapshot for `list_saved_handoffs`-driven resume.
+`handoff::list_all_handoffs()` scans the snapshot directory so archived
+handoffs that are no longer the latest for their project stay selectable
+(marked `[archived]` in `/handoff`). The selected snapshot is carried from the
+TUI to the server via the `set_handoff_resume` protocol request and stored as a
+transient, one-shot override on the agent.
+
+`/handoffres` only clears an existing conversation (in place, via the server)
+when it already has messages; an already-fresh session just sets the override,
+so a just-started conversation is never destructively wiped. `/handoff-clear`
+(alias `/handoffcancel`) sends `set_handoff_resume(None)` to restore automatic
+injection. `/handoff` lists handoffs locally by reading the shared handoff
+store — the same client-side filesystem pattern the session picker uses for its
+listing — while the mutating `set_handoff_resume` path goes through the server
+because it changes the live agent. The commands also have a local fallback that
+lists handoffs (and notes that resume needs a connected server), so they degrade
+gracefully while disconnected.
 
 At first-message injection ([`render_first_message_handoff`]), the override is
 honored if present and consumed immediately; otherwise the default
@@ -156,7 +170,7 @@ for choosing among multiple work streams.
 | Disconnect hook | `crates/jcode-app-core/src/server/client_disconnect_cleanup.rs` |
 | First-message injection and manual override | `crates/jcode-app-core/src/agent/turn_execution.rs` |
 | `set_handoff_resume` protocol + server handler | `crates/jcode-protocol/src/wire.rs`, `crates/jcode-app-core/src/server/client_actions.rs`, `client_lifecycle.rs` |
-| TUI `/handoff` and `/handoffres` commands | `crates/jcode-tui/src/tui/app/remote/key_handling.rs`, `backend.rs`, `state_ui_input_helpers.rs` |
+| TUI `/handoff`, `/handoffres`, `/handoff-clear` commands + local fallback | `crates/jcode-tui/src/tui/app/remote/key_handling.rs`, `commands.rs`, `backend.rs`, `state_ui_input_helpers.rs` |
 | Storage and public-API tests | `crates/jcode-base/src/handoff_tests.rs` |
 | Injection + override tests | `crates/jcode-app-core/src/agent_tests.rs` |
 | Disconnect integration tests | `crates/jcode-app-core/src/server/client_disconnect_grace_tests.rs` |
@@ -169,17 +183,20 @@ cargo test -p jcode-app-core --lib manual_handoff_override_injects_selected_snap
 cargo test -p jcode-app-core --lib handle_set_handoff_resume_overrides_auto_inject_and_errors_on_unknown
 cargo test -p jcode-app-core --lib first_user_message_injects_handoff_once
 cargo test -p jcode-app-core --lib cleanup_persists_handoff_for_session_with_open_todos
+cargo test -p jcode-tui --lib local_handoff_listing
 ```
 
 Coverage includes capture and index persistence, concurrent writers, timestamp
 ordering, terminal-todo retirement, cross-checkout portability, origin changes,
 project isolation, invalid filenames, corrupt-index recovery, bounded rendering,
 initiative promotion, text/image-first injection, cleanup lock release, picker
-listing (latest per project, newest first), specific-snapshot rendering, manual
-override beating auto-inject, the `set_handoff_resume` server handler (valid set
-replies `Done` and wins over auto-inject; unknown id replies `Error`), and a
-no-regression guard that a manual selection does not disturb the default. Tests
-use temporary storage and restore the prior environment.
+listing (latest per project, newest first), archive listing (`list_all_handoffs`
+surfaces superseded snapshots), specific-snapshot rendering, manual override
+beating auto-inject, the `set_handoff_resume` server handler (valid set replies
+`Done` and wins over auto-inject; unknown id replies `Error`), a no-regression
+guard that a manual selection does not disturb the default, and the TUI local
+`/handoff` fallback (surfaces archived handoffs; `/handoffres` explains a server
+is needed). Tests use temporary storage and restore the prior environment.
 
 ## Future work
 

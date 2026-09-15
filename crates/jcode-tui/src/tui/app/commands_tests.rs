@@ -745,3 +745,96 @@ mod worktree {
         );
     }
 }
+
+
+/// The local `/handoff` fallback lists saved handoffs (including archived ones)
+/// from the shared store, and `/handoffres` reports that a connected server is
+/// required — all without a socket.
+#[test]
+fn local_handoff_listing_surfaces_archived_and_requires_server_for_resume() {
+    use crate::tui::app::commands_dispatch::dispatch_local_command;
+    use crate::tui::app::tests::create_test_app;
+
+    // Isolated home so capture writes to a throwaway store.
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match std::env::var_os("JCODE_HOME") {
+                Some(v) => crate::env::set_var("JCODE_HOME", v),
+                None => crate::env::remove_var("JCODE_HOME"),
+            }
+        }
+    }
+    let _guard = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().expect("temp home");
+    crate::env::set_var("JCODE_HOME", home.path());
+    let wd = home.path().join("project");
+    std::fs::create_dir_all(&wd).unwrap();
+    let _restore = Restore;
+
+    fn seed(session_id: &str, wd: &std::path::Path, intent: &str) {
+        crate::todo::save_todos(
+            session_id,
+            &[crate::todo::TodoItem {
+                id: "t".into(),
+                content: format!("work for {intent}"),
+                status: "in_progress".into(),
+                priority: "high".into(),
+                group: None,
+                confidence: None,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        crate::todo::save_plan(
+            session_id,
+            &crate::todo::TodoPlan {
+                user_intention: Some(intent.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::handoff::capture(session_id, Some(wd), "closed", None).expect("capture");
+    }
+
+    // Two snapshots in the same project so one is archived behind the other.
+    seed("archived-handoff", &wd, "archived intent");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    seed("latest-handoff", &wd, "latest intent");
+
+    let mut app = create_test_app();
+
+    // /handoff is claimed locally and lists newest first with the archived tag.
+    assert!(
+        dispatch_local_command(&mut app, "/handoff"),
+        "/handoff should be claimed in local dispatch"
+    );
+    let listing = app
+        .display_messages
+        .last()
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    assert!(
+        listing.contains("latest-handoff"),
+        "listing should show the latest handoff: {listing}"
+    );
+    assert!(
+        listing.contains("archived-handoff") && listing.contains("[archived]"),
+        "listing should surface the archived handoff: {listing}"
+    );
+
+    // `/handoffres` is claimed locally but explains a server is required.
+    assert!(
+        dispatch_local_command(&mut app, "/handoffres latest-handoff"),
+        "/handoffres should be claimed in local dispatch"
+    );
+    let msg = app
+        .display_messages
+        .last()
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("requires a live server connection"),
+        "local /handoffres should explain a server is needed: {msg}"
+    );
+}

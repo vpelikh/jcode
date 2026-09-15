@@ -33,10 +33,11 @@ pub(in crate::tui::app) async fn send_interleave_now(
 
 /// Set which saved handoff this session boots from on its first message.
 ///
-/// `/handoffres <session_id>` clears the conversation in place on the server
-/// (so the next user message is the first visible one), then tells the server
-/// which handoff to inject. The selection is resolved locally first so an
-/// unknown id fails fast client-side.
+/// `/handoffres <session_id>` sets the override on the server. If the current
+/// conversation already has messages it is cleared in place first (so the next
+/// message is the first visible one); an already-fresh conversation is left
+/// untouched. The selection is resolved locally first so an unknown id fails
+/// fast client-side.
 async fn handle_handoff_resume_command(
     app: &mut App,
     remote: &mut RemoteConnection,
@@ -67,55 +68,69 @@ async fn handle_handoff_resume_command(
         }
     };
     let selected = session_id.to_string();
-    // Clear the conversation in place on the server (same session id, like
-    // `/clear`) so the next user message is the first visible one — exactly
-    // when the server injects the override. Using `remote.clear()` keeps the
-    // client and server on the same agent, so the override set immediately
-    // after lands on the right session.
-    remote.clear().await?;
-    remote.set_handoff_resume(Some(selected.clone())).await?;
-    app.clear_provider_messages();
-    app.clear_display_messages();
-    app.is_processing = false;
+    // A handoff override only applies to the first visible user message. If the
+    // current conversation already has messages, clear it in place on the server
+    // (same session id, like `/clear`) so the next message is treated as first;
+    // using `remote.clear()` keeps client and server on the same agent so the
+    // override set immediately after lands on this session. For an already-fresh
+    // conversation we skip the destructive clear and just set the override.
+    let has_messages = !remote_rewindable_messages(app).is_empty();
+    if has_messages {
+        remote.clear().await?;
+        app.clear_provider_messages();
+        app.clear_display_messages();
+        app.is_processing = false;
+    }
+    remote.set_handoff_resume(Some(selected)).await?;
     app.push_display_message(DisplayMessage::system(format!(
-        "Handoff ready: {selected}\n{}",
+        "Handoff ready: {}\n{}",
+        session_id,
         preview.lines().next().unwrap_or("[Handoff from previous session]")
     )));
     app.set_status_notice("Handoff selected");
     Ok(())
 }
 
-/// `/handoff` lists the saved handoffs the user can resume from, newest first,
-/// one per project. Each row carries the `session_id` the user should pass to
-/// `/handoffres`.
+/// `/handoff` lists the saved handoffs the user can resume from, newest first.
+/// Every persisted snapshot is shown (not only the latest per project, so a
+/// superseded handoff is still selectable). Each row carries the `session_id`
+/// the user should pass to `/handoffres`.
 fn handle_handoff_command(app: &mut App, _trimmed: &str) -> Result<()> {
-    let entries = crate::handoff::list_saved_handoffs();
-    if entries.is_empty() {
+    let snapshots = crate::handoff::list_all_handoffs();
+    if snapshots.is_empty() {
         app.push_display_message(DisplayMessage::system(
             "No saved handoffs. A handoff is captured when a session ends with unfinished work; run /handoffres <id> once one exists.".to_string(),
         ));
         return Ok(());
     }
+    let latest = crate::handoff::list_saved_handoffs();
+    let latest_ids: std::collections::HashSet<&str> =
+        latest.iter().map(|e| e.session_id.as_str()).collect();
     let mut msg = format!(
-        "{} saved handoff(s) (latest per project). Resume with /handoffres <id>:\n",
-        entries.len()
+        "{} saved handoff(s), newest first. Resume with /handoffres <id>; clear with /handoff-clear:\n",
+        snapshots.len()
     );
-    for entry in entries.iter().take(16) {
-        let when = entry.ended_at.format("%Y-%m-%d %H:%M");
-        let summary: String = entry
-            .summary
+    for snapshot in snapshots.iter().take(24) {
+        let when = snapshot.ended_at.format("%Y-%m-%d %H:%M");
+        let intent: String = snapshot
+            .intent
             .as_deref()
             .unwrap_or("<no intent>")
             .chars()
             .take(80)
             .collect();
+        let archived = if latest_ids.contains(snapshot.session_id.as_str()) {
+            ""
+        } else {
+            " [archived]"
+        };
         msg.push_str(&format!(
-            "- {}  [{}] {}\n    ended {when}\n",
-            entry.session_id, entry.project_key, summary
+            "- {}{}  {} (ended {when})\n    {}\n",
+            snapshot.session_id, archived, snapshot.project_key, intent
         ));
     }
-    if entries.len() > 16 {
-        msg.push_str(&format!("...and {} more.\n", entries.len() - 16));
+    if snapshots.len() > 24 {
+        msg.push_str(&format!("...and {} more.\n", snapshots.len() - 24));
     }
     app.push_display_message(DisplayMessage::system(msg));
     Ok(())
@@ -2044,6 +2059,15 @@ async fn handle_remote_key_internal(
 
                 if trimmed == "/handoffres" || trimmed.starts_with("/handoffres ") {
                     return handle_handoff_resume_command(app, remote, trimmed).await;
+                }
+
+                if trimmed == "/handoff-clear" || trimmed == "/handoffcancel" {
+                    remote.set_handoff_resume(None).await?;
+                    app.push_display_message(DisplayMessage::system(
+                        "Handoff override cleared; automatic latest-for-project injection restored.".to_string(),
+                    ));
+                    app.set_status_notice("Handoff selection cleared");
+                    return Ok(());
                 }
 
                 if trimmed == "/save" || trimmed.starts_with("/save ") {

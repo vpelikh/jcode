@@ -785,3 +785,39 @@ fn manual_render_does_not_disturb_auto_inject() {
     let boot = render_boot_context(Some(&cwd)).expect("auto context present");
     assert!(boot.contains("[Handoff from previous session]"));
 }
+
+/// list_all_handoffs surfaces archived snapshots that are no longer the latest
+/// for their project (so absent from the index), newest first.
+#[test]
+fn list_all_handoffs_includes_archived_and_is_newest_first() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let home = env._home.path();
+    let cwd = home.join("project");
+    std::fs::create_dir_all(&cwd).ok();
+
+    let mut older = fixture("older", &project_key(Some(&cwd)).unwrap());
+    older.ended_at = Utc::now() - chrono::Duration::hours(2);
+    write_snapshot(&older).unwrap();
+    let mut newer = fixture("newer", &project_key(Some(&cwd)).unwrap());
+    newer.ended_at = Utc::now() - chrono::Duration::hours(1);
+    write_snapshot(&newer).unwrap();
+    // A snapshot from a different project, to confirm cross-project coverage.
+    let other = fixture("other-proj", "git:https://example.com/other.git");
+    write_snapshot(&other).unwrap();
+
+    // The index only keeps the latest per project.
+    let indexed = list_saved_handoffs();
+    let indexed_ids: Vec<&str> = indexed.iter().map(|e| e.session_id.as_str()).collect();
+    assert!(indexed_ids.contains(&"newer"), "index has newer");
+    assert!(!indexed_ids.contains(&"older"), "index drops archived older");
+
+    // list_all_handoffs sees every snapshot, newest first.
+    let all = list_all_handoffs();
+    let all_ids: Vec<&str> = all.iter().map(|s| s.session_id.as_str()).collect();
+    assert_eq!(
+        all_ids,
+        vec!["other-proj", "newer", "older"],
+        "all snapshots surfaced newest first"
+    );
+}

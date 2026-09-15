@@ -1953,6 +1953,50 @@ pub(super) fn handle_git_status_completed(app: &mut App, completed: GitStatusCom
     }
 }
 
+/// Local fallback for `/handoff`: list saved handoffs. This path runs without a
+/// live server connection (disconnected/SSH), so it reads the shared handoff
+/// store directly, mirroring the same output the remote dispatcher produces.
+pub(super) fn handle_handoff_list_local(app: &mut App, _trimmed: &str) -> bool {
+    let snapshots = crate::handoff::list_all_handoffs();
+    if snapshots.is_empty() {
+        app.push_display_message(DisplayMessage::system(
+            "No saved handoffs. A handoff is captured when a session ends with unfinished work; once one exists, connect to a server and run /handoffres <id>.".to_string(),
+        ));
+        return true;
+    }
+    let latest = crate::handoff::list_saved_handoffs();
+    let latest_ids: std::collections::HashSet<&str> =
+        latest.iter().map(|e| e.session_id.as_str()).collect();
+    let mut msg = format!(
+        "{} saved handoff(s), newest first. Connect to a server, then /handoffres <id> (or /clear via /handoff-clear):\n",
+        snapshots.len()
+    );
+    for snapshot in snapshots.iter().take(24) {
+        let when = snapshot.ended_at.format("%Y-%m-%d %H:%M");
+        let intent: String = snapshot
+            .intent
+            .as_deref()
+            .unwrap_or("<no intent>")
+            .chars()
+            .take(80)
+            .collect();
+        let archived = if latest_ids.contains(snapshot.session_id.as_str()) {
+            ""
+        } else {
+            " [archived]"
+        };
+        msg.push_str(&format!(
+            "- {}{}  {} (ended {when})\n    {}\n",
+            snapshot.session_id, archived, snapshot.project_key, intent
+        ));
+    }
+    if snapshots.len() > 24 {
+        msg.push_str(&format!("...and {} more.\n", snapshots.len() - 24));
+    }
+    app.push_display_message(DisplayMessage::system(msg));
+    true
+}
+
 pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
     if handle_subagent_model_command(app, trimmed)
         || app.handle_hotkeys_command(trimmed)
@@ -2020,6 +2064,24 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
     if trimmed == "/resume" || trimmed == "/sessions" || trimmed == "/session" {
         app.open_session_picker();
         app.record_keybinding_slow(super::shortcut_hints::LearnableAction::Resume);
+        return true;
+    }
+
+    if trimmed == "/handoff" || trimmed.starts_with("/handoff ") {
+        return handle_handoff_list_local(app, trimmed);
+    }
+
+    if trimmed == "/handoffres" || trimmed.starts_with("/handoffres ") {
+        app.push_display_message(DisplayMessage::error(
+            "/handoffres requires a live server connection; run it from a connected TUI (list ids with /handoff).".to_string(),
+        ));
+        return true;
+    }
+
+    if trimmed == "/handoff-clear" || trimmed == "/handoffcancel" {
+        app.push_display_message(DisplayMessage::error(
+            "/handoff-clear requires a live server connection; it clears the selected handoff override.".to_string(),
+        ));
         return true;
     }
 
