@@ -2,7 +2,8 @@
 
 use super::{
     NotifySessionContext, clone_split_session, handle_notify_session, handle_rename_session,
-    handle_resume_all_sessions, handle_set_feature, handle_set_working_dir, handle_split,
+    handle_resume_all_sessions, handle_set_feature, handle_set_handoff_resume,
+    handle_set_working_dir, handle_split,
 };
 use crate::agent::Agent;
 use crate::message::{ContentBlock, Message, Role, StreamEvent, ToolDefinition};
@@ -14,6 +15,7 @@ use anyhow::Result;
 use async_stream::stream;
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
@@ -1523,6 +1525,110 @@ async fn set_working_dir_event_carries_resolved_not_raw_input() -> Result<()> {
             );
         }
         other => panic!("expected SessionWorkingDirChanged, got {other:?}"),
+    }
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    Ok(())
+}
+
+/// handle_set_handoff_resume sets a one-shot override on the agent that beats
+/// the automatic latest-for-project handoff at first-message injection, and
+/// replies Done. An unknown id replies Error instead.
+#[tokio::test]
+async fn handle_set_handoff_resume_overrides_auto_inject_and_errors_on_unknown() -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+    let wd = temp.path();
+    std::fs::create_dir_all(wd).ok();
+
+    fn seed(session_id: &str, wd: &Path, intent: &str) {
+        crate::todo::save_todos(
+            session_id,
+            &[crate::todo::TodoItem {
+                id: "t".into(),
+                content: format!("work for {intent}"),
+                status: "in_progress".into(),
+                priority: "high".into(),
+                group: None,
+                confidence: None,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        crate::todo::save_plan(
+            session_id,
+            &crate::todo::TodoPlan {
+                user_intention: Some(intent.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::handoff::capture(session_id, Some(wd), "closed", None).expect("capture");
+    }
+
+    seed("target-handoff", wd, "target intent");
+    std::thread::sleep(Duration::from_millis(20));
+    seed("auto-handoff", wd, "auto intent");
+
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
+    {
+        let mut guard = agent.lock().await;
+        guard.set_working_dir(wd.to_str().expect("utf8"));
+    }
+
+    let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
+    handle_set_handoff_resume(11, Some("target-handoff".to_string()), &agent, &client_event_tx).await;
+    assert!(
+        timeout(Duration::from_secs(2), client_event_rx.recv())
+            .await
+            .expect("Done should arrive")
+            .is_some_and(|e| matches!(e, ServerEvent::Done { id } if id == 11)),
+        "handler must reply Done for a valid handoff"
+    );
+
+    // First user message must boot from the manually selected handoff, not the
+    // newer auto-inject target.
+    let first_str = {
+        let mut guard = agent.lock().await;
+        guard
+            .append_user_context_message("resume", Vec::new())
+            .expect("append first message");
+        // Latest user message (messages() is last-in=last-out by index).
+        let mut preview = String::new();
+        for message in guard.messages().iter().rev() {
+            if message.role == Role::User {
+                preview = message.content_preview();
+                break;
+            }
+        }
+        preview
+    };
+    assert!(
+        first_str.contains("target intent") && !first_str.contains("auto intent"),
+        "override must win over auto-inject, got: {first_str}"
+    );
+
+    // Unknown handoff id fails fast with an Error, no override set.
+    let (client_event_tx2, mut client_event_rx2) = mpsc::unbounded_channel();
+    handle_set_handoff_resume(12, Some("no-such".to_string()), &agent, &client_event_tx2).await;
+    let error = timeout(Duration::from_secs(2), client_event_rx2.recv())
+        .await
+        .expect("Error should arrive")
+        .expect("channel should stay open");
+    match error {
+        ServerEvent::Error { id, message, .. } => {
+            assert_eq!(id, 12);
+            assert!(message.contains("no saved handoff"), "got: {message}");
+        }
+        other => panic!("expected Error, got {other:?}"),
     }
 
     if let Some(prev_home) = prev_home {

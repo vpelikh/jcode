@@ -166,6 +166,7 @@ for choosing among multiple work streams.
 ```bash
 cargo test -p jcode-base --lib handoff::tests
 cargo test -p jcode-app-core --lib manual_handoff_override_injects_selected_snapshot_once
+cargo test -p jcode-app-core --lib handle_set_handoff_resume_overrides_auto_inject_and_errors_on_unknown
 cargo test -p jcode-app-core --lib first_user_message_injects_handoff_once
 cargo test -p jcode-app-core --lib cleanup_persists_handoff_for_session_with_open_todos
 ```
@@ -175,9 +176,10 @@ ordering, terminal-todo retirement, cross-checkout portability, origin changes,
 project isolation, invalid filenames, corrupt-index recovery, bounded rendering,
 initiative promotion, text/image-first injection, cleanup lock release, picker
 listing (latest per project, newest first), specific-snapshot rendering, manual
-override beating auto-inject, and a no-regression guard that a manual selection
-does not disturb the default. Tests use temporary storage and restore the prior
-environment.
+override beating auto-inject, the `set_handoff_resume` server handler (valid set
+replies `Done` and wins over auto-inject; unknown id replies `Error`), and a
+no-regression guard that a manual selection does not disturb the default. Tests
+use temporary storage and restore the prior environment.
 
 ## Future work
 
