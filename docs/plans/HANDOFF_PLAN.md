@@ -183,6 +183,7 @@ cargo test -p jcode-base --lib handoff::tests
 cargo test -p jcode-app-core --lib manual_handoff_override_injects_selected_snapshot_once
 cargo test -p jcode-app-core --lib stale_manual_handoff_override_falls_back_to_auto_inject
 cargo test -p jcode-app-core --lib handle_set_handoff_resume_overrides_auto_inject_and_errors_on_unknown
+cargo test -p jcode-app-core --lib handle_set_handoff_resume_none_clears_override
 cargo test -p jcode-app-core --lib first_user_message_injects_handoff_once
 cargo test -p jcode-app-core --lib cleanup_persists_handoff_for_session_with_open_todos
 cargo test -p jcode-tui --lib local_handoff_listing
@@ -197,10 +198,11 @@ surfaces superseded snapshots), specific-snapshot rendering, manual override
 beating auto-inject, a stale-override fallback (a retired snapshot falls back to
 auto-inject instead of booting context-less, and the stale id is consumed), the
 `set_handoff_resume` server handler (valid set replies `Done` and wins over
-auto-inject; unknown id replies `Error`), a no-regression guard that a manual
-selection does not disturb the default, and the TUI local `/handoff` fallback
-(surfaces archived handoffs; `/handoffres` explains a server is needed). Tests
-use temporary storage and restore the prior environment.
+auto-inject; unknown id replies `Error`; `None` restores auto-injection), a
+no-regression guard that a manual selection does not disturb the default, and
+the TUI local `/handoff` fallback (surfaces archived handoffs; `/handoffres`
+explains a server is needed). Tests use temporary storage and restore the prior
+environment.
 
 ## Future work
 

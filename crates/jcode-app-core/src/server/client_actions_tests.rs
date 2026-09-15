@@ -1638,3 +1638,100 @@ async fn handle_set_handoff_resume_overrides_auto_inject_and_errors_on_unknown()
     }
     Ok(())
 }
+
+/// handle_set_handoff_resume(None) clears a previously set override: a fresh
+/// conversation afterwards uses the automatic latest-for-project handoff again.
+#[tokio::test]
+async fn handle_set_handoff_resume_none_clears_override() -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+    let wd = temp.path();
+    std::fs::create_dir_all(wd).ok();
+
+    fn seed(session_id: &str, wd: &Path, intent: &str) {
+        crate::todo::save_todos(
+            session_id,
+            &[crate::todo::TodoItem {
+                id: "t".into(),
+                content: format!("work for {intent}"),
+                status: "in_progress".into(),
+                priority: "high".into(),
+                group: None,
+                confidence: None,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        crate::todo::save_plan(
+            session_id,
+            &crate::todo::TodoPlan {
+                user_intention: Some(intent.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::handoff::capture(session_id, Some(wd), "closed", None).expect("capture");
+    }
+
+    seed("manual-handoff", wd, "manual intent");
+    std::thread::sleep(Duration::from_millis(20));
+    seed("auto-handoff", wd, "auto intent");
+
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
+    {
+        let mut guard = agent.lock().await;
+        guard.set_working_dir(wd.to_str().expect("utf8"));
+    }
+
+    // Set the manual override, then clear it with None.
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    handle_set_handoff_resume(21, Some("manual-handoff".to_string()), &agent, &tx).await;
+    assert!(
+        timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("Done")
+            .is_some_and(|e| matches!(e, ServerEvent::Done { id } if id == 21)),
+        "setting the override must reply Done"
+    );
+    handle_set_handoff_resume(22, None, &agent, &tx).await;
+    assert!(
+        timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("Done")
+            .is_some_and(|e| matches!(e, ServerEvent::Done { id } if id == 22)),
+        "clearing the override must reply Done"
+    );
+
+    // The override lived on `agent`, which is still a fresh conversation (no
+    // messages yet). Sending `None` cleared it, so this agent's first message
+    // must now use the automatic latest-for-project handoff.
+    let first_str = {
+        let mut guard = agent.lock().await;
+        guard
+            .append_user_context_message("resume", Vec::new())
+            .expect("first message");
+        let mut preview = String::new();
+        for message in guard.messages().iter().rev() {
+            if message.role == Role::User {
+                preview = message.content_preview();
+                break;
+            }
+        }
+        preview
+    };
+    assert!(
+        first_str.contains("auto intent") && !first_str.contains("manual intent"),
+        "after None the fresh conversation should use auto-inject, got: {first_str}"
+    );
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    Ok(())
+}
