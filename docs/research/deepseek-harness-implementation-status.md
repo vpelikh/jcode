@@ -82,13 +82,17 @@ policy and report so every consumer stays in lockstep.
   passed after the boundary fix, including replay and idempotence checks.
   Runtime evidence: `scheduled_prune_preserves_fresh_oversized_results_at_runtime`
   drives the real streaming loop through a bash tool call that returns a 6202-char
-  result and asserts that fresh oversized result survives the Point-D prune while
-  a consumed oversized image is replaced. This closes the loop-wiring coverage gap
+  result and asserts that fresh oversized result survives the loop-head prune
+  while a consumed oversized image is replaced. This closes the loop-wiring coverage gap
   end-to-end rather than relying only on the session-unit boundary test.
 - **Manual persistence and errors:** local and server `/prune` now save changes.
   A failed save reports an error instead of success, and a subsequent no-op
   retries persistence. Isolated temporary-home tests exercise real disk reloads,
   blocked storage paths, and the server handler's request-ID/error response.
+- **413-recovery persistence:** the HTTP request-too-large prune paths (TUI
+  manual + auto-retry, and server `try_recover_after_payload_too_large`) save
+  the pruned transcript immediately, so the mutation is not lost if the retry
+  is interrupted or the user does not resubmit.
 - **Stale provider sessions:** changes invalidate native provider session IDs
   and agent cache/tool state. Local TUI pruning clears its materialized message
   cache and reseeds the compaction view. The agent disk-reload regression checks
