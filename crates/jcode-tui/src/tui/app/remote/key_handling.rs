@@ -31,6 +31,32 @@ pub(in crate::tui::app) async fn send_interleave_now(
     }
 }
 
+/// Clear the client-side session state that accompanies a transcript discard.
+///
+/// Mirrors every cleanup `/clear` performs so callers that also discard the
+/// conversation (`/clear`, `/handoffres`) do not leave orphaned UI state (queued
+/// messages, pasted/pending content, inline images, streaming/live panes, swarm
+/// plan items, or side-panel pages) behind for the next message.
+fn clear_session_state_after_discard(app: &mut App) {
+    app.clear_provider_messages();
+    app.clear_display_messages();
+    app.queued_messages.clear();
+    app.pasted_contents.clear();
+    app.pending_images.clear();
+    app.clear_inline_image_state();
+    app.clear_streaming_render_state();
+    app.clear_live_usage_state();
+    // Full transcript discard orphanes diagrams and side-panel pages, matching
+    // the `/clear` rationale.
+    crate::tui::mermaid::clear_active_diagrams();
+    app.swarm_plan_items.clear();
+    app.swarm_plan_version = None;
+    app.swarm_plan_swarm_id = None;
+    app_mod::commands_review::clear_side_panel_for_new_session(app);
+    app.is_processing = false;
+    app.status = ProcessingStatus::Idle;
+}
+
 /// Set which saved handoff this session boots from on its first message.
 ///
 /// `/handoffres <session_id>` sets the override on the server. If the current
@@ -77,9 +103,7 @@ async fn handle_handoff_resume_command(
     let has_messages = !remote_rewindable_messages(app).is_empty();
     if has_messages {
         remote.clear().await?;
-        app.clear_provider_messages();
-        app.clear_display_messages();
-        app.is_processing = false;
+        clear_session_state_after_discard(app);
     }
     remote.set_handoff_resume(Some(selected)).await?;
     app.push_display_message(DisplayMessage::system(format!(
@@ -1865,24 +1889,7 @@ async fn handle_remote_key_internal(
 
                 if trimmed == "/clear" {
                     remote.clear().await?;
-                    app.clear_provider_messages();
-                    app.clear_display_messages();
-                    app.queued_messages.clear();
-                    app.pasted_contents.clear();
-                    app.pending_images.clear();
-                    app.clear_inline_image_state();
-                    app.clear_streaming_render_state();
-                    app.clear_live_usage_state();
-                    // Full transcript discard: diagrams and side panel pages
-                    // are both orphaned (same rationale as
-                    // reset_current_session; side panel is #605).
-                    crate::tui::mermaid::clear_active_diagrams();
-                    app.swarm_plan_items.clear();
-                    app.swarm_plan_version = None;
-                    app.swarm_plan_swarm_id = None;
-                    super::super::commands_review::clear_side_panel_for_new_session(app);
-                    app.is_processing = false;
-                    app.status = ProcessingStatus::Idle;
+                    clear_session_state_after_discard(app);
                     app.set_status_notice("Session cleared");
                     return Ok(());
                 }
@@ -2029,6 +2036,12 @@ async fn handle_remote_key_internal(
                 }
 
                 if trimmed == "/handoff-clear" || trimmed == "/handoffcancel" {
+                    if app.is_processing {
+                        app.push_display_message(DisplayMessage::error(
+                            "The agent is currently working. Wait for it to finish, then run /handoff-clear again.".to_string(),
+                        ));
+                        return Ok(());
+                    }
                     remote.set_handoff_resume(None).await?;
                     app.push_display_message(DisplayMessage::system(
                         "Handoff override cleared; automatic latest-for-project injection restored.".to_string(),
