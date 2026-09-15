@@ -1665,8 +1665,8 @@ impl Agent {
                 let pruned =
                     self.session
                         .prune_consumed_transcript(&crate::compaction::prune::PrunePolicy::node_caps_with(
-                            crate::config::config().compaction.prune_tool_result_max_chars,
-                            crate::config::config().compaction.prune_image_max_chars,
+                            crate::config::config().compaction.prune_tool_result_max_bytes,
+                            crate::config::config().compaction.prune_image_max_bytes,
                         ));
                 if !pruned.is_empty() {
                     self.note_compaction_applied();

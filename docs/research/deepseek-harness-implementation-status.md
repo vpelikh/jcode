@@ -55,7 +55,7 @@ policy and report so every consumer stays in lockstep.
   has consumed them at least once. No-op when within caps. In the streaming
   loop it is gated on `tool_results_dirty` so a pure-text step skips the scan.
 - **Configurable per-node caps.** `CompactionConfig` gains
-  `prune_tool_result_max_chars` / `prune_image_max_chars` (defaults 4000/1024,
+  `prune_tool_result_max_bytes` / `prune_image_max_bytes` (defaults 4000/1024,
   `#[serde(default)]` so existing configs parse) and `PrunePolicy::node_caps_with`
   builds the policy from them, falling back to the built-in defaults on zero.
   Wired at all 4 live call sites (`/prune`, agent, streaming Point-D, headless).

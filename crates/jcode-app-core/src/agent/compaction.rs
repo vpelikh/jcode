@@ -96,8 +96,8 @@ impl Agent {
         let report = self
             .session
             .prune_transcript(&crate::compaction::prune::PrunePolicy::node_caps_with(
-                crate::config::config().compaction.prune_tool_result_max_chars,
-                crate::config::config().compaction.prune_image_max_chars,
+                crate::config::config().compaction.prune_tool_result_max_bytes,
+                crate::config::config().compaction.prune_image_max_bytes,
             ));
         let message = if report.is_empty() {
             "Prune: nothing oversized to shrink (context already within per-node caps).".to_string()

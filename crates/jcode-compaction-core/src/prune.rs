@@ -66,16 +66,16 @@ impl PrunePolicy {
     /// Per-node caps from explicit values (e.g. loaded from config). Falls back
     /// to the built-in defaults when a value is zero. Keeps aggregate budgets
     /// off, exactly like [`Self::node_caps`], so it never performs surgery.
-    pub fn node_caps_with(tool_result_max_chars: usize, image_max_chars: usize) -> Self {
-        let tool_result_max_chars = if tool_result_max_chars == 0 {
+    pub fn node_caps_with(tool_result_max_bytes: usize, image_max_bytes: usize) -> Self {
+        let tool_result_max_chars = if tool_result_max_bytes == 0 {
             EMERGENCY_TOOL_RESULT_MAX_CHARS
         } else {
-            tool_result_max_chars
+            tool_result_max_bytes
         };
-        let image_max_chars = if image_max_chars == 0 {
+        let image_max_chars = if image_max_bytes == 0 {
             EMERGENCY_IMAGE_MAX_CHARS
         } else {
-            image_max_chars
+            image_max_bytes
         };
         Self {
             image_max_chars: Some(image_max_chars),

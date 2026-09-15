@@ -1143,25 +1143,30 @@ impl Agent {
 
             // Prune already-consumed history only. New results, images and
             // interrupts must reach the model once before becoming eligible.
-            let pruned =
-                self.session
-                    .prune_consumed_transcript(&crate::compaction::prune::PrunePolicy::node_caps_with(
-                        crate::config::config().compaction.prune_tool_result_max_chars,
-                        crate::config::config().compaction.prune_image_max_chars,
+            // Mirror the streaming loop's gate on tool_results_dirty so a
+            // pure-text step skips the scan (pure text cannot add oversized
+            // nodes); tool results are the sole source of per-step growth.
+            if tool_results_dirty {
+                let pruned =
+                    self.session
+                        .prune_consumed_transcript(&crate::compaction::prune::PrunePolicy::node_caps_with(
+                            crate::config::config().compaction.prune_tool_result_max_bytes,
+                            crate::config::config().compaction.prune_image_max_bytes,
+                        ));
+                if !pruned.is_empty() {
+                    self.note_compaction_applied();
+                    logging::info(&format!(
+                        "[prune] per-step shrink in headless turn for session {}: {} image(s), {} tool result(s)",
+                        self.session.id,
+                        pruned.images_stripped,
+                        pruned.tool_results_truncated,
                     ));
-            if !pruned.is_empty() {
-                self.note_compaction_applied();
-                logging::info(&format!(
-                    "[prune] per-step shrink in headless turn for session {}: {} image(s), {} tool result(s)",
-                    self.session.id,
-                    pruned.images_stripped,
-                    pruned.tool_results_truncated,
-                ));
-                if let Err(err) = self.session.save() {
-                    logging::warn(&format!(
-                        "Failed to persist per-step prune for session {}: {}",
-                        self.session.id, err
-                    ));
+                    if let Err(err) = self.session.save() {
+                        logging::warn(&format!(
+                            "Failed to persist per-step prune for session {}: {}",
+                            self.session.id, err
+                        ));
+                    }
                 }
             }
         }

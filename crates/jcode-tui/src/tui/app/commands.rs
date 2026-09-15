@@ -3812,8 +3812,8 @@ pub(super) fn handle_config_command(app: &mut App, trimmed: &str) -> bool {
         let report = app
             .session
             .prune_transcript(&crate::compaction::prune::PrunePolicy::node_caps_with(
-                crate::config::config().compaction.prune_tool_result_max_chars,
-                crate::config::config().compaction.prune_image_max_chars,
+                crate::config::config().compaction.prune_tool_result_max_bytes,
+                crate::config::config().compaction.prune_image_max_bytes,
             ));
         if !report.is_empty() {
             app.messages.clear();

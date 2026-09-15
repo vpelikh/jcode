@@ -383,15 +383,14 @@ pub struct CompactionConfig {
     pub goal_window_turns: usize,
 
     /// [prune] Per-tool-result UTF-8 byte cap for the deterministic prune stage.
-    /// The historical `_chars` field name is retained for configuration compatibility.
     /// A single tool result larger than this is truncated to its head+tail.
     /// (`PrunePolicy::node_caps` default.)
-    pub prune_tool_result_max_chars: usize,
+    pub prune_tool_result_max_bytes: usize,
 
-    /// [prune] Per-image base64 character cap for the deterministic prune stage.
+    /// [prune] Per-image base64 byte cap for the deterministic prune stage.
     /// A single inline image larger than this is replaced with a text marker.
     /// (`PrunePolicy::node_caps` default.)
-    pub prune_image_max_chars: usize,
+    pub prune_image_max_bytes: usize,
 }
 
 impl Default for CompactionConfig {
@@ -407,8 +406,8 @@ impl Default for CompactionConfig {
             topic_shift_threshold: 0.45,
             relevance_keep_threshold: 0.65,
             goal_window_turns: 5,
-            prune_tool_result_max_chars: 4000,
-            prune_image_max_chars: 1024,
+            prune_tool_result_max_bytes: 4000,
+            prune_image_max_bytes: 1024,
         }
     }
 }
