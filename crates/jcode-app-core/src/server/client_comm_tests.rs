@@ -3,7 +3,7 @@ use crate::agent::Agent;
 use crate::message::{Message, ToolDefinition};
 use crate::protocol::{CommDeliveryMode, NotificationType, ServerEvent};
 use crate::provider::{EventStream, Provider};
-use crate::server::services::SessionServiceHandle;
+use crate::server::services::{SessionServiceHandle, SwarmServiceHandle};
 use crate::server::{ClientConnectionInfo, SessionInterruptQueues, SwarmEvent, SwarmMember};
 use crate::tool::Registry;
 use anyhow::Result;
@@ -56,6 +56,38 @@ fn session_handle(
         is_processing: Arc::new(RwLock::new(false)),
         shutdown_signals: Arc::new(RwLock::new(HashMap::new())),
         soft_interrupt_queues,
+    }
+}
+
+/// A minimal swarm service handle for comm tests. The members/swarms/channel
+/// maps are shared so the code under test sees each test's seeded membership;
+/// the remaining state is inert defaults.
+fn swarm_handle(
+    swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>>,
+    swarms_by_id: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    channel_subscriptions: Arc<
+        RwLock<HashMap<String, HashMap<String, HashSet<String>>>>,
+    >,
+    event_history: Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
+    event_counter: Arc<AtomicU64>,
+    swarm_event_tx: broadcast::Sender<SwarmEvent>,
+) -> SwarmServiceHandle {
+    SwarmServiceHandle {
+        swarm_state: crate::server::SwarmState {
+            members: swarm_members,
+            swarms_by_id,
+            plans: Arc::new(RwLock::new(HashMap::new())),
+            coordinators: Arc::new(RwLock::new(HashMap::new())),
+        },
+        shared_context: Arc::new(RwLock::new(HashMap::new())),
+        file_touch: crate::server::FileTouchService::new(),
+        channel_subscriptions,
+        channel_subscriptions_by_session: Arc::new(RwLock::new(HashMap::new())),
+        event_history,
+        event_counter,
+        swarm_event_tx,
+        await_members_runtime: crate::server::AwaitMembersRuntime::default(),
+        swarm_mutation_runtime: crate::server::SwarmMutationRuntime::default(),
     }
 }
 
@@ -174,12 +206,14 @@ async fn comm_message_default_does_not_queue_soft_interrupt_for_connected_sessio
         None,
         &client_event_tx,
         &session_h,
-        &swarm_members,
-        &swarms_by_id,
-        &channel_subscriptions,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
+        &swarm_handle(
+            Arc::clone(&swarm_members),
+            Arc::clone(&swarms_by_id),
+            Arc::clone(&channel_subscriptions),
+            Arc::clone(&event_history),
+            Arc::clone(&event_counter),
+            swarm_event_tx.clone(),
+        ),
         &client_connections,
     )
     .await;
@@ -336,12 +370,14 @@ async fn comm_message_with_wake_queues_soft_interrupt_for_busy_connected_session
             None,
             &client_event_tx,
             &session_h,
-            &swarm_members,
-            &swarms_by_id,
-            &channel_subscriptions,
-            &event_history,
-            &event_counter,
-            &swarm_event_tx,
+            &swarm_handle(
+                Arc::clone(&swarm_members),
+                Arc::clone(&swarms_by_id),
+                Arc::clone(&channel_subscriptions),
+                Arc::clone(&event_history),
+                Arc::clone(&event_counter),
+                swarm_event_tx.clone(),
+            ),
             &client_connections,
         ),
     )
@@ -579,12 +615,14 @@ async fn comm_message_accepts_friendly_name_dm_target() {
         None,
         &client_event_tx,
         &session_h,
-        &swarm_members,
-        &swarms_by_id,
-        &channel_subscriptions,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
+        &swarm_handle(
+            Arc::clone(&swarm_members),
+            Arc::clone(&swarms_by_id),
+            Arc::clone(&channel_subscriptions),
+            Arc::clone(&event_history),
+            Arc::clone(&event_counter),
+            swarm_event_tx.clone(),
+        ),
         &client_connections,
     )
     .await;
@@ -743,12 +781,14 @@ async fn comm_message_rejects_ambiguous_friendly_name_dm_target() {
         None,
         &client_event_tx,
         &session_h,
-        &swarm_members,
-        &swarms_by_id,
-        &channel_subscriptions,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
+        &swarm_handle(
+            Arc::clone(&swarm_members),
+            Arc::clone(&swarms_by_id),
+            Arc::clone(&channel_subscriptions),
+            Arc::clone(&event_history),
+            Arc::clone(&event_counter),
+            swarm_event_tx.clone(),
+        ),
         &client_connections,
     )
     .await;
@@ -854,12 +894,14 @@ async fn comm_broadcast_reaches_only_senders_spawned_subtree() {
         None,
         &client_event_tx,
         &session_h,
-        &swarm_members,
-        &swarms_by_id,
-        &channel_subscriptions,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
+        &swarm_handle(
+            Arc::clone(&swarm_members),
+            Arc::clone(&swarms_by_id),
+            Arc::clone(&channel_subscriptions),
+            Arc::clone(&event_history),
+            Arc::clone(&event_counter),
+            swarm_event_tx.clone(),
+        ),
         &client_connections,
     )
     .await;
@@ -895,12 +937,14 @@ async fn comm_broadcast_reaches_only_senders_spawned_subtree() {
         None,
         &client_event_tx,
         &session_h,
-        &swarm_members,
-        &swarms_by_id,
-        &channel_subscriptions,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
+        &swarm_handle(
+            Arc::clone(&swarm_members),
+            Arc::clone(&swarms_by_id),
+            Arc::clone(&channel_subscriptions),
+            Arc::clone(&event_history),
+            Arc::clone(&event_counter),
+            swarm_event_tx.clone(),
+        ),
         &client_connections,
     )
     .await;

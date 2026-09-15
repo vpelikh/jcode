@@ -51,6 +51,35 @@ fn session_handle_for_test(
     }
 }
 
+/// A minimal swarm service handle for tests. The members/swarms maps are shared
+/// so the code under test sees each test's seeded membership; the remaining
+/// state is inert defaults.
+fn swarm_handle(
+    swarm_members: Arc<RwLock<HashMap<String, crate::server::SwarmMember>>>,
+    swarms_by_id: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    event_history: Arc<RwLock<VecDeque<crate::server::SwarmEvent>>>,
+    event_counter: Arc<std::sync::atomic::AtomicU64>,
+    swarm_event_tx: tokio::sync::broadcast::Sender<crate::server::SwarmEvent>,
+) -> crate::server::services::SwarmServiceHandle {
+    crate::server::services::SwarmServiceHandle {
+        swarm_state: crate::server::SwarmState {
+            members: swarm_members,
+            swarms_by_id,
+            plans: Arc::new(RwLock::new(HashMap::new())),
+            coordinators: Arc::new(RwLock::new(HashMap::new())),
+        },
+        shared_context: Arc::new(RwLock::new(HashMap::new())),
+        file_touch: crate::server::FileTouchService::new(),
+        channel_subscriptions: Arc::new(RwLock::new(HashMap::new())),
+        channel_subscriptions_by_session: Arc::new(RwLock::new(HashMap::new())),
+        event_history,
+        event_counter,
+        swarm_event_tx,
+        await_members_runtime: crate::server::AwaitMembersRuntime::default(),
+        swarm_mutation_runtime: crate::server::SwarmMutationRuntime::default(),
+    }
+}
+
 struct MockProvider;
 
 #[derive(Clone, Default)]
@@ -598,11 +627,13 @@ async fn notify_session_runs_scheduled_task_immediately_for_idle_live_session() 
         NotifySessionContext {
             session: &session_service,
             client_connections: &client_connections,
-            swarm_members: &swarm_members,
-            swarms_by_id: &swarms_by_id,
-            event_history: &event_history,
-            event_counter: &event_counter,
-            swarm_event_tx: &swarm_event_tx,
+            swarm: &swarm_handle(
+                Arc::clone(&swarm_members),
+                Arc::clone(&swarms_by_id),
+                Arc::clone(&event_history),
+                Arc::clone(&event_counter),
+                swarm_event_tx.clone(),
+            ),
             client_event_tx: &client_event_tx,
         },
     )
@@ -722,11 +753,13 @@ async fn notify_session_queues_soft_interrupt_when_live_session_is_busy() {
         NotifySessionContext {
             session: &session_service,
             client_connections: &client_connections,
-            swarm_members: &swarm_members,
-            swarms_by_id: &swarms_by_id,
-            event_history: &event_history,
-            event_counter: &event_counter,
-            swarm_event_tx: &swarm_event_tx,
+            swarm: &swarm_handle(
+                Arc::clone(&swarm_members),
+                Arc::clone(&swarms_by_id),
+                Arc::clone(&event_history),
+                Arc::clone(&event_counter),
+                swarm_event_tx.clone(),
+            ),
             client_event_tx: &client_event_tx,
         },
     )
@@ -838,11 +871,13 @@ async fn resume_all_continues_interrupted_idle_live_session() {
     handle_resume_all_sessions(
         91,
         &sessions,
-        &swarm_members,
-        &swarms_by_id,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
+        &swarm_handle(
+            Arc::clone(&swarm_members),
+            Arc::clone(&swarms_by_id),
+            Arc::clone(&event_history),
+            Arc::clone(&event_counter),
+            swarm_event_tx.clone(),
+        ),
         &client_event_tx,
     )
     .await;
@@ -940,11 +975,13 @@ async fn resume_all_skips_session_with_completed_turn() {
     handle_resume_all_sessions(
         92,
         &sessions,
-        &swarm_members,
-        &swarms_by_id,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
+        &swarm_handle(
+            Arc::clone(&swarm_members),
+            Arc::clone(&swarms_by_id),
+            Arc::clone(&event_history),
+            Arc::clone(&event_counter),
+            swarm_event_tx.clone(),
+        ),
         &client_event_tx,
     )
     .await;

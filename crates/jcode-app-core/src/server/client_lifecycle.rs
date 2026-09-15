@@ -1852,11 +1852,7 @@ pub(super) async fn handle_client(
                 super::client_actions::handle_resume_all_sessions(
                     id,
                     &sessions,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
+                    &swarm_service_handle,
                     &client_event_tx,
                 )
                 .await;
@@ -2134,11 +2130,7 @@ pub(super) async fn handle_client(
                     NotifySessionContext {
                         session: &session_service_handle,
                         client_connections: &client_connections,
-                        swarm_members: &swarm_members,
-                        swarms_by_id: &swarms_by_id,
-                        event_history: &event_history,
-                        event_counter: &event_counter,
-                        swarm_event_tx: &swarm_event_tx,
+                        swarm: &swarm_service_handle,
                         client_event_tx: &client_event_tx,
                     },
                 )
@@ -2241,12 +2233,7 @@ pub(super) async fn handle_client(
                     tldr,
                     &client_event_tx,
                     &session_service_handle,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &channel_subscriptions,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
+                    &swarm_service_handle,
                     &client_connections,
                 )
                 .await;

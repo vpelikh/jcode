@@ -698,12 +698,12 @@ async fn wake_turn_holds_reservation_until_terminal_status_is_published() {
     let member = attached_swarm_member(&session_id, member_event_tx);
     let swarm_members = Arc::new(RwLock::new(HashMap::from([(session_id.clone(), member)])));
     let (swarms_by_id, event_history, event_counter, swarm_event_tx) = empty_swarm_status_state();
-    let ctx = super::live_turn::LiveTurnSwarmContext::new(
-        &swarm_members,
-        &swarms_by_id,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
+    let swarm = test_swarm_service_handle(
+        Arc::clone(&swarm_members),
+        Arc::clone(&swarms_by_id),
+        Arc::clone(&event_history),
+        Arc::clone(&event_counter),
+        swarm_event_tx.clone(),
     );
 
     let started = super::live_turn::run_live_turn_if_idle(
@@ -711,7 +711,7 @@ async fn wake_turn_holds_reservation_until_terminal_status_is_published() {
         "first wake",
         None,
         &sessions,
-        ctx.clone(),
+        &swarm,
     )
     .await;
     assert!(started);
@@ -784,12 +784,12 @@ async fn wake_turn_tracks_member_status_and_emits_terminal_done() {
         "DM from coordinator: please respond",
         Some("You received a direct swarm message.".to_string()),
         &sessions,
-        super::live_turn::LiveTurnSwarmContext::new(
-            &swarm_members,
-            &swarms_by_id,
-            &event_history,
-            &event_counter,
-            &swarm_event_tx,
+        &test_swarm_service_handle(
+            Arc::clone(&swarm_members),
+            Arc::clone(&swarms_by_id),
+            Arc::clone(&event_history),
+            Arc::clone(&event_counter),
+            swarm_event_tx.clone(),
         ),
     )
     .await;

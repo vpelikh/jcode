@@ -1,4 +1,4 @@
-use super::live_turn::{LiveTurnSwarmContext, run_live_turn_if_idle};
+use super::live_turn::run_live_turn_if_idle;
 use super::services::{SessionServiceHandle, SwarmServiceHandle};
 use super::{SwarmMember, fanout_session_event};
 use crate::message::{
@@ -39,10 +39,6 @@ pub(super) async fn dispatch_background_task_completion(
 ) {
     let sessions = &session.sessions;
     let swarm_members = &swarm.swarm_state.members;
-    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
-    let event_history = &swarm.event_history;
-    let event_counter = &swarm.event_counter;
-    let swarm_event_tx = &swarm.swarm_event_tx;
     let notification = format_background_task_notification_markdown(task);
 
     if task.notify
@@ -85,13 +81,7 @@ pub(super) async fn dispatch_background_task_completion(
                     .to_string(),
             ),
             sessions,
-            LiveTurnSwarmContext::new(
-                swarm_members,
-                swarms_by_id,
-                event_history,
-                event_counter,
-                swarm_event_tx,
-            ),
+            swarm,
         )
         .await
         && !session
@@ -122,10 +112,6 @@ pub(super) async fn dispatch_background_task_stalled(
 ) {
     let sessions = &session.sessions;
     let swarm_members = &swarm.swarm_state.members;
-    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
-    let event_history = &swarm.event_history;
-    let event_counter = &swarm.event_counter;
-    let swarm_event_tx = &swarm.swarm_event_tx;
     let notification = crate::message::format_background_task_stalled_markdown(task);
 
     if task.notify
@@ -168,13 +154,7 @@ pub(super) async fn dispatch_background_task_stalled(
                     .to_string(),
             ),
             sessions,
-            LiveTurnSwarmContext::new(
-                swarm_members,
-                swarms_by_id,
-                event_history,
-                event_counter,
-                swarm_event_tx,
-            ),
+            swarm,
         )
         .await
         && !session
@@ -204,10 +184,6 @@ pub(super) async fn dispatch_swarm_await_completion(
 ) {
     let sessions = &session.sessions;
     let swarm_members = &swarm.swarm_state.members;
-    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
-    let event_history = &swarm.event_history;
-    let event_counter = &swarm.event_counter;
-    let swarm_event_tx = &swarm.swarm_event_tx;
     if event.notify
         && fanout_session_event(
             swarm_members,
@@ -255,13 +231,7 @@ pub(super) async fn dispatch_swarm_await_completion(
                 .to_string(),
         ),
         sessions,
-        LiveTurnSwarmContext::new(
-            swarm_members,
-            swarms_by_id,
-            event_history,
-            event_counter,
-            swarm_event_tx,
-        ),
+        swarm,
     )
     .await
         && !session

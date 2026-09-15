@@ -3,7 +3,7 @@
 use super::client_lifecycle::process_message_streaming_mpsc;
 use super::services::{SessionServiceHandle, SwarmServiceHandle};
 use super::{
-    ClientConnectionInfo, SwarmEvent, SwarmMember, SwarmState,
+    ClientConnectionInfo, SwarmMember, SwarmState,
     fanout_session_event, persist_swarm_state_for, swarm_id_for_session,
     truncate_detail,
 };
@@ -17,7 +17,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::process::Command;
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 
 type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
 
@@ -81,11 +81,7 @@ fn combine_input_shell_output(stdout: &[u8], stderr: &[u8]) -> (String, bool) {
 pub(super) struct NotifySessionContext<'a> {
     pub session: &'a SessionServiceHandle,
     pub client_connections: &'a Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
-    pub swarm_members: &'a Arc<RwLock<HashMap<String, SwarmMember>>>,
-    pub swarms_by_id: &'a Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    pub event_history: &'a Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    pub event_counter: &'a Arc<std::sync::atomic::AtomicU64>,
-    pub swarm_event_tx: &'a broadcast::Sender<SwarmEvent>,
+    pub swarm: &'a SwarmServiceHandle,
     pub client_event_tx: &'a mpsc::UnboundedSender<ServerEvent>,
 }
 
@@ -108,13 +104,7 @@ pub(super) async fn handle_notify_session(
             &session_id,
             &message,
             sessions,
-            super::live_turn::LiveTurnSwarmContext::new(
-                ctx.swarm_members,
-                ctx.swarms_by_id,
-                ctx.event_history,
-                ctx.event_counter,
-                ctx.swarm_event_tx,
-            ),
+            ctx.swarm,
         )
         .await
     } else {
@@ -124,11 +114,11 @@ pub(super) async fn handle_notify_session(
     let notified = if ran_immediately {
         false
     } else {
-        let members = ctx.swarm_members.read().await;
+        let members = ctx.swarm.swarm_state.members.read().await;
         if members.contains_key(&session_id) {
             drop(members);
             fanout_session_event(
-                ctx.swarm_members,
+                &ctx.swarm.swarm_state.members,
                 &session_id,
                 ServerEvent::Notification {
                     from_session: "schedule".to_string(),
@@ -1036,23 +1026,15 @@ fn live_session_owes_continuation(agent: &Agent) -> bool {
 /// the currently-live sessions, and for each idle one that still owes the model
 /// a continuation, injects the standard "continue where you left off" reminder
 /// so the session picks back up without the user having to open each one.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "resuming live sessions needs session, swarm membership, and status event state"
-)]
 pub(super) async fn handle_resume_all_sessions(
     id: u64,
     sessions: &SessionAgents,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
+    swarm: &SwarmServiceHandle,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
     // Snapshot live sessions (those with at least one live client attachment).
     let live_session_ids: Vec<String> = {
-        let members = swarm_members.read().await;
+        let members = swarm.swarm_state.members.read().await;
         members
             .iter()
             .filter(|(_, member)| !member.event_txs.is_empty() || !member.event_tx.is_closed())
@@ -1113,13 +1095,7 @@ pub(super) async fn handle_resume_all_sessions(
             Some(reminder),
             None,
             Some("resuming interrupted session".to_string()),
-            super::live_turn::LiveTurnSwarmContext::new(
-                swarm_members,
-                swarms_by_id,
-                event_history,
-                event_counter,
-                swarm_event_tx,
-            ),
+            swarm.clone(),
         )
         .await;
 

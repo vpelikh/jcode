@@ -14,47 +14,15 @@
 //! started turn in their UI.
 
 use super::client_lifecycle::process_locked_message_streaming_mpsc;
-use super::{
-    SwarmEvent, SwarmMember, session_event_fanout_sender, truncate_detail, update_member_status,
-    update_member_status_with_report,
-};
+use super::services::SwarmServiceHandle;
+use super::{SwarmMember, session_event_fanout_sender, truncate_detail};
 use crate::agent::Agent;
 use crate::protocol::ServerEvent;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
-use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, broadcast};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
 type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
-
-/// Swarm bookkeeping handles needed to keep member status accurate around a
-/// server-initiated turn.
-#[derive(Clone)]
-pub(super) struct LiveTurnSwarmContext {
-    pub members: Arc<RwLock<HashMap<String, SwarmMember>>>,
-    pub swarms_by_id: Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    pub event_history: Arc<RwLock<VecDeque<SwarmEvent>>>,
-    pub event_counter: Arc<AtomicU64>,
-    pub event_tx: broadcast::Sender<SwarmEvent>,
-}
-
-impl LiveTurnSwarmContext {
-    pub(super) fn new(
-        members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-        swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-        event_history: &Arc<RwLock<VecDeque<SwarmEvent>>>,
-        event_counter: &Arc<AtomicU64>,
-        event_tx: &broadcast::Sender<SwarmEvent>,
-    ) -> Self {
-        Self {
-            members: Arc::clone(members),
-            swarms_by_id: Arc::clone(swarms_by_id),
-            event_history: Arc::clone(event_history),
-            event_counter: Arc::clone(event_counter),
-            event_tx: event_tx.clone(),
-        }
-    }
-}
 
 /// Reserve the live agent for `session_id` when the session has at least one
 /// live client attachment and its agent is currently idle.
@@ -100,21 +68,16 @@ pub(super) async fn spawn_tracked_live_turn(
     system_reminder: Option<String>,
     display_role: Option<crate::session::StoredDisplayRole>,
     status_detail: Option<String>,
-    swarm: LiveTurnSwarmContext,
+    swarm: SwarmServiceHandle,
 ) {
-    update_member_status(
-        session_id,
-        "running",
-        status_detail,
-        &swarm.members,
-        &swarm.swarms_by_id,
-        Some(&swarm.event_history),
-        Some(&swarm.event_counter),
-        Some(&swarm.event_tx),
-    )
-    .await;
+    swarm
+        .set_member_status(session_id, "running", status_detail)
+        .await;
 
-    let event_tx = session_event_fanout_sender(session_id.to_string(), Arc::clone(&swarm.members));
+    let event_tx = session_event_fanout_sender(
+        session_id.to_string(),
+        Arc::clone(&swarm.swarm_state.members),
+    );
     let session_id = session_id.to_string();
     tokio::spawn(async move {
         let start_message_index = agent.message_count();
@@ -150,18 +113,9 @@ pub(super) async fn spawn_tracked_live_turn(
         let reservation = agent;
         match result {
             Ok(()) => {
-                update_member_status_with_report(
-                    &session_id,
-                    "ready",
-                    None,
-                    completion_report,
-                    &swarm.members,
-                    &swarm.swarms_by_id,
-                    Some(&swarm.event_history),
-                    Some(&swarm.event_counter),
-                    Some(&swarm.event_tx),
-                )
-                .await;
+                swarm
+                    .set_member_status_with_report(&session_id, "ready", None, completion_report)
+                    .await;
                 let _ = event_tx.send(ServerEvent::Done { id: 0 });
             }
             Err(error) => {
@@ -169,17 +123,13 @@ pub(super) async fn spawn_tracked_live_turn(
                     "Server-initiated turn failed for live session {}: {}",
                     session_id, error
                 ));
-                update_member_status(
-                    &session_id,
-                    "failed",
-                    Some(truncate_detail(&error.to_string(), 120)),
-                    &swarm.members,
-                    &swarm.swarms_by_id,
-                    Some(&swarm.event_history),
-                    Some(&swarm.event_counter),
-                    Some(&swarm.event_tx),
-                )
-                .await;
+                swarm
+                    .set_member_status(
+                        &session_id,
+                        "failed",
+                        Some(truncate_detail(&error.to_string(), 120)),
+                    )
+                    .await;
                 let _ = event_tx.send(ServerEvent::Error {
                     id: 0,
                     message: crate::util::format_error_chain(&error),
@@ -198,9 +148,9 @@ pub(super) async fn run_live_turn_if_idle(
     message: &str,
     system_reminder: Option<String>,
     sessions: &SessionAgents,
-    swarm: LiveTurnSwarmContext,
+    swarm: &SwarmServiceHandle,
 ) -> bool {
-    let Some(agent) = idle_live_agent(session_id, sessions, &swarm.members).await else {
+    let Some(agent) = idle_live_agent(session_id, sessions, &swarm.swarm_state.members).await else {
         return false;
     };
     let detail = Some(truncate_detail(message, 120)).filter(|detail| !detail.is_empty());
@@ -211,7 +161,7 @@ pub(super) async fn run_live_turn_if_idle(
         system_reminder,
         None,
         detail,
-        swarm,
+        swarm.clone(),
     )
     .await;
     true
@@ -221,9 +171,9 @@ pub(super) async fn run_live_system_turn_if_idle(
     session_id: &str,
     message: &str,
     sessions: &SessionAgents,
-    swarm: LiveTurnSwarmContext,
+    swarm: &SwarmServiceHandle,
 ) -> bool {
-    let Some(agent) = idle_live_agent(session_id, sessions, &swarm.members).await else {
+    let Some(agent) = idle_live_agent(session_id, sessions, &swarm.swarm_state.members).await else {
         return false;
     };
     let detail = Some(truncate_detail(message, 120)).filter(|detail| !detail.is_empty());
@@ -234,7 +184,7 @@ pub(super) async fn run_live_system_turn_if_idle(
         None,
         Some(crate::session::StoredDisplayRole::System),
         detail,
-        swarm,
+        swarm.clone(),
     )
     .await;
     true

@@ -731,8 +731,29 @@ call-site migrations with tests green after each.
 
 The remaining free-function call sites for `update_member_status` /
 `broadcast_swarm_status` in `comm_control.rs`, `comm_session.rs`, and
-`headless.rs` are still open; as is the
-`LiveTurnSwarmContext` flat-field wrapper (its callers in `background_tasks.rs`,
-`client_comm_message.rs`, `client_actions.rs`, and `tests.rs` do not yet carry a
-handle, so converting it would cascade). They remain separate, mechanical
-follow-ups per the "cosmetic, high-churn" note above.
+`headless.rs` are still open.
+
+The `LiveTurnSwarmContext` flat-field wrapper is now closed. **Slice landed
+(2026-09):** the wrapper is gone from `live_turn.rs` — callers pass
+`&SwarmServiceHandle` / an owned (cloned) `SwarmServiceHandle` instead of the
+flat 5-field `members` + `swarms_by_id` + `event_history` + `event_counter` +
+`event_tx` context, and `spawn_tracked_live_turn` routes both the `running`
+pre-turn and the terminal `ready`/`failed` updates through
+`set_member_status` / `set_member_status_with_report`. The three wake-entry
+helpers (`spawn_tracked_live_turn`, `run_live_turn_if_idle`,
+`run_live_system_turn_if_idle`) take the handle. Callers migrated:
+`background_tasks.rs` (3 dispatch sites pass their existing `swarm`),
+`client_actions.rs::handle_notify_session` (NotifySessionContext collapses its
+flat swarm fields onto `swarm: &SwarmServiceHandle`),
+`client_actions.rs::handle_resume_all_sessions` (collapses its flat 5-arg swarm
+bag onto `&SwarmServiceHandle`, dropping the now-satisfied
+`too_many_arguments` expect), `client_comm_message.rs::handle_comm_message`
+(collapses its flat 5-arg swarm bag onto `&SwarmServiceHandle`, binding the
+members/swarms/channel maps as body locals and routing the final
+`record_swarm_event` through `swarm.record_swarm_event`, dropping the
+`ChannelSubscriptions` alias and `broadcast`/`HashSet` imports), and their
+routers `client_lifecycle.rs` / `client_lightweight_control.rs` plus the
+`tests.rs` / `client_comm_tests.rs` / `client_actions_tests.rs` harnesses
+(which build a `SwarmServiceHandle`). Zero behavior change; the server suite
+stays green (463 passing) including both role-assignment tests and the live-turn
+reservation/status tests.
