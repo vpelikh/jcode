@@ -11,7 +11,8 @@ a fresh session's first message receives the saved handoff exactly once.
 Live model continuation was exercised end to end with a working provider: a
 fresh session recovered the exact pending marker from the saved handoff.
 
-**Planned:** remote fallback.
+**Planned:** wire the new import/export portability into remote fallback (and the
+interactive `/handoff` overlay remains an open enhancement).
 
 ## Purpose
 
@@ -30,8 +31,9 @@ can use on its first turn.
   and a `/handoffres <session_id>` command that boots a fresh conversation from
   a selected handoff, overriding the automatic latest-for-project injection.
 
-Manual selection is implemented. Snapshot pruning is implemented. Remote
-fallback remains future work.
+Manual selection is implemented. Snapshot pruning is implemented. Portability
+(export/import for remote adoption) is implemented as the foundation for the
+remote-fallback future work, which remains open.
 
 ## Lifecycle
 
@@ -111,6 +113,22 @@ Live handoffs — the latest per project that the index still references — are
 never pruned, even if old. Only superseded (archived) snapshots are eligible.
 Pruning is best-effort: unreadable or missing files are ignored and a missing
 store is a no-op, so it never breaks capture.
+
+### Portability (export / import)
+
+`handoff::export_handoff(id)` serializes a saved snapshot into a portable JSON
+payload, and `handoff::import_handoff(payload, working_dir, disposition)`
+adopts one on another host. This is the foundation for the remote-fallback
+future work, letting a captured snapshot be shipped to a target host and become
+the live handoff for that host's project.
+
+Import is intentionally explicit and retirement-safe: it rekeys the snapshot to
+the caller's working-directory project, writes it under a fresh `import-<uuid>`
+session id, and registers it as that project's latest handoff in the index. A
+blanket on-disk scan was rejected precisely because it cannot distinguish a
+genuinely-remote handoff file from a *retired* local snapshot (whose file must
+never reinject). Because import mints a new id and deliberately indexes the
+snapshot, it never resurrects a retired source session.
 
 ## Project identity
 
@@ -217,15 +235,17 @@ auto-inject instead of booting context-less, and the stale id is consumed), the
 auto-inject; unknown id replies `Error`; `None` restores auto-injection), a
 no-regression guard that a manual selection does not disturb the default, the
 TUI local `/handoff` fallback (surfaces archived handoffs; `/handoffres`
-explains a server is needed), and snapshot pruning (per-project archived count
-cap, archived age cap, live handoffs never pruned, and per-project scoping).
-Tests use temporary storage and restore the prior
-environment.
+explains a server is needed), snapshot pruning (per-project archived count
+cap, archived age cap, live handoffs never pruned, and per-project scoping),
+and portability (export/import round trip adopts a remote snapshot and makes it
+injectable, malformed payloads are rejected, and import mints a fresh id so a
+retired source is never resurrected). Tests use temporary storage and restore
+the prior environment.
 
 ## Future work
 
-- Optional fallback after a failed live-session migration, using handoff files
-  already available on the target host.
+- Wire `import_handoff` into the remote-fallback flow after a failed live-session
+  migration, consuming handoff files already available on the target host.
 
 ## Relationship to remote handoff
 

@@ -1011,3 +1011,96 @@ fn prune_is_scoped_per_project() {
         "project A keeps only its archived cap"
     );
 }
+
+/// export_handoff serializes a saved snapshot; importing it on another host
+/// rekeys it to the local project, registers it in the index, and makes it
+/// injectable — the deliberate, retirement-safe form of the plan's
+/// remote-adoption future work.
+#[test]
+fn export_import_round_trip_adopts_remote_handoff() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let src_home = env._home.path();
+    let src = src_home.join("src");
+    std::fs::create_dir_all(&src).ok();
+    let target = src_home.join("target");
+    std::fs::create_dir_all(&target).ok();
+
+    // Capture an open-work handoff on the "source" host.
+    crate::todo::save_todos(
+        "remote-session",
+        &[TodoItem {
+            id: "t".into(),
+            content: "finish the split".into(),
+            status: "in_progress".into(),
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    crate::todo::save_plan(
+        "remote-session",
+        &crate::todo::TodoPlan {
+            user_intention: Some("resume the split".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    capture("remote-session", Some(&src), "closed", None).unwrap();
+
+    // Export it, then "ship" to a different host/project and adopt it.
+    let payload = export_handoff("remote-session").expect("export");
+    let imported = import_handoff(&payload, Some(&target), "closed").expect("import");
+    assert!(imported.starts_with("import-"), "fresh session id");
+
+    let snap = load_snapshot(&imported).expect("adopted snapshot on disk");
+    assert_eq!(snap.intent.as_deref(), Some("resume the split"));
+    assert_eq!(snap.open_todos.len(), 1);
+    // Re-keyed to the target project.
+    let target_key = project_key(Some(&target)).unwrap();
+    assert_eq!(snap.project_key, target_key);
+
+    // Registered in the index and automatically injectable on the target.
+    assert_eq!(
+        latest_handoff_for_project(Some(&target)).as_deref(),
+        Some(imported.as_str()),
+        "imported handoff becomes the latest for the target project"
+    );
+    let boot = render_boot_context(Some(&target)).expect("boot from import");
+    assert!(boot.contains("resume the split"));
+}
+
+/// Import rejects malformed payloads and never creates anything.
+#[test]
+fn import_rejects_malformed_payload() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let cwd = env._home.path();
+    std::fs::create_dir_all(&cwd).ok();
+    assert!(import_handoff("{{{ not json", Some(&cwd), "closed").is_none());
+    assert!(list_all_handoffs().is_empty(), "nothing adopted on garbage");
+}
+
+/// Import mints a fresh session id, so a retired source id is never
+/// resurrected by adoption: the imported snapshot is a distinct live entry.
+#[test]
+fn import_mints_fresh_id_and_does_not_resurrect_retired() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let cwd = env._home.path();
+    std::fs::create_dir_all(&cwd).ok();
+    let key = project_key(Some(&cwd)).unwrap();
+
+    // A snapshot whose id is no longer in the index (retired).
+    write_snapshot(&fixture("retired", &key)).unwrap();
+    crate::storage::write_json_fast(
+        &index_path().unwrap(),
+        &HandoffIndex { latest: Vec::new() },
+    )
+    .unwrap();
+
+    let payload = export_handoff("retired").expect("export");
+    let imported = import_handoff(&payload, Some(&cwd), "closed").unwrap();
+    assert_ne!(imported, "retired", "import must mint a fresh id");
+    // The original retired id is not re-registered.
+    assert!(latest_handoff_for_project(Some(&cwd)).as_deref() != Some("retired"));
+}
