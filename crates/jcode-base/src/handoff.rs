@@ -646,6 +646,30 @@ fn prune_archived_snapshots_locked() {
             "[handoff] pruned {removed} archived handoff snapshot(s)"
         ));
     }
+    // Reconcile the index: drop any latest-entry whose snapshot file no longer
+    // exists (e.g. deleted out-of-band), so `list_saved_handoffs` never shows a
+    // dangling row pointing at a missing file. Runs under the store lock.
+    reconcile_dangling_index_entries();
+}
+
+/// Drop index `latest` entries whose snapshot file is missing on disk.
+///
+/// Normally the index and the snapshot directory stay in sync (pruning never
+/// deletes a live/latest file, and retire keeps the archived file). But a file
+/// can disappear out-of-band (manual delete, earlier process crash between
+/// index and file write, a concurrent sweep). Without reconciliation
+/// `list_saved_handoffs` surface a row whose `/handoffres` finds nothing.
+fn reconcile_dangling_index_entries() {
+    let mut index = load_index();
+    let before = index.latest.len();
+    index
+        .latest
+        .retain(|entry| load_snapshot(&entry.session_id).is_some());
+    if index.latest.len() != before
+        && let Ok(path) = index_path()
+    {
+        let _ = crate::storage::write_json_fast(&path, &index);
+    }
 }
 
 /// Run the archived-snapshot retention sweep once at host startup.
