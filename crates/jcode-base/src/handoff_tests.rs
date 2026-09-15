@@ -1076,7 +1076,7 @@ fn import_rejects_malformed_payload() {
     let env = HandoffTestEnv::new();
     let cwd = env._home.path();
     std::fs::create_dir_all(&cwd).ok();
-    assert!(import_handoff("{{{ not json", Some(&cwd), "closed").is_none());
+    assert!(import_handoff("{{{ not json", Some(cwd), "closed").is_none());
     assert!(list_all_handoffs().is_empty(), "nothing adopted on garbage");
 }
 
@@ -1087,8 +1087,8 @@ fn import_mints_fresh_id_and_does_not_resurrect_retired() {
     let _guard = crate::storage::lock_test_env();
     let env = HandoffTestEnv::new();
     let cwd = env._home.path();
-    std::fs::create_dir_all(&cwd).ok();
-    let key = project_key(Some(&cwd)).unwrap();
+    std::fs::create_dir_all(cwd).ok();
+    let key = project_key(Some(cwd)).unwrap();
 
     // A snapshot whose id is no longer in the index (retired).
     write_snapshot(&fixture("retired", &key)).unwrap();
@@ -1099,10 +1099,10 @@ fn import_mints_fresh_id_and_does_not_resurrect_retired() {
     .unwrap();
 
     let payload = export_handoff("retired").expect("export");
-    let imported = import_handoff(&payload, Some(&cwd), "closed").unwrap();
+    let imported = import_handoff(&payload, Some(cwd), "closed").unwrap();
     assert_ne!(imported, "retired", "import must mint a fresh id");
     // The original retired id is not re-registered.
-    assert!(latest_handoff_for_project(Some(&cwd)).as_deref() != Some("retired"));
+    assert!(latest_handoff_for_project(Some(cwd)).as_deref() != Some("retired"));
 }
 
 /// Validation: importing an OLDER snapshot for a project that already has a
@@ -1196,12 +1196,12 @@ fn import_uses_readable_session_id() {
     let _guard = crate::storage::lock_test_env();
     let env = HandoffTestEnv::new();
     let cwd = env._home.path();
-    std::fs::create_dir_all(&cwd).ok();
-    let key = project_key(Some(&cwd)).unwrap();
+    std::fs::create_dir_all(cwd).ok();
+    let key = project_key(Some(cwd)).unwrap();
 
     write_snapshot(&fixture("chatty-session-42", &key)).unwrap();
     let payload = export_handoff("chatty-session-42").expect("export");
-    let imported = import_handoff(&payload, Some(&cwd), "closed").unwrap();
+    let imported = import_handoff(&payload, Some(cwd), "closed").unwrap();
 
     assert_eq!(
         imported, "import-chatty-session-42",
@@ -1217,14 +1217,14 @@ fn import_disambiguates_colliding_readable_id() {
     let _guard = crate::storage::lock_test_env();
     let env = HandoffTestEnv::new();
     let cwd = env._home.path();
-    std::fs::create_dir_all(&cwd).ok();
-    let key = project_key(Some(&cwd)).unwrap();
+    std::fs::create_dir_all(cwd).ok();
+    let key = project_key(Some(cwd)).unwrap();
 
     write_snapshot(&fixture("shared", &key)).unwrap();
     let payload = export_handoff("shared").expect("export");
 
-    let first = import_handoff(&payload, Some(&cwd), "closed").unwrap();
-    let second = import_handoff(&payload, Some(&cwd), "closed").unwrap();
+    let first = import_handoff(&payload, Some(cwd), "closed").unwrap();
+    let second = import_handoff(&payload, Some(cwd), "closed").unwrap();
     assert_eq!(first, "import-shared", "first import takes the readable id");
     assert_ne!(first, second, "second import must not collide");
     assert!(
@@ -1242,8 +1242,8 @@ fn import_sanitizes_pathological_source_id() {
     let _guard = crate::storage::lock_test_env();
     let env = HandoffTestEnv::new();
     let cwd = env._home.path();
-    std::fs::create_dir_all(&cwd).ok();
-    let key = project_key(Some(&cwd)).unwrap();
+    std::fs::create_dir_all(cwd).ok();
+    let key = project_key(Some(cwd)).unwrap();
     let pathological = "Weird.Session/NAME!";
     // Build a payload carrying a pathological source id (simulating an
     // out-of-band handoff whose id the regular file_path validation would
@@ -1253,7 +1253,7 @@ fn import_sanitizes_pathological_source_id() {
         snap.session_id = pathological.into();
         serde_json::to_string(&snap).unwrap()
     };
-    let imported = import_handoff(&payload, Some(&cwd), "closed").unwrap();
+    let imported = import_handoff(&payload, Some(cwd), "closed").unwrap();
     assert!(imported.starts_with("import-"), "sane prefix");
     // The stem is sanitized: lowercase + safe [a-z0-9_-] only.
     assert_eq!(
@@ -1391,14 +1391,14 @@ fn import_rejects_empty_open_todos() {
     let _guard = crate::storage::lock_test_env();
     let env = HandoffTestEnv::new();
     let cwd = env._home.path();
-    std::fs::create_dir_all(&cwd).ok();
+    std::fs::create_dir_all(cwd).ok();
 
     let mut empty = fixture("empty", "git:https://example.com/e.git");
     empty.open_todos = Vec::new();
     let payload = serde_json::to_string(&empty).unwrap();
 
     assert!(
-        import_handoff(&payload, Some(&cwd), "closed").is_none(),
+        import_handoff(&payload, Some(cwd), "closed").is_none(),
         "a payload with no open work must not be imported as a live handoff"
     );
     assert!(list_all_handoffs().is_empty(), "nothing adopted");
@@ -1411,15 +1411,15 @@ fn repeated_import_never_overwrites() {
     let _guard = crate::storage::lock_test_env();
     let env = HandoffTestEnv::new();
     let cwd = env._home.path();
-    std::fs::create_dir_all(&cwd).ok();
-    let key = project_key(Some(&cwd)).unwrap();
+    std::fs::create_dir_all(cwd).ok();
+    let key = project_key(Some(cwd)).unwrap();
 
     write_snapshot(&fixture("repeat", &key)).unwrap();
     let payload = export_handoff("repeat").expect("export");
 
     let mut ids = std::collections::HashSet::new();
     for _ in 0..12 {
-        let id = import_handoff(&payload, Some(&cwd), "closed").unwrap();
+        let id = import_handoff(&payload, Some(cwd), "closed").unwrap();
         assert!(ids.insert(id.clone()), "imported id {id} must be unique");
         assert!(load_snapshot(&id).is_some(), "imported snapshot {id} loads");
     }
