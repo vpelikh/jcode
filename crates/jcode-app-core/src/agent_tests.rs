@@ -3924,3 +3924,143 @@ impl Drop for PruneTestHome {
         }
     }
 }
+
+
+/// Provider that on call 1 invokes `bash` producing an oversized tool result, and on
+/// call 2 ends the turn. Drives the REAL streaming loop so the scheduled per-step
+/// prune (turn_streaming_mpsc.rs Point D) runs after the tool result is appended.
+#[derive(Clone, Default)]
+struct OversizedToolStreamProvider {
+    calls: Arc<std::sync::Mutex<usize>>,
+}
+
+#[async_trait]
+impl Provider for OversizedToolStreamProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        let call = {
+            let mut g = self.calls.lock().unwrap();
+            *g += 1;
+            *g
+        };
+        let (tx, rx) = tokio_mpsc::channel::<Result<StreamEvent>>(8);
+        tokio::spawn(async move {
+            if call == 1 {
+                let _ = tx
+                    .send(Ok(StreamEvent::ToolUseStart {
+                        id: "call_big".to_string().into(),
+                        name: "bash".to_string(),
+                    }))
+                    .await;
+                // echoes ~6000 chars so the tool result exceeds the 4000 default cap
+                let _ = tx
+                    .send(Ok(StreamEvent::ToolInputDelta(
+                        r#"{"command":"printf 'x%.0s' {1..6000}"}"#.to_string(),
+                    )))
+                    .await;
+                let _ = tx.send(Ok(StreamEvent::ToolUseEnd)).await;
+                let _ = tx
+                    .send(Ok(StreamEvent::MessageEnd {
+                        stop_reason: Some("tool_calls".to_string()),
+                    }))
+                    .await;
+            } else {
+                let _ = tx
+                    .send(Ok(StreamEvent::TextDelta("done".to_string())))
+                    .await;
+                let _ = tx
+                    .send(Ok(StreamEvent::MessageEnd {
+                        stop_reason: Some("end_turn".to_string()),
+                    }))
+                    .await;
+            }
+        });
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    fn name(&self) -> &str {
+        "oversized-stream"
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+}
+
+/// Runtime evidence the scheduled per-step prune (a) does NOT strip a freshly added
+/// oversized tool result from this batch (it is in the unconsumed suffix after the
+/// latest assistant), and (b) DOES strip an oversized image already consumed before
+/// the current turn.
+#[tokio::test]
+async fn scheduled_prune_preserves_fresh_oversized_results_at_runtime() {
+    let _guard = crate::storage::lock_test_env();
+    let sp = OversizedToolStreamProvider::default();
+    let provider: Arc<dyn Provider> = Arc::new(sp);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // A consumed-prefix oversized image (append, then an assistant response marks
+    // it consumed when a later user turn exists). Simulate via a user image block
+    // then an assistant ack.
+    agent
+        .session
+        .append_stored_message(crate::session::StoredMessage {
+            id: "consumed-img".into(),
+            role: crate::message::Role::User,
+            content: vec![ContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "a".repeat(5000),
+            }],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    agent.session.add_message(
+        crate::message::Role::Assistant,
+        vec![ContentBlock::Text {
+            text: "ack".into(),
+            cache_control: None,
+        }],
+    );
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent
+        .run_once_streaming_mpsc("big output", Vec::new(), None, tx)
+        .await
+        .expect("turn should complete");
+
+    let mut text = String::new();
+    while let Ok(event) = rx.try_recv() {
+        if let ServerEvent::TextDelta { text: d } = event {
+            text.push_str(&d);
+        }
+    }
+    assert!(text.contains("done"), "turn must finish, got {text:?}");
+
+    // The fresh oversized bash tool-result from THIS batch must survive pruning.
+    let tool_result_count = agent
+        .session
+        .messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter(|b| matches!(b, ContentBlock::ToolResult { content, .. } if content.len() > 4000))
+        .count();
+    assert_eq!(
+        tool_result_count, 1,
+        "fresh oversized tool result must not be pruned before the model reads it"
+    );
+
+    // The consumed oversized image from BEFORE this turn must have been replaced.
+    let consumed_image = agent.session.messages.iter().flat_map(|m| &m.content)
+        .find(|b| matches!(b, ContentBlock::Text { text, .. } if text.contains("Image omitted during context pruning")));
+    assert!(
+        consumed_image.is_some(),
+        "consumed oversized image must be pruned by scheduled prune"
+    );
+}

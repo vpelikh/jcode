@@ -77,6 +77,11 @@ policy and report so every consumer stays in lockstep.
   starting at the latest assistant response. No assistant response means no
   eligible prefix. The regression failed against full-transcript pruning and
   passed after the boundary fix, including replay and idempotence checks.
+  Runtime evidence: `scheduled_prune_preserves_fresh_oversized_results_at_runtime`
+  drives the real streaming loop through a bash tool call that returns a 6202-char
+  result and asserts that fresh oversized result survives the Point-D prune while
+  a consumed oversized image is replaced. This closes the loop-wiring coverage gap
+  end-to-end rather than relying only on the session-unit boundary test.
 - **Manual persistence and errors:** local and server `/prune` now save changes.
   A failed save reports an error instead of success, and a subsequent no-op
   retries persistence. Isolated temporary-home tests exercise real disk reloads,
