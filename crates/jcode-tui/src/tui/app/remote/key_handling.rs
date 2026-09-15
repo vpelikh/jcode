@@ -59,11 +59,10 @@ fn clear_session_state_after_discard(app: &mut App) {
 
 /// Set which saved handoff this session boots from on its first message.
 ///
-/// `/handoffres <session_id>` sets the override on the server. If the current
-/// conversation already has messages it is cleared in place first (so the next
-/// message is the first visible one); an already-fresh conversation is left
-/// untouched. The selection is resolved locally first so an unknown id fails
-/// fast client-side.
+/// `/handoffres <session_id>` clears the current conversation in place (like
+/// `/clear`) so the next message is the first visible one, then sets the
+/// override on the server. Always clearing guarantees the override fires; a
+/// selection is resolved locally first so an unknown id fails fast client-side.
 async fn handle_handoff_resume_command(
     app: &mut App,
     remote: &mut RemoteConnection,
@@ -94,22 +93,28 @@ async fn handle_handoff_resume_command(
         }
     };
     let selected = session_id.to_string();
-    // A handoff override only applies to the first visible user message. If the
-    // current conversation already has messages, clear it in place on the server
-    // (same session id, like `/clear`) so the next message is treated as first;
-    // using `remote.clear()` keeps client and server on the same agent so the
-    // override set immediately after lands on this session. For an already-fresh
-    // conversation we skip the destructive clear and just set the override.
-    let has_messages = !remote_rewindable_messages(app).is_empty();
-    if has_messages {
-        remote.clear().await?;
-        clear_session_state_after_discard(app);
-    }
+    // A handoff override only applies to the first visible user message, so the
+    // server conversation must be empty for the next message to be treated as
+    // first. Clear it in place on the server (same session id, like `/clear`).
+    // We always clear rather than gating on client-visible messages: after a
+    // reconnect the client's display cache may not yet show server history, so
+    // a client-side empty check could wrongly skip the clear and leave the
+    // override set but never fired. Clearing an already-empty session is a
+    // harmless no-op, so always clearing is both simpler and correct.
+    remote.clear().await?;
+    clear_session_state_after_discard(app);
     remote.set_handoff_resume(Some(selected)).await?;
+    // Show the handoff's headline (first content line, i.e. the intent) rather
+    // than the always-present "[Handoff from previous session]" header.
+    let preview_line = preview
+        .lines()
+        .nth(1)
+        .map(str::to_string)
+        .filter(|line| !line.trim().is_empty())
+        .unwrap_or_else(|| "[Handoff from previous session]".to_string());
     app.push_display_message(DisplayMessage::system(format!(
         "Handoff ready: {}\n{}",
-        session_id,
-        preview.lines().next().unwrap_or("[Handoff from previous session]")
+        session_id, preview_line
     )));
     app.set_status_notice("Handoff selected");
     Ok(())
@@ -122,7 +127,7 @@ async fn handle_handoff_resume_command(
 /// local fallback so the two outputs cannot drift.
 fn handle_handoff_command(app: &mut App, _trimmed: &str) -> Result<()> {
     app.push_display_message(DisplayMessage::system(
-        app_mod::commands::handoff_listing_message(),
+        app_mod::commands::handoff_listing_message(true),
     ));
     Ok(())
 }

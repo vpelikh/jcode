@@ -822,6 +822,10 @@ fn local_handoff_listing_surfaces_archived_and_requires_server_for_resume() {
         listing.contains("archived-handoff") && listing.contains("[archived]"),
         "listing should surface the archived handoff: {listing}"
     );
+    assert!(
+        listing.contains("needs a server connection"),
+        "local listing should note resume needs a server: {listing}"
+    );
 
     // `/handoffres` is claimed locally but explains a server is required.
     assert!(

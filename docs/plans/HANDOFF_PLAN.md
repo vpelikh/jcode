@@ -46,9 +46,10 @@ handoffs that are no longer the latest for their project stay selectable
 TUI to the server via the `set_handoff_resume` protocol request and stored as a
 transient, one-shot override on the agent.
 
-`/handoffres` only clears an existing conversation (in place, via the server)
-when it already has messages; an already-fresh session just sets the override,
-so a just-started conversation is never destructively wiped. `/handoff-clear`
+`/handoffres` clears the current conversation in place (like `/clear`) so the
+next message is the first visible one, then sets the override; always clearing
+guarantees the override fires even right after a reconnect when the client's
+display cache has not yet loaded server history. `/handoff-clear`
 (alias `/handoffcancel`) sends `set_handoff_resume(None)` to restore automatic
 injection. `/handoff` lists handoffs locally by reading the shared handoff
 store — the same client-side filesystem pattern the session picker uses for its
