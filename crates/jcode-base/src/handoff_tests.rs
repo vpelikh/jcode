@@ -1104,3 +1104,86 @@ fn import_mints_fresh_id_and_does_not_resurrect_retired() {
     // The original retired id is not re-registered.
     assert!(latest_handoff_for_project(Some(&cwd)).as_deref() != Some("retired"));
 }
+
+/// Validation: importing an OLDER snapshot for a project that already has a
+/// newer local handoff must NOT override it (upsert keeps the newer entry).
+/// The imported snapshot becomes an archived file, still renderable manually.
+#[test]
+fn import_does_not_override_newer_local_handoff() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let home = env._home.path();
+    let cwd = home.join("project");
+    std::fs::create_dir_all(&cwd).ok();
+    let key = project_key(Some(&cwd)).unwrap();
+
+    // A newer local handoff exists and is live in the index.
+    let mut local = fixture("local-newer", &key);
+    local.ended_at = Utc::now();
+    local.intent = Some("local work".into());
+    write_snapshot(&local).unwrap();
+    assert_eq!(latest_handoff_for_project(Some(&cwd)).as_deref(), Some("local-newer"));
+
+    // An older exported snapshot for the same project is imported.
+    let mut older = fixture("older-src", &key);
+    older.ended_at = Utc::now() - chrono::Duration::days(5);
+    older.intent = Some("older remote work".into());
+    let dir = handoffs_dir().unwrap();
+    crate::storage::write_json_fast(&file_path(&dir, "older-src").unwrap(), &older).unwrap();
+    let payload = export_handoff("older-src").expect("export older");
+    let imported = import_handoff(&payload, Some(&cwd), "closed").expect("import");
+
+    // The newer local handoff remains the latest for the project.
+    assert_eq!(
+        latest_handoff_for_project(Some(&cwd)).as_deref(),
+        Some("local-newer"),
+        "a newer local handoff must not be displaced by an older import"
+    );
+    // The imported snapshot is present on disk and manually selectable.
+    assert!(load_snapshot(&imported).is_some(), "imported file exists");
+    assert!(
+        list_all_handoffs().iter().any(|s| s.session_id == imported),
+        "imported snapshot is discoverable (archived)"
+    );
+}
+
+/// Validation: pruning's age boundary. A snapshot exactly at the
+/// `MAX_ARCHIVED_SNAPSHOT_AGE_DAYS` cutoff is kept (`>` excludes the exact
+/// boundary), while one strictly older is pruned.
+#[test]
+fn prune_age_cutoff_excludes_exact_boundary() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let home = env._home.path();
+    let cwd = home.join("project");
+    std::fs::create_dir_all(&cwd).ok();
+    let key = project_key(Some(&cwd)).unwrap();
+    let now = Utc::now();
+
+    // Live handoff to pin the bucket.
+    write_snapshot(&fixture("live", &key)).unwrap();
+    // Just under the cutoff (30 days minus a few seconds of age) -> kept,
+    // confirming the boundary uses `>` (strictly-older) rather than `>=`.
+    let mut inside = fixture("inside-cutoff", &key);
+    inside.ended_at = now
+        .checked_sub_signed(chrono::Duration::days(MAX_ARCHIVED_SNAPSHOT_AGE_DAYS))
+        .unwrap()
+        + chrono::Duration::seconds(5);
+    write_snapshot(&inside).unwrap();
+    // Strictly older (31 days) -> pruned.
+    let mut stale = fixture("stale", &key);
+    stale.ended_at = now - chrono::Duration::days(MAX_ARCHIVED_SNAPSHOT_AGE_DAYS + 1);
+    write_snapshot(&stale).unwrap();
+
+    prune_archived_snapshots();
+
+    assert!(
+        load_snapshot("inside-cutoff").is_some(),
+        "a snapshot within the age window is kept"
+    );
+    assert!(
+        load_snapshot("stale").is_none(),
+        "a snapshot strictly older than the cutoff is pruned"
+    );
+    assert!(load_snapshot("live").is_some(), "live handoff survives");
+}

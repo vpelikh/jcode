@@ -443,9 +443,15 @@ pub fn export_handoff(session_id: &str) -> Option<String> {
 /// formerly produced there, rekeys it to the current working directory's
 /// project (so it is found by this host's automatic first-message injection
 /// and the `/handoff` picker), writes it as a snapshot file, and *explicitly
-/// registers it as the project's latest handoff in the index*. Unlike a
-/// blanket on-disk scan, adoption is a deliberate act: the imported snapshot
-/// is intentionally live, so it cannot silently resurrect a retired handoff.
+/// registers it with the project in the index*. Unlike a blanket on-disk scan,
+/// adoption is a deliberate act: the imported snapshot is intentionally live,
+/// so it cannot silently resurrect a retired handoff.
+///
+/// When the target project already has a *newer* local handoff, that one stays
+/// as the project's latest entry (upsert keeps the newer timestamp) and the
+/// import is retained as an archived, still-manually-selectable snapshot. Only
+/// when the imported snapshot is the newest for the project does it become the
+/// automatic latest-for-project pick.
 ///
 /// Returns the adopted session id (a fresh UUID that does not collide with an
 /// existing snapshot), or `None` when the payload is malformed or the working
