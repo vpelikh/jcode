@@ -2558,14 +2558,7 @@ pub(super) async fn handle_client(
                     role,
                     &client_event_tx,
                     &sessions,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &swarm_coordinators,
-                    &swarm_plans,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
-                    &swarm_mutation_runtime,
+                    &swarm_service_handle,
                 )
                 .await;
             }
