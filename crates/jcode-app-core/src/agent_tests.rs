@@ -4147,3 +4147,42 @@ async fn text_only_turn_prunes_consumed_oversized_image() {
         "consumed oversized image must be pruned on a text-only turn"
     );
 }
+/// A pure-text continuation turn over a PREVIOUS turn's consumed oversized tool
+/// result must STILL truncate it (the tool cap should not be limited to turns
+/// that themselves ran tools). This proves the consumed-prefix prune runs every
+/// step for already-consumed oversized nodes, not only on tool-result steps.
+#[tokio::test]
+async fn text_only_turn_truncates_consumed_oversized_tool_result() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(TextOnlyStreamProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // A consumed oversized tool result: a prior turn committed a 6000-byte
+    // result, then an assistant ack made it consumed (prefix before last assistant).
+    agent.session.append_stored_message(crate::session::StoredMessage {
+        id: "txt-tool".into(),
+        role: crate::message::Role::User,
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: "t1".into(),
+            content: "x".repeat(10_000),
+            is_error: None,
+        }],
+        display_role: None, timestamp: None, tool_duration_ms: None, token_usage: None,
+    });
+    agent.session.add_message(
+        crate::message::Role::Assistant,
+        vec![ContentBlock::Text { text: "ack".into(), cache_control: None }],
+    );
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.run_once_streaming_mpsc("continue", Vec::new(), None, tx).await.unwrap();
+
+    // After a text-only turn, the consumed oversized tool result must be truncated
+    // to <= 4000 bytes. If it is still 10000, the tool-result pass was wrongly
+    // gated off (it should run on the loop head, every step).
+    let big = agent.session.messages.iter().flat_map(|m| &m.content).filter(|b| {
+        matches!(b, ContentBlock::ToolResult { content, .. } if content.len() > 4000)
+    }).count();
+    assert_eq!(big, 0, "consumed oversized tool result must be truncated on a text-only turn");
+}

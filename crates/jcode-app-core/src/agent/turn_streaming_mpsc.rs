@@ -99,10 +99,6 @@ impl Agent {
         let mut empty_post_tool_continuations = 0u32;
         let mut fable_guardrail_reconsiderations = 0u32;
         let mut stalled_promise_continuations = 0u32;
-        // Whether the PREVIOUS batch (the messages just appended before this
-        // next request) added tool results. Carried across loop iterations so
-        // the loop-head prune can gate its tool-result pass on real growth.
-        let mut prev_had_tool_results = false;
 
         loop {
             // Never open a new provider request after a cancel. Several paths
@@ -127,35 +123,22 @@ impl Agent {
             // shrink already-consumed oversized nodes. New results, screenshots
             // and interrupts appended after the latest assistant are in the
             // unconsumed suffix and remain intact until the model has read them
-            // once. The image cap runs on every step (a consumed oversized
-            // image from a prior turn would otherwise linger on pure-text
-            // follow-ups); the tool-result cap runs only when the previous
-            // batch added tool results — the sole source of per-step growth.
-            if prev_had_tool_results {
-                let pruned = self.session.prune_consumed_transcript(
-                    &crate::compaction::prune::PrunePolicy::node_caps_tool_only(
-                        crate::config::config().compaction.prune_tool_result_max_bytes,
-                    ),
-                );
-                if !pruned.is_empty() {
-                    self.note_prune_applied();
-                    crate::logging::info(&format!(
-                        "[prune] per-step tool shrink for session {}: {} tool result(s)",
-                        self.session.id, pruned.tool_results_truncated,
-                    ));
-                    self.session.save()?;
-                }
-            }
-            let image_pruned = self.session.prune_consumed_transcript(
-                &crate::compaction::prune::PrunePolicy::node_caps_image_only(
+            // once. Both the image and tool-result caps run on every step: a
+            // consumed oversized node from a prior turn must be reclaimed even
+            // on pure-text follow-ups, or it lingers in every subsequent prompt.
+            let pruned = self.session.prune_consumed_transcript(
+                &crate::compaction::prune::PrunePolicy::node_caps_with(
+                    crate::config::config().compaction.prune_tool_result_max_bytes,
                     crate::config::config().compaction.prune_image_max_bytes,
                 ),
             );
-            if !image_pruned.is_empty() {
+            if !pruned.is_empty() {
                 self.note_prune_applied();
                 crate::logging::info(&format!(
-                    "[prune] per-step image shrink for session {}: {} image(s)",
-                    self.session.id, image_pruned.images_stripped,
+                    "[prune] per-step shrink for session {}: {} image(s), {} tool result(s)",
+                    self.session.id,
+                    pruned.images_stripped,
+                    pruned.tool_results_truncated,
                 ));
                 self.session.save()?;
             }
@@ -1700,10 +1683,6 @@ impl Agent {
                     self.session.id
                 ));
             }
-
-            // Record whether THIS batch added tool results, so the loop-head prune
-            // on the next iteration can gate its tool-result pass.
-            prev_had_tool_results = tool_results_dirty;
         }
 
         Ok(())

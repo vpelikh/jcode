@@ -52,12 +52,11 @@ policy and report so every consumer stays in lockstep.
   call, over the prefix preceding the latest assistant response. Fresh tool
   results, screenshots and interrupts appended after the latest assistant are
   in the unconsumed suffix and remain intact until the model has read them once.
-  The **tool-result** cap is gated on whether the prior batch added tool results
-  (`tool_results_dirty`), so a pure-text step skips that scan. The **image** cap
-  runs on **every** step: a consumed oversized image from a prior turn must be
-  reclaimed even on pure-text follow-ups, or it leaks for the whole session.
-  No-op when within caps. A prune invalidates the provider session/cache but
-  preserves the locked tool surface (`note_prune_applied`).
+  Both the **image** and **tool-result** per-node caps run on **every** step: a
+  consumed oversized node from a prior turn must be reclaimed even on pure-text
+  follow-ups, or it lingers in every subsequent prompt. No-op when within caps.
+  A prune invalidates the provider session/cache but preserves the locked tool
+  surface (`note_prune_applied`).
 - **Configurable per-node caps.** `CompactionConfig` gains
   `prune_tool_result_max_bytes` / `prune_image_max_bytes` (defaults 4000/1024,
   `#[serde(default)]` so existing configs parse) and `PrunePolicy::node_caps_with`
