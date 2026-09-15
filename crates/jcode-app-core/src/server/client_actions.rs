@@ -385,7 +385,7 @@ pub(super) fn handle_run_subagent(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "session lifecycle dependencies remain separate from swarm ownership"
+    reason = "set feature mutates agent state, persistence, swarm/session metadata, and client notifications together"
 )]
 pub(super) async fn handle_set_feature(
     id: u64,

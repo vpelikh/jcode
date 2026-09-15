@@ -724,8 +724,9 @@ call-site migrations with tests green after each.
   and `client_lightweight_control.rs::handle_lightweight_control_request`) pass
   `&swarm_service_handle` / `swarm`. Drops the now-unused
   `broadcast_swarm_status` import. Restored the
-  `clippy::too_many_arguments` expectations on `handle_set_feature`
-  (`client_actions.rs`) and `cleanup_detached_source_session_if_unused`
+  `clippy::too_many_arguments` attributes that the prior slices had dropped:
+  the original `#[expect]` on `handle_set_feature` (`client_actions.rs`) and
+  the original `#[allow]` on `cleanup_detached_source_session_if_unused`
   (`client_session.rs`), both still over the 7-arg threshold.
 
 The remaining free-function call sites for `update_member_status` /

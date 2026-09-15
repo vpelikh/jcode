@@ -895,10 +895,7 @@ pub(super) async fn handle_reload(
     let _ = client_event_tx.send(ServerEvent::Done { id });
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "session lifecycle dependencies remain separate from swarm ownership"
-)]
+#[allow(clippy::too_many_arguments)]
 async fn cleanup_detached_source_session_if_unused(
     old_session_id: &str,
     client_connection_id: &str,
