@@ -509,22 +509,9 @@ pub(super) async fn handle_client(
                             sessions: &sessions,
                             global_session_id: &global_session_id,
                             provider_template: &provider_template,
-                            swarm_members: &swarm_members,
-                            swarms_by_id: &swarms_by_id,
-                            shared_context: &shared_context,
-                            swarm_plans: &swarm_plans,
-                            swarm_coordinators: &swarm_coordinators,
-                            file_touch: &file_touch,
-                            channel_subscriptions: &channel_subscriptions,
-                            channel_subscriptions_by_session: &channel_subscriptions_by_session,
                             client_connections: &client_connections,
-                            event_history: &event_history,
-                            event_counter: &event_counter,
-                            swarm_event_tx: &swarm_event_tx,
                             mcp_pool: &mcp_pool,
                             soft_interrupt_queues: &soft_interrupt_queues,
-                            await_members_runtime: &await_members_runtime,
-                            swarm_mutation_runtime: &swarm_mutation_runtime,
                         },
                     )
                     .await?;
@@ -2536,7 +2523,6 @@ pub(super) async fn handle_client(
                     &sessions,
                     &swarm_service_handle,
                     &soft_interrupt_queues,
-                    &swarm_mutation_runtime,
                 )
                 .await;
             }

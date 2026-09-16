@@ -757,3 +757,53 @@ routers `client_lifecycle.rs` / `client_lightweight_control.rs` plus the
 (which build a `SwarmServiceHandle`). Zero behavior change; the server suite
 stays green (463 passing) including both role-assignment tests and the live-turn
 reservation/status tests.
+
+### LightweightControlContext slimming and comm_session migration landed (2026-09)
+
+Two more slices landed in the same ownership direction, both thin wrapper +
+call-site migrations with tests green after each.
+
+- **`LightweightControlContext` slimmed onto the service handles.** The
+  lightweight-request context previously carried the `session` /
+  `swarm` handles *and* thirteen flat swarm fields (`swarm_members`,
+  `swarms_by_id`, `shared_context`, `swarm_plans`, `swarm_coordinators`,
+  `file_touch`, `channel_subscriptions`, `channel_subscriptions_by_session`,
+  `event_history`, `event_counter`, `swarm_event_tx`, `await_members_runtime`,
+  `swarm_mutation_runtime`). Those are removed from the struct; the body
+  `handle_lightweight_control_request` now binds them as locals from the
+  `swarm` handle (design decision A), keeping every downstream call byte-identical.
+  `client_lifecycle.rs::handle_client` drops the thirteen fields from its
+  construction. Trimmed the now-unused `AwaitMembersRuntime` /
+  `ChannelSubscriptions` / `FileTouchService` / `SharedContext` / `SwarmEvent` /
+  `SwarmMember` / `SwarmMutationRuntime` / `VersionedPlan` / `HashSet` /
+  `broadcast` imports.
+
+- **`comm_session.rs` swarm-domain helpers route through the handle.** Two
+  helpers convert from the flat `swarm_members` bag to `&SwarmServiceHandle`:
+  `resolve_spawn_working_dir` (used by `spawn_swarm_agent`) and
+  `resolve_stop_target_session` (used by `handle_comm_stop`); both bind the
+  membership map as a body local. `handle_comm_stop` drops its redundant
+  `swarm_mutation_runtime` parameter (it binds `let swarm_mutation_runtime =
+  &swarm.swarm_mutation_runtime;`), and both routers
+  (`client_lifecycle.rs`, `client_lightweight_control.rs`) drop the extra
+  argument. Test call sites for the two resolvers build a `SwarmServiceHandle`
+  through the shared `TestSwarmBuilder`.
+
+The full `jcode-app-core` lib suite stays green (1480 passing) and clippy
+introduces no new warnings.
+
+### Convergence surface still open (final gate)
+
+The convergence goal — zero flat swarm-map args in any `pub`/`pub(super)`
+handler signature — still has a broad residual across roughly a dozen modules:
+`comm_graph` (4 graph handlers), `comm_plan` (propose/approve/reject),
+`comm_sync`, `comm_await` (await members + resume), `client_comm_channels`
+(4 handlers), `client_comm_context` (share/read/list), `swarm_channels`,
+`state` delivery helpers, `swarm.rs` broadcast/plan/status free functions,
+`reload.rs`, `headless`, `debug_events`, and several client-facing session
+helpers (`client_session::handle_reload`, `client_actions`, `live_turn::idle_live_agent`).
+Each is a mechanical "collapse flat bag onto `&SwarmServiceHandle`, bind as body
+locals" slice like the ones above, but the sweep is high-churn and is best done
+module-by-module as separate reviewable slices rather than one combined landing.
+The `client_lifecycle.rs::handle_client` router still `clone`-then-`destructure`
+path (router clone-then-destructure refactor) also remains a separate decision.

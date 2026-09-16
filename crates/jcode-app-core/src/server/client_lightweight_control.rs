@@ -19,18 +19,16 @@ use super::comm_sync::{
 };
 use super::services::{SessionServiceHandle, SwarmServiceHandle};
 use super::{
-    AwaitMembersRuntime, ChannelSubscriptions, ClientConnectionInfo, FileTouchService,
-    SessionAgents, SessionInterruptQueues, SharedContext, SwarmEvent, SwarmMember,
-    SwarmMutationRuntime, VersionedPlan, format_structured_completion_report, truncate_detail,
-    update_member_status_with_report_tldr,
+    ClientConnectionInfo, SessionAgents, SessionInterruptQueues, format_structured_completion_report,
+    truncate_detail, update_member_status_with_report_tldr,
 };
 use crate::config::SwarmSpawnMode;
 use crate::protocol::{Request, ServerEvent};
 use crate::provider::Provider;
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 
 pub(super) fn parse_swarm_spawn_mode(
     id: u64,
@@ -61,22 +59,9 @@ pub(super) struct LightweightControlContext<'a> {
     pub(super) sessions: &'a SessionAgents,
     pub(super) global_session_id: &'a Arc<RwLock<String>>,
     pub(super) provider_template: &'a Arc<dyn Provider>,
-    pub(super) swarm_members: &'a Arc<RwLock<HashMap<String, SwarmMember>>>,
-    pub(super) swarms_by_id: &'a Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    pub(super) shared_context: &'a Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
-    pub(super) swarm_plans: &'a Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    pub(super) swarm_coordinators: &'a Arc<RwLock<HashMap<String, String>>>,
-    pub(super) file_touch: &'a FileTouchService,
-    pub(super) channel_subscriptions: &'a ChannelSubscriptions,
-    pub(super) channel_subscriptions_by_session: &'a ChannelSubscriptions,
     pub(super) client_connections: &'a Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
-    pub(super) event_history: &'a Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    pub(super) event_counter: &'a Arc<std::sync::atomic::AtomicU64>,
-    pub(super) swarm_event_tx: &'a broadcast::Sender<SwarmEvent>,
     pub(super) mcp_pool: &'a Arc<crate::mcp::SharedMcpPool>,
     pub(super) soft_interrupt_queues: &'a SessionInterruptQueues,
-    pub(super) await_members_runtime: &'a AwaitMembersRuntime,
-    pub(super) swarm_mutation_runtime: &'a SwarmMutationRuntime,
 }
 
 pub(super) async fn handle_lightweight_control_request(
@@ -90,23 +75,26 @@ pub(super) async fn handle_lightweight_control_request(
         sessions,
         global_session_id,
         provider_template,
-        swarm_members,
-        swarms_by_id,
-        shared_context,
-        swarm_plans,
-        swarm_coordinators,
-        file_touch,
-        channel_subscriptions,
-        channel_subscriptions_by_session,
         client_connections,
-        event_history,
-        event_counter,
-        swarm_event_tx,
         mcp_pool,
         soft_interrupt_queues,
-        await_members_runtime,
-        swarm_mutation_runtime,
     } = context;
+    // Swarm-domain state is reached through the swarm service handle. These
+    // locals keep the body single-homed on the handle's fields (server service
+    // split, Slice 3).
+    let swarm_members = &swarm.swarm_state.members;
+    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let shared_context = &swarm.shared_context;
+    let swarm_plans = &swarm.swarm_state.plans;
+    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let file_touch = &swarm.file_touch;
+    let channel_subscriptions = &swarm.channel_subscriptions;
+    let channel_subscriptions_by_session = &swarm.channel_subscriptions_by_session;
+    let event_history = &swarm.event_history;
+    let event_counter = &swarm.event_counter;
+    let swarm_event_tx = &swarm.swarm_event_tx;
+    let await_members_runtime = &swarm.await_members_runtime;
+    let swarm_mutation_runtime = &swarm.swarm_mutation_runtime;
     if let Request::Ping { id } = request {
         write_direct_event(
             &writer,
@@ -464,7 +452,6 @@ pub(super) async fn handle_lightweight_control_request(
                 sessions,
                 swarm,
                 soft_interrupt_queues,
-                swarm_mutation_runtime,
             )
             .await;
         }
