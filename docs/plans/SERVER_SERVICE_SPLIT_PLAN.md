@@ -807,3 +807,21 @@ locals" slice like the ones above, but the sweep is high-churn and is best done
 module-by-module as separate reviewable slices rather than one combined landing.
 The `client_lifecycle.rs::handle_client` router still `clone`-then-`destructure`
 path (router clone-then-destructure refactor) also remains a separate decision.
+
+### comm_graph convergence slice landed (2026-09)
+
+The task-DAG mutation handlers collapsed their flat 7-field swarm bag onto
+`&SwarmServiceHandle`. `handle_comm_seed_graph`, `handle_comm_expand_node`,
+`handle_comm_complete_node`, and `handle_comm_inject_gap` each dropped
+`swarm_members`/`swarms_by_id`/`swarm_plans`/`swarm_coordinators`/
+`event_history`/`event_counter`/`swarm_event_tx` for a single `swarm` handle
+and bind the maps as body locals (design decision A). The shared `finalize`
+helper stays flat because it already carries 13 args with its own satisfied
+expect. Callers migrated: `client_lifecycle.rs` and
+`client_lightweight_control.rs` routers pass `&swarm_service_handle`/`swarm`,
+and the `comm_control_tests::dag_e2e` fixture now feeds the graph handlers
+through the `GraphFixture.swarm` handle, dropping five now-unused fixture
+fields (`swarm_coordinators`, `event_history`, `event_counter`,
+`swarm_event_tx`, `mutation_runtime`). The four graph handlers drop their
+now-satisfied `too_many_arguments` expects. Zero behavior change; the
+`comm_control` suite (70) and the DAG e2e suite (20) stay green.

@@ -316,13 +316,7 @@ pub(super) async fn handle_lightweight_control_request(
                 mode,
                 nodes,
                 &client_event_tx,
-                swarm_members,
-                swarms_by_id,
-                swarm_plans,
-                swarm_coordinators,
-                event_history,
-                event_counter,
-                swarm_event_tx,
+                swarm,
             )
             .await;
         }
@@ -338,13 +332,7 @@ pub(super) async fn handle_lightweight_control_request(
                 node_id,
                 children,
                 &client_event_tx,
-                swarm_members,
-                swarms_by_id,
-                swarm_plans,
-                swarm_coordinators,
-                event_history,
-                event_counter,
-                swarm_event_tx,
+                swarm,
             )
             .await;
         }
@@ -360,13 +348,7 @@ pub(super) async fn handle_lightweight_control_request(
                 node_id,
                 artifact_json,
                 &client_event_tx,
-                swarm_members,
-                swarms_by_id,
-                swarm_plans,
-                swarm_coordinators,
-                event_history,
-                event_counter,
-                swarm_event_tx,
+                swarm,
             )
             .await;
         }
@@ -382,13 +364,7 @@ pub(super) async fn handle_lightweight_control_request(
                 gate_id,
                 nodes,
                 &client_event_tx,
-                swarm_members,
-                swarms_by_id,
-                swarm_plans,
-                swarm_coordinators,
-                event_history,
-                event_counter,
-                swarm_event_tx,
+                swarm,
             )
             .await;
         }

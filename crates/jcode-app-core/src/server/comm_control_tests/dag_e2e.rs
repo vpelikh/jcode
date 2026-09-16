@@ -35,11 +35,6 @@ struct GraphFixture {
     swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>>,
     swarms_by_id: Arc<RwLock<HashMap<String, HashSet<String>>>>,
     swarm_plans: Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    swarm_coordinators: Arc<RwLock<HashMap<String, String>>>,
-    event_history: Arc<RwLock<VecDeque<SwarmEvent>>>,
-    event_counter: Arc<AtomicU64>,
-    swarm_event_tx: broadcast::Sender<SwarmEvent>,
-    mutation_runtime: SwarmMutationRuntime,
     swarm: crate::server::services::SwarmServiceHandle,
 }
 
@@ -111,11 +106,6 @@ async fn graph_fixture_named(swarm_id: &str, coord: &str, worker: &str) -> Graph
         swarm_members,
         swarms_by_id,
         swarm_plans,
-        swarm_coordinators,
-        event_history,
-        event_counter,
-        swarm_event_tx,
-        mutation_runtime,
         swarm,
     }
 }
@@ -128,13 +118,7 @@ impl GraphFixture {
             Some(mode.to_string()),
             nodes,
             &self.client_tx,
-            &self.swarm_members,
-            &self.swarms_by_id,
-            &self.swarm_plans,
-            &self.swarm_coordinators,
-            &self.event_history,
-            &self.event_counter,
-            &self.swarm_event_tx,
+            &self.swarm,
         )
         .await;
     }
@@ -148,13 +132,7 @@ impl GraphFixture {
             None,
             nodes,
             &self.client_tx,
-            &self.swarm_members,
-            &self.swarms_by_id,
-            &self.swarm_plans,
-            &self.swarm_coordinators,
-            &self.event_history,
-            &self.event_counter,
-            &self.swarm_event_tx,
+            &self.swarm,
         )
         .await;
     }
@@ -429,13 +407,7 @@ async fn e2e_deep_expand_inserts_gate_in_live_plan() {
             node_spec("root.2", "explore", &[]),
         ],
         &fx.client_tx,
-        &fx.swarm_members,
-        &fx.swarms_by_id,
-        &fx.swarm_plans,
-        &fx.swarm_coordinators,
-        &fx.event_history,
-        &fx.event_counter,
-        &fx.swarm_event_tx,
+        &fx.swarm,
     )
     .await;
 
@@ -566,13 +538,7 @@ async fn e2e_deep_gate_assignment_carries_inject_gap_contract() {
         "root".to_string(),
         vec![node_spec("root.1", "explore", &[])],
         &fx.client_tx,
-        &fx.swarm_members,
-        &fx.swarms_by_id,
-        &fx.swarm_plans,
-        &fx.swarm_coordinators,
-        &fx.event_history,
-        &fx.event_counter,
-        &fx.swarm_event_tx,
+        &fx.swarm,
     )
     .await;
 
@@ -595,13 +561,7 @@ async fn e2e_deep_gate_assignment_carries_inject_gap_contract() {
         })
         .to_string(),
         &fx.client_tx,
-        &fx.swarm_members,
-        &fx.swarms_by_id,
-        &fx.swarm_plans,
-        &fx.swarm_coordinators,
-        &fx.event_history,
-        &fx.event_counter,
-        &fx.swarm_event_tx,
+        &fx.swarm,
     )
     .await;
 
@@ -706,13 +666,7 @@ async fn e2e_complete_flows_artifact_to_downstream_assignment() {
         "api".to_string(),
         artifact,
         &fx.client_tx,
-        &fx.swarm_members,
-        &fx.swarms_by_id,
-        &fx.swarm_plans,
-        &fx.swarm_coordinators,
-        &fx.event_history,
-        &fx.event_counter,
-        &fx.swarm_event_tx,
+        &fx.swarm,
     )
     .await;
 
@@ -796,13 +750,7 @@ async fn e2e_composite_rewake_prefers_planner_via_assign_next() {
         "root".to_string(),
         vec![node_spec("root.1", "explore", &[])],
         &fx.client_tx,
-        &fx.swarm_members,
-        &fx.swarms_by_id,
-        &fx.swarm_plans,
-        &fx.swarm_coordinators,
-        &fx.event_history,
-        &fx.event_counter,
-        &fx.swarm_event_tx,
+        &fx.swarm,
     )
     .await;
 
@@ -832,13 +780,7 @@ async fn e2e_composite_rewake_prefers_planner_via_assign_next() {
         "root.1".to_string(),
         serde_json::json!({"findings": "child done"}).to_string(),
         &fx.client_tx,
-        &fx.swarm_members,
-        &fx.swarms_by_id,
-        &fx.swarm_plans,
-        &fx.swarm_coordinators,
-        &fx.event_history,
-        &fx.event_counter,
-        &fx.swarm_event_tx,
+        &fx.swarm,
     )
     .await;
 
@@ -892,6 +834,15 @@ async fn e2e_solo_seeder_is_elected_coordinator_and_can_assign() {
         Arc::new(RwLock::new(HashMap::new()));
     let client_connections: Arc<RwLock<HashMap<String, crate::server::ClientConnectionInfo>>> =
         Arc::new(RwLock::new(HashMap::new()));
+    let swarm = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .swarms_by_id(Arc::clone(&swarms_by_id))
+        .plans(Arc::clone(&swarm_plans))
+        .coordinators(Arc::clone(&swarm_coordinators))
+        .event_history(Arc::clone(&event_history))
+        .event_counter(Arc::clone(&event_counter))
+        .swarm_event_tx(swarm_event_tx.clone())
+        .build();
 
     handle_comm_seed_graph(
         1,
@@ -902,13 +853,7 @@ async fn e2e_solo_seeder_is_elected_coordinator_and_can_assign() {
             node_spec("synth", "synthesize", &["explore"]),
         ],
         &client_tx,
-        &swarm_members,
-        &swarms_by_id,
-        &swarm_plans,
-        &swarm_coordinators,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
+        &swarm,
     )
     .await;
 
@@ -998,6 +943,15 @@ async fn e2e_seed_does_not_displace_live_coordinator() {
     let event_history = Arc::new(RwLock::new(VecDeque::new()));
     let event_counter = Arc::new(AtomicU64::new(1));
     let swarm_event_tx = broadcast::channel(64).0;
+    let swarm = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .swarms_by_id(Arc::clone(&swarms_by_id))
+        .plans(Arc::clone(&swarm_plans))
+        .coordinators(Arc::clone(&swarm_coordinators))
+        .event_history(Arc::clone(&event_history))
+        .event_counter(Arc::clone(&event_counter))
+        .swarm_event_tx(swarm_event_tx.clone())
+        .build();
 
     // The non-coordinator worker seeds the graph.
     handle_comm_seed_graph(
@@ -1006,13 +960,7 @@ async fn e2e_seed_does_not_displace_live_coordinator() {
         Some("deep".to_string()),
         vec![node_spec("root", "explore", &[])],
         &client_tx,
-        &swarm_members,
-        &swarms_by_id,
-        &swarm_plans,
-        &swarm_coordinators,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
+        &swarm,
     )
     .await;
 
@@ -1154,13 +1102,7 @@ async fn e2e_solo_seeder_can_complete_its_own_seeded_node() {
         })
         .to_string(),
         &fx.client_tx,
-        &fx.swarm_members,
-        &fx.swarms_by_id,
-        &fx.swarm_plans,
-        &fx.swarm_coordinators,
-        &fx.event_history,
-        &fx.event_counter,
-        &fx.swarm_event_tx,
+        &fx.swarm,
     )
     .await;
 
@@ -1205,13 +1147,7 @@ async fn e2e_self_claim_does_not_steal_foreign_assignment() {
         })
         .to_string(),
         &fx.client_tx,
-        &fx.swarm_members,
-        &fx.swarms_by_id,
-        &fx.swarm_plans,
-        &fx.swarm_coordinators,
-        &fx.event_history,
-        &fx.event_counter,
-        &fx.swarm_event_tx,
+        &fx.swarm,
     )
     .await;
 
@@ -1254,13 +1190,7 @@ async fn e2e_assignee_can_complete_queued_assignment() {
         })
         .to_string(),
         &fx.client_tx,
-        &fx.swarm_members,
-        &fx.swarms_by_id,
-        &fx.swarm_plans,
-        &fx.swarm_coordinators,
-        &fx.event_history,
-        &fx.event_counter,
-        &fx.swarm_event_tx,
+        &fx.swarm,
     )
     .await;
 
