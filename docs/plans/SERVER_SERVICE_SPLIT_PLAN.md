@@ -825,3 +825,17 @@ fields (`swarm_coordinators`, `event_history`, `event_counter`,
 `swarm_event_tx`, `mutation_runtime`). The four graph handlers drop their
 now-satisfied `too_many_arguments` expects. Zero behavior change; the
 `comm_control` suite (70) and the DAG e2e suite (20) stay green.
+
+### client_comm_context convergence slice landed (2026-09)
+
+The shared-context handlers collapsed their flat swarm bag onto
+`&SwarmServiceHandle`. `handle_comm_share` (6 flat fields), `handle_comm_read`
+(2 flat fields), and `handle_comm_list` (3 flat fields incl. `file_touch`)
+each bound their swarm maps/file-touch as body locals from the handle (design
+decision A); the non-swarm params (`sessions`, `client_connections`) stay.
+Both routers pass `&swarm_service_handle`/`swarm`; the `client_comm_tests`
+`handle_comm_list` harness seeds a `TestSwarmBuilder` handle and drops its now
+unused `file_touch` local. The two now-satisfied `too_many_arguments` expects
+(`handle_comm_share`, `handle_comm_list`) were removed; unused imports
+(`FileTouchService`, `SwarmEvent`, `HashSet`, `broadcast`) trimmed. Zero
+behavior change; `client_comm` (6) and `client_lifecycle` (27) stay green.

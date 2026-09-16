@@ -456,20 +456,21 @@ async fn comm_list_includes_member_status_and_detail() {
         swarm_id,
         HashSet::from([requester_id.clone(), peer_id.clone()]),
     )])));
-    let file_touch = crate::server::FileTouchService::new();
     let sessions = Arc::new(RwLock::new(HashMap::from([
         (requester_id.clone(), requester.clone()),
         (peer_id.clone(), peer.clone()),
     ])));
     let client_connections = Arc::new(RwLock::new(HashMap::new()));
+    let swarm = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .swarms_by_id(Arc::clone(&swarms_by_id))
+        .build();
 
     handle_comm_list(
         1,
         requester_id,
         &client_event_tx,
-        &swarm_members,
-        &swarms_by_id,
-        &file_touch,
+        &swarm,
         &sessions,
         &client_connections,
     )

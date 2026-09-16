@@ -2191,12 +2191,7 @@ pub(super) async fn handle_client(
                     value,
                     append,
                     &client_event_tx,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &shared_context,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
+                    &swarm_service_handle,
                 )
                 .await;
             }
@@ -2211,8 +2206,7 @@ pub(super) async fn handle_client(
                     req_session_id,
                     key,
                     &client_event_tx,
-                    &swarm_members,
-                    &shared_context,
+                    &swarm_service_handle,
                 )
                 .await;
             }
@@ -2252,9 +2246,7 @@ pub(super) async fn handle_client(
                     id,
                     req_session_id,
                     &client_event_tx,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &file_touch,
+                    &swarm_service_handle,
                     &sessions,
                     &client_connections,
                 )

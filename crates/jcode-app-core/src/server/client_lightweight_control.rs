@@ -141,12 +141,7 @@ pub(super) async fn handle_lightweight_control_request(
                 value,
                 append,
                 &client_event_tx,
-                swarm_members,
-                swarms_by_id,
-                shared_context,
-                event_history,
-                event_counter,
-                swarm_event_tx,
+                swarm,
             )
             .await;
         }
@@ -160,8 +155,7 @@ pub(super) async fn handle_lightweight_control_request(
                 req_session_id,
                 key,
                 &client_event_tx,
-                swarm_members,
-                shared_context,
+                swarm,
             )
             .await;
         }
@@ -199,9 +193,7 @@ pub(super) async fn handle_lightweight_control_request(
                 id,
                 req_session_id,
                 &client_event_tx,
-                swarm_members,
-                swarms_by_id,
-                file_touch,
+                swarm,
                 sessions,
                 client_connections,
             )
