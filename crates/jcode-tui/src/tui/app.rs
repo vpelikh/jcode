@@ -404,6 +404,9 @@ pub(super) enum SessionPickerMode {
     ActiveSessions,
     /// First-run onboarding action picker.
     Onboarding,
+    /// The `/handoff` interactive overlay: the session picker re-fed from the
+    /// saved handoff store. Selections route to `/handoffres` logic.
+    Handoff,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -412,6 +415,17 @@ pub(super) struct PendingCatchupResume {
     pub source_session_id: Option<String>,
     pub queue_position: Option<(usize, usize)>,
     pub show_brief: bool,
+}
+
+/// A handoff snapshot the user picked from the `/handoff` overlay. Carried
+/// through the async pump (mirroring `PendingCatchupResume`) so the selection
+/// can be applied once the remote connection is available to clear the
+/// conversation and set the handoff resume override.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct PendingHandoffResume {
+    pub session_id: String,
+    /// The headline (first content line) to show once the handoff is applied.
+    pub preview_line: String,
 }
 
 #[derive(Clone, Debug)]
@@ -1694,6 +1708,7 @@ pub struct App {
     catchup_return_stack: Vec<String>,
     pending_catchup_resume: Option<PendingCatchupResume>,
     in_flight_catchup_resume: Option<PendingCatchupResume>,
+    pending_handoff_resume: Option<PendingHandoffResume>,
     /// Login picker overlay (None = not visible)
     login_picker_overlay: Option<RefCell<super::login_picker::LoginPicker>>,
     /// Account picker overlay (None = not visible)

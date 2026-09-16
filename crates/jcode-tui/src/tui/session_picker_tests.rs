@@ -2499,3 +2499,107 @@ fn preview_without_search_has_no_highlight_and_scrolls_to_bottom() {
         "no search means no highlight color in preview"
     );
 }
+
+// --- Handoff data source ---
+
+fn make_handoff_snapshot(session_id: &str, intent: &str, todo: &str) -> super::HandoffSnapshot {
+    super::HandoffSnapshot {
+        session_id: session_id.to_string(),
+        project_key: "git:https://example.com/proj".to_string(),
+        ended_at: Utc::now(),
+        disposition: "closed".to_string(),
+        working_dir: Some("/tmp/proj".to_string()),
+        intent: Some(intent.to_string()),
+        open_todos: vec![crate::handoff::HandoffTodo {
+            id: "t1".to_string(),
+            content: todo.to_string(),
+            status: "in_progress".to_string(),
+            group: Some("slice-1".to_string()),
+            confidence: Some("plausible".to_string()),
+        }],
+        last_assistant_text: Some("wrapping up".to_string()),
+        initiative_id: Some("init-1".to_string()),
+    }
+}
+
+#[test]
+fn for_handoffs_builds_rows_with_intent_title_and_handoff_flag() {
+    let picker = SessionPicker::for_handoffs(vec![
+        make_handoff_snapshot("handoff-a", "Fix the login bug", "add tests"),
+        make_handoff_snapshot("handoff-b", "Refactor parser", "rename module"),
+    ]);
+
+    assert!(picker.is_handoff(), "handoff picker should report handoff mode");
+    // Flat (ungrouped) data source: one `SessionInfo` row per snapshot.
+    assert_eq!(picker.visible_session_count(), 2);
+
+    let ids: Vec<String> = picker
+        .visible_session_iter()
+        .map(|session| session.id.clone())
+        .collect();
+    // Both snapshots were created "now"; the recency sort keeps them in
+    // insertion order, but assert set membership so the test is robust to
+    // identical timestamps.
+    let mut sorted = ids.clone();
+    sorted.sort();
+    assert_eq!(sorted, vec!["handoff-a".to_string(), "handoff-b".to_string()]);
+
+    let titles: Vec<String> = picker
+        .visible_session_iter()
+        .map(|session| session.title.clone())
+        .collect();
+    let mut titles_sorted = titles.clone();
+    titles_sorted.sort();
+    assert_eq!(
+        titles_sorted,
+        vec!["Fix the login bug".to_string(), "Refactor parser".to_string()],
+        "intent should become each row's title"
+    );
+}
+
+#[test]
+fn handoff_row_surfaces_todos_in_search_index() {
+    let picker = SessionPicker::for_handoffs(vec![
+        make_handoff_snapshot("handoff-a", "Fix login", "add tests for auth"),
+    ]);
+
+    let session = picker.selected_session().expect("handoff row");
+    // The todo content and intent are part of the searchable index.
+    assert!(session.search_index.contains("auth"), "todo should be searchable");
+    assert!(session.search_index.contains("login"), "intent should be searchable");
+    // The project key is surfaced too.
+    assert!(
+        session.search_index.contains("example.com"),
+        "project key should be searchable"
+    );
+}
+
+#[test]
+fn handoff_picker_enter_emits_handoff_selected() {
+    let mut picker = SessionPicker::for_handoffs(vec![
+        make_handoff_snapshot("handoff-a", "Fix login", "add tests"),
+    ]);
+
+    let action = picker
+        .handle_overlay_key(KeyCode::Enter, KeyModifiers::empty())
+        .expect("enter should be handled");
+    match action {
+        OverlayAction::Selected(PickerResult::HandoffSelected(id)) => {
+            assert_eq!(id, "handoff-a")
+        }
+        other => panic!("expected HandoffSelected, got {:?}", other),
+    }
+}
+
+#[test]
+fn handoff_picker_session_only_keys_are_no_ops() {
+    let mut picker = SessionPicker::for_handoffs(vec![
+        make_handoff_snapshot("handoff-a", "Fix login", "add tests"),
+    ]);
+
+    // `s`/`S` filter cycling and `d` test-toggle are session-only; in handoff
+    // mode they must not change the filter within the flat data source.
+    let before = picker.filter_mode;
+    let _ = picker.handle_overlay_key(KeyCode::Char('s'), KeyModifiers::empty()).unwrap();
+    assert_eq!(picker.filter_mode, before, "s should be a no-op in handoff mode");
+}

@@ -24,6 +24,7 @@ pub use jcode_tui_session_picker::{
     PickerItem, PreviewMessage, ResumeTarget, ServerGroup, SessionFilterMode, SessionInfo,
     SessionSource,
 };
+use crate::handoff::HandoffSnapshot;
 
 mod filter;
 mod loading;
@@ -57,6 +58,10 @@ pub enum PickerResult {
     StartNewSession,
     /// The onboarding read-only recent-project architecture review was chosen.
     ReviewRecentProject,
+    /// A handoff snapshot was chosen from the handoff data source. Carries the
+    /// snapshot's `session_id`, which the app routes to `/handoffres` logic
+    /// (clear the conversation, then set the handoff resume override).
+    HandoffSelected(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -295,6 +300,12 @@ pub struct SessionPicker {
     /// live Claude session never stops it; only confirming this prompt emits
     /// `PickerResult::TakeOverClaude`.
     pending_claude_takeover: Option<ResumeTarget>,
+    /// When true, the picker's data source is saved handoff snapshots rather
+    /// than live/persisted sessions. Rows are `SessionInfo` built from
+    /// `HandoffSnapshot`s, so the list/render/filter/preview pipeline is reused
+    /// unchanged; only the selection result and a few session-only keys are
+    /// routed differently. Set by [`SessionPicker::for_handoffs`].
+    handoff_mode: bool,
 }
 
 impl SessionPicker {
@@ -343,6 +354,7 @@ impl SessionPicker {
             live_presence_refreshed_at: None,
             current_session_id: None,
             pending_claude_takeover: None,
+            handoff_mode: false,
         };
         picker.refresh_live_presence();
         picker.rebuild_items();
@@ -388,6 +400,7 @@ impl SessionPicker {
             live_presence_refreshed_at: None,
             current_session_id: None,
             pending_claude_takeover: None,
+            handoff_mode: false,
         }
     }
 
@@ -465,10 +478,41 @@ impl SessionPicker {
             live_presence_refreshed_at: None,
             current_session_id: None,
             pending_claude_takeover: None,
+            handoff_mode: false,
         };
         picker.refresh_live_presence();
         picker.rebuild_items();
         picker
+    }
+
+    /// Create a picker over saved handoff snapshots, reusing the same list /
+    /// render / filter / preview machinery as the session picker.
+    ///
+    /// Each [`HandoffSnapshot`] is mapped onto a [`SessionInfo`] row so the
+    /// existing pipeline renders it unchanged:
+    ///
+    /// - id / title / short-name come from the snapshot's session id and intent.
+    /// - the snapshot's open todos and trailing assistant text become the
+    ///   preview body (capped like a transcript).
+    /// - `ended_at` drives the "closed <ago>" label and recency ordering.
+    /// - the working directory and any linked initiative are shown.
+    ///
+    /// Selection emits [`PickerResult::HandoffSelected`] (the snapshot's
+    /// `session_id`) instead of a resume target, so the app can route it to the
+    /// `/handoffres` override flow. Rows are built into the flat (ungrouped)
+    /// path, matching how [`new_grouped`](Self::new_grouped) treats an empty
+    /// server list plus orphan sessions.
+    pub fn for_handoffs(snapshots: Vec<HandoffSnapshot>) -> Self {
+        let sessions = snapshots.into_iter().map(handoff_to_session_info).collect();
+        let mut picker = Self::new_grouped(Vec::new(), sessions);
+        picker.handoff_mode = true;
+        picker.rebuild_items();
+        picker
+    }
+
+    /// Whether this picker is operating on the handoff data source.
+    pub fn is_handoff(&self) -> bool {
+        self.handoff_mode
     }
 
     pub fn activate_catchup_filter(&mut self) {
@@ -1239,6 +1283,16 @@ impl SessionPicker {
                 if self.onboarding_review_recent_project_highlighted() {
                     return Ok(OverlayAction::Selected(PickerResult::ReviewRecentProject));
                 }
+                if self.handoff_mode {
+                    if let Some(session_id) = self
+                        .selected_session()
+                        .map(|session| session.id.clone())
+                    {
+                        return Ok(OverlayAction::Selected(PickerResult::HandoffSelected(
+                            session_id,
+                        )));
+                    }
+                }
                 let targets = self.selection_or_current_targets();
                 if !targets.is_empty() {
                     return Ok(OverlayAction::Selected(
@@ -1257,16 +1311,22 @@ impl SessionPicker {
                 self.search_active = true;
             }
             KeyCode::Char('d') => {
-                self.toggle_test_sessions();
+                if !self.handoff_mode {
+                    self.toggle_test_sessions();
+                }
             }
             KeyCode::Char('T') => {
                 self.begin_claude_takeover_confirmation();
             }
             KeyCode::Char('s') => {
-                self.cycle_filter_mode();
+                if !self.handoff_mode {
+                    self.cycle_filter_mode();
+                }
             }
             KeyCode::Char('S') => {
-                self.cycle_filter_mode_backwards();
+                if !self.handoff_mode {
+                    self.cycle_filter_mode_backwards();
+                }
             }
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
                 return Ok(OverlayAction::Close);
@@ -2416,6 +2476,157 @@ impl SessionPicker {
         super::mermaid::clear_image_state();
 
         result
+    }
+}
+
+/// Map a handoff snapshot onto a [`SessionInfo`] row for the picker's shared
+/// list / render / preview pipeline.
+///
+/// The snapshot's open todos become the preview "body": todo rows rendered as
+/// assistant/meta lines with their status, plus any trailing assistant text.
+/// The intent doubles as the row title, with the snapshot id as a fallback.
+/// `ended_at` is used for both `created_at` and `last_message_time` so recency
+/// ordering and the "closed <ago>" label reflect when the work was last active.
+fn handoff_to_session_info(snapshot: HandoffSnapshot) -> SessionInfo {
+    // Open todos rendered as preview lines, newest/grouped faithfully by the
+    // snapshot's own ordering. A handoff's preview reads as a handoff "context"
+    // block rather than a chat transcript, which is what the user wants to
+    // scrutinize before resuming.
+    let mut messages_preview: Vec<PreviewMessage> = Vec::new();
+    if !snapshot.open_todos.is_empty() {
+        messages_preview.push(PreviewMessage {
+            role: "meta".to_string(),
+            content: format!(
+                "{} open todo{}:",
+                snapshot.open_todos.len(),
+                if snapshot.open_todos.len() == 1 { "" } else { "s" }
+            ),
+            tool_calls: Vec::new(),
+            tool_data: None,
+            timestamp: None,
+        });
+        for todo in &snapshot.open_todos {
+            let status = if todo.status.is_empty() {
+                "open".to_string()
+            } else {
+                todo.status.clone()
+            };
+            let group = todo
+                .group
+                .clone()
+                .map(|g| format!(" [{}]", g))
+                .unwrap_or_default();
+            messages_preview.push(PreviewMessage {
+                role: "assistant".to_string(),
+                content: format!("☐ {}{} ({})", todo.content, group, status),
+                tool_calls: Vec::new(),
+                tool_data: None,
+                timestamp: None,
+            });
+        }
+    } else if let Some(assistant) = snapshot.last_assistant_text.as_deref() {
+        messages_preview.push(PreviewMessage {
+            role: "meta".to_string(),
+            content: "No open todos; last assistant context:".to_string(),
+            tool_calls: Vec::new(),
+            tool_data: None,
+            timestamp: None,
+        });
+        messages_preview.push(PreviewMessage {
+            role: "assistant".to_string(),
+            content: assistant.to_string(),
+            tool_calls: Vec::new(),
+            tool_data: None,
+            timestamp: None,
+        });
+    } else {
+        messages_preview.push(PreviewMessage {
+            role: "meta".to_string(),
+            content: "No open todos recorded for this handoff.".to_string(),
+            tool_calls: Vec::new(),
+            tool_data: None,
+            timestamp: None,
+        });
+    }
+    if let Some(assistant) = snapshot.last_assistant_text.as_deref() {
+        if !snapshot.open_todos.is_empty() {
+            messages_preview.push(PreviewMessage {
+                role: "meta".to_string(),
+                content: "Last assistant message:".to_string(),
+                tool_calls: Vec::new(),
+                tool_data: None,
+                timestamp: None,
+            });
+            messages_preview.push(PreviewMessage {
+                role: "assistant".to_string(),
+                content: assistant.to_string(),
+                tool_calls: Vec::new(),
+                tool_data: None,
+                timestamp: None,
+            });
+        }
+    }
+
+    let id = snapshot.session_id.clone();
+    let title = snapshot
+        .intent
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| id.clone());
+    let short_name = id.clone();
+    let working_dir = snapshot.working_dir.clone();
+
+    let mut search_index = build_search_index(
+        &id,
+        &short_name,
+        &title,
+        working_dir.as_deref(),
+        None,
+        &messages_preview,
+    );
+    // Surface the full context (`project_key`, initiative id) in search so a
+    // user can filter handoffs by project or linked initiative.
+    if !snapshot.project_key.is_empty() {
+        search_index.push(' ');
+        search_index.push_str(&snapshot.project_key.to_lowercase());
+    }
+    if let Some(ref initiative) = snapshot.initiative_id {
+        search_index.push(' ');
+        search_index.push_str(&initiative.to_lowercase());
+    }
+
+    SessionInfo {
+        id,
+        parent_id: None,
+        short_name,
+        icon: "🕘".to_string(),
+        title,
+        message_count: messages_preview.len(),
+        user_message_count: 0,
+        assistant_message_count: snapshot.open_todos.len(),
+        created_at: snapshot.ended_at,
+        last_message_time: snapshot.ended_at,
+        last_active_at: Some(snapshot.ended_at),
+        working_dir,
+        model: None,
+        provider_key: None,
+        is_canary: false,
+        is_debug: false,
+        saved: false,
+        save_label: None,
+        status: SessionStatus::Closed,
+        needs_catchup: false,
+        estimated_tokens: 0,
+        first_user_prompt: None,
+        messages_preview,
+        search_index,
+        server_name: None,
+        server_icon: None,
+        source: SessionSource::Jcode,
+        resume_target: ResumeTarget::JcodeSession {
+            session_id: snapshot.session_id.clone(),
+        },
+        external_path: None,
     }
 }
 

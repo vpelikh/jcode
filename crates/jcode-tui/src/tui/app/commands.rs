@@ -1953,64 +1953,6 @@ pub(super) fn handle_git_status_completed(app: &mut App, completed: GitStatusCom
     }
 }
 
-/// Build the `/handoff` listing text from the shared handoff store.
-///
-/// Shared by the remote and local dispatchers so their output cannot drift.
-/// Lists every persisted snapshot newest-first (archived ones marked), with a
-/// hint on how to resume.
-pub(super) fn handoff_listing_message(resume_available: bool) -> String {
-    let snapshots = crate::handoff::list_all_handoffs();
-    if snapshots.is_empty() {
-        return "No saved handoffs. A handoff is captured when a session ends with unfinished work; once one exists, run /handoffres <id> (list with /handoff).".to_string();
-    }
-    let resume_hint = if resume_available {
-        "Resume with /handoffres <id>; clear with /handoff-clear"
-    } else {
-        "Resume needs a server connection: connect, then /handoffres <id>"
-    };
-    let latest = crate::handoff::list_saved_handoffs();
-    let latest_ids: std::collections::HashSet<&str> =
-        latest.iter().map(|e| e.session_id.as_str()).collect();
-    let mut msg = format!(
-        "{0} saved handoff(s), newest first. {1}:\n",
-        snapshots.len(),
-        resume_hint
-    );
-    for snapshot in snapshots.iter().take(24) {
-        let when = snapshot.ended_at.format("%Y-%m-%d %H:%M");
-        let intent: String = snapshot
-            .intent
-            .as_deref()
-            .unwrap_or("<no intent>")
-            .chars()
-            .take(80)
-            .collect();
-        let archived = if latest_ids.contains(snapshot.session_id.as_str()) {
-            ""
-        } else {
-            " [archived]"
-        };
-        msg.push_str(&format!(
-            "- {}{}  {} (ended {when})\n    {}\n",
-            snapshot.session_id, archived, snapshot.project_key, intent
-        ));
-    }
-    if snapshots.len() > 24 {
-        msg.push_str(&format!("...and {} more.\n", snapshots.len() - 24));
-    }
-    msg
-}
-
-/// Local fallback for `/handoff`: list saved handoffs. This path runs without a
-/// live server connection (disconnected/SSH), so it reads the shared handoff
-/// store directly, mirroring what the remote dispatcher produces via the shared
-/// [`handoff_listing_message`]. Resume is only possible once connected, so the
-/// hint reflects that.
-pub(super) fn handle_handoff_list_local(app: &mut App, _trimmed: &str) -> bool {
-    app.push_display_message(DisplayMessage::system(handoff_listing_message(false)));
-    true
-}
-
 pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
     if handle_subagent_model_command(app, trimmed)
         || app.handle_hotkeys_command(trimmed)
@@ -2082,7 +2024,8 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
     }
 
     if trimmed == "/handoff" || trimmed.starts_with("/handoff ") {
-        return handle_handoff_list_local(app, trimmed);
+        app.open_handoff_picker();
+        return true;
     }
 
     if trimmed == "/handoffres" || trimmed.starts_with("/handoffres ") {

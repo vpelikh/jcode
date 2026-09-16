@@ -193,6 +193,37 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
             }
         }
 
+        if let Some(request) = app.take_pending_handoff_resume() {
+            // Mirror the manual `/handoffres` flow: clear the conversation in
+            // place (so the next message is the first visible one) then set the
+            // one-shot handoff resume override. Always clear so the override is
+            // guaranteed to fire even right after a reconnect when the client's
+            // display cache has not yet loaded server history.
+            match async {
+                remote.clear().await?;
+                remote.set_handoff_resume(Some(request.session_id.clone())).await?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await
+            {
+                Ok(()) => {
+                    app.push_display_message(DisplayMessage::system(format!(
+                        "Handoff ready: {}\n{}",
+                        request.session_id, request.preview_line
+                    )));
+                    app.set_status_notice("Handoff selected");
+                    return true;
+                }
+                Err(err) => {
+                    app.push_display_message(DisplayMessage::error(format!(
+                        "Failed to apply handoff resume: {}",
+                        err
+                    )));
+                    needs_redraw = true;
+                }
+            }
+        }
+
         if let Some(target_session) = app.workspace_client.take_pending_resume_session() {
             match remote.resume_session(&target_session).await {
                 Ok(()) => {

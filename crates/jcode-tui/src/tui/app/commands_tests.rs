@@ -747,13 +747,15 @@ mod worktree {
 }
 
 
-/// The local `/handoff` fallback lists saved handoffs (including archived ones)
-/// from the shared store, and `/handoffres` reports that a connected server is
-/// required — all without a socket.
+/// The local `/handoff` fallback opens the interactive picker over the saved
+/// handoff store (including archived ones) without a socket, and `/handoffres`
+/// reports that a connected server is required. The selected handoff is applied
+/// later on the async pump, which requires a live connection.
 #[test]
 fn local_handoff_listing_surfaces_archived_and_requires_server_for_resume() {
     use crate::tui::app::commands_dispatch::dispatch_local_command;
     use crate::tui::app::tests::create_test_app;
+    use crate::tui::app::SessionPickerMode;
 
     // Isolated home so capture writes to a throwaway store.
     struct Restore;
@@ -804,28 +806,37 @@ fn local_handoff_listing_surfaces_archived_and_requires_server_for_resume() {
 
     let mut app = create_test_app();
 
-    // /handoff is claimed locally and lists newest first with the archived tag.
+    // /handoff is claimed locally and opens the interactive handoff picker
+    // over the saved store (newest first, archived ones still selectable).
     assert!(
         dispatch_local_command(&mut app, "/handoff"),
         "/handoff should be claimed in local dispatch"
     );
-    let listing = app
-        .display_messages
-        .last()
-        .map(|m| m.content.clone())
-        .unwrap_or_default();
-    assert!(
-        listing.contains("latest-handoff"),
-        "listing should show the latest handoff: {listing}"
+    assert_eq!(
+        app.session_picker_mode,
+        SessionPickerMode::Handoff,
+        "/handoff should switch the picker into handoff mode"
     );
-    assert!(
-        listing.contains("archived-handoff") && listing.contains("[archived]"),
-        "listing should surface the archived handoff: {listing}"
-    );
-    assert!(
-        listing.contains("needs a server connection"),
-        "local listing should note resume needs a server: {listing}"
-    );
+    {
+        let picker = app
+            .session_picker_overlay
+            .as_ref()
+            .expect("handoff picker should be open")
+            .borrow();
+        assert!(picker.is_handoff(), "the handoff picker should report handoff mode");
+        assert_eq!(picker.visible_session_count(), 2, "both snapshots should be listed");
+        // Rows are recency-sorted, so the newest handoff is the first visible one.
+        let first_id = picker
+            .visible_session_iter_for_test()
+            .map(|session| session.id.clone())
+            .next()
+            .expect("at least one visible handoff");
+        assert_eq!(
+            first_id.as_str(),
+            "latest-handoff",
+            "handoffs should be listed newest first"
+        );
+    }
 
     // `/handoffres` is claimed locally but explains a server is required.
     assert!(

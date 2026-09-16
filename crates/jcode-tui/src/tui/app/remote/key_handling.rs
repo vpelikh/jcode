@@ -120,18 +120,6 @@ async fn handle_handoff_resume_command(
     Ok(())
 }
 
-/// `/handoff` lists the saved handoffs the user can resume from, newest first.
-/// Every persisted snapshot is shown (not only the latest per project, so a
-/// superseded handoff is still selectable). Each row carries the `session_id`
-/// the user should pass to `/handoffres`. Shares the message builder with the
-/// local fallback so the two outputs cannot drift.
-fn handle_handoff_command(app: &mut App, _trimmed: &str) -> Result<()> {
-    app.push_display_message(DisplayMessage::system(
-        app_mod::commands::handoff_listing_message(true),
-    ));
-    Ok(())
-}
-
 pub(in crate::tui::app) async fn handle_remote_update_command(
     app: &mut App,
     remote: &mut RemoteConnection,
@@ -2033,7 +2021,8 @@ async fn handle_remote_key_internal(
                 }
 
                 if trimmed == "/handoff" || trimmed.starts_with("/handoff ") {
-                    return handle_handoff_command(app, trimmed);
+                    app.open_handoff_picker();
+                    return Ok(());
                 }
 
                 if trimmed == "/handoffres" || trimmed.starts_with("/handoffres ") {
