@@ -88,8 +88,6 @@ pub(super) async fn handle_lightweight_control_request(
     let swarm_plans = &swarm.swarm_state.plans;
     let swarm_coordinators = &swarm.swarm_state.coordinators;
     let file_touch = &swarm.file_touch;
-    let channel_subscriptions = &swarm.channel_subscriptions;
-    let channel_subscriptions_by_session = &swarm.channel_subscriptions_by_session;
     let event_history = &swarm.event_history;
     let event_counter = &swarm.event_counter;
     let swarm_event_tx = &swarm.swarm_event_tx;
@@ -207,8 +205,7 @@ pub(super) async fn handle_lightweight_control_request(
                 id,
                 req_session_id,
                 &client_event_tx,
-                swarm_members,
-                channel_subscriptions,
+                swarm,
             )
             .await;
         }
@@ -222,8 +219,7 @@ pub(super) async fn handle_lightweight_control_request(
                 req_session_id,
                 channel,
                 &client_event_tx,
-                swarm_members,
-                channel_subscriptions,
+                swarm,
             )
             .await;
         }
@@ -641,12 +637,7 @@ pub(super) async fn handle_lightweight_control_request(
                 req_session_id,
                 channel,
                 &client_event_tx,
-                swarm_members,
-                channel_subscriptions,
-                channel_subscriptions_by_session,
-                event_history,
-                event_counter,
-                swarm_event_tx,
+                swarm,
             )
             .await;
         }
@@ -660,12 +651,7 @@ pub(super) async fn handle_lightweight_control_request(
                 req_session_id,
                 channel,
                 &client_event_tx,
-                swarm_members,
-                channel_subscriptions,
-                channel_subscriptions_by_session,
-                event_history,
-                event_counter,
-                swarm_event_tx,
+                swarm,
             )
             .await;
         }

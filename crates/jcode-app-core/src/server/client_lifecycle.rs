@@ -461,8 +461,6 @@ pub(super) async fn handle_client(
     let swarm_plans = swarm_service.swarm_state.plans;
     let swarm_coordinators = swarm_service.swarm_state.coordinators;
     let file_touch = swarm_service.file_touch;
-    let channel_subscriptions = swarm_service.channel_subscriptions;
-    let channel_subscriptions_by_session = swarm_service.channel_subscriptions_by_session;
     let client_debug_state = debug_service.client_debug_state;
     let client_debug_response_tx = debug_service.client_debug_response_tx;
     let event_history = swarm_service.event_history;
@@ -2261,8 +2259,7 @@ pub(super) async fn handle_client(
                     id,
                     req_session_id,
                     &client_event_tx,
-                    &swarm_members,
-                    &channel_subscriptions,
+                    &swarm_service_handle,
                 )
                 .await;
             }
@@ -2277,8 +2274,7 @@ pub(super) async fn handle_client(
                     req_session_id,
                     channel,
                     &client_event_tx,
-                    &swarm_members,
-                    &channel_subscriptions,
+                    &swarm_service_handle,
                 )
                 .await;
             }
@@ -2719,12 +2715,7 @@ pub(super) async fn handle_client(
                     req_session_id,
                     channel,
                     &client_event_tx,
-                    &swarm_members,
-                    &channel_subscriptions,
-                    &channel_subscriptions_by_session,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
+                    &swarm_service_handle,
                 )
                 .await;
             }
@@ -2739,12 +2730,7 @@ pub(super) async fn handle_client(
                     req_session_id,
                     channel,
                     &client_event_tx,
-                    &swarm_members,
-                    &channel_subscriptions,
-                    &channel_subscriptions_by_session,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
+                    &swarm_service_handle,
                 )
                 .await;
             }

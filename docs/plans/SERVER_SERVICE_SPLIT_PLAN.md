@@ -839,3 +839,19 @@ unused `file_touch` local. The two now-satisfied `too_many_arguments` expects
 (`handle_comm_share`, `handle_comm_list`) were removed; unused imports
 (`FileTouchService`, `SwarmEvent`, `HashSet`, `broadcast`) trimmed. Zero
 behavior change; `client_comm` (6) and `client_lifecycle` (27) stay green.
+
+### client_comm_channels convergence slice landed (2026-09)
+
+The channel-subscription handlers collapsed their flat swarm bag onto
+`&SwarmServiceHandle`. `handle_comm_list_channels` and
+`handle_comm_channel_members` (2 flat fields each) and
+`handle_comm_subscribe_channel` / `handle_comm_unsubscribe_channel` (6 flat
+fields each incl. `channel_subscriptions`, `channel_subscriptions_by_session`,
+event history/counter/tx) each bind the maps/event/forward indexes as body
+locals from the handle (design decision A). Both routers pass the handle and
+drop their now-unused `channel_subscriptions` /
+`channel_subscriptions_by_session` locals. The now-satisfied
+`too_many_arguments` expects were removed; the dead `ChannelSubscriptions`
+type alias and unused `SwarmEvent` / `HashSet` / `broadcast` imports trimmed.
+Zero behavior change; `client_comm` (6), `client_lifecycle` (27),
+`comm_control` (70), and `server::` (466) stay green.
