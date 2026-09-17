@@ -952,6 +952,85 @@ fn local_handoff_empty_store_pushes_message_without_opening_picker() {
     );
 }
 
+/// Full client-flow regression guard: opening the `/handoff` overlay and
+/// pressing Enter must queue a handoff resume (not a live-session resume), and
+/// must not leave any session-only picker state behind. This exercises the App
+/// routing (`open_handoff_picker` → `handle_session_picker_key`) that the
+/// picker-level unit tests and socket integration tests don't cover directly.
+#[test]
+fn handoff_overlay_enter_queues_handoff_resume_and_leaves_no_session_state() {
+    use crate::tui::app::tests::create_test_app;
+
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match std::env::var_os("JCODE_HOME") {
+                Some(v) => crate::env::set_var("JCODE_HOME", v),
+                None => crate::env::remove_var("JCODE_HOME"),
+            }
+        }
+    }
+    let _guard = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().expect("temp home");
+    crate::env::set_var("JCODE_HOME", home.path());
+    let wd = home.path().join("project");
+    std::fs::create_dir_all(&wd).unwrap();
+    let _restore = Restore;
+
+    crate::todo::save_todos(
+        "handoff-flow",
+        &[crate::todo::TodoItem {
+            id: "t".into(),
+            content: "flow work".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: None,
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    crate::todo::save_plan(
+        "handoff-flow",
+        &crate::todo::TodoPlan {
+            user_intention: Some("flow intent".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    crate::handoff::capture("handoff-flow", Some(&wd), "closed", None).expect("capture");
+
+    let mut app = create_test_app();
+
+    // Open the interactive handoff overlay.
+    app.open_handoff_picker();
+    assert!(
+        app.session_picker_overlay.is_some(),
+        "handoff picker should be open"
+    );
+
+    // Press Enter to select the single (or currently selected) handoff.
+    app.handle_session_picker_key(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::empty(),
+    )
+    .expect("handoff picker enter should succeed");
+
+    // The overlay closes and a handoff resume is queued, not a session resume.
+    assert!(
+        app.session_picker_overlay.is_none(),
+        "handoff picker should close after selection"
+    );
+    let pending = app
+        .take_pending_handoff_resume()
+        .expect("a handoff resume should be queued");
+    assert_eq!(pending.session_id, "handoff-flow");
+    assert!(
+        app.workspace_client.take_pending_resume_session().is_none(),
+        "a handoff selection must not route to a live-session resume"
+    );
+}
+
 mod prune {
     struct PruneTestHome {
         previous: Option<std::ffi::OsString>,
