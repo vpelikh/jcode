@@ -45,6 +45,14 @@ const DEFAULT_SESSION_SCAN_LIMIT: usize = 100;
 const MIN_SESSION_SCAN_LIMIT: usize = 50;
 const MAX_SESSION_SCAN_LIMIT: usize = 10_000;
 
+/// Handoff preview content caps, mirroring the first-message injection render's
+/// bound so a pathological handoff snapshot cannot balloon the picker preview
+/// pane. `safe_truncate` caps are in characters.
+const HANDOFF_TODO_CONTENT_CAP: usize = 512;
+const HANDOFF_TODO_STATUS_CAP: usize = 32;
+const HANDOFF_TODO_GROUP_CAP: usize = 48;
+const HANDOFF_ASSISTANT_TEXT_CAP: usize = 1024;
+
 #[derive(Clone, Debug)]
 pub enum PickerResult {
     Selected(Vec<ResumeTarget>),
@@ -2524,17 +2532,17 @@ fn handoff_to_session_info(snapshot: HandoffSnapshot) -> SessionInfo {
             let status = if todo.status.is_empty() {
                 "open".to_string()
             } else {
-                safe_truncate(&todo.status, 32).to_string()
+                safe_truncate(&todo.status, HANDOFF_TODO_STATUS_CAP).to_string()
             };
             let group = todo
                 .group
                 .clone()
-                .map(|g| format!(" [{}]", safe_truncate(&g, 48)))
+                .map(|g| format!(" [{}]", safe_truncate(&g, HANDOFF_TODO_GROUP_CAP)))
                 .unwrap_or_default();
             // Bound the todo body like the injection render (`render_snapshot`
             // caps todo content at 512 chars) so a pathological snapshot cannot
             // balloon the picker preview.
-            let content = safe_truncate(&todo.content, 512);
+            let content = safe_truncate(&todo.content, HANDOFF_TODO_CONTENT_CAP);
             messages_preview.push(PreviewMessage {
                 role: "assistant".to_string(),
                 content: format!("☐ {}{} ({})", content, group, status),
@@ -2553,7 +2561,7 @@ fn handoff_to_session_info(snapshot: HandoffSnapshot) -> SessionInfo {
         });
         messages_preview.push(PreviewMessage {
             role: "assistant".to_string(),
-            content: safe_truncate(assistant, 1024).to_string(),
+            content: safe_truncate(assistant, HANDOFF_ASSISTANT_TEXT_CAP).to_string(),
             tool_calls: Vec::new(),
             tool_data: None,
             timestamp: None,
@@ -2579,7 +2587,7 @@ fn handoff_to_session_info(snapshot: HandoffSnapshot) -> SessionInfo {
         });
         messages_preview.push(PreviewMessage {
             role: "assistant".to_string(),
-            content: safe_truncate(assistant, 1024).to_string(),
+            content: safe_truncate(assistant, HANDOFF_ASSISTANT_TEXT_CAP).to_string(),
             tool_calls: Vec::new(),
             tool_data: None,
             timestamp: None,
