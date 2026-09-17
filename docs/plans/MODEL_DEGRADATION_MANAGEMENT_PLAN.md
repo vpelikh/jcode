@@ -2,10 +2,11 @@
 
 ## Status
 
-**In progress.** Slice 1 (watchdog subscription surface) and Slice 2
-(degradation tracker) landed on `feat/model-degradation-management`. The plan
-proposes turning an existing but passive set of detection signals into an
-active degradation-management system.
+**In progress.** Slices 1-3 landed on `feat/model-degradation-management`. Slice 1
+(watchdog subscription surface) and Slice 2 (degradation tracker) are complete;
+Slice 3 wires the tracker's `Compact` rung into the turn-loop head to trigger a
+compaction before the next API call. The plan proposes turning an existing but
+passive set of detection signals into an active degradation-management system.
 
 > **Trigger for this plan (2026-09):** a long-running session with a live
 > language model degraded into a classic stalled-promise loop. The session

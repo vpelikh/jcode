@@ -22,6 +22,7 @@
 //!   separate "load" axis named in the plan. (Escalation for the load axis is a
 //!   future slice; here we only track it for observability.)
 
+use super::*;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -284,6 +285,60 @@ impl DegradationTracker {
             self.system_stalls.len(),
             stall_types.join(",")
         )
+    }
+}
+
+/// Reactive mitigation integrated into the `Agent` turn loop.
+impl Agent {
+    /// Advance the degradation mitigation ladder at a safe turn-loop checkpoint.
+    ///
+    /// Called at the turn-loop head (before the next provider request). Returns
+    /// a user-visible message when we acted on a mitigation (e.g. triggered a
+    /// compaction); `None` when nothing needed doing.
+    ///
+    /// Currently handles the `Compact` rung: when the tracker reports a pending
+    /// compaction, request a manual compaction through the existing
+    /// `request_manual_compaction` mechanism, acknowledge it (one-shot), and
+    /// report success/failure via the returned message. Route-fallback
+    /// (`Rung::RouteFallback`) and the observability rungs land in later slices.
+    pub(crate) fn maybe_mitigate_degradation(&mut self) -> Option<String> {
+        let rung = self.degradation.rung();
+        match rung {
+            Rung::Compact if self.degradation.compact_pending() => {
+                crate::logging::warn(&format!(
+                    "Model degradation: {} reached Compact rung; triggering compaction",
+                    self.degradation.describe()
+                ));
+                let (message, success) = self.request_manual_compaction();
+                self.degradation.acknowledge_compact();
+                if success {
+                    Some(format!(
+                        "Model degradation detected; {}",
+                        message.lines().last().unwrap_or("context compaction started")
+                    ))
+                } else {
+                    // Compaction unavailable right now; log and carry on rather
+                    // than blocking the turn. The rung stays Compact so a later
+                    // checkpoint can retry once progress resumes.
+                    crate::logging::warn(&format!(
+                        "Deferred degradation compaction (unsupported or busy): {message}"
+                    ));
+                    None
+                }
+            }
+            Rung::Compact
+            | Rung::Watch
+            | Rung::Healthy
+            | Rung::RouteFallback
+            | Rung::Escalated => None,
+        }
+    }
+
+    /// Record the current turn's healthy/clean completion into the degradation
+    /// tracker, so a clean stretch prunes stale stall-window entries. Call on
+    /// the loop's clean, tool-call-producing exit.
+    pub(crate) fn record_clean_turn(&mut self) {
+        self.degradation.record_healthy_turn();
     }
 }
 

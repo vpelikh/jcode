@@ -143,6 +143,14 @@ impl Agent {
                 self.session.save()?;
             }
 
+            // Model-degradation mitigation checkpoint (Slice 3): if the route
+            // tracker reached the Compact rung across prior turns, trigger a
+            // compaction before the next API call so we do not keep degrading
+            // under the same long context.
+            if let Some(notice) = self.maybe_mitigate_degradation() {
+                crate::logging::info(&format!("[degradation] {notice}"));
+            }
+
             // Start provider transport setup before deriving and potentially
             // compacting the request history. This is the first point where the
             // stable request settings are available.

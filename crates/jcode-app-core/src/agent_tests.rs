@@ -933,6 +933,55 @@ async fn manual_compaction_physically_consolidates_transcript_when_enabled() {
 }
 
 #[tokio::test]
+async fn degradation_mitigation_triggers_compaction_once_on_compact_rung() {
+    // Confirm the degradation tracker's Compact rung drives a single
+    // compaction through the agent mitigation checkpoint (Slice 3), and that
+    // the action is one-shot per escalation cycle.
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // Give the compaction manager transcript material so a compaction request
+    // actually succeeds (mirrors the manual-compaction test setup).
+    for i in 0..30 {
+        agent.add_message(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: format!("turn {i} {}", "x".repeat(120)),
+                cache_control: None,
+            }],
+        );
+    }
+
+    // Fresh tracker is healthy: no mitigation fires.
+    assert!(
+        agent.maybe_mitigate_degradation().is_none(),
+        "healthy tracker must not mitigate"
+    );
+
+    // Push past the Compact rung (default config promotes at 2 stalls).
+    agent
+        .degradation
+        .record_stall(crate::agent::degradation::StallKind::StalledPromise);
+    agent
+        .degradation
+        .record_stall(crate::agent::degradation::StallKind::StalledPromise);
+    assert_eq!(agent.degradation.rung(), crate::agent::degradation::Rung::Compact);
+
+    // First mitigation call triggers compaction and returns a notice.
+    let notice = agent.maybe_mitigate_degradation();
+    assert!(notice.is_some(), "compact rung should trigger a mitigation notice");
+
+    // Second call is a no-op (compact already acknowledged, one-shot). Even
+    // though the first compaction may still be applying in the background, the
+    // pending flag is consumed, so we must not re-fire on the same cycle.
+    assert!(
+        agent.maybe_mitigate_degradation().is_none(),
+        "compact mitigation must fire only once per cycle"
+    );
+}
+
+#[tokio::test]
 async fn interrupt_signal_fire_before_notified_does_not_hang() {
     // Regression test: fire() called BEFORE notified().await must not hang.
     // The old code called notify_waiters() which drops the notification if
