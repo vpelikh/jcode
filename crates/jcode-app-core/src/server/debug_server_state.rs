@@ -765,8 +765,8 @@ async fn build_server_memory_payload(
     let swarm_plans = &swarm.swarm_state.plans;
     let swarm_coordinators = &swarm.swarm_state.coordinators;
     let file_touch = &swarm.file_touch;
-    let channel_subscriptions = &swarm.channel_subscriptions;
-    let channel_subscriptions_by_session = &swarm.channel_subscriptions_by_session;
+    let channel_subscriptions = swarm.channel_subscriptions_map();
+    let channel_subscriptions_by_session = swarm.channel_subscriptions_by_session_map();
     let event_history = swarm.read_event_sources().0;
     let process = crate::process_memory::snapshot_with_source("server:memory");
     let background_tasks = crate::background::global().list().await;

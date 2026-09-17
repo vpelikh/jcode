@@ -86,6 +86,15 @@ API the handle wraps). Instead:
 3. **`channel_subscriptions{,_by_session}`** (10). Reverse indexes; add
    `subscribe_channel` / `unsubscribe_channel` / `resolve_subscribers` methods
    (some already exist on the handle as `remove_session_channel_subscriptions`).
+   *(landed 2026-09)* Both indexes are now private. Writes route through
+   `subscribe_session_to_channel` / `unsubscribe_session_from_channel` /
+   `remove_session_channel_subscriptions`; reads go through the forward
+   `channel_subscriptions_map()` and reverse
+   `channel_subscriptions_by_session_map()` accessors. Call sites converted in
+   `client_comm_channels` (list / members / subscribe / unsubscribe),
+   `client_comm_message`, `debug_server_state`, and `debug_swarm_read`; the
+   dead `server.rs` re-exports for subscribe/unsubscribe were removed. Zero
+   direct cross-module field access remains.
 4. **`swarm_state` (169)** — the big one, itself a struct. Privatize
    incrementally *within* `SwarmState`: members first (existing handle methods
    `ensure_member`/`rename_member_session`/`set_member_status`/etc. already

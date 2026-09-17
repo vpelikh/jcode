@@ -70,8 +70,7 @@ use self::swarm::{
     swarm_is_self_or_ancestor, update_member_status_with_report_tldr,
 };
 use self::swarm_channels::{
-    remove_session_channel_subscriptions, subscribe_session_to_channel,
-    unsubscribe_session_from_channel,
+    remove_session_channel_subscriptions,
 };
 pub(super) use self::swarm_mutation_state::SwarmMutationRuntime;
 use self::swarm_persistence::{

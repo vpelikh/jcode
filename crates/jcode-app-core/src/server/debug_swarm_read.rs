@@ -26,7 +26,7 @@ pub(super) async fn maybe_handle_swarm_read_command(
     let swarm_plans = &swarm.swarm_state.plans;
     let swarm_coordinators = &swarm.swarm_state.coordinators;
     let file_touch = &swarm.file_touch;
-    let channel_subscriptions = &swarm.channel_subscriptions;
+    let channel_subscriptions = swarm.channel_subscriptions_map();
     let swarm_state = SwarmState {
         members: Arc::clone(swarm_members),
         swarms_by_id: Arc::clone(swarms_by_id),

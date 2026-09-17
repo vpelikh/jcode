@@ -39,9 +39,9 @@ pub(crate) struct SwarmServiceHandle {
     /// File-touch tracking service (forward path index + reverse session index).
     pub(crate) file_touch: FileTouchService,
     /// Channel subscriptions forward index.
-    pub(crate) channel_subscriptions: ChannelSubscriptions,
+    channel_subscriptions: ChannelSubscriptions,
     /// Channel subscriptions reverse index (session_id -> swarm_id -> channels).
-    pub(crate) channel_subscriptions_by_session: ChannelSubscriptions,
+    channel_subscriptions_by_session: ChannelSubscriptions,
     /// Event history for real-time event subscription (ring buffer).
     event_history: Arc<RwLock<VecDeque<SwarmEvent>>>,
     /// Counter for event IDs.
@@ -567,6 +567,59 @@ impl SwarmServiceHandle {
             &self.channel_subscriptions_by_session,
         )
         .await;
+    }
+
+    /// Subscribe a session to a channel within a swarm. Routes the channel
+    /// index updates through the swarm service (Tier 3).
+    pub(crate) async fn subscribe_session_to_channel(
+        &self,
+        session_id: &str,
+        swarm_id: &str,
+        channel: &str,
+    ) {
+        super::super::swarm_channels::subscribe_session_to_channel(
+            session_id,
+            swarm_id,
+            channel,
+            &self.channel_subscriptions,
+            &self.channel_subscriptions_by_session,
+        )
+        .await;
+    }
+
+    /// Unsubscribe a session from a channel within a swarm. Routes the channel
+    /// index updates through the swarm service (Tier 3).
+    pub(crate) async fn unsubscribe_session_from_channel(
+        &self,
+        session_id: &str,
+        swarm_id: &str,
+        channel: &str,
+    ) {
+        super::super::swarm_channels::unsubscribe_session_from_channel(
+            session_id,
+            swarm_id,
+            channel,
+            &self.channel_subscriptions,
+            &self.channel_subscriptions_by_session,
+        )
+        .await;
+    }
+
+    /// Borrow the channel-subscription forward index for read-only consumers
+    /// (channel list / member resolution, debug snapshots). Callers must not
+    /// mutate through this handle; all writes route through
+    /// `subscribe_session_to_channel` / `unsubscribe_session_from_channel` /
+    /// `remove_session_channel_subscriptions`.
+    pub(crate) fn channel_subscriptions_map(&self) -> &ChannelSubscriptions {
+        &self.channel_subscriptions
+    }
+
+    /// Borrow the channel-subscription reverse index (session_id -> swarm_id ->
+    /// channels) for read-only consumers. Callers must not mutate through this
+    /// handle; all writes route through the subscribe/unsubscribe/remove
+    /// methods.
+    pub(crate) fn channel_subscriptions_by_session_map(&self) -> &ChannelSubscriptions {
+        &self.channel_subscriptions_by_session
     }
 
     /// Rebroadcast the current membership of a swarm to its channel
