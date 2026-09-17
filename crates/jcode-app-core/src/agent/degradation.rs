@@ -11,16 +11,12 @@
 //! effects are layered on by the caller, which keeps this logic deterministic
 //! and unit-testable in isolation (see `tests` below).
 //!
-//! The two signals it consumes are:
-//! - **Turn-content stalls** (`record_stall`): stalled-promise filler turns,
-//!   empty turns, unfulfilled tool requests. These indicate *model* degradation
-//!   on a long context and can be mitigated by re-prompting, compacting, or
-//!   switching the route.
-//! - **System-level stalls** (`record_system_stall`): `watchdog.stall` events,
-//!   which indicate CPU/memory oversubscription, NOT model degradation. A system
-//!   stall is recorded but does not by itself promote the route rung; it is the
-//!   separate "load" axis named in the plan. (Escalation for the load axis is a
-//!   future slice; here we only track it for observability.)
+//! The signal it consumes is **turn-content stalls** (`record_stall`):
+//! stalled-promise filler turns, empty turns, unfulfilled tool requests. These
+//! indicate *model* degradation on a long context and can be mitigated by
+//! re-prompting, compacting, or switching the route. (A separate system-level
+//! "load" axis from `watchdog.stall` is a documented future extension; it is
+//! not represented here yet to avoid carrying dead state.)
 
 use super::*;
 use std::collections::VecDeque;
@@ -53,14 +49,12 @@ pub enum Rung {
     RouteFallback,
     /// Escalated to the user / stopped; the tracker will not auto-mitigate
     /// further. Reached only after the higher rungs were tried and failed.
-    #[allow(dead_code, reason = "reached in the route-fallback slice (Slice 4)")]
     Escalated,
 }
 
 impl Rung {
     /// Whether this rung still recommends autonomous mitigation (as opposed to
     /// surfacing to the user).
-    #[allow(dead_code, reason = "used by the route-fallback slice (Slice 4)")]
     pub fn is_autonomous(self) -> bool {
         matches!(self, Self::Watch | Self::Compact | Self::RouteFallback)
     }
@@ -72,15 +66,15 @@ pub enum StallKind {
     /// Dense "let me …" filler with no tool call (`is_stalled_promise_text`).
     StalledPromise,
     /// A turn ended with no tool call and no useful content.
-    #[allow(dead_code, reason = "wired from the empty-turn path in Slice 3")]
+    #[allow(dead_code, reason = "constructed by future empty-turn wiring; test-only for now")]
     EmptyTurn,
     /// The model said it would invoke a tool but did not.
-    #[allow(dead_code, reason = "wired from the unfulfilled-tool path in Slice 3")]
+    #[allow(dead_code, reason = "constructed by future unfulfilled-tool wiring; test-only for now")]
     UnfulfilledToolRequest,
 }
 
 impl StallKind {
-    #[allow(dead_code, reason = "used by describe() logging; kept for later slices")]
+    #[allow(dead_code, reason = "used only by describe() for diagnostics")]
     fn as_str(self) -> &'static str {
         match self {
             Self::StalledPromise => "stalled_promise",
@@ -93,7 +87,7 @@ impl StallKind {
 /// Observational record for a single stall event.
 #[derive(Debug, Clone)]
 struct StallRecord {
-    #[allow(dead_code, reason = "reporting only; more kinds land in Slice 3")]
+    #[allow(dead_code, reason = "reporting only; later kinds will populate it")]
     kind: StallKind,
     at: Instant,
 }
@@ -110,10 +104,6 @@ pub struct DegradationConfig {
     pub compact_threshold: u32,
     /// Number of stall events within [`Self::window`] to reach `RouteFallback`.
     pub fallback_threshold: u32,
-    /// Load concern surfaced by watchdog.stall events. Does not promote the
-    /// route rung but is tracked for observability and the load axis.
-    #[allow(dead_code, reason = "load-axis alarm lands with Slice 5 observability")]
-    pub system_stall_load_concern_threshold: u32,
 }
 
 impl Default for DegradationConfig {
@@ -123,7 +113,6 @@ impl Default for DegradationConfig {
             watch_threshold: 1,
             compact_threshold: 2,
             fallback_threshold: 3,
-            system_stall_load_concern_threshold: 2,
         }
     }
 }
@@ -135,19 +124,18 @@ pub struct DegradationTracker {
     cfg: DegradationConfig,
     /// Most recent stall events within the window, oldest first.
     stalls: VecDeque<StallRecord>,
-    /// Rung reached in the current escalation cycle. Rises monotonically until
-    /// [`Self::reset`] (e.g. after a successful mitigation) or expiry.
+    /// Currently recommended mitigation rung. Recomputes from the live stall
+    /// count; decays on recovery and is terminal at `Escalated` (only
+    /// [`Self::reset`] clears that).
     rung: Rung,
     /// Recommended compact is one-shot: record the fact we already recommended
     /// it so we do not re-fire on every turn while the session is mid-compact.
     compact_recommended: bool,
-    /// Load-axis count (watchdog.stall) within the window.
-    system_stalls: VecDeque<Instant>,
 }
 
 #[allow(
     dead_code,
-    reason = "read-side mitigation/observability API consumed by the compaction, route-fallback, and observability slices; already covered by unit tests"
+    reason = "diagnostic/read API (route, stall_count, describe) exercised by unit tests and used by callers for logging; kept as the stable tracker surface"
 )]
 impl DegradationTracker {
     /// Start a tracker for the given route with the default configuration.
@@ -164,7 +152,6 @@ impl DegradationTracker {
             stalls: VecDeque::new(),
             rung: Rung::Healthy,
             compact_recommended: false,
-            system_stalls: VecDeque::new(),
         }
     }
 
@@ -199,11 +186,6 @@ impl DegradationTracker {
         self.stalls.len() as u32
     }
 
-    /// The loaded count of system-level (watchdog) stalls in the window.
-    pub fn system_stall_count(&self) -> u32 {
-        self.system_stalls.len() as u32
-    }
-
     /// Record a turn-content stall of the given kind.
     pub fn record_stall(&mut self, kind: StallKind) {
         self.prune_expired();
@@ -214,15 +196,10 @@ impl DegradationTracker {
         self.recompute_rung();
     }
 
-    /// Record a system-level (watchdog) stall. Does not move the route rung up,
-    /// but is tracked for load observability.
-    pub fn record_system_stall(&mut self) {
-        self.prune_expired();
-        self.system_stalls.push_back(Instant::now());
-    }
-
-    /// Record a clean, healthy turn. Pushes back the stall window so a flurry of
-    /// stalls long ago stops counting; does not reset an already-escalated rung.
+    /// Record a clean, healthy turn. Prunes stale stall-window entries and
+    /// recomputes the rung from the live count, so a genuine recovery decays the
+    /// rung back toward Healthy instead of pinning it at a stale escalated level.
+    /// `Escalated` remains terminal (only [`Self::reset`] clears it).
     pub fn record_healthy_turn(&mut self) {
         self.prune_expired();
         // Recompute from the live (pruned) count so a clean turn after a
@@ -235,7 +212,6 @@ impl DegradationTracker {
     /// progress) or an explicit user reset.
     pub fn reset(&mut self) {
         self.stalls.clear();
-        self.system_stalls.clear();
         self.rung = Rung::Healthy;
         self.compact_recommended = false;
     }
@@ -255,13 +231,6 @@ impl DegradationTracker {
             .is_some_and(|rec| rec.at < cutoff)
         {
             self.stalls.pop_front();
-        }
-        while self
-            .system_stalls
-            .front()
-            .is_some_and(|at| *at < cutoff)
-        {
-            self.system_stalls.pop_front();
         }
     }
 
@@ -300,11 +269,10 @@ impl DegradationTracker {
     pub fn describe(&self) -> String {
         let stall_types = self.stalls.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>();
         format!(
-            "route={} rung={:?} stall_count={} system_stalls={} kinds=[{}]",
+            "route={} rung={:?} stall_count={} kinds=[{}]",
             self.route,
             self.rung,
             self.stalls.len(),
-            self.system_stalls.len(),
             stall_types.join(",")
         )
     }
@@ -472,7 +440,6 @@ mod tests {
             watch_threshold: 1,
             compact_threshold: 2,
             fallback_threshold: 3,
-            system_stall_load_concern_threshold: 2,
         };
         let mut t = DegradationTracker::with_config(RouteKey("p/m".into()), cfg);
         // Escalate to Compact and acknowledge the compaction.
@@ -514,24 +481,6 @@ mod tests {
         // The pending flag is consumed once, even if healthy turns follow.
         t.record_healthy_turn();
         assert!(!t.compact_pending());
-    }
-
-    #[test]
-    fn system_stall_does_not_promote_route_rung() {
-        let cfg = DegradationConfig {
-            window: Duration::from_secs(60),
-            watch_threshold: 2,
-            compact_threshold: 3,
-            fallback_threshold: 4,
-            system_stall_load_concern_threshold: 2,
-        };
-        let mut t = DegradationTracker::with_config(RouteKey("p/m".into()), cfg);
-        t.record_system_stall();
-        t.record_system_stall();
-        assert_eq!(t.system_stall_count(), 2);
-        // Route rung stays Healthy: a watchdog stall is load, not degradation.
-        assert_eq!(t.rung(), Rung::Healthy);
-        assert!(!t.recommends_mitigation());
     }
 
     #[test]
