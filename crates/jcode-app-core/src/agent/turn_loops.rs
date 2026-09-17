@@ -1155,8 +1155,9 @@ impl Agent {
             // tool call is an identical repeat of the prior run, inject a short
             // model-visible nudge so the model changes approach instead of burning
             // tokens in a stuck loop.
+            let repeat_threshold = super::guard::repeat_reminder_threshold();
             if let Some(reminder) =
-                super::guard::repeat_reminder_from_transcript(&self.session.messages)
+                super::guard::repeat_reminder_from_transcript(&self.session.messages, repeat_threshold)
             {
                 let _ = self.add_message(Role::User, reminder.content);
                 crate::logging::info(&format!(

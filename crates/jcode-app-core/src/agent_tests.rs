@@ -3009,7 +3009,7 @@ async fn stalled_promise_skips_turns_that_emit_a_tool_call() {
 }
 
 /// A provider that repeats the EXACT same tool call (same name + same input)
-/// for `REPEAT_TOOL_THRESHOLD` turns, then completes — reproducing the
+/// for the configured repeat-tool threshold turns, then completes — reproducing the
 /// runaway-loop failure mode the repeat-tool guard (takeaway #7) exists to
 /// catch. On the completion turn it returns plain text so the turn ends.
 #[derive(Clone, Default)]
@@ -3033,7 +3033,7 @@ impl Provider for RepeatingToolProvider {
         };
         let (tx, rx) = tokio_mpsc::channel::<Result<StreamEvent>>(8);
         tokio::spawn(async move {
-            if call <= guard::REPEAT_TOOL_THRESHOLD {
+            if call <= crate::config::config().loop_guard.repeat_tool_threshold {
                 // Repeat the identical bash call (calls 1..=threshold).
                 let _ = tx
                     .send(Ok(StreamEvent::ToolUseStart {
@@ -3077,7 +3077,7 @@ impl Provider for RepeatingToolProvider {
 }
 
 /// The repeat-tool guard must fire through the REAL streaming loop: a model that
-/// emits the exact same tool call `REPEAT_TOOL_THRESHOLD` times in a row gets a
+/// emits the exact same tool call the configured repeat-tool threshold times in a row gets a
 /// short model-visible "[Guard]" reminder injected into the transcript, without
 /// ending the turn. This is the wiring-level counterpart to the detector unit
 /// tests in `guard.rs`.
@@ -3145,7 +3145,7 @@ async fn streaming_turn_injects_repeat_tool_reminder_when_model_loops() {
 
     // The turn must have issued the repeated calls then completed.
     assert!(
-        *calls.lock().unwrap() >= guard::REPEAT_TOOL_THRESHOLD,
+        *calls.lock().unwrap() >= crate::config::config().loop_guard.repeat_tool_threshold,
         "model must have repeated the call at least the threshold times"
     );
 }

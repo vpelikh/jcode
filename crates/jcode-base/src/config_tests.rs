@@ -1,7 +1,7 @@
 use super::{
     AmbientConfig, AutoReviewConfig, Config, DiffDisplayMode, DisplayConfig, HookCommands,
-    LatexRenderingMode, McpToolsMode, ProviderConfig, SessionPickerResumeAction, SwarmSpawnMode,
-    ToolConfig, config_env_fingerprint, populate_context_limits_from_config_ref,
+    LatexRenderingMode, LoopGuardConfig, McpToolsMode, ProviderConfig, SessionPickerResumeAction,
+    SwarmSpawnMode, ToolConfig, config_env_fingerprint, populate_context_limits_from_config_ref,
 };
 use std::ffi::OsString;
 use std::path::Path;
@@ -1652,4 +1652,26 @@ fn test_telegram_connectivity_fields_round_trip_and_env_override() {
         Some("https://env.example.com/bot")
     );
     restore_env_var("JCODE_TELEGRAM_API_BASE", prev);
+}
+
+#[test]
+fn loop_guard_config_defaults_repeat_tool_threshold_to_four() {
+    assert_eq!(LoopGuardConfig::default().repeat_tool_threshold, 4);
+    // A Config default carries the same threshold, and it round-trips through
+    // serde so a user can configure it without breaking the rest of the file.
+    assert_eq!(Config::default().loop_guard.repeat_tool_threshold, 4);
+    let cfg = Config::default();
+    let json = serde_json::to_string(&cfg.loop_guard).unwrap();
+    let back: LoopGuardConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.repeat_tool_threshold, 4);
+}
+
+#[test]
+fn loop_guard_round_trips_a_custom_threshold() {
+    let cfg = LoopGuardConfig {
+        repeat_tool_threshold: 2,
+    };
+    let json = serde_json::to_string(&cfg).unwrap();
+    let back: LoopGuardConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.repeat_tool_threshold, 2);
 }

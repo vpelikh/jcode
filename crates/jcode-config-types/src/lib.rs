@@ -348,6 +348,29 @@ impl CrossProviderFailoverMode {
     }
 }
 
+/// Loop-hygiene / runaway-loop guard configuration (deepseek-harness takeaway #7).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoopGuardConfig {
+    /// How many *consecutive identical* tool calls trip the repeat-tool reminder.
+    ///
+    /// The model-free guard (see `jcode-app-core`'s repeat-tool reminder) injects a
+    /// short prompt-visible nudge telling the model to change approach or finish
+    /// once the same tool call (name + canonicalized input) has been issued this
+    /// many times in a row without progress. Defaults to 4. Set to a larger value
+    /// to be less aggressive, or to 0 to disable the guard entirely.
+    #[serde(default)]
+    pub repeat_tool_threshold: usize,
+}
+
+impl Default for LoopGuardConfig {
+    fn default() -> Self {
+        Self {
+            repeat_tool_threshold: 4,
+        }
+    }
+}
+
 /// Compaction configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]

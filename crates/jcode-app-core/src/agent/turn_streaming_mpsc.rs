@@ -1662,8 +1662,11 @@ impl Agent {
             // model-visible nudge so the model changes approach instead of burning
             // tokens in a stuck loop. This runs after all results are committed so
             // the transcript reflects the full batch.
-            if let Some(reminder) =
-                super::guard::repeat_reminder_from_transcript(&self.session.messages)
+            let repeat_threshold = super::guard::repeat_reminder_threshold();
+            if let Some(reminder) = super::guard::repeat_reminder_from_transcript(
+                &self.session.messages,
+                repeat_threshold,
+            )
             {
                 let text = match reminder.content.first() {
                     Some(ContentBlock::Text { text, .. }) => text.clone(),
