@@ -457,19 +457,14 @@ pub(super) async fn handle_client(
     let client_connections = client_service.client_connections;
     let swarm_members = swarm_service.swarm_state.members;
     let swarms_by_id = swarm_service.swarm_state.swarms_by_id;
-    let shared_context = swarm_service.shared_context;
     let swarm_plans = swarm_service.swarm_state.plans;
-    let swarm_coordinators = swarm_service.swarm_state.coordinators;
     let file_touch = swarm_service.file_touch;
     let client_debug_state = debug_service.client_debug_state;
     let client_debug_response_tx = debug_service.client_debug_response_tx;
-    let event_history = swarm_service.event_history;
-    let event_counter = swarm_service.event_counter;
     let swarm_event_tx = swarm_service.swarm_event_tx;
     let shutdown_signals = session_service.shutdown_signals;
     let soft_interrupt_queues = session_service.soft_interrupt_queues;
     let await_members_runtime = swarm_service.await_members_runtime;
-    let swarm_mutation_runtime = swarm_service.swarm_mutation_runtime;
     let (reader, writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let writer = Arc::new(Mutex::new(writer));
@@ -2289,16 +2284,8 @@ pub(super) async fn handle_client(
                     req_session_id,
                     items,
                     &client_event_tx,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &shared_context,
-                    &swarm_plans,
-                    &swarm_coordinators,
                     &session_service_handle,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
-                    &swarm_mutation_runtime,
+                    &swarm_service_handle,
                 )
                 .await;
             }
@@ -2313,16 +2300,8 @@ pub(super) async fn handle_client(
                     req_session_id,
                     proposer_session,
                     &client_event_tx,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &shared_context,
-                    &swarm_plans,
-                    &swarm_coordinators,
                     &session_service_handle,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
-                    &swarm_mutation_runtime,
+                    &swarm_service_handle,
                 )
                 .await;
             }
@@ -2339,14 +2318,8 @@ pub(super) async fn handle_client(
                     proposer_session,
                     reason,
                     &client_event_tx,
-                    &swarm_members,
-                    &shared_context,
-                    &swarm_coordinators,
                     &session_service_handle,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
-                    &swarm_mutation_runtime,
+                    &swarm_service_handle,
                 )
                 .await;
             }

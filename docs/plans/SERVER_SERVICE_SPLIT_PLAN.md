@@ -927,3 +927,25 @@ handlers still reach into `swarm.swarm_state.plans` directly. Deferred follow-up
    their own service handle, so we do not bake methods onto a handle that gets
    reshuffled. This is a behavior/API-boundary change and should land as its own
    reviewed slice, not mixed into mechanical convergence.
+
+### comm_plan convergence slice landed (2026-09)
+
+The three plan-decision handlers collapsed their flat swarm bag onto
+`&SwarmServiceHandle`. `handle_comm_propose_plan` (9 flat fields),
+`handle_comm_approve_plan` (9), and `handle_comm_reject_plan` (7) each bind
+their maps/event history/runtimes as body locals from the handle (design
+decision A); the non-swarm params (`client_event_tx`, `session`) stay. Both
+routers (`client_lifecycle.rs`, `client_lightweight_control.rs`) drop the
+extra arguments and pass `&swarm_service_handle`/`swarm`; the now-unused
+flat locals (`shared_context`, `swarm_plans`, `swarm_coordinators`,
+`event_history`, `event_counter`, `swarm_mutation_runtime`) were trimmed
+from both routers. `TestSwarmBuilder` gained a `shared_context` seeder so
+the `comm_plan_tests::PlanFixture` shares its context map with the handle
+(the propose path writes proposals into `swarm.shared_context`, which the
+tests read through `fx.shared_context`); the fixture drops six now-dead
+flat fields (`swarms_by_id`, `swarm_coordinators`, `event_history`,
+`event_counter`, `swarm_event_tx`, `mutation_runtime`) and feeds its maps to
+the shared builder. The three now-satisfied `too_many_arguments` expects
+were removed; unused imports (`SwarmEvent`, `SwarmMutationRuntime`,
+`HashSet`, `broadcast`) trimmed. Zero behavior change; `comm_plan` (9) and
+`server::` (466) stay green and clippy introduces no new warnings.

@@ -1,20 +1,18 @@
-use super::services::SessionServiceHandle;
+use super::services::{SessionServiceHandle, SwarmServiceHandle};
 use super::swarm_mutation_state::{
-    PersistedSwarmMutationResponse, SwarmMutationRuntime, begin_or_replay, finish_request,
-    request_key,
+    PersistedSwarmMutationResponse, begin_or_replay, finish_request, request_key,
 };
 use super::{
-    SharedContext, SwarmEvent, SwarmEventType, SwarmMember, SwarmState,
-    VersionedPlan, broadcast_swarm_plan, persist_swarm_state_for,
-    record_swarm_event, summarize_plan_items,
+    SharedContext, SwarmEventType, SwarmMember, SwarmState, VersionedPlan,
+    broadcast_swarm_plan, persist_swarm_state_for, record_swarm_event, summarize_plan_items,
 };
 use crate::plan::PlanItem;
 use crate::protocol::{NotificationType, ServerEvent};
 use jcode_agent_runtime::SoftInterruptSource;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{RwLock, broadcast, mpsc};
+use tokio::sync::{RwLock, mpsc};
 
 /// Reject plans whose dependency graph contains a cycle. Cyclic items can never
 /// become runnable (`summarize_plan_graph` parks them in `blocked_ids` forever),
@@ -34,26 +32,23 @@ fn plan_cycle_error(items: &[PlanItem]) -> Option<String> {
     ))
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "plan proposal updates sessions, swarm coordination, shared context, interrupts, and event history"
-)]
 pub(super) async fn handle_comm_propose_plan(
     id: u64,
     req_session_id: String,
     items: Vec<PlanItem>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    shared_context: &Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
     session: &SessionServiceHandle,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
-    _swarm_mutation_runtime: &SwarmMutationRuntime,
+    swarm: &SwarmServiceHandle,
 ) {
+    let swarm_members = &swarm.swarm_state.members;
+    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let shared_context = &swarm.shared_context;
+    let swarm_plans = &swarm.swarm_state.plans;
+    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let event_history = &swarm.event_history;
+    let event_counter = &swarm.event_counter;
+    let swarm_event_tx = &swarm.swarm_event_tx;
+    let _swarm_mutation_runtime = &swarm.swarm_mutation_runtime;
     let swarm_id = {
         let members = swarm_members.read().await;
         members
@@ -304,26 +299,23 @@ pub(super) async fn handle_comm_propose_plan(
     let _ = client_event_tx.send(ServerEvent::Done { id });
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "plan approval updates sessions, swarm coordination, interrupts, and event history"
-)]
 pub(super) async fn handle_comm_approve_plan(
     id: u64,
     req_session_id: String,
     proposer_session: String,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    shared_context: &Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
     session: &SessionServiceHandle,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
-    swarm_mutation_runtime: &SwarmMutationRuntime,
+    swarm: &SwarmServiceHandle,
 ) {
+    let swarm_members = &swarm.swarm_state.members;
+    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let shared_context = &swarm.shared_context;
+    let swarm_plans = &swarm.swarm_state.plans;
+    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let event_history = &swarm.event_history;
+    let event_counter = &swarm.event_counter;
+    let swarm_event_tx = &swarm.swarm_event_tx;
+    let swarm_mutation_runtime = &swarm.swarm_mutation_runtime;
     let swarm_id = match require_coordinator_swarm(
         id,
         &req_session_id,
@@ -530,25 +522,22 @@ pub(super) async fn handle_comm_approve_plan(
     .await;
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "plan rejection updates sessions, swarm coordination, interrupts, and event history"
-)]
 pub(super) async fn handle_comm_reject_plan(
     id: u64,
     req_session_id: String,
     proposer_session: String,
     reason: Option<String>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    shared_context: &Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
     session: &SessionServiceHandle,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
-    swarm_mutation_runtime: &SwarmMutationRuntime,
+    swarm: &SwarmServiceHandle,
 ) {
+    let swarm_members = &swarm.swarm_state.members;
+    let shared_context = &swarm.shared_context;
+    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let event_history = &swarm.event_history;
+    let event_counter = &swarm.event_counter;
+    let swarm_event_tx = &swarm.swarm_event_tx;
+    let swarm_mutation_runtime = &swarm.swarm_mutation_runtime;
     let swarm_id = match require_coordinator_swarm(
         id,
         &req_session_id,
