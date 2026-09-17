@@ -1256,3 +1256,89 @@ fn note_prune_applied_respects_existing_compaction_summary() {
         "estimate must still include the existing summary, got {actual}"
     );
 }
+
+// ── physical consolidation reconciliation (takeaway #5) ─────────────
+
+/// Restoring a physically-consolidated state must zero the live skip offset
+/// (`compacted_count`) and `messages_for_api_with` must return the consolidated
+/// transcript AS-IS (the summary is already message 0), NOT prepend a second
+/// synthetic summary or skip the tail.
+#[test]
+fn test_restore_physical_consolidation_returns_transcript_as_is() {
+    let mut manager = CompactionManager::new().with_budget(1_000);
+
+    // A physically consolidated transcript: [summary, recent tail...].
+    let mut consolidated = Vec::new();
+    consolidated.push(make_text_message(Role::User, "Previous Conversation Summary ...[sum]"));
+    consolidated.push(make_text_message(Role::User, "tail 1"));
+    consolidated.push(make_text_message(Role::User, "tail 2"));
+
+    let state = crate::session::StoredCompactionState {
+        summary_text: "summarized".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 10,
+        original_turn_count: 10,
+        compacted_count: 10, // original count, but must NOT be used as a live skip
+        physically_consolidated: true,
+    };
+
+    manager.restore_persisted_state_with(&state, &consolidated);
+
+    assert!(
+        manager.is_physically_consolidated(),
+        "restore must adopt the physical flag"
+    );
+    assert_eq!(
+        manager.compacted_count,
+        0,
+        "physical restore must zero the live skip offset"
+    );
+
+    let view = manager.messages_for_api_with(&consolidated);
+    assert_eq!(
+        view.len(),
+        3,
+        "physically consolidated transcript must be returned as-is (no summary prepend, no skipped tail)"
+    );
+    // No synthetic "Previous Conversation Summary" block is prepended; the
+    // existing summary message is index 0.
+    match &view[0].content[0] {
+        ContentBlock::Text { text, .. } => assert!(
+            text.contains("Previous Conversation Summary"),
+            "index 0 must be the physically-carried summary, got unquoted from view: {text}"
+        ),
+        _ => panic!("expected text summary at transcript[0]"),
+    }
+    assert!(
+        view.iter().any(|m| matches!(&m.content[0], ContentBlock::Text { text, .. } if text.contains("tail 2"))),
+        "recent tail must survive"
+    );
+}
+
+/// `mark_physically_consolidated` zeroes the live skip offset and `recent_tail`
+/// returns the kept (virtual) tail slice. A manager can use this to transition
+/// from a virtual apply to a physical view after calling
+/// `Session::physically_consolidate_compaction`.
+#[test]
+fn test_mark_physically_consolidated_resets_offset_and_tail() {
+    let mut manager = CompactionManager::new().with_budget(1_000);
+    let messages = vec![
+        make_text_message(Role::User, "m0"),
+        make_text_message(Role::User, "m1"),
+        make_text_message(Role::User, "m2"),
+        make_text_message(Role::User, "m3"),
+    ];
+    // Simulate the manager having virtually compacted the first 2.
+    manager.compacted_count = 2;
+
+    let tail = manager.recent_tail(&messages);
+    assert_eq!(
+        tail.len(),
+        2,
+        "recent_tail must be the kept (compacted_count..) slice"
+    );
+
+    manager.mark_physically_consolidated();
+    assert!(manager.is_physically_consolidated());
+    assert_eq!(manager.compacted_count, 0, "physical mark must zero the offset");
+}

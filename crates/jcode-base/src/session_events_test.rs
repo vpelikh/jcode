@@ -2899,6 +2899,150 @@ fn test_compact_transcript_with_bracket_produces_balanced_durable_bracket() {
         .expect("reloaded bracket producer log must stay consistent");
 }
 
+/// `Session::physically_consolidate_compaction` is the live producer's hook for
+/// adopting the log-bracketed compaction seam (takeaway #5): it physically
+/// rewrites the transcript to `[summary_message, recent_tail...]`, records a
+/// balanced `CompactionStart`/`CompactionEnd` bracket, marks the persisted state
+/// `physically_consolidated: true`, and leaves a reload that reproduces the same
+/// consolidated surface without the manager double-prepending the summary.
+#[test]
+fn test_physically_consolidate_compaction_rewrites_transcript_and_flags() {
+    let mut session = Session::create_with_id(
+        "physical_consolidate".to_string(),
+        None,
+        Some("Physical consolidate".to_string()),
+    );
+    for i in 0..5 {
+        session.append_stored_message(StoredMessage {
+            id: format!("m{i}"),
+            role: Role::User,
+            content: vec![text_block(&format!("msg {i}"))],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+
+    // Simulate the manager having compacted the first 3 messages into a summary,
+    // keeping the last 2 as the recent tail.
+    let tail = session.messages[3..].to_vec();
+    let state = session
+        .physically_consolidate_compaction(
+            "phys_a",
+            "summarized whole prefix".to_string(),
+            None,
+            3,
+            5,
+            3,
+            tail,
+        )
+        .expect("physical consolidation must validate");
+
+    // The reported state is flagged physically consolidated and records the
+    // original span.
+    assert!(
+        state.physically_consolidated,
+        "state must be marked physically consolidated"
+    );
+    assert_eq!(state.compacted_count, 3);
+
+    // The session.transcript now physically holds [summary, recent_tail...].
+    assert_eq!(
+        session.messages.len(),
+        3,
+        "consolidated transcript must be summary(1) + tail(2)"
+    );
+    assert_eq!(
+        session
+            .messages[0]
+            .content
+            .first()
+            .and_then(|b| match b {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("summary message must be text"),
+        crate::compaction::compacted_summary_text_block("summarized whole prefix").as_str()
+    );
+    assert_eq!(
+        session.messages[1..].iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        vec!["m3", "m4"],
+        "tail messages must be m3, m4"
+    );
+
+    // Legacy compaction vector agrees with the log-derived state, including the
+    // physical flag.
+    session
+        .rederive_all_checked()
+        .expect("physically consolidated session must stay consistent");
+    assert!(
+        session.derive_compaction().as_ref().unwrap().physically_consolidated,
+        "derived compaction must carry the physical flag"
+    );
+    assert!(
+        session.event_map.orphaned_compaction().is_none(),
+        "physical consolidation must leave no orphaned bracket"
+    );
+
+    // A serialize + reload reproduces the consolidated transcript and flag.
+    let json = serde_json::to_string(&session).unwrap();
+    let back: Session = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        back.messages.len(),
+        3,
+        "reload must preserve the consolidated transcript length"
+    );
+    assert!(
+        back.compaction.as_ref().unwrap().physically_consolidated,
+        "reload must preserve the physical flag"
+    );
+    back.rederive_all_checked()
+        .expect("reloaded physical consolidation must stay consistent");
+}
+
+/// Invalid `physically_consolidate_compaction` inputs (a span that exceeds the
+/// original turn count) must return `None` and leave the session untouched.
+#[test]
+fn test_physically_consolidate_compaction_invalid_span_is_rejected() {
+    let mut session = Session::create_with_id(
+        "physical_bad".to_string(),
+        None,
+        None,
+    );
+    session.append_stored_message(StoredMessage {
+        id: "m0".to_string(),
+        role: Role::User,
+        content: vec![text_block("msg 0")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+
+    let tail = session.messages.clone();
+    let before = session.messages.len();
+    let state = session.physically_consolidate_compaction(
+        "phys_bad",
+        "bad".to_string(),
+        None,
+        5, // covers_up_to_turn > original_turn_count
+        1,
+        5,
+        tail,
+    );
+    assert!(state.is_none(), "invalid span must be rejected");
+    assert_eq!(
+        session.messages.len(),
+        before,
+        "rejected consolidation must not mutate the transcript"
+    );
+    assert!(
+        session.event_map.orphaned_compaction().is_none(),
+        "rejected consolidation must not open a bracket"
+    );
+}
+
 /// `Session::set_compaction_with_bracket` records the live producer's compaction
 /// state as a balanced bracket WITHOUT rewriting messages (the virtual-summary
 /// model). The bracket must be balanced, leave no orphan, survive reload, and

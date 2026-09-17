@@ -145,6 +145,20 @@ pub struct CompactionManager {
     /// Active summary (if we've compacted before)
     active_summary: Option<Summary>,
 
+    /// Whether the caller's transcript is PHYSICALLY consolidated (via
+    /// `Session::compact_transcript_with_bracket`) so `all_messages[0]` already
+    /// carries the summary and the remaining messages are the recent tail. When
+    /// true, `compacted_count` is forced to `0` and `messages_for_api_with`
+    /// returns the transcript as-is (no synthetic summary is prepended), because
+    /// consolidating in place would otherwise double-prepend the summary and
+    /// mis-slice the tail.
+    ///
+    /// Mirrors `StoredCompactionState::physically_consolidated`; the value is
+    /// carried on restore and writes. It is orthogonal to `compacted_count` —
+    /// a physical transcript records the original count only in the persisted
+    /// state's `compacted_count` field for auditing, not as a live skip offset.
+    physically_consolidated: bool,
+
     /// Rolling char estimate for the active (non-compacted) message suffix.
     ///
     /// In the common append-only case this is maintained incrementally, so token
@@ -217,6 +231,7 @@ impl CompactionManager {
         Self {
             compacted_count: 0,
             active_summary: None,
+            physically_consolidated: false,
             active_chars: ActiveCharEstimate::default(),
             pending_task: None,
             pending_trigger: None,
@@ -338,7 +353,20 @@ impl CompactionManager {
         self.semantic_embed_cache.clear();
         self.semantic_embed_cache_counter = 0;
         self.total_turns = total_messages;
-        self.compacted_count = state.compacted_count.min(total_messages);
+        // For a physically consolidated transcript the summary lives at index 0
+        // of `all_messages`, so nothing must be skipped: the whole (already
+        // compacted) transcript is the active surface. We must NOT carry forward
+        // the historical `compacted_count` as a live skip offset, or
+        // `messages_for_api_with` would drop the summary and the recent tail and
+        // double-prepend a synthetic summary. The original count is preserved
+        // for auditing inside `active_summary.original_turn_count` (and is what
+        // a later virtual write would need), but the live skip offset is zero.
+        self.physically_consolidated = state.physically_consolidated;
+        self.compacted_count = if state.physically_consolidated {
+            0
+        } else {
+            state.compacted_count.min(total_messages)
+        };
         self.active_chars
             .reset_pending(total_messages > self.compacted_count);
         self.active_summary = Some(Summary {
@@ -381,6 +409,29 @@ impl CompactionManager {
         );
     }
 
+    /// Report whether this manager's transcript is physically consolidated.
+    pub fn is_physically_consolidated(&self) -> bool {
+        self.physically_consolidated
+    }
+
+    /// Mark this manager as operating over a physically consolidated transcript
+    /// (one where `all_messages[0]` is the summary and the rest is the recent
+    /// tail). Resets the live skip offset to `0` so provider-view derivation
+    /// returns the whole consolidated transcript without double-prepending the
+    /// summary. The persisted state's `compacted_count` still records the
+    /// original count for auditing.
+    pub fn mark_physically_consolidated(&mut self) {
+        self.physically_consolidated = true;
+        self.compacted_count = 0;
+    }
+
+    /// The active (kept) tail of a (virtual) transcript that a consolidation
+    /// should preserve: `all_messages[compacted_count..]`.
+    pub fn recent_tail<'a>(&self, all_messages: &'a [Message]) -> &'a [Message] {
+        let start = self.compacted_count.min(all_messages.len());
+        &all_messages[start..]
+    }
+
     /// Export the currently active compacted view for persistence.
     pub fn persisted_state(&self) -> Option<crate::session::StoredCompactionState> {
         self.active_summary
@@ -391,7 +442,7 @@ impl CompactionManager {
                 covers_up_to_turn: summary.covers_up_to_turn,
                 original_turn_count: summary.original_turn_count,
                 compacted_count: self.compacted_count,
-                physically_consolidated: false,
+                physically_consolidated: self.physically_consolidated,
             })
     }
 
@@ -1302,6 +1353,15 @@ impl CompactionManager {
         self.discard_oversized_openai_native_compaction();
 
         let active = self.active_messages(all_messages);
+
+        // Physically consolidated transcript: the summary is already message 0
+        // and `compacted_count` is 0, so the active slice IS the whole
+        // consolidated transcript. Do not prepend a synthetic summary block —
+        // that would duplicate the summary the consumer already carries in
+        // `all_messages[0]`.
+        if self.physically_consolidated {
+            return active.to_vec();
+        }
 
         match &self.active_summary {
             Some(summary) => {
