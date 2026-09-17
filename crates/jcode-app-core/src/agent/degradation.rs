@@ -302,6 +302,10 @@ impl Agent {
                     self.degradation.describe()
                 ));
                 let (message, success) = self.request_manual_compaction();
+                // Mark compaction as attempted regardless of outcome: this is
+                // what un-gates the RouteFallback escalation, whose whole point
+                // is "compaction did not (or could not) restore progress". One
+                // attempt per escalation cycle so we do not re-fire every turn.
                 self.degradation.acknowledge_compact();
                 if success {
                     Some(format!(
@@ -309,9 +313,9 @@ impl Agent {
                         message.lines().last().unwrap_or("context compaction started")
                     ))
                 } else {
-                    // Compaction unavailable right now; log and carry on rather
-                    // than blocking the turn. The rung stays Compact so a later
-                    // checkpoint can retry once progress resumes.
+                    // Compaction could not run now (unsupported provider / busy /
+                    // nothing to compact). We still recorded the attempt so the
+                    // fallback rung can escalate; log and carry on this turn.
                     crate::logging::warn(&format!(
                         "Deferred degradation compaction (unsupported or busy): {message}"
                     ));
@@ -368,7 +372,11 @@ impl Agent {
             current,
             fallback
         ));
-        match self.set_model(&fallback) {
+        // Use the auth (automatic) selection source, NOT the user source: this
+        // is an automated mitigation, not a deliberate user choice. Marking it
+        // User would bump selection_generation and make provider-control auth
+        // reconciliation treat the auto-switch as a sticky user preference.
+        match self.set_model_from_auth(&fallback) {
             Ok(()) => {
                 // A fallback is a new route; reset the escalation cycle so we
                 // observe the fallback's own health cleanly.

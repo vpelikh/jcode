@@ -1060,6 +1060,7 @@ async fn degradation_route_fallback_gating_escalates_or_switches() {
         enabled_agent.degradation.rung(),
         crate::agent::degradation::Rung::RouteFallback
     );
+    let gen_before = enabled_agent.provider_model_selection_generation();
     let notice = enabled_agent.maybe_mitigate_degradation();
     assert!(notice.is_some(), "configured fallback should produce a notice");
     assert!(
@@ -1071,6 +1072,10 @@ async fn degradation_route_fallback_gating_escalates_or_switches() {
         enabled_provider.model(),
         "deepseek/deepseek-v3",
         "provider model should switch to the configured fallback"
+    );
+    assert!(
+        !enabled_agent.user_selected_provider_model_after(gen_before),
+        "an automatic route fallback must NOT be recorded as a user model choice"
     );
     assert_eq!(
         enabled_agent.degradation.rung(),
