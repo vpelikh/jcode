@@ -5,14 +5,14 @@
 
 pub use jcode_config_types::{
     AgentsConfig, AmbientConfig, AuthConfig, AutoJudgeConfig, AutoReviewConfig, CompactionConfig,
-    CompactionMode, CrossProviderFailoverMode, DiagramDisplayMode, DiagramPanePosition,
-    DiffDisplayMode, DisplayConfig, FeatureConfig, GatewayConfig, HookCommands, HooksConfig,
-    KeybindingsConfig, LatexRenderingMode, LaunchHotkeyEntry, LaunchHotkeysConfig,
+    CompactionMode, CrossProviderFailoverMode, DegradationSettings, DiagramDisplayMode,
+    DiagramPanePosition, DiffDisplayMode, DisplayConfig, FeatureConfig, GatewayConfig, HookCommands,
+    HooksConfig, KeybindingsConfig, LatexRenderingMode, LaunchHotkeyEntry, LaunchHotkeysConfig,
     LoopGuardConfig, MarkdownSpacingMode, NamedProviderAuth, NamedProviderConfig,
     NamedProviderModelConfig, NamedProviderType, NativeScrollbarConfig, NotificationsConfig,
     OverscrollStatusMode, PowerConfig, ProviderConfig, ReasoningDisplayMode, SafetyConfig,
     SessionPickerResumeAction, SponsorsConfig, SwarmSpawnMode, SwarmStripLayout, TerminalConfig,
-    UpdateChannel, WebSearchConfig, WebSearchEngine,
+    UpdateChannel, WebSearchConfig, WebSearchEngine, 0fc260497 (feat(agent): add gated route-fallback rung to the mitigation ladder)
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -556,6 +556,9 @@ pub struct Config {
 
     /// Loop-hygiene / runaway-loop guard configuration (repeat-tool reminder).
     pub loop_guard: LoopGuardConfig,
+
+    /// Route-degradation auto-mitigation configuration (opt-in route fallback).
+    pub degradation: DegradationSettings, 0fc260497 (feat(agent): add gated route-fallback rung to the mitigation ladder)
 
     /// Power-management configuration (prevent sleep while streaming)
     pub power: PowerConfig,

@@ -745,6 +745,21 @@ impl Config {
             }
         }
 
+        // Degradation auto-mitigation
+        if let Ok(v) = std::env::var("JCODE_DEGRADATION_ROUTE_FALLBACK") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.degradation.route_fallback_enabled = parsed;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_DEGRADATION_FALLBACK_MODEL") {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                self.degradation.fallback_model = Some(trimmed.to_string());
+            } else {
+                self.degradation.fallback_model = None;
+            }
+        }
+
         // Provider
         if let Ok(v) = std::env::var("JCODE_MODEL") {
             self.provider.default_model = Some(v);

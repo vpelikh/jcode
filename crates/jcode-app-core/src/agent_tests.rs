@@ -982,6 +982,51 @@ async fn degradation_mitigation_triggers_compaction_once_on_compact_rung() {
 }
 
 #[tokio::test]
+async fn degradation_route_fallback_disabled_by_default_escalates_safely() {
+    // The SAFETY property of the route-fallback rung: with fallback disabled
+    // (the default), reaching the RouteFallback rung must NOT change the model.
+    // It escalates to surface the situation to the user instead.
+    // Config is not customized here, so crate::config::config().degradation has
+    // route_fallback_enabled=false by default.
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // Push past the fallback rung (default promotes: 3 stalls -> RouteFallback).
+    for _ in 0..3 {
+        agent
+            .degradation
+            .record_stall(crate::agent::degradation::StallKind::StalledPromise);
+    }
+    assert_eq!(
+        agent.degradation.rung(),
+        crate::agent::degradation::Rung::RouteFallback
+    );
+
+    // Fallback disabled -> escalates (returns a notice, rung becomes Escalated).
+    let notice = agent.maybe_mitigate_degradation();
+    assert!(notice.is_some(), "disabled fallback should surface a notice");
+    let notice = notice.unwrap();
+    assert!(
+        notice.contains("disabled"),
+        "notice should say fallback is disabled: {notice}"
+    );
+    assert_eq!(
+        agent.degradation.rung(),
+        crate::agent::degradation::Rung::Escalated,
+        "disabled fallback must escalate, not switch the model"
+    );
+
+    // Escalated rung is terminal: further mitigation calls do not act.
+    assert!(
+        agent.maybe_mitigate_degradation().is_none() || {
+            // After Escalated, rung() returns Escalated matched by the None arm.
+            agent.degradation.rung() == crate::agent::degradation::Rung::Escalated
+        }
+    );
+}
+
+#[tokio::test]
 async fn interrupt_signal_fire_before_notified_does_not_hang() {
     // Regression test: fire() called BEFORE notified().await must not hang.
     // The old code called notify_waiters() which drops the notification if

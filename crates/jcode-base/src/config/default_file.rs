@@ -683,6 +683,18 @@ bind_addr = "0.0.0.0"
 # Set JCODE_DISABLE_POWER_INHIBIT=1 to force-disable regardless of this setting.
 prevent_sleep_while_streaming = true
 
+[degradation]
+# Auto-mitigation of a model route that degrades into stall/filler turns.
+# Auto-compaction at the "Compact" rung always runs. The ROUTE FALLBACK action
+# below is strictly opt-in: while disabled, a persistently-degrading session
+# escalates and surfaces diagnostics instead of silently changing your model.
+# (default: false)
+route_fallback_enabled = false
+# Optional pinned fallback model spec to retarget a degrading session onto,
+# e.g. "claude-3-5-sonnet" or "deepseek/deepseek-v3@deepseek". Leave empty to
+# keep route fallback disabled even if route_fallback_enabled is true.
+# fallback_model = ""
+
 [safety]
 # Notification settings for ambient mode events
 
@@ -795,6 +807,14 @@ mod tests {
             config.display.reasoning_display(),
             ReasoningDisplayMode::Full,
             "the shipped user config must keep the full reasoning trace visible"
+        );
+        assert!(
+            !config.degradation.route_fallback_enabled,
+            "route fallback must be off by default (safety)"
+        );
+        assert_eq!(
+            config.degradation.fallback_model, None,
+            "no fallback model by default"
         );
     }
 

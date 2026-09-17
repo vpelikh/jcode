@@ -237,6 +237,13 @@ impl DegradationTracker {
         self.compact_recommended = false;
     }
 
+    /// Escalate to the terminal `Escalated` rung: auto-mitigation is exhausted
+    /// or disabled, so the caller should surface the situation to the user
+    /// rather than keep acting. Idempotent.
+    pub fn escalate(&mut self) {
+        self.rung = Rung::Escalated;
+    }
+
     fn prune_expired(&mut self) {
         let cutoff = Instant::now() - self.cfg.window;
         while self
@@ -294,13 +301,15 @@ impl Agent {
     ///
     /// Called at the turn-loop head (before the next provider request). Returns
     /// a user-visible message when we acted on a mitigation (e.g. triggered a
-    /// compaction); `None` when nothing needed doing.
+    /// compaction or a gated route fallback); `None` when nothing needed doing.
     ///
-    /// Currently handles the `Compact` rung: when the tracker reports a pending
-    /// compaction, request a manual compaction through the existing
-    /// `request_manual_compaction` mechanism, acknowledge it (one-shot), and
-    /// report success/failure via the returned message. Route-fallback
-    /// (`Rung::RouteFallback`) and the observability rungs land in later slices.
+    /// Rungs handled:
+    /// - `Compact` (pending): request a manual compaction through the existing
+    ///   `request_manual_compaction` mechanism and acknowledge it (one-shot).
+    /// - `RouteFallback`: switch to the configured fallback model when
+    ///   `degradation.route_fallback_enabled` is true and a `fallback_model` is
+    ///   set; otherwise `escalate()` (surface to the user) and report that
+    ///   auto-mitigation is exhausted.
     pub(crate) fn maybe_mitigate_degradation(&mut self) -> Option<String> {
         let rung = self.degradation.rung();
         match rung {
@@ -326,11 +335,76 @@ impl Agent {
                     None
                 }
             }
+            Rung::RouteFallback => self.maybe_fallback_route(),
             Rung::Compact
             | Rung::Watch
             | Rung::Healthy
-            | Rung::RouteFallback
             | Rung::Escalated => None,
+        }
+    }
+
+    /// Handle the `RouteFallback` rung: switch to the gated fallback model or,
+    /// when fallback is disabled/unconfigured, escalate to surface to the user.
+    fn maybe_fallback_route(&mut self) -> Option<String> {
+        let settings = crate::config::config().degradation.clone();
+        let current = self.provider_model();
+        if !settings.route_fallback_enabled {
+            crate::logging::warn(&format!(
+                "Model degradation: {} reached RouteFallback rung but route fallback is disabled; escalating",
+                self.degradation.describe()
+            ));
+            self.degradation.escalate();
+            return Some(format!(
+                "Model {} is degrading after compaction; route auto-fallback is disabled. Switch models manually to continue.",
+                current
+            ));
+        }
+        let Some(fallback) = settings.fallback_model.clone() else {
+            crate::logging::warn(
+                "Model degradation: route fallback enabled but no fallback_model set; escalating",
+            );
+            self.degradation.escalate();
+            return Some(format!(
+                "Model {} is degrading; route fallback enabled but no fallback_model configured.",
+                current
+            ));
+        };
+        if fallback.trim().is_empty() || fallback == current {
+            crate::logging::warn(
+                "Model degradation: fallback_model empty or equals the current model; escalating",
+            );
+            self.degradation.escalate();
+            return Some(format!(
+                "Model {} is degrading; configured fallback_model is invalid.",
+                current
+            ));
+        }
+        crate::logging::warn(&format!(
+            "Model degradation: {} reached RouteFallback; switching {} -> {}",
+            self.degradation.describe(),
+            current,
+            fallback
+        ));
+        match self.set_model(&fallback) {
+            Ok(()) => {
+                // A fallback is a new route; reset the escalation cycle so we
+                // observe the fallback's own health cleanly.
+                self.degradation.reset();
+                Some(format!(
+                    "Model degradation detected; switched route from {} to {}",
+                    current, fallback
+                ))
+            }
+            Err(e) => {
+                crate::logging::warn(&format!(
+                    "Model degradation: failed to switch to fallback model {fallback}: {e}; escalating"
+                ));
+                self.degradation.escalate();
+                Some(format!(
+                    "Model {} is degrading and the fallback switch to {} failed: {e}",
+                    current, fallback
+                ))
+            }
         }
     }
 

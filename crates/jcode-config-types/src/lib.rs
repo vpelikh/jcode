@@ -1683,6 +1683,30 @@ pub struct LaunchHotkeysConfig {
     pub imported: bool,
 }
 
+/// Route-degradation auto-mitigation configuration.
+///
+/// The model-degradation tracker auto-compacts at the `Compact` rung regardless
+/// of this section. The *route fallback* action it controls is strictly
+/// opt-in: when `route_fallback_enabled` is false (the default), a degrading
+/// session escalates to `Escalated` and surfaces the situation rather than
+/// changing the user's model. Enable it and set `fallback_model` to retarget a
+/// persistently-degrading session onto a pinned fallback model.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct DegradationSettings {
+    /// Allow the mitigation ladder to switch the session to a pinned fallback
+    /// model once the route reaches the `RouteFallback` rung. Default: false.
+    /// Set false to keep auto-route-switching off and instead surface to the
+    /// user.
+    pub route_fallback_enabled: bool,
+    /// Optional pinned fallback model spec (e.g. `"claude-3.5-sonnet"` or an
+    /// OpenRouter `model@provider` spec) to switch to when
+    /// `route_fallback_enabled` is true and the route degrades past compaction.
+    /// When `None` and fallback is enabled, the tracker logs that no fallback
+    /// is configured and does not switch.
+    pub fallback_model: Option<String>,
+}
+
 #[cfg(test)]
 mod reasoning_display_defaults_tests {
     use super::*;
