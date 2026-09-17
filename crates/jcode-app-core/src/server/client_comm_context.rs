@@ -1,8 +1,6 @@
 use super::debug::ClientConnectionInfo;
 use super::services::SwarmServiceHandle;
-use super::{
-    SwarmEventType, SwarmMember, fanout_session_event, record_swarm_event,
-};
+use super::{SwarmEventType, SwarmMember, fanout_session_event, record_swarm_event};
 use crate::protocol::{AgentInfo, ContextEntry, NotificationType, ServerEvent};
 use std::collections::HashMap;
 use std::sync::Arc;

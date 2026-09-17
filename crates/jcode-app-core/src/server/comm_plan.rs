@@ -3,8 +3,8 @@ use super::swarm_mutation_state::{
     PersistedSwarmMutationResponse, begin_or_replay, finish_request, request_key,
 };
 use super::{
-    SwarmEventType, SwarmMember, SwarmState, VersionedPlan,
-    broadcast_swarm_plan, persist_swarm_state_for, record_swarm_event, summarize_plan_items,
+    SwarmEventType, SwarmMember, SwarmState, VersionedPlan, broadcast_swarm_plan,
+    persist_swarm_state_for, record_swarm_event, summarize_plan_items,
 };
 use crate::plan::PlanItem;
 use crate::protocol::{NotificationType, ServerEvent};
