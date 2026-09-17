@@ -1313,6 +1313,26 @@ fn test_restore_physical_consolidation_returns_transcript_as_is() {
         view.iter().any(|m| matches!(&m.content[0], ContentBlock::Text { text, .. } if text.contains("tail 2"))),
         "recent tail must survive"
     );
+
+    // The token estimate must NOT double-count the summary: it is already
+    // message 0 of the transcript, so `token_estimate_with` must match an
+    // estimate over the whole transcript WITHOUT adding the separate
+    // `active_summary` characters again.
+    let active_all_chars: usize = manager
+        .active_messages(&consolidated)
+        .iter()
+        .map(message_char_count)
+        .sum();
+    let expected = crate::compaction::estimate_compaction_tokens(
+        None,
+        active_all_chars,
+        manager.token_budget(),
+    );
+    let actual = manager.token_estimate_with(&consolidated);
+    assert_eq!(
+        actual, expected,
+        "physical-mode token estimate must not add the already-present summary separately"
+    );
 }
 
 /// `mark_physically_consolidated` zeroes the live skip offset and `recent_tail`
