@@ -301,8 +301,10 @@ impl DegradationTracker {
 impl Agent {
     /// The degradation route key for the agent's CURRENT provider/model. Kept in
     /// one place so `build_base` and the route/model-switch re-keying agree.
+    /// Uses `provider.model()` (the raw model) to match how `build_base` forms
+    /// the initial key, keeping the key format stable across the lifecycle.
     pub(crate) fn current_route_key(&self) -> RouteKey {
-        RouteKey(format!("{}/{}", self.provider.display_name(), self.provider_model()))
+        RouteKey(format!("{}/{}", self.provider.display_name(), self.provider.model()))
     }
 
     /// Advance the degradation mitigation ladder at a safe turn-loop checkpoint.
