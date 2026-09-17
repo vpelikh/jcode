@@ -286,7 +286,29 @@ the prior environment.
   hacked session fields. If the overlay grows, consider replacing the
   session-shaped rows with a thin, picker-agnostic row model (e.g. trait or enum
   over a `SessionInfo`-like row), decoupling the handoff surface from the
-  session-shaped one. Not needed for the current flat-intent+preview picker.
+  session-shaped one. Not needed for the current flat-intent+preview picker. This
+  is the *row-model/architecture* follow-up, orthogonal to the wire features below.
+
+- **Atomic handoff apply (non-atomic clear+set is a known gap).** The overlay
+  applies a selection as `remote.clear()` then `set_handoff_resume` — two
+  requests that can split if the transport drops between them, leaving a cleared
+  conversation with no override (auto-inject wins). This mirrors the manual
+  `/handoffres` flow. A protocol feature (a combined apply request, or a
+  rollback/recovery) would make it atomic. Independent of the row model.
+
+- **SSH handoff discovery is blocked.** Over SSH the `/handoff` overlay is
+  unavailable because it lists the *client host's* local store, which is the
+  wrong host for an SSH-backed session. `/handoffres <id>` still works over SSH
+  for a known server-side id, but a client cannot list the server's handoffs.
+  Closing this needs a wire request to read the server-side handoff store.
+
+- **Standalone `--resume` has no handoff picker.** The interactive overlay is
+  TUI-only; `jcode --resume` treats a handoff selection as an inert no-op. Adding
+  handoff selection to the standalone resume CLI is a separate feature.
+
+These are *feature/protocol* follow-ups (wire surface + commands), orthogonal to
+the row-model abstraction above. Each is shippable independently on the current
+architecture.
 
 ## Relationship to remote handoff
 
