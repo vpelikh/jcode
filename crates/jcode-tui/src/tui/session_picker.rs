@@ -229,17 +229,79 @@ struct PreviewRenderCache {
     first_match_line: Option<usize>,
 }
 
+/// A handoff snapshot mapped onto the picker's shared pipeline. Carries the
+/// real [`HandoffSnapshot`] alongside the derived display projection so
+/// handoff-specific fields (`disposition`, `project_key`, `initiative_id`) are
+/// not lost to the `SessionInfo`-shaped render surface.
+pub(crate) struct HandoffModel {
+    /// Display/storage projection consumed by the shared render/filter/search
+    /// pipeline. Always derived from the snapshot by [`handoff_to_model`].
+    session: SessionInfo,
+    /// The real snapshot, retaining handoff-specific fields the projection
+    /// cannot hold.
+    snapshot: HandoffSnapshot,
+}
+
+/// A picker-agnostic row in the flat (`all_sessions` / `all_orphan_sessions`)
+/// backing store. Sessions are `Row::Session`; saved handoff snapshots are
+/// `Row::Handoff`. Both expose a common [`SessionInfo`]-shaped display
+/// projection through [`Row::session`], so the shared list / render / filter /
+/// search / preview pipeline operates on one surface regardless of the row's
+/// true source, while handoff rows keep their real fields for selection,
+/// routing, and search.
+pub(crate) enum Row {
+    Session(SessionInfo),
+    Handoff(HandoffModel),
+}
+
+impl Row {
+    /// The `SessionInfo`-shaped display projection shared by the pipeline.
+    fn session(&self) -> &SessionInfo {
+        match self {
+            Row::Session(session) => session,
+            Row::Handoff(model) => &model.session,
+        }
+    }
+
+    fn session_mut(&mut self) -> &mut SessionInfo {
+        match self {
+            Row::Session(session) => session,
+            Row::Handoff(model) => &mut model.session,
+        }
+    }
+
+    fn id(&self) -> &str {
+        self.session().id.as_str()
+    }
+
+    /// Whether this row is a saved handoff snapshot rather than a session.
+    fn is_handoff(&self) -> bool {
+        matches!(self, Row::Handoff(_))
+    }
+
+    /// The backing handoff snapshot, when this row is a handoff. Selection
+    /// routes off the snapshot's own `session_id` (not the projection, which
+    /// duplicates it) so handoff data stays the source of truth.
+    fn handoff_snapshot(&self) -> Option<&HandoffSnapshot> {
+        match self {
+            Row::Session(_) => None,
+            Row::Handoff(model) => Some(&model.snapshot),
+        }
+    }
+}
+
 pub struct SessionPicker {
     /// Flat list of items (headers and sessions)
     items: Vec<PickerItem>,
     /// References into the backing session collections for the filtered view.
     visible_sessions: Vec<SessionRef>,
-    /// All sessions (unfiltered, for rebuilding)
-    all_sessions: Vec<SessionInfo>,
+    /// All rows (unfiltered, for rebuilding). Sessions are `Row::Session`;
+    /// handoff-driven rows are `Row::Handoff` (see [`Row`]).
+    all_sessions: Vec<Row>,
     /// All server groups (unfiltered, for rebuilding)
     all_server_groups: Vec<ServerGroup>,
-    /// All orphan sessions (unfiltered, for rebuilding)
-    all_orphan_sessions: Vec<SessionInfo>,
+    /// All orphan rows (unfiltered, for rebuilding)
+    all_orphan_sessions: Vec<Row>,
     /// Map from items index to sessions index (only for Session items)
     item_to_session: Vec<Option<usize>>,
     list_state: ListState,
@@ -308,12 +370,6 @@ pub struct SessionPicker {
     /// live Claude session never stops it; only confirming this prompt emits
     /// `PickerResult::TakeOverClaude`.
     pending_claude_takeover: Option<ResumeTarget>,
-    /// When true, the picker's data source is saved handoff snapshots rather
-    /// than live/persisted sessions. Rows are `SessionInfo` built from
-    /// `HandoffSnapshot`s, so the list/render/filter/preview pipeline is reused
-    /// unchanged; only the selection result and a few session-only keys are
-    /// routed differently. Set by [`SessionPicker::for_handoffs`].
-    handoff_mode: bool,
 }
 
 impl SessionPicker {
@@ -329,7 +385,7 @@ impl SessionPicker {
         let mut picker = Self {
             items: Vec::new(),
             visible_sessions: Vec::new(),
-            all_sessions: sessions,
+            all_sessions: sessions.into_iter().map(Row::Session).collect(),
             all_server_groups: Vec::new(),
             all_orphan_sessions: Vec::new(),
             item_to_session: Vec::new(),
@@ -362,7 +418,6 @@ impl SessionPicker {
             live_presence_refreshed_at: None,
             current_session_id: None,
             pending_claude_takeover: None,
-            handoff_mode: false,
         };
         picker.refresh_live_presence();
         picker.rebuild_items();
@@ -408,7 +463,6 @@ impl SessionPicker {
             live_presence_refreshed_at: None,
             current_session_id: None,
             pending_claude_takeover: None,
-            handoff_mode: false,
         }
     }
 
@@ -418,16 +472,27 @@ impl SessionPicker {
 
     /// Create a picker with server grouping
     pub fn new_grouped(server_groups: Vec<ServerGroup>, orphan_sessions: Vec<SessionInfo>) -> Self {
+        Self::new_grouped_rows(
+            server_groups,
+            orphan_sessions.into_iter().map(Row::Session).collect(),
+        )
+    }
+
+    /// Internal row-based grouped constructor. Sessions arrive as
+    /// `Row::Session`; the handoff overlay passes `Row::Handoff` orphans (with
+    /// an empty server list), so the shared pipeline never special-cases the
+    /// data source beyond asking each [`Row`] for its projection.
+    fn new_grouped_rows(server_groups: Vec<ServerGroup>, orphan_rows: Vec<Row>) -> Self {
         // Count totals before filtering
         let _total_session_count: usize = server_groups
             .iter()
             .map(|g| g.sessions.len())
             .sum::<usize>()
-            + orphan_sessions.len();
+            + orphan_rows.len();
         let hidden_test_count: usize = server_groups
             .iter()
             .flat_map(|g| g.sessions.iter())
-            .chain(orphan_sessions.iter())
+            .chain(orphan_rows.iter().map(|row| row.session()))
             .filter(|s| s.is_debug)
             .count();
 
@@ -435,7 +500,7 @@ impl SessionPicker {
         let all_for_crash: Vec<SessionInfo> = server_groups
             .iter()
             .flat_map(|g| g.sessions.iter())
-            .chain(orphan_sessions.iter())
+            .chain(orphan_rows.iter().map(|row| row.session()))
             .cloned()
             .collect();
         let crashed_sessions = crashed_sessions_from_all_sessions(&all_for_crash);
@@ -445,9 +510,9 @@ impl SessionPicker {
             .unwrap_or_default();
 
         let (all_sessions, all_orphan_sessions) = if server_groups.is_empty() {
-            (orphan_sessions, Vec::new())
+            (orphan_rows, Vec::new())
         } else {
-            (Vec::new(), orphan_sessions)
+            (Vec::new(), orphan_rows)
         };
 
         let mut picker = Self {
@@ -486,7 +551,6 @@ impl SessionPicker {
             live_presence_refreshed_at: None,
             current_session_id: None,
             pending_claude_takeover: None,
-            handoff_mode: false,
         };
         picker.refresh_live_presence();
         picker.rebuild_items();
@@ -496,8 +560,10 @@ impl SessionPicker {
     /// Create a picker over saved handoff snapshots, reusing the same list /
     /// render / filter / preview machinery as the session picker.
     ///
-    /// Each [`HandoffSnapshot`] is mapped onto a [`SessionInfo`] row so the
-    /// existing pipeline renders it unchanged:
+    /// Each [`HandoffSnapshot`] is stored as a `Row::Handoff`: the snapshot's
+    /// real fields (`disposition`, `project_key`, `initiative_id`, `open_todos`)
+    /// are retained for selection and search, and a `SessionInfo`-shaped
+    /// projection drives the shared render pipeline:
     ///
     /// - id / title / short-name come from the snapshot's session id and intent.
     /// - the snapshot's open todos and trailing assistant text become the
@@ -511,16 +577,25 @@ impl SessionPicker {
     /// path, matching how [`new_grouped`](Self::new_grouped) treats an empty
     /// server list plus orphan sessions.
     pub fn for_handoffs(snapshots: Vec<HandoffSnapshot>) -> Self {
-        let sessions = snapshots.into_iter().map(handoff_to_session_info).collect();
-        let mut picker = Self::new_grouped(Vec::new(), sessions);
-        picker.handoff_mode = true;
-        picker.rebuild_items();
-        picker
+        let rows = snapshots
+            .into_iter()
+            .map(|snapshot| Row::Handoff(handoff_to_model(snapshot)))
+            .collect();
+        Self::new_grouped_rows(Vec::new(), rows)
     }
 
-    /// Whether this picker is operating on the handoff data source.
+    /// Whether this picker's rows are handoff snapshots rather than sessions.
+    /// Derived from the backing [`Row`] type, so there is no separate mode flag
+    /// that can drift from the data source. A handoff picker always has handoff
+    /// rows in its flat backing (the handoff overlay never mixes sources), so
+    /// checking the first backing row is authoritative even when the current
+    /// filter/search has emptied the visible list.
     pub fn is_handoff(&self) -> bool {
-        self.handoff_mode
+        self.all_sessions
+            .iter()
+            .chain(self.all_orphan_sessions.iter())
+            .next()
+            .is_some_and(|row| row.is_handoff())
     }
 
     pub fn activate_catchup_filter(&mut self) {
@@ -712,6 +787,15 @@ impl SessionPicker {
         server_groups: Vec<ServerGroup>,
         orphan_sessions: Vec<SessionInfo>,
     ) {
+        self.reseed_grouped_rows(
+            server_groups,
+            orphan_sessions.into_iter().map(Row::Session).collect(),
+        );
+    }
+
+    /// Row-based reseed used by the row-backed data source (see
+    /// [`reseed_grouped`] for the session-shaped public wrapper).
+    fn reseed_grouped_rows(&mut self, server_groups: Vec<ServerGroup>, orphan_rows: Vec<Row>) {
         // Remember what the user was looking at so we can restore it after the
         // data swap + item rebuild.
         let selected_id = self.selected_session().map(|session| session.id.clone());
@@ -721,14 +805,14 @@ impl SessionPicker {
         let hidden_test_count: usize = server_groups
             .iter()
             .flat_map(|g| g.sessions.iter())
-            .chain(orphan_sessions.iter())
+            .chain(orphan_rows.iter().map(|row| row.session()))
             .filter(|s| s.is_debug)
             .count();
 
         let all_for_crash: Vec<SessionInfo> = server_groups
             .iter()
             .flat_map(|g| g.sessions.iter())
-            .chain(orphan_sessions.iter())
+            .chain(orphan_rows.iter().map(|row| row.session()))
             .cloned()
             .collect();
         self.crashed_sessions = crashed_sessions_from_all_sessions(&all_for_crash);
@@ -739,9 +823,9 @@ impl SessionPicker {
             .unwrap_or_default();
 
         let (all_sessions, all_orphan_sessions) = if server_groups.is_empty() {
-            (orphan_sessions, Vec::new())
+            (orphan_rows, Vec::new())
         } else {
-            (Vec::new(), orphan_sessions)
+            (Vec::new(), orphan_rows)
         };
         self.all_sessions = all_sessions;
         self.all_server_groups = server_groups;
@@ -851,6 +935,28 @@ impl SessionPicker {
         })
     }
 
+    /// The backing row of the currently selected list item, if any.
+    fn selected_row(&self) -> Option<&Row> {
+        self.list_state.selected().and_then(|i| {
+            self.item_to_session
+                .get(i)
+                .and_then(|opt| opt.as_ref())
+                .and_then(|session_idx| self.visible_sessions.get(*session_idx))
+                .copied()
+                .and_then(|session_ref| self.row_by_ref(session_ref))
+        })
+    }
+
+    /// The snapshot `session_id` for the currently selected row, when that row
+    /// is a handoff. Selection routes off the snapshot's own id (not the
+    /// session-shaped projection, which duplicates it) so the handoff data is
+    /// the source of truth for `/handoffres`.
+    fn selected_handoff_snapshot_id(&self) -> Option<String> {
+        self.selected_row()
+            .and_then(|row| row.handoff_snapshot())
+            .map(|snapshot| snapshot.session_id.clone())
+    }
+
     pub fn session_for_target(&self, target: &ResumeTarget) -> Option<&SessionInfo> {
         self.visible_sessions
             .iter()
@@ -902,9 +1008,22 @@ impl SessionPicker {
         })
     }
 
-    fn session_by_ref(&self, session_ref: SessionRef) -> Option<&SessionInfo> {
+    /// The backing [`Row`] for a session ref. Groups always yield `Row::Session`
+    /// (a server group never holds handoffs); flat/orphan refs can yield a
+    /// `Row::Handoff` in the handoff data source.
+    fn row_by_ref(&self, session_ref: SessionRef) -> Option<&Row> {
         match session_ref {
             SessionRef::Flat(idx) => self.all_sessions.get(idx),
+            // Groups only ever hold real sessions, never handoffs, so a group
+            // ref can never be a handoff row.
+            SessionRef::Group { .. } => None,
+            SessionRef::Orphan(idx) => self.all_orphan_sessions.get(idx),
+        }
+    }
+
+    fn session_by_ref(&self, session_ref: SessionRef) -> Option<&SessionInfo> {
+        match session_ref {
+            SessionRef::Flat(idx) => self.all_sessions.get(idx).map(Row::session),
             SessionRef::Group {
                 group_idx,
                 session_idx,
@@ -912,13 +1031,13 @@ impl SessionPicker {
                 .all_server_groups
                 .get(group_idx)
                 .and_then(|group| group.sessions.get(session_idx)),
-            SessionRef::Orphan(idx) => self.all_orphan_sessions.get(idx),
+            SessionRef::Orphan(idx) => self.all_orphan_sessions.get(idx).map(Row::session),
         }
     }
 
     fn session_by_ref_mut(&mut self, session_ref: SessionRef) -> Option<&mut SessionInfo> {
         match session_ref {
-            SessionRef::Flat(idx) => self.all_sessions.get_mut(idx),
+            SessionRef::Flat(idx) => self.all_sessions.get_mut(idx).map(Row::session_mut),
             SessionRef::Group {
                 group_idx,
                 session_idx,
@@ -926,7 +1045,9 @@ impl SessionPicker {
                 .all_server_groups
                 .get_mut(group_idx)
                 .and_then(|group| group.sessions.get_mut(session_idx)),
-            SessionRef::Orphan(idx) => self.all_orphan_sessions.get_mut(idx),
+            SessionRef::Orphan(idx) => {
+                self.all_orphan_sessions.get_mut(idx).map(Row::session_mut)
+            }
         }
     }
 
@@ -940,14 +1061,11 @@ impl SessionPicker {
                     });
                 }
             }
-            if let Some(idx) = self
-                .all_orphan_sessions
-                .iter()
-                .position(|s| s.id == session_id)
+            if let Some(idx) = self.all_orphan_sessions.iter().position(|s| s.id() == session_id)
             {
                 return Some(SessionRef::Orphan(idx));
             }
-        } else if let Some(idx) = self.all_sessions.iter().position(|s| s.id == session_id) {
+        } else if let Some(idx) = self.all_sessions.iter().position(|s| s.id() == session_id) {
             return Some(SessionRef::Flat(idx));
         }
 
@@ -1176,18 +1294,13 @@ impl SessionPicker {
                 if self.visible_sessions.is_empty() {
                     self.search_query.clear();
                     self.rebuild_items();
-                } else if self.handoff_mode {
+                } else if let Some(session_id) = self.selected_handoff_snapshot_id() {
                     // Searching the handoff list must still select a handoff,
                     // not a resume target. Emit HandoffSelected exactly like the
-                    // non-search Enter path.
-                    if let Some(session_id) = self
-                        .selected_session()
-                        .map(|session| session.id.clone())
-                    {
-                        return Ok(OverlayAction::Selected(
-                            PickerResult::HandoffSelected(session_id),
-                        ));
-                    }
+                    // non-search Enter path, using the selected handoff's own id.
+                    return Ok(OverlayAction::Selected(
+                        PickerResult::HandoffSelected(session_id),
+                    ));
                 } else {
                     let targets = self.selection_or_current_targets();
                     if !targets.is_empty() {
@@ -1294,7 +1407,7 @@ impl SessionPicker {
             }
             KeyCode::Char('q') => return Ok(OverlayAction::Close),
             KeyCode::Char(' ') => {
-                if !self.handoff_mode {
+                if self.selected_handoff_snapshot_id().is_none() {
                     self.toggle_selected_session();
                 }
             }
@@ -1305,11 +1418,7 @@ impl SessionPicker {
                 if self.onboarding_review_recent_project_highlighted() {
                     return Ok(OverlayAction::Selected(PickerResult::ReviewRecentProject));
                 }
-                if self.handoff_mode
-                    && let Some(session_id) = self
-                        .selected_session()
-                        .map(|session| session.id.clone())
-                {
+                if let Some(session_id) = self.selected_handoff_snapshot_id() {
                     return Ok(OverlayAction::Selected(PickerResult::HandoffSelected(
                         session_id,
                     )));
@@ -1332,22 +1441,22 @@ impl SessionPicker {
                 self.search_active = true;
             }
             KeyCode::Char('d') => {
-                if !self.handoff_mode {
+                if !self.is_handoff() {
                     self.toggle_test_sessions();
                 }
             }
             KeyCode::Char('T') => {
-                if !self.handoff_mode {
+                if !self.is_handoff() {
                     self.begin_claude_takeover_confirmation();
                 }
             }
             KeyCode::Char('s') => {
-                if !self.handoff_mode {
+                if !self.is_handoff() {
                     self.cycle_filter_mode();
                 }
             }
             KeyCode::Char('S') => {
-                if !self.handoff_mode {
+                if !self.is_handoff() {
                     self.cycle_filter_mode_backwards();
                 }
             }
@@ -2502,7 +2611,7 @@ impl SessionPicker {
     }
 }
 
-/// Map a handoff snapshot onto a [`SessionInfo`] row for the picker's shared
+/// Map a handoff snapshot onto a [`HandoffModel`] for the picker's shared
 /// list / render / preview pipeline.
 ///
 /// The snapshot's open todos become the preview "body": todo rows rendered as
@@ -2510,7 +2619,10 @@ impl SessionPicker {
 /// The intent doubles as the row title, with the snapshot id as a fallback.
 /// `ended_at` is used for both `created_at` and `last_message_time` so recency
 /// ordering and the "closed <ago>" label reflect when the work was last active.
-fn handoff_to_session_info(snapshot: HandoffSnapshot) -> SessionInfo {
+/// The model keeps the real snapshot alongside the projection, so handoff-only
+/// fields (`disposition`, `project_key`, `initiative_id`) remain available to
+/// selection and search rather than being flattened into a `SessionInfo`.
+fn handoff_to_model(snapshot: HandoffSnapshot) -> HandoffModel {
     // Open todos rendered as preview lines, newest/grouped faithfully by the
     // snapshot's own ordering. A handoff's preview reads as a handoff "context"
     // block rather than a chat transcript, which is what the user wants to
@@ -2622,7 +2734,7 @@ fn handoff_to_session_info(snapshot: HandoffSnapshot) -> SessionInfo {
         search_index.push_str(&initiative.to_lowercase());
     }
 
-    SessionInfo {
+    let session = SessionInfo {
         id,
         parent_id: None,
         short_name,
@@ -2654,7 +2766,9 @@ fn handoff_to_session_info(snapshot: HandoffSnapshot) -> SessionInfo {
             session_id: snapshot.session_id.clone(),
         },
         external_path: None,
-    }
+    };
+
+    HandoffModel { session, snapshot }
 }
 
 /// Run the interactive session picker

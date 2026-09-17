@@ -276,18 +276,19 @@ the prior environment.
 - Wire `import_handoff` into the remote-fallback flow after a failed live-session
   migration, consuming handoff files already available on the target host.
 
-- **Picker reality check (open abstraction step).** The interactive overlay is a
-  "reuse the session picker" milestone: each `HandoffSnapshot` is mapped onto a
-  synthetic `SessionInfo` row so the shared list/render/filter/preview pipeline
-  is reused unchanged. That is a deliberate trade-off — maximum reuse, minimal
-  risk — but it means many `SessionInfo` fields are dummy (status, message
-  counts, estimated tokens) and anything handoff-specific (`disposition`,
-  project grouping, one-shot export-in-place) can only live in app plumbing or
-  hacked session fields. If the overlay grows, consider replacing the
-  session-shaped rows with a thin, picker-agnostic row model (e.g. trait or enum
-  over a `SessionInfo`-like row), decoupling the handoff surface from the
-  session-shaped one. Not needed for the current flat-intent+preview picker. This
-  is the *row-model/architecture* follow-up, orthogonal to the wire features below.
+- **Picker row model (landed 2026-09).** The interactive overlay's handoff
+  surface is decoupled from the session-shaped one. `session_picker.rs` now
+  backs the flat list with a thin, picker-agnostic [`Row`] enum:
+  `Row::Session(SessionInfo)` for live/persisted sessions and
+  `Row::Handoff(HandoffModel)` for saved handoffs. `HandoffModel` keeps the
+  real [`HandoffSnapshot`] (`disposition`, `project_key`, `initiative_id`, open
+  todos) alongside the `SessionInfo`-shaped display projection, so handoff rows
+  carry real fields instead of dummy session ones. The previous `handoff_mode`
+  bool flag is gone: the picker derives `is_handoff()` from the backing row
+  type, Enter/selection route off the snapshot's own `session_id`, and the
+  session-only keys (`s`/`S`/`d`/`T`/`Space`) are no-ops for `Row::Handoff`
+  rows. Behavior is byte-identical (the picker, review, and handoff suites
+  still pass unchanged).
 
 - **Atomic handoff apply (non-atomic clear+set is a known gap).** The overlay
   applies a selection as `remote.clear()` then `set_handoff_resume` — two
