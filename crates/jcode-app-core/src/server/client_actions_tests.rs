@@ -1736,3 +1736,172 @@ async fn handle_set_handoff_resume_none_clears_override() -> Result<()> {
     }
     Ok(())
 }
+
+/// Real-socket integration: boot the real server accept loop, connect a real
+/// client over the Unix socket, and drive `Request::SetHandoffResume` through
+/// the wire so it reaches the real handler. This exercises request framing and
+/// server dispatch that in-process handler tests do not. A valid handoff id
+/// round-trips to a `Done` reply; an unknown id yields `Error`.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_socket_set_handoff_resume_round_trips_done_and_error() -> Result<()> {
+    use crate::protocol::Request;
+    use crate::server::Server;
+    use crate::transport::Stream;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let _guard = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().expect("temp home");
+    let sock_dir = tempfile::tempdir().expect("temp sock dir");
+    let socket_path = sock_dir.path().join("jcode-e2e.sock");
+
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            crate::env::remove_var("JCODE_HOME");
+            crate::env::remove_var("JCODE_SOCKET");
+        }
+    }
+    let _restore = Restore;
+    crate::env::set_var("JCODE_HOME", home.path());
+    crate::env::set_var("JCODE_SOCKET", &socket_path);
+
+    // Seed a handoff the server can resolve.
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    crate::todo::save_todos(
+        "target-handoff",
+        &[crate::todo::TodoItem {
+            id: "t".into(),
+            content: "e2e work".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: None,
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    crate::todo::save_plan(
+        "target-handoff",
+        &crate::todo::TodoPlan {
+            user_intention: Some("e2e intent".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    crate::handoff::capture("target-handoff", Some(&work), "closed", None).expect("seed handoff");
+
+    let provider: Arc<dyn Provider> = Arc::new(StreamingMockProvider::default());
+    let server = Server::new(provider);
+    let run_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    // Wait for the real accept loop, then connect a real client.
+    let mut stream = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(s) = Stream::connect(&socket_path).await {
+                break s;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    })
+    .await
+    .expect("server should accept within 10s");
+
+    // The server requires a Subscribe with a working_dir before stateful
+    // requests.
+    let subscribe = Request::Subscribe {
+        id: 20,
+        working_dir: Some(work.to_string_lossy().into_owned()),
+        selfdev: None,
+        target_session_id: None,
+        client_instance_id: None,
+        client_has_local_history: false,
+        allow_session_takeover: false,
+        crash_on_disconnect: false,
+        continue_on_disconnect: false,
+        terminal_env: Vec::new(),
+    };
+    stream
+        .write_all((serde_json::to_string(&subscribe)? + "\n").as_bytes())
+        .await?;
+
+    // A valid SetHandoffResume must round-trip to a Done reply.
+    let valid = Request::SetHandoffResume {
+        id: 21,
+        session_id: Some("target-handoff".to_string()),
+    };
+    stream
+        .write_all((serde_json::to_string(&valid)? + "\n").as_bytes())
+        .await?;
+
+    let mut reader = tokio::io::BufReader::new(stream);
+    let valid_event: crate::protocol::ServerEvent =
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let mut line = String::new();
+                let n = reader.read_line(&mut line).await?;
+                if n == 0 {
+                    anyhow::bail!("connection closed before Done arrived");
+                }
+                if let Ok(ev) =
+                    serde_json::from_str::<crate::protocol::ServerEvent>(&line)
+                    && matches!(ev, crate::protocol::ServerEvent::Done { id: 21 })
+                {
+                    return Ok(ev);
+                }
+            }
+        })
+        .await
+        .expect("Done reply should arrive")?;
+    assert!(
+        matches!(
+            valid_event,
+            crate::protocol::ServerEvent::Done { id: 21 }
+        ),
+        "valid SetHandoffResume must round-trip to Done, got {valid_event:?}"
+    );
+
+    // An unknown id yields Error over the wire.
+    let unknown = Request::SetHandoffResume {
+        id: 22,
+        session_id: Some("no-such-handoff".to_string()),
+    };
+    reader
+        .get_mut()
+        .write_all((serde_json::to_string(&unknown)? + "\n").as_bytes())
+        .await?;
+    let unknown_event: crate::protocol::ServerEvent =
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let mut line = String::new();
+                let n = reader.read_line(&mut line).await?;
+                if n == 0 {
+                    anyhow::bail!("connection closed before Error arrived");
+                }
+                if let Ok(ev) =
+                    serde_json::from_str::<crate::protocol::ServerEvent>(&line)
+                    && matches!(
+                        ev,
+                        crate::protocol::ServerEvent::Error { id: 22, .. }
+                    )
+                {
+                    return Ok(ev);
+                }
+            }
+        })
+        .await
+        .expect("Error reply should arrive")?;
+    match unknown_event {
+        crate::protocol::ServerEvent::Error { id, message, .. } => {
+            assert_eq!(id, 22);
+            assert!(message.contains("no saved handoff"), "got: {message}");
+        }
+        other => panic!("unknown id should yield Error, got {other:?}"),
+    }
+
+    run_task.abort();
+    Ok(())
+}
