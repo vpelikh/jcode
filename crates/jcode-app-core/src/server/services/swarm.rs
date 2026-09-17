@@ -15,6 +15,14 @@ use tokio::sync::{RwLock, broadcast, mpsc};
 /// Channel subscriptions (swarm_id -> channel -> session_ids).
 type ChannelSubscriptions = Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
 
+/// Borrowed view of the swarm event emission sources handed to read callers:
+/// the ring-buffer history, the event-id counter, and the broadcast sender.
+type EventSources<'a> = (
+    &'a Arc<RwLock<VecDeque<SwarmEvent>>>,
+    &'a Arc<AtomicU64>,
+    &'a broadcast::Sender<SwarmEvent>,
+);
+
 /// Owns swarm membership, plans, shared context, channel subscriptions,
 /// event history/broadcast, file-touch tracking, and the persisted coordination
 /// runtimes.
@@ -35,11 +43,11 @@ pub(crate) struct SwarmServiceHandle {
     /// Channel subscriptions reverse index (session_id -> swarm_id -> channels).
     pub(crate) channel_subscriptions_by_session: ChannelSubscriptions,
     /// Event history for real-time event subscription (ring buffer).
-    pub(crate) event_history: Arc<RwLock<VecDeque<SwarmEvent>>>,
+    event_history: Arc<RwLock<VecDeque<SwarmEvent>>>,
     /// Counter for event IDs.
-    pub(crate) event_counter: Arc<AtomicU64>,
+    event_counter: Arc<AtomicU64>,
     /// Broadcast channel for swarm event subscriptions.
-    pub(crate) swarm_event_tx: broadcast::Sender<SwarmEvent>,
+    swarm_event_tx: broadcast::Sender<SwarmEvent>,
     /// Persisted communicate await_members wait registry.
     pub(crate) await_members_runtime: AwaitMembersRuntime,
     /// Persisted dedupe registry for mutating swarm coordinator operations.
@@ -68,6 +76,59 @@ impl SwarmServiceHandle {
             swarm_event_tx: server.swarm_event_tx.clone(),
             await_members_runtime: server.await_members_runtime.clone(),
             swarm_mutation_runtime: server.swarm_mutation_runtime.clone(),
+        }
+    }
+
+    /// Borrow the swarm event emission sources (`history`, `counter`,
+    /// `broadcast sender`). Reads only: mutations route through
+    /// `record_swarm_event`. Exists so the private event-sink fields stay
+    /// encapsulated (Tier 3).
+    pub(crate) fn read_event_sources(&self) -> EventSources<'_> {
+        (
+            &self.event_history,
+            &self.event_counter,
+            &self.swarm_event_tx,
+        )
+    }
+
+    /// Construct an otherwise-default handle with specific event sources.
+    /// Test-only: lets `TestSwarmBuilder` seed the (now-private) event sinks
+    /// without exposing them as mutable fields.
+    #[cfg(test)]
+    pub(crate) fn with_event_sources(
+        mut self,
+        event_history: Arc<RwLock<VecDeque<SwarmEvent>>>,
+        event_counter: Arc<AtomicU64>,
+        swarm_event_tx: broadcast::Sender<SwarmEvent>,
+    ) -> Self {
+        self.event_history = event_history;
+        self.event_counter = event_counter;
+        self.swarm_event_tx = swarm_event_tx;
+        self
+    }
+
+    /// Build an all-default handle for tests. Test-only: provides a
+    /// constructor for the (now-private) fields while callers configure them
+    /// through `with_event_sources` / `with_swarm_state`.
+    #[cfg(test)]
+    pub(crate) fn test_with_state(
+        swarm_state: SwarmState,
+        shared_context: Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
+        channel_subscriptions: ChannelSubscriptions,
+        channel_subscriptions_by_session: ChannelSubscriptions,
+        swarm_mutation_runtime: SwarmMutationRuntime,
+    ) -> Self {
+        Self {
+            swarm_state,
+            shared_context,
+            file_touch: FileTouchService::new(),
+            channel_subscriptions,
+            channel_subscriptions_by_session,
+            event_history: Arc::new(RwLock::new(VecDeque::new())),
+            event_counter: Arc::new(AtomicU64::new(0)),
+            swarm_event_tx: broadcast::channel(16).0,
+            await_members_runtime: AwaitMembersRuntime::default(),
+            swarm_mutation_runtime,
         }
     }
 

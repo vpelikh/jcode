@@ -42,9 +42,7 @@ pub(super) async fn handle_comm_share(
     let swarm_members = &swarm.swarm_state.members;
     let swarms_by_id = &swarm.swarm_state.swarms_by_id;
     let shared_context = &swarm.shared_context;
-    let event_history = &swarm.event_history;
-    let event_counter = &swarm.event_counter;
-    let swarm_event_tx = &swarm.swarm_event_tx;
+    let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
     let swarm_id = swarm_id_for_session(&req_session_id, swarm_members).await;
 
     if let Some(swarm_id) = swarm_id {

@@ -123,9 +123,7 @@ pub(super) async fn handle_comm_subscribe_channel(
     let swarm_members = &swarm.swarm_state.members;
     let channel_subscriptions = &swarm.channel_subscriptions;
     let channel_subscriptions_by_session = &swarm.channel_subscriptions_by_session;
-    let event_history = &swarm.event_history;
-    let event_counter = &swarm.event_counter;
-    let swarm_event_tx = &swarm.swarm_event_tx;
+    let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
     let started = std::time::Instant::now();
     let swarm_id = swarm_id_for_session(&req_session_id, swarm_members).await;
 
@@ -205,9 +203,7 @@ pub(super) async fn handle_comm_unsubscribe_channel(
     let swarm_members = &swarm.swarm_state.members;
     let channel_subscriptions = &swarm.channel_subscriptions;
     let channel_subscriptions_by_session = &swarm.channel_subscriptions_by_session;
-    let event_history = &swarm.event_history;
-    let event_counter = &swarm.event_counter;
-    let swarm_event_tx = &swarm.swarm_event_tx;
+    let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
     let started = std::time::Instant::now();
     let swarm_id = swarm_id_for_session(&req_session_id, swarm_members).await;
 

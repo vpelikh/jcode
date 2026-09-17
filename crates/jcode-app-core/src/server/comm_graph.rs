@@ -230,9 +230,7 @@ pub(super) async fn handle_comm_seed_graph(
     let swarms_by_id = &swarm.swarm_state.swarms_by_id;
     let swarm_plans = &swarm.swarm_state.plans;
     let swarm_coordinators = &swarm.swarm_state.coordinators;
-    let event_history = &swarm.event_history;
-    let event_counter = &swarm.event_counter;
-    let swarm_event_tx = &swarm.swarm_event_tx;
+    let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
     let Some(swarm_id) = swarm_id_for(&req_session_id, swarm_members).await else {
         err(client_event_tx, id, "Not in a swarm.".to_string());
         return;
@@ -348,9 +346,7 @@ pub(super) async fn handle_comm_expand_node(
     let swarms_by_id = &swarm.swarm_state.swarms_by_id;
     let swarm_plans = &swarm.swarm_state.plans;
     let swarm_coordinators = &swarm.swarm_state.coordinators;
-    let event_history = &swarm.event_history;
-    let event_counter = &swarm.event_counter;
-    let swarm_event_tx = &swarm.swarm_event_tx;
+    let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
     let Some(swarm_id) = swarm_id_for(&req_session_id, swarm_members).await else {
         err(client_event_tx, id, "Not in a swarm.".to_string());
         return;
@@ -418,9 +414,7 @@ pub(super) async fn handle_comm_complete_node(
     let swarms_by_id = &swarm.swarm_state.swarms_by_id;
     let swarm_plans = &swarm.swarm_state.plans;
     let swarm_coordinators = &swarm.swarm_state.coordinators;
-    let event_history = &swarm.event_history;
-    let event_counter = &swarm.event_counter;
-    let swarm_event_tx = &swarm.swarm_event_tx;
+    let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
     let Some(swarm_id) = swarm_id_for(&req_session_id, swarm_members).await else {
         err(client_event_tx, id, "Not in a swarm.".to_string());
         return;
@@ -491,9 +485,7 @@ pub(super) async fn handle_comm_inject_gap(
     let swarms_by_id = &swarm.swarm_state.swarms_by_id;
     let swarm_plans = &swarm.swarm_state.plans;
     let swarm_coordinators = &swarm.swarm_state.coordinators;
-    let event_history = &swarm.event_history;
-    let event_counter = &swarm.event_counter;
-    let swarm_event_tx = &swarm.swarm_event_tx;
+    let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
     let Some(swarm_id) = swarm_id_for(&req_session_id, swarm_members).await else {
         err(client_event_tx, id, "Not in a swarm.".to_string());
         return;

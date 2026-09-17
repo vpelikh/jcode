@@ -45,9 +45,7 @@ pub(super) async fn handle_comm_propose_plan(
     let shared_context = &swarm.shared_context;
     let swarm_plans = &swarm.swarm_state.plans;
     let swarm_coordinators = &swarm.swarm_state.coordinators;
-    let event_history = &swarm.event_history;
-    let event_counter = &swarm.event_counter;
-    let swarm_event_tx = &swarm.swarm_event_tx;
+    let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
     let _swarm_mutation_runtime = &swarm.swarm_mutation_runtime;
     let swarm_id = {
         let members = swarm_members.read().await;
@@ -312,9 +310,7 @@ pub(super) async fn handle_comm_approve_plan(
     let shared_context = &swarm.shared_context;
     let swarm_plans = &swarm.swarm_state.plans;
     let swarm_coordinators = &swarm.swarm_state.coordinators;
-    let event_history = &swarm.event_history;
-    let event_counter = &swarm.event_counter;
-    let swarm_event_tx = &swarm.swarm_event_tx;
+    let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
     let swarm_mutation_runtime = &swarm.swarm_mutation_runtime;
     let swarm_id = match require_coordinator_swarm(
         id,
@@ -534,9 +530,7 @@ pub(super) async fn handle_comm_reject_plan(
     let swarm_members = &swarm.swarm_state.members;
     let shared_context = &swarm.shared_context;
     let swarm_coordinators = &swarm.swarm_state.coordinators;
-    let event_history = &swarm.event_history;
-    let event_counter = &swarm.event_counter;
-    let swarm_event_tx = &swarm.swarm_event_tx;
+    let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
     let swarm_mutation_runtime = &swarm.swarm_mutation_runtime;
     let swarm_id = match require_coordinator_swarm(
         id,

@@ -479,9 +479,7 @@ async fn register_visible_spawned_member(
 ) {
     let swarm_members = &swarm.swarm_state.members;
     let swarms_by_id = &swarm.swarm_state.swarms_by_id;
-    let event_history = &swarm.event_history;
-    let event_counter = &swarm.event_counter;
-    let swarm_event_tx = &swarm.swarm_event_tx;
+    let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
     let (event_tx, _event_rx) = mpsc::unbounded_channel();
     let now = Instant::now();
     let friendly_name = crate::id::extract_session_name(session_id)
@@ -587,9 +585,7 @@ pub(super) async fn spawn_swarm_agent(
     let swarms_by_id = &swarm.swarm_state.swarms_by_id;
     let swarm_coordinators = &swarm.swarm_state.coordinators;
     let swarm_plans = &swarm.swarm_state.plans;
-    let event_history = &swarm.event_history;
-    let event_counter = &swarm.event_counter;
-    let swarm_event_tx = &swarm.swarm_event_tx;
+    let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
     let resolved_working_dir =
         resolve_spawn_working_dir(working_dir, req_session_id, sessions, swarm).await;
     let coordinator = resolve_coordinator_spawn_identity(req_session_id, sessions).await;
