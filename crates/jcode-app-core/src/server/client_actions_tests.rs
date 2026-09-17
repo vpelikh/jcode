@@ -1755,14 +1755,27 @@ async fn real_socket_set_handoff_resume_round_trips_done_and_error() -> Result<(
     let sock_dir = tempfile::tempdir().expect("temp sock dir");
     let socket_path = sock_dir.path().join("jcode-e2e.sock");
 
-    struct Restore;
+    struct Restore {
+        prev: [(&'static str, Option<std::ffi::OsString>); 2],
+    }
     impl Drop for Restore {
         fn drop(&mut self) {
-            crate::env::remove_var("JCODE_HOME");
-            crate::env::remove_var("JCODE_SOCKET");
+            for (key, prev) in &self.prev {
+                match prev {
+                    Some(v) => crate::env::set_var(key, v.clone()),
+                    None => crate::env::remove_var(key),
+                }
+            }
         }
     }
-    let _restore = Restore;
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let prev_socket = std::env::var_os("JCODE_SOCKET");
+    let _restore = Restore {
+        prev: [
+            ("JCODE_HOME", prev_home),
+            ("JCODE_SOCKET", prev_socket),
+        ],
+    };
     crate::env::set_var("JCODE_HOME", home.path());
     crate::env::set_var("JCODE_SOCKET", &socket_path);
 
