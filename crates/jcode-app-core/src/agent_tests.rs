@@ -1898,6 +1898,10 @@ async fn tool_snapshot_is_stable_without_new_mcp_tools() {
 }
 
 #[test]
+#[expect(
+    clippy::assertions_on_constants,
+    reason = "keeps a regression guard on the intentionally-tuned empty-post-tool retry budget"
+)]
 fn empty_post_tool_response_gets_more_than_one_retry() {
     // Regression guard for the Claude Opus 5 benchmark incident. A provider can
     // return an empty response immediately after tool results; that is a
@@ -3582,7 +3586,7 @@ fn compaction_retry_limit_error_distinguishes_413_from_context_limit() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _guard = crate::storage::lock_test_env();
     let registry = rt.block_on(Registry::new(provider.clone()));
-    let mut agent = Agent::new(provider, registry);
+    let agent = Agent::new(provider, registry);
 
     let payload_err = "OpenAI-compatible chat request failed\n  status: 413 Payload Too Large";
     let msg = agent.compaction_retry_limit_error(payload_err);
@@ -3704,7 +3708,7 @@ async fn streaming_turn_recovers_from_413_payload_too_large_and_retries() {
         );
     }
 
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     agent
         .run_turn_streaming_mpsc(tx)
         .await
@@ -3785,11 +3789,8 @@ async fn first_user_message_injects_handoff_once() {
         .session
         .messages
         .iter()
-        .filter_map(|m| match m.role {
-            Role::User => Some(m),
-            _ => None,
-        })
-        .last()
+        .rev()
+        .find(|m| matches!(m.role, Role::User))
         .expect("a user message");
     let first_str = first_text
         .content
@@ -3817,11 +3818,8 @@ async fn first_user_message_injects_handoff_once() {
         .session
         .messages
         .iter()
-        .filter_map(|m| match m.role {
-            Role::User => Some(m),
-            _ => None,
-        })
-        .last()
+        .rev()
+        .find(|m| matches!(m.role, Role::User))
         .expect("a second user message");
     let second_str = second_text
         .content
@@ -3943,11 +3941,8 @@ async fn manual_handoff_override_injects_selected_snapshot_once() {
         .session
         .messages
         .iter()
-        .filter_map(|m| match m.role {
-            Role::User => Some(m),
-            _ => None,
-        })
-        .last()
+        .rev()
+        .find(|m| matches!(m.role, Role::User))
         .map(|m| {
             m.content
                 .iter()
@@ -3973,11 +3968,8 @@ async fn manual_handoff_override_injects_selected_snapshot_once() {
         .session
         .messages
         .iter()
-        .filter_map(|m| match m.role {
-            Role::User => Some(m),
-            _ => None,
-        })
-        .last()
+        .rev()
+        .find(|m| matches!(m.role, Role::User))
         .map(|m| {
             m.content
                 .iter()
@@ -4055,11 +4047,8 @@ async fn stale_manual_handoff_override_falls_back_to_auto_inject() {
         .session
         .messages
         .iter()
-        .filter_map(|m| match m.role {
-            Role::User => Some(m),
-            _ => None,
-        })
-        .last()
+        .rev()
+        .find(|m| matches!(m.role, Role::User))
         .map(|m| {
             m.content
                 .iter()
@@ -4085,11 +4074,8 @@ async fn stale_manual_handoff_override_falls_back_to_auto_inject() {
         .session
         .messages
         .iter()
-        .filter_map(|m| match m.role {
-            Role::User => Some(m),
-            _ => None,
-        })
-        .last()
+        .rev()
+        .find(|m| matches!(m.role, Role::User))
         .map(|m| {
             m.content
                 .iter()

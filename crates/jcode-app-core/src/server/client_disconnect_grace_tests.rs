@@ -143,31 +143,7 @@ impl Fixture {
         .unwrap();
     }
 
-    async fn wait_for_detach(&self) {
-        timeout(Duration::from_secs(1), async {
-            while self.connections.read().await.contains_key("original") {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("cleanup releases attachment registry promptly");
     }
-
-    async fn attach_successor(&self) {
-        // Reserve the same live Agent under the same registry lock order used
-        // by claim_live_target_agent, then register the real event attachment.
-        let mut connections = self.connections.write().await;
-        assert!(Arc::ptr_eq(
-            self.sessions.read().await.get(&self.id).unwrap(),
-            &self.agent
-        ));
-        connections.insert("successor".into(), connection("successor", &self.id));
-        drop(connections);
-        let (sender, _) = mpsc::unbounded_channel();
-        crate::server::register_session_event_sender(&self.members, &self.id, "successor", sender)
-            .await;
-    }
-}
 
 fn connection(name: &str, id: &str) -> ClientConnectionInfo {
     let (disconnect_tx, _) = mpsc::unbounded_channel();

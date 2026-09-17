@@ -989,8 +989,8 @@ async fn set_working_dir_updates_agent_and_fans_out_event() -> Result<()> {
     let prev_home = std::env::var_os("JCODE_HOME");
     crate::env::set_var("JCODE_HOME", temp.path());
 
-    let old_dir = tempfile::tempdir().expect("old dir").into_path();
-    let new_dir = tempfile::tempdir().expect("new dir").into_path();
+    let old_dir = tempfile::tempdir().expect("old dir").keep();
+    let new_dir = tempfile::tempdir().expect("new dir").keep();
 
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let registry = Registry::new(provider.clone()).await;
@@ -1099,7 +1099,7 @@ async fn set_working_dir_to_current_dir_is_noop() -> Result<()> {
     let prev_home = std::env::var_os("JCODE_HOME");
     crate::env::set_var("JCODE_HOME", temp.path());
 
-    let current = tempfile::tempdir().expect("dir").into_path();
+    let current = tempfile::tempdir().expect("dir").keep();
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let registry = Registry::new(provider.clone()).await;
     let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
@@ -1218,7 +1218,7 @@ async fn set_working_dir_persists_resolved_dir_for_fresh_session() -> Result<()>
     let prev_home = std::env::var_os("JCODE_HOME");
     crate::env::set_var("JCODE_HOME", temp.path());
 
-    let target = tempfile::tempdir().expect("target dir").into_path();
+    let target = tempfile::tempdir().expect("target dir").keep();
 
     // Fresh agent/session (no visible conversation yet). A /cd here must be
     // persisted to disk: the agent binds a model/provider route at creation, so

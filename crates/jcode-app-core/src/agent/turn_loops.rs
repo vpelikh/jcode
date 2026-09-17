@@ -2085,7 +2085,7 @@ mod tests {
             "a compact stall with non-ASCII text must be measured by char count"
         );
         // A genuinely long reply with multi-byte chars is still not a stall.
-        let cjk_long = format!("{}", "\u{52a9}\u{8a00}".repeat(500)); // 1000 chars
+        let cjk_long = "\u{52a9}\u{8a00}".repeat(500); // 1000 chars
         let legit = format!("Let me know if you need more. {cjk_long}");
         assert!(
             !Agent::is_stalled_promise_text(&legit),
