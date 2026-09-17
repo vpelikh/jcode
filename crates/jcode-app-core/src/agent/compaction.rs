@@ -20,6 +20,43 @@ impl Agent {
         self.cache_tracker.reset();
         self.provider_session_id = None;
         self.session.provider_session_id = None;
+        // The per-step prune shrunk existing content in the consumed prefix
+        // without changing message counts. Tell the compaction manager exactly
+        // how much content now remains so it reseeds its rolling char estimate
+        // from the already-pruned transcript instead of keeping a stale
+        // (over-counted) pre-prune figure.
+        if let Ok(mut manager) = self.registry.compaction().try_write() {
+            let provider_messages = self.session.messages_for_provider();
+            manager.note_prune_applied(&provider_messages);
+        }
+    }
+
+    /// Full-reseed the compaction manager after a one-shot manual prune (the
+    /// `/prune` command / server route). This is the heavier, user-invoked
+    /// counterpart to the cheap per-step [`Self::note_prune_applied`]: it resets
+    /// the manager and rebuilds from the already-pruned transcript, exactly like
+    /// the TUI `/prune` handler's `reseed_compaction_from_provider_messages` and
+    /// the 413 recovery path. Rebuilding (rather than the light set_exact
+    /// recompute) is correct here because a manual full prune supersedes any
+    /// in-flight background compaction. Provider/cache state is reset too, so
+    /// the next request sends the reduced payload.
+    pub(super) fn reseed_compaction_from_pruned_transcript(&mut self) {
+        let compaction = self.registry.compaction();
+        if let Ok(mut manager) = compaction.try_write() {
+            let provider_messages = self.session.messages_for_provider();
+            manager.reset();
+            manager.set_budget(self.provider.context_window());
+            if let Some(state) = self.session.compaction.as_ref() {
+                manager.restore_persisted_state_with(state, &provider_messages);
+            } else {
+                manager.seed_restored_messages_with(&provider_messages);
+            }
+            self.sync_session_compaction_state_from_manager(&manager);
+        }
+        self.cache_tracker.reset();
+        self.locked_tools = None;
+        self.provider_session_id = None;
+        self.session.provider_session_id = None;
     }
 
     pub fn poll_compaction_completion_event(&mut self) -> Option<CompactionEvent> {
@@ -121,7 +158,13 @@ impl Agent {
             )
         };
         if !report.is_empty() {
-            self.note_compaction_applied();
+            // One-shot manual prune over the whole transcript: full-reseed the
+            // compaction manager from the already-pruned transcript (not the
+            // cheap per-step recompute), so this user-invoked prune matches the
+            // TUI `/prune` handler's `reseed_compaction_from_provider_messages`
+            // and the 413 recovery path. Resetting also supersedes any in-flight
+            // background compaction and drops the pre-prune over-count.
+            self.reseed_compaction_from_pruned_transcript();
         }
         // Also retry persistence on a no-op after a previous failed save.
         self.session

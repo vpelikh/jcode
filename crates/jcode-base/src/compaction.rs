@@ -1590,6 +1590,38 @@ impl CompactionManager {
         truncated
     }
 
+    /// Notify the manager that the *scheduled per-step prune* rewrote existing
+    /// messages in the active transcript (shrinking oversized tool results /
+    /// inline images in place, without changing message counts).
+    ///
+    /// This is the counterpart to [`Self::emergency_truncate_with`] for the
+    /// per-step prune that runs before every provider request. A prune keeps
+    /// the *number* of messages unchanged but shrinks their content, so the
+    /// recompute guard in [`Self::active_message_chars_with`] (which compares
+    /// the cached mark vs the observed active-message count) never fires on its
+    /// own, and the manager would otherwise keep trusting a stale — over-counted
+    /// — char estimate and pre-prune `observed_input_tokens`. We therefore
+    /// `set_exact` the canonical estimate recomputed from the already-pruned
+    /// transcript and clear the observed-token feed. Crucially we *recompute*
+    /// rather than merely `invalidate`: later `notify_message_added_blocks`
+    /// appends an assistant turn via the trusted fast path, so a stale base
+    /// would be silently re-validated and carried forward.
+    pub fn note_prune_applied(&mut self, all_messages: &[Message]) {
+        self.observed_input_tokens = None;
+        let active_chars: usize = self
+            .active_messages(all_messages)
+            .iter()
+            .map(message_char_count)
+            .sum();
+        // `set_exact` seeds only the ACTIVE (uncompacted) suffix. If a compaction
+        // summary already exists, its characters are added separately by
+        // `token_estimate_with` (via `estimate_compaction_tokens`), so we must
+        // NOT fold the summary into this number — it would double-count. Seeding
+        // from `active_messages` respects `compacted_count`, exactly like the
+        // routine recompute guard in `active_message_chars_with`.
+        self.active_chars.set_exact(active_chars);
+    }
+
     /// Synchronously force the context back under budget without waiting for a
     /// background summary.
     ///

@@ -384,7 +384,15 @@ pub struct CompactionConfig {
 
     /// [prune] Per-tool-result UTF-8 byte cap for the deterministic prune stage.
     /// A single tool result larger than this is truncated to its head+tail.
-    /// (`PrunePolicy::node_caps` default.)
+    ///
+    /// Default 16 KiB, applied by the scheduled per-step prune and the manual
+    /// `/prune` command (via `PrunePolicy::node_caps_with`). In a real coding
+    /// session (a multi-turn Kotlin/Java task) ~20% of tool results were 4–18 KiB
+    /// source-file reads that are legitimately worth retaining whole; the cap is
+    /// set to cover those while still bounding larger dumps. The separate
+    /// emergency-truncation cap (`EMERGENCY_TOOL_RESULT_MAX_CHARS`) stays at 4 KiB
+    /// as a harder recovery bound, and `PrunePolicy::node_caps()` (used by some
+    /// unit tests and the emergency path) still reflects that 4 KiB value.
     pub prune_tool_result_max_bytes: usize,
 
     /// [prune] Per-image base64 byte cap for the deterministic prune stage.
@@ -406,7 +414,7 @@ impl Default for CompactionConfig {
             topic_shift_threshold: 0.45,
             relevance_keep_threshold: 0.65,
             goal_window_turns: 5,
-            prune_tool_result_max_bytes: 4000,
+            prune_tool_result_max_bytes: 16384,
             prune_image_max_bytes: 1024,
         }
     }

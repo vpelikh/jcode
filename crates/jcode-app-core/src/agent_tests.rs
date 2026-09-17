@@ -3830,7 +3830,7 @@ async fn manual_prune_updates_provider_view_and_is_idempotent() {
         Role::User,
         vec![ContentBlock::ToolResult {
             tool_use_id: "manual-prune-tool".into(),
-            content: "x".repeat(10_000),
+            content: "x".repeat(20_000),
             is_error: None,
         }],
     );
@@ -3853,7 +3853,7 @@ async fn manual_prune_updates_provider_view_and_is_idempotent() {
             }
         })
         .expect("tool result preserved");
-    assert!(result.len() <= 4000);
+    assert!(result.len() <= 16384);
     agent
         .session
         .rederive_all_checked()
@@ -3877,7 +3877,7 @@ async fn manual_prune_updates_provider_view_and_is_idempotent() {
         Role::User,
         vec![ContentBlock::ToolResult {
             tool_use_id: "retry".into(),
-            content: "z".repeat(10_000),
+            content: "z".repeat(20_000),
             is_error: None,
         }],
     );
@@ -3993,10 +3993,10 @@ impl Provider for OversizedToolStreamProvider {
                         name: "bash".to_string(),
                     }))
                     .await;
-                // echoes ~6000 chars so the tool result exceeds the 4000 default cap
+                // echoes ~20,000 chars so the tool result exceeds the 16 KiB default cap
                 let _ = tx
                     .send(Ok(StreamEvent::ToolInputDelta(
-                        r#"{"command":"printf 'x%.0s' {1..6000}"}"#.to_string(),
+                        r#"{"command":"printf 'x%.0s' {1..20000}"}"#.to_string(),
                     )))
                     .await;
                 let _ = tx.send(Ok(StreamEvent::ToolUseEnd)).await;
@@ -4085,7 +4085,7 @@ async fn scheduled_prune_preserves_fresh_oversized_results_at_runtime() {
         .messages
         .iter()
         .flat_map(|m| &m.content)
-        .filter(|b| matches!(b, ContentBlock::ToolResult { content, .. } if content.len() > 4000))
+        .filter(|b| matches!(b, ContentBlock::ToolResult { content, .. } if content.len() > 16384))
         .count();
     assert_eq!(
         tool_result_count, 1,
@@ -4165,7 +4165,7 @@ async fn text_only_turn_truncates_consumed_oversized_tool_result() {
         role: crate::message::Role::User,
         content: vec![ContentBlock::ToolResult {
             tool_use_id: "t1".into(),
-            content: "x".repeat(10_000),
+            content: "x".repeat(20_000),
             is_error: None,
         }],
         display_role: None, timestamp: None, tool_duration_ms: None, token_usage: None,
@@ -4179,10 +4179,334 @@ async fn text_only_turn_truncates_consumed_oversized_tool_result() {
     agent.run_once_streaming_mpsc("continue", Vec::new(), None, tx).await.unwrap();
 
     // After a text-only turn, the consumed oversized tool result must be truncated
-    // to <= 4000 bytes. If it is still 10000, the tool-result pass was wrongly
-    // gated off (it should run on the loop head, every step).
+    // to <= the default 16 KiB cap. If it is still 20000, the tool-result pass was
+    // wrongly gated off (it should run on the loop head, every step).
     let big = agent.session.messages.iter().flat_map(|m| &m.content).filter(|b| {
-        matches!(b, ContentBlock::ToolResult { content, .. } if content.len() > 4000)
+        matches!(b, ContentBlock::ToolResult { content, .. } if content.len() > 16384)
     }).count();
     assert_eq!(big, 0, "consumed oversized tool result must be truncated on a text-only turn");
+}
+
+/// Streaming provider that enables jcode summary compaction (`uses_jcode_compaction`)
+/// with a small context window so the compaction manager's token estimate drives
+/// real decisions. It ends the turn with a plain text reply (no tool calls), which
+/// keeps the assertion focused on the *accounting* effect of the scheduled prune.
+#[derive(Clone, Default)]
+struct PruneAccountingStreamProvider {
+    context: usize,
+}
+
+#[async_trait]
+impl Provider for PruneAccountingStreamProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        let (tx, rx) = tokio_mpsc::channel::<Result<StreamEvent>>(4);
+        tokio::spawn(async move {
+            let _ = tx
+                .send(Ok(StreamEvent::TextDelta("done".to_string())))
+                .await;
+            let _ = tx
+                .send(Ok(StreamEvent::MessageEnd {
+                    stop_reason: Some("end_turn".to_string()),
+                }))
+                .await;
+        });
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    fn name(&self) -> &str {
+        "prune-accounting"
+    }
+
+    fn supports_compaction(&self) -> bool {
+        true
+    }
+
+    fn uses_jcode_compaction(&self) -> bool {
+        true
+    }
+
+    fn context_window(&self) -> usize {
+        self.context
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+}
+
+/// Drives a LARGE transcript through the REAL streaming loop with BOTH a consumed
+/// oversized tool result AND a consumed oversized image in the preview prefix, then
+/// asserts the scheduled per-step prune (a) actually shrinks both nodes and (b) — the
+/// token-accounting focus — leaves the compaction manager's estimate reseeded from the
+/// already-pruned transcript rather than trusting a stale (over-counted) pre-prune
+/// figure. This is what makes a subsequent auto-compaction decide using the pruned
+/// sizes: its context-usage gate reads exactly this estimate.
+#[tokio::test]
+async fn scheduled_prune_keeps_compaction_token_accounting_consistent_with_both_oversized_nodes() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(PruneAccountingStreamProvider { context: 20_000 });
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // Seed a CONSUMED prefix (everything before the last assistant gets pruned)
+    // containing BOTH an oversized tool result and an oversized inline image.
+    // Adding via `agent.add_message` keeps the manager's message bookkeeping in
+    // lockstep with the session, so `total_turns` matches the message count and
+    // the only thing that can mark `active_chars` stale is the prune itself.
+    agent.add_message(
+        Role::User,
+        vec![ContentBlock::ToolResult {
+            tool_use_id: "big_tool".into(),
+            content: "y".repeat(50_000),
+            is_error: None,
+        }],
+    );
+    agent.add_message(
+        Role::User,
+        vec![ContentBlock::Image {
+            media_type: "image/png".into(),
+            data: "a".repeat(10_000),
+        }],
+    );
+    // An assistant ack makes the tool result + image CONSUMED (they sit before
+    // the last assistant message) so the scheduled prune is allowed to shrink them.
+    agent.add_message(
+        Role::Assistant,
+        vec![ContentBlock::Text {
+            text: "ack".into(),
+            cache_control: None,
+        }],
+    );
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent
+        .run_once_streaming_mpsc("continue", Vec::new(), None, tx)
+        .await
+        .expect("streaming turn should complete");
+
+    let mut text = String::new();
+    while let Ok(event) = rx.try_recv() {
+        if let ServerEvent::TextDelta { text: d } = event {
+            text.push_str(&d);
+        }
+    }
+    assert!(text.contains("done"), "turn must finish, got {text:?}");
+
+    // (1) Both consumed oversized nodes must have been pruned in place.
+    let oversized_tool_results = agent
+        .session
+        .messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter(|b| matches!(b, ContentBlock::ToolResult { content, .. } if content.len() > 16384))
+        .count();
+    assert_eq!(
+        oversized_tool_results, 0,
+        "consumed oversized tool result must be truncated to <= the 16 KiB cap"
+    );
+    let image_marker = agent
+        .session
+        .messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .any(|b| matches!(b, ContentBlock::Text { text, .. } if text.contains("Image omitted during context pruning")));
+    assert!(
+        image_marker,
+        "consumed oversized image must be replaced with the prune marker"
+    );
+
+    // (2) The compaction manager's token accounting must now reflect the pruned
+    // (small) content, NOT a stale pre-prune over-count. The scheduled prune shrinks
+    // content in place without changing the message count, so the count-guard in
+    // `active_message_chars_with` would NOT recompute on its own — the manager must
+    // have been told (via `note_prune_applied`) to invalidate its rolling estimate.
+    let budget = agent.registry.compaction().read().await.token_budget();
+    let provider_messages = agent.provider_messages();
+    let pruned_chars: usize = provider_messages
+        .iter()
+        .map(crate::compaction::message_char_count)
+        .sum();
+    let expected = crate::compaction::estimate_compaction_tokens(None, pruned_chars, budget);
+    let estimate = agent
+        .registry
+        .compaction()
+        .read()
+        .await
+        .token_estimate_with(&provider_messages);
+
+    assert!(
+        pruned_chars < 20_000,
+        "expected the pruned transcript to be small, got {pruned_chars} chars"
+    );
+    assert_eq!(
+        estimate, expected,
+        "manager token estimate must be reseeded from the pruned transcript (expected {expected} from {pruned_chars} chars), got {estimate}"
+    );
+    assert!(
+        estimate < 5_000,
+        "auto-compaction must see the small pruned size, got {estimate} tokens"
+    );
+}
+
+/// The manual `/prune` command (server route) must reseed the compaction
+/// manager's rolling token estimate from the already-pruned transcript, exactly
+/// like the scheduled per-step prune. Regression for a stale-over-count: before
+/// this fix `request_manual_prune` called only `note_compaction_applied()`, which
+/// resets provider/cache/tool state but not the manager's `active_chars`, so a
+/// subsequent auto-compaction gate could read a pre-prune over-count. The TUI
+/// `/prune` handler already reseeds via `reseed_compaction_from_provider_messages`;
+/// this assertion keeps the server route consistent with it.
+#[tokio::test]
+async fn manual_prune_reseeds_compaction_token_accounting_from_pruned_transcript() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(PruneAccountingStreamProvider { context: 20_000 });
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    agent.add_message(
+        Role::User,
+        vec![ContentBlock::ToolResult {
+            tool_use_id: "manual_big".into(),
+            content: "z".repeat(50_000),
+            is_error: None,
+        }],
+    );
+
+    // Prime the manager over-count: it consumed the oversized result and now
+    // trusts a large rolling char estimate.
+    agent.provider_messages();
+    let budget = agent.registry.compaction().read().await.token_budget();
+    let pre_estimate = agent
+        .registry
+        .compaction()
+        .read()
+        .await
+        .token_estimate_with(&agent.provider_messages());
+    assert!(
+        pre_estimate > 10_000,
+        "without the prune the manager should be over-counting, got {pre_estimate}"
+    );
+
+    let (report, _message) = agent.request_manual_prune().expect("manual prune persists");
+    assert_eq!(report.tool_results_truncated, 1);
+
+    // After pruning, the manager's estimate must reflect the small (pruned)
+    // content, NOT the stale pre-prune over-count.
+    let provider_messages = agent.provider_messages();
+    let pruned_chars: usize = provider_messages
+        .iter()
+        .map(crate::compaction::message_char_count)
+        .sum();
+    let expected = crate::compaction::estimate_compaction_tokens(None, pruned_chars, budget);
+    let estimate = agent
+        .registry
+        .compaction()
+        .read()
+        .await
+        .token_estimate_with(&provider_messages);
+    assert_eq!(
+        estimate, expected,
+        "manual prune must reseed the estimate from pruned content (expected {expected}), got {estimate}"
+    );
+    assert!(
+        estimate < 2_000,
+        "auto-compaction must see the small pruned size after manual prune, got {estimate}"
+    );
+}
+
+/// The manual `/prune` full-reseed must also handle a pre-existing compaction
+/// summary correctly (the `restore_persisted_state_with` branch of
+/// `reseed_compaction_from_pruned_transcript`). It should reseed to
+/// `summary_chars + active (pruned) chars` — NOT double-count the summary and
+/// NOT keep a stale pre-prune over-count on the active suffix.
+#[tokio::test]
+async fn manual_prune_reseeds_with_existing_compaction_summary() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(PruneAccountingStreamProvider { context: 20_000 });
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // A short consumed prefix that will be summarized.
+    agent.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "old 1".into(),
+            cache_control: None,
+        }],
+    );
+    agent.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "old 2".into(),
+            cache_control: None,
+        }],
+    );
+    // An oversized tool result in the ACTIVE (uncompacted) suffix.
+    agent.add_message(
+        Role::User,
+        vec![ContentBlock::ToolResult {
+            tool_use_id: "summary_big".into(),
+            content: "z".repeat(50_000),
+            is_error: None,
+        }],
+    );
+
+    // Apply a native compaction over the first 2 messages so `session.compaction`
+    // is populated; the oversized tool result remains active (uncompacted).
+    agent
+        .apply_openai_native_compaction("enc_summary".to_string(), 2)
+        .unwrap();
+
+    let (_report, _msg) = agent.request_manual_prune().expect("manual prune persists");
+
+    // The summary must survive the manual-prune full-reseed.
+    let comp = agent.registry.compaction();
+    let manager = comp.read().await;
+    let summary_chars = manager.summary_chars();
+    assert!(
+        summary_chars > 0,
+        "existing compression summary must be preserved after manual prune (summary_chars={summary_chars})"
+    );
+
+    // The estimate must be summary + active (pruned) chars. Use the manager's own
+    // token_estimate_with (which folds the summary in), and separately confirm the
+    // active suffix is small after the prune by comparing against an estimate built
+    // from the live provider messages' pruned char count.
+    let provider_messages = agent.provider_messages();
+    let estimate = manager.token_estimate_with(&provider_messages);
+
+    // Build the expected figure the same way the manager would if it recomputed:
+    // (budget-adjusted) summary + active chars, where active = messages beyond the
+    // compacted prefix (index 2), all already pruned. Budget (20k) < DEFAULT_TOKEN_BUDGET/2
+    // so SYSTEM_OVERHEAD_TOKENS is 0 and the estimate is just chars / CHARS_PER_TOKEN.
+    let active_chars: usize = provider_messages
+        .iter()
+        .skip(2)
+        .map(crate::compaction::message_char_count)
+        .sum();
+    let expected_active_tokens =
+        (summary_chars + active_chars) / crate::compaction::CHARS_PER_TOKEN;
+    // token_estimate_with returns estimate_compaction_tokens(summary, active_chars),
+    // which equals budget-adjusted(summary_chars + active_chars) — the same as above.
+    assert_eq!(
+        estimate, expected_active_tokens,
+        "manual prune with existing summary must yield summary+active-pruned (got {estimate}, expected {expected_active_tokens})"
+    );
+    // Active suffix must be small (pruned): the 50k tool result was truncated to <=16k.
+    assert!(
+        active_chars <= 16_384,
+        "active tool result must be pruned to <= the 16 KiB cap, got {active_chars} chars"
+    );
+    // Sanity: overall estimate is small (summary is tiny + active is pruned), far
+    // below a stale over-count of ~50k chars (~12.5k tokens).
+    assert!(
+        estimate < 3_000,
+        "manual-prune-with-summary estimate must be small, got {estimate}"
+    );
 }

@@ -1105,3 +1105,154 @@ fn test_recover_within_budget_summary_line_variants() {
     assert!(line.contains("shortened 5 large tool result(s)"));
     assert!(!line.contains("dropped"));
 }
+
+/// The scheduled per-step prune shrinks existing content without changing the
+/// message count, and the manager then appends an assistant turn through the
+/// trusted `append_exact` fast path. This test locks the subtle ordering that
+/// the app-core integration test surfaced: `note_prune_applied` must *recompute*
+/// the active-char estimate from the already-pruned transcript (`set_exact`),
+/// not merely `invalidate` it. If it only invalidated, the next
+/// `notify_message_added_blocks` would trust the stale pre-prune base and carry
+/// the over-count forward, keeping auto-compaction gated on the wrong size.
+#[test]
+fn note_prune_applied_reseeds_from_pruned_transcript_before_append() {
+    let tool_result_len = 50_000;
+    let image_payload_len = 10_000;
+
+    let mut messages = vec![
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "big".into(),
+                content: "y".repeat(tool_result_len),
+                is_error: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "a".repeat(image_payload_len),
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+    ];
+
+    let mut manager = CompactionManager::new().with_budget(20_000);
+    for message in &messages {
+        manager.notify_message_added_blocks(&message.content);
+    }
+
+    // Prune in place (simulating the scheduled per-step prune): the tool result
+    // drops to the 4000-char cap and the image becomes a short text marker.
+    let policy = crate::compaction::prune::PrunePolicy::node_caps();
+    let mut contents: Vec<&mut Vec<ContentBlock>> =
+        messages.iter_mut().map(|m| &mut m.content).collect();
+    crate::compaction::prune::prune_contents(&mut contents, &policy);
+    drop(contents);
+
+    // The manager must reseed from the pruned content.
+    manager.note_prune_applied(&messages);
+    let after_prune = manager.token_estimate_with(&messages);
+    assert!(
+        after_prune < 2_000,
+        "estimate must reflect the pruned (small) content, got {after_prune}"
+    );
+
+    // Now append an assistant turn through the trusted fast path. With a
+    // recompute-based `set_exact` base, this appends onto the small pruned size
+    // and stays small; a buggy invalidate-only base would carry the ~12.5k-token
+    // stale figure forward here.
+    let assistant = make_text_message(Role::Assistant, "ack");
+    let pre_append = manager.token_estimate_with(&messages);
+    manager.notify_message_added_blocks(&assistant.content);
+    messages.push(assistant);
+    let post_append = manager.token_estimate_with(&messages);
+    assert!(
+        post_append < 2_000,
+        "append must carry the small pruned base forward, got {post_append}"
+    );
+    assert!(
+        post_append >= pre_append,
+        "append must only add the small assistant turn, pre={pre_append} post={post_append}"
+    );
+}
+
+/// Edge case: `note_prune_applied` must NOT double-count a pre-existing
+/// compaction summary. It seeds only the ACTIVE (uncompacted) suffix; the
+/// summary's own characters are added separately by `token_estimate_with`
+/// through `estimate_compaction_tokens`. This mirrors how the routine recompute
+/// guard in `active_message_chars_with` treats a summary, and keeps the
+/// per-step prune consistent with the TUI `/prune` reseed
+/// (which folds the summary in via `restore_persisted_state_with`).
+#[test]
+fn note_prune_applied_respects_existing_compaction_summary() {
+    // 3 active messages, 2 of them compacted into a summary, 1 kept active.
+    let mut messages = vec![
+        make_text_message(Role::User, "old 1"),
+        make_text_message(Role::User, "old 2"),
+        // An oversized TOOL RESULT in the active suffix — the node type the
+        // prune actually shrinks (it only rewrites ToolResult / Image blocks).
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "active_big".into(),
+                content: "z".repeat(50_000),
+                is_error: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+    ];
+    let mut manager = CompactionManager::new().with_budget(20_000);
+    for m in &messages {
+        manager.notify_message_added_blocks(&m.content);
+    }
+    manager.compacted_count = 2;
+    manager.active_summary = Some(Summary {
+        text: "a summary of old turns".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 2,
+        original_turn_count: 2,
+    });
+
+    // Prune the active oversized tool-result-ish content in place.
+    let policy = crate::compaction::prune::PrunePolicy::node_caps();
+    let mut contents: Vec<&mut Vec<ContentBlock>> =
+        messages.iter_mut().map(|m| &mut m.content).collect();
+    crate::compaction::prune::prune_contents(&mut contents, &policy);
+    drop(contents);
+
+    manager.note_prune_applied(&messages);
+
+    // The estimate must be summary_chars + active_pruned_chars, NOT double the
+    // pruned content or the stale pre-prune over-count.
+    let summary_chars: usize =
+        crate::compaction::summary_payload_char_count(manager.active_summary.as_ref().unwrap());
+    let active_chars: usize = manager
+        .active_messages(&messages)
+        .iter()
+        .map(message_char_count)
+        .sum();
+    let expected = crate::compaction::estimate_compaction_tokens(
+        manager.active_summary.as_ref(),
+        active_chars,
+        manager.token_budget(),
+    );
+    let actual = manager.token_estimate_with(&messages);
+    assert_eq!(
+        actual, expected,
+        "estimate must be summary+active-pruned (summary {summary_chars} chars), got {actual}"
+    );
+    assert!(
+        actual < 2_500,
+        "active suffix must be small after prune, got {actual}"
+    );
+    assert!(
+        actual > summary_chars / crate::compaction::CHARS_PER_TOKEN,
+        "estimate must still include the existing summary, got {actual}"
+    );
+}
