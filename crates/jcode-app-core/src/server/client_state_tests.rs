@@ -1,3 +1,4 @@
+#![expect(clippy::await_holding_lock, reason = "tests intentionally hold locks across awaits")]
 use super::handle_get_history;
 use super::handle_get_model_catalog;
 use super::session_activity_snapshot;

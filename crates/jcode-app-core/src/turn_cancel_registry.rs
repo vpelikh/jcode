@@ -154,6 +154,7 @@ impl Drop for ActiveTurnGuard {
 }
 
 #[cfg(test)]
+#[expect(clippy::items_after_test_module, reason = "test module sits before shared test helpers")]
 mod tests {
     use super::*;
 

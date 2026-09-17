@@ -2788,7 +2788,7 @@ async fn batch_grep_alias_subcall_is_redirected_and_raw_fallback_runs() {
     assert!(
         redirected.output.to_string().contains("compass_query"),
         "a batch grep-alias subcall should be redirected, got: {}",
-        redirected.output.to_string()
+        redirected.output
     );
 
     // A genuine compass_query attempt (even an errored one on a non-git temp
@@ -2864,7 +2864,7 @@ async fn batch_grep_alias_raw_fallback_is_blocked_while_redirect_pending() {
     assert!(
         redirect.output.to_string().contains("compass_query"),
         "batch grep-alias subcall should be redirected, got: {}",
-        redirect.output.to_string()
+        redirect.output
     );
     assert!(
         compass_enforcement::redirect_pending("enforcement-batch-block-test"),

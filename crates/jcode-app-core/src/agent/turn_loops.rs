@@ -1416,7 +1416,7 @@ mod tests {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
-                tool_use_id: id.clone().into(),
+                tool_use_id: id.into(),
                 content: content.to_string(),
                 is_error: None,
             }],

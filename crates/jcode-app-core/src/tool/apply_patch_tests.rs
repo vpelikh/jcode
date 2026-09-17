@@ -1,3 +1,4 @@
+#![expect(clippy::await_holding_lock, reason = "tests intentionally hold locks across awaits")]
 use super::*;
 use std::io::Write;
 use tempfile::NamedTempFile;

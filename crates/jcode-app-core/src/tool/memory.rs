@@ -459,6 +459,8 @@ fn truncate_for_widget(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::await_holding_lock, reason = "tests intentionally hold locks across awaits")]
+
     use super::*;
 
     #[test]
