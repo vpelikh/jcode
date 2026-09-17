@@ -983,30 +983,30 @@ async fn degradation_mitigation_triggers_compaction_once_on_compact_rung() {
 
 #[tokio::test]
 async fn degradation_route_fallback_gating_escalates_or_switches() {
-    // Consolidated gating test. Both the disabled and enabled paths depend on
-    // the process-global crate::config::config(), which is shared across tests,
-    // so they must run sequentially in one test that writes the config before
-    // each scenario (a parallel split would race on the global config).
-    let prev_home = std::env::var_os("JCODE_HOME");
-    let temp_home = tempfile::Builder::new()
-        .prefix("jcode-degrad-fallback-")
-        .tempdir()
-        .expect("temp home");
-    let config_path = temp_home.path().join("config.toml");
-    crate::env::set_var("JCODE_HOME", temp_home.path());
+    // Consolidated gating test. The disabled and enabled paths both depend on
+    // crate::config::config(). We control them via the DEDICATED degradation
+    // env vars (JCODE_DEGRADATION_ROUTE_FALLBACK / JCODE_DEGRADATION_FALLBACK_MODEL),
+    // which apply_env_overrides applies on every config load and which no other
+    // test sets. Unlike writing config.toml + JCODE_HOME (shared across parallel
+    // config tests), env-var control is deterministic even when another test
+    // concurrently rewrites JCODE_HOME, because the env override wins over the
+    // config file. The scenarios run sequentially so the env is re-set before
+    // each.
+    let prev_enabled = std::env::var_os("JCODE_DEGRADATION_ROUTE_FALLBACK");
+    let prev_model = std::env::var_os("JCODE_DEGRADATION_FALLBACK_MODEL");
 
-    let set_fallback_config = |enabled: bool, model: Option<&str>| {
-        let mut cfg = format!("[degradation]\nroute_fallback_enabled = {}\n", enabled);
-        if let Some(model) = model {
-            cfg.push_str(&format!("fallback_model = \"{model}\"\n"));
+    let set_fallback = |enabled: bool, model: Option<&str>| {
+        crate::env::set_var("JCODE_DEGRADATION_ROUTE_FALLBACK", if enabled { "1" } else { "0" });
+        match model {
+            Some(model) => crate::env::set_var("JCODE_DEGRADATION_FALLBACK_MODEL", model),
+            None => crate::env::remove_var("JCODE_DEGRADATION_FALLBACK_MODEL"),
         }
-        std::fs::write(&config_path, cfg).expect("write config");
         crate::config::Config::invalidate_cache();
     };
 
     // Scenario A: disabled (explicit). Reaching RouteFallback must escalate and
     // NOT switch the model.
-    set_fallback_config(false, None);
+    set_fallback(false, None);
     let disabled_provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
     let mut disabled_agent = Agent::new(
         Arc::clone(&disabled_provider),
@@ -1040,7 +1040,7 @@ async fn degradation_route_fallback_gating_escalates_or_switches() {
 
     // Scenario B: enabled with a fallback model. Reaching RouteFallback
     // switches the provider onto the fallback and resets the cycle.
-    set_fallback_config(true, Some("deepseek/deepseek-v3@deepseek"));
+    set_fallback(true, Some("deepseek/deepseek-v3@deepseek"));
     let enabled_provider = Arc::new(ExplicitPinProvider::new("deepseek/deepseek-v4-flash@deepseek"));
     let enabled_provider_dyn: Arc<dyn Provider> = enabled_provider.clone();
     let mut enabled_agent = Agent::new(
@@ -1087,7 +1087,7 @@ async fn degradation_route_fallback_gating_escalates_or_switches() {
     // disabled. Reaching the Compact rung must NOT silently spin; it escalates
     // promptly to the decision point, which with fallback disabled surfaces to
     // the user (Escalated) rather than stalling at Compact forever.
-    set_fallback_config(false, None);
+    set_fallback(false, None);
     let no_compact_provider: Arc<dyn Provider> =
         Arc::new(ExplicitPinProvider::new("some-model"));
     let mut no_compact_agent = Agent::new(
@@ -1114,11 +1114,14 @@ async fn degradation_route_fallback_gating_escalates_or_switches() {
         "unsupported compaction + disabled fallback must escalate to the user"
     );
 
-    // Restore the environment.
-    if let Some(previous) = prev_home {
-        crate::env::set_var("JCODE_HOME", previous);
-    } else {
-        crate::env::remove_var("JCODE_HOME");
+    // Restore the process env so we do not leak these overrides into other tests.
+    match prev_enabled {
+        Some(v) => crate::env::set_var("JCODE_DEGRADATION_ROUTE_FALLBACK", v),
+        None => crate::env::remove_var("JCODE_DEGRADATION_ROUTE_FALLBACK"),
+    }
+    match prev_model {
+        Some(v) => crate::env::set_var("JCODE_DEGRADATION_FALLBACK_MODEL", v),
+        None => crate::env::remove_var("JCODE_DEGRADATION_FALLBACK_MODEL"),
     }
     crate::config::Config::invalidate_cache();
 }
