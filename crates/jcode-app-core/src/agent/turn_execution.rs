@@ -759,6 +759,10 @@ impl Agent {
                 ));
             } else {
                 self.reconcile_explicit_provider_pin_route();
+                // The model/route was (re)applied on this freshly-assigned
+                // session; reset the degradation cycle so the restored route
+                // does not inherit any prior history for this Agent.
+                self.degradation.reset();
             }
         } else {
             self.session.model = Some(self.provider_model());
