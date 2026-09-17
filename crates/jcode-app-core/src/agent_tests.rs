@@ -787,6 +787,151 @@ async fn messages_for_provider_applies_manual_compaction_in_native_auto_mode() {
 
 // ── InterruptSignal tests ────────────────────────────────────────────────
 
+/// With `[compaction] physically_consolidate = true`, a completed manual (soft)
+/// compaction must PHYSICALLY consolidate the transcript through the
+/// log-bracketed seam (deepseek-harness takeaway #5): `session.messages`
+/// becomes `[summary_message, recent_tail...]`, the persisted compaction state
+/// is flagged `physically_consolidated`, and the compaction manager is marked
+/// physically consolidated so the next provider view is NOT double-summarized.
+#[tokio::test]
+async fn manual_compaction_physically_consolidates_transcript_when_enabled() {
+    let _guard = crate::storage::lock_test_env();
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-phys-compact-")
+        .tempdir()
+        .expect("temp home");
+    std::fs::write(
+        temp_home.path().join("config.toml"),
+        "[compaction]\nphysically_consolidate = true\n",
+    )
+    .expect("write config");
+    crate::env::set_var("JCODE_HOME", temp_home.path());
+    crate::config::Config::invalidate_cache();
+
+    let provider: Arc<dyn Provider> = Arc::new(PruneAccountingStreamProvider { context: 20_000 });
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // Drive the transcript well past the compaction threshold so the manager
+    // will actually compact on request.
+    for i in 0..40 {
+        agent.add_message(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: format!("turn {i} {}", "x".repeat(400)),
+                cache_control: None,
+            }],
+        );
+    }
+
+    let (started, ok) = agent.request_manual_compaction();
+    assert!(ok, "manual compaction should start: {started}");
+
+    // Poll for the compaction completion event.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut seen = false;
+    while std::time::Instant::now() < deadline {
+        let (_, maybe_event) = agent.messages_for_provider();
+        if maybe_event.is_some() {
+            seen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(seen, "manual compaction event should have been applied");
+
+    let comp = agent
+        .session
+        .compaction
+        .as_ref()
+        .expect("compaction state must be set");
+    assert!(
+        comp.physically_consolidated,
+        "compaction state must be physically consolidated"
+    );
+
+    // The session transcript must now physically hold [summary, recent_tail...],
+    // NOT the full 40-message transcript.
+    assert!(
+        agent.session.messages.len() < 40,
+        "transcript must be physically consolidated (summary + tail), got {} messages",
+        agent.session.messages.len()
+    );
+    let first = &agent.session.messages[0];
+    let is_summary = first.content.iter().any(|b| match b {
+        ContentBlock::Text { text, .. } => text.contains("Previous Conversation Summary"),
+        _ => false,
+    });
+    assert!(
+        is_summary,
+        "transcript[0] must be the physically-carried summary message"
+    );
+
+    // The log must hold a balanced bracket (each CompactionStart matched by a
+    // CompactionEnd), which is what replay uses.
+    let log = agent.session.event_log();
+    let starts = log
+        .iter()
+        .filter(|e| matches!(&e.op, crate::session::SessionEventOp::CompactionStart { .. }))
+        .count();
+    let ends = log
+        .iter()
+        .filter(|e| matches!(&e.op, crate::session::SessionEventOp::CompactionEnd { .. }))
+        .count();
+    assert_eq!(
+        starts, ends,
+        "bracket must be balanced (starts={starts}, ends={ends})"
+    );
+    assert!(
+        starts >= 1,
+        "physical consolidation must have recorded a CompactionStart bracket"
+    );
+    agent
+        .session
+        .rederive_all_checked()
+        .expect("physically consolidated session must be internally consistent");
+
+    // The compaction manager must be marked physically consolidated so a
+    // subsequent provider rebuild does not double-prepend the summary.
+    let compaction_registry = agent.registry.compaction();
+    let manager = compaction_registry.read().await;
+    assert!(
+        manager.is_physically_consolidated(),
+        "compaction manager must be marked physically consolidated"
+    );
+    assert_eq!(
+        manager.compacted_count(),
+        0,
+        "physical manager must have zero live skip offset"
+    );
+    drop(manager);
+
+    // A provider view derived after consolidation must NOT carry a duplicate
+    // synthetic "Previous Conversation Summary" prefix beyond the physical one.
+    let view = agent.provider_messages();
+    let summary_blocks = view
+        .iter()
+        .filter(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text, .. } if text.contains("Previous Conversation Summary")))
+        })
+        .count();
+    assert_eq!(
+        summary_blocks, 1,
+        "exactly one summary message must be present in the provider view"
+    );
+
+    // Restore the previous JCODE_HOME and config cache.
+    if let Some(previous) = prev_home {
+        crate::env::set_var("JCODE_HOME", previous);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    crate::config::Config::invalidate_cache();
+}
+
 #[tokio::test]
 async fn interrupt_signal_fire_before_notified_does_not_hang() {
     // Regression test: fire() called BEFORE notified().await must not hang.

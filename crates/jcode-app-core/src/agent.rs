@@ -830,6 +830,7 @@ impl Agent {
                     };
                     let event = manager.take_compaction_event();
                     if event.is_some() || discarded_oversized_native {
+                        self.physically_consolidate_if_enabled(&mut manager);
                         self.sync_session_compaction_state_from_manager(&manager);
                     }
                     if event.is_some() {
