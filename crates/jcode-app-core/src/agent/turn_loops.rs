@@ -1114,7 +1114,6 @@ impl Agent {
                     safe_calls.push((tc, ctx));
                 } else {
                     self.flush_concurrency_safe(std::mem::take(&mut safe_calls), assistant_message_id.as_deref()).await;
-                    tool_results_dirty = true;
                     self.execute_tool_locally(tc, ctx, print_output, trace, assistant_message_id.as_deref())
                         .await;
                     tool_results_dirty = true;
@@ -1288,6 +1287,10 @@ impl Agent {
     /// Running event, telemetry, and tool unlock are handled by the caller
     /// (`flush_concurrency_safe`) so they run once per call rather than once per
     /// batch.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "committing a tool result carries the call, context, output, and per-call print/trace/telemetry flags shared by sequential and parallel paths"
+    )]
     fn commit_tool_result(
         &mut self,
         tc: ToolCall,

@@ -474,7 +474,7 @@ impl TelegramChannel {
                 ""
             };
             rows.push(vec![InlineKeyboardButton {
-                text: picker_button_label(&prefix, &title, &short),
+                text: picker_button_label(prefix, &title, &short),
                 callback_data: s.session_id.clone(),
             }]);
         }
@@ -875,7 +875,7 @@ impl TelegramChannel {
                 ""
             };
             rows.push(vec![InlineKeyboardButton {
-                text: picker_button_label(&prefix, &title, &short),
+                text: picker_button_label(prefix, &title, &short),
                 callback_data: s.session_id.clone(),
             }]);
         }

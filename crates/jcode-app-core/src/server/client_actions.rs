@@ -645,7 +645,7 @@ pub(super) async fn handle_set_working_dir(
                 session_id: session_id.clone(),
                 working_dir: resolved.clone(),
             };
-            let mut delivered =
+            let delivered =
                 fanout_session_event(swarm_members, &session_id, event.clone()).await;
             if delivered == 0 {
                 let _ = client_event_tx.send(event);

@@ -7,13 +7,12 @@ use super::{
 use crate::agent::Agent;
 use anyhow::Result;
 use jcode_agent_runtime::InterruptSignal;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, mpsc};
 
 type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
-type ChannelSubscriptions = Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
 
 const RELOAD_DISCONNECT_MARKER_MAX_AGE: Duration = Duration::from_secs(30);
 pub(super) const IDLE_RECONNECT_GRACE: Duration = Duration::from_secs(30);
