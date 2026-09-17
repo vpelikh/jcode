@@ -228,6 +228,13 @@ Turning the flag on makes the transcript the single source of truth: replay repr
 
 **What this gives us.** The classic stuck-loop failure mode: model calls `bash("git status")` 15 times, token count explodes, user has to kill the session. `jcode-command-risk` catches the `rm -rf ~` variant by blast radius, but it doesn't catch the 15th identical `git status`. The repeat-tool reminder catches that: after N identical calls, it injects "Please change your approach or finish this step." That's it. No LLM call, no API cost, no latency. For the timeout guard: without it, a stuck tool call (not hang — just slow) blocks the whole session until it returns or the user Ctrl-C's. A per-call timeout gives the model a clean `Error: timed out after 30s` message so it can retry with a smaller scope rather than having to figure out what went wrong from a dead stream.
 
+**Current status (2026-09-17).** The repeat-tool reminder is implemented and wired into both live turn loops:
+- `crates/jcode-app-core/src/agent/guard.rs` implements a model-free detector (`repeat_reminder_from_transcript`) with a canonical, order-insensitive tool-signature comparison (nested JSON keys sorted), a `REPEAT_TOOL_THRESHOLD = 4` consecutive-identical rule, and a short `[Guard]` user-role nudge. Interleaved prose does not reset the run.
+- It is wired at the "all tools done, before next API call" seam in the streaming loop (`turn_streaming_mpsc.rs`, injection point D) and in the headless loop (`turn_loops.rs`), each injecting the reminder as a `Role::User` message.
+- Detector unit tests cover sub-threshold silence, exact-threshold firing, and nested-key canonicalization. A new end-to-end integration test (`streaming_turn_injects_repeat_tool_reminder_when_model_loops`) drives a real streaming turn with a provider that repeats the identical `bash` call `REPEAT_TOOL_THRESHOLD` times and asserts the guard injects exactly one `[Guard]` reminder naming the repeated tool and count, without ending the turn — proving the weld, not just the detector.
+
+The per-call timeout half is satisfied per-tool for the tools that need it (e.g. `bash` takes a `timeout` param and promotes to a background task; `agentgrep` has a foreground budget). A *generic* wrapper around `registry.execute` was deliberately not added as a default: many tools are legitimately long-running (interactive `ambient`, background `bash`), so an unconditional watchdog would break them; per-tool declared timeouts remain the safe surface.
+
 ## 8. Sandbox fail-closed, with a strictly-wider escalation ladder
 
 - **dsh:** `ctx.sandbox` confines same-world subprocesses to a file-effect policy:
