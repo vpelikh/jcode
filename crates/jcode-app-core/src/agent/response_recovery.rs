@@ -911,6 +911,9 @@ impl Agent {
                 "Assistant stalled behind action-promise filler after {} continuation attempts; surfacing partial output",
                 attempts
             ));
+            // Reached the per-turn continuation budget: record the degradation
+            // so the route-scoped tracker can escalate (compact / fallback).
+            self.degradation.record_stall(crate::agent::degradation::StallKind::StalledPromise);
             return Ok(false);
         }
         *attempts += 1;

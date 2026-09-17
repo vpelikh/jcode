@@ -1,6 +1,7 @@
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
 
 mod compaction;
+mod degradation;
 mod environment;
 mod guard;
 mod inline_tail;
@@ -259,6 +260,10 @@ pub struct Agent {
     stdin_request_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::tool::StdinInputRequest>>,
     /// Canonical reducer-backed view of runtime provider/model selection.
     provider_runtime_state: ProviderRuntimeState,
+    /// Route-scoped degradation tracker for the model-degradation management
+    /// plan. Totalizes stall-family turn events and recommends an escalating
+    /// mitigation rung (watch → compact → route-fallback).
+    degradation: degradation::DegradationTracker,
     /// When true, this session is an inline swarm worker: stream a throttled
     /// output tail to the global bus so the coordinator's inline gallery can
     /// render a live viewport. Off for normal sessions to avoid bus traffic.
@@ -312,6 +317,7 @@ impl Agent {
             allowed_tools.clone(),
             disabled_tools.clone(),
         );
+        let degradation_key = format!("{}/{}", provider.display_name(), initial_provider_model);
         let agent = Self {
             provider,
             registry,
@@ -346,6 +352,7 @@ impl Agent {
             rewind_undo_snapshot: None,
             stdin_request_tx: None,
             provider_runtime_state: ProviderRuntimeState::observed(initial_provider_model),
+            degradation: degradation::DegradationTracker::new(degradation::RouteKey(degradation_key)),
             inline_output_tap: false,
             inline_tail: inline_tail::InlineTailBuffer::default(),
             transcript_telemetry_sent: false,
