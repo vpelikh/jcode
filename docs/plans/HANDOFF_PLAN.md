@@ -72,6 +72,14 @@ disconnected, `/handoff` still opens the overlay from the shared local handoff
 store; resume then needs a connected server, and the commands degrade
 gracefully.
 
+Note on SSH-backed sessions: the `/handoff` overlay is unavailable over SSH
+because it lists the client host's local handoff store, which is the wrong host
+for an SSH-backed session (resuming sends the id to the server-side store). It
+shows an "unavailable in SSH mode" notice instead. `/handoffres <id>` still works
+over SSH when the user knows an id that exists on the server's store, since it
+routes through the remote connection. Reading the server-side handoff store from
+the client is out of scope; run `jcode` on the host to list its handoffs.
+
 At first-message injection ([`render_first_message_handoff`]), the override is
 honored if present and consumed immediately; otherwise the default
 latest-for-project handoff is used. Because the override applies only to the
