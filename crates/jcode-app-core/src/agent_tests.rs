@@ -1122,6 +1122,44 @@ async fn degradation_route_fallback_gating_escalates_or_switches() {
     }
     crate::config::Config::invalidate_cache();
 }
+
+#[tokio::test]
+async fn degradation_tracker_resets_on_model_switch() {
+    // The tracker is keyed by route, set once at construction. A mid-session
+    // model switch must reset the escalation cycle so the new route starts
+    // healthy instead of inheriting the previous model's stall history.
+    let provider = Arc::new(ExplicitPinProvider::new("model-a"));
+    let provider_dyn: Arc<dyn Provider> = provider.clone();
+    let mut agent = Agent::new(
+        Arc::clone(&provider_dyn),
+        Registry::new(provider_dyn).await,
+    );
+
+    // Escalate the tracker on the original route.
+    for _ in 0..3 {
+        agent
+            .degradation
+            .record_stall(crate::agent::degradation::StallKind::StalledPromise);
+    }
+    assert_eq!(
+        agent.degradation.rung(),
+        crate::agent::degradation::Rung::Compact
+    );
+
+    // Switch to a new model: the escalation cycle must reset.
+    agent.set_model("model-b").expect("model switch should succeed");
+    assert_eq!(
+        agent.degradation.rung(),
+        crate::agent::degradation::Rung::Healthy,
+        "a model switch must reset the degradation cycle"
+    );
+    assert_eq!(
+        agent.degradation.stall_count(),
+        0,
+        "a model switch must clear stale stall history"
+    );
+}
+
 #[tokio::test]
 async fn interrupt_signal_fire_before_notified_does_not_hang() {
     // Regression test: fire() called BEFORE notified().await must not hang.

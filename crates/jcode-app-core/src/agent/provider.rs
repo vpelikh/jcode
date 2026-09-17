@@ -118,6 +118,10 @@ impl Agent {
         self.refresh_compaction_budget();
         self.persist_session_best_effort("route selection");
         self.log_env_snapshot("set_route_selection");
+        // The route changed: the degradation tracker keys on the route, so a
+        // fresh route must start with a clean (Healthy) escalation cycle rather
+        // than inheriting the previous model's stall history.
+        self.degradation.reset();
         Ok(())
     }
 
@@ -147,6 +151,10 @@ impl Agent {
         self.refresh_compaction_budget();
         self.persist_session_best_effort("model selection");
         self.log_env_snapshot("set_model");
+        // The model/route changed: reset the degradation cycle so the new route
+        // starts healthy instead of inheriting the previous model's stall history
+        // (the tracker is keyed by route, set once at construction).
+        self.degradation.reset();
         Ok(())
     }
 

@@ -399,9 +399,8 @@ impl Agent {
         // reconciliation treat the auto-switch as a sticky user preference.
         match self.set_model_from_auth(&fallback) {
             Ok(()) => {
-                // A fallback is a new route; reset the escalation cycle so we
-                // observe the fallback's own health cleanly.
-                self.degradation.reset();
+                // set_model_from_auth already resets the degradation cycle since
+                // the route changed to the fallback; nothing else to do here.
                 Some(format!(
                     "Model degradation detected; switched route from {} to {}",
                     current, fallback
