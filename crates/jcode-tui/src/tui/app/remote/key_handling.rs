@@ -81,17 +81,14 @@ async fn handle_handoff_resume_command(
         ));
         return Ok(());
     }
-    // Resolve and preview the target before telling the server, so an unknown
-    // id fails fast client-side.
-    let preview = match crate::handoff::render_handoff(session_id) {
-        Some(block) => block,
-        None => {
-            app.push_display_message(DisplayMessage::error(format!(
-                "No saved handoff with id {session_id:?}. List them with /handoff."
-            )));
-            return Ok(());
-        }
-    };
+    // Resolve the target before telling the server, so an unknown id fails fast
+    // client-side.
+    if crate::handoff::render_handoff(session_id).is_none() {
+        app.push_display_message(DisplayMessage::error(format!(
+            "No saved handoff with id {session_id:?}. List them with /handoff."
+        )));
+        return Ok(());
+    }
     let selected = session_id.to_string();
     // A handoff override only applies to the first visible user message, so the
     // server conversation must be empty for the next message to be treated as
@@ -104,14 +101,10 @@ async fn handle_handoff_resume_command(
     remote.clear().await?;
     clear_session_state_after_discard(app);
     remote.set_handoff_resume(Some(selected)).await?;
-    // Show the handoff's headline (first content line, i.e. the intent) rather
-    // than the always-present "[Handoff from previous session]" header.
-    let preview_line = preview
-        .lines()
-        .nth(1)
-        .map(str::to_string)
-        .filter(|line| !line.trim().is_empty())
-        .unwrap_or_else(|| "[Handoff from previous session]".to_string());
+    // Show the handoff's headline (intent) rather than the always-present
+    // "[Handoff from previous session]" header. Shared with the interactive
+    // `/handoff` overlay so the two paths cannot drift.
+    let preview_line = app_mod::commands::handoff_headline(session_id);
     app.push_display_message(DisplayMessage::system(format!(
         "Handoff ready: {}\n{}",
         session_id, preview_line

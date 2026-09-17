@@ -854,6 +854,62 @@ fn local_handoff_listing_surfaces_archived_and_requires_server_for_resume() {
     );
 }
 
+/// `handoff_headline` returns the snapshot's intent as the headline (line after
+/// the "[Handoff from previous session]" header), shared by `/handoffres` and
+/// the interactive overlay, and falls back to a stable marker when unknown.
+#[test]
+fn handoff_headline_returns_intent_and_falls_back_for_unknown() {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match std::env::var_os("JCODE_HOME") {
+                Some(v) => crate::env::set_var("JCODE_HOME", v),
+                None => crate::env::remove_var("JCODE_HOME"),
+            }
+        }
+    }
+    let _guard = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().expect("temp home");
+    crate::env::set_var("JCODE_HOME", home.path());
+    let wd = home.path().join("project");
+    std::fs::create_dir_all(&wd).unwrap();
+    let _restore = Restore;
+
+    crate::todo::save_plan(
+        "handoff-abc",
+        &crate::todo::TodoPlan {
+            user_intention: Some("Fix the login bug".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    crate::todo::save_todos(
+        "handoff-abc",
+        &[crate::todo::TodoItem {
+            id: "t".into(),
+            content: "fix the login".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: None,
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    crate::handoff::capture("handoff-abc", Some(&wd), "closed", None).expect("capture");
+
+    assert_eq!(
+        super::handoff_headline("handoff-abc"),
+        "Intent: Fix the login bug",
+        "headline should be the intent line from the rendered handoff"
+    );
+    assert_eq!(
+        super::handoff_headline("does-not-exist"),
+        "[Handoff from previous session]",
+        "unknown handoffs should fall back to the stable marker"
+    );
+}
+
 mod prune {
     struct PruneTestHome {
         previous: Option<std::ffi::OsString>,

@@ -1953,6 +1953,22 @@ pub(super) fn handle_git_status_completed(app: &mut App, completed: GitStatusCom
     }
 }
 
+/// The headline shown when a handoff is selected/resumed: the snapshot's
+/// first content line (its intent), falling back to a stable marker when there
+/// is no renderable content. Shared by the manual `/handoffres` command and the
+/// interactive `/handoff` overlay so the two paths cannot drift.
+pub(super) fn handoff_headline(session_id: &str) -> String {
+    crate::handoff::render_handoff(session_id)
+        .and_then(|block| {
+            block
+                .lines()
+                .nth(1)
+                .map(str::to_string)
+                .filter(|line| !line.trim().is_empty())
+        })
+        .unwrap_or_else(|| "[Handoff from previous session]".to_string())
+}
+
 pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
     if handle_subagent_model_command(app, trimmed)
         || app.handle_hotkeys_command(trimmed)

@@ -3183,18 +3183,10 @@ impl App {
                 self.session_picker_overlay = None;
                 self.session_picker_mode = SessionPickerMode::Resume;
                 self.set_status_notice("Handoff selected");
-                // Compute the headline (first content line, i.e. the intent)
-                // the same way `/handoffres` does, and queue it so the async
-                // pump can apply the override once the remote is available.
-                let preview_line = crate::handoff::render_handoff(&session_id)
-                    .and_then(|block| {
-                        block
-                            .lines()
-                            .nth(1)
-                            .map(str::to_string)
-                            .filter(|line| !line.trim().is_empty())
-                    })
-                    .unwrap_or_else(|| "[Handoff from previous session]".to_string());
+                // Compute the headline (intent) the same way `/handoffres` does,
+                // and queue it so the async pump can apply the override once the
+                // remote is available.
+                let preview_line = super::commands::handoff_headline(&session_id);
                 self.queue_handoff_resume(session_id, preview_line);
             }
         }
