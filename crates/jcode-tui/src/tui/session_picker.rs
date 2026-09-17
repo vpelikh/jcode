@@ -1297,15 +1297,14 @@ impl SessionPicker {
                 if self.onboarding_review_recent_project_highlighted() {
                     return Ok(OverlayAction::Selected(PickerResult::ReviewRecentProject));
                 }
-                if self.handoff_mode {
-                    if let Some(session_id) = self
+                if self.handoff_mode
+                    && let Some(session_id) = self
                         .selected_session()
                         .map(|session| session.id.clone())
-                    {
-                        return Ok(OverlayAction::Selected(PickerResult::HandoffSelected(
-                            session_id,
-                        )));
-                    }
+                {
+                    return Ok(OverlayAction::Selected(PickerResult::HandoffSelected(
+                        session_id,
+                    )));
                 }
                 let targets = self.selection_or_current_targets();
                 if !targets.is_empty() {
@@ -2564,23 +2563,23 @@ fn handoff_to_session_info(snapshot: HandoffSnapshot) -> SessionInfo {
             timestamp: None,
         });
     }
-    if let Some(assistant) = snapshot.last_assistant_text.as_deref() {
-        if !snapshot.open_todos.is_empty() {
-            messages_preview.push(PreviewMessage {
-                role: "meta".to_string(),
-                content: "Last assistant message:".to_string(),
-                tool_calls: Vec::new(),
-                tool_data: None,
-                timestamp: None,
-            });
-            messages_preview.push(PreviewMessage {
-                role: "assistant".to_string(),
-                content: assistant.to_string(),
-                tool_calls: Vec::new(),
-                tool_data: None,
-                timestamp: None,
-            });
-        }
+    if let Some(assistant) = snapshot.last_assistant_text.as_deref()
+        && !snapshot.open_todos.is_empty()
+    {
+        messages_preview.push(PreviewMessage {
+            role: "meta".to_string(),
+            content: "Last assistant message:".to_string(),
+            tool_calls: Vec::new(),
+            tool_data: None,
+            timestamp: None,
+        });
+        messages_preview.push(PreviewMessage {
+            role: "assistant".to_string(),
+            content: assistant.to_string(),
+            tool_calls: Vec::new(),
+            tool_data: None,
+            timestamp: None,
+        });
     }
 
     let id = snapshot.session_id.clone();

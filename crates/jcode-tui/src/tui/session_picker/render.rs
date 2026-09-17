@@ -604,12 +604,12 @@ impl SessionPicker {
         }
         if self.handoff_mode {
             // The flat list count above said "sessions"; make it handoff-accurate.
-            title_parts.last_mut().map(|span| {
+            if let Some(span) = title_parts.last_mut() {
                 *span = Span::styled(
                     "handoffs",
                     Style::default().fg(rgb(120, 210, 230)),
                 );
-            });
+            }
         }
 
         let filter_label = self.filter_mode.label().unwrap_or("all");
