@@ -87,7 +87,6 @@ pub(super) async fn handle_lightweight_control_request(
     let shared_context = &swarm.shared_context;
     let swarm_plans = &swarm.swarm_state.plans;
     let swarm_coordinators = &swarm.swarm_state.coordinators;
-    let file_touch = &swarm.file_touch;
     let event_history = &swarm.event_history;
     let event_counter = &swarm.event_counter;
     let swarm_event_tx = &swarm.swarm_event_tx;
@@ -448,7 +447,7 @@ pub(super) async fn handle_lightweight_control_request(
                 target_session,
                 limit,
                 sessions,
-                swarm_members,
+                swarm,
                 &client_event_tx,
             )
             .await;
@@ -463,9 +462,8 @@ pub(super) async fn handle_lightweight_control_request(
                 req_session_id,
                 target_session,
                 sessions,
-                swarm_members,
+                swarm,
                 client_connections,
-                file_touch,
                 &client_event_tx,
             )
             .await;
@@ -513,8 +511,7 @@ pub(super) async fn handle_lightweight_control_request(
             handle_comm_plan_status(
                 id,
                 req_session_id,
-                swarm_members,
-                swarm_plans,
+                swarm,
                 &client_event_tx,
             )
             .await;
@@ -529,7 +526,7 @@ pub(super) async fn handle_lightweight_control_request(
                 req_session_id,
                 target_session,
                 sessions,
-                swarm_members,
+                swarm,
                 &client_event_tx,
             )
             .await;
@@ -543,13 +540,7 @@ pub(super) async fn handle_lightweight_control_request(
                 req_session_id,
                 &CommResyncPlanContext {
                     client_event_tx: &client_event_tx,
-                    swarm_members,
-                    swarms_by_id,
-                    swarm_plans,
-                    swarm_coordinators,
-                    event_history,
-                    event_counter,
-                    swarm_event_tx,
+                    swarm,
                 },
             )
             .await;

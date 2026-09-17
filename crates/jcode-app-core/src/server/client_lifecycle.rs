@@ -2521,7 +2521,7 @@ pub(super) async fn handle_client(
                     target_session,
                     limit,
                     &sessions,
-                    &swarm_members,
+                    &swarm_service_handle,
                     &client_event_tx,
                 )
                 .await;
@@ -2537,9 +2537,8 @@ pub(super) async fn handle_client(
                     req_session_id,
                     target_session,
                     &sessions,
-                    &swarm_members,
+                    &swarm_service_handle,
                     &client_connections,
-                    &file_touch,
                     &client_event_tx,
                 )
                 .await;
@@ -2585,8 +2584,7 @@ pub(super) async fn handle_client(
                 handle_comm_plan_status(
                     id,
                     req_session_id,
-                    &swarm_members,
-                    &swarm_plans,
+                    &swarm_service_handle,
                     &client_event_tx,
                 )
                 .await;
@@ -2602,7 +2600,7 @@ pub(super) async fn handle_client(
                     req_session_id,
                     target_session,
                     &sessions,
-                    &swarm_members,
+                    &swarm_service_handle,
                     &client_event_tx,
                 )
                 .await;
@@ -2617,13 +2615,7 @@ pub(super) async fn handle_client(
                     req_session_id,
                     &CommResyncPlanContext {
                         client_event_tx: &client_event_tx,
-                        swarm_members: &swarm_members,
-                        swarms_by_id: &swarms_by_id,
-                        swarm_plans: &swarm_plans,
-                        swarm_coordinators: &swarm_coordinators,
-                        event_history: &event_history,
-                        event_counter: &event_counter,
-                        swarm_event_tx: &swarm_event_tx,
+                        swarm: &swarm_service_handle,
                     },
                 )
                 .await;

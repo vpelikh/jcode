@@ -797,7 +797,7 @@ introduces no new warnings.
 The convergence goal — zero flat swarm-map args in any `pub`/`pub(super)`
 handler signature — still has a broad residual across roughly a dozen modules:
 `comm_graph` (4 graph handlers), `comm_plan` (propose/approve/reject),
-`comm_sync`, `comm_await` (await members + resume), `client_comm_channels`
+`comm_await` (await members + resume), `client_comm_channels`
 (4 handlers), `client_comm_context` (share/read/list), `swarm_channels`,
 `state` delivery helpers, `swarm.rs` broadcast/plan/status free functions,
 `reload.rs`, `headless`, `debug_events`, and several client-facing session
@@ -855,3 +855,22 @@ drop their now-unused `channel_subscriptions` /
 type alias and unused `SwarmEvent` / `HashSet` / `broadcast` imports trimmed.
 Zero behavior change; `client_comm` (6), `client_lifecycle` (27),
 `comm_control` (70), and `server::` (466) stay green.
+
+### comm_sync convergence slice landed (2026-09)
+
+The sync/status handlers collapsed their flat swarm bag onto
+`&SwarmServiceHandle`. `handle_comm_summary` (1 flat field),
+`handle_comm_status` (2 flat fields incl. `file_touch`),
+`handle_comm_read_context` (1 flat field), and `handle_comm_plan_status`
+(2 flat fields) each bind the maps/file-touch as body locals from the handle
+(design decision A); the non-swarm params (`sessions`,
+`client_connections`) stay. `handle_comm_resync_plan` drops its flat
+`CommResyncPlanContext` bag for the slimmed `CommResyncPlanContext {
+client_event_tx, swarm }`, binding each map/event/history field as a body
+local. Both routers pass `&swarm_service_handle`/`swarm`; the
+`client_lightweight_control.rs` router drops its now-unused `file_touch`
+local. The now-satisfied `too_many_arguments` expect
+(`handle_comm_status`) was removed; unused imports (`FileTouchService`,
+`SwarmEvent`, `VersionedPlan`, `HashSet`, `broadcast`) trimmed. Zero
+behavior change; the full `jcode-app-core` lib suite stays green (1480
+passing) and clippy introduces no new warnings.
