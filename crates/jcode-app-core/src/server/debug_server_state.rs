@@ -761,7 +761,7 @@ async fn build_server_memory_payload(
     // Swarm-domain state is reached through the swarm service handle (Slice 4).
     let swarm_members = &swarm.swarm_state.members;
     let swarms_by_id = &swarm.swarm_state.swarms_by_id;
-    let shared_context = &swarm.shared_context;
+    let shared_context = swarm.shared_context_map();
     let swarm_plans = &swarm.swarm_state.plans;
     let swarm_coordinators = &swarm.swarm_state.coordinators;
     let file_touch = &swarm.file_touch;

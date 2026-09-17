@@ -35,7 +35,7 @@ pub(crate) struct SwarmServiceHandle {
     /// Shared ownership of core swarm coordination state.
     pub(crate) swarm_state: SwarmState,
     /// Shared context by swarm (swarm_id -> key -> SharedContext).
-    pub(crate) shared_context: Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
+    shared_context: Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
     /// File-touch tracking service (forward path index + reverse session index).
     pub(crate) file_touch: FileTouchService,
     /// Channel subscriptions forward index.
@@ -447,6 +447,92 @@ impl SwarmServiceHandle {
             &self.swarm_state.plans,
         )
         .await;
+    }
+
+    /// Upsert a shared-context entry for `swarm_id` / `key`. `append` toggles
+    /// the append semantics of `comm_context:write` (a trailing line joined to
+    /// the existing value). Preserves the original `created_at` on refresh.
+    /// Routes the shared-context map mutation through the swarm service so
+    /// callers do not touch the raw map (Tier 3).
+    pub(crate) async fn set_shared_context(
+        &self,
+        swarm_id: &str,
+        key: &str,
+        value: String,
+        from_session: &str,
+        from_name: Option<String>,
+        append: bool,
+    ) {
+        let mut shared_ctx = self.shared_context.write().await;
+        let swarm_ctx = shared_ctx.entry(swarm_id.to_string()).or_default();
+        let now = Instant::now();
+        let created_at = swarm_ctx.get(key).map(|c| c.created_at).unwrap_or(now);
+        let stored_value = if append {
+            swarm_ctx
+                .get(key)
+                .map(|existing| {
+                    if existing.value.is_empty() {
+                        value.clone()
+                    } else {
+                        format!("{}\n{}", existing.value, value)
+                    }
+                })
+                .unwrap_or_else(|| value.clone())
+        } else {
+            value.clone()
+        };
+        swarm_ctx.insert(
+            key.to_string(),
+            SharedContext {
+                key: key.to_string(),
+                value: stored_value.clone(),
+                from_session: from_session.to_string(),
+                from_name,
+                created_at,
+                updated_at: now,
+            },
+        );
+    }
+
+    /// Read a single shared-context entry for `swarm_id` / `key`, if present.
+    pub(crate) async fn get_shared_context(
+        &self,
+        swarm_id: &str,
+        key: &str,
+    ) -> Option<SharedContext> {
+        self.shared_context
+            .read()
+            .await
+            .get(swarm_id)
+            .and_then(|swarm_ctx| swarm_ctx.get(key))
+            .cloned()
+    }
+
+    /// Read a snapshot of all shared-context entries for `swarm_id`.
+    pub(crate) async fn shared_context_entries(&self, swarm_id: &str) -> Vec<SharedContext> {
+        self.shared_context
+            .read()
+            .await
+            .get(swarm_id)
+            .map(|swarm_ctx| swarm_ctx.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Borrow the whole shared-context map for read-only snapshot consumers
+    /// (debug `swarm:context` / `server_state` observation paths). Callers
+    /// must not mutate through this handle; all writes route through
+    /// `set_shared_context` / `remove_shared_context`.
+    pub(crate) fn shared_context_map(
+        &self,
+    ) -> &Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>> {
+        &self.shared_context
+    }
+
+    /// Remove a single shared-context entry for `swarm_id` / `key`.
+    pub(crate) async fn remove_shared_context(&self, swarm_id: &str, key: &str) {
+        if let Some(swarm_ctx) = self.shared_context.write().await.get_mut(swarm_id) {
+            swarm_ctx.remove(key);
+        }
     }
 
     /// Record a swarm event into the ring buffer and broadcast it. Routes event

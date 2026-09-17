@@ -1,11 +1,10 @@
 use super::services::SwarmServiceHandle;
-use super::{SharedContext, SwarmState, VersionedPlan, persist_swarm_state_for};
+use super::{SwarmState, VersionedPlan, persist_swarm_state_for};
 use crate::plan::PlanItem;
 use crate::protocol::{NotificationType, ServerEvent};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::sync::RwLock;
 
 pub(super) struct DebugSwarmWriteContext<'a> {
@@ -268,28 +267,16 @@ pub(super) async fn maybe_handle_swarm_write_command(
         };
 
         if let Some(swarm_id) = swarm_id {
-            {
-                let mut shared_ctx = ctx.swarm.shared_context.write().await;
-                let swarm_ctx = shared_ctx
-                    .entry(swarm_id.clone())
-                    .or_insert_with(HashMap::new);
-                let now = Instant::now();
-                let created_at = swarm_ctx
-                    .get(&key)
-                    .map(|context| context.created_at)
-                    .unwrap_or(now);
-                swarm_ctx.insert(
-                    key.clone(),
-                    SharedContext {
-                        key: key.clone(),
-                        value: value.clone(),
-                        from_session: acting_session.to_string(),
-                        from_name: friendly_name.clone(),
-                        created_at,
-                        updated_at: now,
-                    },
-                );
-            }
+            ctx.swarm
+                .set_shared_context(
+                    &swarm_id,
+                    &key,
+                    value.clone(),
+                    acting_session,
+                    friendly_name.clone(),
+                    false,
+                )
+                .await;
 
             let swarm_session_ids: Vec<String> = {
                 let swarms = ctx.swarm.swarm_state.swarms_by_id.read().await;
@@ -369,13 +356,11 @@ pub(super) async fn maybe_handle_swarm_write_command(
 
         if let Some(swarm_id) = swarm_id {
             let proposal_key = format!("plan_proposal:{}", proposer_session);
-            let proposal_value = {
-                let shared_ctx = ctx.swarm.shared_context.read().await;
-                shared_ctx
-                    .get(&swarm_id)
-                    .and_then(|swarm_ctx| swarm_ctx.get(&proposal_key))
-                    .map(|context| context.value.clone())
-            };
+            let proposal_value = ctx
+                .swarm
+                .get_shared_context(&swarm_id, &proposal_key)
+                .await
+                .map(|context| context.value);
 
             return match proposal_value {
                 None => Err(anyhow::anyhow!(
@@ -408,12 +393,9 @@ pub(super) async fn maybe_handle_swarm_write_command(
                                 .insert(proposer_session.to_string());
                             versioned_plan.version
                         };
-                        {
-                            let mut shared_ctx = ctx.swarm.shared_context.write().await;
-                            if let Some(swarm_ctx) = shared_ctx.get_mut(&swarm_id) {
-                                swarm_ctx.remove(&proposal_key);
-                            }
-                        }
+                        ctx.swarm
+                            .remove_shared_context(&swarm_id, &proposal_key)
+                            .await;
                         Ok(Some(
                             serde_json::json!({
                                 "approved": true,
@@ -477,13 +459,11 @@ pub(super) async fn maybe_handle_swarm_write_command(
 
         if let Some(swarm_id) = swarm_id {
             let proposal_key = format!("plan_proposal:{}", proposer_session);
-            let proposal_exists = {
-                let shared_ctx = ctx.swarm.shared_context.read().await;
-                shared_ctx
-                    .get(&swarm_id)
-                    .and_then(|swarm_ctx| swarm_ctx.get(&proposal_key))
-                    .is_some()
-            };
+            let proposal_exists = ctx
+                .swarm
+                .get_shared_context(&swarm_id, &proposal_key)
+                .await
+                .is_some();
 
             if !proposal_exists {
                 return Err(anyhow::anyhow!(
@@ -492,12 +472,9 @@ pub(super) async fn maybe_handle_swarm_write_command(
                 ));
             }
 
-            {
-                let mut shared_ctx = ctx.swarm.shared_context.write().await;
-                if let Some(swarm_ctx) = shared_ctx.get_mut(&swarm_id) {
-                    swarm_ctx.remove(&proposal_key);
-                }
-            }
+            ctx.swarm
+                .remove_shared_context(&swarm_id, &proposal_key)
+                .await;
             let reason_msg = reason
                 .as_ref()
                 .map(|reason| format!(": {}", reason))

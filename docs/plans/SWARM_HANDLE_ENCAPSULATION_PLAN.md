@@ -74,7 +74,15 @@ API the handle wraps). Instead:
    services module). All 14 contiguous trio bindings + 8 special sites were
    converted; zero direct cross-module field access remains.
 2. **`shared_context`** (12). One leaf map; add `read_shared_context()` +
-   mutation-method moves.
+   mutation-method moves. *(landed 2026-09)*
+   Field is now private. Writes route through `set_shared_context(...)`
+   (carrying the upsert-with-append logic and created_at preservation) and
+   `remove_shared_context(swarm_id, key)`. Single-key + all-keys reads route
+   through `get_shared_context` / `shared_context_entries`. Debug snapshot
+   consumers (`debug_swarm_read`, `debug_server_state`) use the read-only
+   `shared_context_map()` accessor. Call sites converted in
+   `client_comm_context`, `comm_plan` (×3), and `debug_swarm_write` (×5).
+   Zero direct cross-module field access remains.
 3. **`channel_subscriptions{,_by_session}`** (10). Reverse indexes; add
    `subscribe_channel` / `unsubscribe_channel` / `resolve_subscribers` methods
    (some already exist on the handle as `remove_session_channel_subscriptions`).
