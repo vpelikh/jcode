@@ -2,8 +2,10 @@
 
 ## Status
 
-**Draft — no code landed yet.** This plan proposes turning an existing but
-passive set of detection signals into an active degradation-management system.
+**In progress.** Slice 1 (watchdog subscription surface) landed on
+`feat/model-degradation-management` as `e68f1f9f1`. The plan proposes turning an
+existing but passive set of detection signals into an active
+degradation-management system.
 
 > **Trigger for this plan (2026-09):** a long-running session with a live
 > language model degraded into a classic stalled-promise loop. The session
