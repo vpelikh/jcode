@@ -223,6 +223,16 @@ impl DegradationTracker {
         self.rung = Rung::Escalated;
     }
 
+    /// Promptly promote to `RouteFallback`, skipping the intermediate rungs.
+    /// Used when an earlier rung is genuinely unavailable (e.g. the provider
+    /// does not support compaction), so the session still reaches the
+    /// fallback/escalation decision instead of silently spinning.
+    pub fn promote_to_route_fallback(&mut self) {
+        // Treat a compaction as "attempted" so the RouteFallback gate opens.
+        self.compact_recommended = true;
+        self.rung = Rung::RouteFallback;
+    }
+
     fn prune_expired(&mut self) {
         let cutoff = Instant::now() - self.cfg.window;
         while self
@@ -297,6 +307,17 @@ impl Agent {
         let rung = self.degradation.rung();
         match rung {
             Rung::Compact if self.degradation.compact_pending() => {
+                // If the provider cannot compact, this rung cannot help: promptly
+                // skip to the fallback/escalation decision rather than spinning
+                // on a compaction that will always fail.
+                if !self.provider.supports_compaction() {
+                    crate::logging::warn(&format!(
+                        "Model degradation: {} reached Compact rung but provider does not support compaction; escalating to route fallback",
+                        self.degradation.describe()
+                    ));
+                    self.degradation.promote_to_route_fallback();
+                    return self.maybe_fallback_route();
+                }
                 crate::logging::warn(&format!(
                     "Model degradation: {} reached Compact rung; triggering compaction",
                     self.degradation.describe()
@@ -313,9 +334,9 @@ impl Agent {
                         message.lines().last().unwrap_or("context compaction started")
                     ))
                 } else {
-                    // Compaction could not run now (unsupported provider / busy /
-                    // nothing to compact). We still recorded the attempt so the
-                    // fallback rung can escalate; log and carry on this turn.
+                    // Compaction could not run now (busy / nothing to compact).
+                    // We still recorded the attempt so the fallback rung can
+                    // escalate; log and carry on this turn.
                     crate::logging::warn(&format!(
                         "Deferred degradation compaction (unsupported or busy): {message}"
                     ));

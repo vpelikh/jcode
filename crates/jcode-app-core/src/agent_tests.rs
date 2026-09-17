@@ -1083,6 +1083,37 @@ async fn degradation_route_fallback_gating_escalates_or_switches() {
         "a successful fallback resets the escalation cycle"
     );
 
+    // Scenario C: compaction unsupported (ExplicitPinProvider) + fallback
+    // disabled. Reaching the Compact rung must NOT silently spin; it escalates
+    // promptly to the decision point, which with fallback disabled surfaces to
+    // the user (Escalated) rather than stalling at Compact forever.
+    set_fallback_config(false, None);
+    let no_compact_provider: Arc<dyn Provider> =
+        Arc::new(ExplicitPinProvider::new("some-model"));
+    let mut no_compact_agent = Agent::new(
+        Arc::clone(&no_compact_provider),
+        Registry::new(no_compact_provider).await,
+    );
+    for _ in 0..2 {
+        no_compact_agent
+            .degradation
+            .record_stall(crate::agent::degradation::StallKind::StalledPromise);
+    }
+    assert_eq!(
+        no_compact_agent.degradation.rung(),
+        crate::agent::degradation::Rung::Compact
+    );
+    let notice = no_compact_agent.maybe_mitigate_degradation();
+    assert!(
+        notice.is_some(),
+        "unsupported compaction should surface a notice"
+    );
+    assert_eq!(
+        no_compact_agent.degradation.rung(),
+        crate::agent::degradation::Rung::Escalated,
+        "unsupported compaction + disabled fallback must escalate to the user"
+    );
+
     // Restore the environment.
     if let Some(previous) = prev_home {
         crate::env::set_var("JCODE_HOME", previous);
@@ -1091,7 +1122,6 @@ async fn degradation_route_fallback_gating_escalates_or_switches() {
     }
     crate::config::Config::invalidate_cache();
 }
-
 #[tokio::test]
 async fn interrupt_signal_fire_before_notified_does_not_hang() {
     // Regression test: fire() called BEFORE notified().await must not hang.
