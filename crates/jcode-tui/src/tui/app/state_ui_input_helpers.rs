@@ -502,11 +502,11 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/session", "Alias for /resume"),
     RegisteredCommand::public(
         "/handoff",
-        "List saved handoffs (all snapshots, newest first) to resume from",
+        "Open the interactive picker over saved handoffs (all snapshots, newest first) to resume from",
     ),
     RegisteredCommand::public(
         "/handoffres",
-        "Resume a fresh session from a specific handoff by id (see /handoff)",
+        "Resume a fresh session from a specific handoff by id (pick with /handoff)",
     ),
     RegisteredCommand::public(
         "/handoff-clear",
