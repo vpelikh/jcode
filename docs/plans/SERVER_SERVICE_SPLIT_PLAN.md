@@ -874,3 +874,21 @@ local. The now-satisfied `too_many_arguments` expect
 `SwarmEvent`, `VersionedPlan`, `HashSet`, `broadcast`) trimmed. Zero
 behavior change; the full `jcode-app-core` lib suite stays green (1480
 passing) and clippy introduces no new warnings.
+
+### Test-builder consolidation completed (2026-09)
+
+The `TestSwarmBuilder` consolidation lands fully: the only two remaining
+hand-built `SwarmServiceHandle` literals in test code were migrated onto the
+shared builder. Both `client_lifecycle_tests::lightweight_comm_request_skips_full_session_initialization`
+(which only needed an inert empty swarm handle) and
+`debug_swarm_write::tests` (which seeds `.members()` and `.coordinators()`
+for the coordinator-lock-ordering test) now construct through
+`crate::server::test_util::TestSwarmBuilder`. The now-unused flat swarm
+locals (`swarm_members`/`swarms_by_id`/`shared_context`/`swarm_plans`/
+`swarm_coordinators`/`file_touch`/`channel_*`/`event_*`/`swarm_event_tx`)
+were dropped, and the now-unused imports (`AwaitMembersRuntime`,
+`FileTouchService`, `SwarmMutationRuntime`, `SwarmState`) were pruned from
+`client_lifecycle_tests.rs`. Zero behavior change; the full `jcode-app-core`
+lib suite stays green (1480 passing) and the clippy baseline is unchanged
+(the 4 pre-existing findings in `client_lifecycle_tests.rs` at lines
+247/254/1053/1058 predate this change).
