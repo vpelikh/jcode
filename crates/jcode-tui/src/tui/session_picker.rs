@@ -2524,16 +2524,20 @@ fn handoff_to_session_info(snapshot: HandoffSnapshot) -> SessionInfo {
             let status = if todo.status.is_empty() {
                 "open".to_string()
             } else {
-                todo.status.clone()
+                safe_truncate(&todo.status, 32).to_string()
             };
             let group = todo
                 .group
                 .clone()
-                .map(|g| format!(" [{}]", g))
+                .map(|g| format!(" [{}]", safe_truncate(&g, 48)))
                 .unwrap_or_default();
+            // Bound the todo body like the injection render (`render_snapshot`
+            // caps todo content at 512 chars) so a pathological snapshot cannot
+            // balloon the picker preview.
+            let content = safe_truncate(&todo.content, 512);
             messages_preview.push(PreviewMessage {
                 role: "assistant".to_string(),
-                content: format!("☐ {}{} ({})", todo.content, group, status),
+                content: format!("☐ {}{} ({})", content, group, status),
                 tool_calls: Vec::new(),
                 tool_data: None,
                 timestamp: None,
@@ -2549,7 +2553,7 @@ fn handoff_to_session_info(snapshot: HandoffSnapshot) -> SessionInfo {
         });
         messages_preview.push(PreviewMessage {
             role: "assistant".to_string(),
-            content: assistant.to_string(),
+            content: safe_truncate(assistant, 1024).to_string(),
             tool_calls: Vec::new(),
             tool_data: None,
             timestamp: None,
@@ -2575,7 +2579,7 @@ fn handoff_to_session_info(snapshot: HandoffSnapshot) -> SessionInfo {
         });
         messages_preview.push(PreviewMessage {
             role: "assistant".to_string(),
-            content: assistant.to_string(),
+            content: safe_truncate(assistant, 1024).to_string(),
             tool_calls: Vec::new(),
             tool_data: None,
             timestamp: None,

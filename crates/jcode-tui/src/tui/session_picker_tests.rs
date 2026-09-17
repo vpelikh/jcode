@@ -2698,3 +2698,50 @@ fn handoff_picker_search_enter_emits_handoff_selected_not_resume_target() {
         other => panic!("expected HandoffSelected from search enter, got {:?}", other),
     }
 }
+
+#[test]
+fn handoff_picker_preview_bounds_long_todo_and_assistant_text() {
+    let long_content = "x".repeat(1000);
+    let long_assistant = "y".repeat(2000);
+    let snapshot = super::HandoffSnapshot {
+        session_id: "handoff-long".to_string(),
+        project_key: "git:https://example.com/proj".to_string(),
+        ended_at: Utc::now(),
+        disposition: "closed".to_string(),
+        working_dir: Some("/tmp/proj".to_string()),
+        intent: Some("Long context".to_string()),
+        open_todos: vec![crate::handoff::HandoffTodo {
+            id: "t1".to_string(),
+            content: long_content.clone(),
+            status: "in_progress".to_string(),
+            group: Some("g".repeat(200)),
+            confidence: None,
+        }],
+        last_assistant_text: Some(long_assistant.clone()),
+        initiative_id: None,
+    };
+
+    let picker = SessionPicker::for_handoffs(vec![snapshot]);
+    let session = picker.selected_session().expect("handoff row");
+
+    // The preview must not carry the full unbounded strings; todo content and
+    // the assistant tail are capped so a pathological snapshot cannot inflate
+    // the picker preview.
+    let assistant_previews = session
+        .messages_preview
+        .iter()
+        .filter(|m| m.role == "assistant")
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    // The todo body (without status/group) is capped at 512; the full 1000-char
+    // string must not appear in the preview.
+    assert!(
+        !assistant_previews.contains(&long_content),
+        "todo content should be capped in the preview"
+    );
+    assert!(
+        !assistant_previews.contains(&long_assistant),
+        "assistant text should be capped in the preview"
+    );
+}
