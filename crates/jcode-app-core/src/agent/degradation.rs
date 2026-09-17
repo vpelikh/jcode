@@ -216,6 +216,15 @@ impl DegradationTracker {
         self.compact_recommended = false;
     }
 
+    /// Reset the escalation cycle AND re-key the tracker to a new route. Used
+    /// when the provider/model route changes, so the tracker both stops
+    /// carrying the prior route's stall history and reports the correct route in
+    /// diagnostics thereafter.
+    pub fn reset_for_route(&mut self, route: RouteKey) {
+        self.route = route;
+        self.reset();
+    }
+
     /// Escalate to the terminal `Escalated` rung: auto-mitigation is exhausted
     /// or disabled, so the caller should surface the situation to the user
     /// rather than keep acting. Idempotent.
@@ -290,6 +299,12 @@ impl DegradationTracker {
 
 /// Reactive mitigation integrated into the `Agent` turn loop.
 impl Agent {
+    /// The degradation route key for the agent's CURRENT provider/model. Kept in
+    /// one place so `build_base` and the route/model-switch re-keying agree.
+    pub(crate) fn current_route_key(&self) -> RouteKey {
+        RouteKey(format!("{}/{}", self.provider.display_name(), self.provider_model()))
+    }
+
     /// Advance the degradation mitigation ladder at a safe turn-loop checkpoint.
     ///
     /// Called at the turn-loop head (before the next provider request). Returns
@@ -509,6 +524,23 @@ mod tests {
         // The pending flag is consumed once, even if healthy turns follow.
         t.record_healthy_turn();
         assert!(!t.compact_pending());
+    }
+
+    #[test]
+    fn reset_for_route_rekeys_and_resets() {
+        let mut t = DegradationTracker::new(RouteKey("p/old".into()));
+        t.record_stall(StallKind::StalledPromise);
+        t.record_stall(StallKind::StalledPromise);
+        t.escalate();
+        assert_eq!(t.rung(), Rung::Escalated);
+
+        // Re-key to a new route clears both the stall history and the terminal
+        // rung, and reports the new route in diagnostics.
+        t.reset_for_route(RouteKey("p/new".into()));
+        assert_eq!(t.route().0, "p/new");
+        assert_eq!(t.rung(), Rung::Healthy);
+        assert_eq!(t.stall_count(), 0);
+        assert!(t.describe().contains("route=p/new"));
     }
 
     #[test]

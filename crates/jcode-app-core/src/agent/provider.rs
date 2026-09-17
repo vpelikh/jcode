@@ -121,7 +121,7 @@ impl Agent {
         // The route changed: the degradation tracker keys on the route, so a
         // fresh route must start with a clean (Healthy) escalation cycle rather
         // than inheriting the previous model's stall history.
-        self.degradation.reset();
+        self.degradation.reset_for_route(self.current_route_key());
         Ok(())
     }
 
@@ -154,7 +154,7 @@ impl Agent {
         // The model/route changed: reset the degradation cycle so the new route
         // starts healthy instead of inheriting the previous model's stall history
         // (the tracker is keyed by route, set once at construction).
-        self.degradation.reset();
+        self.degradation.reset_for_route(self.current_route_key());
         Ok(())
     }
 

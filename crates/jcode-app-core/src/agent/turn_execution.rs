@@ -762,7 +762,7 @@ impl Agent {
                 // The model/route was (re)applied on this freshly-assigned
                 // session; reset the degradation cycle so the restored route
                 // does not inherit any prior history for this Agent.
-                self.degradation.reset();
+                self.degradation.reset_for_route(self.current_route_key());
             }
         } else {
             self.session.model = Some(self.provider_model());
