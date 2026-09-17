@@ -982,48 +982,109 @@ async fn degradation_mitigation_triggers_compaction_once_on_compact_rung() {
 }
 
 #[tokio::test]
-async fn degradation_route_fallback_disabled_by_default_escalates_safely() {
-    // The SAFETY property of the route-fallback rung: with fallback disabled
-    // (the default), reaching the RouteFallback rung must NOT change the model.
-    // It escalates to surface the situation to the user instead.
-    // Config is not customized here, so crate::config::config().degradation has
-    // route_fallback_enabled=false by default.
-    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
-    let registry = Registry::new(provider.clone()).await;
-    let mut agent = Agent::new(provider, registry);
+async fn degradation_route_fallback_gating_escalates_or_switches() {
+    // Consolidated gating test. Both the disabled and enabled paths depend on
+    // the process-global crate::config::config(), which is shared across tests,
+    // so they must run sequentially in one test that writes the config before
+    // each scenario (a parallel split would race on the global config).
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-degrad-fallback-")
+        .tempdir()
+        .expect("temp home");
+    let config_path = temp_home.path().join("config.toml");
+    crate::env::set_var("JCODE_HOME", temp_home.path());
 
-    // Push past the fallback rung (default promotes: 3 stalls -> RouteFallback).
-    for _ in 0..3 {
-        agent
+    let set_fallback_config = |enabled: bool, model: Option<&str>| {
+        let mut cfg = format!("[degradation]\nroute_fallback_enabled = {}\n", enabled);
+        if let Some(model) = model {
+            cfg.push_str(&format!("fallback_model = \"{model}\"\n"));
+        }
+        std::fs::write(&config_path, cfg).expect("write config");
+        crate::config::Config::invalidate_cache();
+    };
+
+    // Scenario A: disabled (explicit). Reaching RouteFallback must escalate and
+    // NOT switch the model.
+    set_fallback_config(false, None);
+    let disabled_provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let mut disabled_agent = Agent::new(
+        Arc::clone(&disabled_provider),
+        Registry::new(disabled_provider.clone()).await,
+    );
+    for _ in 0..2 {
+        disabled_agent
             .degradation
             .record_stall(crate::agent::degradation::StallKind::StalledPromise);
     }
+    disabled_agent.degradation.acknowledge_compact();
+    disabled_agent
+        .degradation
+        .record_stall(crate::agent::degradation::StallKind::StalledPromise);
     assert_eq!(
-        agent.degradation.rung(),
+        disabled_agent.degradation.rung(),
         crate::agent::degradation::Rung::RouteFallback
     );
-
-    // Fallback disabled -> escalates (returns a notice, rung becomes Escalated).
-    let notice = agent.maybe_mitigate_degradation();
+    let notice = disabled_agent.maybe_mitigate_degradation();
     assert!(notice.is_some(), "disabled fallback should surface a notice");
-    let notice = notice.unwrap();
     assert!(
-        notice.contains("disabled"),
-        "notice should say fallback is disabled: {notice}"
+        notice.as_deref().unwrap().contains("disabled"),
+        "disabled notice should say fallback is disabled: {:?}",
+        notice
     );
     assert_eq!(
-        agent.degradation.rung(),
+        disabled_agent.degradation.rung(),
         crate::agent::degradation::Rung::Escalated,
         "disabled fallback must escalate, not switch the model"
     );
 
-    // Escalated rung is terminal: further mitigation calls do not act.
-    assert!(
-        agent.maybe_mitigate_degradation().is_none() || {
-            // After Escalated, rung() returns Escalated matched by the None arm.
-            agent.degradation.rung() == crate::agent::degradation::Rung::Escalated
-        }
+    // Scenario B: enabled with a fallback model. Reaching RouteFallback
+    // switches the provider onto the fallback and resets the cycle.
+    set_fallback_config(true, Some("deepseek/deepseek-v3@deepseek"));
+    let enabled_provider = Arc::new(ExplicitPinProvider::new("deepseek/deepseek-v4-flash@deepseek"));
+    let enabled_provider_dyn: Arc<dyn Provider> = enabled_provider.clone();
+    let mut enabled_agent = Agent::new(
+        Arc::clone(&enabled_provider_dyn),
+        Registry::new(enabled_provider_dyn).await,
     );
+    for _ in 0..2 {
+        enabled_agent
+            .degradation
+            .record_stall(crate::agent::degradation::StallKind::StalledPromise);
+    }
+    enabled_agent.degradation.acknowledge_compact();
+    enabled_agent
+        .degradation
+        .record_stall(crate::agent::degradation::StallKind::StalledPromise);
+    assert_eq!(
+        enabled_agent.degradation.rung(),
+        crate::agent::degradation::Rung::RouteFallback
+    );
+    let notice = enabled_agent.maybe_mitigate_degradation();
+    assert!(notice.is_some(), "configured fallback should produce a notice");
+    assert!(
+        notice.as_deref().unwrap().contains("switched route"),
+        "notice should confirm the route switch: {:?}",
+        notice
+    );
+    assert_eq!(
+        enabled_provider.model(),
+        "deepseek/deepseek-v3",
+        "provider model should switch to the configured fallback"
+    );
+    assert_eq!(
+        enabled_agent.degradation.rung(),
+        crate::agent::degradation::Rung::Healthy,
+        "a successful fallback resets the escalation cycle"
+    );
+
+    // Restore the environment.
+    if let Some(previous) = prev_home {
+        crate::env::set_var("JCODE_HOME", previous);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    crate::config::Config::invalidate_cache();
 }
 
 #[tokio::test]

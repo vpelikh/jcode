@@ -225,6 +225,9 @@ impl DegradationTracker {
     /// stalls long ago stops counting; does not reset an already-escalated rung.
     pub fn record_healthy_turn(&mut self) {
         self.prune_expired();
+        // Recompute from the live (pruned) count so a clean turn after a
+        // recovery can decay the rung instead of pinning it at an old level.
+        self.recompute_rung();
     }
 
     /// Reset the escalation cycle: clear stall records and drop back to Healthy.
@@ -263,10 +266,19 @@ impl DegradationTracker {
     }
 
     fn recompute_rung(&mut self) {
+        // `Escalated` is terminal: once we surface to the user, only an
+        // explicit reset() clears it. Do not let a healthy stretch silently
+        // un-escalate.
+        if self.rung == Rung::Escalated {
+            return;
+        }
         let count = self.stalls.len() as u32;
-        // Recompute from the raw count so a rung can only rise, never drop,
-        // mid-cycle (matches the monotonically-escalating model).
-        let next = if count >= self.cfg.fallback_threshold {
+        // RouteFallback is deliberately gated on a compaction having been
+        // attempted and acknowledged. A count alone reaching the fallback
+        // threshold is NOT enough to justify switching the user's model: we
+        // first compact (which mostly resolves long-context degradation) and
+        // only escalate past it if the window STILL has enough stalls.
+        let next = if count >= self.cfg.fallback_threshold && self.compact_recommended {
             Rung::RouteFallback
         } else if count >= self.cfg.compact_threshold {
             Rung::Compact
@@ -275,7 +287,10 @@ impl DegradationTracker {
         } else {
             Rung::Healthy
         };
-        self.rung = next.max(self.rung);
+        // Rederive from the live count so a genuinely clean stretch (e.g. after
+        // a successful compaction prunes the stall window) decays the rung back
+        // toward Healthy instead of pinning it at a previously-escalated level.
+        self.rung = next;
         if self.rung < Rung::Compact {
             self.compact_recommended = false;
         }
@@ -436,30 +451,51 @@ mod tests {
         t.record_stall(StallKind::StalledPromise);
         assert_eq!(t.rung(), Rung::Compact);
         assert!(t.compact_pending());
+        // RouteFallback is gated on a compaction having been attempted: a 3rd
+        // stall alone must not escalate to a model switch.
+        t.record_stall(StallKind::StalledPromise);
+        assert_eq!(
+            t.rung(),
+            Rung::Compact,
+            "fallback must not fire without an acknowledged compaction"
+        );
+        // After acknowledging the compaction, a persistent stall escalates.
+        t.acknowledge_compact();
         t.record_stall(StallKind::StalledPromise);
         assert_eq!(t.rung(), Rung::RouteFallback);
     }
 
     #[test]
-    fn rung_is_monotonic_until_reset() {
-        let mut t = DegradationTracker::with_config(
-            RouteKey("p/m".into()),
-            DegradationConfig {
-                window: Duration::from_secs(60),
-                watch_threshold: 2,
-                compact_threshold: 3,
-                fallback_threshold: 4,
-                system_stall_load_concern_threshold: 2,
-            },
-        );
-        for _ in 0..4 {
-            t.record_stall(StallKind::EmptyTurn);
-        }
-        assert_eq!(t.rung(), Rung::RouteFallback);
-        // Health events do not drop a reached rung.
+    fn rung_decays_after_a_clean_stretch_and_reset_clears() {
+        let cfg = DegradationConfig {
+            window: Duration::from_secs(60),
+            watch_threshold: 1,
+            compact_threshold: 2,
+            fallback_threshold: 3,
+            system_stall_load_concern_threshold: 2,
+        };
+        let mut t = DegradationTracker::with_config(RouteKey("p/m".into()), cfg);
+        // Escalate to Compact and acknowledge the compaction.
+        t.record_stall(StallKind::StalledPromise);
+        t.record_stall(StallKind::StalledPromise);
+        assert_eq!(t.rung(), Rung::Compact);
+        t.acknowledge_compact();
+        // A clean stretch after the stall window has expired (simulate pruning
+        // by clearing the records, which is what would follow a recovery) lets
+        // the rung decay back to Healthy instead of pinning at a stale level.
+        t.stalls.clear();
         t.record_healthy_turn();
-        assert_eq!(t.rung(), Rung::RouteFallback);
-        // Reset clears it.
+        assert_eq!(t.stalls.len(), 0);
+        assert_eq!(t.rung(), Rung::Healthy, "a clean stretch should decay the rung");
+        assert_eq!(t.stall_count(), 0);
+        // Escalated is terminal: only reset() clears it.
+        t.record_stall(StallKind::StalledPromise);
+        t.record_stall(StallKind::StalledPromise);
+        t.record_stall(StallKind::StalledPromise);
+        t.escalate();
+        assert_eq!(t.rung(), Rung::Escalated);
+        t.record_healthy_turn();
+        assert_eq!(t.rung(), Rung::Escalated, "Escalated is terminal");
         t.reset();
         assert_eq!(t.rung(), Rung::Healthy);
         assert_eq!(t.stall_count(), 0);

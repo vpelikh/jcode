@@ -149,6 +149,10 @@ impl Agent {
             // under the same long context.
             if let Some(notice) = self.maybe_mitigate_degradation() {
                 crate::logging::info(&format!("[degradation] {notice}"));
+                // Surface to the user via the same status channel the stream
+                // already uses for phase/progress notices (Slice 5 parity with
+                // the non-streaming loop's terminal print).
+                let _ = event_tx.send(ServerEvent::StatusDetail { detail: notice });
             }
 
             // Start provider transport setup before deriving and potentially
