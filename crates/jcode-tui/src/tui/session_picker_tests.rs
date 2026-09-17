@@ -2647,3 +2647,25 @@ fn handoff_picker_renders_handoff_title_and_help_hint() {
         "help should note s/S and d are disabled, got: {text}"
     );
 }
+
+#[test]
+fn handoff_picker_search_active_shows_search_help_over_mode_help() {
+    let mut picker = SessionPicker::for_handoffs(vec![
+        make_handoff_snapshot("handoff-a", "Fix login", "add tests"),
+    ]);
+
+    // Press `/` to enter search mode; the bottom help must switch to search
+    // assistance rather than staying on the handoff-mode line.
+    let _ = picker.handle_overlay_key(KeyCode::Char('/'), KeyModifiers::empty()).unwrap();
+    assert!(picker.search_active, "/ should activate search");
+
+    let text: String = buffer_text(&mut picker, 140, 40);
+    assert!(
+        text.contains("type to filter"),
+        "search help should be shown in search mode, got: {text}"
+    );
+    assert!(
+        !text.contains("s/S/d off"),
+        "handoff-mode help should not shadow search help, got: {text}"
+    );
+}

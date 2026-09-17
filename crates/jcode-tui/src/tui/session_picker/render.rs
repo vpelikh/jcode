@@ -654,10 +654,12 @@ impl SessionPicker {
 
         let mut help = if self.loading_message.is_some() {
             " Esc cancel ".to_string()
+        } else if self.search_active {
+            // Search help wins over the (session or handoff) mode help so the
+            // user always sees how to edit the query once `/` is pressed.
+            " type to filter · Ctrl+J/K or ↑↓ nav · Ctrl+W word-del · Esc cancel ".to_string()
         } else if self.handoff_mode {
             " Enter resume · ↑↓ · Esc | s/S/d off ".to_string()
-        } else if self.search_active {
-            " type to filter · Ctrl+J/K or ↑↓ nav · Ctrl+W word-del · Esc cancel ".to_string()
         } else {
             match crate::config::config().keybindings.session_picker_enter {
                 crate::config::SessionPickerResumeAction::CurrentTerminal => {
