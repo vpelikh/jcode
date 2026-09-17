@@ -999,3 +999,23 @@ Three client-request router handlers still carried a flat `swarm_members`
 
 Zero behavior change; the full `jcode-app-core` lib suite stays green
 (1480 passing) and clippy introduces no new warnings.
+
+### live_turn and debug_events handlers route through the swarm handle (landed 2026-09)
+
+Two more `pub(super)` handlers dropped flat swarm-map params for
+`&SwarmServiceHandle` (Seam B / Seam E progress).
+
+- **`live_turn.rs::idle_live_agent`** swaps the flat
+  `&Arc<RwLock<HashMap<String, SwarmMember>>>` for `&SwarmServiceHandle`,
+  reading `swarm.swarm_state.members`. Its two internal callers
+  (`run_live_turn_if_idle` / `run_live_system_turn_if_idle`) pass `swarm`
+  directly instead of `&swarm.swarm_state.members`, and the reservation tests
+  in `tests.rs` build the handle via `TestSwarmBuilder`.
+- **`debug_events.rs::maybe_handle_event_query_command`** swaps the flat
+  `event_history` `Arc` for `&SwarmServiceHandle`, binding
+  `let event_history = &swarm.event_history;`. The debug router passes
+  `&swarm_service_handle`; the now-unused `event_history` local in `debug.rs`
+  and the unused `Arc`/`RwLock` imports in `debug_events.rs` were dropped.
+
+Zero behavior change; the full `jcode-app-core` lib suite stays green
+(1480 passing) and clippy introduces no new warnings.

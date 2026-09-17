@@ -629,18 +629,21 @@ async fn idle_live_agent_reservation_blocks_a_second_wake_until_released() {
     let (member_event_tx, _member_event_rx) = mpsc::unbounded_channel();
     let member = attached_swarm_member(&session_id, member_event_tx);
     let swarm_members = Arc::new(RwLock::new(HashMap::from([(session_id.clone(), member)])));
+    let swarm = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .build();
 
-    let first = super::live_turn::idle_live_agent(&session_id, &sessions, &swarm_members).await;
+    let first = super::live_turn::idle_live_agent(&session_id, &sessions, &swarm).await;
     assert!(first.is_some(), "idle live session should be reservable");
 
-    let second = super::live_turn::idle_live_agent(&session_id, &sessions, &swarm_members).await;
+    let second = super::live_turn::idle_live_agent(&session_id, &sessions, &swarm).await;
     assert!(
         second.is_none(),
         "second reservation must fail while the first guard is alive"
     );
 
     drop(first);
-    let third = super::live_turn::idle_live_agent(&session_id, &sessions, &swarm_members).await;
+    let third = super::live_turn::idle_live_agent(&session_id, &sessions, &swarm).await;
     assert!(
         third.is_some(),
         "reservation is available again once released"
@@ -698,7 +701,7 @@ async fn wake_turn_holds_reservation_until_terminal_status_is_published() {
     let reacquired = timeout(Duration::from_secs(2), async {
         loop {
             if let Some(guard) =
-                super::live_turn::idle_live_agent(&session_id, &sessions, &swarm_members).await
+                super::live_turn::idle_live_agent(&session_id, &sessions, &swarm).await
             {
                 return guard;
             }

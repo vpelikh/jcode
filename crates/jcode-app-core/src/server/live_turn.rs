@@ -15,7 +15,7 @@
 
 use super::client_lifecycle::process_locked_message_streaming_mpsc;
 use super::services::SwarmServiceHandle;
-use super::{SwarmMember, session_event_fanout_sender, truncate_detail};
+use super::{session_event_fanout_sender, truncate_detail};
 use crate::agent::Agent;
 use crate::protocol::ServerEvent;
 use std::collections::HashMap;
@@ -33,7 +33,7 @@ type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
 pub(super) async fn idle_live_agent(
     session_id: &str,
     sessions: &SessionAgents,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    swarm: &SwarmServiceHandle,
 ) -> Option<OwnedMutexGuard<Agent>> {
     let agent = {
         let guard = sessions.read().await;
@@ -41,7 +41,7 @@ pub(super) async fn idle_live_agent(
     }?;
 
     let has_live_attachments = {
-        let members = swarm_members.read().await;
+        let members = swarm.swarm_state.members.read().await;
         members
             .get(session_id)
             .map(|member| !member.event_txs.is_empty() || !member.event_tx.is_closed())
@@ -150,7 +150,7 @@ pub(super) async fn run_live_turn_if_idle(
     sessions: &SessionAgents,
     swarm: &SwarmServiceHandle,
 ) -> bool {
-    let Some(agent) = idle_live_agent(session_id, sessions, &swarm.swarm_state.members).await
+    let Some(agent) = idle_live_agent(session_id, sessions, swarm).await
     else {
         return false;
     };
@@ -174,7 +174,7 @@ pub(super) async fn run_live_system_turn_if_idle(
     sessions: &SessionAgents,
     swarm: &SwarmServiceHandle,
 ) -> bool {
-    let Some(agent) = idle_live_agent(session_id, sessions, &swarm.swarm_state.members).await
+    let Some(agent) = idle_live_agent(session_id, sessions, swarm).await
     else {
         return false;
     };
