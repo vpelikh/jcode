@@ -2602,6 +2602,25 @@ fn handoff_picker_session_only_keys_are_no_ops() {
     let before = picker.filter_mode;
     let _ = picker.handle_overlay_key(KeyCode::Char('s'), KeyModifiers::empty()).unwrap();
     assert_eq!(picker.filter_mode, before, "s should be a no-op in handoff mode");
+    let _ = picker.handle_overlay_key(KeyCode::Char('S'), KeyModifiers::empty()).unwrap();
+    assert_eq!(picker.filter_mode, before, "S should be a no-op in handoff mode");
+    let _ = picker.handle_overlay_key(KeyCode::Char('d'), KeyModifiers::empty()).unwrap();
+    assert_eq!(picker.filter_mode, before, "d should be a no-op in handoff mode");
+
+    // Space multi-select and Claude takeover are also session-only: they must
+    // not mutate handoff state.
+    let _ = picker.handle_overlay_key(KeyCode::Char(' '), KeyModifiers::empty()).unwrap();
+    assert_eq!(
+        picker.selection_count(),
+        0,
+        "Space should not multi-select in handoff mode"
+    );
+    let _ = picker.handle_overlay_key(KeyCode::Char('T'), KeyModifiers::empty()).unwrap();
+    assert_eq!(
+        picker.pending_claude_takeover,
+        None,
+        "T should not arm a Claude takeover in handoff mode"
+    );
 }
 
 #[test]

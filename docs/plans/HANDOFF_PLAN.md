@@ -53,8 +53,9 @@ selectable. Both feed `render_handoff(id)` for a specific snapshot's preview.
 (title = intent, id, "closed <ago>" label, working dir), and its open todos +
 trailing assistant text render in the preview pane, reusing the session picker's
 list, arrow-key navigation, incremental filter/search, preview scroll, and mouse
-support unchanged. `s/S` filter cycling and `d` test-toggle are session-only and
-are disabled in handoff mode. Selecting a row emits
+support unchanged. `s/S` filter cycling, `d` test-toggle, `Space` multi-select,
+and `T` Claude takeover are session-only and are disabled in handoff mode.
+Selecting a row emits
 `PickerResult::HandoffSelected(session_id)`. The selected snapshot's id is
 carried (via a pending-handoff-resume on the App, drained on the async pump) to
 the server via the `set_handoff_resume` protocol request and stored as a

@@ -601,14 +601,15 @@ impl SessionPicker {
                 "sessions",
                 Style::default().fg(rgb(120, 120, 120)),
             ));
-            if self.handoff_mode {
-                // Replace the "sessions" label with a handoff-accurate one.
-                title_parts.pop();
-                title_parts.push(Span::styled(
+        }
+        if self.handoff_mode {
+            // The flat list count above said "sessions"; make it handoff-accurate.
+            title_parts.last_mut().map(|span| {
+                *span = Span::styled(
                     "handoffs",
                     Style::default().fg(rgb(120, 210, 230)),
-                ));
-            }
+                );
+            });
         }
 
         let filter_label = self.filter_mode.label().unwrap_or("all");

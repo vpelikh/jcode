@@ -1274,7 +1274,9 @@ impl SessionPicker {
             }
             KeyCode::Char('q') => return Ok(OverlayAction::Close),
             KeyCode::Char(' ') => {
-                self.toggle_selected_session();
+                if !self.handoff_mode {
+                    self.toggle_selected_session();
+                }
             }
             KeyCode::Enter => {
                 if self.onboarding_start_new_highlighted() {
@@ -1316,7 +1318,9 @@ impl SessionPicker {
                 }
             }
             KeyCode::Char('T') => {
-                self.begin_claude_takeover_confirmation();
+                if !self.handoff_mode {
+                    self.begin_claude_takeover_confirmation();
+                }
             }
             KeyCode::Char('s') => {
                 if !self.handoff_mode {
