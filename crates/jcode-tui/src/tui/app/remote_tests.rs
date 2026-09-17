@@ -1994,4 +1994,9 @@ fn apply_handoff_resume_reports_failure_without_panicking() {
         "expected an error message, got: {:?}",
         messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>()
     );
+    assert_eq!(
+        app.status_notice.as_ref().map(|(s, _)| s.as_str()),
+        Some("Handoff not applied"),
+        "the status notice should not claim success after a failure"
+    );
 }

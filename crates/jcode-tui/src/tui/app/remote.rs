@@ -129,6 +129,9 @@ pub(super) async fn apply_handoff_resume(
                 "Failed to apply handoff resume: {}",
                 err
             )));
+            // The selection arm set "Handoff selected"; correct it so the status
+            // does not claim success after a failure.
+            app.set_status_notice("Handoff not applied");
             Err(())
         }
     }
