@@ -1910,3 +1910,73 @@ fn remote_submit_input_never_strands_a_local_pending_turn() {
         "the prompt should be queued for the remote tick loop"
     );
 }
+
+#[test]
+fn apply_handoff_resume_sends_clear_then_handoff_resume_and_reports_ready() {
+    let mut app = create_test_app();
+    app.is_processing = false;
+
+    let request = crate::tui::app::PendingHandoffResume {
+        session_id: "handoff-abc".to_string(),
+        preview_line: "Resume this work".to_string(),
+    };
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    let id_before = remote.next_request_id_for_test();
+
+    let result = rt.block_on(super::apply_handoff_resume(&mut app, &mut remote, &request));
+    assert_eq!(result, Ok(()), "applying a handoff should succeed");
+
+    // The flow sends two requests: `/clear`, then `set_handoff_resume`.
+    // Each increments `next_request_id`, so exactly 2 more were consumed.
+    assert_eq!(
+        remote.next_request_id_for_test(),
+        id_before + 2,
+        "clear + set_handoff_resume should both be sent"
+    );
+
+    // The tick asserts on a "Handoff ready" message and the status notice.
+    let messages = app.display_messages();
+    assert!(
+        messages.iter().any(|m| m.content.contains("Handoff ready")
+            && m.content.contains("handoff-abc")
+            && m.content.contains("Resume this work")),
+        "expected a Handoff ready message, got: {:?}",
+        messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        app.status_notice.as_ref().map(|(s, _)| s.as_str()),
+        Some("Handoff selected")
+    );
+}
+
+#[test]
+fn apply_handoff_resume_reports_failure_without_panicking() {
+    // A broken socket makes the first `clear()` write fail; the helper must
+    // report the error as `Err(())` after pushing an error message, never panic.
+    let mut app = create_test_app();
+    app.is_processing = false;
+
+    let request = crate::tui::app::PendingHandoffResume {
+        session_id: "handoff-xyz".to_string(),
+        preview_line: "Someday".to_string(),
+    };
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    // Drop the peer end so writes to the read end fail immediately.
+    let _ = remote.take_dummy_peer();
+
+    let result = rt.block_on(super::apply_handoff_resume(&mut app, &mut remote, &request));
+    assert_eq!(result, Err(()), "a failed clear should surface as Err(())");
+
+    let messages = app.display_messages();
+    assert!(
+        messages.iter().any(|m| m.content.contains("Failed to apply handoff resume")),
+        "expected an error message, got: {:?}",
+        messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>()
+    );
+}

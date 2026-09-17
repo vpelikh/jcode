@@ -2603,3 +2603,28 @@ fn handoff_picker_session_only_keys_are_no_ops() {
     let _ = picker.handle_overlay_key(KeyCode::Char('s'), KeyModifiers::empty()).unwrap();
     assert_eq!(picker.filter_mode, before, "s should be a no-op in handoff mode");
 }
+
+#[test]
+fn handoff_picker_renders_handoff_title_and_help_hint() {
+    let mut picker = SessionPicker::for_handoffs(vec![
+        make_handoff_snapshot("handoff-a", "Fix login", "add tests"),
+    ]);
+
+    let text: String = buffer_text(&mut picker, 140, 40);
+
+    // The title calls them handoffs and drops the (misleading) session filter
+    // hint that s/S would be meaningful.
+    assert!(
+        text.contains("handoffs"),
+        "title should label the rows as handoffs, got: {text}"
+    );
+    assert!(
+        !text.contains("(s/S filter)"),
+        "session filter hint should be absent in handoff mode, got: {text}"
+    );
+    // The bottom help explains that s/S filter and d are disabled here.
+    assert!(
+        text.contains("s/S/d off"),
+        "help should note s/S and d are disabled, got: {text}"
+    );
+}

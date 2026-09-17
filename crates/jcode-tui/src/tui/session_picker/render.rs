@@ -601,6 +601,14 @@ impl SessionPicker {
                 "sessions",
                 Style::default().fg(rgb(120, 120, 120)),
             ));
+            if self.handoff_mode {
+                // Replace the "sessions" label with a handoff-accurate one.
+                title_parts.pop();
+                title_parts.push(Span::styled(
+                    "handoffs",
+                    Style::default().fg(rgb(120, 210, 230)),
+                ));
+            }
         }
 
         let filter_label = self.filter_mode.label().unwrap_or("all");
@@ -608,10 +616,17 @@ impl SessionPicker {
             format!("  {}", filter_label),
             Style::default().fg(rgb(255, 180, 100)),
         ));
-        title_parts.push(Span::styled(
-            " (s/S filter)",
-            Style::default().fg(rgb(80, 80, 80)),
-        ));
+        if self.handoff_mode {
+            title_parts.push(Span::styled(
+                "  · saved handoffs",
+                Style::default().fg(rgb(120, 210, 230)),
+            ));
+        } else {
+            title_parts.push(Span::styled(
+                " (s/S filter)",
+                Style::default().fg(rgb(80, 80, 80)),
+            ));
+        }
 
         if self.hidden_test_count > 0 {
             title_parts.push(Span::styled(
@@ -638,6 +653,8 @@ impl SessionPicker {
 
         let mut help = if self.loading_message.is_some() {
             " Esc cancel ".to_string()
+        } else if self.handoff_mode {
+            " Enter resume · ↑↓ · Esc | s/S/d off ".to_string()
         } else if self.search_active {
             " type to filter · Ctrl+J/K or ↑↓ nav · Ctrl+W word-del · Esc cancel ".to_string()
         } else {

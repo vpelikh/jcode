@@ -1,8 +1,8 @@
 #![cfg_attr(test, allow(clippy::items_after_test_module))]
 
 use super::{
-    App, DisplayMessage, PendingReloadReconnectStatus, ProcessingStatus, RemoteResumeActivity,
-    SendAction, ctrl_bracket_fallback_to_esc, input, parse_rate_limit_error,
+    App, DisplayMessage, PendingHandoffResume, PendingReloadReconnectStatus, ProcessingStatus,
+    RemoteResumeActivity, SendAction, ctrl_bracket_fallback_to_esc, input, parse_rate_limit_error,
     remote_notifications::present_swarm_notification, spawn_in_new_terminal,
 };
 use crate::bus::BusEvent;
@@ -86,6 +86,46 @@ pub(super) enum RemoteEventOutcome {
     Continue,
     Reconnect,
     Quit,
+}
+
+/// Apply a user-selected handoff from the `/handoff` overlay. Mirrors the
+/// manual `/handoffres` flow: clear the conversation in place (so the next
+/// message is the first visible one) then set the one-shot handoff resume
+/// override. Always clear so the override is guaranteed to fire even right
+/// after a reconnect when the client's display cache has not yet loaded server
+/// history. Returns `Ok(())` (and reported the "Handoff ready" message) or
+/// `Err(())` (after pushing an error) so the caller can decide whether the
+/// tick consumed input / needs a redraw.
+pub(super) async fn apply_handoff_resume(
+    app: &mut App,
+    remote: &mut RemoteConnection,
+    request: &PendingHandoffResume,
+) -> Result<(), ()> {
+    match async {
+        remote.clear().await?;
+        remote
+            .set_handoff_resume(Some(request.session_id.clone()))
+            .await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await
+    {
+        Ok(()) => {
+            app.push_display_message(DisplayMessage::system(format!(
+                "Handoff ready: {}\n{}",
+                request.session_id, request.preview_line
+            )));
+            app.set_status_notice("Handoff selected");
+            Ok(())
+        }
+        Err(err) => {
+            app.push_display_message(DisplayMessage::error(format!(
+                "Failed to apply handoff resume: {}",
+                err
+            )));
+            Err(())
+        }
+    }
 }
 
 pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) -> bool {
@@ -194,33 +234,9 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
         }
 
         if let Some(request) = app.take_pending_handoff_resume() {
-            // Mirror the manual `/handoffres` flow: clear the conversation in
-            // place (so the next message is the first visible one) then set the
-            // one-shot handoff resume override. Always clear so the override is
-            // guaranteed to fire even right after a reconnect when the client's
-            // display cache has not yet loaded server history.
-            match async {
-                remote.clear().await?;
-                remote.set_handoff_resume(Some(request.session_id.clone())).await?;
-                Ok::<(), anyhow::Error>(())
-            }
-            .await
-            {
-                Ok(()) => {
-                    app.push_display_message(DisplayMessage::system(format!(
-                        "Handoff ready: {}\n{}",
-                        request.session_id, request.preview_line
-                    )));
-                    app.set_status_notice("Handoff selected");
-                    return true;
-                }
-                Err(err) => {
-                    app.push_display_message(DisplayMessage::error(format!(
-                        "Failed to apply handoff resume: {}",
-                        err
-                    )));
-                    needs_redraw = true;
-                }
+            match apply_handoff_resume(app, remote, &request).await {
+                Ok(()) => return true,
+                Err(()) => needs_redraw = true,
             }
         }
 
