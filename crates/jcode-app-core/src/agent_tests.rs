@@ -3008,6 +3008,148 @@ async fn stalled_promise_skips_turns_that_emit_a_tool_call() {
     );
 }
 
+/// A provider that repeats the EXACT same tool call (same name + same input)
+/// for `REPEAT_TOOL_THRESHOLD` turns, then completes — reproducing the
+/// runaway-loop failure mode the repeat-tool guard (takeaway #7) exists to
+/// catch. On the completion turn it returns plain text so the turn ends.
+#[derive(Clone, Default)]
+struct RepeatingToolProvider {
+    calls: Arc<std::sync::Mutex<usize>>,
+}
+
+#[async_trait]
+impl Provider for RepeatingToolProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        let call = {
+            let mut guard = self.calls.lock().unwrap();
+            *guard += 1;
+            *guard
+        };
+        let (tx, rx) = tokio_mpsc::channel::<Result<StreamEvent>>(8);
+        tokio::spawn(async move {
+            if call <= guard::REPEAT_TOOL_THRESHOLD {
+                // Repeat the identical bash call (calls 1..=threshold).
+                let _ = tx
+                    .send(Ok(StreamEvent::ToolUseStart {
+                        id: "repeat_tool".to_string().into(),
+                        name: "bash".to_string(),
+                    }))
+                    .await;
+                let _ = tx
+                    .send(Ok(StreamEvent::ToolInputDelta(
+                        r#"{"command":"git status"}"#.to_string(),
+                    )))
+                    .await;
+                let _ = tx.send(Ok(StreamEvent::ToolUseEnd)).await;
+                let _ = tx
+                    .send(Ok(StreamEvent::MessageEnd {
+                        stop_reason: Some("tool_calls".to_string()),
+                    }))
+                    .await;
+            } else {
+                // The 4th (threshold) identical call was committed and the guard
+                // should have injected its reminder; provide a real completion so
+                // the turn can end.
+                let _ = tx.send(Ok(StreamEvent::TextDelta("done".to_string()))).await;
+                let _ = tx
+                    .send(Ok(StreamEvent::MessageEnd {
+                        stop_reason: Some("end_turn".to_string()),
+                    }))
+                    .await;
+            }
+        });
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    fn name(&self) -> &str {
+        "repeating-tool"
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+}
+
+/// The repeat-tool guard must fire through the REAL streaming loop: a model that
+/// emits the exact same tool call `REPEAT_TOOL_THRESHOLD` times in a row gets a
+/// short model-visible "[Guard]" reminder injected into the transcript, without
+/// ending the turn. This is the wiring-level counterpart to the detector unit
+/// tests in `guard.rs`.
+#[tokio::test]
+async fn streaming_turn_injects_repeat_tool_reminder_when_model_loops() {
+    let _guard = crate::storage::lock_test_env();
+    let repeating = RepeatingToolProvider::default();
+    let calls = repeating.calls.clone();
+    let provider: Arc<dyn Provider> = Arc::new(repeating);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent
+        .run_once_streaming_mpsc("do the task", Vec::new(), None, tx)
+        .await
+        .expect("turn should complete");
+
+    let mut text = String::new();
+    while let Ok(event) = rx.try_recv() {
+        if let ServerEvent::TextDelta { text: delta } = event {
+            text.push_str(&delta);
+        }
+    }
+    assert!(text.contains("done"), "turn must complete, got {text:?}");
+
+    // Exactly one [Guard] reminder must have been injected for the repeated run.
+    let reminders = agent
+        .session
+        .messages
+        .iter()
+        .filter(|m| {
+            m.role == Role::User
+                && m.content.iter().any(|block| match block {
+                    ContentBlock::Text { text, .. } => {
+                        text.contains("[Guard]") && text.contains("repeated identically")
+                    }
+                    _ => false,
+                })
+        })
+        .count();
+    assert_eq!(
+        reminders,
+        1,
+        "exactly one [Guard] reminder must be injected; transcript has {} messages",
+        agent.session.messages.len()
+    );
+
+    // The reminder must mention the repeated tool and the exact count.
+    let reminder_text = agent
+        .session
+        .messages
+        .iter()
+        .find_map(|m| {
+            m.content.iter().find_map(|block| match block {
+                ContentBlock::Text { text, .. } if text.contains("[Guard]") => Some(text.clone()),
+                _ => None,
+            })
+        })
+        .expect("reminder text present");
+    assert!(
+        reminder_text.contains("`bash`") && reminder_text.contains("4 times"),
+        "reminder must name the repeated tool and count, got: {reminder_text}"
+    );
+
+    // The turn must have issued the repeated calls then completed.
+    assert!(
+        *calls.lock().unwrap() >= guard::REPEAT_TOOL_THRESHOLD,
+        "model must have repeated the call at least the threshold times"
+    );
+}
+
 /// A provider reproducing the compact degradation: the first response is a
 /// SHORT turn that explicitly says it will invoke a tool ("I'll invoke bash
 /// now.") but contains no tool call. The second response is a real completion.
