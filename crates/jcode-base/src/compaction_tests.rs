@@ -1268,10 +1268,11 @@ fn test_restore_physical_consolidation_returns_transcript_as_is() {
     let mut manager = CompactionManager::new().with_budget(1_000);
 
     // A physically consolidated transcript: [summary, recent tail...].
-    let mut consolidated = Vec::new();
-    consolidated.push(make_text_message(Role::User, "Previous Conversation Summary ...[sum]"));
-    consolidated.push(make_text_message(Role::User, "tail 1"));
-    consolidated.push(make_text_message(Role::User, "tail 2"));
+    let consolidated = vec![
+        make_text_message(Role::User, "Previous Conversation Summary ...[sum]"),
+        make_text_message(Role::User, "tail 1"),
+        make_text_message(Role::User, "tail 2"),
+    ];
 
     let state = crate::session::StoredCompactionState {
         summary_text: "summarized".to_string(),
