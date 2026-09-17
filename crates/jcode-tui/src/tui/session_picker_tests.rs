@@ -2669,3 +2669,32 @@ fn handoff_picker_search_active_shows_search_help_over_mode_help() {
         "handoff-mode help should not shadow search help, got: {text}"
     );
 }
+
+#[test]
+fn handoff_picker_search_enter_emits_handoff_selected_not_resume_target() {
+    let mut picker = SessionPicker::for_handoffs(vec![
+        make_handoff_snapshot("handoff-login", "Fix login", "add auth tests"),
+        make_handoff_snapshot("handoff-parser", "Refactor parser", "rename module"),
+    ]);
+
+    // Enter search mode and narrow to the login handoff.
+    let _ = picker.handle_overlay_key(KeyCode::Char('/'), KeyModifiers::empty()).unwrap();
+    for c in "login".chars() {
+        let _ = picker
+            .handle_overlay_key(KeyCode::Char(c), KeyModifiers::empty())
+            .unwrap();
+    }
+    assert_eq!(picker.visible_session_count(), 1, "search should narrow to the login handoff");
+
+    // Enter must select the handoff (HandoffSelected), not try to resume the
+    // source session as a live session.
+    let action = picker
+        .handle_overlay_key(KeyCode::Enter, KeyModifiers::empty())
+        .expect("enter should be handled");
+    match action {
+        OverlayAction::Selected(PickerResult::HandoffSelected(id)) => {
+            assert_eq!(id, "handoff-login")
+        }
+        other => panic!("expected HandoffSelected from search enter, got {:?}", other),
+    }
+}
