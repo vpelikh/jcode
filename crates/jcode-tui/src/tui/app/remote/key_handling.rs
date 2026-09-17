@@ -37,7 +37,7 @@ pub(in crate::tui::app) async fn send_interleave_now(
 /// conversation (`/clear`, `/handoffres`) do not leave orphaned UI state (queued
 /// messages, pasted/pending content, inline images, streaming/live panes, swarm
 /// plan items, or side-panel pages) behind for the next message.
-fn clear_session_state_after_discard(app: &mut App) {
+pub(super) fn clear_session_state_after_discard(app: &mut App) {
     app.clear_provider_messages();
     app.clear_display_messages();
     app.queued_messages.clear();

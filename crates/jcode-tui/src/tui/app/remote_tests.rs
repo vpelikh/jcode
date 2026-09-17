@@ -1915,6 +1915,11 @@ fn remote_submit_input_never_strands_a_local_pending_turn() {
 fn apply_handoff_resume_sends_clear_then_handoff_resume_and_reports_ready() {
     let mut app = create_test_app();
     app.is_processing = false;
+    // Seed local display state that `/handoffres` must discard (mirroring the
+    // manual flow) so the old conversation does not persist once the override
+    // takes effect.
+    app.queued_messages.push("stale prompt".to_string());
+    app.pasted_contents.push("pasted".to_string());
 
     let request = crate::tui::app::PendingHandoffResume {
         session_id: "handoff-abc".to_string(),
@@ -1935,6 +1940,16 @@ fn apply_handoff_resume_sends_clear_then_handoff_resume_and_reports_ready() {
         remote.next_request_id_for_test(),
         id_before + 2,
         "clear + set_handoff_resume should both be sent"
+    );
+
+    // Local queued/pasted state is discarded, matching the manual `/handoffres`.
+    assert!(
+        app.queued_messages.is_empty(),
+        "clear_session_state_after_discard should clear queued messages"
+    );
+    assert!(
+        app.pasted_contents.is_empty(),
+        "clear_session_state_after_discard should clear pasted content"
     );
 
     // The tick asserts on a "Handoff ready" message and the status notice.

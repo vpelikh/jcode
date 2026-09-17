@@ -103,6 +103,12 @@ pub(super) async fn apply_handoff_resume(
 ) -> Result<(), ()> {
     match async {
         remote.clear().await?;
+        // Mirror the manual `/handoffres` flow exactly: after clearing the
+        // server conversation, reset the local client display state (queued
+        // messages, pasted content, inline images, streaming panes, swarm plan
+        // items, side-panel pages) so the overlay/transcript does not show the
+        // old conversation once the handoff override takes effect.
+        key_handling::clear_session_state_after_discard(app);
         remote
             .set_handoff_resume(Some(request.session_id.clone()))
             .await?;
