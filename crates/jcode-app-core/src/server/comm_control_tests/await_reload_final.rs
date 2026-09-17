@@ -55,6 +55,11 @@ async fn await_members_returns_persisted_final_response_after_reload_retry() {
         HashSet::from([requester.to_string()]),
     )])));
     let (swarm_event_tx, _swarm_event_rx) = broadcast::channel(32);
+    let swarm = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .swarms_by_id(Arc::clone(&swarms_by_id))
+        .swarm_event_tx(swarm_event_tx.clone())
+        .build();
 
     handle_comm_await_members(
         1,
@@ -68,9 +73,7 @@ async fn await_members_returns_persisted_final_response_after_reload_retry() {
         false,
         CommAwaitMembersContext {
             client_event_tx: &client_tx,
-            swarm_members: &swarm_members,
-            swarms_by_id: &swarms_by_id,
-            swarm_event_tx: &swarm_event_tx,
+            swarm: &swarm,
             await_members_runtime: &await_runtime,
         },
     )
@@ -152,6 +155,11 @@ async fn await_members_ignores_persisted_final_when_requested_member_is_queued_a
         HashSet::from([requester.to_string(), peer.to_string()]),
     )])));
     let (swarm_event_tx, _swarm_event_rx) = broadcast::channel(32);
+    let swarm = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .swarms_by_id(Arc::clone(&swarms_by_id))
+        .swarm_event_tx(swarm_event_tx.clone())
+        .build();
 
     handle_comm_await_members(
         2,
@@ -165,9 +173,7 @@ async fn await_members_ignores_persisted_final_when_requested_member_is_queued_a
         false,
         CommAwaitMembersContext {
             client_event_tx: &client_tx,
-            swarm_members: &swarm_members,
-            swarms_by_id: &swarms_by_id,
-            swarm_event_tx: &swarm_event_tx,
+            swarm: &swarm,
             await_members_runtime: &await_runtime,
         },
     )

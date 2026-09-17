@@ -456,12 +456,10 @@ pub(super) async fn handle_client(
     let client_count = client_service.client_count;
     let client_connections = client_service.client_connections;
     let swarm_members = swarm_service.swarm_state.members;
-    let swarms_by_id = swarm_service.swarm_state.swarms_by_id;
     let swarm_plans = swarm_service.swarm_state.plans;
     let file_touch = swarm_service.file_touch;
     let client_debug_state = debug_service.client_debug_state;
     let client_debug_response_tx = debug_service.client_debug_response_tx;
-    let swarm_event_tx = swarm_service.swarm_event_tx;
     let shutdown_signals = session_service.shutdown_signals;
     let soft_interrupt_queues = session_service.soft_interrupt_queues;
     let await_members_runtime = swarm_service.await_members_runtime;
@@ -2723,9 +2721,7 @@ pub(super) async fn handle_client(
                     wake,
                     CommAwaitMembersContext {
                         client_event_tx: &client_event_tx,
-                        swarm_members: &swarm_members,
-                        swarms_by_id: &swarms_by_id,
-                        swarm_event_tx: &swarm_event_tx,
+                        swarm: &swarm_service_handle,
                         await_members_runtime: &await_members_runtime,
                     },
                 )

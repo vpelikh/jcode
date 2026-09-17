@@ -949,3 +949,31 @@ the shared builder. The three now-satisfied `too_many_arguments` expects
 were removed; unused imports (`SwarmEvent`, `SwarmMutationRuntime`,
 `HashSet`, `broadcast`) trimmed. Zero behavior change; `comm_plan` (9) and
 `server::` (466) stay green and clippy introduces no new warnings.
+
+### comm_await handlers route through the swarm handle (landed 2026-09)
+
+The `await_members` handlers were the final `comm_await` call sites still
+carrying a flat swarm bag.
+
+- **`CommAwaitMembersContext` slimmed.** The context previously held the flat
+  `swarm_members` / `swarms_by_id` / `swarm_event_tx` triple; it now holds
+  `&SwarmServiceHandle` (plus `client_event_tx` and `await_members_runtime`).
+  `handle_comm_await_members` binds the three maps as body locals from
+  `ctx.swarm` and keeps every in-body reference, byte-identical behavior.
+- **`resume_background_awaits` takes `&SwarmServiceHandle`** (plus
+  `&AwaitMembersRuntime`), binding the maps as body locals.
+- **Callers migrated.** Both production routers pass a swarm handle:
+  `client_lifecycle.rs::handle_client` (`&swarm_service_handle`, dropping the
+  now-unused `swarms_by_id` / `swarm_event_tx` flat locals) and
+  `client_lightweight_control.rs::handle_lightweight_control_request`
+  (`swarm`). The startup recovery path in `server.rs` builds
+  `SwarmServiceHandle::from_server(self)` once for the resume `tokio::spawn`
+  instead of three field clones. All await test fixtures now build a
+  `SwarmServiceHandle` via `TestSwarmBuilder` with `.members` /
+  `.swarms_by_id` / `.swarm_event_tx` instead of the flat context fields.
+- `spawn_or_resume_await_members` intentionally keeps flat owned args: it
+  spawns into a task that needs owned `Arc`/`Sender` clones, and the plan's
+  design-decision A keeps such task-spawn internals unchanged.
+
+Zero behavior change; the full `jcode-app-core` lib suite stays green
+(1480 passing) and clippy introduces no new warnings.

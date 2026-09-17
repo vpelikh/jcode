@@ -643,9 +643,7 @@ pub(super) async fn handle_lightweight_control_request(
                 wake,
                 CommAwaitMembersContext {
                     client_event_tx: &client_event_tx,
-                    swarm_members,
-                    swarms_by_id,
-                    swarm_event_tx,
+                    swarm,
                     await_members_runtime,
                 },
             )
