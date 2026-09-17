@@ -2641,10 +2641,10 @@ fn handoff_picker_renders_handoff_title_and_help_hint() {
         !text.contains("(s/S filter)"),
         "session filter hint should be absent in handoff mode, got: {text}"
     );
-    // The bottom help explains that s/S filter and d are disabled here.
+    // The bottom help explains that the session-only keys are disabled here.
     assert!(
-        text.contains("s/S/d off"),
-        "help should note s/S and d are disabled, got: {text}"
+        text.contains("s/S/d"),
+        "help should note session keys are disabled, got: {text}"
     );
 }
 
@@ -2665,7 +2665,7 @@ fn handoff_picker_search_active_shows_search_help_over_mode_help() {
         "search help should be shown in search mode, got: {text}"
     );
     assert!(
-        !text.contains("s/S/d off"),
+        !text.contains("Enter resume"),
         "handoff-mode help should not shadow search help, got: {text}"
     );
 }

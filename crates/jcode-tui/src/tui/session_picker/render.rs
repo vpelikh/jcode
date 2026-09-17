@@ -659,7 +659,7 @@ impl SessionPicker {
             // user always sees how to edit the query once `/` is pressed.
             " type to filter · Ctrl+J/K or ↑↓ nav · Ctrl+W word-del · Esc cancel ".to_string()
         } else if self.handoff_mode {
-            " Enter resume · ↑↓ · Esc | s/S/d off ".to_string()
+            " Enter resume · ↑↓ · Esc | s/S/d/Space/T off ".to_string()
         } else {
             match crate::config::config().keybindings.session_picker_enter {
                 crate::config::SessionPickerResumeAction::CurrentTerminal => {
