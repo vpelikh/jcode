@@ -59,6 +59,62 @@ impl Agent {
         self.session.provider_session_id = None;
     }
 
+    /// Physically consolidate a just-completed compaction when
+    /// `[compaction] physically_consolidate` is enabled (deepseek-harness
+    /// takeaway #5). Callers pass the already-write-locked manager guard, so
+    /// the helper does not re-acquire the compaction lock.
+    ///
+    /// The manager has already applied the compaction internally (advanced
+    /// `compacted_count` and set `active_summary`) but left `session.messages`
+    /// un-rewritten (the virtual model). This helper rewrites the transcript to
+    /// `[summary_message, recent_tail...]` via
+    /// [`Session::physically_consolidate_compaction`], which records a balanced
+    /// `CompactionStart`/`CompactionEnd` bracket and marks the persisted state
+    /// `physically_consolidated`. It then marks the manager physically
+    /// consolidated so the next provider-view derivation returns the transcript
+    /// as-is instead of double-prepending the summary.
+    ///
+    /// Returns `true` when a physical consolidation was applied, `false`
+    /// otherwise (feature disabled, no active summary, or invalid span).
+    pub(super) fn physically_consolidate_if_enabled(
+        &mut self,
+        manager: &mut crate::compaction::CompactionManager,
+    ) -> bool {
+        if !crate::config::config().compaction.physically_consolidate {
+            return false;
+        }
+        // Only a genuine (non-empty) summary can be physically consolidated; a
+        // compaction that produced nothing has no summary to place at index 0.
+        let Some(state) = manager.persisted_state() else {
+            return false;
+        };
+        let manager_compacted = manager.compacted_count();
+        if manager_compacted == 0 {
+            return false;
+        }
+        // Build the recent tail from the still-un-rewritten transcript. The
+        // manager applied the compaction virtually, so messages[compacted_count..]
+        // are the messages that survive the cut.
+        let start = manager_compacted.min(self.session.messages.len());
+        let tail = self.session.messages[start..].to_vec();
+        let applied = self
+            .session
+            .physically_consolidate_compaction(
+                crate::id::new_id("compact"),
+                state.summary_text.clone(),
+                state.openai_encrypted_content.clone(),
+                state.covers_up_to_turn,
+                state.original_turn_count,
+                state.compacted_count,
+                tail,
+            )
+            .is_some();
+        if applied {
+            manager.mark_physically_consolidated();
+        }
+        applied
+    }
+
     pub fn poll_compaction_completion_event(&mut self) -> Option<CompactionEvent> {
         let provider_messages = self.session.messages_for_provider();
         let compaction = self.registry.compaction();
@@ -66,7 +122,10 @@ impl Agent {
             Ok(mut manager) => {
                 let event = manager.poll_compaction_event_with(&provider_messages);
                 if event.is_some() {
-                    self.sync_session_compaction_state_from_manager(&manager);
+                    let consolidated = self.physically_consolidate_if_enabled(&mut manager);
+                    if !consolidated {
+                        self.sync_session_compaction_state_from_manager(&manager);
+                    }
                 }
                 event
             }
@@ -252,7 +311,10 @@ impl Agent {
                     };
                     (dropped, usage_pct)
                 };
-                self.sync_session_compaction_state_from_manager(&manager);
+                let consolidated = self.physically_consolidate_if_enabled(&mut manager);
+                if !consolidated {
+                    self.sync_session_compaction_state_from_manager(&manager);
+                }
                 (dropped, usage_pct)
             }
             Err(_) => {

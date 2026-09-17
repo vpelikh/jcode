@@ -399,6 +399,21 @@ pub struct CompactionConfig {
     /// A single inline image larger than this is replaced with a text marker.
     /// (`PrunePolicy::node_caps` default.)
     pub prune_image_max_bytes: usize,
+
+    /// When true, the live producer physically consolidates `session.messages`
+    /// into `[summary_message, recent_tail...]` on compaction completion (both
+    /// auto-compaction and manual `/compact`), using the log-bracketed seam
+    /// (`Session::compact_transcript_with_bracket`, deepseek-harness takeaway
+    /// #5) instead of the legacy virtual model that keeps the full transcript
+    /// and prepends a synthetic summary at request time.
+    ///
+    /// Physical consolidation makes the transcript the single source of truth:
+    /// replay reproduces exactly what the provider saw, and reload needs no
+    /// separate `compacted_count` resume bookkeeping (the state is marked
+    /// `physically_consolidated`). It is a behavior- and persistence-changing
+    /// opt-in; the default keeps the historical virtual model.
+    #[serde(default)]
+    pub physically_consolidate: bool,
 }
 
 impl Default for CompactionConfig {
@@ -416,6 +431,7 @@ impl Default for CompactionConfig {
             goal_window_turns: 5,
             prune_tool_result_max_bytes: 16384,
             prune_image_max_bytes: 1024,
+            physically_consolidate: false,
         }
     }
 }
