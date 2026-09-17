@@ -363,7 +363,17 @@ fn handle_reload_queues_signal_for_canary_session() -> Result<()> {
             ),
         ])));
 
-        handle_reload(7, true, "session_test_reload", &agent, &swarm_members, &tx).await;
+        handle_reload(
+            7,
+            true,
+            "session_test_reload",
+            &agent,
+            &crate::server::test_util::TestSwarmBuilder::default()
+                .members(Arc::clone(&swarm_members))
+                .build(),
+            &tx,
+        )
+        .await;
 
         let reloading = events
             .recv()
@@ -432,7 +442,9 @@ async fn handle_reload_does_not_wait_for_busy_agent_lock() -> Result<()> {
             true,
             "session_fallback_reload",
             &agent,
-            &swarm_members,
+            &crate::server::test_util::TestSwarmBuilder::default()
+                .members(Arc::clone(&swarm_members))
+                .build(),
             &tx,
         ),
     )

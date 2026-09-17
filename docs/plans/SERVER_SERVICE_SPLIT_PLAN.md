@@ -977,3 +977,25 @@ carrying a flat swarm bag.
 
 Zero behavior change; the full `jcode-app-core` lib suite stays green
 (1480 passing) and clippy introduces no new warnings.
+
+### client-request router handlers route through the swarm handle (landed 2026-09)
+
+Three client-request router handlers still carried a flat `swarm_members`
+`pub(super)` param; they now take `&SwarmServiceHandle` (Seam B narrowing).
+
+- **`handle_rename_session` / `handle_set_working_dir`** (`client_actions.rs`)
+  and **`handle_reload`** (`client_session.rs`) swap the flat
+  `&Arc<RwLock<HashMap<String, SwarmMember>>>` for `&SwarmServiceHandle`,
+  binding `let swarm_members = &swarm.swarm_state.members;` as a body local so
+  every in-body reference (fanout / live-client fanout / member read) is
+  byte-identical.
+- **Routers** in `client_lifecycle.rs::handle_client` pass the existing
+  `&swarm_service_handle`.
+- **Test fixtures** (`client_actions_tests.rs` rename + 7 set_working_dir call
+  sites, `client_session_tests/reload.rs` both reload call sites) build a
+  `SwarmServiceHandle` inline via `TestSwarmBuilder::default().members(...)`.
+- Drops the now-unused `SwarmMember` imports in `client_actions.rs` and
+  `client_session.rs`.
+
+Zero behavior change; the full `jcode-app-core` lib suite stays green
+(1480 passing) and clippy introduces no new warnings.

@@ -1756,7 +1756,7 @@ pub(super) async fn handle_client(
                     force,
                     &client_session_id,
                     &agent,
-                    &swarm_members,
+                    &swarm_service_handle,
                     &client_event_tx,
                 )
                 .await;
@@ -1938,7 +1938,7 @@ pub(super) async fn handle_client(
                     title,
                     &agent,
                     &client_session_id,
-                    &swarm_members,
+                    &swarm_service_handle,
                     &client_event_tx,
                 )
                 .await;
@@ -1960,7 +1960,7 @@ pub(super) async fn handle_client(
                     working_dir,
                     &agent,
                     &client_session_id,
-                    &swarm_members,
+                    &swarm_service_handle,
                     &client_event_tx,
                 )
                 .await;

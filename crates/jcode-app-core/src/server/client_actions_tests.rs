@@ -481,7 +481,9 @@ async fn rename_session_event_uses_agent_session_id_even_when_client_id_is_stale
         Some("Release planning".to_string()),
         &agent,
         stale_client_session_id,
-        &swarm_members,
+        &crate::server::test_util::TestSwarmBuilder::default()
+            .members(Arc::clone(&swarm_members))
+            .build(),
         &client_event_tx,
     )
     .await;
@@ -1034,7 +1036,9 @@ async fn set_working_dir_updates_agent_and_fans_out_event() -> Result<()> {
         new_dir.to_str().expect("utf8").to_string(),
         &agent,
         &agent_session_id,
-        &swarm_members,
+        &crate::server::test_util::TestSwarmBuilder::default()
+            .members(Arc::clone(&swarm_members))
+            .build(),
         &client_event_tx,
     )
     .await;
@@ -1118,7 +1122,9 @@ async fn set_working_dir_to_current_dir_is_noop() -> Result<()> {
         current.to_str().expect("utf8").to_string(),
         &agent,
         &agent_session_id,
-        &swarm_members,
+        &crate::server::test_util::TestSwarmBuilder::default()
+            .members(Arc::clone(&swarm_members))
+            .build(),
         &client_event_tx,
     )
     .await;
@@ -1183,7 +1189,9 @@ async fn set_working_dir_noop_detects_canonically_equivalent_dir() -> Result<()>
         canonical.to_str().expect("utf8").to_string(),
         &agent,
         &agent_session_id,
-        &swarm_members,
+        &crate::server::test_util::TestSwarmBuilder::default()
+            .members(Arc::clone(&swarm_members))
+            .build(),
         &client_event_tx,
     )
     .await;
@@ -1236,7 +1244,9 @@ async fn set_working_dir_persists_resolved_dir_for_fresh_session() -> Result<()>
         target.to_str().expect("utf8").to_string(),
         &agent,
         &agent_session_id,
-        &swarm_members,
+        &crate::server::test_util::TestSwarmBuilder::default()
+            .members(Arc::clone(&swarm_members))
+            .build(),
         &client_event_tx,
     )
     .await;
@@ -1317,7 +1327,9 @@ async fn set_working_dir_to_previously_noncanonical_but_different_dir_is_a_chang
         dir_b.to_str().expect("utf8").to_string(),
         &agent,
         &agent_session_id,
-        &swarm_members,
+        &crate::server::test_util::TestSwarmBuilder::default()
+            .members(Arc::clone(&swarm_members))
+            .build(),
         &client_event_tx,
     )
     .await;
@@ -1378,7 +1390,9 @@ async fn set_working_dir_to_missing_dir_reports_error_not_change() -> Result<()>
         missing.to_str().expect("utf8").to_string(),
         &agent,
         &agent_session_id,
-        &swarm_members,
+        &crate::server::test_util::TestSwarmBuilder::default()
+            .members(Arc::clone(&swarm_members))
+            .build(),
         &client_event_tx,
     )
     .await;
@@ -1467,7 +1481,9 @@ async fn set_working_dir_event_carries_resolved_not_raw_input() -> Result<()> {
         raw_input,
         &agent,
         &agent_session_id,
-        &swarm_members,
+        &crate::server::test_util::TestSwarmBuilder::default()
+            .members(Arc::clone(&swarm_members))
+            .build(),
         &client_event_tx,
     )
     .await;

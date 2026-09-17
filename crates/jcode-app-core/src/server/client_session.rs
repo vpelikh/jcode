@@ -3,7 +3,7 @@
 use super::services::{MemberIdentity, SwarmServiceHandle};
 use super::client_state::{handle_get_history, spawn_model_prefetch_update};
 use super::{
-    ClientConnectionInfo, ClientDebugState, FileTouchService, SessionInterruptQueues, SwarmMember,
+    ClientConnectionInfo, ClientDebugState, FileTouchService, SessionInterruptQueues,
     SwarmState, fanout_live_client_event,
     persist_swarm_state_for, register_background_tool_signal, register_session_event_sender,
     register_session_interrupt_queue, remove_background_tool_signal,
@@ -807,9 +807,10 @@ pub(super) async fn handle_reload(
     force: bool,
     client_session_id: &str,
     agent: &Arc<Mutex<Agent>>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    swarm: &SwarmServiceHandle,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
+    let swarm_members = &swarm.swarm_state.members;
     // A non-forced reload (e.g. `jcode server reload`) is a graceful upgrade
     // request: only reload when this server is provably running older code than
     // an available reload candidate. This keeps us from downgrading a newer

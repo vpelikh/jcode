@@ -3,7 +3,7 @@
 use super::client_lifecycle::process_message_streaming_mpsc;
 use super::services::{SessionServiceHandle, SwarmServiceHandle};
 use super::{
-    ClientConnectionInfo, SwarmMember, SwarmState, fanout_session_event, persist_swarm_state_for,
+    ClientConnectionInfo, SwarmState, fanout_session_event, persist_swarm_state_for,
     swarm_id_for_session, truncate_detail,
 };
 use crate::agent::Agent;
@@ -518,10 +518,11 @@ pub(super) async fn handle_rename_session(
     title: Option<String>,
     agent: &Arc<Mutex<Agent>>,
     client_session_id: &str,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    swarm: &SwarmServiceHandle,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
     let started = Instant::now();
+    let swarm_members = &swarm.swarm_state.members;
     let normalized_title = title
         .as_deref()
         .map(str::trim)
@@ -601,10 +602,11 @@ pub(super) async fn handle_set_working_dir(
     working_dir: String,
     agent: &Arc<Mutex<Agent>>,
     client_session_id: &str,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    swarm: &SwarmServiceHandle,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
     let started = Instant::now();
+    let swarm_members = &swarm.swarm_state.members;
     let working_dir = working_dir.trim().to_string();
     if working_dir.is_empty() {
         let _ = client_event_tx.send(ServerEvent::Error {
