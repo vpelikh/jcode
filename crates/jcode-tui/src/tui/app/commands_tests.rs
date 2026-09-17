@@ -910,6 +910,48 @@ fn handoff_headline_returns_intent_and_falls_back_for_unknown() {
     );
 }
 
+/// With no saved handoffs, `/handoff` explains that and does not open an
+/// interactive overlay (there is nothing to select).
+#[test]
+fn local_handoff_empty_store_pushes_message_without_opening_picker() {
+    use crate::tui::app::commands_dispatch::dispatch_local_command;
+    use crate::tui::app::tests::create_test_app;
+
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match std::env::var_os("JCODE_HOME") {
+                Some(v) => crate::env::set_var("JCODE_HOME", v),
+                None => crate::env::remove_var("JCODE_HOME"),
+            }
+        }
+    }
+    let _guard = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().expect("temp home");
+    crate::env::set_var("JCODE_HOME", home.path());
+    let _restore = Restore;
+
+    let mut app = create_test_app();
+
+    assert!(
+        dispatch_local_command(&mut app, "/handoff"),
+        "/handoff should be claimed in local dispatch"
+    );
+    let msg = app
+        .display_messages
+        .last()
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("No saved handoffs"),
+        "empty /handoff should explain no snapshots exist: {msg}"
+    );
+    assert!(
+        app.session_picker_overlay.is_none(),
+        "empty /handoff must not open a selectable picker"
+    );
+}
+
 mod prune {
     struct PruneTestHome {
         previous: Option<std::ffi::OsString>,
