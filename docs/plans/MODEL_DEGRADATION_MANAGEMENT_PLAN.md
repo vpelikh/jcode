@@ -19,6 +19,12 @@ degradation-management system.
 - The non-streaming loop records a clean turn for rung decay; the streaming
   loop does not yet (its many exit paths were left untouched). Decay still
   happens there via window expiry.
+- The route-fallback action auto-switches without an interactive per-turn
+  confirmation. The plan's Slice-4 exit criteria called for confirming a switch
+  when the current route was explicitly user-chosen; the landed implementation
+  instead relies on the strict opt-in gate (`route_fallback_enabled` must be
+  true), which is treated as the user's standing authorization. Confirmation is
+  not implemented.
 
 > **Trigger for this plan (2026-09):** a long-running session with a live
 > language model degraded into a classic stalled-promise loop. The session
