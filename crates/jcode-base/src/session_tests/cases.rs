@@ -398,6 +398,7 @@ fn test_debug_memory_profile_reports_messages_and_provider_cache() {
         covers_up_to_turn: 7,
         original_turn_count: 9,
         compacted_count: 7,
+        physically_consolidated: false,
     });
 
     let _ = session.provider_messages();
@@ -1215,6 +1216,7 @@ fn test_save_persists_compaction_state() -> Result<()> {
         covers_up_to_turn: 8,
         original_turn_count: 8,
         compacted_count: 8,
+        physically_consolidated: false,
     });
 
     // Add a message so save() does not early-return (persist guard).
@@ -2210,6 +2212,7 @@ fn test_render_messages_shows_recent_compacted_history_by_default() {
         covers_up_to_turn: 2,
         original_turn_count: 2,
         compacted_count: 2,
+        physically_consolidated: false,
     });
 
     let rendered = render_messages(&session);
@@ -2259,6 +2262,7 @@ fn test_render_messages_can_expand_compacted_history_window() {
         covers_up_to_turn: 2,
         original_turn_count: 2,
         compacted_count: 2,
+        physically_consolidated: false,
     });
 
     // A small compacted prefix (few renderable messages, a single turn) must
@@ -2335,6 +2339,7 @@ fn test_compacted_history_truncates_only_when_long_and_many_turns() {
         covers_up_to_turn: prefix_turns,
         original_turn_count: prefix_turns,
         compacted_count,
+        physically_consolidated: false,
     });
 
     let total_renderable = prefix_turns * 5; // 100
@@ -2404,6 +2409,7 @@ fn test_compacted_history_never_truncates_single_long_turn() {
         covers_up_to_turn: 1,
         original_turn_count: 1,
         compacted_count,
+        physically_consolidated: false,
     });
 
     // Even with a tiny requested window, a single long turn is never truncated.
@@ -2464,6 +2470,7 @@ fn test_compacted_history_window_counts_renderable_messages_not_hidden_reminders
         covers_up_to_turn: 4,
         original_turn_count: 4,
         compacted_count: 4,
+        physically_consolidated: false,
     });
 
     let (rendered, _images, info) = render_messages_and_images_with_compacted_history(&session, 1);
@@ -3036,6 +3043,7 @@ fn test_journal_append_reload_keeps_sources_consistent() -> Result<()> {
         covers_up_to_turn: 1,
         original_turn_count: 1,
         compacted_count: 1,
+        physically_consolidated: false,
     };
     session.event_map.start_compaction("comp_1", 1);
     session.event_map.end_compaction(compaction.clone());
@@ -3824,6 +3832,7 @@ fn compaction_via_public_api_survives_journal_append_reload() -> Result<()> {
         covers_up_to_turn: 1,
         original_turn_count: 1,
         compacted_count: 1,
+        physically_consolidated: false,
     });
     session.add_message(
         Role::User,
@@ -3960,6 +3969,7 @@ fn full_session_state_round_trips_through_public_persistence() -> Result<()> {
         covers_up_to_turn: 1,
         original_turn_count: 1,
         compacted_count: 1,
+        physically_consolidated: false,
     });
 
     session.save()?;
@@ -4114,6 +4124,7 @@ fn fork_mid_bracket_is_consistent_and_resolvable() -> Result<()> {
         covers_up_to_turn: 1,
         original_turn_count: 1,
         compacted_count: 1,
+        physically_consolidated: false,
     };
     // Event order: append(m0), append(m1), CompactionStart, CompactionEnd.
     let start_idx = parent.event_map.events.len(); // will be CompactionStart index
@@ -4186,6 +4197,7 @@ fn compaction_across_multiple_journal_appends_replays_last_wins() -> Result<()> 
         covers_up_to_turn: 1,
         original_turn_count: 1,
         compacted_count: 1,
+        physically_consolidated: false,
     });
     session.add_message(
         Role::User,
@@ -4204,6 +4216,7 @@ fn compaction_across_multiple_journal_appends_replays_last_wins() -> Result<()> 
         covers_up_to_turn: 2,
         original_turn_count: 2,
         compacted_count: 2,
+        physically_consolidated: false,
     });
     session.save()?; // pure event-append: journals only append_events
 
@@ -4381,6 +4394,7 @@ fn legacy_branded_ids_journal_loads_through_real_persistence() -> Result<()> {
         covers_up_to_turn: 1,
         original_turn_count: 1,
         compacted_count: 1,
+        physically_consolidated: false,
     };
     session.event_map.start_compaction("comp_1", 1);
     session.event_map.end_compaction(compaction.clone());

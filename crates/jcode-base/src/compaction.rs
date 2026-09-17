@@ -391,6 +391,7 @@ impl CompactionManager {
                 covers_up_to_turn: summary.covers_up_to_turn,
                 original_turn_count: summary.original_turn_count,
                 compacted_count: self.compacted_count,
+                physically_consolidated: false,
             })
     }
 
@@ -1820,6 +1821,7 @@ pub async fn build_transfer_compaction_state(
         covers_up_to_turn: total_turns,
         original_turn_count: total_turns,
         compacted_count: 0,
+        physically_consolidated: false,
     }))
 }
 

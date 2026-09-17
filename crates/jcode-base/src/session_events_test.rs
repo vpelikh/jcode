@@ -172,6 +172,7 @@ fn test_event_map_compaction_operations() {
         covers_up_to_turn: 10,
         original_turn_count: 100,
         compacted_count: 5,
+        physically_consolidated: false,
     };
 
     session.set_compaction(compaction.clone());
@@ -206,6 +207,7 @@ fn test_compaction_bracket_balanced_round_trip() {
         covers_up_to_turn: 6,
         original_turn_count: 40,
         compacted_count: 6,
+        physically_consolidated: false,
     };
     map.end_compaction(state.clone());
 
@@ -266,6 +268,7 @@ fn test_all_session_event_ops_round_trip_losslessly() {
         covers_up_to_turn: 3,
         original_turn_count: 10,
         compacted_count: 3,
+        physically_consolidated: false,
     };
 
     let ops = vec![
@@ -346,6 +349,7 @@ fn test_compaction_bracket_orphan_detection_on_crash() {
         covers_up_to_turn: 12,
         original_turn_count: 50,
         compacted_count: 12,
+        physically_consolidated: false,
     });
     let log = reg.check(&map);
     assert!(
@@ -393,6 +397,7 @@ fn test_orphaned_compaction_reports_innermost_unmatched_start() {
                 covers_up_to_turn: 5,
                 original_turn_count: 20,
                 compacted_count: 5,
+                physically_consolidated: false,
             },
         },
         parent_id: None,
@@ -474,6 +479,7 @@ fn test_compaction_end_without_start_is_flagged() {
                 covers_up_to_turn: 1,
                 original_turn_count: 10,
                 compacted_count: 1,
+                physically_consolidated: false,
             },
         },
         parent_id: None,
@@ -833,6 +839,7 @@ fn test_rebuild_event_map_preserves_completed_bracket_run() {
         covers_up_to_turn: 1,
         original_turn_count: 1,
         compacted_count: 1,
+        physically_consolidated: false,
     };
     // A balanced bracket: Start -> replace -> End.
     session.compact_transcript_with_bracket("run", session.messages.clone(), comp.clone(), 1);
@@ -1036,6 +1043,7 @@ fn test_session_event_validation_skips_invalid_compaction() {
                 covers_up_to_turn: 100,
                 original_turn_count: 10, // invalid: covers > original
                 compacted_count: 5,
+                physically_consolidated: false,
             },
         },
         parent_id: None,
@@ -1231,6 +1239,7 @@ fn test_clear_messages_emits_clearall_and_drops_compaction() {
         covers_up_to_turn: 1,
         original_turn_count: 1,
         compacted_count: 1,
+        physically_consolidated: false,
     });
     assert!(session.compaction.is_some());
 
@@ -1296,6 +1305,7 @@ fn test_fork_boundary_compaction_cache_edge_cases() {
         covers_up_to_turn: 1,
         original_turn_count: 2,
         compacted_count: 1,
+        physically_consolidated: false,
     };
     // Build a log: [AppendMessage m0, SetCompaction, AppendMessage m1].
     map.events.push(SessionEvent {
@@ -1672,6 +1682,7 @@ fn test_rebuild_event_map_reflects_direct_field_sync() {
         covers_up_to_turn: 1,
         original_turn_count: 2,
         compacted_count: 1,
+        physically_consolidated: false,
     });
     session.memory_injections.push(StoredMemoryInjection {
         summary: "🧠 auto-recalled 1 memory".to_string(),
@@ -1712,6 +1723,7 @@ fn test_rebuild_event_map_after_clearing_compaction_drops_stale_setcompaction() 
         covers_up_to_turn: 1,
         original_turn_count: 1,
         compacted_count: 1,
+        physically_consolidated: false,
     });
     assert!(session.derive_compaction().is_some());
 
@@ -1786,6 +1798,7 @@ fn test_strip_transcript_for_remote_client_drops_compaction_when_messages_empty(
         covers_up_to_turn: 1,
         original_turn_count: 2,
         compacted_count: 1,
+        physically_consolidated: false,
     });
     session.record_memory_injection(
         "auto-recalled".to_string(),
@@ -1931,6 +1944,7 @@ fn test_replace_messages_then_direct_compaction_clear_stays_consistent() {
         covers_up_to_turn: 1,
         original_turn_count: 1,
         compacted_count: 1,
+        physically_consolidated: false,
     });
 
     let transcript = vec![StoredMessage {
@@ -1984,6 +1998,7 @@ fn test_load_path_hydrates_compaction_mem_inj_and_replay_events() {
         covers_up_to_turn: 1,
         original_turn_count: 2,
         compacted_count: 1,
+        physically_consolidated: false,
     });
     session.memory_injections.push(StoredMemoryInjection {
         summary: "recalled".to_string(),
@@ -2412,6 +2427,7 @@ fn test_compaction_cache_tracks_clear_and_reset_order() {
         covers_up_to_turn: 1,
         original_turn_count: 1,
         compacted_count: 1,
+        physically_consolidated: false,
     };
 
     let mut session = Session::create_with_id("test_comp_order".to_string(), None, None);
@@ -2459,6 +2475,7 @@ fn test_set_compaction_invalid_state_does_not_desync() {
         covers_up_to_turn: 5,
         original_turn_count: 1,
         compacted_count: 1,
+        physically_consolidated: false,
     };
     session.set_compaction(bad.clone());
 
@@ -2727,6 +2744,7 @@ fn test_persisted_event_log_survives_snapshot_round_trip_with_bracket_and_unknow
         covers_up_to_turn: 1,
         original_turn_count: 1,
         compacted_count: 1,
+        physically_consolidated: false,
     };
     session.event_map.start_compaction("comp_1", 1);
     // Bracket start does not touch the legacy vectors; a real producer would
@@ -2819,6 +2837,7 @@ fn test_compact_transcript_with_bracket_produces_balanced_durable_bracket() {
         covers_up_to_turn: 3,
         original_turn_count: 3,
         compacted_count: 2,
+        physically_consolidated: false,
     };
 
     let id = session.compact_transcript_with_bracket("comp_a", tail.clone(), compaction.clone(), 3);
@@ -2909,6 +2928,7 @@ fn test_set_compaction_with_bracket_records_balanced_bracket_without_rewriting_m
         covers_up_to_turn: 3,
         original_turn_count: 3,
         compacted_count: 2,
+        physically_consolidated: false,
     };
 
     let id = session.set_compaction_with_bracket("comp_state", compaction.clone());
@@ -2988,6 +3008,7 @@ fn test_set_compaction_with_bracket_invalid_state_falls_back_without_orphan() {
         covers_up_to_turn: 5,
         original_turn_count: 3,
         compacted_count: 2,
+        physically_consolidated: false,
     };
     session.set_compaction_with_bracket("comp_bad", invalid.clone());
     // No orphaned bracket, and no persisted (invalid) state in the legacy vector.
@@ -3016,6 +3037,7 @@ fn test_set_compaction_with_bracket_retry_completes_orphan() {
         covers_up_to_turn: 3,
         original_turn_count: 3,
         compacted_count: 2,
+        physically_consolidated: false,
     };
     session.set_compaction_with_bracket("first", good.clone());
     // A second call must not orphan the first bracket.
@@ -3050,6 +3072,7 @@ fn test_compaction_bracket_enforcement_catches_broken_bracket() {
                 covers_up_to_turn: 1,
                 original_turn_count: 10,
                 compacted_count: 1,
+                physically_consolidated: false,
             },
         },
         parent_id: None,
@@ -3199,6 +3222,7 @@ fn test_compact_transcript_retry_recovers_orphaned_bracket() {
         covers_up_to_turn: 1,
         original_turn_count: 1,
         compacted_count: 1,
+        physically_consolidated: false,
     };
     session.compact_transcript_with_bracket("retry_1", tail, compaction.clone(), 1);
 
@@ -3271,6 +3295,7 @@ fn test_compact_transcript_retry_on_multi_orphan_does_not_panic() {
         covers_up_to_turn: 1,
         original_turn_count: 1,
         compacted_count: 1,
+        physically_consolidated: false,
     };
     // The retry completes the innermost orphan (B). It must NOT panic, even in
     // debug builds, because fresh_bracket is false (we inherited an orphan).
@@ -3326,6 +3351,7 @@ fn test_compact_transcript_rejected_start_falls_back_to_set_compaction() {
         covers_up_to_turn: 1,
         original_turn_count: 1,
         compacted_count: 1,
+        physically_consolidated: false,
     };
     // covers_up_to_turn == 0 -> CompactionStart validation rejects it.
     session.compact_transcript_with_bracket("bad_start", tail, compaction.clone(), 0);
@@ -3407,6 +3433,7 @@ fn test_compact_transcript_invalid_compaction_state_opens_no_bracket() {
         covers_up_to_turn: 5,
         original_turn_count: 1,
         compacted_count: 1,
+        physically_consolidated: false,
     };
     session.compact_transcript_with_bracket("bad_state", tail, bad.clone(), 1);
 
@@ -3495,6 +3522,7 @@ fn test_current_compaction_ignores_open_bracket_and_keeps_last_completed() {
                 covers_up_to_turn: 1,
                 original_turn_count: 1,
                 compacted_count: 1,
+                physically_consolidated: false,
             },
         },
         parent_id: None,
@@ -3541,6 +3569,7 @@ fn test_current_compaction_cache_matches_reverse_scan_after_reload() {
         covers_up_to_turn: turn,
         original_turn_count: 10,
         compacted_count: turn,
+        physically_consolidated: false,
     };
 
     let cases: Vec<Vec<SessionEvent>> = vec![
@@ -3817,6 +3846,7 @@ fn test_memory_profile_snapshot_total_matches_debug_total() {
         covers_up_to_turn: 1,
         original_turn_count: 1,
         compacted_count: 1,
+        physically_consolidated: false,
     });
     session.append_session_event(SessionEvent {
         timestamp: Utc::now(),
@@ -3890,6 +3920,7 @@ fn test_memory_profile_event_log_refresh_after_injection_and_replay() {
         covers_up_to_turn: 1,
         original_turn_count: 1,
         compacted_count: 1,
+        physically_consolidated: false,
     });
     let s3 = session.memory_profile_snapshot();
     assert_eq!(

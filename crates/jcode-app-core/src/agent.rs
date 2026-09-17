@@ -763,6 +763,7 @@ impl Agent {
             covers_up_to_turn: compacted_count,
             original_turn_count: compacted_count,
             compacted_count,
+            physically_consolidated: false,
         };
 
         self.session.compaction = Some(state.clone());
