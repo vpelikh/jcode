@@ -413,11 +413,10 @@ impl App {
                     || modifiers.contains(KeyModifiers::SUPER) =>
             {
                 // Explicit text clipboard paste only. Never invoke smart file/image paste.
-                if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                    if let Ok(text) = clipboard.get_text() {
+                if let Ok(mut clipboard) = arboard::Clipboard::new()
+                    && let Ok(text) = clipboard.get_text() {
                         self.append_ssh_login_input(&text);
                     }
-                }
             }
             KeyCode::Backspace => {
                 self.remote_login.as_mut().unwrap().input.pop();

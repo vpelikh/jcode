@@ -559,7 +559,7 @@ fn push_todo_item_line(
     if !suffix.is_empty()
         && suffix.len() <= inner
             .width
-            .saturating_sub(spans_width(&first_spans) as u16) as usize
+            .saturating_sub(spans_width(&first_spans)) as usize
     {
         first_spans.push(Span::styled(
             suffix.to_string(),

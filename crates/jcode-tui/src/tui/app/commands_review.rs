@@ -1577,7 +1577,8 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
     // The in-flight reviewer id is persisted on the state (not just in-memory)
     // so a reloaded session resumes polling the same child session instead of
     // spawning a duplicate.
-    let result = if state.active_reviewer_id.is_some() {
+    
+    if state.active_reviewer_id.is_some() {
         let reviewer_id = state.active_reviewer_id.clone().unwrap();
         match poll_loop_reviewer(&reviewer_id, stale_reviewer_timeout()) {
             PollResult::Gone => {
@@ -1653,8 +1654,7 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
                 false
             }
         }
-    };
-    result
+    }
 }
 
 /// Whether the review loop changed files during any fix round. Only a

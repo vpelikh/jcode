@@ -1358,11 +1358,10 @@ pub(in crate::tui::app) fn handle_server_event(
             // immediately (which just burns credits against an endpoint still
             // over its completion-token cap), schedule a single wait-and-retry
             // honoring the upstream wait, and surface a clear message.
-            if let Some(wait) = app_mod::model_context::token_limit_retry_wait(&message) {
-                if app.schedule_pending_remote_retry_in(wait, "Token limit reached") {
+            if let Some(wait) = app_mod::model_context::token_limit_retry_wait(&message)
+                && app.schedule_pending_remote_retry_in(wait, "Token limit reached") {
                     return false;
                 }
-            }
             // A 429 rate-limit with no concrete reset time (e.g. a free-tier
             // "Rate limit exceeded" body and no `Retry-After` header) must not be
             // given up after a few sub-second backoffs. Honor any explicit server

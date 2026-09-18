@@ -106,11 +106,10 @@ pub(super) fn rate_limit_retry_wait(
 
     // 1. An explicit server Retry-After hint wins (capped so a hostile/oversized
     //    value can never stall the turn indefinitely).
-    if let Some(secs) = retry_after_secs {
-        if secs > 0 {
+    if let Some(secs) = retry_after_secs
+        && secs > 0 {
             return RateLimitRetry::Wait(Duration::from_secs(secs).min(MAX_HINT));
         }
-    }
 
     // 2. A wait already embedded in the body (token-limit "retry after 6m",
     //    "Повторите попытку через 8 мин.", etc.).
@@ -143,7 +142,7 @@ fn contains_status_429(text: &str) -> bool {
         let followed_by_digit = text
             .as_bytes()
             .get(idx + 3)
-            .map_or(false, |b| b.is_ascii_digit());
+            .is_some_and(|b| b.is_ascii_digit());
         if !preceded_by_digit && !followed_by_digit {
             return true;
         }

@@ -4409,8 +4409,8 @@ pub(crate) fn render_tool_message(
     // command (wrapped beneath the row so it is never elided) in addition to the
     // working directory, execution time, and exit code which already render
     // inline. Command *output* remains governed solely by show_bash_output.
-    if bash_verbose_block {
-        if let Some(command) = tc.input.get("command").and_then(|v| v.as_str()).filter(|c| !c.trim().is_empty()) {
+    if bash_verbose_block
+        && let Some(command) = tc.input.get("command").and_then(|v| v.as_str()).filter(|c| !c.trim().is_empty()) {
             // Wrap a long command across continuation lines rather than trimming
             // it with an ellipsis, so the full command stays legible.
             push_wrapped_indented(
@@ -4421,7 +4421,6 @@ pub(crate) fn render_tool_message(
                 row_width,
             );
         }
-    }
 
     // Fallback command preview on a second line only when the row has no
     // intent. With an intent present, the command summary is inline-only: it

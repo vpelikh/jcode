@@ -329,7 +329,7 @@ impl App {
     /// Format a `Duration` as a short human string (e.g. "6 minutes").
     fn format_duration_for_message(wait: Duration) -> String {
         let secs = wait.as_secs();
-        if secs >= 60 && secs % 60 == 0 {
+        if secs >= 60 && secs.is_multiple_of(60) {
             let minutes = secs / 60;
             if minutes == 1 {
                 "1 minute".to_string()
