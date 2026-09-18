@@ -86,6 +86,7 @@ fn palette_commands_that_open_surfaces_really_open_them() {
     // a command whose action silently opened the wrong surface would still
     // pass it. Here the surface-opening commands are committed and asserted to
     // visibly open exactly the surface their label names.
+    #[allow(clippy::type_complexity)] // Trait-object case table; a slice of (name, closure) pairs.
     let cases: &[(&str, &dyn Fn(&App) -> bool)] = &[
         ("Settings", &|app| app.model.panel.is_open()),
         ("Help", &|app| app.model.help_open),

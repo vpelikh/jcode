@@ -266,7 +266,6 @@ pub struct Frame {
     strip_top: Option<f64>,
 }
     #[allow(dead_code)] // Unused feature scaffolding/geometry kept for the desktop app; not yet wired into the render path.
-
 impl Frame {
     /// Resolve geometry for a surface of `size` physical pixels at `scale`,
     /// with a single-line composer.

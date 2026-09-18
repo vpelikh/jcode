@@ -149,6 +149,7 @@ struct App {
     /// Its own channel rather than the harness one: a scan is local disk work
     /// with no daemon involved, and routing it through the connection would
     /// mean a disconnected window could not list its own history.
+#[allow(clippy::type_complexity)] // Resume-scan channel pair; kept inline for the shared worker struct.
     resume_scans: Option<(Sender<Vec<resume::Record>>, Receiver<Vec<resume::Record>>)>,
     clipboard: clipboard::Clipboard,
     /// Images pasted into the composer, waiting for the next submission.

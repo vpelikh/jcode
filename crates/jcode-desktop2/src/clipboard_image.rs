@@ -74,7 +74,6 @@ pub fn from_wayland() -> Option<Image> {
     })
 }
     #[allow(dead_code)] // Unused feature scaffolding/geometry kept for the desktop app; not yet wired into the render path.
-
 /// Which media type, if any, of those on offer we would take. Split out so the
 /// preference order is testable without a compositor: the ordering is the part
 /// with a decision in it, and it is not observable from the outside otherwise.
