@@ -893,8 +893,8 @@ mod tests {
         };
 
         assert_eq!(
-            cache_relevant_message_hashes(&[sent.clone()]),
-            cache_relevant_message_hashes(&[persisted.clone()]),
+            cache_relevant_message_hashes(std::slice::from_ref(&sent)),
+            cache_relevant_message_hashes(std::slice::from_ref(&persisted)),
             "non-transmitted metadata must not change the cache-relevant hash"
         );
         assert_eq!(
