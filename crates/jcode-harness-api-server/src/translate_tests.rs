@@ -1759,7 +1759,7 @@ fn archive_restore_and_retention_are_reversible_and_owner_only() {
         .iter()
         .find(|session| session.session_id == "old_session")
         .expect("old session remains restorable");
-    assert_eq!(old.archived, true);
+    assert!(old.archived);
     assert!(old.archived_at_ms.is_some());
     let recent = sessions
         .iter()

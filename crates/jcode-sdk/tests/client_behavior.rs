@@ -56,11 +56,8 @@ fn fake_harness(handle: impl Fn(&ClientFrame, &mut dyn Write) + Send + 'static) 
     std::thread::spawn(move || {
         let mut reader = BufReader::new(theirs.try_clone().expect("clone"));
         let mut writer = theirs;
-        loop {
-            let frame: ClientFrame = match read_frame(&mut reader) {
-                Ok(frame) => frame,
-                Err(_) => break,
-            };
+        while let Ok(frame) = read_frame(&mut reader) {
+            let frame: ClientFrame = frame;
             // The handshake is boilerplate every test would repeat.
             if let ApiRequest::Hello { .. } = frame.request {
                 let reply = ServerFrame {

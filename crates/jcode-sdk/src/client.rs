@@ -307,12 +307,16 @@ fn stop_global_stream(control: &GlobalEventControl, error: Option<Error>) {
     drop(children);
 }
 
+/// One live subscription: `(id, session filter, sink)` fanned out by the
+/// reader thread (see `EventStream`).
+type SubscriberEntry = (u64, Option<String>, Sender<ApiEvent>);
+
 struct Inner {
     writer: Mutex<Box<dyn Write + Send>>,
     /// Requests waiting for their `reply_to` frame.
     pending: Mutex<HashMap<u64, Sender<ServerFrame>>>,
     /// Live subscriptions: (id, session filter, sink).
-    subscribers: Mutex<Vec<(u64, Option<String>, Sender<ApiEvent>)>>,
+    subscribers: Mutex<Vec<SubscriberEntry>>,
     next_id: AtomicU64,
     next_sub: AtomicU64,
     closed: AtomicBool,
@@ -1478,11 +1482,8 @@ fn start_global_child(parent: &JcodeClient, control: &Arc<GlobalEventControl>, s
 /// The reader thread: correlates replies, fans stream events out.
 fn spawn_reader(inner: Arc<Inner>, mut reader: Box<dyn BufRead + Send>) {
     std::thread::spawn(move || {
-        loop {
-            let frame: ServerFrame = match read_frame(&mut reader) {
-                Ok(frame) => frame,
-                Err(_) => break,
-            };
+        while let Ok(frame) = read_frame(&mut reader) {
+            let frame: ServerFrame = frame;
             // Unknown kinds are skipped silently, per the protocol's
             // forward-compatibility rule.
             if matches!(frame.event, ApiEvent::Unknown) {
