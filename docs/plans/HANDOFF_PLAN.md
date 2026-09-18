@@ -311,6 +311,21 @@ the prior environment.
   or partially append), so it is O(1) on the per-frame render path yet robust
   to an emptied visible list.
 
+- **Row-model unification (follow-up, deferred).** A fully-uniform `Vec<Row>`
+  pipeline (groups included) is feasible but requires decoupling the
+  serializable `HandoffSnapshot` / `HandoffTodo` shapes out of `jcode-base`
+  into `jcode-session-types`, since `ServerGroup` lives in the leaf
+  `jcode-tui-session-picker` crate that cannot depend on `jcode-base`
+  (that would create a cycle with `jcode-app-core`). Doing so would let
+  `ServerGroup.sessions` become `Vec<Row>` and would let `Row`/`HandoffModel`
+  move into the picker crate. Payoff is architectural only — one accessor
+  path, no `Group`-arm special case, a self-contained picker crate, and the
+  ability to group handoffs by project — with **zero user-visible behavior
+  change**. It touches the serialization/wire surface and re-types a public
+  struct across `loading.rs`, `memory.rs`, `filter.rs`, and test literals, so
+  it is deliberately out of scope here. Optional; pursue only if grouped
+  handoffs or a non-app-core picker consumer becomes a real need.
+
 - **Atomic handoff apply (non-atomic clear+set is a known gap).** The overlay
   applies a selection as `remote.clear()` then `set_handoff_resume` — two
   requests that can split if the transport drops between them, leaving a cleared
