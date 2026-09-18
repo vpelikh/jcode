@@ -1487,7 +1487,7 @@ fn confidence_fingerprint_ignores_confidence_churn_when_history_is_non_empty() {
         ..Default::default()
     };
 
-    let fp_base = <App>::confidence_gate_fingerprint(&[base.clone()]);
+    let fp_base = <App>::confidence_gate_fingerprint(std::slice::from_ref(&base));
 
     let mut churned = base.clone();
     churned.confidence = Some(crate::todo::ConfidenceState::from_legacy_score(90));
@@ -1525,7 +1525,7 @@ fn confidence_fingerprint_ignores_priority_churn_on_todo_without_completion_conf
         completion_confidence: None, // never enters the weighted average
         ..Default::default()
     };
-    let fp_base = <App>::confidence_gate_fingerprint(&[base.clone()]);
+    let fp_base = <App>::confidence_gate_fingerprint(std::slice::from_ref(&base));
 
     let mut churned = base.clone();
     churned.priority = "critical".to_string();

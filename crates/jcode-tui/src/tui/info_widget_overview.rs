@@ -350,7 +350,7 @@ mod tests {
             .find(|p| p.kind == InfoPageKind::TodosExpanded)
             .unwrap();
         // header + 7 wrapped rows (rendered height, border-exclusive here).
-        assert!(expanded.height >= 1 + 7, "height {0}", expanded.height);
+        assert!(expanded.height > 7, "height {0}", expanded.height);
 
         // A huge list that cannot fit the overview height must degrade to the
         // compact summary page, not produce an oversized/truncated page.

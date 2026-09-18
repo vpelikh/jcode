@@ -574,7 +574,7 @@ fn todo_long_content_wraps_instead_of_truncating() {
 handles streaming partial results and rendering them to the debug side panel";
     let body_no_spaces = long_body.replace(' ', "");
     let data = InfoWidgetData {
-        todos: vec![todo_item("a", &long_body, "in_progress", None)],
+        todos: vec![todo_item("a", long_body, "in_progress", None)],
         ..Default::default()
     };
     let text = lines_text(&render_todos_widget(&data, Rect::new(0, 0, 30, 20)));

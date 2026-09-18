@@ -275,7 +275,7 @@ fn save_completed_todo(session_id: &str, completion_confidence: Option<u8>) {
             assigned_to: None,
             confidence: None,
             completion_confidence: completion_confidence
-                .map(|score| crate::todo::ConfidenceState::from_legacy_score(score)),
+                .map(crate::todo::ConfidenceState::from_legacy_score),
             confidence_history: match completion_confidence {
                 // Validated -> Verified: a single-level step, no spike.
                 Some(_) => vec![

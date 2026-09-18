@@ -2275,8 +2275,7 @@ fn tool_call_details_bash_renders_full_wrapped_command_without_lossy_row_snippet
 
     // Row must not carry a lossy command snippet alongside the intent.
     let row_text: String = rendered
-        .first()
-        .map(|l| l.clone())
+        .first().cloned()
         .unwrap_or_default();
     assert!(
         !row_text.contains("· $ "),

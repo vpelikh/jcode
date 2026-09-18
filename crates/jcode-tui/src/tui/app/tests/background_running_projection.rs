@@ -107,7 +107,7 @@ fn focused_session_background_count_reflects_only_that_sessions_live_tasks() {
         // Clean up: cancel the tasks (normal completion path), which also stops
         // the pending futures. The TaskFileCleanup guard additionally removes
         // any on-disk files even if this cleanup or an earlier assert panics.
-        let _ = rt.block_on(async {
+        rt.block_on(async {
             let _ = manager.cancel(&a.task_id).await;
             let _ = manager.cancel(&b.task_id).await;
         });

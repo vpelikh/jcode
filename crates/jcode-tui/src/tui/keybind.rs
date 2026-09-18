@@ -9,6 +9,8 @@ use jcode_tui_core::keybind::{
     format_binding, is_disabled, macos_option_char_to_ascii_key, parse_bindings_or_default,
     parse_keybinding, parse_optional, parse_or_default,
 };
+#[cfg(test)]
+use jcode_tui_core::keybind::alt_label;
 
 // Re-export the per-platform keybinding registry + provenance + validation API
 // so the rest of the TUI can reach it via `crate::tui::keybind::*`.
