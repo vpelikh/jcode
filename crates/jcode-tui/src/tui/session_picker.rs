@@ -576,6 +576,11 @@ impl SessionPicker {
     /// `/handoffres` override flow. Rows are built into the flat (ungrouped)
     /// path, matching how [`new_grouped`](Self::new_grouped) treats an empty
     /// server list plus orphan sessions.
+    ///
+    /// Note: an empty input produces a picker with no backing rows, which
+    /// [`is_handoff`](Self::is_handoff) reports as `false` (matching the
+    /// derived-from-rows contract). Callers should avoid passing an empty list;
+    /// the app-level `open_handoff_picker` guard already does so.
     pub fn for_handoffs(snapshots: Vec<HandoffSnapshot>) -> Self {
         let rows = snapshots
             .into_iter()
