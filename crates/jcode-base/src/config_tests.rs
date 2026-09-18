@@ -1,5 +1,5 @@
 use super::{
-    AmbientConfig, AutoReviewConfig, Config, DiffDisplayMode, DisplayConfig, HookCommands,
+    AmbientConfig, Config, DiffDisplayMode, DisplayConfig, HookCommands,
     LatexRenderingMode, LoopGuardConfig, McpToolsMode, ProviderConfig, SessionPickerResumeAction,
     SwarmSpawnMode, ToolConfig, config_env_fingerprint, populate_context_limits_from_config_ref,
 };

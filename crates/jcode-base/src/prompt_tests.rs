@@ -753,9 +753,7 @@ fn default_preferred_tools_guidance_matches_system_prompt_code_search_section() 
 
     // DEFAULT_PREFERRED_TOOLS starts with a "# Default Preferred Tools" heading
     // then the guidance paragraphs.
-    let const_body = DEFAULT_PREFERRED_TOOLS
-        .splitn(2, "\n\n")
-        .nth(1)
+    let const_body = DEFAULT_PREFERRED_TOOLS.split_once("\n\n").map(|x| x.1)
         .expect("default preferred tools should have a body")
         .trim();
 

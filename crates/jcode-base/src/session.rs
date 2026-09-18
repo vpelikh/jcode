@@ -2325,6 +2325,7 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
     /// `recent_tail` is the slice of the pre-compaction transcript that survives
     /// (i.e. the active messages the manager chose to keep). It becomes indices
     /// `1..` of the new transcript, after the summary message.
+    #[allow(clippy::too_many_arguments)] // Args map 1:1 to StoredCompactionState fields; grouping into a struct would duplicate the shape.
     pub fn physically_consolidate_compaction(
         &mut self,
         compaction_id: impl Into<CompactionId>,

@@ -3538,7 +3538,7 @@ fn log_only_plugin_event_forces_persistence_without_message() -> Result<()> {
         "log-only plugin marker must survive save + reload"
     );
     assert!(
-        reloaded.messages.is_empty() || reloaded.has_message_beyond_session_context() == false,
+        reloaded.messages.is_empty() || !reloaded.has_message_beyond_session_context(),
         "the session still has no real conversation"
     );
     reloaded
@@ -4278,7 +4278,7 @@ fn old_format_journal_without_append_events_still_loads() -> Result<()> {
 
     // Simulate an OLD journal: rewrite the journal line, stripping `append_events`.
     let line = std::fs::read_to_string(&journal_path)?;
-    let mut entry: serde_json::Value = serde_json::from_str(&line.trim_end())?;
+    let mut entry: serde_json::Value = serde_json::from_str(line.trim_end())?;
     if let serde_json::Value::Object(map) = &mut entry {
         map.remove("append_events");
     }

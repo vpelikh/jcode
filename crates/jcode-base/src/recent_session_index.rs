@@ -112,7 +112,7 @@ pub fn recent(limit: usize) -> Result<Vec<RecentSessionMetadata>> {
 /// can locate a session without paging through the full `/list`.
 pub fn search(query: &str, limit: usize) -> Result<Vec<RecentSessionMetadata>> {
     let connection = open()?;
-    let like = format!("%{}%", query.replace('\\', "").replace('%', ""));
+    let like = format!("%{}%", query.replace(['\\', '%'], ""));
     let mut statement = connection.prepare(
         "SELECT session_id, working_dir, generated_title, custom_title,
                 todo_title, saved, updated_at_ms, last_active_at_ms

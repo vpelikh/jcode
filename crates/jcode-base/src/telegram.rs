@@ -816,8 +816,7 @@ async fn send_message_once(
             }
             let backoff = retry_after
                 .unwrap_or_else(|| 2u64.pow(attempts.saturating_sub(1)))
-                .max(1)
-                .min(MAX_RETRY_DELAY_SECS);
+                .clamp(1, MAX_RETRY_DELAY_SECS);
             logging::warn(&format!(
                 "Telegram rate limited, waiting {backoff}s (attempt {attempts})"
             ));
@@ -881,6 +880,7 @@ fn is_markdown_parse_error_v2(description: &str) -> bool {
 /// Returns `Err` when the request fails to send *or* Telegram reports the action
 /// was not accepted (`ok:false`), so callers can decide whether retrying is
 /// worthwhile rather than blindly looping a rejected indicator.
+#[allow(clippy::result_unit_err)] // Error is intentionally a unit: callers treat the indicator as best-effort and ignore the detail.
 pub async fn send_chat_action(
     client: &reqwest::Client,
     bot_token: &str,
@@ -1519,7 +1519,8 @@ mod tests {
 
     #[test]
     fn test_discovery_backoff_is_reasonable() {
-        assert!(DISCOVERY_BACKOFF_SECS >= 30);
+        // Enforced at compile time: DISCOVERY_BACKOFF_SECS is a pub const.
+        const _: () = assert!(DISCOVERY_BACKOFF_SECS >= 30);
     }
 
     #[test]
@@ -1756,13 +1757,11 @@ mod tests {
                     let (reader, mut writer) = stream.into_split();
                     let mut reader = BufReader::new(reader);
                     let mut request_line = String::new();
-                    if reader.read_line(&mut request_line).await.is_ok() {
-                        if let Ok(mut c) = captured.try_lock() {
-                            if c.is_none() {
+                    if reader.read_line(&mut request_line).await.is_ok()
+                        && let Ok(mut c) = captured.try_lock()
+                            && c.is_none() {
                                 *c = Some(request_line.trim().to_string());
                             }
-                        }
-                    }
                     // Drain remaining request headers + body so the client sees the
                     // response cleanly.
                     let mut buf = [0u8; 4096];
@@ -1976,11 +1975,10 @@ mod tests {
                     let (reader, mut writer) = stream.into_split();
                     let mut reader = BufReader::new(reader);
                     let mut request_line = String::new();
-                    if reader.read_line(&mut request_line).await.is_ok() {
-                        if let Ok(mut c) = counters.try_lock() {
+                    if reader.read_line(&mut request_line).await.is_ok()
+                        && let Ok(mut c) = counters.try_lock() {
                             c.push(idx);
                         }
-                    }
                     let mut buf = [0u8; 4096];
                     let _ = reader.read(&mut buf).await;
                     let response = if Some(idx) == fail_index {

@@ -1133,7 +1133,7 @@ fn import_rejects_malformed_payload() {
     let _guard = crate::storage::lock_test_env();
     let env = HandoffTestEnv::new();
     let cwd = env._home.path();
-    std::fs::create_dir_all(&cwd).ok();
+    std::fs::create_dir_all(cwd).ok();
     assert!(import_handoff("{{{ not json", Some(cwd), "closed").is_none());
     assert!(list_all_handoffs().is_empty(), "nothing adopted on garbage");
 }
