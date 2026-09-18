@@ -74,7 +74,6 @@ pub enum StallKind {
 }
 
 impl StallKind {
-    #[allow(dead_code, reason = "used only by describe() for diagnostics")]
     fn as_str(self) -> &'static str {
         match self {
             Self::StalledPromise => "stalled_promise",
@@ -87,7 +86,6 @@ impl StallKind {
 /// Observational record for a single stall event.
 #[derive(Debug, Clone)]
 struct StallRecord {
-    #[allow(dead_code, reason = "reporting only; later kinds will populate it")]
     kind: StallKind,
     at: Instant,
 }
