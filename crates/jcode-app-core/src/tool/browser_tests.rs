@@ -218,6 +218,7 @@ fn description_tells_models_to_check_status_before_setup() {
 
 #[cfg(unix)]
 #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
 async fn readiness_does_not_trust_a_stale_setup_marker() {
     use std::os::unix::fs::PermissionsExt;
 

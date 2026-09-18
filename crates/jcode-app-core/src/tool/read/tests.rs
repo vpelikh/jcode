@@ -818,6 +818,7 @@ fn collect_prior_read_candidates_keeps_uncompacted_reads_with_ranges() {
 /// isolated `JCODE_HOME`), the global config cache (via `Config::invalidate_cache`),
 /// and `ReadTool::execute` itself.
 #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
 async fn read_tool_dedup_returns_pointer_for_unchanged_reread() {
     // Isolate config + session storage so the test never touches the user's
     // real ~/.jcode directory (the same pattern config_color_tests uses).
@@ -903,6 +904,7 @@ async fn read_tool_dedup_returns_pointer_for_unchanged_reread() {
 /// never a stale pointer. This exercises the freshness guard through the real
 /// `ReadTool::execute` path.
 #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
 async fn read_tool_dedup_returns_fresh_content_when_file_changed() {
     let _guard = crate::storage::lock_test_env();
     let prev_home = std::env::var_os("JCODE_HOME");
@@ -992,6 +994,7 @@ async fn read_tool_dedup_returns_fresh_content_when_file_changed() {
 /// `read_dedup` is on. This is the gate that avoids the per-read session load
 /// for the common "read a few lines" case.
 #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
 async fn read_tool_dedup_skips_lookup_for_small_reads() {
     let _guard = crate::storage::lock_test_env();
     let prev_home = std::env::var_os("JCODE_HOME");
