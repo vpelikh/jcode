@@ -154,12 +154,11 @@ pub fn prune_contents(
     // Step 2: aggregate tool-result budget, but only when no image byte was
     // reclaimed (mirrors historical escalation: never require images and tool
     // results both).
-    if report.images_stripped == 0 {
-        if let Some(budget) = policy.tool_result_total_budget {
+    if report.images_stripped == 0
+        && let Some(budget) = policy.tool_result_total_budget {
             report.tool_results_truncated +=
                 prune_truncate_tool_results_in_contents(contents, budget);
         }
-    }
 
     // Step 3: per-node caps.
     if let Some(cap) = policy.image_max_chars {
@@ -186,8 +185,8 @@ fn strip_oversized_images_node(contents: &mut [&mut Vec<ContentBlock>], max_char
     let mut replaced = 0;
     for content in contents.iter_mut() {
         for block in content.iter_mut() {
-            if let ContentBlock::Image { media_type, data } = block {
-                if data.len() > max_chars {
+            if let ContentBlock::Image { media_type, data } = block
+                && data.len() > max_chars {
                     let mut marker = prune_image_marker(media_type.clone(), data.len());
                     if marker.len() > max_chars {
                         // Tiny configured caps cannot hold the descriptive
@@ -199,7 +198,7 @@ fn strip_oversized_images_node(contents: &mut [&mut Vec<ContentBlock>], max_char
                         let full_suffix = format!("{}B", data.len());
                         let suffix_bytes =
                             crate::tail_str_boundary(&full_suffix, remaining / 3).to_string();
-                        let prefix = crate::truncate_str_boundary(&media_type, head_bytes);
+                        let prefix = crate::truncate_str_boundary(media_type, head_bytes);
                         marker = format!("{}{}{}", prefix, icon, suffix_bytes);
                     }
                     *block = ContentBlock::Text {
@@ -208,7 +207,6 @@ fn strip_oversized_images_node(contents: &mut [&mut Vec<ContentBlock>], max_char
                     };
                     replaced += 1;
                 }
-            }
         }
     }
     replaced
@@ -223,8 +221,8 @@ fn truncate_oversized_tool_results_node(
     let mut truncated = 0;
     for content in contents.iter_mut() {
         for block in content.iter_mut() {
-            if let ContentBlock::ToolResult { content: text, .. } = block {
-                if text.len() > max_chars {
+            if let ContentBlock::ToolResult { content: text, .. } = block
+                && text.len() > max_chars {
                     let mut shortened = prune_truncated_tool_result(text, max_chars);
                     if shortened.len() > max_chars {
                         // Tiny configured caps cannot hold the recovery marker.
@@ -243,7 +241,6 @@ fn truncate_oversized_tool_results_node(
                     *text = shortened;
                     truncated += 1;
                 }
-            }
         }
     }
     truncated
@@ -268,7 +265,7 @@ mod tests {
         }
     }
 
-    fn to_contents<'a>(blocks: &'a mut Vec<Vec<ContentBlock>>) -> Vec<&'a mut Vec<ContentBlock>> {
+    fn to_contents(blocks: &mut [Vec<ContentBlock>]) -> Vec<&mut Vec<ContentBlock>> {
         blocks.iter_mut().collect()
     }
 
