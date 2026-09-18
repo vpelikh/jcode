@@ -763,8 +763,10 @@ fn the_recorded_frame_matches_the_rendered_geometry() {
     ] {
         // Keep this baseline on a genuinely single-line hint. Wrapped hints
         // intentionally grow the well and are covered by the dedicated test.
-        let mut model = Model::default();
-        model.hint = 2; // "describe the bug, not the fix"
+        let model = Model {
+            hint: 2, // "describe the bug, not the fix"
+            ..Model::default()
+        };
         let recorded = App::frame_for_model(size, scale, &model);
         let rendered = crate::layout::Frame::new(size, scale);
         assert_eq!(
