@@ -28,6 +28,7 @@ enum Disposition {
     ClientInternal,
     /// A real gap. Worth exposing, not yet done. Every entry needs a reason
     /// that says what a client cannot build without it.
+    #[allow(dead_code)] // Currently unused by the ledger; reserved for gaps worth exposing.
     Gap(&'static str),
 }
 

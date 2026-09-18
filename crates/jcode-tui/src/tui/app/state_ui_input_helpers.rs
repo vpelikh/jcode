@@ -574,6 +574,7 @@ pub(crate) fn registered_command_entries() -> impl Iterator<Item = (&'static str
 /// The non-hidden registered commands and their declared subcommand
 /// completions. Exposed so the suggestion tests can pin the invariant that
 /// every registered command is discoverable while typing.
+#[cfg(test)]
 pub(crate) fn registered_command_specs()
 -> impl Iterator<Item = (&'static str, &'static [CommandCompletion])> {
     REGISTERED_COMMANDS
