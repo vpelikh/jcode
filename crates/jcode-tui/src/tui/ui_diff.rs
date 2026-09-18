@@ -535,7 +535,7 @@ mod tests {
         // unnumbered diff lines and would blank out their line numbers in the
         // rendered diff. When a numbered diff is present, the consumer filter
         // must drop these unnumbered prose lines.
-        let lines = collect_diff_lines(&"2- two\n2+ TWO\n\nConfig changes:\n- `key`: old -> new (live now)\n".to_string());
+        let lines = collect_diff_lines("2- two\n2+ TWO\n\nConfig changes:\n- `key`: old -> new (live now)\n");
         // Raw parse keeps the numbered diff plus the unnumbered bullet.
         assert_eq!(lines.len(), 3, "unexpected parse: {:?}", lines);
 

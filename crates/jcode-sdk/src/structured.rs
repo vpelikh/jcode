@@ -367,6 +367,7 @@ fn ajv_style_details(
     (message, Some(params))
 }
 
+#[allow(clippy::result_large_err)] // Internal helper; the structured validation issue is the intended return path.
 fn parse_json_from_text(text: &str) -> Result<Value, StructuredValidationIssue> {
     let candidates = json_candidates(text);
     let mut last_error = "input was empty".to_string();

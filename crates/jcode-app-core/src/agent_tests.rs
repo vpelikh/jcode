@@ -2193,12 +2193,9 @@ fn empty_post_tool_response_gets_more_than_one_retry() {
     // transient hiccup, not a finished task. With only one retry allowed, a
     // single empty response (observed once in 43 turns) ended a 20-hour agent
     // run with the work half-done and the submission unoptimized.
-    assert!(
-        Agent::MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS > 1,
-        "a single retry lets one transient empty response end a long run"
-    );
+    const _: () = assert!(Agent::MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS > 1);
     // Bounded, so a genuinely finished agent still exits instead of looping.
-    assert!(Agent::MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS <= 10);
+    const _: () = assert!(Agent::MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS <= 10);
 }
 
 #[test]
