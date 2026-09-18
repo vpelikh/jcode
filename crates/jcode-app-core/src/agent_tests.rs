@@ -3058,6 +3058,57 @@ impl Provider for AlwaysStalledProvider {
     }
 }
 
+/// Two degraded turns through the real streaming turn loop must accumulate into
+/// the route degradation tracker and reach the Compact rung, proving the
+/// end-to-end public interface (run_once_streaming_mpsc -> stalled-promise
+/// recovery -> tracker promotion) drives the mitigation decision — not just the
+/// tracker's unit logic.
+#[tokio::test]
+async fn stalled_turns_through_public_loop_reach_compact_rung() {
+    let _guard = crate::storage::lock_test_env();
+    let provider = Arc::new(AlwaysStalledProvider::default());
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // First degraded turn: one stall episode recorded.
+    {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        agent
+            .run_once_streaming_mpsc("do the task", Vec::new(), None, tx)
+            .await
+            .expect("turn should complete");
+    }
+    assert_eq!(
+        agent.degradation.stall_count(),
+        1,
+        "first degraded turn must record one stall episode"
+    );
+    assert_eq!(
+        agent.degradation.rung(),
+        crate::agent::degradation::Rung::Watch,
+        "one degraded turn reaches Watch"
+    );
+
+    // Second degraded turn: the tracker accumulates to Compact.
+    {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        agent
+            .run_once_streaming_mpsc("do the task", Vec::new(), None, tx)
+            .await
+            .expect("turn should complete");
+    }
+    assert_eq!(
+        agent.degradation.stall_count(),
+        2,
+        "two degraded turns must record two stall episodes"
+    );
+    assert_eq!(
+        agent.degradation.rung(),
+        crate::agent::degradation::Rung::Compact,
+        "two degraded turns reach Compact"
+    );
+}
+
 /// The non-streaming turn loop (run_once -> run_turn) must recover identically:
 /// an always-stalled provider is bounded to 1 original call + exactly
 /// MAX_STALLED_PROMISE_CONTINUATION_ATTEMPTS retries, and each retry persists
