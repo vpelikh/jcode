@@ -2212,6 +2212,7 @@ impl Palette<'_> {
         self.tint.unwrap_or_else(|| role_color(role, self.theme))
     }
 }
+    #[allow(clippy::too_many_arguments)] // Cohesive rich-text layout params; grouping would obscure the call sites.
 
 pub fn layout_rich(
     text: &mut TextSystem,
