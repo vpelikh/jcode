@@ -668,14 +668,13 @@ impl Model {
     /// avoid a redundant redraw when an explicit preference keeps the window
     /// pinned to light/dark despite a fresh system signal.
     pub(crate) fn resolve_theme_from_system(&mut self, system_dark: Option<bool>) -> bool {
-        if self.theme_preference == theme::ThemeMode::System {
-            if let Some(dark) = system_dark {
+        if self.theme_preference == theme::ThemeMode::System
+            && let Some(dark) = system_dark {
                 let next = theme::Theme::for_mode(theme::ThemeMode::System, dark);
                 let changed = next.mode != self.theme.mode;
                 self.theme = next;
                 return changed;
             }
-        }
         false
     }
 

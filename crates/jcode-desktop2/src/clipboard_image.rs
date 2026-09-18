@@ -45,9 +45,7 @@ const IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/
 /// cheap call instead of a failed transfer, and so the type we report is the one
 /// the source actually published rather than something we inferred.
 pub fn from_wayland() -> Option<Image> {
-    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
-        return None;
-    }
+    std::env::var_os("WAYLAND_DISPLAY")?;
     let listed = std::process::Command::new("wl-paste")
         .arg("--list-types")
         .output()
