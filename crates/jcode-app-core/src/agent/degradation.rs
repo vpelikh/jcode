@@ -344,10 +344,10 @@ impl Agent {
                 // attempt per escalation cycle so we do not re-fire every turn.
                 self.degradation.acknowledge_compact();
                 if success {
-                    Some(format!(
-                        "Model degradation detected; {}",
-                        message.lines().last().unwrap_or("context compaction started")
-                    ))
+                    // Concise: the turn loop's own compaction machinery surfaces
+                    // the "Context compacted" confirmation once it applies, so the
+                    // degradation notice should not duplicate that verbose status.
+                    Some("Model degradation detected; compacting context".to_string())
                 } else {
                     // Compaction could not run now (busy / nothing to compact).
                     // We still recorded the attempt so the fallback rung can
