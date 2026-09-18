@@ -1417,7 +1417,7 @@ impl SessionPicker {
             }
             KeyCode::Char('q') => return Ok(OverlayAction::Close),
             KeyCode::Char(' ') => {
-                if self.selected_handoff_snapshot_id().is_none() {
+                if !self.is_handoff() {
                     self.toggle_selected_session();
                 }
             }
