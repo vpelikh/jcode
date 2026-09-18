@@ -101,7 +101,7 @@ pub fn scan(dir: &Path, limit: usize) -> Vec<Record> {
         };
         candidates.push((modified, meta.len(), path));
     }
-    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.sort_by_key(|a| std::cmp::Reverse(a.0));
     candidates.truncate(limit);
     candidates
         .into_iter()
