@@ -1299,13 +1299,18 @@ impl SessionPicker {
                 if self.visible_sessions.is_empty() {
                     self.search_query.clear();
                     self.rebuild_items();
-                } else if let Some(session_id) = self.selected_handoff_snapshot_id() {
+                } else if self.is_handoff() {
                     // Searching the handoff list must still select a handoff,
                     // not a resume target. Emit HandoffSelected exactly like the
                     // non-search Enter path, using the selected handoff's own id.
-                    return Ok(OverlayAction::Selected(
-                        PickerResult::HandoffSelected(session_id),
-                    ));
+                    // Gated on the data-source mode (not just the selected row)
+                    // so a handoff picker never falls through to a resume
+                    // target, matching the pre-row-model behavior.
+                    if let Some(session_id) = self.selected_handoff_snapshot_id() {
+                        return Ok(OverlayAction::Selected(
+                            PickerResult::HandoffSelected(session_id),
+                        ));
+                    }
                 } else {
                     let targets = self.selection_or_current_targets();
                     if !targets.is_empty() {
