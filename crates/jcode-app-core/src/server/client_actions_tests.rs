@@ -3,7 +3,7 @@
 use super::{
     NotifySessionContext, clone_split_session, handle_notify_session, handle_rename_session,
     handle_resume_all_sessions, handle_set_feature, handle_set_handoff_resume,
-    handle_set_working_dir, handle_split,
+    handle_set_working_dir, handle_split, handle_handoff_list, handle_handoff_import,
 };
 use crate::agent::Agent;
 use crate::message::{ContentBlock, Message, Role, StreamEvent, ToolDefinition};
@@ -1712,6 +1712,164 @@ async fn handle_set_handoff_resume_none_clears_override() -> Result<()> {
     assert!(
         first_str.contains("auto intent") && !first_str.contains("manual intent"),
         "after None the fresh conversation should use auto-inject, got: {first_str}"
+    );
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    Ok(())
+}
+
+/// handle_handoff_list lists the server-side handoff store (newest first,
+/// including archived snapshots) as HandoffWireModel entries with their export
+/// payload attached, so a client can discover and re-adopt a snapshot.
+#[tokio::test]
+async fn handle_handoff_list_lists_server_handoff_store() -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+    let wd = temp.path();
+    std::fs::create_dir_all(wd).ok();
+
+    fn seed(session_id: &str, wd: &std::path::Path, intent: &str) {
+        crate::todo::save_todos(
+            session_id,
+            &[crate::todo::TodoItem {
+                id: "t".into(),
+                content: format!("work for {intent}"),
+                status: "in_progress".into(),
+                priority: "high".into(),
+                group: None,
+                confidence: None,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        crate::todo::save_plan(
+            session_id,
+            &crate::todo::TodoPlan {
+                user_intention: Some(intent.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::handoff::capture(session_id, Some(wd), "closed", None).expect("capture");
+    }
+
+    seed("alpha-handoff", wd, "alpha intent");
+    std::thread::sleep(Duration::from_millis(20));
+    seed("beta-handoff", wd, "beta intent");
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    handle_handoff_list(101, &tx).await;
+    let event = timeout(Duration::from_secs(2), rx.recv())
+        .await?
+        .expect("handoff_listed event");
+    match event {
+        ServerEvent::HandoffListed { id, handoffs } => {
+            assert_eq!(id, 101);
+            // Newest first: beta captured after alpha.
+            assert_eq!(handoffs.len(), 2);
+            assert_eq!(handoffs[0].session_id, "beta-handoff");
+            assert_eq!(handoffs[1].session_id, "alpha-handoff");
+            assert_eq!(handoffs[0].intent.as_deref(), Some("beta intent"));
+            assert_eq!(handoffs[0].open_todo_count, 1);
+            // Each entry carries its portable export payload for re-adoption.
+            assert!(
+                handoffs[0].payload.as_deref().unwrap_or_default().contains("beta-handoff"),
+                "listed entry should carry its export payload"
+            );
+        }
+        other => return Err(anyhow::anyhow!("expected HandoffListed, got {other:?}")),
+    }
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    Ok(())
+}
+
+/// handle_handoff_import adopts a portable payload as the live handoff for the
+/// session's working-directory project and replies with the adopted id.
+/// Malformed payloads reply Error instead.
+#[tokio::test]
+async fn handle_handoff_import_adopts_payload_and_errors_on_bad_input() -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+    let wd = temp.path();
+    std::fs::create_dir_all(wd).ok();
+
+    // Seed a source handoff on this host, then export + import it so "remote
+    // adoption" mints a fresh import-<source> id and rekeys it to `wd`.
+    crate::todo::save_todos(
+        "source-session",
+        &[crate::todo::TodoItem {
+            id: "t".into(),
+            content: "work to adopt".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: None,
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    crate::todo::save_plan(
+        "source-session",
+        &crate::todo::TodoPlan {
+            user_intention: Some("imported intent".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    crate::handoff::capture("source-session", Some(wd), "closed", None).expect("capture");
+    let payload = crate::handoff::export_handoff("source-session").expect("export");
+
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
+    {
+        let mut guard = agent.lock().await;
+        guard.set_working_dir(wd.to_str().expect("utf8"));
+    }
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    handle_handoff_import(31, payload, None, &agent, &tx).await;
+    let event = timeout(Duration::from_secs(2), rx.recv())
+        .await?
+        .expect("handoff_imported event");
+    match event {
+        ServerEvent::HandoffImported { id, session_id } => {
+            assert_eq!(id, 31);
+            assert!(
+                session_id.starts_with("import-source"),
+                "adopted id should be import-<source>, got {session_id}"
+            );
+            // The adopted snapshot becomes the live handoff for the project.
+            assert_eq!(
+                crate::handoff::latest_handoff_for_project(Some(wd)).as_deref(),
+                Some(session_id.as_str())
+            );
+        }
+        other => return Err(anyhow::anyhow!("expected HandoffImported, got {other:?}")),
+    }
+
+    // Malformed payload -> Error.
+    let (tx2, mut rx2) = mpsc::unbounded_channel();
+    handle_handoff_import(32, "{{{ not json".to_string(), None, &agent, &tx2).await;
+    let event2 = timeout(Duration::from_secs(2), rx2.recv())
+        .await?
+        .expect("error event");
+    assert!(
+        matches!(event2, ServerEvent::Error { id: 32, .. }),
+        "malformed payload must reply Error, got {event2:?}"
     );
 
     if let Some(prev_home) = prev_home {

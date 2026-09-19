@@ -39,3 +39,53 @@ fn prune_request_and_result_wire_roundtrip() {
         assert_eq!(serde_json::to_value(event).unwrap(), wire);
     }
 }
+
+#[test]
+fn handoff_list_and_import_wire_roundtrip() {
+    let list = super::decode_request(r#"{"type":"handoff_list","id":7}"#).unwrap();
+    assert!(matches!(list, super::Request::HandoffList { id: 7 }));
+    assert_eq!(list.id(), 7);
+    assert_eq!(
+        serde_json::to_value(&list).unwrap(),
+        serde_json::json!({"type":"handoff_list","id":7})
+    );
+
+    let import = super::decode_request(
+        r#"{"type":"handoff_import","id":8,"payload":"{\"session_id\":\"src\"}"}"#,
+    )
+    .unwrap();
+    assert!(matches!(&import, super::Request::HandoffImport {
+        id: 8, payload, disposition: None
+    } if payload == "{\"session_id\":\"src\"}"));
+    assert_eq!(import.id(), 8);
+
+    let listed: super::ServerEvent = serde_json::from_value(serde_json::json!({
+        "type": "handoff_listed",
+        "id": 7,
+        "handoffs": [{
+            "session_id": "import-src",
+            "project_key": "git:https://example.com/repo",
+            "ended_at": "2026-09-19T10:00:00Z",
+            "disposition": "closed",
+            "open_todo_count": 3,
+            "intent": "Finish the plan",
+        }]
+    }))
+    .unwrap();
+    assert!(matches!(&listed, super::ServerEvent::HandoffListed {
+        id: 7, handoffs
+    } if handoffs.len() == 1 && handoffs[0].session_id == "import-src"
+        && handoffs[0].open_todo_count == 3
+        && handoffs[0].intent.as_deref() == Some("Finish the plan")
+        && handoffs[0].payload.is_none()));
+
+    let imported: super::ServerEvent = serde_json::from_value(serde_json::json!({
+        "type": "handoff_imported",
+        "id": 8,
+        "session_id": "import-src",
+    }))
+    .unwrap();
+    assert!(matches!(&imported, super::ServerEvent::HandoffImported {
+        id: 8, session_id
+    } if session_id == "import-src"));
+}

@@ -917,6 +917,35 @@ impl RemoteConnection {
         self.send_request(request).await
     }
 
+    /// Ask the server for its handoff store (newest first, including archived
+    /// snapshots). The result arrives asynchronously via
+    /// [`ServerEvent::HandoffListed`], correlated by the request id.
+    ///
+    /// Over SSH the client host's local store is the wrong host to inspect, so
+    /// this is the correct way to discover handoffs for a remote session.
+    pub async fn handoff_list(&mut self) -> Result<u64> {
+        let id = self.next_request_id;
+        let request = Request::HandoffList { id };
+        self.next_request_id += 1;
+        self.send_request(request).await?;
+        Ok(id)
+    }
+
+    /// Ask the server to adopt a portable handoff payload as the live handoff
+    /// for the current session's project. The outcome arrives asynchronously
+    /// via [`ServerEvent::HandoffImported`] (or `Error` on rejection).
+    pub async fn handoff_import(&mut self, payload: String, disposition: Option<String>) -> Result<u64> {
+        let id = self.next_request_id;
+        let request = Request::HandoffImport {
+            id,
+            payload,
+            disposition,
+        };
+        self.next_request_id += 1;
+        self.send_request(request).await?;
+        Ok(id)
+    }
+
     /// Inject externally transcribed text into the active remote TUI session.
     pub async fn send_transcript(
         &mut self,
