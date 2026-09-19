@@ -604,6 +604,8 @@ impl Request {
             Request::RenameSession { id, .. } => *id,
             Request::SetWorkingDir { id, .. } => *id,
             Request::SetHandoffResume { id, .. } => *id,
+            Request::HandoffList { id } => *id,
+            Request::HandoffImport { id, .. } => *id,
             Request::Split { id } => *id,
             Request::Transfer { id } => *id,
             Request::Compact { id } => *id,

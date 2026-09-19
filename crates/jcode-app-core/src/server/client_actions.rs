@@ -751,6 +751,85 @@ pub(super) async fn handle_set_handoff_resume(
     let _ = client_event_tx.send(ServerEvent::Done { id });
 }
 
+/// Reply to `Request::HandoffList` with the server-side handoff store, newest
+/// first.
+///
+/// This is the read side of remote handoff discovery: an SSH-backed or remote
+/// session's client host is the wrong host to inspect its local store, so the
+/// client lists what the *server* has saved instead. Includes archived
+/// snapshots (not just the latest-per-project index) so the remote `/handoff`
+/// overlay matches the local picker's discoverability.
+pub(super) async fn handle_handoff_list(
+    id: u64,
+    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+) {
+    let handoffs = crate::handoff::list_all_handoffs()
+        .into_iter()
+        .map(|snapshot| {
+            let payload = crate::handoff::export_handoff(&snapshot.session_id);
+            crate::protocol::HandoffWireModel {
+                session_id: snapshot.session_id,
+                project_key: snapshot.project_key,
+                ended_at: snapshot.ended_at.to_rfc3339(),
+                disposition: snapshot.disposition,
+                working_dir: snapshot.working_dir,
+                intent: snapshot.intent,
+                open_todo_count: snapshot.open_todos.len(),
+                initiative_id: snapshot.initiative_id,
+                payload,
+            }
+        })
+        .collect();
+    let _ = client_event_tx.send(ServerEvent::HandoffListed { id, handoffs });
+}
+
+/// Adopt a portable handoff payload into the server's store, making it the
+/// live handoff for the current session's project.
+///
+/// This is the wire entry point for the remote-fallback flow: after a failed
+/// live-session migration, the client ships a snapshot already available on
+/// this (target) host to `import_handoff`, which rekeys it to the session's
+/// working-directory project so a fresh session boots from it.
+pub(super) async fn handle_handoff_import(
+    id: u64,
+    payload: String,
+    disposition: Option<String>,
+    agent: &Arc<Mutex<Agent>>,
+    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+) {
+    let working_dir = {
+        let guard = agent.lock().await;
+        guard.working_dir().map(std::path::PathBuf::from)
+    };
+    let disposition = disposition
+        .as_deref()
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or("closed");
+    match crate::handoff::import_handoff(&payload, working_dir.as_deref(), disposition) {
+        Some(session_id) => {
+            crate::logging::event_info(
+                "HANDOFF",
+                vec![
+                    ("phase", "imported".to_string()),
+                    ("request_id", id.to_string()),
+                    ("adopted", session_id.clone()),
+                ],
+            );
+            let _ = client_event_tx.send(ServerEvent::HandoffImported { id, session_id });
+        }
+        None => {
+            // Malformed payload or no resolvable project key for this session.
+            crate::logging::warn(&format!("[handoff] import request {id} rejected"));
+            let _ = client_event_tx.send(ServerEvent::Error {
+                id,
+                message: "could not adopt handoff payload (malformed or no project for session)"
+                    .to_string(),
+                retry_after_secs: None,
+            });
+        }
+    }
+}
+
 pub(super) async fn handle_trigger_memory_extraction(
     id: u64,
     agent: &Arc<Mutex<Agent>>,

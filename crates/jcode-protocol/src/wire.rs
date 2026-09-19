@@ -348,6 +348,35 @@ pub enum Request {
         session_id: Option<String>,
     },
 
+    /// List every handoff snapshot the server's handoff store holds, newest
+    /// first (including archived snapshots no longer latest for their project).
+    ///
+    /// This is the read side of the remote-adoption flow: the client host's
+    /// local store is the wrong host for an SSH-backed or remote session, so
+    /// the client asks the *server* for its on-disk handoff store instead.
+    /// Replies with [`ServerEvent::HandoffListed`].
+    #[serde(rename = "handoff_list")]
+    HandoffList { id: u64 },
+
+    /// Adopt a portable handoff payload into this server's store and make it
+    /// the live handoff for the current session's project (the remote-fallback
+    /// counterpart to `export_handoff`/`import_handoff`).
+    ///
+    /// The payload is an opaque JSON snapshot previously produced by
+    /// `handoff::export_handoff` on another host. The server rekeys it to the
+    /// session's working-directory project, registers it in the index, and
+    /// replies [`ServerEvent::HandoffImported`] with the adopted session id
+    /// (readable `import-<source>`, so `/handoffres` stays recognizable).
+    #[serde(rename = "handoff_import")]
+    HandoffImport {
+        id: u64,
+        payload: String,
+        /// Disposition to stamp on the adopted snapshot ("closed", "crashed",
+        /// or "reloading"). Defaults to "closed" when omitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disposition: Option<String>,
+    },
+
     /// Split the current session — clone conversation into a new session
     #[serde(rename = "split")]
     Split { id: u64 },
@@ -794,6 +823,41 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         working_dir: Option<String>,
     },
+}
+
+/// A wire-safe projection of a saved handoff snapshot, for listing the
+/// server-side handoff store over the protocol.
+///
+/// This mirrors the essential display fields of `jcode_base::handoff::HandoffSnapshot`
+/// without making `jcode-protocol` depend on `jcode-base`. It carries enough for
+/// the client to render the `/handoff` overlay from the *server*'s store and to
+/// request adoption of a specific snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandoffWireModel {
+    /// Source session id the snapshot was captured from.
+    pub session_id: String,
+    /// Portable project identity (git remote URL or absolute working dir).
+    pub project_key: String,
+    /// Capture timestamp, RFC3339 UTC.
+    pub ended_at: String,
+    /// Why the session ended: "closed", "crashed", or "reloading".
+    pub disposition: String,
+    /// Source working directory, when recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    /// The user's intent from the todo plan, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
+    /// Number of open work items at close (cheap preview size).
+    pub open_todo_count: usize,
+    /// Durable initiative linked to this work, if one was attached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiative_id: Option<String>,
+    /// The full opaque export payload for this snapshot, for re-adoption on
+    /// this host via `handoff_import`. Included so the client can ship the
+    /// exact snapshot back to the server without a second round trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<String>,
 }
 
 /// Server event sent to client
@@ -1588,5 +1652,28 @@ pub enum ServerEvent {
         /// Human-readable detail (errors, or the no-verdict reason).
         #[serde(default, skip_serializing_if = "String::is_empty")]
         message: String,
+    },
+
+    /// Reply to `Request::HandoffList` — the server-side handoff store, newest
+    /// first. Empty when the store is missing or empty.
+    #[serde(rename = "handoff_listed")]
+    HandoffListed {
+        /// Echoes the request id.
+        id: u64,
+        /// The server's saved handoffs (including archived snapshots).
+        handoffs: Vec<HandoffWireModel>,
+    },
+
+    /// Reply to `Request::HandoffImport` — the outcome of adopting a portable
+    /// handoff payload into the server's store.
+    #[serde(rename = "handoff_imported")]
+    HandoffImported {
+        /// Echoes the request id.
+        id: u64,
+        /// The adopted session id (`import-<source>`, possibly disambiguated),
+        /// suitable for `/handoffres`. Empty on malformed or rejected payloads
+        /// (the server then also emits `Error`).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        session_id: String,
     },
 }
