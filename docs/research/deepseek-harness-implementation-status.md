@@ -567,3 +567,30 @@ against what was built:
   unification is a natural companion to the already-parked F8 promote-on-timeout
   seam, which is the right place to introduce the shared type across tools.
   Revisited there.
+
+### Alternative considered: async `select!` cancellation at a finer grain
+
+A more fundamental alternative is to make the scan cancellable **inside** a
+candidate rather than only between candidates — e.g. move the scan onto async
+paths and use `tokio::select!` against a deadline so the runtime drops the work
+mid-candidate. Weighed against the cooperative flag:
+
+- **Performance / responsiveness.** This would reclaim a blocked thread during a
+  single long deserialize rather than waiting for the next candidate boundary.
+  It is genuinely finer-grained.
+- **Feasibility / implementation.** `Session::load_from_path`
+  (`persistence.rs:269`) is a **synchronous** `-> Result<Self>` that does blocking
+  disk read + JSON deserialize + journal replay with **no internal `await` point**.
+  An async `select!` has no yield to cancel at mid-candidate; the work would have
+  to be rewritten to async, chunked deserialization — a major, invasive change to
+  the persistence layer and every caller — to gain anything. The candidate boundary
+  is the natural, and effectively the only cheap, preemption point.
+- **Compatibility / maintenance.** Rewriting session load as async touches
+  `jcode-base` persistence and ripples into every `Session::load*` caller; the
+  cooperative flag changes only `session_search.rs`.
+- **Decision.** Rejected for this follow-up: the finer granularity is not
+  achievable without rewriting synchronous `load_from_path` into async, chunked
+  deserialization, which is a large cross-crate refactor well outside F8 Part A
+  and not justified by the marginal thread-reclaim gain. The cooperative flag
+  yields the same model-visible outcome and reclaims threads at the practical
+  preemption point the load API provides.
