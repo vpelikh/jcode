@@ -496,18 +496,36 @@ tool:
   earlier observation that `execution_timeout()` alone was "too thin" — each
   tool no longer has to re-derive "how do I pick one fixed number."
 
-### Deferred (Part A): abortable scan loop
+### Deferred (Part A): abortable scan loop — ✅ **Delivered**
 
-The other session_search trade-off — on timeout the read-only scan continues to
-completion in the background rather than being stopped early — is
-**deferred by explicit steering choice**. Options were evaluated: adding a
-per-call deadline/cancel token to `ToolContext` was rejected because
-`ToolContext` is constructed at **96 sites** across the workspace, making a
-struct-field addition invasive for a single tool's benefit. The right shape is a
-**tool-internal** cooperative-cancel loop (a cancel flag checked in the scan
-iteration) that works with `execute_with_deadline` dropping the outer future.
-This is a per-tool change, not a seam-wide one, and is tracked as a separate
-follow-up.
+The session_search read-only scan is now **cooperatively abortable** on timeout,
+closing the previous trade-off where the blocking scan ran every file to
+completion in the background after `execute_with_deadline` dropped the outer
+future. The design follows the option this note settled on: a **tool-internal**
+cancel flag, not a per-call cancel token threaded through `ToolContext` (which is
+constructed at 96 sites, too invasive for one tool's benefit).
+
+- **`session_search.rs`:** a per-call `CheckAbort` (`Arc<AtomicBool>`) is created
+  in `execute` alongside an `AbortOnDrop` guard that lives for the whole executing
+  future. When `execute_with_deadline`'s timeout fires it drops that future; the
+  guard's `Drop` sets the flag, and every scan loop checks `abort.load(...)` at
+  each candidate boundary and stops early:
+  - raw pre-filter (`filter_candidates_parallel`),
+  - index build (`jcode_index_candidates`),
+  - scoring deserialize (`score_candidates_parallel`),
+  - external JSONL loads (`load_external_candidates_parallel`),
+  - claude loads (`load_claude_candidates_parallel`), and
+  - the external result fold (`search_external_sessions`).
+- **Behavior:** the turn still returns immediately with the model-visible
+  "timed out after Ns" error (unchanged), but now the already-spawned
+  `spawn_blocking` threads are reclaimed at the next candidate boundary instead
+  of continuing to the end. The scan stays read-only and idempotent, so bailing
+  mid-loop leaves no partial writes. The background index **warmup** path is
+  unattended and deliberately uses a never-cancelled flag (no deadline races it).
+- **Tests:** new `pre_abort_flag_short_circuits_the_scan` pins that a flag set up
+  front returns an empty report with `candidate_jcode_sessions == 0` (no scoring)
+  even though matching sessions exist; the existing timeout / model-visible-error /
+  scope-scaling tests still pass (session_search suite: 31 passed, 0 failed).
 
 The core F8 "promote-on-timeout" seam for `bash`/`bg`/`webfetch` remains a
 separate, behavior-changing follow-up as described above.
