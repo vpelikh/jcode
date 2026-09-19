@@ -2061,6 +2061,112 @@ fn apply_handoff_resume_sends_clear_then_handoff_resume_and_reports_ready() {
 }
 
 #[test]
+fn handoff_listed_opens_picker_from_server_store_when_pending() {
+    use crate::handoff::HandoffSnapshot;
+    use crate::protocol::HandoffWireModel;
+
+    let mut app = create_test_app();
+    app.is_processing = false;
+
+    // The server-side listing payload for `HandoffListed` is a serialized
+    // HandoffSnapshot (the portable export format).
+    let snapshot = HandoffSnapshot {
+        session_id: "src-session".into(),
+        project_key: "git:https://example.com/repo".into(),
+        ended_at: chrono::Utc::now(),
+        disposition: "closed".into(),
+        working_dir: Some("/srv/code".into()),
+        intent: Some("server intent".into()),
+        open_todos: Vec::new(),
+        last_assistant_text: None,
+        initiative_id: None,
+    };
+    let payload = serde_json::to_string(&snapshot).unwrap();
+    let wire = HandoffWireModel {
+        session_id: "src-session".into(),
+        project_key: "git:https://example.com/repo".into(),
+        ended_at: "2026-09-19T11:00:00Z".into(),
+        disposition: "closed".into(),
+        working_dir: Some("/srv/code".into()),
+        intent: Some("server intent".into()),
+        open_todo_count: 0,
+        initiative_id: None,
+        payload: Some(payload),
+    };
+
+    // Feed the matching request id so the event is consumed.
+    app.set_pending_remote_handoff_list(99);
+    // `RemoteConnection::dummy()` builds a Unix socket pair, so it needs a
+    // Tokio reactor; `handle_server_event` is otherwise synchronous for the
+    // HandoffListed path.
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    let needs_redraw = handle_server_event(
+        &mut app,
+        ServerEvent::HandoffListed {
+            id: 99,
+            handoffs: vec![wire],
+        },
+        &mut remote,
+    );
+    let _ = needs_redraw;
+
+    // The `/handoff` overlay must have opened in Handoff mode, fed from the
+    // server store (the request id was consumed).
+    assert_eq!(
+        app.session_picker_mode,
+        crate::tui::app::SessionPickerMode::Handoff,
+        "HandoffListed matching a pending request should open the handoff picker"
+    );
+    let picker_is_handoff = app
+        .session_picker_overlay
+        .as_ref()
+        .is_some_and(|picker| picker.borrow().is_handoff());
+    assert!(
+        picker_is_handoff,
+        "the opened picker should be backed by handoff rows"
+    );
+}
+
+#[test]
+fn handoff_listed_is_ignored_without_a_matching_pending_request() {
+    use crate::protocol::HandoffWireModel;
+
+    let mut app = create_test_app();
+    app.is_processing = false;
+
+    // No `set_pending_remote_handoff_list` was called, so the request id does
+    // not match; the picker must stay closed rather than open with stray data.
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    handle_server_event(
+        &mut app,
+        ServerEvent::HandoffListed {
+            id: 1234,
+            handoffs: vec![HandoffWireModel {
+                session_id: "stray".into(),
+                project_key: "git:x".into(),
+                ended_at: "2026-09-19T11:00:00Z".into(),
+                disposition: "closed".into(),
+                working_dir: None,
+                intent: None,
+                open_todo_count: 0,
+                initiative_id: None,
+                payload: None,
+            }],
+        },
+        &mut remote,
+    );
+    assert_ne!(
+        app.session_picker_mode,
+        crate::tui::app::SessionPickerMode::Handoff,
+        "an unmatched HandoffListed must not open the handoff picker"
+    );
+}
+
+#[test]
 fn apply_handoff_resume_reports_failure_without_panicking() {
     // A broken socket makes the first `clear()` write fail; the helper must
     // report the error as `Err(())` after pushing an error message, never panic.
