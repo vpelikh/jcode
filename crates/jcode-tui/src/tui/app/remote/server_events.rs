@@ -1,4 +1,5 @@
 use super::*;
+use crate::protocol::HandoffWireModel;
 use crate::tool::selfdev::ReloadContext;
 use crate::tui::TuiState;
 use crate::tui::app as app_mod;
@@ -3027,8 +3028,47 @@ pub(in crate::tui::app) fn handle_server_event(
             app.set_status_notice("⌨ Interactive terminal detected (command will timeout)");
             false
         }
+        ServerEvent::HandoffListed { id, handoffs } => {
+            if app.take_pending_remote_handoff_list(id).is_some() {
+                open_picker_from_remote_handoffs(app, handoffs);
+            }
+            false
+        }
+        ServerEvent::HandoffImported { id, session_id } => {
+            let _ = id;
+            if session_id.is_empty() {
+                app.set_status_notice("Could not adopt handoff (payload rejected by server)");
+            } else {
+                app.push_display_message(DisplayMessage::system(format!(
+                    "Handoff adopted on this server: {session_id}"
+                )));
+                app.set_status_notice("Handoff imported");
+            }
+            false
+        }
         _ => false,
     }
+}
+
+/// Rebuild `HandoffSnapshot`s from `HandoffListed` wire models and open the
+/// `/handoff` overlay from them.
+///
+/// Each wire model carries its full opaque export payload (the serialized
+/// snapshot), so we reconstruct the real snapshot for the picker's preview and
+/// resume flow. Models whose payload failed to parse are skipped; if none
+/// survive, the standard empty message is shown.
+fn open_picker_from_remote_handoffs(app: &mut App, handoffs: Vec<HandoffWireModel>) {
+    let mut snapshots: Vec<crate::handoff::HandoffSnapshot> = Vec::new();
+    for model in handoffs {
+        if let Some(payload) = model.payload {
+            if let Ok(snapshot) =
+                serde_json::from_str::<crate::handoff::HandoffSnapshot>(&payload)
+            {
+                snapshots.push(snapshot);
+            }
+        }
+    }
+    app.open_handoff_picker_with(snapshots);
 }
 
 fn runtime_activity_status_notice(message: &str) -> String {

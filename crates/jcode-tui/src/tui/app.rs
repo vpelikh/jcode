@@ -428,6 +428,16 @@ pub(super) struct PendingHandoffResume {
     pub preview_line: String,
 }
 
+/// An in-flight `handoff_list` request to the connected server. Over SSH the
+/// client host's local store is the wrong host to inspect; the `/handoff`
+/// overlay must be fed from the *server*'s store. When `ServerEvent::HandoffListed`
+/// arrives with a matching request id, the picker is opened from that data.
+#[derive(Clone, Debug)]
+pub(super) struct PendingRemoteHandoffList {
+    /// The request id echoed back in `HandoffListed`.
+    pub request_id: u64,
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct RemoteResumeActivity {
     pub session_id: String,
@@ -1710,6 +1720,9 @@ pub struct App {
     pending_catchup_resume: Option<PendingCatchupResume>,
     in_flight_catchup_resume: Option<PendingCatchupResume>,
     pending_handoff_resume: Option<PendingHandoffResume>,
+    /// In-flight `handoff_list` to the connected server (fed to the `/handoff`
+    /// overlay over SSH, where the client's local store is the wrong host).
+    pending_remote_handoff_list: Option<PendingRemoteHandoffList>,
     /// Login picker overlay (None = not visible)
     login_picker_overlay: Option<RefCell<super::login_picker::LoginPicker>>,
     /// Account picker overlay (None = not visible)

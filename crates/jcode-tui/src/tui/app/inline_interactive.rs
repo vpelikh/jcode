@@ -1,4 +1,5 @@
 use super::*;
+use crate::handoff::HandoffSnapshot;
 use crate::tui::session_picker::{self, OverlayAction, PickerResult, ResumeTarget, SessionPicker};
 use crate::tui::{
     AccountPickerAction, InlineInteractiveState, PickerAction, PickerEntry, PickerKind,
@@ -2465,9 +2466,17 @@ impl App {
             return;
         }
         let snapshots = crate::handoff::list_all_handoffs();
+        self.open_handoff_picker_with(snapshots);
+    }
+
+    /// Open the `/handoff` overlay with an explicit snapshot set. Used by the
+    /// remote/SSH path where the snapshots come from the connected *server*'s
+    /// store rather than the client host's local store. Empty input shows the
+    /// standard "no saved handoffs" message.
+    pub(super) fn open_handoff_picker_with(&mut self, snapshots: Vec<HandoffSnapshot>) {
         if snapshots.is_empty() {
             self.push_display_message(DisplayMessage::system(
-                "No saved handoffs. A handoff is captured when a session ends with unfinished work; once one exists, run /handoff to pick it.".to_string(),
+                "No saved handoffs on the server. A handoff is captured when a session ends with unfinished work; once one exists, run /handoff to pick it.".to_string(),
             ));
             return;
         }
@@ -2488,6 +2497,31 @@ impl App {
 
     pub(super) fn take_pending_handoff_resume(&mut self) -> Option<PendingHandoffResume> {
         self.pending_handoff_resume.take()
+    }
+
+    /// Record an in-flight `handoff_list` request whose `HandoffListed` reply
+    /// should open the `/handoff` overlay from the server's store.
+    pub(super) fn set_pending_remote_handoff_list(&mut self, request_id: u64) {
+        self.pending_remote_handoff_list = Some(PendingRemoteHandoffList { request_id });
+    }
+
+    /// Consume the pending remote handoff list request if its id matches the
+    /// reply that just arrived, returning whether the picker should open now.
+    pub(super) fn take_pending_remote_handoff_list(
+        &mut self,
+        request_id: u64,
+    ) -> Option<PendingRemoteHandoffList> {
+        // Only consume when this is the request we are waiting on; a stale or
+        // unrelated `HandoffListed` for another request is not ours to open.
+        if self
+            .pending_remote_handoff_list
+            .as_ref()
+            .is_some_and(|pending| pending.request_id == request_id)
+        {
+            self.pending_remote_handoff_list.take()
+        } else {
+            None
+        }
     }
 
     /// Open the active sessions manager: the session picker scoped to live
