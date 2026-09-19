@@ -549,7 +549,7 @@ pub(super) async fn dispatch_ui_activity(
         return;
     };
 
-    let members = &swarm.swarm_state.members;
+    let members = &swarm.swarm_state().members;
     if fanout_session_event(
         members,
         session_id,
@@ -665,38 +665,3 @@ mod tests {
     }
 }
 
-pub(super) async fn dispatch_ui_activity(
-    activity: &crate::bus::UiActivity,
-    swarm: &SwarmServiceHandle,
-) {
-    if activity.message.trim().is_empty() {
-        return;
-    }
-    let Some(session_id) = activity.session_id.as_deref() else {
-        return;
-    };
-
-    let members = &swarm.swarm_state().members;
-    if fanout_session_event(
-        members,
-        session_id,
-        ServerEvent::Notification {
-            from_session: "jcode".to_string(),
-            from_name: Some("Jcode".to_string()),
-            notification_type: NotificationType::Message {
-                scope: Some(activity.kind.scope().to_string()),
-                channel: None,
-                tldr: None,
-            },
-            message: activity.message.clone(),
-        },
-    )
-    .await
-        == 0
-    {
-        crate::logging::warn(&format!(
-            "Failed to notify attached clients for UI activity on session {}",
-            session_id
-        ));
-    }
-}
