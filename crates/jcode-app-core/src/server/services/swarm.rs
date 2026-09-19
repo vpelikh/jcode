@@ -289,6 +289,67 @@ impl SwarmServiceHandle {
         inserted
     }
 
+    /// Register a headless session as a swarm member that is always scored
+    /// `is_headless: true` (never auto-claims coordinator) and carries its own
+    /// runtime describe metadata, then add it to `swarms_by_id`. Distinct from
+    /// `ensure_member`, which serves connection-backed TUI publishers
+    /// (`is_headless: false`, per-connection `event_txs`). Routes the member
+    /// insert + swarm-membership insert through the handle so the caller does
+    /// not reach into either raw map.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "registering a headless member carries session identity, joined swarm id, and its runtime descriptor"
+    )]
+    pub(crate) async fn register_headless_member(
+        &self,
+        session_id: &str,
+        working_dir: Option<PathBuf>,
+        swarm_id: Option<&str>,
+        swarm_enabled: bool,
+        friendly_name: String,
+        report_back_to_session_id: Option<String>,
+        event_tx: mpsc::UnboundedSender<ServerEvent>,
+        runtime: crate::protocol::SwarmMemberRuntime,
+    ) {
+        let now = Instant::now();
+        {
+            let mut members = self.swarm_state.members.write().await;
+            members.insert(
+                session_id.to_string(),
+                SwarmMember {
+                    session_id: session_id.to_string(),
+                    event_tx: event_tx.clone(),
+                    event_txs: HashMap::new(),
+                    working_dir,
+                    swarm_id: swarm_id.map(|id| id.to_string()),
+                    swarm_enabled,
+                    status: "ready".to_string(),
+                    detail: None,
+                    task_label: None,
+                    friendly_name: Some(friendly_name),
+                    report_back_to_session_id,
+                    latest_completion_report: None,
+                    role: "agent".to_string(),
+                    joined_at: now,
+                    last_status_change: now,
+                    is_headless: true,
+                    output_tail: None,
+                    todo_progress: None,
+                    todo_items: Vec::new(),
+                    runtime,
+                },
+            );
+        }
+
+        if let Some(id) = swarm_id {
+            let mut swarms = self.swarm_state.swarms_by_id.write().await;
+            swarms
+                .entry(id.to_string())
+                .or_insert_with(HashSet::new)
+                .insert(session_id.to_string());
+        }
+    }
+
     /// Whether a freshly arrived (or reconnecting) member should be marked
     /// `ready` after subscribe: `true` unless the member is currently mid-turn
     /// (`running`). Moving this read behind the swarm service keeps session
@@ -1022,5 +1083,49 @@ mod tests {
         // A second removal is a clean no-op (empty identity).
         let again = handle.remove_session_member("sess").await;
         assert!(again.swarm_id.is_none() && again.friendly_name.is_none());
+    }
+
+    #[tokio::test]
+    async fn register_headless_member_inserts_member_and_swarm_membership() {
+        let handle = base_handle();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        handle
+            .register_headless_member(
+                "headless-1",
+                None,
+                Some("swarm-h"),
+                true,
+                "headless-1".to_string(),
+                None,
+                event_tx,
+                crate::protocol::SwarmMemberRuntime::default(),
+            )
+            .await;
+
+        let members = handle.swarm_state().members.read().await;
+        let member = members.get("headless-1").expect("member inserted");
+        assert!(member.is_headless, "headless member carries is_headless=true");
+        assert_eq!(member.swarm_id.as_deref(), Some("swarm-h"));
+        assert!(member.event_txs.is_empty(), "no per-connection senders");
+
+        let swarms = handle.swarm_state().swarms_by_id.read().await;
+        let swarm = swarms.get("swarm-h").expect("swarm created");
+        assert!(swarm.contains("headless-1"));
+
+        // No swarm id: no swarms_by_id entry is created.
+        let (event_tx2, _event_rx2) = tokio::sync::mpsc::unbounded_channel();
+        let h2 = base_handle();
+        h2.register_headless_member(
+            "solo",
+            None,
+            None,
+            false,
+            "solo".to_string(),
+            None,
+            event_tx2,
+            crate::protocol::SwarmMemberRuntime::default(),
+        )
+        .await;
+        assert!(h2.swarm_state().swarms_by_id.read().await.is_empty());
     }
 }

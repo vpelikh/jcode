@@ -3,14 +3,13 @@ use crate::agent::Agent;
 use crate::protocol::ServerEvent;
 use crate::provider::Provider;
 use crate::server::{
-    SessionInterruptQueues, SwarmMember, register_background_tool_signal,
-    register_session_interrupt_queue, swarm_id_for_session,
+    SessionInterruptQueues, register_background_tool_signal, register_session_interrupt_queue,
+    swarm_id_for_session,
 };
 use crate::tool::Registry;
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
 
 type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
@@ -52,9 +51,6 @@ pub(super) async fn create_headless_session(
     memory_scope: HeadlessMemoryScope,
 ) -> Result<String> {
     let swarm_members = &swarm.swarm_state().members;
-    let swarms_by_id = &swarm.swarm_state().swarms_by_id;
-    let swarm_coordinators = &swarm.swarm_state().coordinators;
-    let _swarm_plans = &swarm.swarm_state().plans;
     let memory_enabled = crate::config::config().features.memory;
     let swarm_enabled = crate::config::config().features.swarm;
 
@@ -237,59 +233,27 @@ pub(super) async fn create_headless_session(
         }
     });
 
-    {
-        let now = Instant::now();
-        let mut members = swarm_members.write().await;
-        members.insert(
-            client_session_id.clone(),
-            SwarmMember {
-                session_id: client_session_id.clone(),
-                event_tx: event_tx.clone(),
-                event_txs: HashMap::new(),
-                working_dir: working_dir.clone(),
-                swarm_id: swarm_id.clone(),
-                swarm_enabled,
-                status: "ready".to_string(),
-                detail: None,
-                task_label: None,
-                friendly_name: Some(friendly_name.clone()),
-                report_back_to_session_id: report_back_to_session_id.clone(),
-                latest_completion_report: None,
-                role: "agent".to_string(),
-                joined_at: now,
-                last_status_change: now,
-                is_headless: true,
-                output_tail: None,
-                todo_progress: None,
-                todo_items: Vec::new(),
-                runtime: crate::protocol::SwarmMemberRuntime {
-                    model: Some(provider_model),
-                    provider: Some(provider_name),
-                    auth_method,
-                    effort,
-                    elapsed_secs: Some(0),
-                },
+    // Register the headless session as a swarm member (is_headless: true,
+    // never auto-claims coordinator) and join its swarm, routing both raw-map
+    // writes through the swarm service handle.
+    swarm
+        .register_headless_member(
+            &client_session_id,
+            working_dir.clone(),
+            swarm_id.as_deref(),
+            swarm_enabled,
+            friendly_name.clone(),
+            report_back_to_session_id.clone(),
+            event_tx.clone(),
+            crate::protocol::SwarmMemberRuntime {
+                model: Some(provider_model),
+                provider: Some(provider_name),
+                auth_method,
+                effort,
+                elapsed_secs: Some(0),
             },
-        );
-    }
-
-    if let Some(ref id) = swarm_id {
-        let mut swarms = swarms_by_id.write().await;
-        swarms
-            .entry(id.clone())
-            .or_insert_with(HashSet::new)
-            .insert(client_session_id.clone());
-    }
-
-    // Headless sessions never auto-claim coordinator; only TUI-connected sessions do.
-    let is_new_coordinator = false;
-    let _ = swarm_coordinators;
-    if is_new_coordinator {
-        let mut members = swarm_members.write().await;
-        if let Some(m) = members.get_mut(&client_session_id) {
-            m.role = "coordinator".to_string();
-        }
-    }
+        )
+        .await;
 
     if let Some(ref id) = swarm_id {
         swarm.broadcast_swarm_status(id).await;
