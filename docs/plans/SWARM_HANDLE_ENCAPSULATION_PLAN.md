@@ -152,26 +152,26 @@ private; zero non-`services/swarm.rs` code reaches them; all mutations go
 through handle methods; suite green + clippy clean.
 **Achieved (partial).** Every named handle field is private and cross-module
 code reaches them only through documented read accessors. The single-purpose
-teardown/rename mutations are routed through handle methods
+teardown/rename/registration mutations are routed through handle methods
 (`remove_session_member` / `take_session_membership`, `rename_member_session`
-now also rewrites coordinators, resume/detached cleanup), and all four
-member-removal write sites in the session lifecycle funnel through the handle.
-`debug_swarm_write` / persistence-test code is a documented privileged
-observer. `Server.swarm_state` (the handle's constructor source) remains a pub
-field, out of scope.
+now also rewrites coordinators, resume/detached cleanup, and headless
+registration via `register_headless_member`), and the member-removal write
+sites in the session lifecycle funnel through the handle. `debug_swarm_write` /
+persistence-test code is a documented privileged observer. `Server.swarm_state`
+(the handle's constructor source) remains a pub field, out of scope.
 
 **Known remaining boundary (honest):** the deeper live orchestration (subscribe
 `working-dir`/swarm-id rebind in `handle_set_feature` or `handle_detach`,
-plus several plan/coordinator writes in `comm_graph`, `comm_session`,
-`comm_control`, `comm_plan`, `comm_sync`, `client_actions`, `headless`, and
-`background_tasks`) still mutate the swarm maps in place *after* borrowing them
-through the accessor. These are the plan's "risk concentration": their
-mutations are interleaved with persistence, event emission, broadcasting, and
-coordinator re-election, so pulling them into the handle requires keeping the
-borrow order identical. Not done in this pass; follow-up slices should route
-each onto a handle method/reconstructed `SwarmState` argument. Field-level
-encapsulation (the tier's core) is complete; mutation routing is the remaining
-part of "all mutations go through handle methods".
+plus plan/coordinator writes in `comm_graph`, `comm_session`, `comm_control`,
+`comm_plan`, `comm_sync`, `client_actions`, and `background_tasks`) still
+mutate the swarm maps in place *after* borrowing them through the accessor.
+These are the plan's "risk concentration": their mutations are interleaved
+with persistence, event emission, broadcasting, and coordinator re-election, so
+pulling them into the handle requires keeping the borrow order identical. Not
+done in this pass; follow-up slices should route each onto a handle
+method/reconstructed `SwarmState` argument. Field-level encapsulation (the
+tier's core) is complete; mutation routing of the single-purpose teardown/
+rename/registration paths is done, with the entangled orchestration remaining.
 
 ## Review notes (2026-09)
 
