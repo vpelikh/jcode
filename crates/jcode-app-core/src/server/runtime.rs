@@ -367,28 +367,18 @@ impl ServerRuntime {
 #[cfg(test)]
 mod tests {
     use super::RuntimeTaskScope;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
-
-    struct DropFlag(Arc<AtomicBool>);
-
-    impl Drop for DropFlag {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::SeqCst);
-        }
-    }
 
     #[tokio::test]
     async fn runtime_task_scope_cancels_and_joins_owned_tasks() {
         let scope = RuntimeTaskScope::default();
-        let dropped = Arc::new(AtomicBool::new(false));
-        let task_dropped = Arc::clone(&dropped);
+        let dropped = crate::cancel_scope::CancelScope::new();
+        let task_dropped = dropped.child();
 
         assert!(
             scope
                 .spawn(move |cancellation| async move {
-                    let _drop_flag = DropFlag(task_dropped);
+                    let _drop_flag = task_dropped.guard();
                     cancellation.cancelled().await;
                 })
                 .await
@@ -399,7 +389,10 @@ mod tests {
             .await
             .expect("runtime task scope should join cancelled tasks");
 
-        assert!(dropped.load(Ordering::SeqCst));
+        assert!(
+            dropped.cancelled(),
+            "cancelling and joining the task must drop its guard and arm the scope"
+        );
         assert_eq!(scope.task_count().await, 0);
         assert!(
             !scope

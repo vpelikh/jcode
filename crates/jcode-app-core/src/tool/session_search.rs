@@ -38,8 +38,6 @@ use serde_json::{Value, json};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 /// Max session snapshots/journals to deserialize after raw pre-filtering.
@@ -59,31 +57,18 @@ const INDEX_SCORE_CANDIDATE_MULTIPLIER: usize = 2;
 /// Legacy JSON index file superseded by the binary token-hash indexes.
 const LEGACY_INDEX_FILE_NAME: &str = "session_search_recent_index_v1.json";
 
-/// Cooperative cancellation flag for the blocking scan (deepseek-harness F8 Part A).
+/// Cooperative cancellation for the blocking scan (deepseek-harness F8 Part A),
+/// backed by the crate's shared [`crate::cancel_scope::CancelScope`].
 ///
 /// `search_sessions_blocking` runs on `spawn_blocking` threads, so it cannot be
 /// pulled off the CPU by dropping the async future around it; dropping only the
 /// outer future leaves the blocking task running to completion. Instead each scan
-/// iteration checks this shared flag and returns early. The flag is set by an
-/// `AbortOnDrop` guard that fires when the executing future is dropped, i.e. when
+/// iteration checks this shared scope and returns early. The scope's
+/// [`Drop`]-armed guard fires when the executing future is dropped, i.e. when
 /// `execute_with_deadline`'s timeout elapses. This reclaims the blocking threads
 /// early without any cross-thread disruption: the scan is read-only, so bailing
 /// out at a candidate boundary is always safe and leaves no partial writes.
-type CheckAbort = Arc<AtomicBool>;
-
-/// Sets the shared abort flag when dropped.
-///
-/// Created in `execute` before the scan is spawned and held until the executing
-/// future ends. When `execute_with_deadline` times out it drops that future, the
-/// guard's `Drop` runs, and the already-running `spawn_blocking` workers observe
-/// the flag at their next candidate boundary and stop early.
-struct AbortOnDrop(CheckAbort);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::SeqCst);
-    }
-}
+type CheckAbort = crate::cancel_scope::CancelScope;
 
 #[derive(Debug, Deserialize)]
 struct SearchInput {
@@ -165,9 +150,9 @@ impl SessionSearchTool {
     ///
     /// Cancellation safety (deepseek-harness F8 Part A): the scan is
     /// **read-only and idempotent**, and it is now also **cooperatively
-    /// abortable**. `execute` holds an `AbortOnDrop` guard for the life of the
+    /// abortable**. `execute` holds a `CancelScope` guard for the life of the
     /// executing future; when `execute_with_deadline`'s timeout fires it drops
-    /// that future, the guard sets a shared `AtomicBool`, and every scan loop
+    /// that future, the guard sets the shared cancel flag, and every scan loop
     /// (raw pre-filter, index build, scoring deserialize, external loaders)
     /// checks the flag at each candidate boundary and stops early. So on
     /// timeout the turn returns immediately with the model-visible timeout
@@ -213,8 +198,8 @@ pub fn spawn_recent_index_warmup() {
                 return Ok(0);
             }
             // Background warmup is unattended and must finish, so it uses a
-            // never-cancelled flag (no deadline is racing it).
-            let never_abort = Arc::new(AtomicBool::new(false));
+            // never-cancelled scope (no deadline is racing it).
+            let never_abort = crate::cancel_scope::CancelScope::new();
             let _ = jcode_index_candidates(&collection.files, &empty_query, &never_abort)?;
             Ok(collection.files.len())
         })()
@@ -617,8 +602,8 @@ impl Tool for SessionSearchTool {
         // and sets the shared flag when that future is dropped (i.e. when
         // `execute_with_deadline`'s timeout elapses), so the blocking scan can bail
         // out at its next candidate boundary instead of running to the end.
-        let abort = Arc::new(AtomicBool::new(false));
-        let _abort_on_drop = AbortOnDrop(abort.clone());
+        let abort = crate::cancel_scope::CancelScope::new();
+        let _abort_on_drop = abort.guard();
 
         let report = tokio::task::spawn_blocking({
             let session_id = ctx.session_id.clone();
@@ -728,7 +713,7 @@ fn search_sessions_blocking(
     }
     // Cancelled up front: skip even file enumeration so a timed-out call that
     // the turn has already left reclaims the blocking thread immediately.
-    if abort.load(Ordering::Relaxed) {
+    if abort.cancelled() {
         return Ok(report);
     }
 
@@ -934,7 +919,7 @@ fn jcode_index_candidates(
     query: &QueryProfile,
     abort: &CheckAbort,
 ) -> Result<Vec<SessionFileCandidate>> {
-    if abort.load(Ordering::Relaxed) {
+    if abort.cancelled() {
         return Ok(Vec::new());
     }
     let index_path = index_dir()?.join("session_search_jcode_index_v2.bin");
@@ -996,7 +981,7 @@ fn filter_candidates_parallel(
             handles.push(scope.spawn(move || {
                 let mut outcome = RawFilterOutcome::default();
                 for candidate in chunk {
-                    if abort.load(Ordering::Relaxed) {
+                    if abort.cancelled() {
                         break;
                     }
                     if path_matches_query(&candidate.session_id_hint, query) {
@@ -1072,7 +1057,7 @@ fn score_candidates_parallel(
             handles.push(scope.spawn(move || {
                 let mut outcome = SearchWorkerOutcome::default();
                 for candidate in chunk {
-                    if abort.load(Ordering::Relaxed) {
+                    if abort.cancelled() {
                         break;
                     }
                     match Session::load_from_path(&candidate.snapshot_path) {
@@ -1159,7 +1144,7 @@ fn search_external_sessions(
         load_cursor_external_session,
         abort,
     );
-    if abort.load(Ordering::Relaxed) {
+    if abort.cancelled() {
         return report;
     }
 
@@ -1170,7 +1155,7 @@ fn search_external_sessions(
 
     report.scanned_external_sessions = records.len();
     for record in records {
-        if abort.load(Ordering::Relaxed) {
+        if abort.cancelled() {
             break;
         }
         append_external_session_results(&mut report.results, &record, query, options);
@@ -1200,7 +1185,7 @@ fn collect_external_jsonl_source(
         return;
     }
     report.external_sources.push(source);
-    if abort.load(Ordering::Relaxed) {
+    if abort.cancelled() {
         return;
     }
     let paths = collect_recent_files_recursive(&root, "jsonl", options.max_scan_sessions);
@@ -1300,7 +1285,7 @@ fn load_external_candidates_parallel(
             handles.push(scope.spawn(move || {
                 let mut outcome = ExternalLoadOutcome::default();
                 for path in chunk {
-                    if abort.load(Ordering::Relaxed) {
+                    if abort.cancelled() {
                         break;
                     }
                     if !external_path_or_raw_matches_query(path, query) {
@@ -1410,7 +1395,7 @@ fn load_claude_candidates_parallel(
             handles.push(scope.spawn(move || {
                 let mut records = Vec::new();
                 for session in chunk {
-                    if abort.load(Ordering::Relaxed) {
+                    if abort.cancelled() {
                         break;
                     }
                     let path = PathBuf::from(&session.full_path);

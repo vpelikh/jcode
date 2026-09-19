@@ -30,6 +30,7 @@ pub mod headless_review;
 pub mod ambient_runner;
 pub mod ambient_scheduler;
 pub mod build;
+mod cancel_scope;
 pub mod catchup;
 pub mod channel;
 pub mod external_auth;
