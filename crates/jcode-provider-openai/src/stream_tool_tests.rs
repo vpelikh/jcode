@@ -56,7 +56,7 @@ fn done(tx: &Sender, id: &str, arguments: &str) {
 fn assert_start(stream: &mut OpenAIResponsesStream, id: &str, name: &str) {
     assert!(
         matches!(next(stream), StreamEvent::ToolUseStart { id: actual_id, name: actual_name }
-        if actual_id == format!("call_{id}") && actual_name == name)
+        if actual_id == format!("call_{id}").into() && actual_name == name)
     );
 }
 
