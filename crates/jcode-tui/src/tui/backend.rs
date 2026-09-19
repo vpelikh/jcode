@@ -1606,6 +1606,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handoff_list_and_import_send_the_right_wire_requests() {
+        use tokio::io::AsyncBufReadExt;
+
+        let mut remote = RemoteConnection::dummy();
+        let peer = remote.take_dummy_peer().unwrap();
+        let (reader, _writer) = peer.into_split();
+        let mut reader = BufReader::new(reader);
+
+        // handoff_list
+        let list_id = remote.handoff_list().await.unwrap();
+        let mut request = String::new();
+        reader.read_line(&mut request).await.unwrap();
+        let parsed = serde_json::from_str::<Request>(&request).unwrap();
+        assert!(matches!(&parsed, Request::HandoffList { id } if *id == list_id));
+        assert_eq!(parsed.id(), list_id);
+
+        // handoff_import with a payload and disposition
+        let import_id = remote
+            .handoff_import("{\"session_id\":\"src\"}".to_string(), Some("closed".to_string()))
+            .await
+            .unwrap();
+        let mut request = String::new();
+        reader.read_line(&mut request).await.unwrap();
+        let parsed = serde_json::from_str::<Request>(&request).unwrap();
+        assert!(matches!(&parsed, Request::HandoffImport {
+            id, payload, disposition
+        } if *id == import_id
+            && payload == "{\"session_id\":\"src\"}"
+            && disposition.as_deref() == Some("closed")));
+        assert_eq!(parsed.id(), import_id);
+    }
+
+    #[tokio::test]
     async fn native_resume_filters_duplicate_control_done_but_preserves_turn_done() {
         let mut remote = RemoteConnection::dummy();
         let peer = remote.take_dummy_peer().unwrap();

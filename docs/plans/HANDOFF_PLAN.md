@@ -12,7 +12,11 @@ Live model continuation was exercised end to end with a working provider: a
 fresh session recovered the exact pending marker from the saved handoff.
 
 **Planned:** wire the new import/export portability into remote fallback. The
-interactive `/handoff` overlay is now implemented (see below).
+interactive `/handoff` overlay is now implemented, and the remote wire surface
+now lets an SSH/remote client read and adopt the *server's* handoff store, so
+remote-fallback adoption is wired through `import_handoff`. See "Future work"
+for what remains. The wire request + server handlers + client methods and their
+tests were implemented in 2026-09 on `feat/handoff-remote-fallback`.
 
 ## Purpose
 
@@ -281,8 +285,16 @@ the prior environment.
 
 ## Future work
 
-- Wire `import_handoff` into the remote-fallback flow after a failed live-session
-  migration, consuming handoff files already available on the target host.
+- **Remote wire surface (landed 2026-09).** `import_handoff` is now reachable
+  over the wire: `Request::HandoffImport` adopts a portable payload into the
+  server's store as the live handoff for the session's project, and it is the
+  entry point a remote-fallback flow uses after a failed live-session migration
+  (consume the snapshot already on the target host, or ship one from the client).
+  `Request::HandoffList` plus `ServerEvent::HandoffListed` expose the server-side
+  store so a client can discover what the *target host* has saved. The remote
+  `/handoff` overlay is fed from that listing over SSH. A combined atomic
+  "clear + adopt + resume" apply request would be the natural next step and is
+  listed below.
 
 - **Picker row model (landed 2026-09).** The interactive overlay's handoff
   surface is decoupled from the session-shaped one. `session_picker.rs` now
@@ -341,11 +353,13 @@ the prior environment.
   `/handoffres` flow. A protocol feature (a combined apply request, or a
   rollback/recovery) would make it atomic. Independent of the row model.
 
-- **SSH handoff discovery is blocked.** Over SSH the `/handoff` overlay is
-  unavailable because it lists the *client host's* local store, which is the
-  wrong host for an SSH-backed session. `/handoffres <id>` still works over SSH
-  for a known server-side id, but a client cannot list the server's handoffs.
-  Closing this needs a wire request to read the server-side handoff store.
+- **SSH handoff discovery is wired (landed 2026-09).** Over SSH the `/handoff`
+  overlay is now fed from the connected *server's* handoff store via
+  `handoff_list`/`HandoffListed` instead of the client host's local store (the
+  wrong host for an SSH-backed session). `HandoffImport`/`HandoffImported`
+  exposes adoption of a portable payload server-side, and `/handoffres <id>`
+  works for any server-side id. The `payload` field on each `HandoffListed`
+  row lets the client re-adopt a snapshot with a single round trip.
 
 - **Standalone `--resume` has no handoff picker.** The interactive overlay is
   TUI-only; `jcode --resume` treats a handoff selection as an inert no-op. Adding
