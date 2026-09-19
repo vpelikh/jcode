@@ -607,7 +607,9 @@ impl Tool for SessionSearchTool {
 
         let report = tokio::task::spawn_blocking({
             let session_id = ctx.session_id.clone();
-            let abort = abort.clone();
+            // `child()` shares the flag into the blocking task; the caller keeps
+            // the guard that arms it when its future is dropped.
+            let abort = abort.child();
             let query = query.clone();
             let options = options.clone();
             move || search_sessions_blocking(&sessions_dir, &query, &options, &session_id, &abort)
@@ -1165,6 +1167,11 @@ fn search_external_sessions(
     report
 }
 
+/// Collect one external source's sessions into `records`, narrowing with the
+/// incremental index like the jcode path. `abort` lets the caller stop the scan
+/// when the tool is cancelled; it is threaded into the loader loop the same way
+/// every other source threads it.
+#[allow(clippy::too_many_arguments)] // all 8 arguments are independent inputs of one private helper
 fn collect_external_jsonl_source(
     records: &mut Vec<ExternalSessionRecord>,
     report: &mut SearchReport,
