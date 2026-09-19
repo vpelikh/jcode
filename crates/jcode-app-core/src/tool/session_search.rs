@@ -1133,7 +1133,7 @@ fn search_external_sessions(
         load_pi_external_session,
         abort,
     );
-    collect_opencode_external_sessions(&mut records, &mut report, options);
+    collect_opencode_external_sessions(&mut records, &mut report, options, abort);
     collect_external_jsonl_source(
         &mut records,
         &mut report,
@@ -1473,6 +1473,7 @@ fn collect_opencode_external_sessions(
     records: &mut Vec<ExternalSessionRecord>,
     report: &mut SearchReport,
     options: &SearchOptions,
+    abort: &CheckAbort,
 ) {
     if !source_matches_filter("opencode", options) {
         return;
@@ -1493,6 +1494,9 @@ fn collect_opencode_external_sessions(
         return;
     };
     for path in collect_recent_files_recursive(&root, "json", options.max_scan_sessions) {
+        if abort.cancelled() {
+            break;
+        }
         match load_opencode_external_session(
             &path,
             &messages_base,
