@@ -351,15 +351,28 @@ impl SwarmServiceHandle {
         }
     }
 
-    /// Remove a session's member record, returning the swarm id it belonged to
-    /// (if any). Leaner than `take_session_membership`: it only touches
-    /// `members` and does not clear file-touch or channel subscriptions, so
-    /// teardown paths that want to keep those until the caller has finished
-    /// their own swarm teardown (`remove_session_from_swarm`) can fold their
-    /// member removal through the handle instead of the raw map.
-    pub(crate) async fn remove_session_member(&self, session_id: &str) -> Option<String> {
+    /// Remove a session's member record, returning the removed member's identity
+    /// (swarm id, swarm-enabled flag, friendly name). Leaner than
+    /// `take_session_membership`: it only touches `members` and does not clear
+    /// file-touch or channel subscriptions, so teardown paths that want to keep
+    /// those until the caller has finished their own swarm teardown
+    /// (`remove_session_from_swarm`) can fold their member removal through the
+    /// handle instead of the raw map. No-op (empty identity) when no member was
+    /// present.
+    pub(crate) async fn remove_session_member(&self, session_id: &str) -> MemberIdentity {
         let mut members = self.swarm_state.members.write().await;
-        members.remove(session_id).and_then(|member| member.swarm_id)
+        match members.remove(session_id) {
+            Some(member) => MemberIdentity {
+                swarm_id: member.swarm_id,
+                swarm_enabled: member.swarm_enabled,
+                friendly_name: member.friendly_name,
+            },
+            None => MemberIdentity {
+                swarm_id: None,
+                swarm_enabled: false,
+                friendly_name: None,
+            },
+        }
     }
 
     /// Tear down a session's swarm membership on `/clear`: remove the member
@@ -990,8 +1003,9 @@ mod tests {
             SwarmMutationRuntime::default(),
         );
 
-        let swarm_id = handle.remove_session_member("sess").await;
-        assert_eq!(swarm_id.as_deref(), Some("swarm-1"));
+        let removed = handle.remove_session_member("sess").await;
+        assert_eq!(removed.swarm_id.as_deref(), Some("swarm-1"));
+        assert_eq!(removed.friendly_name.as_deref(), Some("sess"));
         // The member record is gone, but swarms_by_id (swarm-level membership)
         // is untouched: the caller decides whether to also run
         // remove_session_from_swarm.
@@ -1005,7 +1019,8 @@ mod tests {
                 .contains_key("swarm-1")
         );
 
-        // A second removal is a clean no-op.
-        assert_eq!(handle.remove_session_member("sess").await, None);
+        // A second removal is a clean no-op (empty identity).
+        let again = handle.remove_session_member("sess").await;
+        assert!(again.swarm_id.is_none() && again.friendly_name.is_none());
     }
 }

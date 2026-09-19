@@ -938,7 +938,7 @@ async fn cleanup_detached_source_session_if_unused(
     file_touch.clear_session(old_session_id).await;
 
     let removed_swarm_id = swarm.remove_session_member(old_session_id).await;
-    if let Some(swarm_id) = removed_swarm_id {
+    if let Some(swarm_id) = removed_swarm_id.swarm_id {
         swarm
             .remove_session_from_swarm(old_session_id, &swarm_id)
             .await;
