@@ -44,7 +44,6 @@ pub(super) async fn handle_comm_propose_plan(
     let swarm_plans = &swarm.swarm_state.plans;
     let swarm_coordinators = &swarm.swarm_state.coordinators;
     let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
-    let _swarm_mutation_runtime = swarm.swarm_mutation_runtime();
     let swarm_id = {
         let members = swarm_members.read().await;
         members
