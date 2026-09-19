@@ -623,7 +623,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+#[allow(clippy::await_holding_lock)]
     async fn inspect_reload_wait_status_returns_failed_with_marker_detail() {
         let _lock = crate::storage::lock_test_env();
         let temp = tempfile::tempdir().expect("tempdir");
@@ -650,7 +650,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+#[allow(clippy::await_holding_lock)]
     async fn inspect_reload_wait_status_returns_ready_for_socket_ready_marker() {
         let _lock = crate::storage::lock_test_env();
         let temp = tempfile::tempdir().expect("tempdir");
@@ -673,7 +673,7 @@ mod tests {
         assert_eq!(status, ReloadWaitStatus::Ready);
     }
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+#[allow(clippy::await_holding_lock)]
     async fn wait_for_reload_ack_returns_matching_ack() {
         let _lock = crate::storage::lock_test_env();
         let request_id = crate::id::new_id("reload-test");
@@ -693,7 +693,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+#[allow(clippy::await_holding_lock)]
     async fn wait_for_reload_ack_handles_repeated_unique_requests() {
         let _lock = crate::storage::lock_test_env();
         let (tx, _) = reload_ack();
@@ -716,7 +716,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+#[allow(clippy::await_holding_lock)]
     async fn inspect_reload_wait_status_handles_repeated_ready_markers() {
         let _lock = crate::storage::lock_test_env();
         let temp = tempfile::tempdir().expect("tempdir");
@@ -768,7 +768,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+#[allow(clippy::await_holding_lock)]
     async fn inspect_reload_wait_status_idle_when_last_known_pid_is_dead_without_marker() {
         let _lock = crate::storage::lock_test_env();
         let temp = tempfile::tempdir().expect("tempdir");
@@ -786,7 +786,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+#[allow(clippy::await_holding_lock)]
     async fn clear_reload_marker_if_stale_for_pid_keeps_own_starting_marker() {
         let _lock = crate::storage::lock_test_env();
         let temp = tempfile::tempdir().expect("tempdir");
@@ -811,7 +811,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+#[allow(clippy::await_holding_lock)]
     async fn clear_reload_marker_if_stale_for_pid_clears_foreign_or_completed_markers() {
         let _lock = crate::storage::lock_test_env();
         let temp = tempfile::tempdir().expect("tempdir");
@@ -853,7 +853,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+#[allow(clippy::await_holding_lock)]
     async fn publish_reload_socket_ready_leaves_failed_marker_untouched() {
         let _lock = crate::storage::lock_test_env();
         let temp = tempfile::tempdir().expect("tempdir");
@@ -876,7 +876,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+#[allow(clippy::await_holding_lock)]
     async fn recent_reload_state_ignores_corrupt_marker() {
         let _lock = crate::storage::lock_test_env();
         let temp = tempfile::tempdir().expect("tempdir");
@@ -903,7 +903,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+#[allow(clippy::await_holding_lock)]
     async fn reload_marker_active_treats_failed_phase_as_inactive() {
         let _lock = crate::storage::lock_test_env();
         let temp = tempfile::tempdir().expect("tempdir");

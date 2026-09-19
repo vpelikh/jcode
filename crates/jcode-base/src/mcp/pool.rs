@@ -429,7 +429,7 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
+#[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
     async fn issue_790_reload_reuses_default_config_directory() {
         let _guard = crate::storage::lock_test_env();
         let original_cwd = std::env::current_dir().expect("current cwd");

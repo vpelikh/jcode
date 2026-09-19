@@ -488,7 +488,7 @@ fn history_reload_recovery_does_not_mark_delivered_until_continuation_is_accepte
 }
 
 #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
+#[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
 async fn manual_prune_handler_persists_and_reports_save_errors() {
     let _lock = crate::storage::lock_test_env();
     let home = tempfile::tempdir().unwrap();

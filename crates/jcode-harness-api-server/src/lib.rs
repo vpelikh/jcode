@@ -498,7 +498,7 @@ mod public_acceptance_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[allow(clippy::await_holding_lock)] // jcode_home_test_lock() deliberately serializes env-mutating tests across awaits.
+#[allow(clippy::await_holding_lock)] // jcode_home_test_lock() deliberately serializes env-mutating tests across awaits.
     async fn public_socket_keeps_its_attachment_after_another_sessions_state() {
         let _home_lock = translate::jcode_home_test_lock();
         let root = std::env::temp_dir().join(format!(

@@ -209,7 +209,7 @@ async fn wait_for_prewarm(slot: &openai_websocket_prewarm::PrewarmSlot) {
 }
 
 #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
+#[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
 async fn unfinished_or_incompatible_prewarm_is_cancelled_without_foreground_wait() {
     let _lock = jcode_base::storage::lock_test_env();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -251,7 +251,7 @@ async fn unfinished_or_incompatible_prewarm_is_cancelled_without_foreground_wait
 }
 
 #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
+#[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
 async fn ready_prewarm_with_different_settings_is_invalidated() {
     let _lock = jcode_base::storage::lock_test_env();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -287,7 +287,7 @@ async fn ready_prewarm_with_different_settings_is_invalidated() {
 }
 
 #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
+#[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
 async fn rejected_warmup_is_not_adopted() {
     let _lock = jcode_base::storage::lock_test_env();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

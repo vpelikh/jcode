@@ -251,7 +251,7 @@ fn test_parse_update_without_explicit_at() {
 // absolute paths through unchanged, so nothing else bounds it.
 
 #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
+#[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
 async fn apply_patch_refuses_to_delete_a_protected_path() {
     let _env_lock = crate::storage::lock_test_env();
     let temp = tempfile::tempdir().expect("temp home");

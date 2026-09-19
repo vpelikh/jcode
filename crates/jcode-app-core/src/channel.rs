@@ -2978,7 +2978,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
+#[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
     async fn test_free_callback_requests_confirmation_instead_of_freeing() {
         let _guard = crate::storage::lock_test_env();
         let home = tempfile::TempDir::new().expect("temp home");
@@ -3048,7 +3048,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
+#[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
     async fn test_stop_button_callback_does_not_require_confirm() {
         let _guard = crate::storage::lock_test_env();
         let home = tempfile::TempDir::new().expect("temp home");
@@ -3113,7 +3113,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
+#[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
     async fn test_stop_callback_fires_even_while_process_lock_is_held() {
         // Regression guard for the Round-3 deadlock fix: a streaming turn holds
         // process_lock for its entire duration, so the Stop callback MUST be
@@ -3179,7 +3179,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
+#[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
     async fn test_abort_command_is_immediate_and_not_confirm_gated() {
         let _guard = crate::storage::lock_test_env();
         let home = tempfile::TempDir::new().expect("temp home");

@@ -714,7 +714,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+#[allow(clippy::await_holding_lock)]
     async fn clear_coordinator_releases_coordinator_lock_before_waiting_for_members() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let _env = isolated_runtime(&dir);

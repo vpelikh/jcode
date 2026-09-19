@@ -243,7 +243,7 @@ async fn set_working_dir_rejected_when_agent_is_busy() {
 }
 
 #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
+#[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
 async fn context_message_persists_without_starting_turn() {
     let _guard = crate::storage::lock_test_env();
     let _env = IsolatedReloadRecoveryEnv::new();
@@ -1050,7 +1050,7 @@ fn reload_starting_rejects_new_turn_without_spawning_processing_task() {
 }
 
 #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
+#[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
 async fn client_initiated_turn_fans_out_stream_and_terminal_events_to_live_attachments() {
     let _guard = crate::storage::lock_test_env();
     let _runtime = IsolatedRuntimeDir::new();
