@@ -946,6 +946,24 @@ impl RemoteConnection {
         Ok(id)
     }
 
+    /// Ask the server to atomically adopt a portable handoff payload *and* boot
+    /// the current session from it in a single hop: the payload is imported, the
+    /// live conversation is cleared, and the handoff-resume override is armed so
+    /// the next first user message boots from the adopted snapshot. The outcome
+    /// arrives asynchronously via [`ServerEvent::HandoffImported`] (or `Error`
+    /// on rejection, which leaves the live conversation untouched).
+    pub async fn handoff_apply(&mut self, payload: String, disposition: Option<String>) -> Result<u64> {
+        let id = self.next_request_id;
+        let request = Request::HandoffApply {
+            id,
+            payload,
+            disposition,
+        };
+        self.next_request_id += 1;
+        self.send_request(request).await?;
+        Ok(id)
+    }
+
     /// Inject externally transcribed text into the active remote TUI session.
     pub async fn send_transcript(
         &mut self,
@@ -1636,6 +1654,21 @@ mod tests {
             && payload == "{\"session_id\":\"src\"}"
             && disposition.as_deref() == Some("closed")));
         assert_eq!(parsed.id(), import_id);
+
+        // handoff_apply with a payload and disposition
+        let apply_id = remote
+            .handoff_apply("{\"session_id\":\"src\"}".to_string(), Some("interrupted".to_string()))
+            .await
+            .unwrap();
+        let mut request = String::new();
+        reader.read_line(&mut request).await.unwrap();
+        let parsed = serde_json::from_str::<Request>(&request).unwrap();
+        assert!(matches!(&parsed, Request::HandoffApply {
+            id, payload, disposition
+        } if *id == apply_id
+            && payload == "{\"session_id\":\"src\"}"
+            && disposition.as_deref() == Some("interrupted")));
+        assert_eq!(parsed.id(), apply_id);
     }
 
     #[tokio::test]

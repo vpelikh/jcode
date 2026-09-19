@@ -67,7 +67,11 @@ fn handoff_list_and_import_wire_roundtrip() {
             "project_key": "git:https://example.com/repo",
             "ended_at": "2026-09-19T10:00:00Z",
             "disposition": "closed",
-            "open_todo_count": 3,
+            "open_todos": [
+                {"id": "t1", "content": "one", "status": "in_progress"},
+                {"id": "t2", "content": "two", "status": "in_progress"},
+                {"id": "t3", "content": "three", "status": "in_progress"}
+            ],
             "intent": "Finish the plan",
         }]
     }))
@@ -75,7 +79,7 @@ fn handoff_list_and_import_wire_roundtrip() {
     assert!(matches!(&listed, super::ServerEvent::HandoffListed {
         id: 7, handoffs
     } if handoffs.len() == 1 && handoffs[0].session_id == "import-src"
-        && handoffs[0].open_todo_count == 3
+        && handoffs[0].open_todos.len() == 3
         && handoffs[0].intent.as_deref() == Some("Finish the plan")
         && handoffs[0].payload.is_none()));
 
@@ -88,4 +92,29 @@ fn handoff_list_and_import_wire_roundtrip() {
     assert!(matches!(&imported, super::ServerEvent::HandoffImported {
         id: 8, session_id
     } if session_id == "import-src"));
+}
+
+#[test]
+fn handoff_apply_wire_roundtrip() {
+    let apply = super::decode_request(
+        r#"{"type":"handoff_apply","id":9,"payload":"{\"session_id\":\"src\"}","disposition":"interrupted"}"#,
+    )
+    .unwrap();
+    assert!(matches!(&apply, super::Request::HandoffApply {
+        id: 9, payload, disposition: Some(d)
+    } if payload == "{\"session_id\":\"src\"}" && d == "interrupted"));
+    assert_eq!(apply.id(), 9);
+    assert_eq!(
+        serde_json::to_value(&apply).unwrap(),
+        serde_json::json!({"type":"handoff_apply","id":9,"payload":"{\"session_id\":\"src\"}","disposition":"interrupted"})
+    );
+
+    // disposition is optional (defaults to "closed" server-side).
+    let apply_min = super::decode_request(
+        r#"{"type":"handoff_apply","id":10,"payload":"{\"session_id\":\"src\"}"}"#,
+    )
+    .unwrap();
+    assert!(matches!(apply_min, super::Request::HandoffApply {
+        id: 10, disposition: None, ..
+    }));
 }

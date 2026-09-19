@@ -3,7 +3,7 @@
 use super::{
     NotifySessionContext, clone_split_session, handle_notify_session, handle_rename_session,
     handle_resume_all_sessions, handle_set_feature, handle_set_handoff_resume,
-    handle_set_working_dir, handle_split, handle_handoff_list, handle_handoff_import,
+    handle_set_working_dir, handle_split, handle_handoff_list, handle_handoff_import, handle_handoff_apply,
 };
 use crate::agent::Agent;
 use crate::message::{ContentBlock, Message, Role, StreamEvent, ToolDefinition};
@@ -1776,7 +1776,10 @@ async fn handle_handoff_list_lists_server_handoff_store() -> Result<()> {
             assert_eq!(handoffs[0].session_id, "beta-handoff");
             assert_eq!(handoffs[1].session_id, "alpha-handoff");
             assert_eq!(handoffs[0].intent.as_deref(), Some("beta intent"));
-            assert_eq!(handoffs[0].open_todo_count, 1);
+            assert_eq!(handoffs[0].open_todos.len(), 1);
+            assert_eq!(handoffs[0].open_todos[0].content, "work for beta intent");
+            assert_eq!(handoffs[0].open_todos[0].status, "in_progress");
+            assert!(handoffs[0].last_assistant_text.is_none());
             // Each entry carries its portable export payload for re-adoption.
             assert!(
                 handoffs[0].payload.as_deref().unwrap_or_default().contains("beta-handoff"),
@@ -1870,6 +1873,119 @@ async fn handle_handoff_import_adopts_payload_and_errors_on_bad_input() -> Resul
     assert!(
         matches!(event2, ServerEvent::Error { id: 32, .. }),
         "malformed payload must reply Error, got {event2:?}"
+    );
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    Ok(())
+}
+
+/// handle_handoff_apply atomically imports a portable payload, clears the live
+/// conversation, and sets the handoff-resume override to the adopted id, so the
+/// next first user message boots from the snapshot. Malformed payloads reply
+/// Error and leave the live conversation untouched (import runs first).
+#[tokio::test]
+async fn handle_handoff_apply_imports_clears_and_arms_resume() -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+    let wd = temp.path();
+    std::fs::create_dir_all(wd).ok();
+
+    // Seed a source handoff on this host, then export it for apply ("remote
+    // adoption"). apply mints a fresh import-<source> id and rekeys to `wd`.
+    crate::todo::save_todos(
+        "source-session",
+        &[crate::todo::TodoItem {
+            id: "t".into(),
+            content: "work to adopt".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: None,
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    crate::todo::save_plan(
+        "source-session",
+        &crate::todo::TodoPlan {
+            user_intention: Some("applied intent".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    crate::handoff::capture("source-session", Some(wd), "closed", None).expect("capture");
+    let payload = crate::handoff::export_handoff("source-session").expect("export");
+
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
+    {
+        let mut guard = agent.lock().await;
+        guard.set_working_dir(wd.to_str().expect("utf8"));
+        // Pre-existing conversation that must be cleared by apply.
+        guard.add_message(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "old conversation".to_string(),
+                cache_control: None,
+            }],
+        );
+        assert_eq!(guard.visible_conversation_message_count(), 1);
+    }
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    handle_handoff_apply(41, payload, None, &agent, &tx).await;
+    let event = timeout(Duration::from_secs(2), rx.recv())
+        .await?
+        .expect("handoff_apply reply");
+    match event {
+        ServerEvent::HandoffImported { id, session_id } => {
+            assert_eq!(id, 41);
+            assert!(session_id.starts_with("import-"), "expected import-<source> id, got {session_id}");
+            // Latest handoff for the project is now the adopted one.
+            assert_eq!(
+                crate::handoff::latest_handoff_for_project(Some(wd)).as_deref(),
+                Some(session_id.as_str())
+            );
+            // Live conversation was cleared and resume override armed.
+            let guard = agent.lock().await;
+            assert_eq!(guard.visible_conversation_message_count(), 0, "apply must clear the live conversation");
+        }
+        other => return Err(anyhow::anyhow!("expected HandoffImported, got {other:?}")),
+    }
+
+    // Malformed payload -> Error; live conversation must stay untouched.
+    {
+        let mut guard = agent.lock().await;
+        guard.add_message(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "another message".to_string(),
+                cache_control: None,
+            }],
+        );
+        let count_before = guard.visible_conversation_message_count();
+        assert!(count_before >= 1);
+    }
+    let (tx2, mut rx2) = mpsc::unbounded_channel();
+    handle_handoff_apply(42, "{{{ not json".to_string(), None, &agent, &tx2).await;
+    let event2 = timeout(Duration::from_secs(2), rx2.recv())
+        .await?
+        .expect("error event");
+    assert!(
+        matches!(event2, ServerEvent::Error { id: 42, .. }),
+        "malformed payload must reply Error, got {event2:?}"
+    );
+    let guard = agent.lock().await;
+    assert!(
+        guard.visible_conversation_message_count() >= 1,
+        "failed apply must leave the live conversation untouched"
     );
 
     if let Some(prev_home) = prev_home {

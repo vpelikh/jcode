@@ -2062,15 +2062,15 @@ fn apply_handoff_resume_sends_clear_then_handoff_resume_and_reports_ready() {
 
 #[test]
 fn handoff_listed_opens_picker_from_server_store_when_pending() {
-    use crate::handoff::HandoffSnapshot;
     use crate::protocol::HandoffWireModel;
 
     let mut app = create_test_app();
     app.is_processing = false;
 
-    // The server-side listing payload for `HandoffListed` is a serialized
-    // HandoffSnapshot (the portable export format).
-    let snapshot = HandoffSnapshot {
+    // The picker row is built from the wire model's *typed* fields. `payload`
+    // is deliberately None (there is nothing to parse), proving a row is shown
+    // even without an opaque payload — the #3 fix.
+    let wire = HandoffWireModel {
         session_id: "src-session".into(),
         project_key: "git:https://example.com/repo".into(),
         ended_at: chrono::Utc::now(),
@@ -2080,18 +2080,7 @@ fn handoff_listed_opens_picker_from_server_store_when_pending() {
         open_todos: Vec::new(),
         last_assistant_text: None,
         initiative_id: None,
-    };
-    let payload = serde_json::to_string(&snapshot).unwrap();
-    let wire = HandoffWireModel {
-        session_id: "src-session".into(),
-        project_key: "git:https://example.com/repo".into(),
-        ended_at: "2026-09-19T11:00:00Z".into(),
-        disposition: "closed".into(),
-        working_dir: Some("/srv/code".into()),
-        intent: Some("server intent".into()),
-        open_todo_count: 0,
-        initiative_id: None,
-        payload: Some(payload),
+        payload: None,
     };
 
     // Feed the matching request id so the event is consumed.
@@ -2148,11 +2137,12 @@ fn handoff_listed_is_ignored_without_a_matching_pending_request() {
             handoffs: vec![HandoffWireModel {
                 session_id: "stray".into(),
                 project_key: "git:x".into(),
-                ended_at: "2026-09-19T11:00:00Z".into(),
+                ended_at: chrono::Utc::now(),
                 disposition: "closed".into(),
                 working_dir: None,
                 intent: None,
-                open_todo_count: 0,
+                open_todos: Vec::new(),
+                last_assistant_text: None,
                 initiative_id: None,
                 payload: None,
             }],

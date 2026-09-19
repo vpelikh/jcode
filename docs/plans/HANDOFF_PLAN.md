@@ -361,12 +361,33 @@ the prior environment.
   it is deliberately out of scope here. Optional; pursue only if grouped
   handoffs or a non-app-core picker consumer becomes a real need.
 
-- **Atomic handoff apply (non-atomic clear+set is a known gap).** The overlay
-  applies a selection as `remote.clear()` then `set_handoff_resume` — two
-  requests that can split if the transport drops between them, leaving a cleared
-  conversation with no override (auto-inject wins). This mirrors the manual
-  `/handoffres` flow. A protocol feature (a combined apply request, or a
-  rollback/recovery) would make it atomic. Independent of the row model.
+- **Atomic handoff apply (landed 2026-09).** `Request::HandoffApply { id, payload,
+  disposition }` adopts a portable payload and boots the session from it in a
+  single server-side hop: `handle_handoff_apply` imports the payload first
+  (rejecting malformed input with `Error` and leaving the live conversation
+  untouched), then clears the current conversation and sets the handoff-resume
+  override to the adopted id so the next first user message boots from the
+  snapshot. This removes the previous non-atomic `clear()` + `set_handoff_resume`
+  two-request split at the client, which could leave a cleared conversation with
+  no override (auto-inject wins). Covered by a unit test
+  (`handle_handoff_apply_imports_clears_and_arms_resume`), a wire roundtrip, and
+  the existing real-socket handoff surface. Independent of the row model.
+
+- **Wire-model duplication (follow-up, deferred).** `HandoffWireModel` and the
+  session-shaped `Row`/display projection carry overlapping session fields.
+  `end`, `archived`, `created_at`, and `name` are kept in sync by `wire.rs`'s
+  `ui_projection` equivalents. Unifying them (render off the wire model directly,
+  or type the wire surface out of the same shapes) is feasible but touches the
+  session-picker's public API and its serialization surface for zero
+  user-visible behavior change. Optional; pursue only if the duplication starts
+  to drift or a non-app-core consumer needs the wire shape.
+
+- **Payload-per-row (follow-up, deferred).** Each `HandoffListed` row carries its
+  full export `payload`. This is convenient for one-round-trip re-adoption but
+  means every listing ships the complete snapshot body even when the client only
+  needs discovery. An on-demand `HandoffExport { id }` request (returning the
+  payload only for a chosen row) would keep listings lean, at the cost of an
+  extra round trip per adoption. Independent of the row model.
 
 - **SSH handoff discovery is wired (landed 2026-09).** Over SSH the `/handoff`
   overlay is now fed from the connected *server's* handoff store via

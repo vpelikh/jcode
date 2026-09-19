@@ -4,7 +4,7 @@ use super::client_actions::{
     handle_notify_session, handle_rename_session, handle_run_subagent, handle_set_feature,
     handle_set_handoff_resume, handle_set_subagent_model, handle_set_working_dir, handle_split,
     handle_stdin_response, handle_transfer, handle_trigger_memory_extraction,
-    handle_handoff_list, handle_handoff_import,
+    handle_handoff_list, handle_handoff_import, handle_handoff_apply,
 };
 use super::client_comm::{
     handle_comm_channel_members, handle_comm_list, handle_comm_list_channels, handle_comm_message,
@@ -2004,6 +2004,14 @@ pub(super) async fn handle_client(
                 disposition,
             } => {
                 handle_handoff_import(id, payload, disposition, &agent, &client_event_tx).await;
+            }
+
+            Request::HandoffApply {
+                id,
+                payload,
+                disposition,
+            } => {
+                handle_handoff_apply(id, payload, disposition, &agent, &client_event_tx).await;
             }
 
             Request::NotifyAuthChanged {

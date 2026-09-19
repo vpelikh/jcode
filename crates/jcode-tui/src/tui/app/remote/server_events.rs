@@ -3050,22 +3050,38 @@ pub(in crate::tui::app) fn handle_server_event(
     }
 }
 
-/// Rebuild `HandoffSnapshot`s from `HandoffListed` wire models and open the
-/// `/handoff` overlay from them.
+/// Build `/handoff` picker rows from `HandoffListed` wire models.
 ///
-/// Each wire model carries its full opaque export payload (the serialized
-/// snapshot), so we reconstruct the real snapshot for the picker's preview and
-/// resume flow. Models whose payload failed to parse are skipped; if none
-/// survive, the standard empty message is shown.
+/// The wire model carries every field the preview/resume flow needs as typed
+/// values, so the client reconstructs the snapshot directly and never parses
+/// the opaque `payload`. A malformed payload can therefore no longer silently
+/// drop a row from the picker. The `payload` itself is still available for
+/// re-adoption (`handoff_import`) when a row is selected.
 fn open_picker_from_remote_handoffs(app: &mut App, handoffs: Vec<HandoffWireModel>) {
-    let mut snapshots: Vec<crate::handoff::HandoffSnapshot> = Vec::new();
+    use crate::handoff::{HandoffSnapshot, HandoffTodo};
+    let mut snapshots: Vec<HandoffSnapshot> = Vec::with_capacity(handoffs.len());
     for model in handoffs {
-        if let Some(payload) = model.payload
-            && let Ok(snapshot) =
-                serde_json::from_str::<crate::handoff::HandoffSnapshot>(&payload)
-        {
-            snapshots.push(snapshot);
-        }
+        snapshots.push(HandoffSnapshot {
+            session_id: model.session_id,
+            project_key: model.project_key,
+            ended_at: model.ended_at,
+            disposition: model.disposition,
+            working_dir: model.working_dir,
+            intent: model.intent,
+            open_todos: model
+                .open_todos
+                .into_iter()
+                .map(|t| HandoffTodo {
+                    id: t.id,
+                    content: t.content,
+                    status: t.status,
+                    group: t.group,
+                    confidence: t.confidence,
+                })
+                .collect(),
+            last_assistant_text: model.last_assistant_text,
+            initiative_id: model.initiative_id,
+        });
     }
     app.open_handoff_picker_with(snapshots);
 }

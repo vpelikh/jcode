@@ -773,11 +773,22 @@ pub(super) async fn handle_handoff_list(
             crate::protocol::HandoffWireModel {
                 session_id: snapshot.session_id,
                 project_key: snapshot.project_key,
-                ended_at: snapshot.ended_at.to_rfc3339(),
+                ended_at: snapshot.ended_at,
                 disposition: snapshot.disposition,
                 working_dir: snapshot.working_dir,
                 intent: snapshot.intent,
-                open_todo_count: snapshot.open_todos.len(),
+                open_todos: snapshot
+                    .open_todos
+                    .into_iter()
+                    .map(|t| crate::protocol::HandoffTodoWire {
+                        id: t.id,
+                        content: t.content,
+                        status: t.status,
+                        group: t.group,
+                        confidence: t.confidence,
+                    })
+                    .collect(),
+                last_assistant_text: snapshot.last_assistant_text,
                 initiative_id: snapshot.initiative_id,
                 payload,
             }
@@ -823,6 +834,59 @@ pub(super) async fn handle_handoff_import(
         None => {
             // Malformed payload or no resolvable project key for this session.
             crate::logging::warn(&format!("[handoff] import request {id} rejected"));
+            let _ = client_event_tx.send(ServerEvent::Error {
+                id,
+                message: "could not adopt handoff payload (malformed or no project for session)"
+                    .to_string(),
+                retry_after_secs: None,
+            });
+        }
+    }
+}
+
+/// Atomically adopt a handoff payload and boot this session from it, all in
+/// one server-side hop.
+///
+/// This is the remote-fallback apply flow: [`import_handoff`] adopts the
+/// payload (rekeyed to the session's working-dir project), then the current
+/// conversation is cleared and the handoff-resume override is set to the
+/// adopted id, so the next first user message boots from the snapshot. The
+/// import happens first — clearing only runs when it succeeds — so a rejected
+/// payload leaves the session untouched (only an `Error` is replied).
+pub(super) async fn handle_handoff_apply(
+    id: u64,
+    payload: String,
+    disposition: Option<String>,
+    agent: &Arc<Mutex<Agent>>,
+    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+) {
+    let working_dir = {
+        let guard = agent.lock().await;
+        guard.working_dir().map(std::path::PathBuf::from)
+    };
+    let disposition = disposition
+        .as_deref()
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or("closed");
+    match crate::handoff::import_handoff(&payload, working_dir.as_deref(), disposition) {
+        Some(session_id) => {
+            // Import succeeded: now clear the session and boot it fresh from
+            // the adopted snapshot, all server-side (no client round trips).
+            let mut guard = agent.lock().await;
+            guard.clear();
+            guard.set_handoff_resume(Some(session_id.clone()));
+            crate::logging::event_info(
+                "HANDOFF",
+                vec![
+                    ("phase", "applied".to_string()),
+                    ("request_id", id.to_string()),
+                    ("adopted", session_id.clone()),
+                ],
+            );
+            let _ = client_event_tx.send(ServerEvent::HandoffImported { id, session_id });
+        }
+        None => {
+            crate::logging::warn(&format!("[handoff] apply request {id} rejected (import failed)"));
             let _ = client_event_tx.send(ServerEvent::Error {
                 id,
                 message: "could not adopt handoff payload (malformed or no project for session)"

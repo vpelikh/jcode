@@ -377,6 +377,27 @@ pub enum Request {
         disposition: Option<String>,
     },
 
+    /// Atomically adopt a portable handoff payload and boot the session from it
+    /// in one server-side hop: import the snapshot, clear the current
+    /// conversation, and set the handoff-resume override to the adopted id.
+    ///
+    /// This is the remote-fallback apply flow. Unlike a sequence of
+    /// `handoff_import` then `clear` then `set_handoff_resume` from the client,
+    /// the server performs all three with no intermediate round trips, so a
+    /// fresh session will boot from the adopted snapshot. The import happens
+    /// first; the conversation is only cleared when the import succeeds, so a
+    /// rejected payload leaves the session untouched. Replies with
+    /// [`ServerEvent::HandoffImported`].
+    #[serde(rename = "handoff_apply")]
+    HandoffApply {
+        id: u64,
+        payload: String,
+        /// Disposition to stamp on the adopted snapshot ("closed", "crashed",
+        /// or "reloading"). Defaults to "closed" when omitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disposition: Option<String>,
+    },
+
     /// Split the current session — clone conversation into a new session
     #[serde(rename = "split")]
     Split { id: u64 },
@@ -825,21 +846,35 @@ pub enum Request {
     },
 }
 
+/// A compact, typed view of one open todo in a handoff listing. Mirrors
+/// `jcode_base::handoff::HandoffTodo`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandoffTodoWire {
+    pub id: String,
+    pub content: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
+}
+
 /// A wire-safe projection of a saved handoff snapshot, for listing the
 /// server-side handoff store over the protocol.
 ///
-/// This mirrors the essential display fields of `jcode_base::handoff::HandoffSnapshot`
-/// without making `jcode-protocol` depend on `jcode-base`. It carries enough for
-/// the client to render the `/handoff` overlay from the *server*'s store and to
-/// request adoption of a specific snapshot.
+/// This mirrors the display/context fields of `jcode_base::handoff::HandoffSnapshot`
+/// without making `jcode-protocol` depend on `jcode-base`. The typed fields are
+/// sufficient for the client to render the `/handoff` overlay from the *server*'s
+/// store without parsing the opaque `payload`. `payload` remains for re-adoption
+/// on this host via `handoff_import` in a single round trip.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandoffWireModel {
     /// Source session id the snapshot was captured from.
     pub session_id: String,
     /// Portable project identity (git remote URL or absolute working dir).
     pub project_key: String,
-    /// Capture timestamp, RFC3339 UTC.
-    pub ended_at: String,
+    /// Capture timestamp, serialized as RFC3339 UTC on the wire.
+    pub ended_at: chrono::DateTime<chrono::Utc>,
     /// Why the session ended: "closed", "crashed", or "reloading".
     pub disposition: String,
     /// Source working directory, when recorded.
@@ -848,8 +883,14 @@ pub struct HandoffWireModel {
     /// The user's intent from the todo plan, when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent: Option<String>,
-    /// Number of open work items at close (cheap preview size).
-    pub open_todo_count: usize,
+    /// Live work items at close, typed so the client renders the preview from
+    /// these instead of re-parsing `payload` (a malformed payload can no longer
+    /// silently drop a row from the picker).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_todos: Vec<HandoffTodoWire>,
+    /// Tail text of the last assistant message, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_assistant_text: Option<String>,
     /// Durable initiative linked to this work, if one was attached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initiative_id: Option<String>,
