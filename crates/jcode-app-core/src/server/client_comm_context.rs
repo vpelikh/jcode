@@ -189,7 +189,7 @@ pub(super) async fn handle_comm_list(
 ) {
     let swarm_members = &swarm.swarm_state.members;
     let swarms_by_id = &swarm.swarm_state.swarms_by_id;
-    let file_touch = &swarm.file_touch;
+    let file_touch = swarm.file_touch();
     let swarm_id = swarm_id_for_session(&req_session_id, swarm_members).await;
 
     if let Some(swarm_id) = swarm_id {

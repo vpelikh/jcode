@@ -37,7 +37,7 @@ pub(crate) struct SwarmServiceHandle {
     /// Shared context by swarm (swarm_id -> key -> SharedContext).
     shared_context: Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
     /// File-touch tracking service (forward path index + reverse session index).
-    pub(crate) file_touch: FileTouchService,
+    file_touch: FileTouchService,
     /// Channel subscriptions forward index.
     channel_subscriptions: ChannelSubscriptions,
     /// Channel subscriptions reverse index (session_id -> swarm_id -> channels).
@@ -77,6 +77,17 @@ impl SwarmServiceHandle {
             await_members_runtime: server.await_members_runtime.clone(),
             swarm_mutation_runtime: server.swarm_mutation_runtime.clone(),
         }
+    }
+
+    /// Borrow the file-touch tracking service.
+    ///
+    /// Reads and writes both route through the encapsulated `FileTouchService`
+    /// (`record_touch`, `snapshot`, `reverse_snapshot`, `clear_session`,
+    /// `expire_older_than`, `sorted_file_strings_for_session`,
+    /// `accesses_for_path`); callers do not reach into the raw index maps.
+    /// Exists so the field stays encapsulated (Tier 3).
+    pub(crate) fn file_touch(&self) -> &FileTouchService {
+        &self.file_touch
     }
 
     /// Borrow the swarm event emission sources (`history`, `counter`,

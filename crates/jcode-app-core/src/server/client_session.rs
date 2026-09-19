@@ -1041,7 +1041,7 @@ pub(super) async fn handle_resume_session(
     let swarms_by_id = &swarm.swarm_state.swarms_by_id;
     let swarm_plans = &swarm.swarm_state.plans;
     let swarm_coordinators = &swarm.swarm_state.coordinators;
-    let file_touch = &swarm.file_touch;
+    let file_touch = swarm.file_touch();
 
     let resume_start = Instant::now();
     let incoming_client_instance_id = client_instance_id.map(str::to_string);

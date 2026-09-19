@@ -254,7 +254,7 @@ pub(super) async fn handle_comm_status(
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
     let swarm_members = &swarm.swarm_state.members;
-    let file_touch = &swarm.file_touch;
+    let file_touch = swarm.file_touch();
     if !ensure_same_swarm_access(
         id,
         &req_session_id,
