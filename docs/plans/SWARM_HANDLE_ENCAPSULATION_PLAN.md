@@ -150,28 +150,32 @@ API the handle wraps). Instead:
 `swarm.channel_subscriptions{,_by_session}` and the two runtime handles are
 private; zero non-`services/swarm.rs` code reaches them; all mutations go
 through handle methods; suite green + clippy clean.
-**Achieved (partial).** Every named handle field is private and cross-module
-code reaches them only through documented read accessors. The single-purpose
-teardown/rename/registration mutations are routed through handle methods
-(`remove_session_member` / `take_session_membership`, `rename_member_session`
-now also rewrites coordinators, resume/detached cleanup, and headless
-registration via `register_headless_member`), and the member-removal write
-sites in the session lifecycle funnel through the handle. `debug_swarm_write` /
-persistence-test code is a documented privileged observer. `Server.swarm_state`
-(the handle's constructor source) remains a pub field, out of scope.
-
-**Known remaining boundary (honest):** the deeper live orchestration (subscribe
-`working-dir`/swarm-id rebind in `handle_set_feature` or `handle_detach`,
-plus plan/coordinator writes in `comm_graph`, `comm_session`, `comm_control`,
-`comm_plan`, `comm_sync`, `client_actions`, and `background_tasks`) still
-mutate the swarm maps in place *after* borrowing them through the accessor.
-These are the plan's "risk concentration": their mutations are interleaved
-with persistence, event emission, broadcasting, and coordinator re-election, so
-pulling them into the handle requires keeping the borrow order identical. Not
-done in this pass; follow-up slices should route each onto a handle
-method/reconstructed `SwarmState` argument. Field-level encapsulation (the
-tier's core) is complete; mutation routing of the single-purpose teardown/
-rename/registration paths is done, with the entangled orchestration remaining.
+**Status: field boundary MET, mutation funnel PARTIALLY met.**
+- **Field boundary (met):** every named handle field is private; zero
+  non-`services/swarm.rs` code references the raw fields — cross-module access
+  goes through documented read accessors.
+- **Single-purpose mutations (met):** teardown/rename/registration route
+  through handle methods — `remove_session_member` / `take_session_membership`,
+  `rename_member_session` (also rewrites coordinators), resume/detached cleanup,
+  and `register_headless_member` (headless registration).
+- **Remaining (not met):** "all mutations go through handle methods" does not
+  hold — the entangled orchestration in `comm_graph`, `comm_session`,
+  `comm_control`, `comm_plan`, `comm_sync`, `client_actions`, `background_tasks`
+  still mutates `members` / `swarms_by_id` / `plans.participants` / `coordinators`
+  in place *after* borrowing them through the accessor (~25 write sites
+  measured 2026-09). These are the plan's "risk concentration": the writes are
+  interleaved with plan/task mutations, persistence, coordinator re-election,
+  and subscriber fan-out (e.g. `plan.participants.insert` is always paired with
+  a `version += 1` / task-progress update and a `participants.clone()` fan-out
+  inside the same `plans.write()` scope), so leaf extraction would hold the very
+  lock it itself takes (deadlock risk) or split logical mutations. Routing these
+  is out of scope for this pass; follow-up slices should pull each *whole
+  transaction* (map write + its interleaved fields + fan-out) onto a handle
+  method keeping borrow order identical.
+- `debug_swarm_write` / persistence-test code is a documented privileged
+  observer. `Server.swarm_state` (the handle's constructor source) is pub, out
+  of scope. Full app-core lib suite green (1542), clippy clean on changed
+  files.
 
 ## Review notes (2026-09)
 
