@@ -820,6 +820,38 @@ async fn session_search_deadline_is_model_visible_on_hang() {
     );
 }
 
+#[tokio::test]
+async fn abort_on_drop_guard_arms_the_flag_when_the_future_is_dropped() {
+    // deepseek-harness F8 Part A, mechanism check. The pre-set-flag test proves
+    // a cancelled scan short-circuits; this one proves the *trigger*: the
+    // `AbortOnDrop` guard held by the executing future must set the shared flag
+    // when that future is dropped. `execute_with_deadline` drops the inner
+    // future on timeout, so this pins the real path — a timed-out call leaves
+    // the flag armed for the already-spawned blocking scan.
+    let abort = Arc::new(AtomicBool::new(false));
+    assert!(!abort.load(Ordering::Relaxed), "flag must start clear");
+    // The guard is created *inside* the future, exactly like `execute` does
+    // before its `spawn_blocking(...).await`. The async state machine holds it
+    // for the whole future, so the timeout dropping the future drops the guard.
+    let dropped = jcode_tool_core::execute_with_deadline(
+        Some(std::time::Duration::from_millis(20)),
+        SessionSearchTool::new().name(),
+        async {
+            let _guard = AbortOnDrop(abort.clone());
+            // Simulate the running blocking scan: await forever, just as
+            // `execute` does while its blocking scan is in flight.
+            std::future::pending::<()>().await;
+            Ok::<_, anyhow::Error>(())
+        },
+    )
+    .await;
+    assert!(dropped.is_err(), "the hung call must be dropped by the deadline");
+    assert!(
+        abort.load(Ordering::Relaxed),
+        "dropping the timed-out future must drop the guard and arm the flag"
+    );
+}
+
 #[test]
 fn pre_abort_flag_short_circuits_the_scan() {
     // deepseek-harness F8 Part A: the cooperative cancel flag is checked at

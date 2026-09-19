@@ -522,10 +522,15 @@ constructed at 96 sites, too invasive for one tool's benefit).
   of continuing to the end. The scan stays read-only and idempotent, so bailing
   mid-loop leaves no partial writes. The background index **warmup** path is
   unattended and deliberately uses a never-cancelled flag (no deadline races it).
-- **Tests:** new `pre_abort_flag_short_circuits_the_scan` pins that a flag set up
-  front returns an empty report with `candidate_jcode_sessions == 0` (no scoring)
-  even though matching sessions exist; the existing timeout / model-visible-error /
-  scope-scaling tests still pass (session_search suite: 31 passed, 0 failed).
+- **Tests:** two new tests cover the mechanism end to end. A pre-set flag test
+  (`pre_abort_flag_short_circuits_the_scan`) returns an empty report with
+  `candidate_jcode_sessions == 0` (no scoring) even though matching sessions
+  exist; a mechanism test
+  (`abort_on_drop_guard_arms_the_flag_when_the_future_is_dropped`) proves the
+  `AbortOnDrop` guard, created inside the executing future exactly as `execute`
+  does, arms the flag when `execute_with_deadline` drops that future on timeout.
+  The existing timeout / model-visible-error / scope-scaling tests still pass
+  (session_search suite: 32 passed, 0 failed).
 
 The core F8 "promote-on-timeout" seam for `bash`/`bg`/`webfetch` remains a
 separate, behavior-changing follow-up as described above.
