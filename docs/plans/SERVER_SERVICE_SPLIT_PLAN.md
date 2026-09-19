@@ -1244,3 +1244,25 @@ instead of a body-local free function.
 Zero behavior change; the server suite stays green (479 passing) and clippy adds
 no new warnings. Two unit tests cover coordinator vs deep-participant grant and
 light-mode denial.
+
+### `clear_coordinator` / `clear_plan` moved onto the handle (2026-09)
+
+Third Tier 3 follow-up slice. The two standalone debug swarm mutations
+(`swarm:clear_coordinator`, `swarm:clear_plan`) are now `SwarmServiceHandle`
+methods instead of reaching into the raw `swarm_state` maps from
+`debug_swarm_write.rs`.
+
+- **`clear_coordinator(swarm_id)`** removes the coordinator and demotes any
+  `coordinator`-role member back to `agent`, then persists the change, returning
+  whether a coordinator was actually removed.
+- **`clear_plan(swarm_id)`** removes the plan from the plans map, re-persists so
+  the on-disk state drops it (preventing resurrect on restart), broadcasts a
+  `plan_cleared` `ServerEvent::SwarmPlan` to attached sessions so their TUIs drop
+  the resident item graph, and returns the removed plan (or `None`).
+- `debug_swarm_write.rs`: the two `swarm:clear_*` branches now call the handle
+  methods, removing ~12 direct `swarm_state().` accesses (the coordinator/members/
+  plans/coordinators clones, persist, and clear-event fan-out).
+
+Zero behavior change; the server suite stays green (481 passing) and clippy adds
+no new warnings. Two unit tests cover coordinator demotion/removal reporting and
+plan removal + missing-plan no-op.

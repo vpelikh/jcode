@@ -22,30 +22,8 @@ pub(super) async fn maybe_handle_swarm_write_command(
             .strip_prefix("swarm:clear_coordinator:")
             .unwrap_or("")
             .trim();
-        // Swarm member/coordinator mutations never nest these independent
-        // locks. In particular, persistence reads coordinators again, so a
-        // retained write guard here self-deadlocks the command.
-        let removed = {
-            let mut coordinators = ctx.swarm.swarm_state().coordinators.write().await;
-            coordinators.remove(swarm_id).is_some()
-        };
+        let removed = ctx.swarm.clear_coordinator(swarm_id).await;
         if removed {
-            {
-                let mut members = ctx.swarm.swarm_state().members.write().await;
-                for member in members.values_mut() {
-                    if member.swarm_id.as_deref() == Some(swarm_id) && member.role == "coordinator"
-                    {
-                        member.role = "agent".to_string();
-                    }
-                }
-            }
-            let swarm_state = SwarmState {
-                members: ctx.swarm.swarm_state().members.clone(),
-                swarms_by_id: ctx.swarm.swarm_state().swarms_by_id.clone(),
-                plans: ctx.swarm.swarm_state().plans.clone(),
-                coordinators: ctx.swarm.swarm_state().coordinators.clone(),
-            };
-            persist_swarm_state_for(swarm_id, &swarm_state).await;
             return Ok(Some(format!(
                 "Coordinator cleared for swarm '{}'. Any session can now self-promote.",
                 swarm_id
@@ -64,54 +42,10 @@ pub(super) async fn maybe_handle_swarm_write_command(
                 "swarm:clear_plan requires a swarm_id: swarm:clear_plan:<swarm_id>"
             ));
         }
-        let removed = {
-            let mut plans = ctx.swarm.swarm_state().plans.write().await;
-            plans.remove(swarm_id)
-        };
+        let removed = ctx.swarm.clear_plan(swarm_id).await;
         let Some(removed) = removed else {
             return Err(anyhow::anyhow!("No plan found for swarm '{}'", swarm_id));
         };
-        // Re-persist so the on-disk swarm state drops the plan too; otherwise
-        // the next server restart resurrects it and every fresh session in
-        // this working dir gets the stale plan graph pushed on subscribe.
-        let swarm_state = SwarmState {
-            members: ctx.swarm.swarm_state().members.clone(),
-            swarms_by_id: ctx.swarm.swarm_state().swarms_by_id.clone(),
-            plans: ctx.swarm.swarm_state().plans.clone(),
-            coordinators: ctx.swarm.swarm_state().coordinators.clone(),
-        };
-        persist_swarm_state_for(swarm_id, &swarm_state).await;
-        // Push the cleared state to attached clients. Without this, every
-        // connected TUI keeps rendering (and holding resident) the old item
-        // graph until its next reconnect; a 1.5k-item stale plan is ~650 KB
-        // of JSON pinned per client. Version advances past the removed plan
-        // so the client-side stale-regression guard accepts the update.
-        let clear_event = ServerEvent::SwarmPlan {
-            swarm_id: swarm_id.to_string(),
-            version: removed.version.saturating_add(1),
-            items: Vec::new(),
-            participants: Vec::new(),
-            reason: Some("plan_cleared".to_string()),
-            summary: None,
-        };
-        let session_ids: Vec<String> = {
-            let swarms = ctx.swarm.swarm_state().swarms_by_id.read().await;
-            swarms
-                .get(swarm_id)
-                .map(|s| s.iter().cloned().collect())
-                .unwrap_or_default()
-        };
-        {
-            let members = ctx.swarm.swarm_state().members.read().await;
-            for sid in session_ids {
-                if let Some(member) = members.get(&sid) {
-                    let _ = member.event_tx.send(clear_event.clone());
-                    for tx in member.event_txs.values() {
-                        let _ = tx.send(clear_event.clone());
-                    }
-                }
-            }
-        }
         return Ok(Some(
             serde_json::json!({
                 "swarm_id": swarm_id,

@@ -3,7 +3,7 @@
 use crate::protocol::ServerEvent;
 use crate::server::{
     AwaitMembersRuntime, FileTouchService, Server, SharedContext, SwarmEvent, SwarmEventType,
-    SwarmMember, SwarmMutationRuntime, SwarmState,
+    SwarmMember, SwarmMutationRuntime, SwarmState, VersionedPlan,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -864,6 +864,88 @@ impl SwarmServiceHandle {
         });
         None
     }
+
+    /// Clear `swarm_id`'s coordinator, demoting any swarm members whose role is
+    /// `coordinator` back to `agent`, then persist the change. Returns whether
+    /// a coordinator was actually removed. This is the debug
+    /// `swarm:clear_coordinator` operation.
+    pub(crate) async fn clear_coordinator(&self, swarm_id: &str) -> bool {
+        // Never nest these independent locks: persistence re-reads
+        // coordinators, so retaining a write guard here self-deadlocks.
+        let removed = {
+            let mut coordinators = self.swarm_state.coordinators.write().await;
+            coordinators.remove(swarm_id).is_some()
+        };
+        if removed {
+            {
+                let mut members = self.swarm_state.members.write().await;
+                for member in members.values_mut() {
+                    if member.swarm_id.as_deref() == Some(swarm_id) && member.role == "coordinator"
+                    {
+                        member.role = "agent".to_string();
+                    }
+                }
+            }
+            let swarm_state = SwarmState {
+                members: self.swarm_state.members.clone(),
+                swarms_by_id: self.swarm_state.swarms_by_id.clone(),
+                plans: self.swarm_state.plans.clone(),
+                coordinators: self.swarm_state.coordinators.clone(),
+            };
+            super::super::persist_swarm_state_for(swarm_id, &swarm_state).await;
+        }
+        removed
+    }
+
+    /// Clear `swarm_id`'s plan: remove it from the plans map, re-persist so the
+    /// on-disk state drops it too (otherwise the next restart resurrects the
+    /// stale plan graph), and broadcast a `plan_cleared` `ServerEvent::SwarmPlan`
+    /// to every attached session so their TUIs drop the resident item graph.
+    /// Returns the removed plan, or `None` if no plan existed. This is the
+    /// debug `swarm:clear_plan` operation.
+    pub(crate) async fn clear_plan(&self, swarm_id: &str) -> Option<VersionedPlan> {
+        let removed = {
+            let mut plans = self.swarm_state.plans.write().await;
+            plans.remove(swarm_id)
+        };
+        let removed = removed?;
+
+        let swarm_state = SwarmState {
+            members: self.swarm_state.members.clone(),
+            swarms_by_id: self.swarm_state.swarms_by_id.clone(),
+            plans: self.swarm_state.plans.clone(),
+            coordinators: self.swarm_state.coordinators.clone(),
+        };
+        super::super::persist_swarm_state_for(swarm_id, &swarm_state).await;
+
+        let clear_event = ServerEvent::SwarmPlan {
+            swarm_id: swarm_id.to_string(),
+            version: removed.version.saturating_add(1),
+            items: Vec::new(),
+            participants: Vec::new(),
+            reason: Some("plan_cleared".to_string()),
+            summary: None,
+        };
+        let session_ids: Vec<String> = {
+            let swarms = self.swarm_state.swarms_by_id.read().await;
+            swarms
+                .get(swarm_id)
+                .map(|s| s.iter().cloned().collect())
+                .unwrap_or_default()
+        };
+        {
+            let members = self.swarm_state.members.read().await;
+            for sid in session_ids {
+                if let Some(member) = members.get(&sid) {
+                    let _ = member.event_tx.send(clear_event.clone());
+                    for tx in member.event_txs.values() {
+                        let _ = tx.send(clear_event.clone());
+                    }
+                }
+            }
+        }
+        Some(removed)
+    }
 }
 
 #[cfg(test)]
@@ -1267,5 +1349,67 @@ mod tests {
             None,
             "light-mode non-coordinator cannot drive"
         );
+    }
+
+    #[tokio::test]
+    async fn clear_coordinator_demotes_members_and_reports_removal() {
+        let handle = base_handle();
+        insert_member(&handle, "coord", "swarm-A", "coordinator").await;
+        insert_member(&handle, "agent", "swarm-A", "agent").await;
+        handle
+            .swarm_state()
+            .coordinators
+            .write()
+            .await
+            .insert("swarm-A".to_string(), "coord".to_string());
+
+        assert!(
+            handle.clear_coordinator("swarm-A").await,
+            "removes coordinator"
+        );
+
+        let coordinators = handle.swarm_state().coordinators.read().await;
+        assert!(!coordinators.contains_key("swarm-A"));
+        drop(coordinators);
+        let members = handle.swarm_state().members.read().await;
+        assert_eq!(
+            members.get("coord").map(|m| m.role.as_str()),
+            Some("agent"),
+            "former coordinator is demoted to agent"
+        );
+        assert_eq!(members.get("agent").map(|m| m.role.as_str()), Some("agent"));
+
+        // Clearing a swarm with no coordinator reports no removal.
+        assert!(!handle.clear_coordinator("swarm-A").await);
+    }
+
+    #[tokio::test]
+    async fn clear_plan_removes_persisted_plan() {
+        let handle = base_handle();
+        handle.swarm_state().plans.write().await.insert(
+            "swarm-A".to_string(),
+            VersionedPlan {
+                items: Vec::new(),
+                version: 3,
+                participants: HashSet::new(),
+                task_progress: HashMap::new(),
+                mode: "deep".to_string(),
+                node_meta: HashMap::new(),
+            },
+        );
+
+        let removed = handle.clear_plan("swarm-A").await;
+        assert_eq!(
+            removed.map(|p| p.version),
+            Some(3),
+            "returns the removed plan"
+        );
+        assert!(
+            handle.swarm_state().plans.read().await.is_empty(),
+            "plan is dropped from the map"
+        );
+
+        // Clearing a missing plan is a no-op returning None.
+        assert!(handle.clear_plan("swarm-nope").await.is_none());
     }
 }
