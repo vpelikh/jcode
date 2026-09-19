@@ -594,3 +594,36 @@ mid-candidate. Weighed against the cooperative flag:
   and not justified by the marginal thread-reclaim gain. The cooperative flag
   yields the same model-visible outcome and reclaims threads at the practical
   preemption point the load API provides.
+
+### Alternative considered: time-bounded joins on detached per-candidate threads
+
+The cooperative flag still waits for the current candidate's synchronous
+`load_from_path` to finish before honoring a cancellation. A distinct alternative
+is to abandon a stuck candidate directly: spawn each candidate (or small batch)
+on its own **detached** thread and wait on each join with a timeout, so a single
+pathological deserialize is dropped instead of only waiting for the next
+boundary. Weighed against the cooperative flag:
+
+- **Performance / responsiveness.** This reclaims a blocked thread *during* a
+  long deserialize, which the cooperative flag deliberately does not. It is
+  closer to the finer-granularity ideal.
+- **Compatibility / safety.** jcode's parallel scan uses `std::thread::scope`,
+  whose core guarantee is that **every spawned thread is joined before the scope
+  returns**. A detached, timeout-joined worker breaks that — a candidate can be
+  left running after `search_sessions_blocking` returns (it only reads files, so
+  no write corruption, but the thread is unattended). That is a real behavioral
+  change from the current code's "all workers completed" contract, and it means
+  the timeout is no longer fire-once-cleanly: a thread that finished but lost a
+  timeout race would carry on scoring a session the caller has already left.
+- **Maintenance / complexity.** Detaching workers requires reworking the
+  `std::thread::scope` block into managed handles with channels, adds a
+  join-timeout constant, and complicates the `parse_errors`/results fold (partial
+  outcomes from abandoned workers must be reconciled). The cooperative flag keeps
+  all of that under the scope's lifetime discipline.
+- **Decision.** Rejected for this follow-up. The `std::thread::scope` lifetime
+  guarantee is worth more than the marginal mid-deserialize reclaim: it keeps
+  cancellation exactly-once and deterministic (workers always complete and their
+  outcomes are always folded), which is the property the model-visible contract
+  leans on. Timeout-joining a *leaf* worker is a reasonable future enhancement if
+  a candidate is ever observed to hang in practice, but there is no evidence of
+  that today, so it is not adopted as part of F8 Part A.
