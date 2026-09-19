@@ -1,6 +1,6 @@
 use super::services::SwarmServiceHandle;
 use super::{
-    ClientConnectionInfo, SwarmEventType, SwarmMember, SwarmState, broadcast_swarm_plan,
+    ClientConnectionInfo, SwarmEventType, SwarmState, broadcast_swarm_plan,
     persist_swarm_state_for, record_swarm_event,
 };
 use crate::agent::Agent;
@@ -142,56 +142,6 @@ pub(super) async fn member_runtime_extras(
     }
 }
 
-async fn ensure_same_swarm_access(
-    id: u64,
-    req_session_id: &str,
-    target_session: &str,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
-) -> bool {
-    let (req_swarm, target_swarm) = {
-        let members = swarm_members.read().await;
-        (
-            members
-                .get(req_session_id)
-                .and_then(|member| member.swarm_id.clone()),
-            members
-                .get(target_session)
-                .and_then(|member| member.swarm_id.clone()),
-        )
-    };
-
-    if req_swarm.is_some() && req_swarm == target_swarm {
-        true
-    } else {
-        let _ = client_event_tx.send(ServerEvent::Error {
-            id,
-            message: format!(
-                "Session '{}' is not in the same swarm as requester '{}'",
-                target_session, req_session_id
-            ),
-            retry_after_secs: None,
-        });
-        false
-    }
-}
-
-async fn can_read_full_context(
-    req_session_id: &str,
-    target_session: &str,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-) -> bool {
-    if req_session_id == target_session {
-        return true;
-    }
-
-    let members = swarm_members.read().await;
-    members
-        .get(req_session_id)
-        .map(|member| member.role == "coordinator")
-        .unwrap_or(false)
-}
-
 pub(super) async fn handle_comm_summary(
     id: u64,
     req_session_id: String,
@@ -201,15 +151,9 @@ pub(super) async fn handle_comm_summary(
     swarm: &SwarmServiceHandle,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
-    let swarm_members = &swarm.swarm_state().members;
-    if !ensure_same_swarm_access(
-        id,
-        &req_session_id,
-        &target_session,
-        swarm_members,
-        client_event_tx,
-    )
-    .await
+    if !swarm
+        .ensure_same_swarm_access(id, &req_session_id, &target_session, client_event_tx)
+        .await
     {
         return;
     }
@@ -253,20 +197,15 @@ pub(super) async fn handle_comm_status(
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
-    let swarm_members = &swarm.swarm_state().members;
     let file_touch = swarm.file_touch();
-    if !ensure_same_swarm_access(
-        id,
-        &req_session_id,
-        &target_session,
-        swarm_members,
-        client_event_tx,
-    )
-    .await
+    if !swarm
+        .ensure_same_swarm_access(id, &req_session_id, &target_session, client_event_tx)
+        .await
     {
         return;
     }
 
+    let swarm_members = &swarm.swarm_state().members;
     let snapshot = {
         let members = swarm_members.read().await;
         let Some(member) = members.get(&target_session) else {
@@ -330,20 +269,17 @@ pub(super) async fn handle_comm_read_context(
     swarm: &SwarmServiceHandle,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
-    let swarm_members = &swarm.swarm_state().members;
-    if !ensure_same_swarm_access(
-        id,
-        &req_session_id,
-        &target_session,
-        swarm_members,
-        client_event_tx,
-    )
-    .await
+    if !swarm
+        .ensure_same_swarm_access(id, &req_session_id, &target_session, client_event_tx)
+        .await
     {
         return;
     }
 
-    if !can_read_full_context(&req_session_id, &target_session, swarm_members).await {
+    if !swarm
+        .can_read_full_context(&req_session_id, &target_session)
+        .await
+    {
         let _ = client_event_tx.send(ServerEvent::Error {
             id,
             message: "Only the coordinator, worktree manager, or the target session may read full context. Use summary for lightweight access.".to_string(),

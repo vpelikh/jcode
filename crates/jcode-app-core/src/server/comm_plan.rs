@@ -3,15 +3,14 @@ use super::swarm_mutation_state::{
     PersistedSwarmMutationResponse, begin_or_replay, finish_request, request_key,
 };
 use super::{
-    SwarmEventType, SwarmMember, SwarmState, VersionedPlan, broadcast_swarm_plan,
+    SwarmEventType, SwarmState, VersionedPlan, broadcast_swarm_plan,
     persist_swarm_state_for, record_swarm_event, summarize_plan_items,
 };
 use crate::plan::PlanItem;
 use crate::protocol::{NotificationType, ServerEvent};
 use jcode_agent_runtime::SoftInterruptSource;
-use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 
 /// Reject plans whose dependency graph contains a cycle. Cyclic items can never
 /// become runnable (`summarize_plan_graph` parks them in `blocked_ids` forever),
@@ -44,12 +43,7 @@ pub(super) async fn handle_comm_propose_plan(
     let swarm_plans = &swarm.swarm_state().plans;
     let swarm_coordinators = &swarm.swarm_state().coordinators;
     let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
-    let swarm_id = {
-        let members = swarm_members.read().await;
-        members
-            .get(&req_session_id)
-            .and_then(|member| member.swarm_id.clone())
-    };
+    let swarm_id = swarm.member_swarm_id(&req_session_id).await;
 
     let swarm_id = match swarm_id.as_ref() {
         Some(swarm_id) => swarm_id.clone(),
@@ -302,15 +296,14 @@ pub(super) async fn handle_comm_approve_plan(
     let swarm_coordinators = &swarm.swarm_state().coordinators;
     let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
     let swarm_mutation_runtime = swarm.swarm_mutation_runtime();
-    let swarm_id = match require_coordinator_swarm(
-        id,
-        &req_session_id,
-        "Only the coordinator can approve plan proposals.",
-        client_event_tx,
-        swarm_members,
-        swarm_coordinators,
-    )
-    .await
+    let swarm_id = match swarm
+        .require_coordinator_swarm(
+            id,
+            &req_session_id,
+            "Only the coordinator can approve plan proposals.",
+            client_event_tx,
+        )
+        .await
     {
         Some(swarm_id) => swarm_id,
         None => return,
@@ -512,18 +505,16 @@ pub(super) async fn handle_comm_reject_plan(
     swarm: &SwarmServiceHandle,
 ) {
     let swarm_members = &swarm.swarm_state().members;
-    let swarm_coordinators = &swarm.swarm_state().coordinators;
     let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
     let swarm_mutation_runtime = swarm.swarm_mutation_runtime();
-    let swarm_id = match require_coordinator_swarm(
-        id,
-        &req_session_id,
-        "Only the coordinator can reject plan proposals.",
-        client_event_tx,
-        swarm_members,
-        swarm_coordinators,
-    )
-    .await
+    let swarm_id = match swarm
+        .require_coordinator_swarm(
+            id,
+            &req_session_id,
+            "Only the coordinator can reject plan proposals.",
+            client_event_tx,
+        )
+        .await
     {
         Some(swarm_id) => swarm_id,
         None => return,
@@ -633,50 +624,3 @@ pub(super) async fn handle_comm_reject_plan(
 #[cfg(test)]
 #[path = "comm_plan_tests.rs"]
 mod tests;
-
-async fn require_coordinator_swarm(
-    id: u64,
-    req_session_id: &str,
-    permission_error: &str,
-    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-) -> Option<String> {
-    let (swarm_id, is_coordinator) = {
-        let members = swarm_members.read().await;
-        let swarm_id = members
-            .get(req_session_id)
-            .and_then(|member| member.swarm_id.clone());
-        let is_coordinator = if let Some(ref swarm_id) = swarm_id {
-            let coordinators = swarm_coordinators.read().await;
-            coordinators
-                .get(swarm_id)
-                .map(|coordinator| coordinator == req_session_id)
-                .unwrap_or(false)
-        } else {
-            false
-        };
-        (swarm_id, is_coordinator)
-    };
-
-    if !is_coordinator {
-        let _ = client_event_tx.send(ServerEvent::Error {
-            id,
-            message: permission_error.to_string(),
-            retry_after_secs: None,
-        });
-        return None;
-    }
-
-    match swarm_id {
-        Some(swarm_id) => Some(swarm_id),
-        None => {
-            let _ = client_event_tx.send(ServerEvent::Error {
-                id,
-                message: "Not in a swarm.".to_string(),
-                retry_after_secs: None,
-            });
-            None
-        }
-    }
-}
