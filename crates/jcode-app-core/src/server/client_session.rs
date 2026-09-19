@@ -1444,14 +1444,6 @@ pub(super) async fn handle_resume_session(
             swarm.rename_member_session(&old_session_id, &session_id).await;
             swarm.remove_session_channel_subscriptions(&old_session_id).await;
             file_touch.clear_session(&old_session_id).await;
-            {
-                let mut coordinators = swarm_coordinators.write().await;
-                for coordinator in coordinators.values_mut() {
-                    if *coordinator == old_session_id {
-                        *coordinator = session_id.clone();
-                    }
-                }
-            }
             swarm.set_member_status(&session_id, "ready", None).await;
             if let Some(swarm_id) = {
                 let members = swarm_members.read().await;

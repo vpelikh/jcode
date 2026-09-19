@@ -338,6 +338,17 @@ impl SwarmServiceHandle {
                 swarm.insert(new_session_id.to_string());
             }
         }
+
+        // A coordinator slot may also be held by the renamed session. Update
+        // it so resume does not leave the old id pointing at a vanished
+        // session. Held separately from the member/swarm locks above so no two
+        // swarm maps are ever write-locked together (deadlock avoidance).
+        let mut coordinators = self.swarm_state.coordinators.write().await;
+        for coordinator in coordinators.values_mut() {
+            if *coordinator == old_session_id {
+                *coordinator = new_session_id.to_string();
+            }
+        }
     }
 
     /// Tear down a session's swarm membership on `/clear`: remove the member
@@ -859,5 +870,67 @@ mod tests {
             .unsubscribe_session_from_channel("s", "sw", "c")
             .await;
         let _ = handle.read_event_sources();
+    }
+
+    #[tokio::test]
+    async fn rename_member_session_rewrites_coordinator_slot() {
+        let coord = |id: &str| {
+            let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+            SwarmMember {
+                session_id: id.to_string(),
+                event_tx,
+                event_txs: HashMap::new(),
+                working_dir: Some(id.to_string().into()),
+                swarm_id: Some("swarm-test".to_string()),
+                swarm_enabled: true,
+                status: "ready".to_string(),
+                detail: None,
+                task_label: None,
+                friendly_name: Some(id.to_string()),
+                report_back_to_session_id: None,
+                latest_completion_report: None,
+                role: "coordinator".to_string(),
+                joined_at: Instant::now(),
+                last_status_change: Instant::now(),
+                is_headless: false,
+                output_tail: None,
+                todo_progress: None,
+                todo_items: Vec::new(),
+                runtime: crate::protocol::SwarmMemberRuntime::default(),
+            }
+        };
+        let handle = SwarmServiceHandle::test_with_state(
+            SwarmState {
+                members: Arc::new(RwLock::new(HashMap::from([
+                    ("old".to_string(), coord("old")),
+                    ("child".to_string(), coord("child")),
+                ]))),
+                swarms_by_id: Arc::new(RwLock::new(HashMap::from([(
+                    "swarm-test".to_string(),
+                    HashSet::from(["old".to_string(), "child".to_string()]),
+                )]))),
+                plans: Arc::new(RwLock::new(HashMap::new())),
+                coordinators: Arc::new(RwLock::new(HashMap::from([(
+                    "swarm-test".to_string(),
+                    "old".to_string(),
+                )]))),
+            },
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(HashMap::new())),
+            SwarmMutationRuntime::default(),
+        );
+
+        handle.rename_member_session("old", "new").await;
+
+        // The member map now keys by the new id.
+        assert!(handle.swarm_state().members.read().await.contains_key("new"));
+        // The coordinator slot follows the renamed session.
+        let coordinators = handle.swarm_state().coordinators.read().await;
+        assert_eq!(
+            coordinators.get("swarm-test").map(String::as_str),
+            Some("new"),
+            "routing a coordinator through a rename must point at the new session id"
+        );
     }
 }
