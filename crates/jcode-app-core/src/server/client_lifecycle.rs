@@ -443,8 +443,8 @@ pub(super) async fn handle_client(
     // list, while the handler body is unchanged.
     // Swarm-domain operations in the session lifecycle functions take the
     // handle by reference (server service split, Slice 4). Clone it up front so
-    // the flat-local destructuring below can still move the swarm fields out of
-    // the original while the handle stays available to route through.
+    // the body routes io close/dispatch through `swarm_service_handle` while
+    // the swarm locals (cloned via the accessors below) stay independent.
     let swarm_service_handle = swarm_service.clone();
     // The session service handle is also kept alive by reference for
     // NotifySessionContext routing below; clone it up front so the flat-local
@@ -455,9 +455,12 @@ pub(super) async fn handle_client(
     let global_session_id = session_service.session_id;
     let client_count = client_service.client_count;
     let client_connections = client_service.client_connections;
-    // Clone `file_touch`/`await_members_runtime` before the flat-local
-    // destructuring below moves the `swarm_state` fields out of `swarm_service`,
-    // since the accessors borrow the handle (Tier 3 encapsulation).
+    // Clone `file_touch`/`await_members_runtime`/`swarm_state` sub-maps before
+    // the `session_service`/`client_service`/`debug_service` fields are moved
+    // out below. The swarm values are borrowed from `swarm_service` through the
+    // accessors and cloned here (the Arc/RwLock handles are cheap to clone), so
+    // `swarm_service` itself is not partially moved and stays available for the
+    // handle methods used by the dispatch and cleanup paths (Tier 3).
     let file_touch = swarm_service.file_touch().clone();
     let await_members_runtime = swarm_service.await_members_runtime().clone();
     let swarm_members = swarm_service.swarm_state().members.clone();
