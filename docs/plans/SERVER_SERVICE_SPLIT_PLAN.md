@@ -1218,9 +1218,12 @@ methods (`member_swarm_id*/member_swarm_ids`, `can_read_full_context`,
 `require_coordinator_swarm`, `ensure_same_swarm_access`).
 
 Remaining Tier 3 follow-up: the deeper direct-`swarm_state()` mutation sites
-(`comm_control`, `comm_await`, `comm_sync` resync, `debug_swarm_write`, session
-helpers) that have no shared permission helper yet, and the file_touch /
-shared_context / channel-subscription index ownership decision.
+(`comm_await`, `comm_graph`, `comm_session`, `comm_sync` resync, session
+lifecycle helpers) that are large intertwined domain operations — likely their
+own dedicated slices — plus the file_touch / shared_context / channel-subscription
+index ownership decision and the Seam E debug ownership decision. The shared
+permission guards and the standalone debug clear operations are now
+encapsulated on the handle (slices above).
 
 ### `require_plan_driver_swarm` moved onto the handle (2026-09)
 
