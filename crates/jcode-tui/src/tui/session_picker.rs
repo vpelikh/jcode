@@ -249,8 +249,8 @@ pub(crate) struct HandoffModel {
 /// true source, while handoff rows keep their real fields for selection,
 /// routing, and search.
 pub(crate) enum Row {
-    Session(SessionInfo),
-    Handoff(HandoffModel),
+    Session(Box<SessionInfo>),
+    Handoff(Box<HandoffModel>),
 }
 
 impl Row {
@@ -384,7 +384,10 @@ impl SessionPicker {
         let mut picker = Self {
             items: Vec::new(),
             visible_sessions: Vec::new(),
-            all_sessions: sessions.into_iter().map(Row::Session).collect(),
+            all_sessions: sessions
+                .into_iter()
+                .map(|s| Row::Session(Box::new(s)))
+                .collect(),
             all_server_groups: Vec::new(),
             all_orphan_sessions: Vec::new(),
             item_to_session: Vec::new(),
@@ -473,7 +476,10 @@ impl SessionPicker {
     pub fn new_grouped(server_groups: Vec<ServerGroup>, orphan_sessions: Vec<SessionInfo>) -> Self {
         Self::new_grouped_rows(
             server_groups,
-            orphan_sessions.into_iter().map(Row::Session).collect(),
+            orphan_sessions
+                .into_iter()
+                .map(|s| Row::Session(Box::new(s)))
+                .collect(),
         )
     }
 
@@ -583,7 +589,7 @@ impl SessionPicker {
     pub fn for_handoffs(snapshots: Vec<HandoffSnapshot>) -> Self {
         let rows = snapshots
             .into_iter()
-            .map(|snapshot| Row::Handoff(handoff_to_model(snapshot)))
+            .map(|snapshot| Row::Handoff(Box::new(handoff_to_model(snapshot))))
             .collect();
         Self::new_grouped_rows(Vec::new(), rows)
     }
@@ -798,7 +804,10 @@ impl SessionPicker {
     ) {
         self.reseed_grouped_rows(
             server_groups,
-            orphan_sessions.into_iter().map(Row::Session).collect(),
+            orphan_sessions
+                .into_iter()
+                .map(|s| Row::Session(Box::new(s)))
+                .collect(),
         );
     }
 

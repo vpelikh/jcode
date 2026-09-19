@@ -199,6 +199,7 @@ impl Drop for EnvGuard {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
 async fn explicit_save_and_current_account_are_sandboxed_without_paid_plan() {
     let _lock = crate::storage::lock_test_env();
     let _env = EnvGuard::new();

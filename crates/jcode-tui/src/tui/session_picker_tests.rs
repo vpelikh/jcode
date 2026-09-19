@@ -1899,7 +1899,7 @@ fn test_preview_structured_messages_stay_left_aligned() {
         session.messages_preview.push(PreviewMessage {
             role: role.to_string(), content, tool_calls: Vec::new(), timestamp: None,
             tool_data: tool.map(|name| crate::message::ToolCall {
-                id: format!("alignment-{name}"), name: name.to_string(),
+                id: format!("alignment-{name}").into(), name: name.to_string(),
                 input: serde_json::json!({"command": "echo alignment"}),
                 intent: Some("Check structured preview alignment".to_string()),
                 thought_signature: None,

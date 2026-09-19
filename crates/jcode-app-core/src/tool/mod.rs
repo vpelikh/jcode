@@ -18,6 +18,13 @@ mod discover_secrets;
 mod edit;
 mod feedback;
 mod gmail;
+// The `initiative` tool is not currently registered (a test asserts it is
+// deliberately *not* advertised in the registry). It is kept compiled in the
+// lib because it ships a complete Goals/initiative domain plus a side-panel
+// view that later pages the same (see the deepseek-harness status doc), while
+// staying unreachable until explicitly wired. It is therefore dominated by
+// `dead_code`; allow it rather than dropping the module or gating it to tests.
+#[allow(dead_code)]
 mod goal;
 pub mod inflight;
 mod invalid;

@@ -1,5 +1,6 @@
 // Public Provider::complete + EventStream regressions using a loopback Responses
 // server. These are deterministic protocol fixtures, not live OpenAI acceptance.
+#[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
 async fn persistent_terminal_public_case(
     error_kind: &str,
     code: Option<&str>,
@@ -154,6 +155,7 @@ async fn persistent_terminal_public_missing_previous_full_replay() {
 // Synthetic concurrency regression: a mutex waiter is queued before failure,
 // so a caller-side clear after the helper returns cannot hide a stale handoff.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
 async fn persistent_terminal_failure_invalidates_before_mutex_handoff() {
     let _env_lock = jcode_base::storage::lock_test_env();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

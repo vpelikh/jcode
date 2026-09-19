@@ -156,6 +156,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
     async fn terminal_usage_recorded_once_before_delivery() {
         let _lock = jcode_base::storage::lock_test_env();
         let temp = tempfile::tempdir().unwrap();
