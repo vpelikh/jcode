@@ -766,7 +766,10 @@ pub(super) async fn handle_handoff_list(
     let handoffs = crate::handoff::list_all_handoffs()
         .into_iter()
         .map(|snapshot| {
-            let payload = crate::handoff::export_handoff(&snapshot.session_id);
+            // Serialize the snapshot we already hold directly; list_all_handoffs
+            // validated each snapshot's identity, so the payload is always the
+            // exact `export_handoff` format (serde_json of HandoffSnapshot).
+            let payload = serde_json::to_string(&snapshot).ok();
             crate::protocol::HandoffWireModel {
                 session_id: snapshot.session_id,
                 project_key: snapshot.project_key,
