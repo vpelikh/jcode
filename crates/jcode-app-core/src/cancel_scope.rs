@@ -116,12 +116,22 @@ mod tests {
     fn a_scope_is_shiftable_into_a_blocking_task() {
         let scope = CancelScope::new();
         let alias = scope.child();
-        std::thread::spawn(move || {
+        let worker = std::thread::spawn(move || {
             // Simulate a worker observing the flag between iterations.
             while !alias.cancelled() {
                 std::thread::yield_now();
             }
         });
         drop(scope.guard());
+        // Join so a cancellation that never fired (a regression) would block
+        // forever and fail the test loudly instead of leaking a busy-waiting
+        // thread past the test's end.
+        worker
+            .join()
+            .expect("worker must observe the cancellation and exit");
+        assert!(
+            scope.cancelled(),
+            "the scope must be cancelled after its guard drops"
+        );
     }
 }
