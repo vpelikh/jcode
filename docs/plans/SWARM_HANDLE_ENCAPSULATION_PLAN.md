@@ -4,9 +4,11 @@ Status: Plan for the Tier 3 "true encapsulation" follow-up flagged by
 `SERVER_SERVICE_SPLIT_PLAN.md`. Tier 1 (mechanical convergence onto
 `&SwarmServiceHandle`) is landed; this documents how to *close* the split by
 privatizing the handle's fields so all mutations must go through handle
-methods. **All seven slices are landed (2026-09);** the done criteria below are
-met except the optional stricter `SwarmState` sub-field privatization (see
-`swarm_state` slice note).
+methods. **All seven slices are delivered (2026-09); the field boundary is
+closed, but the "all mutations route through handle methods" done-criterion is
+only partially met — the entangled orchestration mutations remain (see the
+Done criteria status block).** The optional stricter `SwarmState` sub-field
+privatization is also out of scope (see the `swarm_state` slice note).
 
 Scope: `crates/jcode-app-core/src/server/services/swarm.rs` +
 `crates/jcode-app-core/src/server/**`.
