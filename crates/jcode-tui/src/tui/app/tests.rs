@@ -1161,6 +1161,7 @@ fn stale_server_history_is_deferred_before_remote_state_is_applied() {
             id: 1,
             session_id: "session_from_stale_server".to_string(),
             messages: vec![crate::protocol::HistoryMessage {
+                response_stats: None,
                 role: "assistant".to_string(),
                 content: "stale answer".to_string(),
                 tool_calls: None,
@@ -1251,6 +1252,7 @@ fn deferred_stale_server_history_captures_session_id_for_reload_handoff() {
             id: 1,
             session_id: "session_real_server_owned".to_string(),
             messages: vec![crate::protocol::HistoryMessage {
+                response_stats: None,
                 role: "assistant".to_string(),
                 content: "stale answer".to_string(),
                 tool_calls: None,
@@ -1333,6 +1335,7 @@ fn ancient_server_history_is_deferred_via_client_side_release_check() {
             id: 1,
             session_id: "session_from_ancient_server".to_string(),
             messages: vec![crate::protocol::HistoryMessage {
+                response_stats: None,
                 role: "assistant".to_string(),
                 content: "ancient answer".to_string(),
                 tool_calls: None,
@@ -1730,6 +1733,7 @@ fn assert_clear_usage_reset(app: &App) {
 
 fn seed_stale_clear_image(app: &mut App) -> u64 {
     app.remote_side_pane_images = vec![crate::session::RenderedImage {
+        history_message_index: None,
         media_type: "image/png".to_string(),
         data: "stale-image".to_string(),
         label: Some("stale.png".to_string()),

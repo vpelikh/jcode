@@ -4,7 +4,7 @@ use crate::{terminal_eprintln as eprintln, terminal_println as println};
 impl Agent {
     /// Run a single turn with the given user message
     pub async fn run_once(&mut self, user_message: &str) -> Result<()> {
-        self.append_user_context_message(user_message, Vec::new())?;
+self.append_user_context_message(user_message, Vec::new())?;
         if trace_enabled() {
             eprintln!("[trace] session_id {}", self.session.id);
         }
@@ -22,7 +22,7 @@ impl Agent {
         user_message: &str,
         display_role: Option<crate::session::StoredDisplayRole>,
     ) -> Result<String> {
-        self.append_user_context_message_with_display_role(
+self.append_user_context_message_with_display_role(
             user_message,
             Vec::new(),
             display_role,
@@ -159,7 +159,11 @@ impl Agent {
             ));
         }
 
-        self.add_message_with_display_role(Role::User, blocks, display_role);
+        let starts_turn = blocks.len() > 1 || !user_message.trim().is_empty();
+        let input_id = self.add_message_with_display_role(Role::User, blocks, display_role);
+        if starts_turn {
+            self.begin_model_usage_turn(&input_id);
+        }
         self.session.save()
     }
 
@@ -346,6 +350,10 @@ impl Agent {
     }
 
     pub fn set_canary(&mut self, build_hash: &str) {
+        if !self.session.is_canary {
+            // Self-dev changes the tool surface, including hiding bundled docs.
+            self.unlock_tools();
+        }
         self.session.set_canary(build_hash);
         if let Err(err) = self.session.save() {
             logging::error(&format!("Failed to persist canary session state: {}", err));
@@ -543,6 +551,8 @@ impl Agent {
     }
 
     /// Expose the `selfdev` tool only while running in self-development mode.
+    /// Self-dev agents use the working tree rather than bundled `jcode_docs`,
+    /// which can lag behind the source they are editing.
     ///
     /// The registry keeps the implementation available for self-dev sessions,
     /// but regular agents should not spend tool-list context on an internal
@@ -552,6 +562,7 @@ impl Agent {
             tools.retain(|tool| tool.name != "selfdev");
             return;
         }
+        tools.retain(|tool| tool.name != "jcode_docs");
         for tool in tools.iter_mut() {
             if tool.name == "selfdev" {
                 tool.description =
@@ -667,6 +678,11 @@ impl Agent {
     }
 
     pub(super) fn validate_tool_allowed(&self, name: &str) -> Result<()> {
+        if self.session.is_canary && name == "jcode_docs" {
+            return Err(anyhow::anyhow!(
+                "Tool 'jcode_docs' is disabled in self-development mode. Read the working tree documentation instead."
+            ));
+        }
         if let Some(allowed) = self.allowed_tools.as_ref()
             && !crate::tool::tool_name_is_allowed(allowed, name)
         {
@@ -826,6 +842,7 @@ impl Agent {
         crate::session::render_messages(&self.session)
             .into_iter()
             .map(|msg| HistoryMessage {
+                response_stats: msg.response_stats,
                 role: msg.role,
                 content: msg.content,
                 tool_calls: if msg.tool_calls.is_empty() {
@@ -845,6 +862,7 @@ impl Agent {
         let history = messages
             .into_iter()
             .map(|msg| HistoryMessage {
+                response_stats: msg.response_stats,
                 role: msg.role,
                 content: msg.content,
                 tool_calls: if msg.tool_calls.is_empty() {
@@ -874,6 +892,7 @@ impl Agent {
         let history = messages
             .into_iter()
             .map(|msg| HistoryMessage {
+                response_stats: msg.response_stats,
                 role: msg.role,
                 content: msg.content,
                 tool_calls: if msg.tool_calls.is_empty() {

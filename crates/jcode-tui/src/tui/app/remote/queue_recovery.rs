@@ -134,11 +134,23 @@ impl App {
 /// holds it briefly and re-sends it once after the real turn finishes, which is
 /// the only thing that resumes an interrupted headed session after reload.
 pub(super) fn recover_undelivered_queued_continuation(app: &mut App, reason: &str) -> bool {
+    recover_queued_continuation(app, reason, false)
+}
+
+/// A busy rejection proves the send was not accepted, including automatic
+/// reminders. Unlike a disconnect, it is safe to queue these without risking
+/// replaying a continuation that the server is already running.
+pub(super) fn recover_rejected_queued_continuation(app: &mut App) -> bool {
+    recover_queued_continuation(app, "server busy rejection", true)
+}
+
+fn recover_queued_continuation(app: &mut App, reason: &str, rejected: bool) -> bool {
     let is_recoverable = app
         .rate_limit_pending_message
         .as_ref()
         .is_some_and(|pending| {
             pending.is_system
+                && (rejected || !pending.auto_retry)
                 && (!pending.content.trim().is_empty() || pending.system_reminder.is_some())
         });
     if !is_recoverable {

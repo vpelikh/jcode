@@ -199,8 +199,6 @@ const LAUNCH_HOTKEY_TRACKING_VERSION: u32 = 1;
 /// asking, even if the user never explicitly picked "Don't ask again".
 pub const MAX_TERMINAL_NUDGES: u64 = 5;
 const LAUNCH_HOTKEY_LEARNED_USES: u64 = 3;
-#[cfg(any(test, target_os = "macos", target_os = "linux", windows))]
-const LAUNCH_HOTKEY_NOTICE_MIN_LAUNCHES_TO_STOP: u64 = 10;
 
 #[derive(Debug, Clone, Default)]
 pub struct StartupHints {
@@ -1410,7 +1408,6 @@ fn macos_launch_hotkeys_notice(state: &SetupHintsState) -> Option<StartupHints> 
     let rows: Vec<LaunchHotkeyRow> = entries
         .into_iter()
         .map(|entry| {
-            let cwd = launch_hotkeys::resolve_target_dir(&entry.dir, &last_dir, &last_repo);
             let display = keymap::KeyChord::parse(&entry.chord)
                 .map(|c| c.display_symbols())
                 .unwrap_or_else(|| entry.chord.clone());
@@ -1418,7 +1415,6 @@ fn macos_launch_hotkeys_notice(state: &SetupHintsState) -> Option<StartupHints> 
                 chord: entry.chord,
                 display,
                 label: entry.label,
-                cwd_display: cwd.display().to_string(),
                 self_dev: entry.args.iter().any(|arg| arg == "self-dev"),
             }
         })
@@ -1429,7 +1425,7 @@ fn macos_launch_hotkeys_notice(state: &SetupHintsState) -> Option<StartupHints> 
     Some(StartupHints::with_status_and_display(
         "Launch hotkeys available".to_string(),
         "Launch hotkeys",
-        format!("Configured Jcode launch hotkeys:\n{}", lines.join("\n")),
+        compact_launch_hotkey_notice(&lines),
     ))
 }
 
@@ -2223,7 +2219,6 @@ fn linux_launch_hotkeys_notice(state: &SetupHintsState) -> Option<StartupHints> 
             chord: hk.chord.canonical(),
             display: hk.chord.display_super(),
             label: hk.label.clone(),
-            cwd_display: hk.dir.clone(),
             self_dev: hk.self_dev,
         })
         .collect();
@@ -2236,20 +2231,10 @@ fn linux_launch_hotkeys_notice(state: &SetupHintsState) -> Option<StartupHints> 
     if !linux_hotkeys_installed(comp) {
         return None;
     }
-    let footer = format!(
-        "Bound via {} and available system-wide.",
-        linux_hotkey_target_description(comp)
-    );
-
     Some(StartupHints::with_status_and_display(
         "Launch hotkeys available".to_string(),
         "Launch hotkeys",
-        format!(
-            "Configured Jcode launch hotkeys ({}): {} {}",
-            comp.name(),
-            lines.join("; "),
-            footer
-        ),
+        compact_launch_hotkey_notice(&lines),
     ))
 }
 
@@ -2261,20 +2246,23 @@ pub(crate) struct LaunchHotkeyRow {
     /// Pretty, user-facing chord rendering (e.g. `⌘;` or `Super+;`).
     pub display: String,
     pub label: String,
-    pub cwd_display: String,
     pub self_dev: bool,
 }
 
-/// Decide which launch-hotkey lines to surface, given how often each chord has
-/// been used. Pure so the adaptive "stop nagging once learned" policy is
-/// unit-tested without touching config or the filesystem.
+/// Keep startup reminders focused on the shortcuts, not installation details.
+#[cfg(any(test, target_os = "macos", target_os = "linux", windows))]
+pub(crate) fn compact_launch_hotkey_notice(lines: &[String]) -> String {
+    format!("Hotkeys: {}", lines.join(" · "))
+}
+
+/// Decide which launch-hotkey lines to surface on the first launch. Pure so
+/// the one-time onboarding policy is tested without config or filesystem I/O.
 ///
 /// Policy:
 /// - Hide a per-repo binding once it has been used `LAUNCH_HOTKEY_LEARNED_USES`
 ///   times (the user has clearly internalized it).
-/// - Once the user has learned at least one binding and has launched jcode at
-///   least `LAUNCH_HOTKEY_NOTICE_MIN_LAUNCHES_TO_STOP` times, drop the whole
-///   notice so it never lingers for an experienced user.
+/// - Never repeat the notice after the first launch, even if no binding has
+///   been used. Choosing not to use global hotkeys should not cause nagging.
 /// - Returns `None` when nothing should be shown.
 #[cfg(any(test, target_os = "macos", target_os = "linux", windows))]
 pub(crate) fn launch_hotkey_notice_lines(
@@ -2282,27 +2270,18 @@ pub(crate) fn launch_hotkey_notice_lines(
     usage: &HashMap<String, u64>,
     launch_count: u64,
 ) -> Option<Vec<String>> {
-    if rows.is_empty() {
+    if rows.is_empty() || launch_count != 1 {
         return None;
     }
 
     let uses_for = |chord: &str| usage.get(chord).copied().unwrap_or(0);
-    let learned_any = rows
-        .iter()
-        .any(|row| uses_for(&row.chord) >= LAUNCH_HOTKEY_LEARNED_USES);
-    if learned_any && launch_count >= LAUNCH_HOTKEY_NOTICE_MIN_LAUNCHES_TO_STOP {
-        return None;
-    }
 
     let lines: Vec<String> = rows
         .iter()
         .filter(|row| uses_for(&row.chord) < LAUNCH_HOTKEY_LEARNED_USES)
         .map(|row| {
             let suffix = if row.self_dev { " [self-dev]" } else { "" };
-            format!(
-                "{} → {} ({}){}",
-                row.display, row.label, row.cwd_display, suffix
-            )
+            format!("{} → {}{}", row.display, row.label, suffix)
         })
         .collect();
 

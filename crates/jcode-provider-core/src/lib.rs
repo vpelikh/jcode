@@ -16,6 +16,7 @@ pub mod token_limit;
 pub mod transport;
 
 pub use transport::is_transient_transport_error;
+pub use jcode_usage_types::{ModelUsage, compare_model_usage};
 
 pub use anthropic::{
     ANTHROPIC_OAUTH_BETA_HEADERS, ANTHROPIC_OAUTH_BETA_HEADERS_1M, AnthropicContextMode,
@@ -688,6 +689,8 @@ pub struct ModelRoute {
     pub detail: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cheapness: Option<RouteCheapnessEstimate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<jcode_usage_types::ModelUsage>,
 }
 
 /// Exact runtime identity for a selected model route.
@@ -1579,6 +1582,7 @@ mod tests {
                 api_method: "snapshot-api".to_string(),
                 available: true,
                 detail: "test route".to_string(),
+                usage: None,
                 cheapness: None,
             }]
         }
@@ -1624,6 +1628,7 @@ mod tests {
             api_method: "openrouter".to_string(),
             available: true,
             detail: "https://openrouter.ai/api/v1".to_string(),
+            usage: None,
             cheapness: None,
         });
         assert_eq!(selection.model, "openrouter/owl-alpha");
@@ -1636,6 +1641,7 @@ mod tests {
             api_method: "openai-compatible:nvidia-nim".to_string(),
             available: true,
             detail: "https://integrate.api.nvidia.com/v1".to_string(),
+            usage: None,
             cheapness: None,
         });
         assert_eq!(

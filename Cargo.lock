@@ -4356,7 +4356,7 @@ checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 
 [[package]]
 name = "jcode"
-version = "0.83.0"
+version = "0.84.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -4705,6 +4705,7 @@ dependencies = [
 name = "jcode-harness-api"
 version = "0.1.0"
 dependencies = [
+ "jcode-usage-types",
  "serde",
  "serde_json",
 ]
@@ -5010,6 +5011,7 @@ dependencies = [
  "jcode-logging",
  "jcode-message-types",
  "jcode-schema-dialect",
+ "jcode-usage-types",
  "rand 0.9.3",
  "reqwest 0.12.28",
  "serde",
@@ -5242,12 +5244,15 @@ name = "jcode-sdk"
 version = "0.1.0"
 dependencies = [
  "jcode-harness-api",
+ "jcode-provider-metadata",
  "jcode-transport",
  "jsonschema",
  "libc",
  "serde",
  "serde_json",
  "tempfile",
+ "url",
+ "uuid",
 ]
 
 [[package]]

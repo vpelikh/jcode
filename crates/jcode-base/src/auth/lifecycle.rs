@@ -1239,6 +1239,7 @@ mod tests {
             api_method: api_method.to_string(),
             available,
             detail: String::new(),
+            usage: None,
             cheapness: None,
         }
     }
