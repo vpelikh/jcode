@@ -3060,12 +3060,11 @@ pub(in crate::tui::app) fn handle_server_event(
 fn open_picker_from_remote_handoffs(app: &mut App, handoffs: Vec<HandoffWireModel>) {
     let mut snapshots: Vec<crate::handoff::HandoffSnapshot> = Vec::new();
     for model in handoffs {
-        if let Some(payload) = model.payload {
-            if let Ok(snapshot) =
+        if let Some(payload) = model.payload
+            && let Ok(snapshot) =
                 serde_json::from_str::<crate::handoff::HandoffSnapshot>(&payload)
-            {
-                snapshots.push(snapshot);
-            }
+        {
+            snapshots.push(snapshot);
         }
     }
     app.open_handoff_picker_with(snapshots);
