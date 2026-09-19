@@ -173,28 +173,35 @@ through handle methods; suite green + clippy clean.
 
 ### Follow-up: route the coordination write sites (deferred to a new session)
 
-**Measured 2026-09:** ~48 functional write sites, split into two kinds:
+**Measured 2026-09 (raw functional write sites):** 53 in-place `.write()` /
+`participants.insert|remove` sites across 8 functional files:
 
-- **Kind A — genuine coordination mutations (~35, the WIN):** these should move
-  onto **whole-transaction `SwarmServiceHandle` methods** (the caller stops
-  touching the raw map entirely). Per file: `comm_control` (13), `comm_plan`
-  (7), `comm_graph` (7), `comm_session` (8), `client_session` (4),
-  `client_actions` (2), `comm_sync` (2). Requires one method per transaction
-  (e.g. `assign_plan_task`, `requeue_existing_assignment`, `attach_plan`,
-  `elect_coordinator`) taking the inputs and returning the fan-out tuple, NOT a
-  leaf method (deadlock). Do slice-by-slice over these files, suite green +
-  clippy `--all-targets` + deadlock review after each.
-- **Kind B — ephemeral per-member UI-field writes (~5-8):** `background_tasks`
-  (`output_tail`, `todo_items`, `todo_progress`), plus some per-member
-  `last_seen`/role writes in `comm_control`/`client_actions`. These are
-  cosmetic single-record updates, not coordination — recommend leaving them
-  behind the read accessor (routing them is ceremony with no boundary value),
-  unless literal completeness is required (then thin methods like
-  `set_member_output_tail`).
+- `comm_control` (13), `comm_session` (8), `comm_plan` (7), `comm_graph` (7),
+  `client_session` (5), `background_tasks` (5), `client_actions` (4),
+  `comm_sync` (2). (Counts are raw per-file write sites, not yet split per site.)
 
-Recommended scope for the follow-up: **route Kind A (the ~35 coordination
-transactions) whole-transaction onto handle methods; leave Kind B as-is.**
-Verify each slice independently.
+These split into two kinds:
+
+- **Kind A — genuine coordination mutations (the WIN):** plan version/participant
+  and membership/coordinator writes. These should move onto **whole-transaction
+  `SwarmServiceHandle` methods** (the caller stops touching the raw map
+  entirely). Requires one method per transaction (e.g. `assign_plan_task`,
+  `requeue_existing_assignment`, `attach_plan`, `elect_coordinator`) taking the
+  inputs and returning the fan-out tuple, NOT a leaf method (deadlock). Do
+  slice-by-slice over these files, suite green + clippy `--all-targets` +
+  deadlock review after each. A per-site Kind A/B classification is the first
+  step before writing the handle methods.
+- **Kind B — ephemeral per-member UI-field writes:** `background_tasks`
+  (`output_tail`, `todo_items`, `todo_progress`) and single-member
+  `last_seen`/role/working-dir writes in `comm_control`/`client_session`/
+  `client_actions`. These are cosmetic single-record updates, not coordination —
+  recommend leaving them behind the read accessor (routing them is ceremony
+  with no boundary value), unless literal completeness is required (then thin
+  methods like `set_member_output_tail`).
+
+Recommended scope for the follow-up: **route Kind A (genuine coordination)
+whole-transaction onto handle methods; leave Kind B (UI-only) as-is.** Verify
+each slice independently.
 
 - `debug_swarm_write` / persistence-test code is a documented privileged
   observer. `Server.swarm_state` (the handle's constructor source) is pub, out
