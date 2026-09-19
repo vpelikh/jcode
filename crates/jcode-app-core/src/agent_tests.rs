@@ -4068,7 +4068,10 @@ async fn streaming_turn_recovers_from_413_payload_too_large_and_retries() {
 
 /// The handoff integration: a fresh agent with a working dir that has a prior
 /// handoff prepends the compact block to its very first user message, and does
-/// not re-inject it on subsequent messages.
+/// not re-inject it on subsequent messages within the same conversation. The
+/// auto-injected handoff is consumed on injection, so a *later* fresh session
+/// in the same project no longer sees the stale one (the cross-session
+/// re-injection bug); each scenario below seeds its own distinct working dir.
 #[tokio::test]
 async fn first_user_message_injects_handoff_once() {
     let _guard = crate::storage::lock_test_env();
@@ -4084,32 +4087,37 @@ async fn first_user_message_injects_handoff_once() {
     }
     let _restore = RestoreHome(std::env::var_os("JCODE_HOME"));
     crate::env::set_var("JCODE_HOME", home.path());
-    let wd = home.path().join("project");
-    std::fs::create_dir_all(&wd).unwrap();
 
-    // Seed a handoff for this working dir from a "previous" session.
-    crate::todo::save_todos(
-        "prev-session",
-        &[crate::todo::TodoItem {
-            id: "p".into(),
-            content: "resume the split".into(),
-            status: "in_progress".into(),
-            priority: "high".into(),
-            group: None,
-            confidence: None,
-            ..Default::default()
-        }],
-    )
-    .unwrap();
-    crate::todo::save_plan(
-        "prev-session",
-        &crate::todo::TodoPlan {
-            user_intention: Some("continue server split".into()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    crate::handoff::capture("prev-session", Some(&wd), "closed", None).expect("capture");
+    // Seed a fresh handoff for a dedicated working dir.
+    fn seed_handoff(wd: &std::path::Path) {
+        crate::todo::save_todos(
+            "prev-session",
+            &[crate::todo::TodoItem {
+                id: "p".into(),
+                content: "resume the split".into(),
+                status: "in_progress".into(),
+                priority: "high".into(),
+                group: None,
+                confidence: None,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        crate::todo::save_plan(
+            "prev-session",
+            &crate::todo::TodoPlan {
+                user_intention: Some("continue server split".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::handoff::capture("prev-session", Some(wd), "closed", None).expect("capture");
+    }
+
+    // Scenario 1: text-first conversation injects exactly once.
+    let wd = home.path().join("project-text");
+    std::fs::create_dir_all(&wd).unwrap();
+    seed_handoff(&wd);
 
     // Build a fresh agent in that working dir.
     let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
@@ -4170,6 +4178,43 @@ async fn first_user_message_injects_handoff_once() {
         !second_str.contains("[Handoff from previous session]"),
         "second user message must not re-inject the handoff, got: {second_str}"
     );
+
+    // The auto-inject consumed the handoff: a brand-new session in the *same*
+    // project no longer inherits the stale snapshot (the bug fixed). Only the
+    // archived snapshot remains, reachable via explicit manual resume.
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent2 =
+        Agent::new_with_initial_working_dir(provider, registry, Some(wd.to_str().unwrap()));
+    agent2
+        .append_user_context_message("continue again", Vec::new())
+        .expect("fresh session first message");
+    let agent2_first = agent2
+        .session
+        .messages
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, Role::User))
+        .map(|m| {
+            m.content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    assert!(
+        !agent2_first.contains("[Handoff from previous session]"),
+        "consumed handoff must not re-inject into a fresh later session, got: {agent2_first}"
+    );
+
+    // Scenario 2: an image-first conversation in its own dir injects once.
+    let wd = home.path().join("project-image");
+    std::fs::create_dir_all(&wd).unwrap();
+    seed_handoff(&wd);
     let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
     let registry = Registry::new(provider.clone()).await;
     let mut image_agent =
@@ -4187,10 +4232,18 @@ async fn first_user_message_injects_handoff_once() {
     assert!(message.content.iter().any(|block| matches!(block,
         ContentBlock::Text { text, .. } if text.contains("[Handoff from previous session]")
     )));
+
+    // Scenario 3: turn-entry points (run_once / run_once_capture) inject once
+    // into a fresh conversation via the autoregressive paths, each with its own
+    // seeded project.
     for capture in [false, true] {
+        let wd = home.path().join(format!("project-cli-{capture}"));
+        std::fs::create_dir_all(&wd).unwrap();
+        seed_handoff(&wd);
         let provider: Arc<dyn Provider> = Arc::new(HandoffFailureProvider);
         let registry = Registry::new(provider.clone()).await;
-        let mut agent = Agent::new_with_initial_working_dir(provider, registry, Some(wd.to_str().unwrap()));
+        let mut agent =
+            Agent::new_with_initial_working_dir(provider, registry, Some(wd.to_str().unwrap()));
         agent.set_memory_enabled(false);
         for text in ["first CLI message", "second CLI message"] {
             let result = if capture {

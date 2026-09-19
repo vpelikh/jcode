@@ -357,6 +357,20 @@ pub fn latest_handoff_for_project(working_dir: Option<&Path>) -> Option<String> 
 /// first-message injection at session start. Returns `None` when there is
 /// nothing to show.
 pub fn render_boot_context(working_dir: Option<&Path>) -> Option<String> {
+    let (_, snapshot) = latest_snapshot_for_project(working_dir)?;
+    render_snapshot(&snapshot)
+}
+
+/// Resolve the latest handoff snapshot (and its session id) for a project, if
+/// any.
+///
+/// Reads `project_key` -> latest index entry -> snapshot and validates project
+/// identity, without consuming anything (the handoff stays eligible for
+/// automatic injection). Returns `None` when there is no handoff, it fails the
+/// identity check, or the snapshot cannot be loaded.
+fn latest_snapshot_for_project(
+    working_dir: Option<&Path>,
+) -> Option<(String, HandoffSnapshot)> {
     let key = project_key(working_dir)?;
     let session_id = load_index()
         .latest
@@ -367,7 +381,48 @@ pub fn render_boot_context(working_dir: Option<&Path>) -> Option<String> {
     if snapshot.project_key != key {
         return None;
     }
-    render_snapshot(&snapshot)
+    Some((session_id, snapshot))
+}
+
+/// The most recent handoff for a working dir as a compact markdown block for
+/// first-message injection, **and consume it** so it does not re-inject on a
+/// later session in the same project.
+///
+/// Automatic first-message injection is a one-shot: after the handoff is
+/// rendered for a fresh conversation, it must no longer be the project's
+/// "latest unfinished handoff", otherwise every new session in the project
+/// would re-surface the same stale snapshot. This retires the resolved entry
+/// from the index once it has been rendered, while keeping the archived
+/// snapshot available for explicit promotion via `/handoffres`.
+pub fn render_boot_context_and_consume(working_dir: Option<&Path>) -> Option<String> {
+    // Resolve + render first, without locking: a lock failure must not prevent
+    // the fresh conversation from booting with its handoff context, matching
+    // `render_boot_context` (read-only, lock-free). Consuming (retiring) is a
+    // best-effort extra that only happens when we hold the store lock.
+    let (session_id, snapshot) = latest_snapshot_for_project(working_dir)?;
+    let rendered = render_snapshot(&snapshot)?;
+    // Take the store lock so the retire is atomic with a concurrent writer
+    // (`capture`, `import_handoff`, `prune_archived_snapshots`), all of which
+    // take the lock for index writes. A lock failure is logged and the handoff
+    // is simply left in place (it may surface once more on the next boot)
+    // rather than silently dropping the rendered context.
+    match lock_store() {
+        Ok(_lock) => {
+            if let Err(err) = retire_session(&session_id) {
+                crate::logging::warn(&format!(
+                    "[handoff] failed to consume auto-injected {}: {}",
+                    session_id, err
+                ));
+            }
+        }
+        Err(error) => {
+            crate::logging::warn(&format!(
+                "[handoff] cannot lock store to consume auto-injected {}: {}",
+                session_id, error
+            ));
+        }
+    }
+    Some(rendered)
 }
 
 /// List the saved handoffs available for manual selection, one per project.

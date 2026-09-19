@@ -117,9 +117,10 @@ self.append_user_context_message_with_display_role(
                 return Some(rendered);
             }
         }
-        self.session.working_dir.as_deref().and_then(|wd| {
-            crate::handoff::render_boot_context(Some(std::path::Path::new(wd)))
-        })
+        self.session
+            .working_dir
+            .as_deref()
+            .and_then(|wd| crate::handoff::render_boot_context_and_consume(Some(std::path::Path::new(wd))))
     }
 
     fn append_user_context_message_with_display_role(

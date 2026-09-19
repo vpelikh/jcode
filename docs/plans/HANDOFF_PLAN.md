@@ -86,6 +86,14 @@ latest-for-project handoff is used. Because the override applies only to the
 first visible message and is cleared after injection, manual selection never
 regresses the automatic behavior on a later turn or session.
 
+Automatic latest-for-project injection is itself one-shot: the injected handoff
+is retired from the index once it is rendered, so a *later* fresh session in the
+same project no longer re-injects the same stale snapshot (previously every new
+session kept inheriting the old handoff forever). The retired snapshot's file is
+kept, so explicit manual resume via `/handoffres` and the `/handoff` picker
+still work; if the resumed session itself produces open work, its own close
+captures a fresh handoff.
+
 ### Capture
 
 `handoff::capture()` reads the session's todo plan, open todos, optional assistant
