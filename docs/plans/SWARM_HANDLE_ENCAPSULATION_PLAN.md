@@ -4,7 +4,9 @@ Status: Plan for the Tier 3 "true encapsulation" follow-up flagged by
 `SERVER_SERVICE_SPLIT_PLAN.md`. Tier 1 (mechanical convergence onto
 `&SwarmServiceHandle`) is landed; this documents how to *close* the split by
 privatizing the handle's fields so all mutations must go through handle
-methods.
+methods. **All seven slices are landed (2026-09);** the done criteria below are
+met except the optional stricter `SwarmState` sub-field privatization (see
+`swarm_state` slice note).
 
 Scope: `crates/jcode-app-core/src/server/services/swarm.rs` +
 `crates/jcode-app-core/src/server/**`.
@@ -99,12 +101,36 @@ API the handle wraps). Instead:
    incrementally *within* `SwarmState`: members first (existing handle methods
    `ensure_member`/`rename_member_session`/`set_member_status`/etc. already
    cover most mutations), then plans/coordinators/swarms_by_id.
+   *(landed 2026-09)* The handle's `swarm_state` field is private behind a
+   `swarm_state()` read-only accessor; ~167 direct `swarm.swarm_state.<map>`
+   accesses across 23 files route through it. Live-path mutations already went
+   through handle methods (no functional write accesses remained after
+   convergence), so this closes the handle boundary. The `SwarmState` struct's
+   own four maps stay `pub` (state.rs remains the domain API the handle wraps,
+   per non-goals); a stricter future boundary could snapshot-ify or further
+   private the sub-fields, out of scope here.
 5. **`await_members_runtime` / `swarm_mutation_runtime`** (8). Runtime handles;
    expose narrow pass-through accessors or move the orchestration onto methods.
+   *(landed 2026-09)* The two fields are private; `await_members_runtime()` and
+   `swarm_mutation_runtime()` pass-through accessors route all 8 cross-module
+   reads (`client_lifecycle`, `comm_session` ×2, `comm_control` ×2, `comm_plan`
+   ×3, `client_lightweight_control`). `handle_client` clones the await runtime
+   from the surviving handle clone. Direct unit tests added for the accessors.
 6. **`file_touch`** (5). `FileTouchService` is already encapsulated; just
    expose accessors (or keep as the service handle's own field).
+   *(landed 2026-09)* The field is private; a `file_touch()` accessor routes all
+   8 cross-module sites (`monitor_bus` clones it, the debug/comm reads borrow
+   it). Direct unit test added.
 7. **Subscribe/resume orchestration final pass** — with the per-map methods in
    place, collapse the last inline multi-map mutations in `client_session.rs`.
+   *(landed 2026-09)* The resume path's coordinator rewrite (old→new session id)
+   was folded into `rename_member_session`, which now atomically updates
+   members, `swarms_by_id`, and coordinators. Direct unit test locks the
+   coordinator-rename. The remaining subscribe/cleanup inline mutations are
+   deeply interleaved working-dir-rebind + coordinator re-election logic (the
+   plan's "risk concentration"); they stay as documented orchestration because
+   extracting them would risk the exact borrow-order behavior the plan warned
+   to preserve.
 
 ## Boundaries / non-goals
 
@@ -124,6 +150,12 @@ API the handle wraps). Instead:
 `swarm.channel_subscriptions{,_by_session}` and the two runtime handles are
 private; zero non-`services/swarm.rs` code reaches them; all mutations go
 through handle methods; suite green + clippy clean.
+**Achieved:** every named field is private; cross-module code reaches the maps
+only through documented read accessors; live-path mutations route through handle
+methods (debug write / persistence-test code is a documented privileged
+observer). `Server.swarm_state` (the handle's constructor source) remains a pub
+field, out of scope. Full lib suite green (1539) + clippy clean on changed
+files.
 
 ## Review notes (2026-09)
 
