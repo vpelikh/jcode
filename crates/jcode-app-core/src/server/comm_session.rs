@@ -1082,14 +1082,8 @@ pub(super) async fn handle_comm_stop(
         }
     }
 
-    let (removed_swarm_id, removed_name) = {
-        let mut members = swarm_members.write().await;
-        if let Some(member) = members.remove(&target_session) {
-            (member.swarm_id, member.friendly_name)
-        } else {
-            (None, None)
-        }
-    };
+    let removed_member = swarm.remove_session_member(&target_session).await;
+    let (removed_swarm_id, removed_name) = (removed_member.swarm_id, removed_member.friendly_name);
     if let Some(ref swarm_id) = removed_swarm_id {
         swarm
             .record_swarm_event(
