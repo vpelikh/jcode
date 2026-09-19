@@ -515,7 +515,10 @@ constructed at 96 sites, too invasive for one tool's benefit).
   - scoring deserialize (`score_candidates_parallel`),
   - external JSONL loads (`load_external_candidates_parallel`),
   - claude loads (`load_claude_candidates_parallel`), and
-  - the external result fold (`search_external_sessions`).
+  - the external result fold (`search_external_sessions`),
+  plus an **entry-point short-circuit** in `search_sessions_blocking` so a flag
+  already set when the blocking call starts skips even file enumeration and
+  returns an empty report immediately.
 - **Behavior:** the turn still returns immediately with the model-visible
   "timed out after Ns" error (unchanged), but now the already-spawned
   `spawn_blocking` threads are reclaimed at the next candidate boundary instead
@@ -524,6 +527,7 @@ constructed at 96 sites, too invasive for one tool's benefit).
   unattended and deliberately uses a never-cancelled flag (no deadline races it).
 - **Tests:** two new tests cover the mechanism end to end. A pre-set flag test
   (`pre_abort_flag_short_circuits_the_scan`) returns an empty report with
+  `scanned_jcode_sessions == 0` (no file enumeration) and
   `candidate_jcode_sessions == 0` (no scoring) even though matching sessions
   exist; a mechanism test
   (`abort_on_drop_guard_arms_the_flag_when_the_future_is_dropped`) proves the

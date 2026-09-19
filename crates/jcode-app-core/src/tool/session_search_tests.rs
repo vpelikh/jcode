@@ -885,6 +885,10 @@ fn pre_abort_flag_short_circuits_the_scan() {
             "a scan cancelled up front must score nothing"
         );
         assert_eq!(
+            report.scanned_jcode_sessions, 0,
+            "a scan cancelled up front must skip even file enumeration"
+        );
+        assert_eq!(
             report.candidate_jcode_sessions, 0,
             "a scan cancelled up front must reach no candidate files"
         );

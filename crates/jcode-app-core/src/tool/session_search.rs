@@ -726,6 +726,11 @@ fn search_sessions_blocking(
     if !query.is_actionable() {
         return Ok(report);
     }
+    // Cancelled up front: skip even file enumeration so a timed-out call that
+    // the turn has already left reclaims the blocking thread immediately.
+    if abort.load(Ordering::Relaxed) {
+        return Ok(report);
+    }
 
     if source_matches_filter("jcode", options) {
         let collection = collect_session_files(sessions_dir, options.max_scan_sessions)?;
