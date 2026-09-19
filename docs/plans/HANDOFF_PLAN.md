@@ -367,11 +367,27 @@ the prior environment.
   (rejecting malformed input with `Error` and leaving the live conversation
   untouched), then clears the current conversation and sets the handoff-resume
   override to the adopted id so the next first user message boots from the
-  snapshot. This removes the previous non-atomic `clear()` + `set_handoff_resume`
-  two-request split at the client, which could leave a cleared conversation with
-  no override (auto-inject wins). Covered by a unit test
-  (`handle_handoff_apply_imports_clears_and_arms_resume`), a wire roundtrip, and
-  the existing real-socket handoff surface. Independent of the row model.
+  snapshot. This is the cross-host adoption path (consistent with
+  `Request::HandoffImport`): it consumes a *payload* shipped from another host
+  and rekeys it to this session's project. Covered by a unit test
+  (`handle_handoff_apply_imports_clears_and_arms_resume`), a protocol wire
+  roundtrip, and a client `RemoteConnection::handoff_apply` method.
+
+  The resume-by-id path is *not* converted: when a snapshot is already on the
+  server and the user just selects it (the `/handoff` overlay), the client still
+  performs `clear()` then `set_handoff_resume(id)` as two requests
+  (`apply_handoff_resume`). That split is a distinct, still-open gap listed
+  below. Independent of the row model.
+
+- **Atomic resume-by-id (follow-up, deferred).** The `/handoff` picker selects a
+  snapshot already saved on the server by id, so it cannot use the payload-based
+  `HandoffApply`. Instead `apply_handoff_resume` issues `remote.clear()` then
+  `set_handoff_resume(id)` — two requests that can split if the transport drops
+  between them, leaving a cleared conversation with no override (auto-inject
+  wins). A single request that clears *and* arms the resume override by id
+  (no payload import) would make this atomic. Mirrors the manual `/handoffres`
+  flow. Consistent with `handoff_import`/`handoff_apply` being wire surfaces
+  awaiting a consumer.
 
 - **Wire-model duplication (follow-up, deferred).** `HandoffWireModel` and the
   session-shaped `Row`/display projection carry overlapping session fields.
