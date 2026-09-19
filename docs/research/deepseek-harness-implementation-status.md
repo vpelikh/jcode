@@ -538,3 +538,32 @@ constructed at 96 sites, too invasive for one tool's benefit).
 
 The core F8 "promote-on-timeout" seam for `bash`/`bg`/`webfetch` remains a
 separate, behavior-changing follow-up as described above.
+
+### Alternative considered: a reusable cancel-scope primitive
+
+Rather than keeping `CheckAbort`/`AbortOnDrop` local to `session_search`, a
+credible alternative is to lift the "drop-arms-cancel-flag" pattern into a
+shared, reusable type (e.g. a `JournalingCancelScope` / `AbortOnDrop`) in
+`jcode-tool-core` that any hang-prone tool could adopt the same way. Weighed
+against what was built:
+
+- **Reuse / maintenance.** `AtomicBool` + a `Drop`-armed flag already exists
+  ad-hoc in the repo (`server/runtime.rs` has a `DropFlag`, `client_lifecycle.rs`
+  a `done: Arc<AtomicBool>`), so the idiom is proven but currently duplicated at
+  three sites. A shared primitive would remove that duplication and make the next
+  consumer one type-import instead of a reimplementation.
+- **Cost / complexity.** A shared type must sit in a leaf crate both
+  app-core-internal tooling and server runtime can depend on, and requires
+  converting the existing two server sites to it — a small but cross-cutting
+  change outside the F8 Part A scope. It also risks an interface that is *just*
+  `Arc<AtomicBool>` in disguise, earning its abstraction less than it costs
+  unless the semantics (drop-arms, `never()` helper) are the real
+  deliverable.
+- **Compatibility / behavior.** Either approach leaves the observable contract
+  identical (a timed-out call returns the model-visible timeout and reclaims the
+  blocking thread); the only difference is where the type lives.
+- **Decision.** Keeping it local was chosen for this follow-up: it stays
+  behavior-identical and zero-risk to the two existing server sites, and the
+  unification is a natural companion to the already-parked F8 promote-on-timeout
+  seam, which is the right place to introduce the shared type across tools.
+  Revisited there.
