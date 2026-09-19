@@ -18,6 +18,13 @@ remote-fallback adoption is wired through `import_handoff`. See "Future work"
 for what remains. The wire request + server handlers + client methods and their
 tests were implemented in 2026-09 on `feat/handoff-remote-fallback`.
 
+**Regression gap closed (2026-09).** This branch re-ran the full `jcode-app-core`
+suite to completion: **1540 passed, 0 failed** (the plan's earlier 1469 figure
+predates this suite's growth). The new wire surface is additionally validated
+end to end by a real-socket integration test that drives `Request::HandoffList`
+and `Request::HandoffImport` through the client_lifecycle dispatch to the real
+handlers, not just the handlers in isolation.
+
 ## Purpose
 
 Preserve unfinished work across sessions without requiring the user to repeat
