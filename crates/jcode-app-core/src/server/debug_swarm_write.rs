@@ -266,22 +266,7 @@ pub(super) async fn maybe_handle_swarm_write_command(
         let coord_session = parts[0];
         let proposer_session = parts[1];
 
-        let (swarm_id, is_coordinator) = {
-            let members = ctx.swarm.swarm_state().members.read().await;
-            let swarm_id = members
-                .get(coord_session)
-                .and_then(|member| member.swarm_id.clone());
-            let is_coord = if let Some(ref swarm_id) = swarm_id {
-                let coordinators = ctx.swarm.swarm_state().coordinators.read().await;
-                coordinators
-                    .get(swarm_id)
-                    .map(|coordinator| coordinator == coord_session)
-                    .unwrap_or(false)
-            } else {
-                false
-            };
-            (swarm_id, is_coord)
-        };
+        let (swarm_id, is_coordinator) = ctx.swarm.coordinator_identity(coord_session).await;
 
         if !is_coordinator {
             return Err(anyhow::anyhow!(
@@ -369,22 +354,7 @@ pub(super) async fn maybe_handle_swarm_write_command(
             None
         };
 
-        let (swarm_id, is_coordinator) = {
-            let members = ctx.swarm.swarm_state().members.read().await;
-            let swarm_id = members
-                .get(coord_session)
-                .and_then(|member| member.swarm_id.clone());
-            let is_coord = if let Some(ref swarm_id) = swarm_id {
-                let coordinators = ctx.swarm.swarm_state().coordinators.read().await;
-                coordinators
-                    .get(swarm_id)
-                    .map(|coordinator| coordinator == coord_session)
-                    .unwrap_or(false)
-            } else {
-                false
-            };
-            (swarm_id, is_coord)
-        };
+        let (swarm_id, is_coordinator) = ctx.swarm.coordinator_identity(coord_session).await;
 
         if !is_coordinator {
             return Err(anyhow::anyhow!(

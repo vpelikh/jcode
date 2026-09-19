@@ -1269,3 +1269,23 @@ methods instead of reaching into the raw `swarm_state` maps from
 Zero behavior change; the server suite stays green (481 passing) and clippy adds
 no new warnings. Two unit tests cover coordinator demotion/removal reporting and
 plan removal + missing-plan no-op.
+
+### coordinator-identity consolidation (2026-09)
+
+Refinement slice: the coordinator-membership read lived in both
+`require_coordinator_swarm` and (duplicated, inline) in the debug
+`swarm:approve_plan` / `swarm:reject_plan` commands. Added a single
+`SwarmServiceHandle::coordinator_identity(session_id) -> (Option<String>, bool)`
+accessor and routed all three sites through it.
+
+- **`coordinator_identity(session_id)`** resolves a session's swarm id and
+  whether it is that swarm's coordinator in one members+coordinators read,
+  without emitting an error event (so the debug Result-returning branches can
+  share it).
+- `require_coordinator_swarm` now delegates to `coordinator_identity`, and
+  `debug_swarm_write.rs`'s approve/reject plan branches use it, removing two
+  more inline `.swarm_state()` coordinator blocks (~18 direct map accesses).
+
+Zero behavior change; the server suite stays green (482 passing) and clippy adds
+no new warnings. One unit test covers coordinator vs plain-member vs unknown /
+post-clear coordinator identity.
