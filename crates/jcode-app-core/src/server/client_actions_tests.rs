@@ -2061,3 +2061,194 @@ async fn real_socket_set_handoff_resume_round_trips_done_and_error() -> Result<(
     run_task.abort();
     Ok(())
 }
+
+/// Real-socket integration: drive `Request::HandoffList` and
+/// `Request::HandoffImport` through the wire so they reach the real handlers,
+/// exercising request framing and the server dispatch path (the same
+/// `client_lifecycle` loop that routes `SetHandoffResume`).
+///
+/// `HandoffList` round-trips to `HandoffListed` carrying the seeded snapshot
+/// (with its portable payload); `HandoffImport` of that payload round-trips to
+/// `HandoffImported` with an `import-list-me` id that becomes the live handoff
+/// for the subscribed project.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_socket_handoff_list_and_import_round_trip() -> Result<()> {
+    use crate::protocol::Request;
+    use crate::server::Server;
+    use crate::transport::Stream;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let _guard = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().expect("temp home");
+    let sock_dir = tempfile::tempdir().expect("temp sock dir");
+    let socket_path = sock_dir.path().join("jcode-handoff-list.sock");
+
+    struct Restore {
+        prev: [(&'static str, Option<std::ffi::OsString>); 2],
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            for (key, prev) in &self.prev {
+                match prev {
+                    Some(v) => crate::env::set_var(key, v.clone()),
+                    None => crate::env::remove_var(key),
+                }
+            }
+        }
+    }
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let prev_socket = std::env::var_os("JCODE_SOCKET");
+    let _restore = Restore {
+        prev: [
+            ("JCODE_HOME", prev_home),
+            ("JCODE_SOCKET", prev_socket),
+        ],
+    };
+    crate::env::set_var("JCODE_HOME", home.path());
+    crate::env::set_var("JCODE_SOCKET", &socket_path);
+
+    // Seed a handoff the server can list and a source snapshot to export+import.
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    crate::todo::save_todos(
+        "list-me",
+        &[crate::todo::TodoItem {
+            id: "t".into(),
+            content: "e2e work".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: None,
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    crate::todo::save_plan(
+        "list-me",
+        &crate::todo::TodoPlan {
+            user_intention: Some("listable intent".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    crate::handoff::capture("list-me", Some(&work), "closed", None).expect("seed handoff");
+    // Export the seeded snapshot so we can re-adopt it over the wire as a
+    // fresh `import-<source>` handoff (the remote-fallback path).
+    let payload = crate::handoff::export_handoff("list-me").expect("export");
+
+    let provider: Arc<dyn Provider> = Arc::new(StreamingMockProvider::default());
+    let server = Server::new(provider);
+    let run_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut stream = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(s) = Stream::connect(&socket_path).await {
+                break s;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    })
+    .await
+    .expect("server should accept within 10s");
+
+    let subscribe = Request::Subscribe {
+        id: 30,
+        working_dir: Some(work.to_string_lossy().into_owned()),
+        selfdev: None,
+        target_session_id: None,
+        client_instance_id: None,
+        client_has_local_history: false,
+        allow_session_takeover: false,
+        crash_on_disconnect: false,
+        continue_on_disconnect: false,
+        terminal_env: Vec::new(),
+    };
+    stream
+        .write_all((serde_json::to_string(&subscribe)? + "\n").as_bytes())
+        .await?;
+
+    // HandoffList -> HandoffListed, newest first (source-session captured last,
+    // so unless timestamps tick, either order satisfies "contains list-me").
+    let list = Request::HandoffList { id: 31 };
+    stream
+        .write_all((serde_json::to_string(&list)? + "\n").as_bytes())
+        .await?;
+    let mut reader = tokio::io::BufReader::new(stream);
+    let listed: crate::protocol::ServerEvent = timeout(Duration::from_secs(5), async {
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).await?;
+            if n == 0 {
+                anyhow::bail!("connection closed before HandoffListed arrived");
+            }
+            if let Ok(ev) = serde_json::from_str::<crate::protocol::ServerEvent>(&line)
+                && matches!(ev, crate::protocol::ServerEvent::HandoffListed { .. })
+            {
+                return Ok(ev);
+            }
+        }
+    })
+    .await
+    .expect("HandoffListed reply should arrive")?;
+    match listed {
+        crate::protocol::ServerEvent::HandoffListed { id, handoffs } => {
+            assert_eq!(id, 31);
+            assert!(
+                handoffs.iter().any(|h| h.session_id == "list-me" && h.payload.is_some()),
+                "listing should include the seeded snapshot with its payload, got {handoffs:?}"
+            );
+        }
+        other => panic!("HandoffList should round-trip to HandoffListed, got {other:?}"),
+    }
+
+    // HandoffImport of the exported source payload -> HandoffImported with an
+    // import-<source> id that becomes the live handoff for the project.
+    let import = Request::HandoffImport {
+        id: 32,
+        payload,
+        disposition: Some("closed".to_string()),
+    };
+    reader
+        .get_mut()
+        .write_all((serde_json::to_string(&import)? + "\n").as_bytes())
+        .await?;
+    let imported: crate::protocol::ServerEvent = timeout(Duration::from_secs(5), async {
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).await?;
+            if n == 0 {
+                anyhow::bail!("connection closed before HandoffImported arrived");
+            }
+            if let Ok(ev) = serde_json::from_str::<crate::protocol::ServerEvent>(&line)
+                && matches!(ev, crate::protocol::ServerEvent::HandoffImported { .. })
+            {
+                return Ok(ev);
+            }
+        }
+    })
+    .await
+    .expect("HandoffImported reply should arrive")?;
+    match imported {
+        crate::protocol::ServerEvent::HandoffImported {
+            id,
+            session_id,
+        } => {
+            assert_eq!(id, 32);
+            assert_eq!(
+                session_id, "import-list-me",
+                "adopted id should be import-<source>, got {session_id}"
+            );
+            assert_eq!(
+                crate::handoff::latest_handoff_for_project(Some(&work)).as_deref(),
+                Some(session_id.as_str())
+            );
+        }
+        other => panic!("HandoffImport should round-trip to HandoffImported, got {other:?}"),
+    }
+
+    run_task.abort();
+    Ok(())
+}
