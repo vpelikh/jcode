@@ -505,11 +505,13 @@ future. The design follows the option this note settled on: a **tool-internal**
 cancel flag, not a per-call cancel token threaded through `ToolContext` (which is
 constructed at 96 sites, too invasive for one tool's benefit).
 
-- **`session_search.rs`:** a per-call `CheckAbort` (`Arc<AtomicBool>`) is created
-  in `execute` alongside an `AbortOnDrop` guard that lives for the whole executing
-  future. When `execute_with_deadline`'s timeout fires it drops that future; the
-  guard's `Drop` sets the flag, and every scan loop checks `abort.load(...)` at
-  each candidate boundary and stops early:
+- **`session_search.rs`:** it uses the crate's shared
+  `cancel_scope::CancelScope` (via a `CheckAbort` alias). `execute` creates a
+  scope and holds a `CancelGuard` for the whole executing future; the blocking
+  scan shares the scope's flag into `spawn_blocking` via `child()`. When
+  `execute_with_deadline`'s timeout fires it drops that future, the guard's
+  `Drop` sets the shared cancel flag, and every scan loop checks
+  `abort.cancelled()` at each candidate boundary and stops early:
   - raw pre-filter (`filter_candidates_parallel`),
   - index build (`jcode_index_candidates`),
   - scoring deserialize (`score_candidates_parallel`),
@@ -525,17 +527,18 @@ constructed at 96 sites, too invasive for one tool's benefit).
   `spawn_blocking` threads are reclaimed at the next candidate boundary instead
   of continuing to the end. The scan stays read-only and idempotent, so bailing
   mid-loop leaves no partial writes. The background index **warmup** path is
-  unattended and deliberately uses a never-cancelled flag (no deadline races it).
+  unattended and deliberately uses a never-cancelled scope (no deadline races it).
 - **Tests:** two new tests cover the mechanism end to end. A pre-set flag test
   (`pre_abort_flag_short_circuits_the_scan`) returns an empty report with
   `scanned_jcode_sessions == 0` (no file enumeration) and
   `candidate_jcode_sessions == 0` (no scoring) even though matching sessions
   exist; a mechanism test
   (`abort_on_drop_guard_arms_the_flag_when_the_future_is_dropped`) proves the
-  `AbortOnDrop` guard, created inside the executing future exactly as `execute`
-  does, arms the flag when `execute_with_deadline` drops that future on timeout.
-  The existing timeout / model-visible-error / scope-scaling tests still pass
-  (session_search suite: 32 passed, 0 failed).
+  `cancel_scope::CancelGuard`, created inside the executing future exactly as
+  `execute` does, arms the scope when `execute_with_deadline` drops that future
+  on timeout. The existing timeout / model-visible-error / scope-scaling tests
+  still pass (session_search suite: 32 passed, 0 failed; cancel_scope suite:
+  4 passed).
 
 The core F8 "promote-on-timeout" seam for `bash`/`bg`/`webfetch` remains a
 separate, behavior-changing follow-up as described above.
