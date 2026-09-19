@@ -24,8 +24,8 @@ use crate::Model;
 ///         "nothing in the left margin" is false before the chrome is solid;
 ///   * pre-session screens with no attached session, which draw their own
 ///     connecting/starting status lines instead of a settled transcript.
-///     A settled (default) `Boot` reports a `Solid` chrome layer, so only the
-///     pinned mid-reveal captures are filtered out.
+/// A settled (default) `Boot` reports a `Solid` chrome layer, so only the
+/// pinned mid-reveal captures are filtered out.
 fn page_nodes() -> Vec<(&'static str, Model)> {
     nodes()
         .into_iter()
