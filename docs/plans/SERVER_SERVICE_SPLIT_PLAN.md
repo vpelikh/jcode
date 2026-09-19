@@ -33,8 +33,10 @@ reduce argument fanout **without changing the single-process runtime model**.
 > `queue_soft_interrupt_for_session` directly (`jade_relay`,
 > `background_tasks`, `client_actions`, `comm_plan`, `comm_control`,
 > `client_comm_message`) now route through `SessionServiceHandle::
-> queue_soft_interrupt`. This summary describes the problems the split set out
-> to solve and the current state.
+> queue_soft_interrupt`. The Tier 3 field-privatization pass is complete: every
+> `SwarmServiceHandle` field is private except `swarm_state` (see the landed-slice
+> sections below). This summary describes the problems the split set out to
+> solve and the current state.
 
 The architecture was a single broad state owner, now incrementally moved onto
 service handles:
@@ -64,7 +66,10 @@ that yet, and the current pain is ownership fanout, not runtime topology.
 > have mostly been split into a fine-grained `server/**` module tree inside
 > `jcode-app-core`. What has **not** changed is the *state ownership*: the
 > individual module files are still thin slices over one giant state bag passed
-> by hand.
+> by hand. Tier 3 has since privatized every `SwarmServiceHandle` field except
+> `swarm_state`, so the handle is now a method surface rather than a raw field
+> bag; the `swarm_state` maps remain the main body-local re-binding that later
+> method-API slices will move behind services.
 
 ---
 
