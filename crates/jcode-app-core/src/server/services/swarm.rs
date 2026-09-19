@@ -51,7 +51,7 @@ pub(crate) struct SwarmServiceHandle {
     /// Persisted communicate await_members wait registry.
     pub(crate) await_members_runtime: AwaitMembersRuntime,
     /// Persisted dedupe registry for mutating swarm coordinator operations.
-    pub(crate) swarm_mutation_runtime: SwarmMutationRuntime,
+    swarm_mutation_runtime: SwarmMutationRuntime,
 }
 
 /// Identity carried by a session's swarm membership, returned when a `/clear`
@@ -88,6 +88,16 @@ impl SwarmServiceHandle {
     /// Exists so the field stays encapsulated (Tier 3).
     pub(crate) fn file_touch(&self) -> &FileTouchService {
         &self.file_touch
+    }
+
+    /// Borrow the persisted dedupe registry for mutating swarm coordinator
+    /// operations.
+    ///
+    /// Reads and writes route through the encapsulated `SwarmMutationRuntime`;
+    /// callers do not reach into the raw registry maps. Exists so the field
+    /// stays encapsulated (Tier 3).
+    pub(crate) fn swarm_mutation_runtime(&self) -> &SwarmMutationRuntime {
+        &self.swarm_mutation_runtime
     }
 
     /// Borrow the swarm event emission sources (`history`, `counter`,
