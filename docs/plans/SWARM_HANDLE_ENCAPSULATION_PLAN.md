@@ -162,22 +162,43 @@ through handle methods; suite green + clippy clean.
   `rename_member_session` (also rewrites coordinators), resume/detached cleanup,
   and `register_headless_member` (headless registration).
 - **Remaining (not met):** "all mutations go through handle methods" does not
-  hold — the entangled orchestration in `comm_graph`, `comm_session`,
-  `comm_control`, `comm_plan`, `comm_sync`, `client_actions`, `background_tasks`
-  still mutates `members` / `swarms_by_id` / `plans.participants` / `coordinators`
-  in place *after* borrowing them through the accessor (~25 write sites
-  measured 2026-09). These are the plan's "risk concentration": the writes are
+  hold — the entangled orchestration still mutates `members` / `swarms_by_id` /
+  `plans.participants` / `coordinators` in place *after* borrowing them through
+  the accessor. These are the plan's "risk concentration": the writes are
   interleaved with plan/task mutations, persistence, coordinator re-election,
   and subscriber fan-out (e.g. `plan.participants.insert` is always paired with
   a `version += 1` / task-progress update and a `participants.clone()` fan-out
   inside the same `plans.write()` scope), so leaf extraction would hold the very
-  lock it itself takes (deadlock risk) or split logical mutations. Routing these
-  is out of scope for this pass; follow-up slices should pull each *whole
-  transaction* (map write + its interleaved fields + fan-out) onto a handle
-  method keeping borrow order identical.
+  lock it itself takes (deadlock risk) or split logical mutations.
+
+### Follow-up: route the coordination write sites (deferred to a new session)
+
+**Measured 2026-09:** ~48 functional write sites, split into two kinds:
+
+- **Kind A — genuine coordination mutations (~35, the WIN):** these should move
+  onto **whole-transaction `SwarmServiceHandle` methods** (the caller stops
+  touching the raw map entirely). Per file: `comm_control` (13), `comm_plan`
+  (7), `comm_graph` (7), `comm_session` (8), `client_session` (4),
+  `client_actions` (2), `comm_sync` (2). Requires one method per transaction
+  (e.g. `assign_plan_task`, `requeue_existing_assignment`, `attach_plan`,
+  `elect_coordinator`) taking the inputs and returning the fan-out tuple, NOT a
+  leaf method (deadlock). Do slice-by-slice over these files, suite green +
+  clippy `--all-targets` + deadlock review after each.
+- **Kind B — ephemeral per-member UI-field writes (~5-8):** `background_tasks`
+  (`output_tail`, `todo_items`, `todo_progress`), plus some per-member
+  `last_seen`/role writes in `comm_control`/`client_actions`. These are
+  cosmetic single-record updates, not coordination — recommend leaving them
+  behind the read accessor (routing them is ceremony with no boundary value),
+  unless literal completeness is required (then thin methods like
+  `set_member_output_tail`).
+
+Recommended scope for the follow-up: **route Kind A (the ~35 coordination
+transactions) whole-transaction onto handle methods; leave Kind B as-is.**
+Verify each slice independently.
+
 - `debug_swarm_write` / persistence-test code is a documented privileged
   observer. `Server.swarm_state` (the handle's constructor source) is pub, out
-  of scope. Full app-core lib suite green (1542), clippy clean on changed
+  of scope. Full app-core lib suite green (1543), clippy clean on changed
   files.
 
 ## Review notes (2026-09)
