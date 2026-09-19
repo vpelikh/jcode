@@ -2245,6 +2245,16 @@ async fn real_socket_handoff_list_and_import_round_trip() -> Result<()> {
                 crate::handoff::latest_handoff_for_project(Some(&work)).as_deref(),
                 Some(session_id.as_str())
             );
+            // Observe the actual requirement satisfied end to end: the same
+            // boot-context renderer first-message injection uses must now
+            // yield the imported snapshot's intent for a fresh session in the
+            // subscribed project. This closes the feedback loop with runtime
+            // evidence, not just index inspection.
+            let boot = crate::handoff::render_boot_context_and_consume(Some(&work));
+            assert!(
+                boot.as_deref().is_some_and(|c| c.contains("listable intent")),
+                "a fresh session's boot context should surface the imported handoff, got {boot:?}"
+            );
         }
         other => panic!("HandoffImport should round-trip to HandoffImported, got {other:?}"),
     }
