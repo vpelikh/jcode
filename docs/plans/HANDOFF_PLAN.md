@@ -23,7 +23,11 @@ suite to completion: **1540 passed, 0 failed** (the plan's earlier 1469 figure
 predates this suite's growth). The new wire surface is additionally validated
 end to end by a real-socket integration test that drives `Request::HandoffList`
 and `Request::HandoffImport` through the client_lifecycle dispatch to the real
-handlers, not just the handlers in isolation.
+handlers — and then observes the runtime outcome, not just the index: the same
+`render_boot_context_and_consume` function first-message injection uses returns
+the imported snapshot's intent for a fresh session. The full shipped `jcode`
+binary also builds and links with the changes (all four wire tags present in the
+linked artifact).
 
 ## Purpose
 
