@@ -170,7 +170,6 @@ pub fn has_active_turn(session_id: &str) -> bool {
 }
 
 #[cfg(test)]
-#[expect(clippy::items_after_test_module, reason = "test module sits before shared test helpers")]
 mod tests {
     use super::*;
 

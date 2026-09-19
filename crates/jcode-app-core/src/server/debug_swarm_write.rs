@@ -3,6 +3,8 @@ use super::{SwarmState, VersionedPlan, persist_swarm_state_for};
 use crate::plan::PlanItem;
 use crate::protocol::{NotificationType, ServerEvent};
 use anyhow::Result;
+#[cfg(test)]
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
