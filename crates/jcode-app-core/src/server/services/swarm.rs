@@ -351,6 +351,17 @@ impl SwarmServiceHandle {
         }
     }
 
+    /// Remove a session's member record, returning the swarm id it belonged to
+    /// (if any). Leaner than `take_session_membership`: it only touches
+    /// `members` and does not clear file-touch or channel subscriptions, so
+    /// teardown paths that want to keep those until the caller has finished
+    /// their own swarm teardown (`remove_session_from_swarm`) can fold their
+    /// member removal through the handle instead of the raw map.
+    pub(crate) async fn remove_session_member(&self, session_id: &str) -> Option<String> {
+        let mut members = self.swarm_state.members.write().await;
+        members.remove(session_id).and_then(|member| member.swarm_id)
+    }
+
     /// Tear down a session's swarm membership on `/clear`: remove the member
     /// from `members` and `swarms_by_id`, clear its file-touch tracking, and
     /// drop its channel subscriptions. Returns the member's identity so the
@@ -932,5 +943,69 @@ mod tests {
             Some("new"),
             "routing a coordinator through a rename must point at the new session id"
         );
+    }
+
+    #[tokio::test]
+    async fn remove_session_member_drops_only_the_member_and_returns_swarm_id() {
+        let handle = SwarmServiceHandle::test_with_state(
+            SwarmState {
+                members: Arc::new(RwLock::new(HashMap::from([(
+                    "sess".to_string(),
+                    {
+                        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+                        SwarmMember {
+                            session_id: "sess".to_string(),
+                            event_tx,
+                            event_txs: HashMap::new(),
+                            working_dir: None,
+                            swarm_id: Some("swarm-1".to_string()),
+                            swarm_enabled: true,
+                            status: "ready".to_string(),
+                            detail: None,
+                            task_label: None,
+                            friendly_name: Some("sess".to_string()),
+                            report_back_to_session_id: None,
+                            latest_completion_report: None,
+                            role: "agent".to_string(),
+                            joined_at: Instant::now(),
+                            last_status_change: Instant::now(),
+                            is_headless: false,
+                            output_tail: None,
+                            todo_progress: None,
+                            todo_items: Vec::new(),
+                            runtime: crate::protocol::SwarmMemberRuntime::default(),
+                        }
+                    },
+                )]))),
+                swarms_by_id: Arc::new(RwLock::new(HashMap::from([(
+                    "swarm-1".to_string(),
+                    HashSet::from(["sess".to_string()]),
+                )]))),
+                plans: Arc::new(RwLock::new(HashMap::new())),
+                coordinators: Arc::new(RwLock::new(HashMap::new())),
+            },
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(HashMap::new())),
+            SwarmMutationRuntime::default(),
+        );
+
+        let swarm_id = handle.remove_session_member("sess").await;
+        assert_eq!(swarm_id.as_deref(), Some("swarm-1"));
+        // The member record is gone, but swarms_by_id (swarm-level membership)
+        // is untouched: the caller decides whether to also run
+        // remove_session_from_swarm.
+        assert!(!handle.swarm_state().members.read().await.contains_key("sess"));
+        assert!(
+            handle
+                .swarm_state()
+                .swarms_by_id
+                .read()
+                .await
+                .contains_key("swarm-1")
+        );
+
+        // A second removal is a clean no-op.
+        assert_eq!(handle.remove_session_member("sess").await, None);
     }
 }

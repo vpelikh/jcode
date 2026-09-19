@@ -937,12 +937,7 @@ async fn cleanup_detached_source_session_if_unused(
     swarm.remove_session_channel_subscriptions(old_session_id).await;
     file_touch.clear_session(old_session_id).await;
 
-    let removed_swarm_id = {
-        let mut members = swarm_members.write().await;
-        members
-            .remove(old_session_id)
-            .and_then(|member| member.swarm_id)
-    };
+    let removed_swarm_id = swarm.remove_session_member(old_session_id).await;
     if let Some(swarm_id) = removed_swarm_id {
         swarm
             .remove_session_from_swarm(old_session_id, &swarm_id)
