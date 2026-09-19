@@ -808,11 +808,68 @@ impl SwarmServiceHandle {
             false
         }
     }
+
+    /// Require that `req_session_id` may drive the plan for its swarm: either it
+    /// is the coordinator, or the plan runs in deep mode and the session is a
+    /// participant. Returns `Some(swarm_id)` on success, else sends the
+    /// permission error and returns `None`. Mirrors the `require_plan_driver_swarm`
+    /// guard used by the assign / task-control handlers.
+    pub(crate) async fn require_plan_driver_swarm(
+        &self,
+        id: u64,
+        req_session_id: &str,
+        permission_error: &str,
+        client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+    ) -> Option<String> {
+        let swarm_id = self.member_swarm_id(req_session_id).await;
+        let Some(swarm_id) = swarm_id else {
+            let _ = client_event_tx.send(ServerEvent::Error {
+                id,
+                message: "Not in a swarm.".to_string(),
+                retry_after_secs: None,
+            });
+            return None;
+        };
+
+        let is_coordinator = {
+            let coordinators = self.swarm_state.coordinators.read().await;
+            coordinators
+                .get(&swarm_id)
+                .map(|coordinator| coordinator == req_session_id)
+                .unwrap_or(false)
+        };
+        if is_coordinator {
+            return Some(swarm_id);
+        }
+
+        // Deep mode: any participant of the plan may drive its own task graph.
+        let is_deep_participant = {
+            let plans = self.swarm_state.plans.read().await;
+            plans
+                .get(&swarm_id)
+                .map(|plan| {
+                    jcode_plan::bridge::parse_mode(&plan.mode) == jcode_plan::dag::Mode::Deep
+                        && plan.participants.contains(req_session_id)
+                })
+                .unwrap_or(false)
+        };
+        if is_deep_participant {
+            return Some(swarm_id);
+        }
+
+        let _ = client_event_tx.send(ServerEvent::Error {
+            id,
+            message: permission_error.to_string(),
+            retry_after_secs: None,
+        });
+        None
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::VersionedPlan;
 
     fn base_handle() -> SwarmServiceHandle {
         SwarmServiceHandle::test_with_state(
@@ -1127,6 +1184,88 @@ mod tests {
         assert!(
             !handle.can_read_full_context("agent-1", "agent-2").await,
             "non-coordinator may not read other members"
+        );
+    }
+
+    #[tokio::test]
+    async fn require_plan_driver_swarm_grants_coordinator_and_deep_participant() {
+        let handle = base_handle();
+        insert_member(&handle, "coord", "swarm-A", "coordinator").await;
+        insert_member(&handle, "member", "swarm-A", "agent").await;
+        handle
+            .swarm_state()
+            .coordinators
+            .write()
+            .await
+            .insert("swarm-A".to_string(), "coord".to_string());
+        // Deep-mode plan where `member` participates.
+        handle.swarm_state().plans.write().await.insert(
+            "swarm-A".to_string(),
+            VersionedPlan {
+                items: Vec::new(),
+                version: 1,
+                participants: HashSet::from(["member".to_string()]),
+                task_progress: HashMap::new(),
+                mode: "deep".to_string(),
+                node_meta: HashMap::new(),
+            },
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        assert_eq!(
+            handle
+                .require_plan_driver_swarm(1, "coord", "denied", &tx)
+                .await,
+            Some("swarm-A".into()),
+            "coordinator may drive the plan"
+        );
+        assert_eq!(
+            handle
+                .require_plan_driver_swarm(2, "member", "denied", &tx)
+                .await,
+            Some("swarm-A".into()),
+            "deep-mode participant may drive the plan"
+        );
+        assert_eq!(
+            handle
+                .require_plan_driver_swarm(3, "ghost", "denied", &tx)
+                .await,
+            None,
+            "unknown session is denied"
+        );
+    }
+
+    #[tokio::test]
+    async fn require_plan_driver_swarm_denies_non_coordinator_in_light_mode() {
+        let handle = base_handle();
+        insert_member(&handle, "coord", "swarm-A", "coordinator").await;
+        insert_member(&handle, "member", "swarm-A", "agent").await;
+        handle
+            .swarm_state()
+            .coordinators
+            .write()
+            .await
+            .insert("swarm-A".to_string(), "coord".to_string());
+        // Light-mode plan: only the single coordinator may drive.
+        handle.swarm_state().plans.write().await.insert(
+            "swarm-A".to_string(),
+            VersionedPlan {
+                items: Vec::new(),
+                version: 1,
+                participants: HashSet::from(["member".to_string()]),
+                task_progress: HashMap::new(),
+                mode: "light".to_string(),
+                node_meta: HashMap::new(),
+            },
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        assert_eq!(
+            handle
+                .require_plan_driver_swarm(1, "member", "denied", &tx)
+                .await,
+            None,
+            "light-mode non-coordinator cannot drive"
         );
     }
 }

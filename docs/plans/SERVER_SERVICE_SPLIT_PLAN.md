@@ -1221,3 +1221,26 @@ Remaining Tier 3 follow-up: the deeper direct-`swarm_state()` mutation sites
 (`comm_control`, `comm_await`, `comm_sync` resync, `debug_swarm_write`, session
 helpers) that have no shared permission helper yet, and the file_touch /
 shared_context / channel-subscription index ownership decision.
+
+### `require_plan_driver_swarm` moved onto the handle (2026-09)
+
+Second Tier 3 follow-up slice. The deep/light-mode plan-driver authorization guard
+(used by the assign and task-control handlers) is now a `SwarmServiceHandle` method
+instead of a body-local free function.
+
+- **`require_plan_driver_swarm(id, req_session_id, permission_error,
+  client_event_tx)`** encapsulates the coordinator-or-deep-participant authorization:
+  it accepts the coordinator, or a participant when the swarm plan runs in deep
+  mode (light mode keeps the single-coordinator rule). It routes the "Not in a
+  swarm" and permission errors through the handle instead of the caller binding
+  members/plans/coordinators.
+- `comm_control.rs`: all three call sites (`handle_comm_assign_task_with_mode`,
+  `handle_comm_assign_next`, `handle_comm_task_control`) now call the handle
+  method; the flat `swarm_members`/`swarm_plans`/`swarm_coordinators` args are
+  dropped from the guard, and the free `require_plan_driver_swarm` helper (with
+  its light/deep-mode doc comment) is deleted. One now-unused
+  `swarm_coordinators` binding is removed.
+
+Zero behavior change; the server suite stays green (479 passing) and clippy adds
+no new warnings. Two unit tests cover coordinator vs deep-participant grant and
+light-mode denial.

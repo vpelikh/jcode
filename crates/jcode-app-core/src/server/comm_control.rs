@@ -1394,16 +1394,14 @@ async fn handle_comm_assign_task_with_mode(
         (!trimmed.is_empty()).then(|| trimmed.to_string())
     });
 
-    let swarm_id = match require_plan_driver_swarm(
-        id,
-        &req_session_id,
-        "Only the coordinator can assign tasks.",
-        client_event_tx,
-        swarm_members,
-        swarm_plans,
-        swarm_coordinators,
-    )
-    .await
+    let swarm_id = match swarm
+        .require_plan_driver_swarm(
+            id,
+            &req_session_id,
+            "Only the coordinator can assign tasks.",
+            client_event_tx,
+        )
+        .await
     {
         Some(swarm_id) => swarm_id,
         None => return,
@@ -1778,20 +1776,17 @@ pub(super) async fn handle_comm_assign_next(
 ) {
     let swarm_members = &swarm.swarm_state().members;
     let swarm_plans = &swarm.swarm_state().plans;
-    let swarm_coordinators = &swarm.swarm_state().coordinators;
     let sessions = &session.sessions;
     let soft_interrupt_queues = &session.soft_interrupt_queues;
     if target_session.is_none() {
-        let swarm_id = match require_plan_driver_swarm(
-            id,
-            &req_session_id,
-            "Only the coordinator can assign tasks.",
-            client_event_tx,
-            swarm_members,
-            swarm_plans,
-            swarm_coordinators,
-        )
-        .await
+        let swarm_id = match swarm
+            .require_plan_driver_swarm(
+                id,
+                &req_session_id,
+                "Only the coordinator can assign tasks.",
+                client_event_tx,
+            )
+            .await
         {
             Some(swarm_id) => swarm_id,
             None => return,
@@ -1946,16 +1941,14 @@ pub(super) async fn handle_comm_task_control(
         return;
     };
 
-    let swarm_id = match require_plan_driver_swarm(
-        id,
-        &req_session_id,
-        "Only the coordinator can control assigned tasks.",
-        client_event_tx,
-        swarm_members,
-        swarm_plans,
-        swarm_coordinators,
-    )
-    .await
+    let swarm_id = match swarm
+        .require_plan_driver_swarm(
+            id,
+            &req_session_id,
+            "Only the coordinator can control assigned tasks.",
+            client_event_tx,
+        )
+        .await
     {
         Some(swarm_id) => swarm_id,
         None => return,
@@ -2403,75 +2396,4 @@ pub(super) fn handle_client_debug_response(
     client_debug_response_tx: &broadcast::Sender<(u64, String)>,
 ) {
     let _ = client_debug_response_tx.send((id, output));
-}
-
-/// Authorize a session to drive task dispatch for its swarm plan.
-///
-/// Light mode keeps the single-coordinator rule: a coordinator is the one driver,
-/// which matches the cheap fan-out preset. Deep mode follows the task-DAG
-/// ownership model (see `docs/SWARM_TASK_GRAPH.md` section 2): the plan is a tree
-/// of ownership over a graph, and the agent that seeded/participates in the graph
-/// must be able to dispatch it even when another session already holds the
-/// swarm-level coordinator slot. Without this, a deep-mode agent that joins a
-/// shared swarm can seed a graph but is then blocked from spawning/assigning any
-/// of it, so nothing ever runs.
-///
-/// Returns the swarm id when the caller is the coordinator, or (deep mode only) a
-/// participant of the swarm's plan.
-async fn require_plan_driver_swarm(
-    id: u64,
-    req_session_id: &str,
-    permission_error: &str,
-    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-) -> Option<String> {
-    let swarm_id = {
-        let members = swarm_members.read().await;
-        members
-            .get(req_session_id)
-            .and_then(|member| member.swarm_id.clone())
-    };
-    let Some(swarm_id) = swarm_id else {
-        let _ = client_event_tx.send(ServerEvent::Error {
-            id,
-            message: "Not in a swarm.".to_string(),
-            retry_after_secs: None,
-        });
-        return None;
-    };
-
-    let is_coordinator = {
-        let coordinators = swarm_coordinators.read().await;
-        coordinators
-            .get(&swarm_id)
-            .map(|coordinator| coordinator == req_session_id)
-            .unwrap_or(false)
-    };
-    if is_coordinator {
-        return Some(swarm_id);
-    }
-
-    // Deep mode: any participant of the plan may drive its own task graph.
-    let is_deep_participant = {
-        let plans = swarm_plans.read().await;
-        plans
-            .get(&swarm_id)
-            .map(|plan| {
-                jcode_plan::bridge::parse_mode(&plan.mode) == jcode_plan::dag::Mode::Deep
-                    && plan.participants.contains(req_session_id)
-            })
-            .unwrap_or(false)
-    };
-    if is_deep_participant {
-        return Some(swarm_id);
-    }
-
-    let _ = client_event_tx.send(ServerEvent::Error {
-        id,
-        message: permission_error.to_string(),
-        retry_after_secs: None,
-    });
-    None
 }
