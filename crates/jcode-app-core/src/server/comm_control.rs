@@ -761,10 +761,10 @@ fn spawn_assigned_task_run(
     swarm: SwarmServiceHandle,
 ) {
     let assignment_text = append_swarm_completion_report_instructions(&assignment_text);
-    let swarm_members = Arc::clone(&swarm.swarm_state.members);
-    let swarms_by_id = Arc::clone(&swarm.swarm_state.swarms_by_id);
-    let swarm_plans = Arc::clone(&swarm.swarm_state.plans);
-    let swarm_coordinators = Arc::clone(&swarm.swarm_state.coordinators);
+    let swarm_members = swarm.swarm_state().members.clone();
+    let swarms_by_id = swarm.swarm_state().swarms_by_id.clone();
+    let swarm_plans = swarm.swarm_state().plans.clone();
+    let swarm_coordinators = swarm.swarm_state().coordinators.clone();
     tokio::spawn(async move {
         {
             let now_ms = now_unix_ms();
@@ -1108,10 +1108,10 @@ fn task_progress_event_sender(
     swarm_id: String,
     task_id: String,
 ) -> mpsc::UnboundedSender<ServerEvent> {
-    let swarm_members = Arc::clone(&swarm.swarm_state.members);
-    let swarms_by_id = Arc::clone(&swarm.swarm_state.swarms_by_id);
-    let swarm_plans = Arc::clone(&swarm.swarm_state.plans);
-    let swarm_coordinators = Arc::clone(&swarm.swarm_state.coordinators);
+    let swarm_members = swarm.swarm_state().members.clone();
+    let swarms_by_id = swarm.swarm_state().swarms_by_id.clone();
+    let swarm_plans = swarm.swarm_state().plans.clone();
+    let swarm_coordinators = swarm.swarm_state().coordinators.clone();
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerEvent>();
     tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
@@ -1181,8 +1181,8 @@ pub(super) async fn handle_comm_assign_role(
     sessions: &SessionAgents,
     swarm: &SwarmServiceHandle,
 ) {
-    let swarm_members = &swarm.swarm_state.members;
-    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let swarm_members = &swarm.swarm_state().members;
+    let swarm_coordinators = &swarm.swarm_state().coordinators;
     let swarm_mutation_runtime = swarm.swarm_mutation_runtime();
     let (swarm_id, is_coordinator) = {
         let members = swarm_members.read().await;
@@ -1296,7 +1296,7 @@ pub(super) async fn handle_comm_assign_role(
         }
     }
 
-    persist_swarm_state_for(&swarm_id, &swarm.swarm_state).await;
+    persist_swarm_state_for(&swarm_id, swarm.swarm_state()).await;
 
     swarm.broadcast_swarm_status(&swarm_id).await;
     swarm
@@ -1379,10 +1379,10 @@ async fn handle_comm_assign_task_with_mode(
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
     swarm: &SwarmServiceHandle,
 ) {
-    let swarm_members = &swarm.swarm_state.members;
-    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
-    let swarm_plans = &swarm.swarm_state.plans;
-    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let swarm_members = &swarm.swarm_state().members;
+    let swarms_by_id = &swarm.swarm_state().swarms_by_id;
+    let swarm_plans = &swarm.swarm_state().plans;
+    let swarm_coordinators = &swarm.swarm_state().coordinators;
     let swarm_mutation_runtime = swarm.swarm_mutation_runtime();
     let sessions = &session.sessions;
     let requested_target_session = target_session.and_then(|target| {
@@ -1776,9 +1776,9 @@ pub(super) async fn handle_comm_assign_next(
     swarm: &SwarmServiceHandle,
     mcp_pool: &Arc<crate::mcp::SharedMcpPool>,
 ) {
-    let swarm_members = &swarm.swarm_state.members;
-    let swarm_plans = &swarm.swarm_state.plans;
-    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let swarm_members = &swarm.swarm_state().members;
+    let swarm_plans = &swarm.swarm_state().plans;
+    let swarm_coordinators = &swarm.swarm_state().coordinators;
     let sessions = &session.sessions;
     let soft_interrupt_queues = &session.soft_interrupt_queues;
     if target_session.is_none() {
@@ -1932,10 +1932,10 @@ pub(super) async fn handle_comm_task_control(
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
     swarm: &SwarmServiceHandle,
 ) {
-    let swarm_members = &swarm.swarm_state.members;
-    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
-    let swarm_plans = &swarm.swarm_state.plans;
-    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let swarm_members = &swarm.swarm_state().members;
+    let swarms_by_id = &swarm.swarm_state().swarms_by_id;
+    let swarm_plans = &swarm.swarm_state().plans;
+    let swarm_coordinators = &swarm.swarm_state().coordinators;
     let sessions = &session.sessions;
     let Some(action) = TaskControlAction::parse(&action) else {
         let _ = client_event_tx.send(ServerEvent::Error {

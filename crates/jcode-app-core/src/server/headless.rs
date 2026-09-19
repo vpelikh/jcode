@@ -51,10 +51,10 @@ pub(super) async fn create_headless_session(
     report_back_to_session_id: Option<String>,
     memory_scope: HeadlessMemoryScope,
 ) -> Result<String> {
-    let swarm_members = &swarm.swarm_state.members;
-    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
-    let swarm_coordinators = &swarm.swarm_state.coordinators;
-    let _swarm_plans = &swarm.swarm_state.plans;
+    let swarm_members = &swarm.swarm_state().members;
+    let swarms_by_id = &swarm.swarm_state().swarms_by_id;
+    let swarm_coordinators = &swarm.swarm_state().coordinators;
+    let _swarm_plans = &swarm.swarm_state().plans;
     let memory_enabled = crate::config::config().features.memory;
     let swarm_enabled = crate::config::config().features.swarm;
 

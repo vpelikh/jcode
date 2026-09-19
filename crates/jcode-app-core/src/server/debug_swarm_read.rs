@@ -20,11 +20,11 @@ pub(super) async fn maybe_handle_swarm_read_command(
     // Swarm-domain state is reached through the swarm service handle. These
     // locals keep the body single-homed on the handle's fields instead of a
     // flat pass-through argument bag (server service split, Slice 4).
-    let swarm_members = &swarm.swarm_state.members;
-    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let swarm_members = &swarm.swarm_state().members;
+    let swarms_by_id = &swarm.swarm_state().swarms_by_id;
     let shared_context = swarm.shared_context_map();
-    let swarm_plans = &swarm.swarm_state.plans;
-    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let swarm_plans = &swarm.swarm_state().plans;
+    let swarm_coordinators = &swarm.swarm_state().coordinators;
     let file_touch = swarm.file_touch();
     let channel_subscriptions = swarm.channel_subscriptions_map();
     let swarm_state = SwarmState {

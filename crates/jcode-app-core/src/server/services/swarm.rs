@@ -33,7 +33,7 @@ type EventSources<'a> = (
 #[derive(Clone)]
 pub(crate) struct SwarmServiceHandle {
     /// Shared ownership of core swarm coordination state.
-    pub(crate) swarm_state: SwarmState,
+    swarm_state: SwarmState,
     /// Shared context by swarm (swarm_id -> key -> SharedContext).
     shared_context: Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
     /// File-touch tracking service (forward path index + reverse session index).
@@ -109,6 +109,20 @@ impl SwarmServiceHandle {
     /// stays encapsulated (Tier 3).
     pub(crate) fn await_members_runtime(&self) -> &AwaitMembersRuntime {
         &self.await_members_runtime
+    }
+
+    /// Borrow the shared core swarm coordination state.
+    ///
+    /// The returned `SwarmState` holds the members / swarms_by_id / plans /
+    /// coordinators maps as shared `Arc<RwLock<..>>` handles; callers read or
+    /// write individual maps through those handles. Mutations to membership and
+    /// roles should route through the behavior methods (`ensure_member`,
+    /// `set_member_status`, `remove_session_from_swarm`, ...) where one exists;
+    /// this accessor is for the read paths and the remaining coordination
+    /// plumbing that needs the raw maps. Exists so the field stays encapsulated
+    /// (Tier 3).
+    pub(crate) fn swarm_state(&self) -> &SwarmState {
+        &self.swarm_state
     }
 
     /// Borrow the swarm event emission sources (`history`, `counter`,

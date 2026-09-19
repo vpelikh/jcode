@@ -41,7 +41,7 @@ pub(super) async fn idle_live_agent(
     }?;
 
     let has_live_attachments = {
-        let members = swarm.swarm_state.members.read().await;
+        let members = swarm.swarm_state().members.read().await;
         members
             .get(session_id)
             .map(|member| !member.event_txs.is_empty() || !member.event_tx.is_closed())
@@ -76,7 +76,7 @@ pub(super) async fn spawn_tracked_live_turn(
 
     let event_tx = session_event_fanout_sender(
         session_id.to_string(),
-        Arc::clone(&swarm.swarm_state.members),
+        swarm.swarm_state().members.clone(),
     );
     let session_id = session_id.to_string();
     tokio::spawn(async move {

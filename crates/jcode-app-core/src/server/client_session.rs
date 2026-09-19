@@ -500,10 +500,10 @@ pub(super) async fn handle_subscribe(
     // Swarm-domain state is reached through the swarm service handle. These
     // locals keep the body single-homed on the handle's fields instead of a
     // flat pass-through argument bag (server service split, Slice 4).
-    let swarm_members = &swarm.swarm_state.members;
-    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
-    let swarm_plans = &swarm.swarm_state.plans;
-    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let swarm_members = &swarm.swarm_state().members;
+    let swarms_by_id = &swarm.swarm_state().swarms_by_id;
+    let swarm_plans = &swarm.swarm_state().plans;
+    let swarm_coordinators = &swarm.swarm_state().coordinators;
 
     let subscribe_start = Instant::now();
     crate::logging::event_info(
@@ -810,7 +810,7 @@ pub(super) async fn handle_reload(
     swarm: &SwarmServiceHandle,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
-    let swarm_members = &swarm.swarm_state.members;
+    let swarm_members = &swarm.swarm_state().members;
     // A non-forced reload (e.g. `jcode server reload`) is a graceful upgrade
     // request: only reload when this server is provably running older code than
     // an available reload candidate. This keeps us from downgrading a newer
@@ -908,7 +908,7 @@ async fn cleanup_detached_source_session_if_unused(
     swarm: &SwarmServiceHandle,
     file_touch: &FileTouchService,
 ) {
-    let swarm_members = &swarm.swarm_state.members;
+    let swarm_members = &swarm.swarm_state().members;
     unregister_session_event_sender(swarm_members, old_session_id, client_connection_id).await;
 
     if !remove_detached_source_if_unclaimed(
@@ -1037,10 +1037,10 @@ pub(super) async fn handle_resume_session(
     // Swarm-domain state is reached through the swarm service handle. These
     // locals keep the body single-homed on the handle's fields instead of a
     // flat pass-through argument bag (server service split, Slice 4).
-    let swarm_members = &swarm.swarm_state.members;
-    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
-    let swarm_plans = &swarm.swarm_state.plans;
-    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let swarm_members = &swarm.swarm_state().members;
+    let swarms_by_id = &swarm.swarm_state().swarms_by_id;
+    let swarm_plans = &swarm.swarm_state().plans;
+    let swarm_coordinators = &swarm.swarm_state().coordinators;
     let file_touch = swarm.file_touch();
 
     let resume_start = Instant::now();

@@ -266,7 +266,7 @@ pub(super) async fn handle_debug_client(
     let session_id = session_service.session_id;
     let provider = client_service.provider;
     let client_connections = client_service.client_connections;
-    let swarm_members = swarm_service.swarm_state.members;
+    let swarm_members = swarm_service.swarm_state().members.clone();
     let client_debug_state = debug_service.client_debug_state;
     let client_debug_response_tx = debug_service.client_debug_response_tx;
     let debug_jobs = debug_service.debug_jobs;

@@ -1970,8 +1970,9 @@ impl Server {
         // keep the body single-homed on the handles' fields instead of a flat
         // pass-through argument bag (server service split, Slice 4).
         let file_touch = swarm.file_touch().clone();
-        let swarm_members = Arc::clone(&swarm.swarm_state.members);
-        let swarms_by_id = Arc::clone(&swarm.swarm_state.swarms_by_id);
+        let swarm_state = swarm.swarm_state();
+        let swarm_members = Arc::clone(&swarm_state.members);
+        let swarms_by_id = Arc::clone(&swarm_state.swarms_by_id);
         let mut receiver = Bus::global().subscribe();
         let mut last_cleanup = Instant::now();
         const TOUCH_EXPIRY: Duration = Duration::from_secs(30 * 60); // 30 min

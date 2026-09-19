@@ -60,10 +60,10 @@ pub(super) async fn maybe_handle_session_admin_command(
     // Swarm-domain state is reached through the swarm service handle. These
     // locals keep the body single-homed on the handle's fields instead of a
     // flat pass-through argument bag (server service split, Slice 4).
-    let swarm_members = &swarm.swarm_state.members;
-    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
-    let swarm_coordinators = &swarm.swarm_state.coordinators;
-    let swarm_plans = &swarm.swarm_state.plans;
+    let swarm_members = &swarm.swarm_state().members;
+    let swarms_by_id = &swarm.swarm_state().swarms_by_id;
+    let swarm_coordinators = &swarm.swarm_state().coordinators;
+    let swarm_plans = &swarm.swarm_state().plans;
     if let Some((working_dir, selfdev_requested)) = parse_create_session_command(cmd) {
         let create_command = match working_dir {
             Some(dir) => format!("create_session:{dir}"),

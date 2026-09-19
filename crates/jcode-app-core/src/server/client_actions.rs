@@ -108,11 +108,11 @@ pub(super) async fn handle_notify_session(
     let notified = if ran_immediately {
         false
     } else {
-        let members = ctx.swarm.swarm_state.members.read().await;
+        let members = ctx.swarm.swarm_state().members.read().await;
         if members.contains_key(&session_id) {
             drop(members);
             fanout_session_event(
-                &ctx.swarm.swarm_state.members,
+                &ctx.swarm.swarm_state().members,
                 &session_id,
                 ServerEvent::Notification {
                     from_session: "schedule".to_string(),
@@ -385,10 +385,10 @@ pub(super) async fn handle_set_feature(
     // Swarm-domain state is reached through the swarm service handle. These
     // locals keep the body single-homed on the handle's fields instead of a
     // flat pass-through argument bag (server service split, Slice 4).
-    let swarm_members = &swarm.swarm_state.members;
-    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
-    let swarm_coordinators = &swarm.swarm_state.coordinators;
-    let swarm_plans = &swarm.swarm_state.plans;
+    let swarm_members = &swarm.swarm_state().members;
+    let swarms_by_id = &swarm.swarm_state().swarms_by_id;
+    let swarm_coordinators = &swarm.swarm_state().coordinators;
+    let swarm_plans = &swarm.swarm_state().plans;
     match feature {
         FeatureToggle::Memory => {
             let mut agent_guard = agent.lock().await;
@@ -522,7 +522,7 @@ pub(super) async fn handle_rename_session(
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
     let started = Instant::now();
-    let swarm_members = &swarm.swarm_state.members;
+    let swarm_members = &swarm.swarm_state().members;
     let normalized_title = title
         .as_deref()
         .map(str::trim)
@@ -606,7 +606,7 @@ pub(super) async fn handle_set_working_dir(
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
     let started = Instant::now();
-    let swarm_members = &swarm.swarm_state.members;
+    let swarm_members = &swarm.swarm_state().members;
     let working_dir = working_dir.trim().to_string();
     if working_dir.is_empty() {
         let _ = client_event_tx.send(ServerEvent::Error {
@@ -1078,7 +1078,7 @@ pub(super) async fn handle_resume_all_sessions(
 ) {
     // Snapshot live sessions (those with at least one live client attachment).
     let live_session_ids: Vec<String> = {
-        let members = swarm.swarm_state.members.read().await;
+        let members = swarm.swarm_state().members.read().await;
         members
             .iter()
             .filter(|(_, member)| !member.event_txs.is_empty() || !member.event_tx.is_closed())

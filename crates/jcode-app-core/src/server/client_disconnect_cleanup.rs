@@ -102,7 +102,7 @@ pub(super) async fn cleanup_client_connection(
     // Swarm-domain state is reached through the swarm service handle. The
     // members map is bound for the mid-body membership reads and the member
     // removal; all other swarm teardown routes through the handle.
-    let swarm_members = &swarm.swarm_state.members;
+    let swarm_members = &swarm.swarm_state().members;
     let disposition = disconnect_disposition(disconnected_while_processing(
         client_is_processing,
         processing_task.as_ref(),

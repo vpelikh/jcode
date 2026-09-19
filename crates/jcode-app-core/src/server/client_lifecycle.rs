@@ -460,8 +460,8 @@ pub(super) async fn handle_client(
     // since the accessors borrow the handle (Tier 3 encapsulation).
     let file_touch = swarm_service.file_touch().clone();
     let await_members_runtime = swarm_service.await_members_runtime().clone();
-    let swarm_members = swarm_service.swarm_state.members;
-    let swarm_plans = swarm_service.swarm_state.plans;
+    let swarm_members = swarm_service.swarm_state().members.clone();
+    let swarm_plans = swarm_service.swarm_state().plans.clone();
     let client_debug_state = debug_service.client_debug_state;
     let client_debug_response_tx = debug_service.client_debug_response_tx;
     let shutdown_signals = session_service.shutdown_signals;
@@ -3079,7 +3079,7 @@ async fn start_processing_message(
     let report_agent = Arc::clone(&agent);
     let tx = super::state::session_event_fanout_sender_with_fallback(
         client_session_id.to_string(),
-        Arc::clone(&swarm.swarm.swarm_state.members),
+        swarm.swarm.swarm_state().members.clone(),
         client_event_tx.clone(),
     );
     let done_tx = processing_done_tx.clone();

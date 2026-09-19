@@ -20,7 +20,7 @@ pub(super) async fn handle_comm_list_channels(
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
     swarm: &SwarmServiceHandle,
 ) {
-    let swarm_members = &swarm.swarm_state.members;
+    let swarm_members = &swarm.swarm_state().members;
     let channel_subscriptions = swarm.channel_subscriptions_map();
     let swarm_id = swarm_id_for_session(&req_session_id, swarm_members).await;
 
@@ -61,7 +61,7 @@ pub(super) async fn handle_comm_channel_members(
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
     swarm: &SwarmServiceHandle,
 ) {
-    let swarm_members = &swarm.swarm_state.members;
+    let swarm_members = &swarm.swarm_state().members;
     let channel_subscriptions = swarm.channel_subscriptions_map();
     let swarm_id = swarm_id_for_session(&req_session_id, swarm_members).await;
 
@@ -117,7 +117,7 @@ pub(super) async fn handle_comm_subscribe_channel(
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
     swarm: &SwarmServiceHandle,
 ) {
-    let swarm_members = &swarm.swarm_state.members;
+    let swarm_members = &swarm.swarm_state().members;
     let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
     let started = std::time::Instant::now();
     let swarm_id = swarm_id_for_session(&req_session_id, swarm_members).await;
@@ -190,7 +190,7 @@ pub(super) async fn handle_comm_unsubscribe_channel(
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
     swarm: &SwarmServiceHandle,
 ) {
-    let swarm_members = &swarm.swarm_state.members;
+    let swarm_members = &swarm.swarm_state().members;
     let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
     let started = std::time::Instant::now();
     let swarm_id = swarm_id_for_session(&req_session_id, swarm_members).await;
