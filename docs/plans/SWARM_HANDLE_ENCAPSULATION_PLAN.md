@@ -173,7 +173,7 @@ through handle methods; suite green + clippy clean.
 
 ### Follow-up: route the coordination write sites (deferred to a new session)
 
-**Measured 2026-09 (raw functional write sites):** 53 in-place `.write()` /
+**Measured 2026-09 (raw functional write sites):** 51 in-place `.write()` /
 `participants.insert|remove` sites across 8 functional files:
 
 - `comm_control` (13), `comm_session` (8), `comm_plan` (7), `comm_graph` (7),
