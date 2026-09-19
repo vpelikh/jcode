@@ -11,7 +11,7 @@
 //! row off and the next one in, exactly the motion niri makes for a workspace
 //! switch. Only the focused row is ever on screen when the camera is at rest,
 //! which is what makes a column's neighbors always mean "same project".
-    #[allow(dead_code)] // Unused feature scaffolding/geometry kept for the desktop app; not yet wired into the render path.
+#[allow(dead_code)] // Unused feature scaffolding/geometry kept for the desktop app; not yet wired into the render path.
 /// Focused columns occupy most, but not all, of the viewport. The remaining
 /// strip is split between the adjacent sessions so they are always
 /// discoverable.
