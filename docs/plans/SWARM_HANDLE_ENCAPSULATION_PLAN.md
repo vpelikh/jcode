@@ -105,9 +105,10 @@ API the handle wraps). Instead:
    cover most mutations), then plans/coordinators/swarms_by_id.
    *(landed 2026-09)* The handle's `swarm_state` field is private behind a
    `swarm_state()` read-only accessor; ~167 direct `swarm.swarm_state.<map>`
-   accesses across 23 files route through it. Live-path mutations already went
-   through handle methods (no functional write accesses remained after
-   convergence), so this closes the handle boundary. The `SwarmState` struct's
+   accesses across 23 files route through it. Note: the single-purpose
+   teardown/rename/registration mutations now route through the handle, while
+   the entangled orchestration mutations still touch the maps in place through
+   the accessor (see the Done criteria status block). The `SwarmState` struct's
    own four maps stay `pub` (state.rs remains the domain API the handle wraps,
    per non-goals); a stricter future boundary could snapshot-ify or further
    private the sub-fields, out of scope here.
@@ -199,10 +200,11 @@ through handle methods; suite green + clippy clean.
 - **Direct unit tests for the Tier-3 handle methods (added 2026-09).** The
   earlier review pass noted the new handle methods were only covered
   transitively via callers. `services/swarm.rs` now carries a dedicated
-  `#[cfg(test)] mod tests` with six tests locking the behavior of
-  `set_shared_context` (plain upsert, created_at preservation, append
-  semantics), `get_shared_context` / `remove_shared_context` /
-  `shared_context_entries`, `subscribe_session_to_channel` /
-  `unsubscribe_session_from_channel` (both forward and reverse indexes), and
-  `read_event_sources` (seeded sinks round-trip). Added 6 tests; suite 1494
-  green, clippy clean.
+  `#[cfg(test)] mod tests` locking the behavior of `set_shared_context`
+  (plain upsert, created_at preservation, append semantics),
+  `get_shared_context` / `remove_shared_context` / `shared_context_entries`,
+  `subscribe_session_to_channel` / `unsubscribe_session_from_channel` (both
+  forward and reverse indexes), `read_event_sources` (seeded sinks
+  round-trip), the runtime accessors, the file-touch accessor,
+  `remove_session_member`, `rename_member_session` (coordinator rewrite), and
+  `register_headless_member`. Suite green (1542), clippy clean.
