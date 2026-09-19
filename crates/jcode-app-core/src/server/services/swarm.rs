@@ -296,6 +296,11 @@ impl SwarmServiceHandle {
     /// (`is_headless: false`, per-connection `event_txs`). Routes the member
     /// insert + swarm-membership insert through the handle so the caller does
     /// not reach into either raw map.
+    ///
+    /// `swarm_id` is honored only when `swarm_enabled` is true: a disabled
+    /// member never carries a swarm id or a `swarms_by_id` entry, regardless of
+    /// what the caller passes. This keeps the member consistent even if a caller
+    /// links `Some(swarm_id)` with `swarm_enabled: false`.
     #[expect(
         clippy::too_many_arguments,
         reason = "registering a headless member carries session identity, joined swarm id, and its runtime descriptor"
@@ -312,6 +317,10 @@ impl SwarmServiceHandle {
         runtime: crate::protocol::SwarmMemberRuntime,
     ) {
         let now = Instant::now();
+        // A non-swarm-enabled member must not be recorded under a swarm id. The
+        // caller's `swarm_id` is derived from `swarm_enabled`, but enforce the
+        // invariant here so a disabled member is never inconsistently tagged.
+        let swarm_id = if swarm_enabled { swarm_id } else { None };
         {
             let mut members = self.swarm_state.members.write().await;
             members.insert(
@@ -1127,6 +1136,31 @@ mod tests {
         )
         .await;
         assert!(h2.swarm_state().swarms_by_id.read().await.is_empty());
+
+        // Invariant: an inconsistent caller passing Some(swarm_id) with
+        // swarm_enabled=false must not tag the member or create a swarms_by_id
+        // entry.
+        let (event_tx3, _event_rx3) = tokio::sync::mpsc::unbounded_channel();
+        let h3 = base_handle();
+        h3.register_headless_member(
+            "disabled",
+            None,
+            Some("swarm-x"),
+            false,
+            "disabled".to_string(),
+            None,
+            event_tx3,
+            crate::protocol::SwarmMemberRuntime::default(),
+        )
+        .await;
+        assert!(
+            h3.swarm_state().members.read().await.get("disabled").unwrap().swarm_id.is_none(),
+            "a swarm-disabled member must carry no swarm id"
+        );
+        assert!(
+            !h3.swarm_state().swarms_by_id.read().await.contains_key("swarm-x"),
+            "a swarm-disabled member must not create a swarms_by_id entry"
+        );
     }
 
     #[tokio::test]
