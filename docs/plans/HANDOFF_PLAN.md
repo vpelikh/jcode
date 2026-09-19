@@ -25,7 +25,11 @@ end to end by a real-socket integration test that drives `Request::HandoffList`
 and `Request::HandoffImport` through the client_lifecycle dispatch to the real
 handlers — and then observes the runtime outcome, not just the index: the same
 `render_boot_context_and_consume` function first-message injection uses returns
-the imported snapshot's intent for a fresh session. The full shipped `jcode`
+the imported snapshot's intent for a fresh session. The TUI `/handoff` overlay's
+`HandoffListed` dispatch arm is covered by `handle_server_event` tests (opens the
+picker from the server store when a request id matches; ignores stray events),
+and the full `remote_tests` module plus the handoff and session-picker suites run
+green. The full shipped `jcode`
 binary also builds, links (all four wire tags present in the linked artifact),
 and executes cleanly (`jcode --version`).
 
