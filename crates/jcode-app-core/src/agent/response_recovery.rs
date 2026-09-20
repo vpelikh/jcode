@@ -906,14 +906,33 @@ impl Agent {
         if !Self::is_stalled_promise_text(text_content) {
             return Ok(false);
         }
+        // Record a route-scoped degradation stall on the FIRST stalled-promise
+        // detection of a turn. `attempts` starts at 0 at the top of each turn
+        // (see `stalled_promise_continuations` in both turn loops), so this
+        // fires once per turn. This is what feeds the escalation ladder
+        // (Watch -> Compact -> RouteFallback): a session that emits
+        // action-promise filler *across turns* (e.g. DeepSeek-V4-Flash on a
+        // very long context) must accumulate toward mitigation even though no
+        // single turn exhausts the continuation budget. Recording at the first
+        // detection of each turn (rather than only after budget exhaustion)
+        // closes that causal gap. Note this deliberately counts one stall per
+        // turn, not per distinct filler episode within a turn: two separate
+        // filler blips separated by a tool call in the SAME turn undercount to
+        // one, which errs toward under-detection (safe). `recompute_rung` gates
+        // RouteFallback on an acknowledged compaction, so an isolated filler
+        // blip that recovers on a later turn decays back out via
+        // `record_clean_turn`.
+        if *attempts == 0 {
+            self.degradation.record_stall(crate::agent::degradation::StallKind::StalledPromise);
+        }
         if *attempts >= Self::MAX_STALLED_PROMISE_CONTINUATION_ATTEMPTS {
             logging::warn(&format!(
                 "Assistant stalled behind action-promise filler after {} continuation attempts; surfacing partial output",
                 attempts
             ));
-            // Reached the per-turn continuation budget: record the degradation
-            // so the route-scoped tracker can escalate (compact / fallback).
-            self.degradation.record_stall(crate::agent::degradation::StallKind::StalledPromise);
+            // Reached the per-turn continuation budget. The degradation stall
+            // was already recorded at the start of the episode; just surface
+            // the partial output rather than loop forever.
             return Ok(false);
         }
         *attempts += 1;

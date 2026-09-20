@@ -16,15 +16,35 @@ degradation-management system.
 - The tracker is not persisted; state resets on disconnect/reload.
 - `watchdog::subscribe()` (Slice 1) has no production consumer yet; the system
   "load" axis is documented as a future extension rather than wired state.
-- The non-streaming loop records a clean turn for rung decay; the streaming
-  loop does not yet (its many exit paths were left untouched). Decay still
-  happens there via window expiry.
 - The route-fallback action auto-switches without an interactive per-turn
   confirmation. The plan's Slice-4 exit criteria called for confirming a switch
   when the current route was explicitly user-chosen; the landed implementation
   instead relies on the strict opt-in gate (`route_fallback_enabled` must be
   true), which is treated as the user's standing authorization. Confirmation is
   not implemented.
+
+**Closed on `feat/degradation-tracker-wiring` (2026-09):**
+- `record_stall(StalledPromise)` used to fire only *after* a single turn
+  exhausted its continuation budget
+  (`MAX_STALLED_PROMISE_CONTINUATION_ATTEMPTS`). A session that emitted
+  valid interleaved continuations between filler hits — the exact DeepSeek
+  long-context pattern — never exhausted a per-turn budget, so the route
+  tracker stayed `Healthy` and no mitigation ever fired. It now records one
+  stall at the first stalled-promise detection of each turn (the per-turn
+  continuation counter resets to 0 at the top of every turn), so such sessions
+  accumulate toward `Watch`/`Compact`/`RouteFallback`. The count is per-turn,
+  not per-distinct-filler-blip-within-a-turn: two filler episodes separated by
+  a tool call in the same turn undercount to one, which errs toward
+  under-detection (safe); `record_clean_turn` on real tool progress decays the
+  rung on legitimate recovery.
+- The streaming turn loop now records a clean turn (`record_clean_turn`) after
+  committing tool results, matching the non-streaming loop, so a genuine
+  recovery decays the rung instead of pinning a stale escalation.
+- An end-to-end test (`degraded_streaming_session_reaches_compact_and_mitigation_
+  fires`) runs two degraded turns through the public streaming loop and asserts
+  the loop's own mitigation checkpoint consumes the Compact one-shot — the
+  exact durable chain that this wiring, plus `record_stall` on first detection,
+  re-establishes.
 
 **Integration/landing note (2026-09):** the branch merges cleanly into current
 `master` with one trivial additive conflict in `crates/jcode-base/src/config.rs`
