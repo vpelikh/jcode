@@ -1981,10 +1981,15 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
     ///
     /// Returns the same transcript as [`derive_messages`](Self::derive_messages)
     /// — the `LiveTranscriptProjection` fold is proven byte-identical by the
-    /// `ProjectionMatchesDerived` invariant — but through the registry, so
+    /// `ProjectionMatchesDerived` invariant — but through the projection seam, so
     /// consumers get a typed projection stating their intent to read *derived*
     /// state rather than scan the raw stream. This is the accessor future hot
     /// paths adopt on their way off `derive_messages`.
+    ///
+    /// This single-projection accessor folds only the transcript via `project_map`.
+    /// Readers that also want other derived domains (message count, per-role
+    /// counts) should use the `ProjectionRegistry` directly for a single fold
+    /// feeding many projections.
     ///
     /// `None` when the log folds into an invariant violation (a structural
     /// problem a load-path invariant run would have caught); callers that trust

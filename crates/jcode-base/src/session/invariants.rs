@@ -261,8 +261,10 @@ impl ProjectionRegistry {
 
     /// Incremental seam: apply a single new event to every registered projection
     /// so a running registry can stay current without refolding the log.
-    /// Equivalent to [`fold`](Self::fold) on the prefix plus this event, but O(1)
-    /// per event.
+    /// Cost per event is projection-specific: O(1) for counters that track
+    /// deltas, O(span) for projections that splice (e.g. the live transcript).
+    /// Equivalent to [`fold`](Self::fold) on the prefix plus this event, without
+    /// re-walking the earlier events.
     pub fn apply(&mut self, event: &SessionEvent) {
         for unit in &mut self.units {
             (unit.apply)(&mut *unit.state, event);
