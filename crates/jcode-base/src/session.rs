@@ -1987,18 +1987,20 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
     /// accessor future hot paths adopt on their way off `derive_messages`.
     ///
     /// Infallible: `LiveTranscriptProjection` defines no failing validation, so
-    /// `project_map` always succeeds. The `ProjectionMatchesDerived` invariant
-    /// (not this method) is the guard that proves the projection never diverges
-    /// from `derive_messages`.
+    /// `project_map` always succeeds — a failure here would be an internal bug and
+    /// panics (failing loudly rather than silently falling back and masking a
+    /// divergence). The `ProjectionMatchesDerived` invariant (not this method) is
+    /// the guard that proves the projection never diverges from `derive_messages`.
     ///
     /// This single-projection accessor folds only the transcript via `project_map`.
     /// Readers that also want other derived domains (message count, per-role
     /// counts) should use the `ProjectionRegistry` directly for a single fold
     /// feeding many projections.
     pub fn projected_messages(&self) -> Vec<StoredMessage> {
-        project_map::<LiveTranscriptProjection>(&self.event_map)
-            .ok()
-            .unwrap_or_else(|| self.event_map.derive_messages())
+        project_map::<LiveTranscriptProjection>(&self.event_map).expect(
+            "LiveTranscriptProjection fold is infallible (no failing validate); a failure here \
+             is an internal bug that should be surfaced, not silently masked by a fallback",
+        )
     }
 
     /// Get current compaction from event log (derives pure state)

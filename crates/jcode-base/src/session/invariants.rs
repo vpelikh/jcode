@@ -839,6 +839,36 @@ impl LogProjection for RoleCountsProjection {
             _ => {}
         }
     }
+
+    fn validate(state: &Self::State) -> Result<(), InvariantViolation> {
+        // Internal self-consistency: the running totals must match the folded
+        // roles list. This catches a future edit that drifts one of `roles` or
+        // `counts` (the two are maintained by hand in `apply`).
+        let derived = state.roles.iter().fold(
+            RoleCounts::default(),
+            |mut c, role| {
+                match role {
+                    Role::User => c.user += 1,
+                    Role::Assistant => c.assistant += 1,
+                }
+                c
+            },
+        );
+        if derived != state.counts {
+            return Err(InvariantViolation::new(
+                "session.role_counts_consistent",
+                format!(
+                    "role-counts projection self-inconsistent: roles derive {user}/{assistant} \
+                     but counts hold {cu}/{ca}",
+                    user = derived.user,
+                    assistant = derived.assistant,
+                    cu = state.counts.user,
+                    ca = state.counts.assistant,
+                ),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1382,6 +1412,26 @@ mod tests {
 
         // validate_all is green for a well-formed sequence.
         assert!(reg.validate_all().is_empty());
+    }
+
+    #[test]
+    fn role_counts_validate_catches_drifted_totals() {
+        // The RoleCountsProjection.validate self-check must flag a state where
+        // `counts` and `roles` have drifted (simulating a future edit bug).
+        let mut map = SessionEventMap::default();
+        append(&mut map, "e1", text_msg_user("m1"));
+        append(&mut map, "e2", text_msg_assistant("m2"));
+
+        let mut reg = ProjectionRegistry::builtin();
+        reg.fold(&map.events).expect("fold ok");
+        assert!(reg.validate_all().is_empty(), "well-formed fold is clean");
+
+        // Build a synthetic drifted RoleCountsState and validate it directly.
+        let mut bad = RoleCountsState::default();
+        bad.roles.push(Role::User);
+        bad.counts.user = 99; // drifted: roles has 1 user, counts says 99.
+        let err = RoleCountsProjection::validate(&bad).expect_err("must flag drift");
+        assert_eq!(err.invariant, "session.role_counts_consistent");
     }
 
     #[test]

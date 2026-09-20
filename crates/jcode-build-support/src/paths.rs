@@ -130,8 +130,16 @@ fn wrapper_payload_sibling(path: &Path) -> Option<PathBuf> {
     payload.filter(|p| p.is_file())
 }
 
+/// Root Cargo target directory for a repo: the shared dir when configured via
+/// `JCODE_SHARED_TARGET_DIR`, otherwise the repo's own `target/`.
+pub fn target_dir_for(repo_dir: &Path) -> PathBuf {
+    shared_target_dir().unwrap_or_else(|| repo_dir.join("target"))
+}
+
 fn profile_binary_path(repo_dir: &Path, profile: &str) -> PathBuf {
-    repo_dir.join("target").join(profile).join(binary_name())
+    target_dir_for(repo_dir)
+        .join(profile)
+        .join(binary_name())
 }
 
 pub fn release_binary_path(repo_dir: &Path) -> PathBuf {
@@ -391,6 +399,20 @@ fn home_dir() -> Result<PathBuf> {
         .map(PathBuf::from)
         .or_else(|_| std::env::var("USERPROFILE").map(PathBuf::from))
         .map_err(|_| anyhow::anyhow!("HOME/USERPROFILE not set"))
+}
+
+/// Resolve the shared Cargo target directory, if configured.
+///
+/// When `JCODE_SHARED_TARGET_DIR` is set, all worktrees of the same repo build
+/// into this one directory instead of each worktree's own `<repo>/target/`.
+/// This avoids re-compiling (and re-storing) the same crate graph many times,
+/// at the cost of mixing incremental fingerprints across branches. Reload and
+/// newest-binary discovery funnel through here too, so they stay consistent
+/// with where `scripts/dev_cargo.sh` writes when it exports `CARGO_TARGET_DIR`.
+///
+/// Returns `None` when unset so callers fall back to the per-repo `target/` dir.
+pub fn shared_target_dir() -> Option<PathBuf> {
+    non_empty_env_path("JCODE_SHARED_TARGET_DIR")
 }
 
 fn non_empty_env_path(name: &str) -> Option<PathBuf> {
@@ -691,6 +713,31 @@ mod tests {
             find_repo_in_ancestors(&crate_dir).as_deref(),
             Some(repo.path())
         );
+    }
+
+    /// When JCODE_SHARED_TARGET_DIR is set, profile binary paths resolve into it
+    /// rather than the per-repo `target/` dir, keeping reload/newest-binary
+    /// discovery consistent with where dev_cargo.sh points cargo.
+    #[test]
+    fn profile_binary_path_honors_shared_target_dir() {
+        let repo = repo_fixture(false);
+        let shared = repo.path().join("..").join("shared-target");
+
+        // Default: binary under the repo's own target dir.
+        jcode_core::env::remove_var("JCODE_SHARED_TARGET_DIR");
+        let local = profile_binary_path(repo.path(), "selfdev");
+        assert!(
+            local.starts_with(repo.path().join("target")),
+            "default path not under repo/target: {local:?}"
+        );
+
+        jcode_core::env::set_var("JCODE_SHARED_TARGET_DIR", &shared);
+        let shared_path = profile_binary_path(repo.path(), "selfdev");
+        assert!(
+            shared_path.starts_with(&shared),
+            "shared path not under JCODE_SHARED_TARGET_DIR: {shared_path:?}"
+        );
+        jcode_core::env::remove_var("JCODE_SHARED_TARGET_DIR");
     }
 
     /// Every build target must map to the package it claims to build, or

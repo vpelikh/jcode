@@ -500,8 +500,7 @@ export -f cargo
         source: &build::SourceState,
         binary_name: &str,
     ) -> Result<()> {
-        let binary = repo_dir
-            .join("target")
+        let binary = build::target_dir_for(repo_dir)
             .join(build::SELFDEV_CARGO_PROFILE)
             .join(binary_name);
         if !binary.exists() {
@@ -549,8 +548,7 @@ export -f cargo
                 std::env::consts::DLL_PREFIX,
                 std::env::consts::DLL_SUFFIX
             );
-            let library = repo_dir
-                .join("target")
+            let library = build::target_dir_for(repo_dir)
                 .join(build::SELFDEV_CARGO_PROFILE)
                 .join(library_name);
             let output = std::process::Command::new(&binary)
@@ -578,8 +576,7 @@ export -f cargo
     ) -> Result<usize> {
         use std::io::Write;
 
-        let binary = repo_dir
-            .join("target")
+        let binary = build::target_dir_for(repo_dir)
             .join(build::SELFDEV_CARGO_PROFILE)
             .join("jcode-desktop2");
         let home = std::env::var_os("HOME")
@@ -605,8 +602,7 @@ export -f cargo
             std::env::consts::DLL_PREFIX,
             std::env::consts::DLL_SUFFIX
         );
-        let library = repo_dir
-            .join("target")
+        let library = build::target_dir_for(repo_dir)
             .join(build::SELFDEV_CARGO_PROFILE)
             .join(library_name);
         if !library.exists() {
