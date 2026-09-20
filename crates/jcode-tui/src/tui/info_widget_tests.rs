@@ -2136,3 +2136,79 @@ fn compact_todos_rows_fit_and_height_matches() {
         );
     }
 }
+
+/// Every rendered row of all todo widget variants must fit within the widget's
+/// inner width across narrow widths and a spread of item/group/goal shapes.
+///
+/// This guards the wrapping introduced for long items (full text, no ellipsis),
+/// which had two overflow regressions at narrow widths:
+///   * the per-item confidence trailer (` · plausible`) was appended
+///     unconditionally even when the fixed glyph/priority prefix already filled
+///     the box, so the first item happened to overflow;
+///   * the continuation rows printed the content wrapped to the narrower
+///     first-line prefix, so wrapped chunks overflowed the wider continuation
+///     prefix.
+/// The fix wraps content to the continuation prefix and appends the confidence
+/// and blocked trailers only when they fit in the leftover columns, so no row
+/// can exceed `inner.width`.
+#[test]
+fn todo_widget_rows_never_overflow_narrow_widths() {
+    use unicode_width::UnicodeWidthStr;
+    let mk = |content: &str, status: &str, group: Option<&str>| todo_item("x", content, status, group);
+    let mut failures = Vec::new();
+    for width in 12u16..=40 {
+        for content in [
+            "a",
+            "ab cd ef",
+            "abcdefghijklmnopqrstuvwxyz",
+            "a very long single word that must hard wrap 汉字汉字 漢字 again",
+            "ショートワードが長すぎる場合に分割される必要があります",
+            "emoji 🚀 sailing wide 🏄 and more text",
+            "混在mixed combining 文字 and ascii text",
+        ] {
+            for group in [None, Some("g"), Some("a very long group 汉字 name")] {
+                for status in ["in_progress", "pending", "completed", "cancelled"] {
+                    let data = InfoWidgetData {
+                        todos: vec![mk(content, status, group)],
+                        todo_goals: vec![crate::todo::TodoGoal {
+                            group: group.map(|s| s.to_string()),
+                            closed_feedback_loop: Some(
+                                crate::todo::FeedbackLoopState::from_legacy_score(85),
+                            ),
+                            feedback_loop_relevance: Some(
+                                crate::todo::FeedbackLoopRelevance::Representative,
+                            ),
+                            feedback_loop_coverage: Some(
+                                crate::todo::FeedbackLoopCoverage::MainPaths,
+                            ),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    };
+                    let inner = Rect::new(0, 0, width, 100);
+                    for (kind, lines) in [
+                        ("widget", render_todos_widget(&data, inner)),
+                        ("expanded", render_todos_expanded(&data, inner)),
+                        ("compact", render_todos_compact(&data, inner)),
+                    ] {
+                        for (idx, line) in lines.iter().enumerate() {
+                            let w = line.spans.iter().map(|s| s.content.width()).sum::<usize>();
+                            if w > width as usize {
+                                failures.push(format!(
+                                    "[{kind}] width {width} group {group:?} status {status} content '{content}' row {idx} (w {w}):\n{}",
+                                    lines_text(&lines)
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} rows overflow their widget:\n{}",
+        failures.len(),
+        failures.join("\n====\n")
+    );
+}
