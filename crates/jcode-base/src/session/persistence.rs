@@ -505,28 +505,18 @@ impl Session {
             || self.parent_id.is_some()
             || self.is_canary
             || self.save_label.is_some()
+            // A session given a real name (title) is intentionally configured:
+            // an explicit `Session::create_with_id(_, _, Some(title))` names the
+            // session and must be findable by id even before a visible message
+            // exists (regression for #1144 where a titled session was skipped by
+            // the lazy-save gate). `custom_title` is separately honored below.
+            || self.title.as_deref().is_some_and(|t| !t.trim().is_empty())
             || self.compaction.is_some()
             // Structured transcript state (swarm status/plan events, memory
             // injections, compaction markers) is meaningful and must not be
             // dropped, so persist it even without a visible conversation line.
             || !self.replay_events.is_empty()
             || !self.memory_injections.is_empty()
-            // Log-only event-log signals (plugin `Unknown` escape-hatch events,
-            // bare compaction-bracket markers) carry durable meaning even when
-            // they are not accompanied by a message/compaction/configured state.
-            // Unlike a blanket `!event_map.is_empty()`, this deliberately
-            // EXCLUDES the placeholder session-context AppendMessage event (and
-            // every ordinary message event), so the untouched-panel lazy-save
-            // gate still holds: a fresh session whose only event is the auto-added
-            // context stub is still skipped until a real conversation starts.
-            || self.event_map.events.iter().any(|e| {
-                matches!(
-                    e.op,
-                    SessionEventOp::Unknown { .. }
-                        | SessionEventOp::CompactionStart { .. }
-                        | SessionEventOp::CompactionEnd { .. }
-                )
-            })
             // An actively-run session (a PID marker was registered via
             // `mark_active`/`mark_active_with_pid`) must persist even before a
             // conversation message exists so restart/crash recovery can find it.
