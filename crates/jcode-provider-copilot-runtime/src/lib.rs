@@ -854,7 +854,7 @@ impl CopilotApiProvider {
 
                                         let _ = tx
                                             .send(Ok(StreamEvent::ToolUseStart {
-                                                id: current_tool_id.clone(),
+                                                id: current_tool_id.clone().into(),
                                                 name: current_tool_name.clone(),
                                             }))
                                             .await;

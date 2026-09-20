@@ -4521,7 +4521,7 @@ pub(crate) fn render_tool_message(
             let intent = tools_ui::batch_subcall_intent(call, &params);
 
             let sub_tc = ToolCall {
-                id: String::new(),
+                id: String::new().into(),
                 name: tools_ui::resolve_display_tool_name(raw_name).to_string(),
                 input: params,
                 intent,

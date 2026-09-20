@@ -90,7 +90,7 @@ impl Agent {
         ));
         let intent = ToolCall::intent_from_input(&arguments);
         tool_calls.push(ToolCall {
-            id: call_id,
+            id: call_id.into(),
             name: tool_name,
             input: arguments,
             intent,

@@ -21,10 +21,10 @@ pub(super) fn handle_tool_done(
     let existing_tool_call = app
         .streaming_tool_calls
         .iter()
-        .find(|tc| tc.id == id)
+        .find(|tc| tc.id == id.clone().into())
         .cloned();
     let tool_call = existing_tool_call.unwrap_or_else(|| ToolCall {
-        id: id.clone(),
+        id: id.clone().into(),
         name: name.clone(),
         input: serde_json::Value::Null,
         intent: None,
@@ -51,7 +51,7 @@ pub(super) fn handle_tool_done(
     // in one assistant message, siblings that already streamed their parsed
     // input/intent are still waiting for their own ToolDone; clearing the
     // whole list here made their rows render with no intent or summary.
-    app.streaming_tool_calls.retain(|tc| tc.id != id);
+    app.streaming_tool_calls.retain(|tc| tc.id != id.clone().into());
     app.status = ProcessingStatus::Streaming;
     true
 }
@@ -73,7 +73,7 @@ pub(super) fn handle_generated_image(
         revised_prompt.as_deref(),
     );
     let tool_call = ToolCall {
-        id: id.clone(),
+        id: id.clone().into(),
         name: crate::message::GENERATED_IMAGE_TOOL_NAME.to_string(),
         input,
         intent: Some("OpenAI native image generation".to_string()),

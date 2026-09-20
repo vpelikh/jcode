@@ -783,7 +783,7 @@ async fn consume_native_stream(
                 }
                 StreamEvent::ToolUseStart { id, name } => {
                     pending_tool = Some(NativeClaudeToolCall {
-                        id,
+                        id: id.to_string(),
                         name,
                         input_json: String::new(),
                         thought_signature: None,

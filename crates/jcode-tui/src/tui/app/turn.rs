@@ -1,5 +1,6 @@
 use super::*;
 use crate::message::ToolDefinition;
+use crate::session::ToolCallId;
 
 impl App {
     pub(super) fn append_current_turn_system_reminder(
@@ -103,15 +104,23 @@ impl App {
             // Clone data needed for the API call to avoid borrow issues
             // The future would hold references across the select! which conflicts with handle_key
             let provider = self.provider.clone();
+            let session_id_clone = self.provider_session_id.clone();
+            let static_part = split_prompt.static_part.clone();
+            let dynamic_part = split_prompt.dynamic_part.clone();
+            // Hash the *raw* (pre-decoration) provider messages for the cache
+            // signature. `Message::with_timestamps` bakes volatile timestamp and
+            // tool-timing tags into user text; if we hashed those, a metadata-only
+            // re-serialization (or a user message that itself begins with an
+            // RFC3339-shaped string) would spuriously flip the prefix hash and
+            // report `harness: prefix changed`. Computing the signature on the raw
+            // messages (whose volatile fields are still stripped by the
+            // cache-relevant projection) keeps the cache key stable.
+            self.begin_kv_cache_request(&provider_messages, &tools, &static_part, &dynamic_part);
             let request_messages = if crate::config::config().features.message_timestamps {
                 Message::with_timestamps(&provider_messages)
             } else {
                 provider_messages
             };
-            let session_id_clone = self.provider_session_id.clone();
-            let static_part = split_prompt.static_part.clone();
-            let dynamic_part = split_prompt.dynamic_part.clone();
-            self.begin_kv_cache_request(&request_messages, &tools, &static_part, &dynamic_part);
 
             // Make API call non-blocking - poll it in select! so we can handle input while waiting
             let mut api_future = std::pin::pin!(provider.complete_split(
@@ -241,7 +250,7 @@ impl App {
             let mut call_output_tokens_seen: u64 = 0;
             let mut interleaved = false; // Track if we interleaved a message mid-stream
             // Track tool results from provider (already executed by Claude Code CLI)
-            let mut sdk_tool_results: std::collections::HashMap<String, (String, bool)> =
+            let mut sdk_tool_results: std::collections::HashMap<ToolCallId, (String, bool)> =
                 std::collections::HashMap::new();
             let provider_name = self.provider.name().to_string();
             let store_reasoning_content =
@@ -512,7 +521,7 @@ impl App {
                                         self.resume_streaming_tps();
                                         self.clear_active_experimental_feature_notice();
                                         self.broadcast_debug(crate::tui::backend::DebugEvent::ToolStart {
-                                            id: id.clone(),
+                                            id: id.clone().to_string(),
                                             name: name.clone(),
                                         });
                                         // Close any open reasoning region before committing the
@@ -529,7 +538,7 @@ impl App {
                                             );
                                         }
                                         self.streaming_tool_calls.push(ToolCall {
-                                            id: id.clone(),
+                                            id: id.clone().into(),
                                             name: name.clone(),
                                             input: serde_json::Value::Null,
                                             intent: None, thought_signature: None, });
@@ -574,7 +583,7 @@ impl App {
                                                 streaming_tool.intent = tool.intent.clone();
                                             }
                                             self.broadcast_debug(crate::tui::backend::DebugEvent::ToolExec {
-                                                id: tool.id.clone(),
+                                                id: tool.id.clone().to_string(),
                                                 name: tool.name.clone(),
                                             });
                                             self.commit_pending_streaming_assistant_message();
@@ -875,7 +884,7 @@ impl App {
                                             .unwrap_or_default();
 
                                         self.broadcast_debug(crate::tui::backend::DebugEvent::ToolDone {
-                                            id: tool_use_id.clone(),
+                                            id: tool_use_id.clone().to_string(),
                                             name: tool_name.clone(),
                                             output: content.clone(),
                                             is_error,
@@ -913,7 +922,7 @@ impl App {
                                             revised_prompt.as_deref(),
                                         );
                                         let tool_call = ToolCall {
-                                            id: id.clone(),
+                                            id: id.clone().into(),
                                             name: crate::message::GENERATED_IMAGE_TOOL_NAME.to_string(),
                                             input,
                                             intent: Some("OpenAI native image generation".to_string()), thought_signature: None, };
@@ -1194,7 +1203,7 @@ impl App {
                     Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
                         session_id: self.session.id.clone(),
                         message_id: message_id.clone(),
-                        tool_call_id: tc.id.clone(),
+                        tool_call_id: tc.id.clone().to_string(),
                         tool_name: tc.name.clone(),
                         status: if sdk_is_error {
                             ToolStatus::Error
@@ -1215,7 +1224,7 @@ impl App {
                     } else {
                         sdk_content.clone()
                     };
-                    let _ = self.replace_latest_tool_display_message(&tc.id, None, display_output);
+                    let _ = self.replace_latest_tool_display_message(&tc.id.to_string(), None, display_output);
 
                     self.observe_tool_result(&tc, &sdk_content, sdk_is_error, None);
                     self.note_tool_completed(&tc, sdk_is_error);
@@ -1247,7 +1256,7 @@ impl App {
                 let ctx = ToolContext {
                     session_id: self.session.id.clone(),
                     message_id: message_id.clone(),
-                    tool_call_id: tc.id.clone(),
+                    tool_call_id: tc.id.clone().to_string(),
                     working_dir: self.session.working_dir.as_deref().map(PathBuf::from),
                     stdin_request_tx: None,
                     graceful_shutdown_signal: None,
@@ -1257,7 +1266,7 @@ impl App {
                 Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
                     session_id: self.session.id.clone(),
                     message_id: message_id.clone(),
-                    tool_call_id: tc.id.clone(),
+                    tool_call_id: tc.id.clone().to_string(),
                     tool_name: tc.name.clone(),
                     status: ToolStatus::Running,
                     intent: tc.intent.clone(),
@@ -1403,7 +1412,7 @@ impl App {
                         Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
                             session_id: self.session.id.clone(),
                             message_id: message_id.clone(),
-                            tool_call_id: tc.id.clone(),
+                            tool_call_id: tc.id.clone().to_string(),
                             tool_name: tc.name.clone(),
                             status: ToolStatus::Completed,
                             intent: tc.intent.clone(),
@@ -1415,7 +1424,7 @@ impl App {
                         Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
                             session_id: self.session.id.clone(),
                             message_id: message_id.clone(),
-                            tool_call_id: tc.id.clone(),
+                            tool_call_id: tc.id.clone().to_string(),
                             tool_name: tc.name.clone(),
                             status: ToolStatus::Error,
                             intent: tc.intent.clone(),
@@ -1427,13 +1436,13 @@ impl App {
 
                 // Update the tool's DisplayMessage with the output
                 let _ = self.replace_latest_tool_display_message(
-                    &tc.id,
+                    &tc.id.to_string(),
                     tool_title.clone(),
                     output.clone(),
                 );
 
                 self.add_provider_message(Message::tool_result_with_duration(
-                    &tc.id,
+                    tc.id.as_str(),
                     &output,
                     is_error,
                     Some(tool_duration_ms),

@@ -164,7 +164,7 @@ impl OpenRouterStream {
         }
 
         self.pending.push_back(StreamEvent::ToolUseStart {
-            id: tc.id,
+            id: tc.id.into(),
             name: tc.name,
         });
         self.pending

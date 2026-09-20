@@ -298,7 +298,7 @@ impl App {
                 DisplayMessage::tool(
                     "Edited demo.txt".to_string(),
                     crate::message::ToolCall {
-                        id: "debug_expand_edit_1".to_string(),
+                        id: "debug_expand_edit_1".to_string().into(),
                         name: "edit".to_string(),
                         input: serde_json::json!({
                             "file_path": "demo.txt",
@@ -341,7 +341,7 @@ impl App {
                     "Draft created successfully.\nDraft ID: draft_visual_123\nTo: team@example.com\nSubject: Launch update\nAttachments: 1"
                         .to_string(),
                     crate::message::ToolCall {
-                        id: "debug_gmail_draft_1".to_string(),
+                        id: "debug_gmail_draft_1".to_string().into(),
                         name: "gmail".to_string(),
                         input: serde_json::json!({
                             "action": "draft",

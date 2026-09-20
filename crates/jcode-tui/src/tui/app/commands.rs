@@ -647,7 +647,7 @@ pub(super) fn parse_manual_subagent_spec(rest: &str) -> Result<ManualSubagentSpe
 fn launch_manual_subagent(app: &mut App, spec: ManualSubagentSpec) {
     let description = derive_subagent_description(&spec.prompt);
     let tool_call = crate::message::ToolCall {
-        id: id::new_id("call"),
+        id: id::new_id("call").into(),
         name: "subagent".to_string(),
         input: serde_json::json!({
             "description": description,
@@ -671,7 +671,7 @@ fn launch_manual_subagent(app: &mut App, spec: ManualSubagentSpec) {
     });
 
     let content_blocks = vec![ContentBlock::ToolUse {
-        id: tool_call.id.clone(),
+        id: tool_call.id.clone().to_string(),
         name: tool_call.name.clone(),
         input: tool_call.input.clone(),
         thought_signature: None,
@@ -695,7 +695,7 @@ fn launch_manual_subagent(app: &mut App, spec: ManualSubagentSpec) {
         Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
             session_id: session_id.clone(),
             message_id: message_id.clone(),
-            tool_call_id: tool_call_for_task.id.clone(),
+            tool_call_id: tool_call_for_task.id.clone().to_string(),
             tool_name: tool_call_for_task.name.clone(),
             status: ToolStatus::Running,
             intent: tool_call_for_task.intent.clone(),
@@ -705,7 +705,7 @@ fn launch_manual_subagent(app: &mut App, spec: ManualSubagentSpec) {
         let ctx = crate::tool::ToolContext {
             session_id: session_id.clone(),
             message_id: message_id.clone(),
-            tool_call_id: tool_call_for_task.id.clone(),
+            tool_call_id: tool_call_for_task.id.clone().to_string(),
             working_dir: working_dir.as_deref().map(PathBuf::from),
             stdin_request_tx: None,
             graceful_shutdown_signal: None,
@@ -736,7 +736,7 @@ fn launch_manual_subagent(app: &mut App, spec: ManualSubagentSpec) {
         Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
             session_id: session_id.clone(),
             message_id,
-            tool_call_id: tool_call_for_task.id.clone(),
+            tool_call_id: tool_call_for_task.id.clone().to_string(),
             tool_name: tool_call_for_task.name.clone(),
             status,
             intent: tool_call_for_task.intent.clone(),

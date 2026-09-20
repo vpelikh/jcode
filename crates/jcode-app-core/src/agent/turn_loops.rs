@@ -1,4 +1,5 @@
 use super::*;
+use crate::session::ToolCallId;
 use crate::{terminal_eprintln as eprintln, terminal_print as print, terminal_println as println};
 use crate::tool::ToolOutput;
 
@@ -100,6 +101,46 @@ impl Agent {
                     repaired
                 ));
             }
+
+            // Scheduled per-step prune (takeaway #6): before the next API call,
+            // shrink already-consumed oversized nodes. New results, screenshots
+            // and interrupts appended after the latest assistant are in the
+            // unconsumed suffix and remain intact until the model has read them
+            // once. Both the image and tool-result caps run on every step: a
+            // consumed oversized node from a prior turn must be reclaimed even
+            // on pure-text follow-ups, or it lingers in every subsequent prompt.
+            let pruned = self.session.prune_consumed_transcript(
+                &crate::compaction::prune::PrunePolicy::node_caps_with(
+                    crate::config::config().compaction.prune_tool_result_max_bytes,
+                    crate::config::config().compaction.prune_image_max_bytes,
+                ),
+            );
+            if !pruned.is_empty() {
+                self.note_prune_applied();
+                logging::info(&format!(
+                    "[prune] per-step shrink in headless turn for session {}: {} image(s), {} tool result(s)",
+                    self.session.id,
+                    pruned.images_stripped,
+                    pruned.tool_results_truncated,
+                ));
+                if let Err(err) = self.session.save() {
+                    logging::warn(&format!(
+                        "Failed to persist per-step prune for session {}: {}",
+                        self.session.id, err
+                    ));
+                }
+            }
+
+            // Model-degradation mitigation checkpoint (Slice 3): if the route
+            // tracker reached the Compact rung across prior turns, trigger a
+            // compaction before the next API call so we do not keep degrading
+            // under the same long context.
+            if let Some(notice) = self.maybe_mitigate_degradation()
+                && print_output
+            {
+                crate::terminal_println!("📦 {notice}");
+            }
+
             // Start provider transport setup before deriving and potentially
             // compacting the request history. This is the first point where the
             // stable request settings are available.
@@ -264,7 +305,7 @@ impl Agent {
             let mut reasoning_signature = String::new();
             let mut openai_reasoning_items: Vec<ContentBlock> = Vec::new();
             // Track tool results from provider (already executed by Claude Code CLI)
-            let mut sdk_tool_results: std::collections::HashMap<String, (String, bool)> =
+            let mut sdk_tool_results: std::collections::HashMap<ToolCallId, (String, bool)> =
                 std::collections::HashMap::new();
             let mut openai_native_compaction: Option<(String, usize)> = None;
 
@@ -906,6 +947,10 @@ impl Agent {
                     }
                 }
                 logging::info("Turn complete - no tool calls, returning");
+                // Clean completion after all recovery checks: prune stale
+                // degradation-stall window entries so an old flurry stops
+                // counting (Slice 3 degradation tracker).
+                self.record_clean_turn();
                 if print_output {
                     println!();
                 }
@@ -965,7 +1010,7 @@ impl Agent {
                     Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
                         session_id: self.session.id.clone(),
                         message_id: message_id.clone(),
-                        tool_call_id: tc.id.clone(),
+                        tool_call_id: tc.id.clone().to_string(),
                         tool_name: tc.name.clone(),
                         status: ToolStatus::Error,
                         intent: tc.intent.clone(),
@@ -977,7 +1022,7 @@ impl Agent {
                     self.add_message(
                         Role::User,
                         vec![ContentBlock::ToolResult {
-                            tool_use_id: tc.id,
+                            tool_use_id: tc.id.clone(),
                             content: error_msg,
                             is_error: Some(true),
                         }],
@@ -1022,7 +1067,7 @@ impl Agent {
                         Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
                             session_id: self.session.id.clone(),
                             message_id: message_id.clone(),
-                            tool_call_id: tc.id.clone(),
+                            tool_call_id: tc.id.clone().to_string(),
                             tool_name: tc.name.clone(),
                             status: if sdk_is_error {
                                 ToolStatus::Error
@@ -1059,7 +1104,7 @@ impl Agent {
                 let ctx = ToolContext {
                     session_id: self.session.id.clone(),
                     message_id: message_id.clone(),
-                    tool_call_id: tc.id.clone(),
+                    tool_call_id: tc.id.clone().to_string(),
                     working_dir: self.working_dir().map(PathBuf::from),
                     stdin_request_tx: self.stdin_request_tx.clone(),
                     graceful_shutdown_signal: Some(self.graceful_shutdown.clone()),
@@ -1080,7 +1125,6 @@ impl Agent {
                     safe_calls.push((tc, ctx));
                 } else {
                     self.flush_concurrency_safe(std::mem::take(&mut safe_calls), assistant_message_id.as_deref()).await;
-                    tool_results_dirty = true;
                     self.execute_tool_locally(tc, ctx, print_output, trace, assistant_message_id.as_deref())
                         .await;
                     tool_results_dirty = true;
@@ -1121,8 +1165,9 @@ impl Agent {
             // tool call is an identical repeat of the prior run, inject a short
             // model-visible nudge so the model changes approach instead of burning
             // tokens in a stuck loop.
+            let repeat_threshold = super::guard::repeat_reminder_threshold();
             if let Some(reminder) =
-                super::guard::repeat_reminder_from_transcript(&self.session.messages)
+                super::guard::repeat_reminder_from_transcript(&self.session.messages, repeat_threshold)
             {
                 let _ = self.add_message(Role::User, reminder.content);
                 crate::logging::info(&format!(
@@ -1160,7 +1205,7 @@ impl Agent {
             Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
                 session_id: self.session.id.clone(),
                 message_id: message_id.clone(),
-                tool_call_id: tc.id.clone(),
+                tool_call_id: tc.id.clone().to_string(),
                 tool_name: tc.name.clone(),
                 status: ToolStatus::Running,
                 intent: tc.intent.clone(),
@@ -1216,7 +1261,7 @@ impl Agent {
         Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
             session_id: self.session.id.clone(),
             message_id: message_id.clone(),
-            tool_call_id: tc.id.clone(),
+            tool_call_id: tc.id.clone().to_string(),
             tool_name: tc.name.clone(),
             status: ToolStatus::Running,
             intent: tc.intent.clone(),
@@ -1253,6 +1298,10 @@ impl Agent {
     /// Running event, telemetry, and tool unlock are handled by the caller
     /// (`flush_concurrency_safe`) so they run once per call rather than once per
     /// batch.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "committing a tool result carries the call, context, output, and per-call print/trace/telemetry flags shared by sequential and parallel paths"
+    )]
     fn commit_tool_result(
         &mut self,
         tc: ToolCall,
@@ -1274,7 +1323,7 @@ impl Agent {
                 Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
                     session_id: self.session.id.clone(),
                     message_id: message_id.clone(),
-                    tool_call_id: tc.id.clone(),
+                    tool_call_id: tc.id.clone().to_string(),
                     tool_name: tc.name.clone(),
                     status: ToolStatus::Completed,
                     intent: tc.intent.clone(),
@@ -1308,7 +1357,7 @@ impl Agent {
                 Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
                     session_id: self.session.id.clone(),
                     message_id: message_id.clone(),
-                    tool_call_id: tc.id.clone(),
+                    tool_call_id: tc.id.clone().to_string(),
                     tool_name: tc.name.clone(),
                     status: ToolStatus::Error,
                     intent: tc.intent.clone(),
@@ -1328,7 +1377,7 @@ impl Agent {
                 self.add_message_with_duration(
                     Role::User,
                     vec![ContentBlock::ToolResult {
-                        tool_use_id: tc.id,
+                        tool_use_id: tc.id.clone(),
                         content: error_msg,
                         is_error: Some(true),
                     }],
@@ -1378,7 +1427,7 @@ mod tests {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
-                tool_use_id: id.to_string(),
+                tool_use_id: id.into(),
                 content: content.to_string(),
                 is_error: None,
             }],
@@ -2047,7 +2096,7 @@ mod tests {
             "a compact stall with non-ASCII text must be measured by char count"
         );
         // A genuinely long reply with multi-byte chars is still not a stall.
-        let cjk_long = format!("{}", "\u{52a9}\u{8a00}".repeat(500)); // 1000 chars
+        let cjk_long = "\u{52a9}\u{8a00}".repeat(500); // 1000 chars
         let legit = format!("Let me know if you need more. {cjk_long}");
         assert!(
             !Agent::is_stalled_promise_text(&legit),

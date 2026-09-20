@@ -177,7 +177,7 @@ fn stream_text_or_recovered_tool_call(
             id: format!(
                 "fallback_text_call_{}",
                 FALLBACK_TOOL_CALL_COUNTER.fetch_add(1, Ordering::Relaxed)
-            ),
+            ).into(),
             name: tool_name,
         });
         pending.push_back(StreamEvent::ToolInputDelta(arguments));
@@ -336,7 +336,7 @@ fn stream_tool_calls(
                 .filter(|id| !id.is_empty())
                 .unwrap_or(&item_id);
             pending.push_back(StreamEvent::ToolUseStart {
-                id: sanitize_tool_id(id),
+                id: sanitize_tool_id(id).into(),
                 name: state.name.clone().expect("named tool call"),
             });
             state.started = true;
@@ -637,7 +637,7 @@ pub fn handle_openai_output_item(
             let arguments = normalize_openai_tool_arguments(raw_arguments);
 
             pending.push_back(StreamEvent::ToolUseStart {
-                id: call_id.clone(),
+                id: call_id.clone().into(),
                 name,
             });
             pending.push_back(StreamEvent::ToolInputDelta(arguments));
