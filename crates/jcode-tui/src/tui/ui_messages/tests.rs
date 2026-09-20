@@ -2173,6 +2173,133 @@ fn render_tool_message_shows_bash_output_when_enabled() {
     crate::tui::ui::tools_ui::tests_show_bash_output_override::set(false);
 }
 
+#[test]
+fn render_tool_message_shows_bash_exit_code_badge_on_failed_run() {
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "boom\n\nWorking directory: /tmp/proj\n\nExecution time: 5ms\n\nExit code: 2".to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_bash_exit_failed".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({"command": "false"}),
+            intent: Some("Run failing command".to_string()),
+            thought_signature: None,
+        }),
+    };
+
+    let lines = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off);
+    let rendered = lines
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        rendered.contains("[exit 2]"),
+        "failed bash run should show exit badge: {rendered}"
+    );
+    assert!(
+        rendered.contains('✗'),
+        "failed bash run should use the error icon even with cwd/time footers preceding the exit code: {rendered}"
+    );
+}
+
+#[test]
+fn render_tool_message_shows_bash_exit_code_badge_on_success() {
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "clean\n\nExit code: 0".to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_bash_exit_ok".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({"command": "git status"}),
+            intent: Some("Check git status".to_string()),
+            thought_signature: None,
+        }),
+    };
+
+    let lines = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off);
+    let rendered = lines
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        rendered.contains("[exit 0]"),
+        "successful bash run should show exit badge: {rendered}"
+    );
+}
+
+#[test]
+fn render_tool_message_shows_bash_details_block_when_enabled() {
+    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(true);
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "On branch main\nUntracked files\n\nWorking directory: /home/user/project\n\nExecution time: 120ms\n\nExit code: 0".to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_bash_details".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({
+                "command": "git status",
+            }),
+            intent: Some("Check git status".to_string()),
+            thought_signature: None,
+        }),
+    };
+
+    let rendered = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // The first line carries the exit badge plus the working directory and
+    // execution time inline, matching the issue's requested single-row format.
+    assert!(
+        rendered.contains("[exit 0]"),
+        "verbose details still show the exit badge on the row: {rendered}"
+    );
+    assert!(
+        rendered.contains("/home/user/project"),
+        "working directory should render inline on the tool row: {rendered}"
+    );
+    assert!(
+        rendered.contains("120ms"),
+        "execution time should render inline on the tool row: {rendered}"
+    );
+    assert!(
+        rendered.contains("$ git status"),
+        "verbose details should show the full command: {rendered}"
+    );
+    assert!(
+        rendered.contains("Output:"),
+        "verbose details should label the command result: {rendered}"
+    );
+    assert!(
+        rendered.contains("On branch main"),
+        "verbose details should show the real command output (not the metadata footers): {rendered}"
+    );
+    assert!(
+        !rendered.contains("Working directory:"),
+        "metadata footers should be filtered out of the output block: {rendered}"
+    );
+    assert!(
+        !rendered.contains("Execution time:"),
+        "execution-time footer should be filtered out of the output block: {rendered}"
+    );
+    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(false);
+}
+
 fn gmail_draft_message(content: &str, input: serde_json::Value) -> DisplayMessage {
     DisplayMessage {
         role: "tool".to_string(),

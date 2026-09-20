@@ -198,6 +198,12 @@ prompt_entry_animation = true
 # summary (default: false).
 # show_bash_output = false
 
+# Enrich bash tool rows into a verbose details block showing the working
+# directory (when known), execution time, the full executed command, and the
+# command output (default: false). Independent of show_bash_output, which only
+# shows the last few output lines.
+# show_bash_details = false
+
 # Show the dimmed technical detail (command, file path, args) next to the
 # model-provided intent on tool rows (default: false). When false, tool rows
 # with an intent show just the intent; rows without an intent still show the

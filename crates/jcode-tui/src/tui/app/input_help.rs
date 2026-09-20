@@ -192,6 +192,9 @@ impl App {
             "tool-call-details" => {
                 "/tool-call-details\nShow whether the dimmed technical detail (command, path, args) renders next to the model-provided intent on tool rows.\n\n/tool-call-details on\nShow the technical detail after the intent, e.g. `bash · Run tests · $ cargo test`.\n\n/tool-call-details off\nShow only the intent on tool rows that have one. Rows without an intent still show the technical detail, and error summaries always render."
             }
+            "bash-details" => {
+                "/bash-details\nShow whether bash tool rows render the verbose details block.\n\n/bash-details on\nBeneath each bash tool row, show the full executed command, the working directory (when known), the execution time, and the command's output.\n\n/bash-details off\nKeep the compact bash row (the [exit N] badge always shows regardless)."
+            }
             "auth" | "login" => {
                 "/auth\nShow authentication status for all providers.\n\n/login\nInteractive provider selection - pick a provider to log into.\n\n/login <provider>\nStart login flow directly for any provider shown by /login or the /login completions.\n\nUse /login jcode for pay-as-you-go hosted models through the Jcode router. Set a monthly spending limit in the browser; no API key is pasted into the terminal."
             }

@@ -83,6 +83,12 @@ pub struct DisplayConfig {
     /// summary (default: false).
     #[serde(default)]
     pub show_bash_output: bool,
+    /// Enrich bash tool rows into a verbose details block showing the working
+    /// directory (when known), execution time, the full executed command, and
+    /// the command output (default: false). Independent of `show_bash_output`,
+    /// which only shows the last few output lines.
+    #[serde(default)]
+    pub show_bash_details: bool,
     /// Show the dimmed technical detail (command, path, args) after the
     /// model-provided intent on tool rows (default: false). When off, rows
     /// that have an intent show only the intent; rows without an intent
@@ -157,6 +163,7 @@ impl Default for DisplayConfig {
             copy_badge_alt_label: String::new(),
             show_agentgrep_output: false,
             show_bash_output: false,
+            show_bash_details: false,
             tool_call_details: false,
             native_scrollbars: NativeScrollbarConfig::default(),
             keybinding_hints: true,

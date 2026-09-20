@@ -2432,6 +2432,10 @@ fn split_resume_hint(detail: &str) -> (&str, Option<&str>) {
     }
 }
 
+fn truncate_inline(input: &str, width: usize) -> String {
+    truncate_connection_line(input, width)
+}
+
 fn truncate_connection_line(input: &str, width: usize) -> String {
     if input.chars().count() <= width {
         return input.to_string();
@@ -3899,6 +3903,8 @@ pub(crate) fn render_tool_message(
         return lines;
     };
 
+    let is_bash = tools_ui::canonical_tool_name(&tc.name) == "bash";
+
     if tools_ui::is_memory_store_tool(tc) && !msg.content.starts_with("Error:") {
         let content = tc
             .input
@@ -4020,6 +4026,67 @@ pub(crate) fn render_tool_message(
     let row_width = block_width.saturating_sub(1);
     let display_name = tools_ui::resolve_display_tool_name(&tc.name).to_string();
     let base_prefix = format!("  {} {} ", icon, display_name);
+    // Show a compact `[exit N]` badge on bash rows so the outcome is visible at
+    // a glance without needing to expand verbose details. A confirmed success
+    // (exit 0) renders dimly; any non-zero exit renders in the error color and
+    // is always shown.
+    let bash_exit = if is_bash {
+        tools_ui::parse_bash_exit_code(&msg.content).map(|code| (code, code != 0))
+    } else {
+        None
+    };
+    let bash_exit_span = bash_exit.as_ref().map(|(code, is_nonzero)| {
+        let color = if *is_nonzero {
+            rgb(220, 100, 100)
+        } else {
+            dim_color()
+        };
+        Span::styled(format!(" [exit {}]", code), Style::default().fg(color))
+    });
+    let bash_exit_width = bash_exit_span
+        .as_ref()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .unwrap_or(0);
+    // Inline working directory and execution time on the bash tool row, so the
+    // outcome is visible at a glance (matching the issue's requested format:
+    // `✓ bash [exit 0] · /path · git status · N tok · 120ms`).
+    let (bash_cwd_span, bash_duration_span) = if is_bash {
+        let cwd =
+            tools_ui::parse_bash_working_dir(&msg.content).map(|s| (s, true)).or_else(|| {
+                tc.input
+                    .get("cwd")
+                    .or_else(|| tc.input.get("working_dir"))
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| (s.to_string(), false))
+            });
+        let cwd_span = cwd.map(|(dir, _)| {
+            Span::styled(
+                format!(" · {}", truncate_inline(dir.as_str(), 24)),
+                Style::default().fg(dim_color()),
+            )
+        });
+        let dur = tools_ui::parse_bash_execution_time(&msg.content)
+            .or_else(|| tools_ui::parse_bash_timing_duration(&msg.content));
+        let dur_span = dur.map(|d| {
+            Span::styled(
+                format!(" · {}", d),
+                Style::default().fg(dim_color()),
+            )
+        });
+        (cwd_span, dur_span)
+    } else {
+        (None, None)
+    };
+    let bash_inline_width = bash_cwd_span
+        .as_ref()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .unwrap_or(0)
+        + bash_duration_span
+            .as_ref()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .unwrap_or(0);
     let token_suffix_width =
         UnicodeWidthStr::width(format!(" · {}", token_badge.label.as_str()).as_str());
     let edit_suffix_width = if is_edit_tool && has_diff_changes {
@@ -4030,7 +4097,9 @@ pub(crate) fn render_tool_message(
     let reserved_summary_width = row_width
         .saturating_sub(UnicodeWidthStr::width(base_prefix.as_str()))
         .saturating_sub(token_suffix_width)
-        .saturating_sub(edit_suffix_width);
+        .saturating_sub(edit_suffix_width)
+        .saturating_sub(bash_exit_width)
+        .saturating_sub(bash_inline_width);
 
     let intent = tc
         .intent
@@ -4110,6 +4179,15 @@ pub(crate) fn render_tool_message(
         ));
         tool_line.push(Span::styled(")", Style::default().fg(dim_color())));
     }
+    if let Some(exit_span) = bash_exit_span {
+        tool_line.push(exit_span);
+    }
+    if let Some(cwd_span) = bash_cwd_span {
+        tool_line.push(cwd_span);
+    }
+    if let Some(dur_span) = bash_duration_span {
+        tool_line.push(dur_span);
+    }
     let token_suffix = Line::from(vec![
         Span::styled(" · ", Style::default().fg(dim_color())),
         Span::styled(token_badge.label, Style::default().fg(token_badge.color)),
@@ -4141,11 +4219,93 @@ pub(crate) fn render_tool_message(
         }
     }
 
+    let show_bash_details = is_bash && tools_ui::show_bash_details();
+
+    // Verbose bash details block (opt-in via `display.show_bash_details`):
+    // renders the full executed command, the working directory (when known),
+    // execution time, and the command's output so the agent's actions are easy
+    // to review and debug.
+    if show_bash_details {
+        if let Some(command) = tc.input.get("command").and_then(|v| v.as_str()).filter(|c| !c.trim().is_empty()) {
+            let command_line = Line::from(vec![
+                Span::raw("    "),
+                Span::styled(
+                    format!("$ {}", command.trim()),
+                    Style::default().fg(dim_color()),
+                ),
+            ]);
+            lines.push(super::truncate_line_with_ellipsis_to_width(
+                &command_line,
+                row_width,
+            ));
+        }
+
+        // Working directory and execution time render inline on the tool row
+        // itself (see the bash_inline spans above), so the details block only
+        // adds the full command and the command's output.
+
+        // Full output (first several non-empty lines), distinct from the
+        // `show_bash_output` tail preview. The `[tool timing: ...]` header is
+        // harness metadata, not command output, and the Working directory /
+        // Execution time / Exit code footers are metadata too, so they are
+        // stripped before we surface the real command result.
+        let detail_content = strip_tool_result_timestamp_header(&msg.content);
+        if detail_content.trim() != "Command completed successfully (no output)"
+            && detail_content.trim()
+                != "Tool output missing (session interrupted before tool execution completed)"
+        {
+            const MAX_DETAIL_OUTPUT_LINES: usize = 8;
+            let output_lines = detail_content.lines().filter(|line| {
+                let t = line.trim();
+                !t.is_empty()
+                    && !t.starts_with("Working directory:")
+                    && !t.starts_with("Execution time:")
+                    && !t.starts_with("Exit code:")
+                    && !t.starts_with("--- Command finished with exit code:")
+            });
+            let total = output_lines.clone().count();
+            if total > 0 {
+                let output_label = Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled("Output:", Style::default().fg(dim_color()).add_modifier(
+                        ratatui::style::Modifier::BOLD,
+                    )),
+                ]);
+                lines.push(super::truncate_line_with_ellipsis_to_width(
+                    &output_label,
+                    row_width,
+                ));
+            }
+            for output in output_lines.take(MAX_DETAIL_OUTPUT_LINES) {
+                let output_line = Line::from(vec![
+                    Span::raw("      "),
+                    Span::styled(output.to_string(), Style::default().fg(dim_color())),
+                ]);
+                lines.push(super::truncate_line_with_ellipsis_to_width(
+                    &output_line,
+                    row_width,
+                ));
+            }
+            if total > MAX_DETAIL_OUTPUT_LINES {
+                let elided = Line::from(vec![
+                    Span::raw("      "),
+                    Span::styled(
+                        format!("… {} more line(s) (show_bash_output on shows the tail)", total - MAX_DETAIL_OUTPUT_LINES),
+                        Style::default().fg(dim_color()),
+                    ),
+                ]);
+                lines.push(super::truncate_line_with_ellipsis_to_width(&elided, row_width));
+            }
+        }
+    }
+
     // Fallback command preview on a second line only when the row has no
     // intent. With an intent present, the command summary is inline-only: it
     // shows on the tool row when it fits and is dropped otherwise, never
-    // spilling onto a second line.
+    // spilling onto a second line. Skipped when the verbose details block
+    // already rendered the command.
     if tools_ui::canonical_tool_name(&tc.name) == "bash"
+        && !show_bash_details
         && intent.is_none()
         && !rendered_tool_line_text.contains('$')
         && let Some(command) = tc.input.get("command").and_then(|v| v.as_str())
@@ -4179,7 +4339,17 @@ pub(crate) fn render_tool_message(
         && msg.content.trim() != "Command completed successfully (no output)"
     {
         const MAX_COLLAPSED_OUTPUT_LINES: usize = 3;
-        let output_lines = msg.content.lines().filter(|line| !line.trim().is_empty());
+        let output_lines = msg
+            .content
+            .lines()
+            .filter(|line| {
+                let t = line.trim();
+                !t.is_empty()
+                    && !t.starts_with("Working directory:")
+                    && !t.starts_with("Execution time:")
+                    && !t.starts_with("Exit code:")
+                    && !t.starts_with("--- Command finished with exit code:")
+            });
         let total = output_lines.clone().count();
         for output in output_lines.skip(total.saturating_sub(MAX_COLLAPSED_OUTPUT_LINES)) {
             let output_line = Line::from(vec![
