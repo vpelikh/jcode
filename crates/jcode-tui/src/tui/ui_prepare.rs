@@ -770,6 +770,7 @@ fn build_top_pad_lines(width: u16, pad_top: usize) -> Vec<Line<'static>> {
 }
 
 fn prepare_messages_inner(app: &dyn TuiState, width: u16, height: u16) -> PreparedChatFrame {
+    let inner_start = Instant::now();
     let header_start = Instant::now();
     let header_prepared = prepare_header_cached(app, width);
     let header_ms = header_start.elapsed().as_secs_f64() * 1000.0;
@@ -781,6 +782,7 @@ fn prepare_messages_inner(app: &dyn TuiState, width: u16, height: u16) -> Prepar
     // Anchored images render inside the body at their producing message; only
     // images without a resolvable anchor target fall back to this trailing
     // inline section so nothing silently disappears.
+    let inline_start = Instant::now();
     let inline_images_prepared = if app.pin_images() {
         let anchored = super::inline_image_ui::resolve_anchored_items_cached(app);
         let items = anchored.unplaced_items(app.display_messages());
@@ -800,6 +802,7 @@ fn prepare_messages_inner(app: &dyn TuiState, width: u16, height: u16) -> Prepar
     } else {
         Arc::new(empty_prepared_messages())
     };
+    let inline_ms = inline_start.elapsed().as_secs_f64() * 1000.0;
 
     let batch_start = Instant::now();
     let has_batch_progress = active_batch_progress(app).is_some();
@@ -928,6 +931,8 @@ fn prepare_messages_inner(app: &dyn TuiState, width: u16, height: u16) -> Prepar
             batch_ms,
             streaming_ms,
             compose_ms: compose_start.elapsed().as_secs_f64() * 1000.0,
+            inline_ms,
+            total_inner_ms: inner_start.elapsed().as_secs_f64() * 1000.0,
         });
         return frame;
     }
@@ -976,6 +981,8 @@ fn prepare_messages_inner(app: &dyn TuiState, width: u16, height: u16) -> Prepar
         batch_ms,
         streaming_ms,
         compose_ms: compose_start.elapsed().as_secs_f64() * 1000.0,
+        inline_ms,
+        total_inner_ms: inner_start.elapsed().as_secs_f64() * 1000.0,
     });
     frame
 }
