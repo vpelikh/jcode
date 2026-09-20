@@ -892,3 +892,38 @@ were dropped, and the now-unused imports (`AwaitMembersRuntime`,
 lib suite stays green (1480 passing) and the clippy baseline is unchanged
 (the 4 pre-existing findings in `client_lifecycle_tests.rs` at lines
 247/254/1053/1058 predate this change).
+
+### Tier 2 landed (2026-09): jcode-app-core clippy baseline cleared to zero
+
+The full `jcode-app-core` clippy baseline (lib `14 -> 0` warnings; test
+`57 -> 0` warnings) is now cleared. Mechanical lints were fixed in place
+(unused imports/aliases, needless borrows/returns/clones, collapsible ifs,
+deprecated tempfile `into_path() -> keep()`, `as_chunks`, elided lifetimes),
+and genuinely intentional test patterns were marked with scoped
+`#[expect(...)]` rather than blanket suppression: `await_holding_lock` for
+tests that deliberately hold a lock across an await to assert lock-ordering /
+holding behavior, `items_after_test_module` where a test module precedes
+shared helpers, and `assertions_on_constants` for the tuning-guard on
+`MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS`. This updates the earlier "4
+pre-existing findings" note: those findings are now fixed, not just carried.
+
+### Follow-up (Tier 3, deferred): true service encapsulation
+
+The current `SwarmServiceHandle` is a struct of maps with public fields and a
+growing set of methods (`ensure_member`, `set_member_status`,
+`broadcast_swarm_status`, ...). Design decision A (collapse flat bag onto the
+handle, bind fields as body locals) satisfied the convergence gate — zero flat
+swarm-map args in handler signatures — but did **not** actually reduce coupling:
+handlers still reach into `swarm.swarm_state.plans` directly. Deferred follow-up:
+
+1. Make the handle's fields private (or `pub(crate)` scoped to `services`),
+   exposing behavior through methods (`join_swarm`, `set_member_status`,
+   `update_plan`, `subscribe_channel`, `record_file_touch`, ...).
+2. Move the remaining direct-map call sites (`comm_control`, `comm_plan`,
+   `comm_await`, `swarm_channels`, `debug_swarm_write`, session helpers) onto
+   those methods so the body-local re-binding can be deleted.
+3. Decided **before** starting: whether `file_touch`, `shared_context`, and
+   channel-subscription indexes truly belong on the *swarm* handle or warrant
+   their own service handle, so we do not bake methods onto a handle that gets
+   reshuffled. This is a behavior/API-boundary change and should land as its own
+   reviewed slice, not mixed into mechanical convergence.
