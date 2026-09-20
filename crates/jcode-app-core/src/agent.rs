@@ -1,7 +1,9 @@
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
 
 mod compaction;
+mod degradation;
 mod environment;
+mod guard;
 mod inline_tail;
 mod interrupts;
 mod messages;
@@ -212,9 +214,9 @@ pub struct Agent {
     /// Not persisted to session history.
     current_turn_system_reminder: Option<String>,
     /// Tool call ids observed in the current session transcript.
-    tool_call_ids: HashSet<String>,
+    tool_call_ids: HashSet<crate::session::ToolCallId>,
     /// Tool result ids observed in the current session transcript.
-    tool_result_ids: HashSet<String>,
+    tool_result_ids: HashSet<crate::session::ToolCallId>,
     /// Number of stored session messages already indexed for missing tool-output repair.
     tool_output_scan_index: usize,
     /// Soft interrupt queue: messages to inject at next safe point without cancelling
@@ -245,6 +247,10 @@ pub struct Agent {
     mcp_late_register_resolved: bool,
     /// Override system prompt (used by ambient mode to inject a custom prompt)
     system_prompt_override: Option<String>,
+    /// When set, the first visible user message boots from this specific saved
+    /// handoff instead of the automatic latest-for-project one. Cleared after
+    /// it is consumed so it cannot re-inject on a later turn or session.
+    handoff_resume_id: Option<String>,
     /// AGENTS.md is session bootstrap input. Keep the captured text stable so
     /// tool writes do not mutate the provider's cacheable prefix mid-session.
     agents_md_snapshot: (Option<String>, crate::prompt::ContextInfo),
@@ -256,6 +262,10 @@ pub struct Agent {
     stdin_request_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::tool::StdinInputRequest>>,
     /// Canonical reducer-backed view of runtime provider/model selection.
     provider_runtime_state: ProviderRuntimeState,
+    /// Route-scoped degradation tracker for the model-degradation management
+    /// plan. Totalizes stall-family turn events and recommends an escalating
+    /// mitigation rung (watch → compact → route-fallback).
+    degradation: degradation::DegradationTracker,
     /// When true, this session is an inline swarm worker: stream a throttled
     /// output tail to the global bus so the coordinator's inline gallery can
     /// render a live viewport. Off for normal sessions to avoid bus traffic.
@@ -309,7 +319,8 @@ impl Agent {
             allowed_tools.clone(),
             disabled_tools.clone(),
         );
-        Self {
+        let degradation_key = format!("{}/{}", provider.display_name(), initial_provider_model);
+        let agent = Self {
             provider,
             registry,
             skills,
@@ -337,16 +348,26 @@ impl Agent {
             locked_tools: None,
             mcp_late_register_resolved: false,
             system_prompt_override: None,
+            handoff_resume_id: None,
             agents_md_snapshot,
             memory_enabled: crate::config::config().features.memory,
             rewind_undo_snapshot: None,
             stdin_request_tx: None,
             provider_runtime_state: ProviderRuntimeState::observed(initial_provider_model),
+            degradation: degradation::DegradationTracker::new(degradation::RouteKey(degradation_key)),
             inline_output_tap: false,
             inline_tail: inline_tail::InlineTailBuffer::default(),
             transcript_telemetry_sent: false,
             concurrency_session: None,
-        }
+        };
+        // A freshly bound session is a new in-memory activation. Clear any stale
+        // compass-query-first redirect flag that may linger on this session id
+        // from an earlier (abandoned) in-memory lifetime in the same daemon, so
+        // re-attaching to it does not wrongly block `allow_raw_fallback` until a
+        // compass_query is attempted. Mirrors the clear performed in
+        // `restore_session`.
+        crate::tool::compass_enforcement::clear_redirect_pending(&agent.session.id);
+        agent
     }
 
     fn current_skills_snapshot(&self) -> Arc<SkillRegistry> {
@@ -522,8 +543,11 @@ impl Agent {
 
     fn seed_compaction_from_session(&mut self) {
         // Read the event-sourced log once; on resume this is hydrated from disk
-        // in Session::load_from_path so it reflects the full transcript.
-        let messages = self.session.derive_messages();
+        // in Session::load_from_path so it reflects the full transcript. Use the
+        // projection seam (takeaway #4): it matches derive_messages exactly
+        // (proven by ProjectionMatchesDerived) and states our intent to read
+        // derived state.
+        let messages = self.session.projected_messages();
         logging::info(&format!(
             "seed_compaction_from_session: session has {} messages via event log",
             messages.len()
@@ -565,7 +589,7 @@ impl Agent {
                     // with the sanitized compaction state.
                     self.session.append_session_event(SessionEvent {
                         timestamp: Utc::now(),
-                        event_id: crate::id::new_id("compaction"),
+                        event_id: crate::id::new_id("compaction").into(),
                         op: SessionEventOp::SetCompaction { compaction: inner },
                         parent_id: None,
                         version: 1,
@@ -693,11 +717,17 @@ impl Agent {
             self.session.compaction = new_state;
             match self.session.compaction.clone() {
                 Some(state) => {
-                    // Emit a SetCompaction event so the event log stays in sync
-                    // with the compaction mutation. `set_compaction` also
-                    // updates `self.compaction`, so the direct assignment above
-                    // is redundant but makes the intent explicit.
-                    self.session.set_compaction(state);
+                    // Emit a compaction event so the event log stays in sync with
+                    // the (virtual) compaction mutation, and record it inside a
+                    // balanced `CompactionStart`/`CompactionEnd` bracket
+                    // (deepseek-harness takeaway #5). This makes the live
+                    // producer's compaction log-bracketed and replayable without
+                    // physically rewriting the transcript, keeping the manager's
+                    // `compacted_count` offsets valid on reload.
+                    self.session.set_compaction_with_bracket(
+                        crate::id::new_id("compact"),
+                        state,
+                    );
                 }
                 None => {
                     // Compaction was cleared (active_summary is None). There is
@@ -745,13 +775,16 @@ impl Agent {
             covers_up_to_turn: compacted_count,
             original_turn_count: compacted_count,
             compacted_count,
+            physically_consolidated: false,
         };
 
         self.session.compaction = Some(state.clone());
-        // Emit a SetCompaction event so the event log stays in sync with the
-        // compaction mutation. `set_compaction` also sets `self.compaction`,
-        // making the direct assignment above redundant but explicit.
-        self.session.set_compaction(state.clone());
+        // Emit a compaction event so the event log stays in sync with the
+        // compaction mutation, inside a balanced bracket (takeaway #5), consistent
+        // with the manager-driven path. `set_compaction_with_bracket` sets
+        // `self.compaction` as well, making the direct assignment above redundant
+        // but explicit.
+        self.session.set_compaction_with_bracket(crate::id::new_id("compact"), state.clone());
         let compaction = self.registry.compaction();
         if let Ok(mut manager) = compaction.try_write() {
             manager.set_budget(self.provider.context_window());
@@ -809,6 +842,7 @@ impl Agent {
                     };
                     let event = manager.take_compaction_event();
                     if event.is_some() || discarded_oversized_native {
+                        self.physically_consolidate_if_enabled(&mut manager);
                         self.sync_session_compaction_state_from_manager(&manager);
                     }
                     if event.is_some() {
@@ -898,7 +932,9 @@ impl Agent {
     }
 
     fn repair_missing_tool_outputs(&mut self) -> usize {
-        let messages = self.session.derive_messages();
+        // Read the live transcript through the projection seam (takeaway #4),
+        // which matches derive_messages exactly (proven by ProjectionMatchesDerived).
+        let messages = self.session.projected_messages();
         
         if self.tool_output_scan_index > messages.len() {
             self.reset_tool_output_tracking();
@@ -906,7 +942,7 @@ impl Agent {
 
         let scan_start = self.tool_output_scan_index;
         let mut new_result_ids = Vec::new();
-        let mut assistant_tool_uses: Vec<(usize, Vec<String>)> = Vec::new();
+        let mut assistant_tool_uses: Vec<(usize, Vec<crate::session::ToolCallId>)> = Vec::new();
 
         for (index, msg) in messages.iter().enumerate().skip(scan_start) {
             match msg.role {
@@ -935,7 +971,7 @@ impl Agent {
 
         self.tool_result_ids.extend(new_result_ids);
 
-        let mut missing_repairs: Vec<(usize, Vec<String>)> = Vec::new();
+        let mut missing_repairs: Vec<(usize, Vec<crate::session::ToolCallId>)> = Vec::new();
         for (index, tool_uses) in assistant_tool_uses {
             let mut missing_for_message = Vec::new();
             for id in tool_uses {
@@ -947,7 +983,7 @@ impl Agent {
                 // its real result is on the way, and synthesizing a
                 // placeholder now produces a duplicate tool_result that
                 // Anthropic rejects outright. See `tool::inflight`.
-                if crate::tool::inflight::is_tool_in_flight(&id) {
+                if crate::tool::inflight::is_tool_in_flight(id.as_str()) {
                     logging::info(&format!(
                         "Skipping missing tool-output repair for {id}: tool is still executing"
                     ));
@@ -985,7 +1021,7 @@ impl Agent {
             inserted += missing_for_message.len();
         }
 
-        self.tool_output_scan_index = self.session.derive_messages().len();
+        self.tool_output_scan_index = self.session.projected_messages().len();
 
         if repaired > 0 {
             self.persist_session_best_effort("missing tool-output repair");

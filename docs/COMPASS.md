@@ -212,4 +212,7 @@ immediately after a redirect and never attempted `compass_query` at all. The
 restriction is cleared by any actual `compass_query` execution — including a
 `building-in-background` fail-fast — so a project Compass genuinely cannot index
 still reaches raw grep after one real attempt. `find`/`outline`/`trace` modes
-are unaffected (they are never redirected and never blocked).
+are unaffected (they are never redirected and never blocked). The restriction is
+also not applied when `compass_query` has since become unavailable to the session
+(removed or disabled by policy), and the pending flag is reset on a fresh session
+bind or restore, so a re-attached or restored session is never stale-blocked.
