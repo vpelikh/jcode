@@ -1,33 +1,32 @@
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
 
+use super::services::{MemberIdentity, SwarmServiceHandle};
 use super::client_state::{handle_get_history, spawn_model_prefetch_update};
 use super::{
-    ClientConnectionInfo, ClientDebugState, FileTouchService, SessionInterruptQueues, SwarmEvent,
-    SwarmMember, SwarmState, VersionedPlan, broadcast_swarm_status, fanout_live_client_event,
+    ClientConnectionInfo, ClientDebugState, FileTouchService, SessionInterruptQueues,
+    SwarmState, fanout_live_client_event,
     persist_swarm_state_for, register_background_tool_signal, register_session_event_sender,
-    register_session_interrupt_queue, remove_background_tool_signal, remove_plan_participant,
-    remove_session_channel_subscriptions, remove_session_from_swarm,
-    remove_session_interrupt_queue, rename_background_tool_signal, rename_plan_participant,
+    register_session_interrupt_queue, remove_background_tool_signal,
+    remove_session_interrupt_queue, rename_background_tool_signal,
     rename_session_interrupt_queue, send_swarm_plan_to_session, swarm_id_for_session,
-    unregister_session_event_sender, update_member_status,
+    unregister_session_event_sender,
 };
 use crate::agent::Agent;
 use crate::message::ContentBlock;
-use crate::protocol::{NotificationType, ServerEvent};
+use crate::protocol::ServerEvent;
 use crate::provider::Provider;
 use crate::tool::Registry;
 use crate::transport::WriteHalf;
 use anyhow::Result;
 use futures::FutureExt;
 use jcode_agent_runtime::InterruptSignal;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 
 type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
-type ChannelSubscriptions = Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
 const RELOAD_RESTORE_MARKER_MAX_AGE: Duration = Duration::from_secs(60);
 
 pub(super) fn session_was_interrupted_by_reload(agent: &Agent) -> bool {
@@ -142,17 +141,12 @@ pub(super) async fn handle_clear_session(
     shutdown_signals: &Arc<RwLock<HashMap<String, InterruptSignal>>>,
     soft_interrupt_queues: &SessionInterruptQueues,
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    file_touch: &FileTouchService,
-    channel_subscriptions: &ChannelSubscriptions,
-    channel_subscriptions_by_session: &ChannelSubscriptions,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
+    swarm: &SwarmServiceHandle,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
+    // Swarm-domain state is reached through the swarm service handle. These
+    // locals keep the body single-homed on the handle's fields instead of a
+    // flat pass-through argument bag (server service split, Slice 4).
     let clear_start = Instant::now();
     let old_session_id = client_session_id.clone();
     crate::logging::event_info(
@@ -229,30 +223,14 @@ pub(super) async fn handle_clear_session(
 
     // `/clear` creates a genuinely fresh session. Do not migrate the old
     // session's swarm membership or plan participation to the replacement:
-    // doing so lets a subsequent plan snapshot repopulate the cleared UI.
-    let (swarm_id_for_update, swarm_enabled, friendly_name) = {
-        let mut members = swarm_members.write().await;
-        match members.remove(client_session_id) {
-            Some(member) => (member.swarm_id, member.swarm_enabled, member.friendly_name),
-            None => (None, false, None),
-        }
-    };
-    if let Some(ref swarm_id) = swarm_id_for_update {
-        let mut swarms = swarms_by_id.write().await;
-        if let Some(swarm) = swarms.get_mut(swarm_id) {
-            swarm.remove(client_session_id);
-            if swarm.is_empty() {
-                swarms.remove(swarm_id);
-            }
-        }
-    }
-    file_touch.clear_session(client_session_id).await;
-    remove_session_channel_subscriptions(
-        client_session_id,
-        channel_subscriptions,
-        channel_subscriptions_by_session,
-    )
-    .await;
+    // doing so lets a subsequent plan snapshot repopulate the cleared UI. The
+    // swarm side effects (members, swarms_by_id, file-touch, channels) are
+    // owned by the swarm service and run via the handle.
+    let MemberIdentity {
+        swarm_id: swarm_id_for_update,
+        swarm_enabled,
+        friendly_name,
+    } = swarm.take_session_membership(client_session_id).await;
     // The connection remains subscribed across `/clear`, so there is no later
     // subscribe request to register the replacement session. Register it as a
     // fresh root while deliberately leaving the old swarm and plan behind.
@@ -263,26 +241,12 @@ pub(super) async fn handle_clear_session(
         client_event_tx,
         agent,
         swarm_enabled,
-        swarm_members,
-        swarms_by_id,
-        event_history,
-        event_counter,
-        swarm_event_tx,
+        swarm,
     )
     .await;
-    update_member_status(
-        &new_id,
-        "ready",
-        None,
-        swarm_members,
-        swarms_by_id,
-        Some(event_history),
-        Some(event_counter),
-        Some(swarm_event_tx),
-    )
-    .await;
+    swarm.set_member_status(&new_id, "ready", None).await;
     if let Some(ref swarm_id) = swarm_id_for_update {
-        remove_plan_participant(swarm_id, client_session_id, swarm_plans).await;
+        swarm.remove_plan_participant(swarm_id, client_session_id).await;
     }
 
     *client_session_id = new_id.clone();
@@ -313,7 +277,6 @@ pub(super) async fn handle_clear_session(
     );
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn ensure_client_swarm_member(
     client_session_id: &str,
     client_connection_id: &str,
@@ -321,11 +284,7 @@ async fn ensure_client_swarm_member(
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
     agent: &Arc<Mutex<Agent>>,
     swarm_enabled: bool,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
+    swarm: &SwarmServiceHandle,
 ) -> bool {
     let (working_dir, derived_swarm_id, fallback_name) = {
         // A target-aware subscribe can attach to an agent that is in the middle
@@ -364,90 +323,21 @@ async fn ensure_client_swarm_member(
     // the temporary pre-resume session name can otherwise leak onto the real
     // resumed session and corrupt swarm metadata.
     let member_name = fallback_name.or_else(|| friendly_name.clone());
-    let mut inserted = false;
-    {
-        let mut members = swarm_members.write().await;
-        if let Some(member) = members.get_mut(client_session_id) {
-            member.event_tx = client_event_tx.clone();
-            member
-                .event_txs
-                .insert(client_connection_id.to_string(), client_event_tx.clone());
-            member.swarm_enabled = swarm_enabled;
-            member.is_headless = false;
-            if member_name.is_some() {
-                member.friendly_name = member_name.clone();
-            }
-        } else {
-            let now = Instant::now();
-            members.insert(
-                client_session_id.to_string(),
-                SwarmMember {
-                    session_id: client_session_id.to_string(),
-                    event_tx: client_event_tx.clone(),
-                    event_txs: HashMap::from([(
-                        client_connection_id.to_string(),
-                        client_event_tx.clone(),
-                    )]),
-                    working_dir: working_dir.clone(),
-                    swarm_id: derived_swarm_id.clone(),
-                    swarm_enabled,
-                    status: "ready".to_string(),
-                    detail: None,
-                    task_label: None,
-                    friendly_name: member_name.clone(),
-                    report_back_to_session_id: None,
-                    latest_completion_report: None,
-                    role: "agent".to_string(),
-                    joined_at: now,
-                    last_status_change: now,
-                    is_headless: false,
-                    output_tail: None,
-                    todo_progress: None,
-                    todo_items: Vec::new(),
-                    runtime: crate::protocol::SwarmMemberRuntime::default(),
-                },
-            );
-            inserted = true;
-        }
-    }
 
-    if inserted && let Some(ref swarm_id_ref) = derived_swarm_id {
-        let mut swarms = swarms_by_id.write().await;
-        swarms
-            .entry(swarm_id_ref.to_string())
-            .or_insert_with(HashSet::new)
-            .insert(client_session_id.to_string());
-        drop(swarms);
-        super::record_swarm_event(
-            event_history,
-            event_counter,
-            swarm_event_tx,
-            client_session_id.to_string(),
+    // Session reads its own agent to resolve identity metadata, then hands the
+    // resolved values to the swarm service to register/refresh the member. The
+    // swarm maps and event sinks are owned by the swarm service (Slice 4).
+    swarm
+        .ensure_member(
+            client_session_id,
+            client_connection_id,
             member_name,
-            Some(swarm_id_ref.to_string()),
-            crate::server::SwarmEventType::MemberChange {
-                action: "joined".to_string(),
-            },
+            working_dir,
+            derived_swarm_id,
+            swarm_enabled,
+            client_event_tx,
         )
-        .await;
-    }
-
-    crate::logging::event_info(
-        "SESSION_LIFECYCLE",
-        vec![
-            ("phase", "swarm_member_registered".to_string()),
-            ("session_id", client_session_id.to_string()),
-            ("client_connection_id", client_connection_id.to_string()),
-            ("inserted", inserted.to_string()),
-            ("swarm_enabled", swarm_enabled.to_string()),
-            (
-                "swarm_id",
-                derived_swarm_id.unwrap_or_else(|| "none".to_string()),
-            ),
-        ],
-    );
-
-    inserted
+        .await
 }
 
 /// Resolve the working directory a subscribe should actually bind to.
@@ -603,18 +493,16 @@ pub(super) async fn handle_subscribe(
     agent: &Arc<Mutex<Agent>>,
     registry: &Registry,
     swarm_enabled: bool,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    channel_subscriptions: &ChannelSubscriptions,
-    channel_subscriptions_by_session: &ChannelSubscriptions,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
+    swarm: &SwarmServiceHandle,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
     mcp_pool: &Arc<crate::mcp::SharedMcpPool>,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
 ) {
+    // Swarm-domain state is reached through the swarm service handle. These
+    // locals keep the body single-homed on the handle's fields instead of a
+    // flat pass-through argument bag (server service split, Slice 4).
+    let swarm_members = &swarm.swarm_state().members;
+    let swarm_plans = &swarm.swarm_state().plans;
+
     let subscribe_start = Instant::now();
     crate::logging::event_info(
         "SESSION_LIFECYCLE",
@@ -638,11 +526,7 @@ pub(super) async fn handle_subscribe(
         client_event_tx,
         agent,
         swarm_enabled,
-        swarm_members,
-        swarms_by_id,
-        event_history,
-        event_counter,
-        swarm_event_tx,
+        swarm,
     )
     .await;
 
@@ -677,60 +561,13 @@ pub(super) async fn handle_subscribe(
             crate::tool::compass_query::prewarm_compass_index(Path::new(&bound_dir));
         }
 
-        let new_path = PathBuf::from(&bound_dir);
-        let mut old_swarm_id: Option<String> = None;
-        let mut updated_swarm_id: Option<String> = None;
-        {
-            let mut members = swarm_members.write().await;
-            if let Some(member) = members.get_mut(client_session_id) {
-                old_swarm_id = member.swarm_id.clone();
-                // Existing members include reconnects and daemon-restored
-                // sessions. Keep their persisted swarm id so an intentional
-                // resume retains its workers and plan. Only a newly inserted
-                // root receives the new session-scoped identity.
-                let new_swarm_id = if inserted_swarm_member {
-                    swarm_id_for_session(client_session_id)
-                } else {
-                    member
-                        .swarm_id
-                        .clone()
-                        .or_else(|| swarm_id_for_session(client_session_id))
-                };
-                member.working_dir = Some(new_path);
-                member.swarm_id = if member.swarm_enabled {
-                    new_swarm_id.clone()
-                } else {
-                    None
-                };
-                updated_swarm_id = member.swarm_id.clone();
-            }
-        }
-
-        if let Some(ref old_id) = old_swarm_id {
-            if updated_swarm_id.as_ref() != Some(old_id) {
-                remove_session_channel_subscriptions(
-                    client_session_id,
-                    channel_subscriptions,
-                    channel_subscriptions_by_session,
-                )
-                .await;
-            }
-            let mut swarms = swarms_by_id.write().await;
-            if let Some(swarm) = swarms.get_mut(old_id) {
-                swarm.remove(client_session_id);
-                if swarm.is_empty() {
-                    swarms.remove(old_id);
-                }
-            }
-        }
-
-        if let Some(ref new_id) = updated_swarm_id {
-            let mut swarms = swarms_by_id.write().await;
-            swarms
-                .entry(new_id.clone())
-                .or_insert_with(HashSet::new)
-                .insert(client_session_id.to_string());
-        }
+        let (old_swarm_id, updated_swarm_id) = swarm
+            .move_member_between_swarms(
+                client_session_id,
+                PathBuf::from(&bound_dir),
+                inserted_swarm_member,
+            )
+            .await;
 
         if updated_swarm_id != old_swarm_id {
             crate::logging::event_info(
@@ -751,70 +588,6 @@ pub(super) async fn handle_subscribe(
                     ),
                 ],
             );
-            let mut members = swarm_members.write().await;
-            if let Some(member) = members.get_mut(client_session_id) {
-                member.role = "agent".to_string();
-            }
-        }
-
-        if let Some(old_id) = old_swarm_id.clone() {
-            let was_coordinator = {
-                let coordinators = swarm_coordinators.read().await;
-                coordinators
-                    .get(&old_id)
-                    .map(|session_id| session_id == client_session_id)
-                    .unwrap_or(false)
-            };
-            if was_coordinator {
-                let mut new_coordinator: Option<String> = None;
-                {
-                    let swarms = swarms_by_id.read().await;
-                    if let Some(swarm) = swarms.get(&old_id) {
-                        new_coordinator = swarm.iter().min().cloned();
-                    }
-                }
-                {
-                    let mut coordinators = swarm_coordinators.write().await;
-                    coordinators.remove(&old_id);
-                    if let Some(ref new_id) = new_coordinator {
-                        coordinators.insert(old_id.clone(), new_id.clone());
-                    }
-                }
-                if let Some(new_id) = new_coordinator.clone() {
-                    let members = swarm_members.read().await;
-                    if let Some(member) = members.get(&new_id) {
-                        let _ = member.event_tx.send(ServerEvent::Notification {
-                            from_session: new_id.clone(),
-                            from_name: member.friendly_name.clone(),
-                            notification_type: NotificationType::Message {
-                                scope: Some("swarm".to_string()),
-                                channel: None,
-                                tldr: None,
-                            },
-                            message: "You are now the coordinator for this swarm.".to_string(),
-                        });
-                    }
-                }
-            }
-        }
-
-        if let Some(old_id) = old_swarm_id.clone() {
-            if updated_swarm_id.as_ref() != Some(&old_id) {
-                remove_plan_participant(&old_id, client_session_id, swarm_plans).await;
-                let swarm_state = SwarmState {
-                    members: Arc::clone(swarm_members),
-                    swarms_by_id: Arc::clone(swarms_by_id),
-                    plans: Arc::clone(swarm_plans),
-                    coordinators: Arc::clone(swarm_coordinators),
-                };
-                persist_swarm_state_for(&old_id, &swarm_state).await;
-            }
-            broadcast_swarm_status(&old_id, swarm_members, swarms_by_id).await;
-        }
-        if let Some(new_id) = updated_swarm_id
-            && old_swarm_id.as_ref() != Some(&new_id)
-        {
-            broadcast_swarm_status(&new_id, swarm_members, swarms_by_id).await;
         }
     }
 
@@ -891,18 +664,8 @@ pub(super) async fn handle_subscribe(
         ],
     );
 
-    if subscribe_should_mark_ready(client_session_id, swarm_members).await {
-        update_member_status(
-            client_session_id,
-            "ready",
-            None,
-            swarm_members,
-            swarms_by_id,
-            Some(event_history),
-            Some(event_counter),
-            Some(swarm_event_tx),
-        )
-        .await;
+    if swarm.member_should_mark_ready(client_session_id).await {
+        swarm.set_member_status(client_session_id, "ready", None).await;
     }
 
     // Re-send the current swarm plan so a reconnecting client renders the
@@ -931,63 +694,15 @@ fn prewarm_idle_agent(agent: &Arc<Mutex<Agent>>) -> bool {
     guard.prewarm_provider().now_or_never().is_some()
 }
 
-async fn subscribe_should_mark_ready(
-    client_session_id: &str,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-) -> bool {
-    let members = swarm_members.read().await;
-    members
-        .get(client_session_id)
-        .is_none_or(|member| member.status != "running")
-}
-
-async fn rename_swarm_member_session(
-    old_session_id: &str,
-    new_session_id: &str,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-) {
-    // Never hold both swarm maps at once. Coordinator cleanup reads them in the
-    // opposite order, so retaining the member write guard while waiting for the
-    // swarm map can permanently deadlock reconnects and every later subscribe.
-    let renamed_swarm_id = {
-        let mut members = swarm_members.write().await;
-        let renamed_swarm_id = members.remove(old_session_id).and_then(|mut member| {
-            let swarm_id = member.swarm_id.clone();
-            member.session_id = new_session_id.to_string();
-            member.status = "ready".to_string();
-            member.detail = None;
-            members.insert(new_session_id.to_string(), member);
-            swarm_id
-        });
-
-        // Keep the spawn tree intact across the rename: children that reported
-        // back to the old session id must follow it.
-        for member in members.values_mut() {
-            if member.report_back_to_session_id.as_deref() == Some(old_session_id) {
-                member.report_back_to_session_id = Some(new_session_id.to_string());
-            }
-        }
-        renamed_swarm_id
-    };
-
-    if let Some(swarm_id) = renamed_swarm_id {
-        let mut swarms = swarms_by_id.write().await;
-        if let Some(swarm) = swarms.get_mut(&swarm_id) {
-            swarm.remove(old_session_id);
-            swarm.insert(new_session_id.to_string());
-        }
-    }
-}
-
 pub(super) async fn handle_reload(
     id: u64,
     force: bool,
     client_session_id: &str,
     agent: &Arc<Mutex<Agent>>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    swarm: &SwarmServiceHandle,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
+    let swarm_members = &swarm.swarm_state().members;
     // A non-forced reload (e.g. `jcode server reload`) is a graceful upgrade
     // request: only reload when this server is provably running older code than
     // an available reload candidate. This keeps us from downgrading a newer
@@ -1082,14 +797,10 @@ async fn cleanup_detached_source_session_if_unused(
     shutdown_signals: &Arc<RwLock<HashMap<String, InterruptSignal>>>,
     soft_interrupt_queues: &SessionInterruptQueues,
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    swarm: &SwarmServiceHandle,
     file_touch: &FileTouchService,
-    channel_subscriptions: &ChannelSubscriptions,
-    channel_subscriptions_by_session: &ChannelSubscriptions,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
 ) {
+    let swarm_members = &swarm.swarm_state().members;
     unregister_session_event_sender(swarm_members, old_session_id, client_connection_id).await;
 
     if !remove_detached_source_if_unclaimed(
@@ -1115,30 +826,14 @@ async fn cleanup_detached_source_session_if_unused(
     }
     remove_background_tool_signal(old_session_id);
     remove_session_interrupt_queue(soft_interrupt_queues, old_session_id).await;
-    remove_session_channel_subscriptions(
-        old_session_id,
-        channel_subscriptions,
-        channel_subscriptions_by_session,
-    )
-    .await;
+    swarm.remove_session_channel_subscriptions(old_session_id).await;
     file_touch.clear_session(old_session_id).await;
 
-    let removed_swarm_id = {
-        let mut members = swarm_members.write().await;
-        members
-            .remove(old_session_id)
-            .and_then(|member| member.swarm_id)
-    };
-    if let Some(swarm_id) = removed_swarm_id {
-        remove_session_from_swarm(
-            old_session_id,
-            &swarm_id,
-            swarm_members,
-            swarms_by_id,
-            swarm_coordinators,
-            swarm_plans,
-        )
-        .await;
+    let removed_swarm_id = swarm.remove_session_member(old_session_id).await;
+    if let Some(swarm_id) = removed_swarm_id.swarm_id {
+        swarm
+            .remove_session_from_swarm(old_session_id, &swarm_id)
+            .await;
     }
 }
 
@@ -1218,24 +913,23 @@ pub(super) async fn handle_resume_session(
     soft_interrupt_queues: &SessionInterruptQueues,
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
     client_debug_state: &Arc<RwLock<ClientDebugState>>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    file_touch: &FileTouchService,
-    channel_subscriptions: &ChannelSubscriptions,
-    channel_subscriptions_by_session: &ChannelSubscriptions,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
+    swarm: &SwarmServiceHandle,
     client_count: &Arc<RwLock<usize>>,
     writer: &Arc<Mutex<WriteHalf>>,
     server_name: &str,
     server_icon: &str,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
     mcp_pool: &Arc<crate::mcp::SharedMcpPool>,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
-    supports_pdf_panels: bool,
 ) -> Result<Arc<Mutex<Agent>>> {
+    // Swarm-domain state is reached through the swarm service handle. These
+    // locals keep the body single-homed on the handle's fields instead of a
+    // flat pass-through argument bag (server service split, Slice 4).
+    let swarm_members = &swarm.swarm_state().members;
+    let swarms_by_id = &swarm.swarm_state().swarms_by_id;
+    let swarm_plans = &swarm.swarm_state().plans;
+    let swarm_coordinators = &swarm.swarm_state().coordinators;
+    let file_touch = swarm.file_touch();
+
     let resume_start = Instant::now();
     let incoming_client_instance_id = client_instance_id.map(str::to_string);
     crate::logging::event_info(
@@ -1309,13 +1003,8 @@ pub(super) async fn handle_resume_session(
             shutdown_signals,
             soft_interrupt_queues,
             client_connections,
-            swarm_members,
-            swarms_by_id,
+            swarm,
             file_touch,
-            channel_subscriptions,
-            channel_subscriptions_by_session,
-            swarm_plans,
-            swarm_coordinators,
         )
         .await;
 
@@ -1418,7 +1107,7 @@ pub(super) async fn handle_resume_session(
             server_name,
             server_icon,
             None,
-            supports_pdf_panels,
+            false,
         )
         .await?;
         let _ = client_event_tx.send(ServerEvent::Done { id });
@@ -1640,41 +1329,17 @@ pub(super) async fn handle_resume_session(
                 }
             }
 
-            rename_swarm_member_session(&old_session_id, &session_id, swarm_members, swarms_by_id)
-                .await;
-            remove_session_channel_subscriptions(
-                &old_session_id,
-                channel_subscriptions,
-                channel_subscriptions_by_session,
-            )
-            .await;
+            swarm.rename_member_session(&old_session_id, &session_id).await;
+            swarm.remove_session_channel_subscriptions(&old_session_id).await;
             file_touch.clear_session(&old_session_id).await;
-            {
-                let mut coordinators = swarm_coordinators.write().await;
-                for coordinator in coordinators.values_mut() {
-                    if *coordinator == old_session_id {
-                        *coordinator = session_id.clone();
-                    }
-                }
-            }
-            update_member_status(
-                &session_id,
-                "ready",
-                None,
-                swarm_members,
-                swarms_by_id,
-                Some(event_history),
-                Some(event_counter),
-                Some(swarm_event_tx),
-            )
-            .await;
+            swarm.set_member_status(&session_id, "ready", None).await;
             if let Some(swarm_id) = {
                 let members = swarm_members.read().await;
                 members
                     .get(&session_id)
                     .and_then(|member| member.swarm_id.clone())
             } {
-                rename_plan_participant(&swarm_id, &old_session_id, &session_id, swarm_plans).await;
+                swarm.rename_plan_participant(&swarm_id, &old_session_id, &session_id).await;
                 let swarm_state = SwarmState {
                     members: Arc::clone(swarm_members),
                     swarms_by_id: Arc::clone(swarms_by_id),
@@ -1705,7 +1370,7 @@ pub(super) async fn handle_resume_session(
                 server_name,
                 server_icon,
                 Some(was_interrupted),
-                supports_pdf_panels,
+                false,
             )
             .await?;
             let _ = client_event_tx.send(ServerEvent::Done { id });

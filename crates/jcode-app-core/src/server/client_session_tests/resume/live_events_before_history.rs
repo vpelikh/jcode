@@ -76,7 +76,6 @@ async fn handle_resume_session_registers_live_events_before_history_replay() -> 
         },
     )])));
     let swarms_by_id = Arc::new(RwLock::new(HashMap::<String, HashSet<String>>::new()));
-    let file_touch = FileTouchService::new();
     let channel_subscriptions = Arc::new(RwLock::new(HashMap::<
         String,
         HashMap<String, HashSet<String>>,
@@ -110,7 +109,6 @@ async fn handle_resume_session_registers_live_events_before_history_replay() -> 
         let client_debug_state = Arc::clone(&client_debug_state);
         let swarm_members = Arc::clone(&swarm_members);
         let swarms_by_id = Arc::clone(&swarms_by_id);
-        let file_touch = file_touch.clone();
         let channel_subscriptions = Arc::clone(&channel_subscriptions);
         let channel_subscriptions_by_session = Arc::clone(&channel_subscriptions_by_session);
         let swarm_plans = Arc::clone(&swarm_plans);
@@ -141,23 +139,23 @@ async fn handle_resume_session_registers_live_events_before_history_replay() -> 
                 &soft_interrupt_queues,
                 &client_connections,
                 &client_debug_state,
-                &swarm_members,
-                &swarms_by_id,
-                &file_touch,
-                &channel_subscriptions,
-                &channel_subscriptions_by_session,
-                &swarm_plans,
-                &swarm_coordinators,
+                &crate::server::test_util::TestSwarmBuilder::default()
+                    .members(swarm_members.clone())
+                    .swarms_by_id(swarms_by_id.clone())
+                    .plans(swarm_plans.clone())
+                    .coordinators(swarm_coordinators.clone())
+                    .channel_subscriptions(channel_subscriptions.clone())
+                    .channel_subscriptions_by_session(channel_subscriptions_by_session.clone())
+                    .event_history(event_history.clone())
+                    .event_counter(event_counter.clone())
+                    .swarm_event_tx(swarm_event_tx.clone())
+                    .build(),
                 &client_count,
                 &writer,
                 "test-server",
                 "🌿",
                 &client_event_tx,
                 &mcp_pool,
-                &event_history,
-                &event_counter,
-                &swarm_event_tx,
-                false,
             )
             .await
         }

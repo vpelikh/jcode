@@ -73,7 +73,6 @@ async fn handle_resume_session_allows_attach_without_local_history() -> Result<(
     let client_debug_state = Arc::new(RwLock::new(ClientDebugState::default()));
     let swarm_members = Arc::new(RwLock::new(HashMap::<String, SwarmMember>::new()));
     let swarms_by_id = Arc::new(RwLock::new(HashMap::<String, HashSet<String>>::new()));
-    let file_touch = FileTouchService::new();
     let channel_subscriptions = Arc::new(RwLock::new(HashMap::<
         String,
         HashMap<String, HashSet<String>>,
@@ -113,23 +112,23 @@ async fn handle_resume_session_allows_attach_without_local_history() -> Result<(
         &soft_interrupt_queues,
         &client_connections,
         &client_debug_state,
-        &swarm_members,
-        &swarms_by_id,
-        &file_touch,
-        &channel_subscriptions,
-        &channel_subscriptions_by_session,
-        &swarm_plans,
-        &swarm_coordinators,
+        &crate::server::test_util::TestSwarmBuilder::default()
+            .members(swarm_members.clone())
+            .swarms_by_id(swarms_by_id.clone())
+            .plans(swarm_plans.clone())
+            .coordinators(swarm_coordinators.clone())
+            .channel_subscriptions(channel_subscriptions.clone())
+            .channel_subscriptions_by_session(channel_subscriptions_by_session.clone())
+            .event_history(event_history.clone())
+            .event_counter(event_counter.clone())
+            .swarm_event_tx(swarm_event_tx.clone())
+            .build(),
         &client_count,
         &writer,
         "test-server",
         "🌿",
         &client_event_tx,
         &mcp_pool,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
-        false,
     )
     .await?;
 
