@@ -86,7 +86,7 @@ pub(super) async fn handle_lightweight_control_request(
     let swarm_members = &swarm.swarm_state.members;
     let swarms_by_id = &swarm.swarm_state.swarms_by_id;
     let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
-    let await_members_runtime = &swarm.await_members_runtime;
+    let await_members_runtime = swarm.await_members_runtime();
     if let Request::Ping { id } = request {
         write_direct_event(
             &writer,

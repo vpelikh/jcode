@@ -1183,7 +1183,7 @@ pub(super) async fn handle_comm_assign_role(
 ) {
     let swarm_members = &swarm.swarm_state.members;
     let swarm_coordinators = &swarm.swarm_state.coordinators;
-    let swarm_mutation_runtime = &swarm.swarm_mutation_runtime;
+    let swarm_mutation_runtime = swarm.swarm_mutation_runtime();
     let (swarm_id, is_coordinator) = {
         let members = swarm_members.read().await;
         let swarm_id = members
@@ -1383,7 +1383,7 @@ async fn handle_comm_assign_task_with_mode(
     let swarms_by_id = &swarm.swarm_state.swarms_by_id;
     let swarm_plans = &swarm.swarm_state.plans;
     let swarm_coordinators = &swarm.swarm_state.coordinators;
-    let swarm_mutation_runtime = &swarm.swarm_mutation_runtime;
+    let swarm_mutation_runtime = swarm.swarm_mutation_runtime();
     let sessions = &session.sessions;
     let requested_target_session = target_session.and_then(|target| {
         let trimmed = target.trim();

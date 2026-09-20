@@ -838,7 +838,7 @@ pub(super) async fn handle_comm_spawn(
     client_connections: &ClientConnections,
 ) {
     let swarm_members = &swarm.swarm_state.members;
-    let swarm_mutation_runtime = &swarm.swarm_mutation_runtime;
+    let swarm_mutation_runtime = swarm.swarm_mutation_runtime();
     // Hold this swarm's admission through member registration so concurrent
     // recursive requests cannot all pass the population check against stale
     // state. Unrelated swarms retain independent spawn throughput.
@@ -973,7 +973,7 @@ pub(super) async fn handle_comm_stop(
     // locals keep the body single-homed on the handle's fields (server service
     // split, Slice 4).
     let swarm_members = &swarm.swarm_state.members;
-    let swarm_mutation_runtime = &swarm.swarm_mutation_runtime;
+    let swarm_mutation_runtime = swarm.swarm_mutation_runtime();
     // Stopping is authorized per-target by ownership (the requester is the
     // target's spawner or a transitive ancestor) rather than by the swarm-level
     // coordinator slot, so that any parent can stop agents in its own subtree.

@@ -1053,6 +1053,60 @@ Zero behavior change; the `jcode-app-core` lib suite stays green (server module
 > boundary remains open and should be settled before methods are baked directly
 > onto the handle for those indexes.
 
+### Tier 3 encapsulation: `SwarmServiceHandle.swarm_mutation_runtime` privatized (landed 2026-09)
+
+The second true Tier 3 encapsulation continues the field-privatization pass: the
+`SwarmServiceHandle.swarm_mutation_runtime` field is no longer `pub(crate)`.
+
+- The `swarm_mutation_runtime` field on `SwarmServiceHandle` is now private, with
+  a `swarm_mutation_runtime()` accessor returning `&SwarmMutationRuntime`,
+  mirroring the `file_touch()` precedent. All reads/writes continue to route
+  through the encapsulated `SwarmMutationRuntime` (the persisted dedupe registry
+  for mutating swarm coordinator operations); callers no longer reach into the
+  raw registry.
+- All seven production access sites now go through the accessor instead of
+  `&swarm.swarm_mutation_runtime`: `handle_comm_assign_role` and
+  `handle_comm_assign_task_with_mode` (`comm_control.rs`), `handle_comm_propose_plan`
+  / `handle_comm_approve_plan` / `handle_comm_reject_plan` (`comm_plan.rs`), and
+  `handle_comm_spawn` / `handle_comm_stop` (`comm_session.rs`). The unused
+  `_swarm_mutation_runtime` binding in `comm_plan.rs` was updated to go through
+  the accessor too, keeping the body single-homed on handle accessors.
+- Test fixtures are unaffected: `TestSwarmBuilder::swarm_mutation_runtime(v)`
+  continues to seed the (now-private) field via `test_with_state`, which accepts
+  the runtime as an argument.
+
+Zero behavior change; the `jcode-app-core` lib suite stays green (server module
+473 passing) and clippy adds no new warnings.
+
+### Tier 3 encapsulation: `SwarmServiceHandle.await_members_runtime` privatized (landed 2026-09)
+
+The third Tier 3 encapsulation slice completes the non-`swarm_state` field
+privatization: the `SwarmServiceHandle.await_members_runtime` field is no longer
+`pub(crate)`.
+
+- The `await_members_runtime` field on `SwarmServiceHandle` is now private, with
+  an `await_members_runtime()` accessor returning `&AwaitMembersRuntime`,
+  mirroring the `file_touch()` / `swarm_mutation_runtime()` precedent. All reads
+  and writes route through the encapsulated `AwaitMembersRuntime` (the persisted
+  communicate await_members wait registry); callers do not reach into the raw
+  waiters/active-key maps.
+- The two direct handle access sites go through the accessor:
+  `client_lifecycle.rs::handle_client` (clones the `Arc`-backed service via the
+  accessor before the `swarm_state` destructuring, alongside `file_touch`) and
+  `client_lightweight_control.rs` (pure borrow). The downstream `ctx.
+  await_members_runtime` references in `comm_await.rs` are on a local context
+  struct passed out of the handle and are unchanged.
+- Test fixtures are unaffected (`AwaitMembersRuntime` stays `Clone`, seeded via
+  `test_with_state`).
+
+With this slice, `file_touch`, `swarm_mutation_runtime`, `await_members_runtime`,
+the event-history/counter/broadcast sinks, the shared-context map, and the
+channel-subscription indexes are all private on `SwarmServiceHandle`. The only
+remaining `pub(crate)` field is `swarm_state` itself.
+
+Zero behavior change; the `jcode-app-core` lib suite stays green (server module
+473 passing) and clippy adds no new warnings.
+
 ## Tier 1 convergence status (landed 2026-09)
 
 The flat swarm-map argument convergence on the swarm/client router boundary is
