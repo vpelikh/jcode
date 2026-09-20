@@ -330,6 +330,54 @@ fn repo_with_remote(dir: &std::path::Path) {
         .output();
 }
 
+/// The boot-injection gate: inject only on a fresh conversation with a handoff.
+#[test]
+fn should_inject_gates_on_fresh_conversation_and_handoff() {
+    let _guard = crate::storage::lock_test_env();
+    let before = std::env::var_os("JCODE_HOME");
+    let home = tempfile::TempDir::new().expect("tempdir");
+    crate::env::set_var("JCODE_HOME", home.path());
+    let cwd = std::env::temp_dir().join("jcode-gate-test");
+
+    // No handoff yet -> never inject.
+    assert!(!should_inject(true, Some(&cwd)));
+    assert!(!should_inject(false, Some(&cwd)));
+
+    // Create a handoff.
+    std::fs::create_dir_all(&cwd).ok();
+    crate::todo::save_todos(
+        "s-gate",
+        &[TodoItem {
+            id: "g".into(),
+            content: "open work".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: None,
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .expect("todos");
+    capture("s-gate", Some(&cwd), "closed", None).expect("capture");
+
+    // With a handoff: fresh conversation injects, an ongoing one does not.
+    assert!(should_inject(true, Some(&cwd)), "fresh session should inject");
+    assert!(
+        !should_inject(false, Some(&cwd)),
+        "an already-running session must not re-inject"
+    );
+
+    // A different (unrelated) project never injects from another's handoff.
+    let unrelated = std::env::temp_dir().join("jcode-gate-other");
+    std::fs::create_dir_all(&unrelated).ok();
+    assert!(!should_inject(true, Some(&unrelated)));
+
+    match before {
+        Some(value) => crate::env::set_var("JCODE_HOME", value),
+        None => crate::env::remove_var("JCODE_HOME"),
+    }
+}
+
 /// End-to-end through the public API over the real storage layout: capture on
 /// close, boot-render from a *different* checkout path of the same project
 /// (proves cross-path injection), and promote to an initiative.

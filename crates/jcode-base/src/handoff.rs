@@ -268,6 +268,17 @@ pub fn render_boot_context(working_dir: Option<&Path>) -> Option<String> {
     Some(out)
 }
 
+/// Decide whether to inject a handoff into the system prompt at session start.
+///
+/// Mirrors the gate used by `Agent::build_system_prompt_split`: a handoff is
+/// injected only at the very start of a fresh conversation (no visible
+/// messages yet), so an already-running session does not re-announce it every
+/// turn. Exposed as a pure function so the injection decision is testable in
+/// isolation without constructing an `Agent`.
+pub fn should_inject(fresh_conversation: bool, working_dir: Option<&Path>) -> bool {
+    fresh_conversation && render_boot_context(working_dir).is_some()
+}
+
 /// Promote a handoff snapshot into a durable project-scoped `initiative` goal.
 ///
 /// This is the bridge from transient handoff scratch to the curated `goals/`
