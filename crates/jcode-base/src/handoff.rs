@@ -26,7 +26,7 @@ use crate::todo::{TodoItem, load_plan, load_todos};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -77,6 +77,17 @@ pub struct IndexEntry {
 }
 
 const MAX_INDEX_ENTRIES: usize = 64;
+
+/// Default maximum number of archived snapshot files kept per project on disk,
+/// beyond the single live handoff the index retains. Older snapshots beyond
+/// this are pruned. The `MAX_INDEX_ENTRIES` cap bounds the index; this bounds
+/// the archived *files* that `list_all_handoffs` surfaces, so the picker does
+/// not grow without bound as sessions accumulate.
+const MAX_ARCHIVED_SNAPSHOTS_PER_PROJECT: usize = 16;
+
+/// Default maximum age of archived snapshot files, in days. Snapshots older
+/// than this are pruned even when they are under the per-project count cap.
+const MAX_ARCHIVED_SNAPSHOT_AGE_DAYS: i64 = 30;
 
 /// Compute a portable project identity from a working directory.
 ///
@@ -190,7 +201,10 @@ pub fn capture(
         return None;
     };
     match write_snapshot_locked(&snapshot) {
-        Ok(()) => Some(snapshot),
+        Ok(()) => {
+            prune_archived_snapshots();
+            Some(snapshot)
+        }
         Err(err) => {
             crate::logging::warn(&format!(
                 "[handoff] failed to persist handoff session={} error={}",
@@ -410,6 +424,120 @@ pub fn list_all_handoffs() -> Vec<HandoffSnapshot> {
     }
     snapshots.sort_by(|a, b| b.ended_at.cmp(&a.ended_at));
     snapshots
+}
+
+/// Prune archived handoff snapshot files so the store does not grow without
+/// bound as sessions accumulate.
+///
+/// The index already caps live per-project entries at `MAX_INDEX_ENTRIES`, but
+/// the archived snapshot files it drops still persist on disk and are surfaced
+/// by [`list_all_handoffs`]. This enforces a retention policy over those
+/// files:
+///
+/// - Snapshots beyond `MAX_ARCHIVED_SNAPSHOTS_PER_PROJECT` for a single project
+///   are removed (oldest first), keeping the picker's per-project archive
+///   bounded.
+/// - Snapshots older than `MAX_ARCHIVED_SNAPSHOT_AGE_DAYS` are removed
+///   regardless of count.
+///
+/// Live handoffs — the latest per project, as held by the index — are never
+/// pruned; only superseded archived snapshots are eligible. This runs after a
+/// successful [`capture`] write. Failures to read or delete individual files
+/// are ignored (best-effort), and a missing or unreadable store is a no-op.
+pub fn prune_archived_snapshots() {
+    let Ok(index) = load_index_opt() else {
+        return;
+    };
+    // Live handoffs: the latest per project recorded by the index.
+    let mut live: HashMap<String, String> = HashMap::new();
+    for entry in &index.latest {
+        live
+            .entry(entry.project_key.clone())
+            .or_insert_with(|| entry.session_id.clone());
+    }
+
+    let Ok(dir) = handoffs_dir() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+
+    // Collect candidate snapshots grouped by project, excluding live handoffs.
+    let mut by_project: HashMap<String, Vec<HandoffSnapshot>> = HashMap::new();
+    let mut seen = HashSet::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if file_name == "index.json" {
+            continue;
+        }
+        let session_id = file_name
+            .strip_suffix(".json")
+            .unwrap_or_default()
+            .to_string();
+        if session_id.is_empty() || !seen.insert(session_id.clone()) {
+            continue;
+        }
+        if live.values().any(|id| id == &session_id) {
+            continue;
+        }
+        if let Some(snapshot) = load_snapshot(&session_id) {
+            by_project
+                .entry(snapshot.project_key.clone())
+                .or_default()
+                .push(snapshot);
+        }
+    }
+
+    let now = Utc::now();
+    let age_limit = chrono::Duration::days(MAX_ARCHIVED_SNAPSHOT_AGE_DAYS);
+    for snapshots in by_project.values_mut() {
+        // Oldest first so we trim the least-recently-finished first.
+        snapshots.sort_by(|a, b| a.ended_at.cmp(&b.ended_at));
+        for (offset, snapshot) in snapshots.iter().enumerate() {
+            let too_old = now - snapshot.ended_at > age_limit;
+            let over_cap = snapshots.len() - offset > MAX_ARCHIVED_SNAPSHOTS_PER_PROJECT;
+            if !too_old && !over_cap {
+                break;
+            }
+            delete_snapshot(&snapshot.session_id);
+        }
+    }
+}
+
+/// Load the handoff index, surfacing IO/path failures as `Err` so callers can
+/// detect that pruning has nothing to operate on. Returns `Ok(empty)` for a
+/// missing or corrupt index, matching [`load_index`]'s resilience.
+fn load_index_opt() -> Result<HandoffIndex> {
+    let path = index_path()?;
+    if !path.exists() {
+        return Ok(HandoffIndex::default());
+    }
+    Ok(crate::storage::read_json::<HandoffIndex>(&path).unwrap_or_default())
+}
+
+/// Best-effort delete of a snapshot file by session id. Returns `true` when a
+/// file was removed, `false` when nothing existed or deletion failed.
+fn delete_snapshot(session_id: &str) -> bool {
+    let Ok(dir) = handoffs_dir() else {
+        return false;
+    };
+    let Ok(path) = file_path(&dir, session_id) else {
+        return false;
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_err) => false,
+    }
 }
 
 /// Render a specific handoff snapshot by id as a compact markdown block, for

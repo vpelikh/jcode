@@ -819,3 +819,195 @@ fn list_all_handoffs_includes_archived_and_is_newest_first() {
         "all snapshots surfaced newest first"
     );
 }
+
+/// Stagger a fixture's ended_at by a number of hours before the given base.
+fn aged(session: &str, project: &str, base: DateTime<Utc>, hours_ago: i64) -> HandoffSnapshot {
+    let mut snapshot = fixture(session, project);
+    snapshot.ended_at = base - chrono::Duration::hours(hours_ago);
+    snapshot
+}
+
+/// Pruning enforces the per-project archived count cap: only the newest
+/// `MAX_ARCHIVED_SNAPSHOTS_PER_PROJECT` archived snapshots survive alongside
+/// the live handoff, and the oldest are removed from disk.
+#[test]
+fn prune_enforces_archived_count_cap_per_project() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let home = env._home.path();
+    let cwd = home.join("project");
+    std::fs::create_dir_all(&cwd).ok();
+    let project = project_key(Some(&cwd)).unwrap();
+    let now = Utc::now();
+
+    // One live handoff (newest) plus several archived snapshots under the age
+    // cap but exceeding the count cap.
+    write_snapshot(&fixture("live", &project)).unwrap();
+    let archived = MAX_ARCHIVED_SNAPSHOTS_PER_PROJECT + 5;
+    for n in 1..=archived {
+        let id = format!("arch-{n:03}");
+        // hours_ago = n keeps all within the 30-day age window.
+        write_snapshot(&aged(&id, &project, now, n as i64)).unwrap();
+    }
+
+    prune_archived_snapshots();
+
+    let remaining = list_all_handoffs();
+    let remaining_ids: Vec<&str> = remaining.iter().map(|s| s.session_id.as_str()).collect();
+    assert!(
+        remaining_ids.contains(&"live"),
+        "the live handoff must never be pruned"
+    );
+    // live + the newest MAX_ARCHIVED archived snapshots.
+    assert_eq!(
+        remaining.len(),
+        1 + MAX_ARCHIVED_SNAPSHOTS_PER_PROJECT,
+        "only the live handoff plus the newest archived snapshots remain"
+    );
+    // hours_ago = n grows with n, so the highest-numbered snapshots are the
+    // oldest. The 5 oldest archived (17..=21) are pruned.
+    for n in (MAX_ARCHIVED_SNAPSHOTS_PER_PROJECT + 1)..=archived {
+        let id = format!("arch-{n:03}");
+        assert!(
+            load_snapshot(&id).is_none(),
+            "pruned snapshot {id} should be gone from disk"
+        );
+    }
+    // The 16 newest archived snapshots (1..=16) survive.
+    for n in 1..=MAX_ARCHIVED_SNAPSHOTS_PER_PROJECT {
+        assert!(
+            load_snapshot(&format!("arch-{n:03}")).is_some(),
+            "kept snapshot arch-{n:03} should remain"
+        );
+    }
+}
+
+/// Pruning removes archived snapshots older than the age cap even when the
+/// per-project count is under the cap, and leaves the live handoff intact.
+#[test]
+fn prune_enforces_archived_age_cap() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let home = env._home.path();
+    let cwd = home.join("project");
+    std::fs::create_dir_all(&cwd).ok();
+    let project = project_key(Some(&cwd)).unwrap();
+    let now = Utc::now();
+
+    // Live handoff plus a couple of archived snapshots, kept under the count
+    // cap so only the age rule is exercised.
+    write_snapshot(&fixture("live", &project)).unwrap();
+    write_snapshot(&aged("fresh", &project, now, 24)).unwrap();
+    // 31 days is beyond the 30-day cap; 31d = 744 hours.
+    let mut stale = fixture("stale", &project);
+    stale.ended_at = now - chrono::Duration::days(MAX_ARCHIVED_SNAPSHOT_AGE_DAYS + 1);
+    write_snapshot(&stale).unwrap();
+
+    prune_archived_snapshots();
+
+    assert!(
+        load_snapshot("live").is_some(),
+        "live handoff survives age pruning"
+    );
+    assert!(
+        load_snapshot("fresh").is_some(),
+        "an in-window archived snapshot survives"
+    );
+    assert!(
+        load_snapshot("stale").is_none(),
+        "an over-age archived snapshot is pruned"
+    );
+}
+
+/// Live handoffs referenced by the index are never pruned, even when the
+/// snapshot is itself very old. Age/count pruning applies only to archived
+/// (superseded) snapshots.
+#[test]
+fn prune_never_deletes_live_handoffs() {
+    let _guard = crate::storage::lock_test_env();
+    let _env = HandoffTestEnv::new();
+    let now = Utc::now();
+
+    // Project A's latest handoff is old, but it is still the live one (the
+    // index references it) so it must survive pruning.
+    let mut live_old = fixture("live-old", "git:https://example.com/a.git");
+    live_old.ended_at = now - chrono::Duration::days(MAX_ARCHIVED_SNAPSHOT_AGE_DAYS + 60);
+    write_snapshot(&live_old).unwrap();
+
+    // Project B has a live handoff plus an over-age *archived* snapshot (e.g.
+    // from a resumed session that then captured a newer handoff). The over-age
+    // snapshot is a valid prune target and demonstrates pruning still works.
+    let mut stale_b = fixture("stale-b", "git:https://example.com/b.git");
+    stale_b.ended_at = now - chrono::Duration::days(MAX_ARCHIVED_SNAPSHOT_AGE_DAYS + 1);
+    write_snapshot(&stale_b).unwrap();
+    // A newer handoff for project B supersedes stale-b, archiving it.
+    write_snapshot(&fixture("b-live", "git:https://example.com/b.git")).unwrap();
+
+    prune_archived_snapshots();
+
+    assert!(
+        load_snapshot("live-old").is_some(),
+        "the live handoff must never be pruned, even if old"
+    );
+    assert!(
+        load_snapshot("stale-b").is_none(),
+        "an over-age archived snapshot in another project is still pruned"
+    );
+    // live-old is still the latest handoff for project A.
+    assert!(
+        load_index()
+            .latest
+            .iter()
+            .any(|e| e.project_key == "git:https://example.com/a.git"
+                && e.session_id == "live-old"),
+        "live-old remains the referenced handoff in the index"
+    );
+    // b-live survives alongside it.
+    assert!(
+        load_snapshot("b-live").is_some(),
+        "the newer live handoff for project B survives"
+    );
+}
+
+/// Pruning is scoped per project: archived snapshots of one project do not
+/// cause another project's fresh snapshots to be pruned.
+#[test]
+fn prune_is_scoped_per_project() {
+    let _guard = crate::storage::lock_test_env();
+    let _env = HandoffTestEnv::new();
+    let now = Utc::now();
+
+    let project_a = "git:https://example.com/a.git";
+    let project_b = "git:https://example.com/b.git";
+
+    // Project A has live + many archived (over its cap).
+    write_snapshot(&fixture("a-live", project_a)).unwrap();
+    for n in 1..=(MAX_ARCHIVED_SNAPSHOTS_PER_PROJECT + 8) {
+        write_snapshot(&aged(&format!("a-arch-{n}"), project_a, now, n as i64)).unwrap();
+    }
+
+    // Project B has only live + two fresh archived (under its cap).
+    write_snapshot(&fixture("b-live", project_b)).unwrap();
+    write_snapshot(&aged("b-arch-1", project_b, now, 1)).unwrap();
+    write_snapshot(&aged("b-arch-2", project_b, now, 2)).unwrap();
+
+    prune_archived_snapshots();
+
+    // All of project B's snapshots survive; project A is trimmed to its cap.
+    let all = list_all_handoffs();
+    let all_ids: Vec<&str> = all.iter().map(|s| s.session_id.as_str()).collect();
+    for id in ["b-live", "b-arch-1", "b-arch-2"] {
+        assert!(all_ids.contains(&id), "project B snapshot {id} must survive");
+    }
+    assert!(all_ids.contains(&"a-live"), "project A live handoff survives");
+    let a_archived: Vec<&str> = all_ids
+        .iter()
+        .copied()
+        .filter(|id| id.starts_with("a-arch-"))
+        .collect();
+    assert_eq!(
+        a_archived.len(),
+        MAX_ARCHIVED_SNAPSHOTS_PER_PROJECT,
+        "project A keeps only its archived cap"
+    );
+}

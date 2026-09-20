@@ -11,7 +11,7 @@ a fresh session's first message receives the saved handoff exactly once.
 Live model continuation was exercised end to end with a working provider: a
 fresh session recovered the exact pending marker from the saved handoff.
 
-**Planned:** snapshot pruning and remote fallback.
+**Planned:** remote fallback.
 
 ## Purpose
 
@@ -30,8 +30,8 @@ can use on its first turn.
   and a `/handoffres <session_id>` command that boots a fresh conversation from
   a selected handoff, overriding the automatic latest-for-project injection.
 
-Manual selection is implemented. Snapshot pruning and remote fallback remain
-future work.
+Manual selection is implemented. Snapshot pruning is implemented. Remote
+fallback remains future work.
 
 ## Lifecycle
 
@@ -95,6 +95,22 @@ snapshot's intent, open todos, and optional assistant text, then records an
 opening checkpoint. Creation and checkpoint errors are returned to the caller.
 Handoffs and initiatives remain separate stores: snapshots represent session
 state, while initiatives represent durable, curated goals.
+
+### Pruning
+
+`handoff::prune_archived_snapshots()` enforces a retention policy over the
+archived snapshot files, which the index's `MAX_INDEX_ENTRIES` cap alone does not
+cover. It runs after every successful `handoff::capture` write.
+
+- Per project, at most `MAX_ARCHIVED_SNAPSHOTS_PER_PROJECT` (16) archived
+  snapshots are kept; older ones are deleted oldest-first.
+- Archived snapshots older than `MAX_ARCHIVED_SNAPSHOT_AGE_DAYS` (30) are
+  deleted regardless of count.
+
+Live handoffs — the latest per project that the index still references — are
+never pruned, even if old. Only superseded (archived) snapshots are eligible.
+Pruning is best-effort: unreadable or missing files are ignored and a missing
+store is a no-op, so it never breaks capture.
 
 ## Project identity
 
@@ -199,14 +215,15 @@ beating auto-inject, a stale-override fallback (a retired snapshot falls back to
 auto-inject instead of booting context-less, and the stale id is consumed), the
 `set_handoff_resume` server handler (valid set replies `Done` and wins over
 auto-inject; unknown id replies `Error`; `None` restores auto-injection), a
-no-regression guard that a manual selection does not disturb the default, and
-the TUI local `/handoff` fallback (surfaces archived handoffs; `/handoffres`
-explains a server is needed). Tests use temporary storage and restore the prior
+no-regression guard that a manual selection does not disturb the default, the
+TUI local `/handoff` fallback (surfaces archived handoffs; `/handoffres`
+explains a server is needed), and snapshot pruning (per-project archived count
+cap, archived age cap, live handoffs never pruned, and per-project scoping).
+Tests use temporary storage and restore the prior
 environment.
 
 ## Future work
 
-- Snapshot pruning beyond the index's project-entry cap.
 - Optional fallback after a failed live-session migration, using handoff files
   already available on the target host.
 
