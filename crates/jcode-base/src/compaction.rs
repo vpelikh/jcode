@@ -867,8 +867,18 @@ impl CompactionManager {
 
     /// Get current token estimate using the caller's message list
     pub fn token_estimate_with(&self, all_messages: &[Message]) -> usize {
+        // For a physically consolidated transcript the summary is already message 0
+        // of `all_messages`, so it is included in `active_message_chars`. Passing
+        // `active_summary` as well would DOUBLE-COUNT the summary's characters
+        // (once from the summary, once from the transcript's index-0 message),
+        // inflating the estimate and risking spurious auto-compaction.
+        let summary = if self.physically_consolidated {
+            None
+        } else {
+            self.active_summary.as_ref()
+        };
         estimate_compaction_tokens(
-            self.active_summary.as_ref(),
+            summary,
             self.active_message_chars_with(all_messages),
             self.token_budget,
         )
