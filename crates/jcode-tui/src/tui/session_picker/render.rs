@@ -602,7 +602,7 @@ impl SessionPicker {
                 Style::default().fg(rgb(120, 120, 120)),
             ));
         }
-        if self.handoff_mode {
+        if self.is_handoff() {
             // The flat list count above said "sessions"; make it handoff-accurate.
             if let Some(span) = title_parts.last_mut() {
                 *span = Span::styled(
@@ -617,7 +617,7 @@ impl SessionPicker {
             format!("  {}", filter_label),
             Style::default().fg(rgb(255, 180, 100)),
         ));
-        if self.handoff_mode {
+        if self.is_handoff() {
             title_parts.push(Span::styled(
                 "  · saved handoffs",
                 Style::default().fg(rgb(120, 210, 230)),
@@ -658,7 +658,7 @@ impl SessionPicker {
             // Search help wins over the (session or handoff) mode help so the
             // user always sees how to edit the query once `/` is pressed.
             " type to filter · Ctrl+J/K or ↑↓ nav · Ctrl+W word-del · Esc cancel ".to_string()
-        } else if self.handoff_mode {
+        } else if self.is_handoff() {
             " Enter resume · ↑↓ · Esc | s/S/d/Space/T off ".to_string()
         } else {
             match crate::config::config().keybindings.session_picker_enter {

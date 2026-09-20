@@ -760,7 +760,7 @@ fn test_filter_mode_cycles_through_requested_session_sources() {
     cursor.source = SessionSource::Cursor;
 
     let mut picker = SessionPicker::new(vec![saved, claude_code, codex, pi, opencode, cursor]);
-    picker.all_sessions[0].working_dir = Some("/work/project".to_string());
+    picker.all_sessions[0].session_mut().working_dir = Some("/work/project".to_string());
     picker.set_current_dir(Some("/work/project/".to_string()));
     picker.rebuild_items();
 
@@ -2518,7 +2518,7 @@ fn search_highlights_matching_title_in_rendered_rows() {
     let mut picker = SessionPicker::new(vec![session]);
     // make_session sets title = "Test session"; search a substring of the title.
     picker.search_query = "sess".to_string();
-    let rows = picker.render_session_item_lines(picker.all_sessions.first().unwrap(), false);
+    let rows = picker.render_session_item_lines(picker.all_sessions.first().unwrap().session(), false);
     let has_highlight = rows[0]
         .spans
         .iter()

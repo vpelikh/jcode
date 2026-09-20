@@ -1,16 +1,17 @@
 use super::{
-    PickerItem, PreviewMessage, ResumeTarget, ServerGroup, SessionInfo, SessionPicker, SessionRef,
+    PickerItem, PreviewMessage, ResumeTarget, Row, ServerGroup, SessionInfo, SessionPicker,
+    SessionRef,
 };
+
+fn row_session_bytes(row: &Row) -> usize {
+    estimate_session_info_bytes(row.session())
+}
 
 pub(super) fn debug_memory_profile(picker: &SessionPicker) -> serde_json::Value {
     let items_estimate_bytes: usize = picker.items.iter().map(estimate_picker_item_bytes).sum();
     let visible_sessions_estimate_bytes =
         picker.visible_sessions.capacity() * std::mem::size_of::<SessionRef>();
-    let all_sessions_estimate_bytes: usize = picker
-        .all_sessions
-        .iter()
-        .map(estimate_session_info_bytes)
-        .sum();
+    let all_sessions_estimate_bytes: usize = picker.all_sessions.iter().map(row_session_bytes).sum();
     let all_server_groups_estimate_bytes: usize = picker
         .all_server_groups
         .iter()
@@ -19,7 +20,7 @@ pub(super) fn debug_memory_profile(picker: &SessionPicker) -> serde_json::Value 
     let all_orphan_sessions_estimate_bytes: usize = picker
         .all_orphan_sessions
         .iter()
-        .map(estimate_session_info_bytes)
+        .map(row_session_bytes)
         .sum();
     let item_to_session_estimate_bytes =
         picker.item_to_session.capacity() * std::mem::size_of::<Option<usize>>();

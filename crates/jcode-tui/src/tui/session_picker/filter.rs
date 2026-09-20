@@ -308,7 +308,7 @@ impl SessionPicker {
                     SessionRef::Orphan(idx) => self
                         .all_orphan_sessions
                         .get(*idx)
-                        .is_some_and(|session| !saved_ids.contains(&session.id)),
+                        .is_some_and(|row| !saved_ids.contains(row.id())),
                     _ => false,
                 })
                 .collect();
@@ -330,7 +330,7 @@ impl SessionPicker {
                     SessionRef::Flat(idx) => self
                         .all_sessions
                         .get(*idx)
-                        .is_some_and(|session| !saved_ids.contains(&session.id)),
+                        .is_some_and(|row| !saved_ids.contains(row.id())),
                     _ => false,
                 })
                 .collect();
