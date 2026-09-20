@@ -1946,3 +1946,93 @@ fn test_persisted_event_log_survives_snapshot_round_trip_with_bracket_and_unknow
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `Session::compact_transcript_with_bracket` is the producer seam for a
+/// log-bracketed compaction (takeaway #5): it emits a balanced CompactionStart
+/// / CompactionEnd pair around the single surface mutation (replace), keeps the
+/// legacy `compaction` vector in sync, and leaves a replayer a correct derived
+/// surface plus an `End`-carried state that `current_compaction` picks up.
+#[test]
+fn test_compact_transcript_with_bracket_produces_balanced_durable_bracket() {
+    let mut session = Session::create_with_id(
+        "bracket_producer".to_string(),
+        None,
+        Some("Bracket producer".to_string()),
+    );
+    for i in 0..3 {
+        session.append_stored_message(StoredMessage {
+            id: format!("m{i}"),
+            role: Role::User,
+            content: vec![text_block(&format!("msg {i}"))],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+
+    let tail = vec![StoredMessage {
+        id: "tail".to_string(),
+        role: Role::User,
+        content: vec![text_block("[summary]")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    }];
+    let compaction = StoredCompactionState {
+        summary_text: "summarized".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 3,
+        original_turn_count: 3,
+        compacted_count: 2,
+    };
+
+    let id = session.compact_transcript_with_bracket("comp_a", tail.clone(), compaction.clone(), 3);
+
+    // Balanced bracket, no orphan, and a single persisting state.
+    assert!(
+        session.event_map.orphaned_compaction().is_none(),
+        "completed bracket must not leave an orphaned lock"
+    );
+    let ops: Vec<&SessionEventOp> = session.event_map.events.iter().map(|e| &e.op).collect();
+    let has_start = ops.iter().any(|op| matches!(op, SessionEventOp::CompactionStart { .. }));
+    let has_end = ops.iter().any(|op| matches!(op, SessionEventOp::CompactionEnd { .. }));
+    assert!(has_start && has_end, "bracket must contain both markers; ops={ops:?}");
+
+    // Legacy vectors agree with what the log derives.
+    let (derived_messages, derived_compaction) = session.rederive_all();
+    assert_eq!(
+        derived_messages.len(),
+        tail.len(),
+        "derived surface length must match the summarized tail"
+    );
+    assert_eq!(
+        derived_messages.last().map(|m| m.id.as_str()),
+        Some("tail"),
+        "derived surface must be the summarized tail"
+    );
+    assert_eq!(
+        derived_compaction.as_ref().map(|c| &c.summary_text),
+        Some(&"summarized".to_string())
+    );
+    session
+        .rederive_all_checked()
+        .expect("bracket producer must yield a consistent event log");
+
+    // The bracket must survive a full serialize + reload, staying balanced.
+    let json = serde_json::to_string(&session).unwrap();
+    let back: Session = serde_json::from_str(&json).unwrap();
+    assert!(
+        back.event_map.orphaned_compaction().is_none(),
+        "balanced bracket must survive serialize round-trip"
+    );
+    assert_eq!(
+        back.event_map.current_compaction().as_ref().map(|c| &c.summary_text),
+        Some(&"summarized".to_string()),
+        "current_compaction must report the bracket's End-carried state"
+    );
+    assert_eq!(back.compaction.as_ref().map(|c| &c.summary_text), Some(&"summarized".to_string()));
+    back.rederive_all_checked()
+        .expect("reloaded bracket producer log must stay consistent");
+}
