@@ -85,9 +85,9 @@ pub struct DisplayConfig {
     pub show_bash_output: bool,
     /// Enrich bash tool rows into a verbose details block showing the working
     /// directory (when known), execution time, the full executed command, and
-    /// the command output (default: false). Independent of `show_bash_output`,
+    /// the command output (default: true). Independent of `show_bash_output`,
     /// which only shows the last few output lines.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub show_bash_details: bool,
     /// Show the dimmed technical detail (command, path, args) after the
     /// model-provided intent on tool rows (default: false). When off, rows
@@ -163,7 +163,7 @@ impl Default for DisplayConfig {
             copy_badge_alt_label: String::new(),
             show_agentgrep_output: false,
             show_bash_output: false,
-            show_bash_details: false,
+            show_bash_details: true,
             tool_call_details: false,
             native_scrollbars: NativeScrollbarConfig::default(),
             keybinding_hints: true,
@@ -249,6 +249,24 @@ mod tests {
         let disabled: DisplayConfig =
             serde_json::from_str(r#"{"pin_todos":false}"#).expect("display config");
         assert!(!disabled.pin_todos);
+    }
+
+    #[test]
+    fn bash_details_defaults_on_and_parses_explicit_value() {
+        let default = DisplayConfig::default();
+        assert!(default.show_bash_details, "verbose bash details should default on");
+
+        // Omitting the field keeps the default (on).
+        let missing: DisplayConfig = serde_json::from_str("{}").expect("display config");
+        assert!(missing.show_bash_details);
+
+        // Explicit on/off round-trips.
+        let on: DisplayConfig =
+            serde_json::from_str(r#"{"show_bash_details":true}"#).expect("display config");
+        assert!(on.show_bash_details);
+        let off: DisplayConfig =
+            serde_json::from_str(r#"{"show_bash_details":false}"#).expect("display config");
+        assert!(!off.show_bash_details);
     }
 
     #[test]
