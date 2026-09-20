@@ -43,7 +43,8 @@ pub use branded::{
 pub use invariants::{
     CompactionBracket, InvariantLog, InvariantRegistry, InvariantViolation, LiveTranscriptProjection,
     LogInvariant, LogProjection, MessageCountProjection, ProjectionMatchesDerived, ProjectionResults,
-    ProjectionRegistry, fold_projection, project_map,
+    ProjectionRegistry, RoleCounts, RoleCountsProjection, RoleCountsState, fold_projection,
+    project_map,
 };
 mod crash;
 mod invariants;

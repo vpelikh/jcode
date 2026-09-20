@@ -26,7 +26,7 @@
 //! assumed.
 
 use crate::session::event_types::{SessionEvent, SessionEventMap, SessionEventOp};
-use jcode_message_types::ContentBlock;
+use jcode_message_types::{ContentBlock, Role};
 use jcode_session_types::StoredMessage;
 use std::any::Any;
 use std::collections::HashSet;
@@ -188,6 +188,7 @@ impl ProjectionRegistry {
         let mut r = Self::default();
         r.add::<MessageCountProjection>();
         r.add::<LiveTranscriptProjection>();
+        r.add::<RoleCountsProjection>();
         r
     }
 
@@ -698,18 +699,141 @@ impl LogProjection for LiveTranscriptProjection {
                 messages,
                 ..
             } => {
-                // Mirror `derive_messages` EXACTLY, including its clamping order,
-                // so the two implementations can never diverge. The canonical
-                // algorithm clamps each bound independently to the live length
-                // first, then forces `end >= start` so a *reversed* span
-                // (`start_index > end_index`) degrades to `start == end` — a
-                // point-insertion, never a crash.
-                let start = (*start_index).min(state.len());
-                let raw_end = (*end_index).min(state.len());
-                let end = raw_end.max(start);
-                state.splice(start..end, messages.iter().cloned());
+                let bounds = SpliceBounds::of(*start_index, *end_index, state.len());
+                state.splice(bounds.start..bounds.end, messages.iter().cloned());
             }
             SessionEventOp::ClearAll => state.clear(),
+            _ => {}
+        }
+    }
+}
+
+/// Canonical `ReplaceMessages` splice bounds, mirroring
+/// `SessionEventMap::derive_messages` exactly (including its clamping order) so
+/// every consumer of a splice agrees byte-for-byte. Each bound is clamped to the
+/// live length first, then `end` is forced `>= start` so a *reversed* span
+/// (`start_index > end_index`) degrades to `start == end` — a point-insertion,
+/// never a crash.
+struct SpliceBounds {
+    start: usize,
+    end: usize,
+}
+
+impl SpliceBounds {
+    fn of(start_index: usize, end_index: usize, live_len: usize) -> Self {
+        let start = start_index.min(live_len);
+        let raw_end = end_index.min(live_len);
+        Self {
+            start,
+            end: raw_end.max(start),
+        }
+    }
+}
+
+/// Per-role message counts derived from the live transcript.
+///
+/// This is takeaway #4's "one fold, many readers" demonstration: it reads a
+/// *different* derived domain than [`MessageCountProjection`] (a total) and
+/// [`LiveTranscriptProjection`] (the full transcript) while sharing the single
+/// registry fold. A TUI or usage overlay can render a per-role breakdown
+/// without scanning the raw stream or re-walking the transcript; it just looks
+/// up this typed state by name.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RoleCounts {
+    pub user: usize,
+    pub assistant: usize,
+}
+
+impl RoleCounts {
+    /// Total messages across all roles.
+    pub fn total(&self) -> usize {
+        self.user + self.assistant
+    }
+}
+
+/// Projects [`RoleCounts`] from the log: user vs assistant message counts.
+///
+/// Its state keeps a compact `Vec<Role>` (not full messages) alongside running
+/// counts, updated by *delta* per event — O(1) on append/insert, O(span) on a
+/// replace — so it never re-walks the whole transcript per event and clones no
+/// message payloads. Bounds mirror the shared [`SpliceBounds`] helper so it
+/// agrees with [`LiveTranscriptProjection`]/`derive_messages` on every splice.
+pub struct RoleCountsProjection;
+
+/// Internal running state: a compact per-role list plus running totals.
+#[derive(Debug, Clone, Default)]
+pub struct RoleCountsState {
+    /// Roles in live message order (a memory-light stand-in for the transcript).
+    pub roles: Vec<Role>,
+    /// Per-role counts over `roles`.
+    pub counts: RoleCounts,
+}
+
+impl RoleCountsState {
+    fn add(&mut self, role: &Role) {
+        match role {
+            Role::User => self.counts.user += 1,
+            Role::Assistant => self.counts.assistant += 1,
+        }
+    }
+
+    fn subtract(&mut self, role: &Role) {
+        match role {
+            Role::User => self.counts.user = self.counts.user.saturating_sub(1),
+            Role::Assistant => self.counts.assistant = self.counts.assistant.saturating_sub(1),
+        }
+    }
+}
+
+impl LogProjection for RoleCountsProjection {
+    type State = RoleCountsState;
+
+    fn name() -> &'static str {
+        "session.role_counts"
+    }
+
+    fn apply(state: &mut Self::State, event: &SessionEvent) {
+        match &event.op {
+            SessionEventOp::AppendMessage { message, .. } => {
+                state.roles.push(message.role.clone());
+                state.add(&message.role);
+            }
+            SessionEventOp::InsertMessage {
+                index,
+                message,
+                ..
+            } => {
+                let index = (*index).min(state.roles.len());
+                state.roles.insert(index, message.role.clone());
+                state.add(&message.role);
+            }
+            SessionEventOp::ReplaceMessages {
+                start_index,
+                end_index,
+                messages,
+                ..
+            } => {
+                let bounds = SpliceBounds::of(*start_index, *end_index, state.roles.len());
+                // Remove the roles in the replaced span, then add the incoming
+                // replacement roles. Only the new ones are added — the surviving
+                // tail (after `end`) was never subtracted, so counting it again
+                // would double it. Clone the removed roles first to avoid
+                // borrowing `state.roles` while mutating `state`.
+                let removed: Vec<Role> = state.roles[bounds.start..bounds.end].to_vec();
+                for role in &removed {
+                    state.subtract(role);
+                }
+                state
+                    .roles
+                    .splice(bounds.start..bounds.end, messages.iter().map(|m| m.role.clone()));
+                for m in messages {
+                    state.add(&m.role);
+                }
+            }
+            SessionEventOp::ClearAll => {
+                state.roles.clear();
+                state.counts = RoleCounts::default();
+            }
             _ => {}
         }
     }
@@ -718,7 +842,6 @@ impl LogProjection for LiveTranscriptProjection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jcode_message_types::Role;
     use jcode_session_types::StoredMessage;
 
     fn text_msg(id: &str) -> StoredMessage {
@@ -734,6 +857,16 @@ mod tests {
             tool_duration_ms: None,
             token_usage: None,
         }
+    }
+
+    fn text_msg_user(id: &str) -> StoredMessage {
+        let mut m = text_msg(id);
+        m.role = Role::User;
+        m
+    }
+
+    fn text_msg_assistant(id: &str) -> StoredMessage {
+        text_msg(id)
     }
 
     fn tool_use_msg(id: &str, tool_id: &str) -> StoredMessage {
@@ -1183,5 +1316,128 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn one_fold_serves_transcript_and_role_domains() {
+        // Takeaway #4's "one fold, many readers": a single fold over the log
+        // must produce the full transcript AND a distinct per-role breakdown,
+        // so a UI can render either without re-walking the raw stream.
+        let mut map = SessionEventMap::default();
+        append(&mut map, "e1", text_msg_user("m1"));
+        append(&mut map, "e2", text_msg_assistant("m2"));
+        append(&mut map, "e3", text_msg_user("m3"));
+
+        let mut reg = ProjectionRegistry::builtin();
+        reg.fold(&map.events).expect("fold ok");
+
+        let cur = reg.current();
+        // Transcript domain (full messages).
+        let transcript = cur
+            .get::<LiveTranscriptProjection>()
+            .expect("transcript projection present");
+        assert_eq!(transcript.len(), 3);
+
+        // Distinct role domain, from the SAME single fold.
+        let rc = cur
+            .get::<RoleCountsProjection>()
+            .expect("role-counts projection present");
+        assert_eq!(rc.counts, RoleCounts { user: 2, assistant: 1 });
+        assert_eq!(rc.counts.total(), 3);
+        // The role-counts projection tracks the same number of messages as the
+        // full transcript, with no full message payloads stored.
+        assert_eq!(rc.roles.len(), transcript.len());
+    }
+
+    #[test]
+    fn role_counts_track_splices() {
+        // Role counts must stay correct across a replace (splice) that reshapes
+        // the transcript, not just append-at-end.
+        let mut map = SessionEventMap::default();
+        append(&mut map, "e1", text_msg_user("m1"));
+        append(&mut map, "e2", text_msg_assistant("m2"));
+        map.events.push(SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: "repl".to_string().into(),
+            op: SessionEventOp::ReplaceMessages {
+                start_index: 0,
+                end_index: usize::MAX,
+                messages: vec![text_msg_user("only-user")],
+            },
+            parent_id: None,
+            version: 1,
+        });
+        let mut reg = ProjectionRegistry::builtin();
+        reg.fold(&map.events).expect("fold ok");
+        let cur = reg.current();
+        let rc = cur.get::<RoleCountsProjection>().expect("present");
+        assert_eq!(rc.counts, RoleCounts { user: 1, assistant: 0 });
+        assert_eq!(rc.counts.total(), 1);
+    }
+
+    #[test]
+    fn role_counts_track_partial_and_reversed_splices() {
+        // Partial splice removing a mixed span must update counts via the delta
+        // math, and a reversed-bounds span must not corrupt them.
+        let mut map = SessionEventMap::default();
+        append(&mut map, "e1", text_msg_user("m1"));
+        append(&mut map, "e2", text_msg_assistant("m2"));
+        append(&mut map, "e3", text_msg_user("m3"));
+        append(&mut map, "e4", text_msg_assistant("m4"));
+        // Partial: replace indices 1..=2 ([Asst, User]) with a single [User].
+        // Live roles before: [User, Asst, User, Asst].
+        map.events.push(SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: "partial".to_string().into(),
+            op: SessionEventOp::ReplaceMessages {
+                start_index: 1,
+                end_index: 3,
+                messages: vec![text_msg_user("new")],
+            },
+            parent_id: None,
+            version: 1,
+        });
+        // Assert against derive_messages, which stays the ground truth.
+        let rc_before_partial = {
+            let mut reg = ProjectionRegistry::builtin();
+            reg.fold(&map.events).expect("fold ok");
+            reg.current().get::<RoleCountsProjection>().expect("present").clone()
+        };
+        let derived = map.derive_messages();
+        let (u, a) = derived
+            .iter()
+            .fold((0, 0), |(u, a), m| match m.role {
+                Role::User => (u + 1, a),
+                Role::Assistant => (u, a + 1),
+            });
+        assert_eq!(rc_before_partial.counts, RoleCounts { user: u, assistant: a });
+        assert_eq!(rc_before_partial.counts.total(), derived.len());
+
+        // Reversed-bounds replace: must be a no-op (point-insertion at end),
+        // counts unchanged.
+        map.events.push(SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: "reversed".to_string().into(),
+            op: SessionEventOp::ReplaceMessages {
+                start_index: 99,
+                end_index: 1,
+                messages: vec![text_msg_assistant("sneaky")],
+            },
+            parent_id: None,
+            version: 1,
+        });
+        let mut reg = ProjectionRegistry::builtin();
+        reg.fold(&map.events).expect("fold ok");
+        let cur = reg.current();
+        let rc = cur.get::<RoleCountsProjection>().expect("present");
+        let derived = map.derive_messages();
+        let (u, a) = derived
+            .iter()
+            .fold((0, 0), |(u, a), m| match m.role {
+                Role::User => (u + 1, a),
+                Role::Assistant => (u, a + 1),
+            });
+        assert_eq!(rc.counts, RoleCounts { user: u, assistant: a });
+        assert_eq!(rc.counts.total(), derived.len());
     }
 }
