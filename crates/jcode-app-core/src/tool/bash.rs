@@ -1030,6 +1030,22 @@ impl BashTool {
         if let Some(ref dir) = ctx.working_dir {
             command.current_dir(dir);
         }
+        // Put the foreground child in its own process group so that, if it is
+        // promoted to a background task on timeout and that task is later
+        // aborted/cancelled, we can kill the whole descendant tree (bash ->
+        // cargo -> rustc/test binaries) instead of only the direct child.
+        // Without this, killed-on-drop children leave orphaned grandchildren
+        // (e.g. `dev_cargo.sh` / `cargo test` / `rustc` workers) running
+        // forever under the long-lived server, accumulating stale processes.
+        #[cfg(unix)]
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         let mut child = command.spawn()?;
 
         let child_pid = child.id().unwrap_or(0);
@@ -1132,7 +1148,15 @@ impl BashTool {
                     None
                 };
 
+                // Guard kills the child's whole process group when this task is
+                // dropped without a normal completion (e.g. the timeout-promoted
+                // background task is aborted). Disarmed once the command exits
+                // normally so normal completion kills nothing.
+                #[cfg(unix)]
+                let mut process_group_guard = ProcessGroupKillGuard::new(child.id());
                 let status = child.wait().await?;
+                #[cfg(unix)]
+                process_group_guard.disarm();
 
                 if let Some(task) = stdin_task {
                     task.abort();
