@@ -3002,3 +3002,85 @@ fn expected_last_compaction(events: &[SessionEvent]) -> Option<StoredCompactionS
     }
     found
 }
+
+/// Validation robustness: a wildly-futuristic event timestamp must be rejected,
+/// a far-past timestamp too, and duplicate event ids must be accepted (the log
+/// deliberately permits the same id when the payload differs, e.g. re-inserting
+/// a tool-output repair at the same index). These pin the validation contract so
+/// a corrupt/rogue event cannot silently bend the append-only timestamp window.
+#[test]
+fn test_event_validation_rejects_extreme_timestamps_but_accepts_duplicate_ids() {
+    let mut map = SessionEventMap::default();
+    let msg = |id: &str| StoredMessage {
+        id: id.to_string(),
+        role: Role::User,
+        content: vec![text_block("hi")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    };
+
+    // Far-future timestamp (400 days > the ~1yr window) -> rejected.
+    map.append_event(SessionEvent {
+        timestamp: Utc::now() + chrono::Duration::days(400),
+        event_id: "future".to_string(),
+        op: SessionEventOp::AppendMessage {
+            message_id: "m_future".to_string(),
+            message: msg("m_future"),
+        },
+        parent_id: None,
+        version: 1,
+    });
+    assert_eq!(
+        map.events.len(),
+        0,
+        "a far-future event timestamp must be rejected by validation"
+    );
+
+    // Far-past timestamp (400 days ago) -> rejected.
+    map.append_event(SessionEvent {
+        timestamp: Utc::now() - chrono::Duration::days(400),
+        event_id: "past".to_string(),
+        op: SessionEventOp::AppendMessage {
+            message_id: "m_past".to_string(),
+            message: msg("m_past"),
+        },
+        parent_id: None,
+        version: 1,
+    });
+    assert_eq!(map.events.len(), 0, "a far-past event timestamp must be rejected");
+
+    // Duplicate event_id with different payload -> accepted (documented).
+    let shared_id = "same_event_id".to_string();
+    map.append_event(SessionEvent {
+        timestamp: Utc::now(),
+        event_id: shared_id.clone(),
+        op: SessionEventOp::AppendMessage {
+            message_id: "m_a".to_string(),
+            message: msg("m_a"),
+        },
+        parent_id: None,
+        version: 1,
+    });
+    map.append_event(SessionEvent {
+        timestamp: Utc::now(),
+        event_id: shared_id.clone(),
+        op: SessionEventOp::AppendMessage {
+            message_id: "m_b".to_string(),
+            message: msg("m_b"),
+        },
+        parent_id: None,
+        version: 1,
+    });
+    assert_eq!(
+        map.events.len(),
+        2,
+        "duplicate event_id with distinct payloads must both be recorded"
+    );
+    assert_eq!(
+        map.derive_messages().len(),
+        2,
+        "both duplicate-id messages must derive"
+    );
+}
