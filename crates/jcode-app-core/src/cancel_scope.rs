@@ -13,7 +13,7 @@
 //! so a single canceller is enough and there is no torn or double set to reason
 //! about.
 //!
-//! See `session_search` (the working consumer) and the 
+//! See `session_search` (the working consumer) and the
 //! runtime task-scope test helpers for usage. As of the F8 Part A work this is
 //! deliberately a *same-crate* helper: it has exactly one production consumer,
 //! so it does not yet earn a leaf crate; when a second real consumer appears it
