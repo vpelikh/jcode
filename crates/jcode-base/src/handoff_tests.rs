@@ -1348,3 +1348,38 @@ fn concurrent_prune_and_writes_do_not_deadlock_or_overrun() {
         );
     }
 }
+
+/// Reconciliation: a snapshot file deleted out-of-band leaves a dangling index
+/// entry; running the sweep (prune) drops it so `list_saved_handoffs` never
+/// surfaces a row whose `/handoffres` would find nothing.
+#[test]
+fn sweep_reconciles_dangling_index_entry() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let home = env._home.path();
+    let cwd = home.join("project");
+    std::fs::create_dir_all(&cwd).ok();
+    let key = project_key(Some(&cwd)).unwrap();
+
+    write_snapshot(&fixture("visible", &key)).unwrap();
+    assert_eq!(latest_handoff_for_project(Some(&cwd)).as_deref(), Some("visible"));
+
+    // Delete the file out-of-band, leaving the index entry behind.
+    let dir = handoffs_dir().unwrap();
+    std::fs::remove_file(file_path(&dir, "visible").unwrap()).unwrap();
+
+    // The index now points at a missing file -> dangling.
+    assert_eq!(latest_handoff_for_project(Some(&cwd)).as_deref(), Some("visible"));
+    assert!(list_saved_handoffs().iter().any(|e| e.session_id == "visible"));
+
+    // The sweep reconciles the index.
+    sweep_stale_handoffs();
+    assert!(
+        !list_saved_handoffs().iter().any(|e| e.session_id == "visible"),
+        "dangling index entry is dropped after the sweep"
+    );
+    assert!(
+        latest_handoff_for_project(Some(&cwd)).is_none(),
+        "no latest for the project once its only file is gone"
+    );
+}
