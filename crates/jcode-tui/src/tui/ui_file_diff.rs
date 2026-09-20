@@ -700,4 +700,82 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn orphan_deletion_keeps_its_original_line_number() {
+        // A deletion-only edit (no replacement) routes through the orphan path.
+        // Its deleted row must still carry the original line number.
+        let dir = std::env::temp_dir().join(format!("jcode-file-diff-orphan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("demo.txt");
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        f.write_all(b"one\nthree\n").unwrap(); // "two" was deleted
+        f.flush().unwrap();
+        let file_path_str = file_path.to_string_lossy().to_string();
+
+        // Simulate an edit that deleted line 2 (2- two) with no replacement.
+        let msg = DisplayMessage::tool(
+            "2- two".to_string(),
+            ToolCall {
+                id: "t".into(),
+                name: "edit".into(),
+                input: json!({ "file_path": file_path_str }),
+                intent: None,
+                thought_signature: None,
+            },
+        );
+
+        let entry = build_file_diff_cache_entry(&file_path_str, Some(&msg), None);
+
+        let del_row = entry
+            .rows
+            .iter()
+            .find(|r| r.kind == FileDiffDisplayRowKind::Del)
+            .expect("there should be an orphan deletion row");
+        assert!(
+            del_row.prefix.contains("2 │-"),
+            "orphan del prefix was {:?}",
+            del_row.prefix
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn multi_line_deletion_shows_each_original_number() {
+        // Deleting lines 3 and 4 (replaced by one added line) must render each
+        // deleted row with its own original line number, not a shared/blank one.
+        let dir = std::env::temp_dir().join(format!("jcode-file-diff-multi-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("demo.txt");
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        f.write_all(b"one\ntwo\nA\nfive\n").unwrap(); // A replaced X (line3) and Y (line4)
+        f.flush().unwrap();
+        let file_path_str = file_path.to_string_lossy().to_string();
+
+        let msg = DisplayMessage::tool(
+            "3- X\n4- Y\n3+ A".to_string(),
+            ToolCall {
+                id: "t".into(),
+                name: "edit".into(),
+                input: json!({ "file_path": file_path_str }),
+                intent: None,
+                thought_signature: None,
+            },
+        );
+
+        let entry = build_file_diff_cache_entry(&file_path_str, Some(&msg), None);
+
+        let dels: Vec<_> = entry
+            .rows
+            .iter()
+            .filter(|r| r.kind == FileDiffDisplayRowKind::Del)
+            .collect();
+        assert_eq!(dels.len(), 2, "expected two deleted rows, rows={:?}", entry.rows);
+        let prefixes: Vec<_> = dels.iter().map(|r| r.prefix.clone()).collect();
+        assert!(prefixes.iter().any(|p| p.contains("3 │-")), "prefixes={:?}", prefixes);
+        assert!(prefixes.iter().any(|p| p.contains("4 │-")), "prefixes={:?}", prefixes);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
