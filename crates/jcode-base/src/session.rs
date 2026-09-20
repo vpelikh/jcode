@@ -698,8 +698,7 @@ impl Session {
         // and the TUI alarm. Raw hashing keys off non-transmitted metadata and
         // the `with_timestamps`-derived text tags, causing spurious
         // CLIENT_CACHE_VIOLATION reports for metadata-only re-timestamps.
-        let message_hash =
-            crate::message::cache_relevant_message_hashes(std::slice::from_ref(&message))[0];
+        let message_hash = crate::message::cache_relevant_message_hash(&message);
         let prefix_hash = self
             .provider_message_prefix_hashes_cache
             .last()

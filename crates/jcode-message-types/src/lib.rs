@@ -351,13 +351,6 @@ pub fn extend_stable_hash(acc: u64, next: u64) -> u64 {
     stable_hash_bytes(&[acc.to_le_bytes().as_slice(), next.to_le_bytes().as_slice()].concat())
 }
 
-pub fn stable_message_hash(message: &Message) -> u64 {
-    match serde_json::to_vec(message) {
-        Ok(bytes) => stable_hash_bytes(&bytes),
-        Err(_) => stable_hash_bytes(format!("{:?}", message).as_bytes()),
-    }
-}
-
 /// Project a message down to the fields that actually influence a provider's
 /// KV-cache key, dropping harness-only / volatile metadata.
 ///
@@ -393,17 +386,23 @@ fn strip_injected_timestamp_tag(text: &str) -> &str {
     // first content block of a user message. Only strip when the tag is a
     // leading, self-contained bracket run followed by whitespace; leave
     // genuine leading `[`...`]` user content untouched.
-    if text.starts_with("[tool timing: ") {
-        if let Some(end) = text.find("] ") {
-            return text.get(end + 2..).unwrap_or(text);
-        }
-    } else if let Some(end) = text.find("] ") {
-        let tag = &text[1..end];
-        if is_rfc3339_timestamp_tag(tag) {
-            return text.get(end + 2..).unwrap_or(text);
-        }
+    let Some(end) = text.find("] ") else {
+        return text;
+    };
+    let tag = &text[1..end];
+    // A real injected timing tag always carries the start/finish/duration
+    // sub-structure; a genuine tool result that merely starts with
+    // "[tool timing: ...]" (e.g. a heading or note) must be preserved.
+    let is_injected = if text.starts_with("[tool timing: ") {
+        tag.contains("start=") && tag.contains("finish=") && tag.contains("duration=")
+    } else {
+        is_rfc3339_timestamp_tag(tag)
+    };
+    if is_injected {
+        text.get(end + 2..).unwrap_or(text)
+    } else {
+        text
     }
-    text
 }
 
 fn is_rfc3339_timestamp_tag(tag: &str) -> bool {
@@ -451,22 +450,20 @@ pub fn cache_relevant_message_value(message: &Message) -> serde_json::Value {
                     // `with_timestamps` baked into text. It is the textual echo
                     // of the `timestamp` field stripped above, so it must not
                     // key the cache prefix (see the projection docs).
-                    if let Some(text) = block.get_mut("text").and_then(|t| t.as_str()) {
-                        let stripped = strip_injected_timestamp_tag(text).to_string();
-                        if let Some(text_value) = block.get_mut("text") {
-                            *text_value = serde_json::Value::String(stripped);
-                        }
+                    if let Some(text) = block.get_mut("text")
+                        && let serde_json::Value::String(text) = text
+                    {
+                        *text = strip_injected_timestamp_tag(text).to_string();
                     }
                 } else if let serde_json::Value::Object(block) = block
                     && block.get("type").and_then(|kind| kind.as_str()) == Some("tool_result")
                 {
                     // Tool-result content carries the derived `[tool timing: ...]`
                     // tag from `tool_duration_ms`; strip it for the same reason.
-                    if let Some(content) = block.get_mut("content").and_then(|c| c.as_str()) {
-                        let stripped = strip_injected_timestamp_tag(content).to_string();
-                        if let Some(content_value) = block.get_mut("content") {
-                            *content_value = serde_json::Value::String(stripped);
-                        }
+                    if let Some(content) = block.get_mut("content")
+                        && let serde_json::Value::String(content) = content
+                    {
+                        *content = strip_injected_timestamp_tag(content).to_string();
                     }
                 }
             }
@@ -481,22 +478,24 @@ pub fn cache_relevant_messages(messages: &[Message]) -> Vec<serde_json::Value> {
     messages.iter().map(cache_relevant_message_value).collect()
 }
 
+/// Hash a single message over the cache-relevant projection (see
+/// [`cache_relevant_message_value`]). Shared by [`cache_relevant_message_hashes`]
+/// and the prefix-hash builders in `jcode-base` so they never allocate a
+/// singleton slice merely to hash one message.
+pub fn cache_relevant_message_hash(message: &Message) -> u64 {
+    let encoded = serde_json::to_string(&cache_relevant_message_value(message)).unwrap_or_default();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&encoded, &mut hasher);
+    std::hash::Hasher::finish(&hasher)
+}
+
 /// Per-message hashes over the cache-relevant projection. These are the
 /// hashes compared across turns to decide whether the conversation prefix was
 /// mutated (a harness bug) or merely appended to (normal growth). Both the
 /// local TUI path and the server event path must use this same projection so
 /// prefix-change detection never keys off non-transmitted metadata.
 pub fn cache_relevant_message_hashes(messages: &[Message]) -> Vec<u64> {
-    messages
-        .iter()
-        .map(|message| {
-            let encoded =
-                serde_json::to_string(&cache_relevant_message_value(message)).unwrap_or_default();
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            std::hash::Hash::hash(&encoded, &mut hasher);
-            std::hash::Hasher::finish(&hasher)
-        })
-        .collect()
+    messages.iter().map(cache_relevant_message_hash).collect()
 }
 
 pub fn ends_with_fresh_user_turn(messages: &[Message]) -> bool {
@@ -1148,6 +1147,28 @@ mod tests {
             ),
             "tool-result timing tag must not change the hash with or without with_timestamps"
         );
+
+        // Same for a tool result with NO duration (`tool_duration_ms = None`).
+        // `tool_result_tag` then emits a plain `[<rfc3339>]` tag instead of the
+        // `[tool timing: ...]` form, which exercises the generic RFC3339 strip
+        // branch on a tool-result block (a distinct path from the duration form).
+        let tool_no_dur = Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "tc-1".into(),
+                content: "ls output".to_string(),
+                is_error: None,
+            }],
+            timestamp: Some(t0),
+            tool_duration_ms: None,
+        };
+        assert_eq!(
+            cache_relevant_message_hashes(std::slice::from_ref(&tool_no_dur)),
+            cache_relevant_message_hashes(
+                &[Message::with_timestamps(std::slice::from_ref(&tool_no_dur))[0].clone()]
+            ),
+            "None-duration tool result plain RFC3339 timestamp tag must not change the hash"
+        );
     }
 
     #[test]
@@ -1234,26 +1255,81 @@ mod tests {
             kept, "stripped",
             "timestamp-shaped tag is stripped even with an impossible date"
         );
+
+        // Tool-result timing tags are only stripped when they carry the injected
+        // `start=`/`finish=`/`duration=` sub-structure. A genuine tool result
+        // that merely begins with "[tool timing: ...]" (a heading or prose note,
+        // lacking the keyword sub-structure) must be preserved verbatim.
+        let genuine_tool = Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "tc-1".into(),
+                content: "[tool timing: benchmarks] table below".to_string(),
+                is_error: None,
+            }],
+            timestamp: Some(t0),
+            tool_duration_ms: None,
+        };
+        let value = cache_relevant_message_value(&genuine_tool);
+        let kept = value
+            .get("content")
+            .and_then(|c| c.get(0))
+            .and_then(|b| b.get("content"))
+            .and_then(|t| t.as_str())
+            .expect("tool result block");
+        assert_eq!(
+            kept,
+            "[tool timing: benchmarks] table below",
+            "genuine '[tool timing: ...]' tool result without start/finish/duration must be preserved"
+        );
+
+        // The injected tool-timing form still strips: it carries the full
+        // sub-structure, matching `Message::tool_result_with_duration`.
+        let injected_tool = Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "tc-1".into(),
+                content: "[tool timing: start=2026-01-01T00:00:00.000Z \
+                          finish=2026-01-01T00:00:00.100Z duration=100ms] ls output"
+                    .to_string(),
+                is_error: None,
+            }],
+            timestamp: Some(t0),
+            tool_duration_ms: None,
+        };
+        let value = cache_relevant_message_value(&injected_tool);
+        let stripped = value
+            .get("content")
+            .and_then(|c| c.get(0))
+            .and_then(|b| b.get("content"))
+            .and_then(|t| t.as_str())
+            .expect("tool result block");
+        assert_eq!(
+            stripped, "ls output",
+            "injected tool-timing tag with start/finish/duration must be stripped"
+        );
     }
 
-    /// Property test: `Message::format_timestamp` emits a *variable-width*
-    /// RFC3339 fraction (chrono trims trailing zeros, so `.500Z` becomes `.5Z`
-    /// and `.000Z` becomes no fraction). The strip matcher must handle every
-    /// emitted shape, or a re-timestamp whose fraction happens to end in zero
-    /// would fall through and re-introduce the false `harness: prefix changed`.
+    /// Property test: `Message::format_timestamp` emits a fixed-width RFC3339
+    /// millisecond fraction (`to_rfc3339_opts(Millis, true)` always writes
+    /// exactly 3 zero-padded fractional digits, e.g. `.000Z`, `.010Z`, `.100Z`),
+    /// so `is_rfc3339_timestamp_tag`'s fixed 24-char match covers every value
+    /// the formatter can produce. The strip matcher must handle every fraction
+    /// value, or a re-timestamp whose fraction differs would fall through and
+    /// re-introduce the false `harness: prefix changed`.
     #[test]
     fn cache_relevant_strip_handles_all_format_timestamp_shapes() {
         let base = chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
-        // Sweep fractions covering every trailing-zero profile chrono can emit:
-        // no fraction, 1, 2, and 3 significant digits.
+        // Sweep fractions covering the full millisecond range: every value is
+        // emitted with 3 zero-padded digits and a fixed overall width.
         let fractions_ms = [
-            0i64,       // .000 -> no fraction
-            10,         // .010 -> ".01"
-            100,        // .100 -> ".1"
-            1,          // .001 -> ".001"
-            309,        // .309 -> full 3 digits
-            500,        // .500 -> ".5"
-            999,        // .999 -> full
+            0i64,          // .000
+            1,             // .001
+            10,            // .010
+            100,           // .100
+            309,           // .309
+            500,           // .500
+            999,           // .999
             123_456 % 1000, // arbitrary
         ];
         for frac in fractions_ms {

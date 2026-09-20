@@ -7,7 +7,7 @@
 //! This is a fallback mechanism for providers like Fireworks (via OpenRouter) that
 //! have automatic caching but don't report cache hit/miss metrics.
 
-use jcode_message_types::{Message, cache_relevant_message_hashes, extend_stable_hash};
+use jcode_message_types::{Message, cache_relevant_message_hash, extend_stable_hash};
 use std::collections::VecDeque;
 
 /// Maximum number of prefix hashes to remember (for detecting intermittent violations)
@@ -62,8 +62,7 @@ impl CacheTracker {
             // the with_timestamps-derived text tags), which triggers spurious
             // CLIENT_CACHE_VIOLATION reports when the same message is rehashed
             // with backfilled metadata on a later turn.
-            let message_hash =
-                cache_relevant_message_hashes(std::slice::from_ref(message))[0];
+            let message_hash = cache_relevant_message_hash(message);
             let prefix_hash = prefix_hashes
                 .last()
                 .copied()
