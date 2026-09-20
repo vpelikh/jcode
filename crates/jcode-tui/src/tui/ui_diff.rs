@@ -482,7 +482,7 @@ mod tests {
     #[test]
     fn write_tool_falls_back_to_content_diff_counts() {
         let tool = ToolCall {
-            id: "tool_1".to_string(),
+            id: "tool_1".to_string().into(),
             name: "write".to_string(),
             input: json!({
                 "file_path": "demo.txt",
@@ -498,7 +498,7 @@ mod tests {
     #[test]
     fn multiedit_pascal_case_falls_back_to_input_diff_counts() {
         let tool = ToolCall {
-            id: "tool_2".to_string(),
+            id: "tool_2".to_string().into(),
             name: "MultiEdit".to_string(),
             input: json!({
                 "file_path": "demo.txt",

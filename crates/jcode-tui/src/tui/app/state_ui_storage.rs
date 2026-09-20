@@ -506,7 +506,7 @@ mod tests {
             duration_secs: None,
             title: None,
             tool_data: Some(crate::message::ToolCall {
-                id: "call-1".to_string(),
+                id: "call-1".to_string().into(),
                 name: name.to_string(),
                 input: input.clone(),
                 intent: crate::message::ToolCall::intent_from_input(&input),

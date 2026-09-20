@@ -121,7 +121,7 @@ fn test_parse_openai_response_function_call_arguments_streaming() {
     )
     .expect("tool name must be emitted at output_item.added");
     assert!(matches!(first, StreamEvent::ToolUseStart { id, name }
-        if id == "call_123" && name == "batch"));
+        if id == "call_123".into() && name == "batch"));
     assert!(pending.is_empty());
 
     let delta = r#"{"type":"response.function_call_arguments.delta","item_id":"fc_123","delta":"{\"tool_calls\":[{\"tool\":\"read\"}]"}"#;
@@ -585,7 +585,7 @@ fn test_handle_openai_output_item_normalizes_null_arguments() {
 
     match first {
         StreamEvent::ToolUseStart { id, name } => {
-            assert_eq!(id, "call_1");
+            assert_eq!(id, "call_1".into());
             assert_eq!(name, "bash");
         }
         _ => panic!("expected ToolUseStart"),

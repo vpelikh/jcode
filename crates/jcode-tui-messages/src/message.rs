@@ -421,7 +421,7 @@ mod tests {
             duration_secs: Some(1.0),
             title: Some("Read".to_string()),
             tool_data: Some(ToolCall {
-                id: "call-1".to_string(),
+                id: "call-1".to_string().into(),
                 name: "read".to_string(),
                 input,
                 intent: None,

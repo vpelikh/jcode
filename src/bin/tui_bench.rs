@@ -403,17 +403,15 @@ impl BenchState {
                 let file_path = make_bench_file(idx, assistant_len.max(240))?;
                 let file_path_str = file_path.to_string_lossy().to_string();
                 bench_file_paths.push(file_path.clone());
-                let tool = ToolCall {
-                    id: format!("bench_edit_{idx}"),
-                    name: "edit".to_string(),
-                    input: json!({
+                let tool = ToolCall::test(
+                    format!("bench_edit_{idx}"),
+                    "edit",
+                    json!({
                         "file_path": file_path_str,
                         "old_string": format!("target line {}", idx),
                         "new_string": format!("target line {} updated", idx),
                     }),
-                    intent: None,
-                    thought_signature: None,
-                };
+                );
                 let tool_output = format!(
                     "{line}- target line {idx}\n{line}+ target line {idx} updated",
                     line = idx + 1,

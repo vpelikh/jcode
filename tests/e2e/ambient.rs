@@ -184,7 +184,7 @@ async fn test_ambient_end_cycle_tool() -> Result<()> {
 
     provider.queue_response(vec![
         StreamEvent::ToolUseStart {
-            id: "tool_001".to_string(),
+            id: "tool_001".to_string().into(),
             name: "end_ambient_cycle".to_string(),
         },
         StreamEvent::ToolInputDelta(tool_input),
@@ -242,7 +242,7 @@ async fn test_ambient_request_permission_tool() -> Result<()> {
 
     provider.queue_response(vec![
         StreamEvent::ToolUseStart {
-            id: "tool_perm_001".to_string(),
+            id: "tool_perm_001".to_string().into(),
             name: "request_permission".to_string(),
         },
         StreamEvent::ToolInputDelta(tool_input),
@@ -290,7 +290,7 @@ async fn test_ambient_schedule_tool() -> Result<()> {
 
     provider.queue_response(vec![
         StreamEvent::ToolUseStart {
-            id: "tool_sched_001".to_string(),
+            id: "tool_sched_001".to_string().into(),
             name: "schedule_ambient".to_string(),
         },
         StreamEvent::ToolInputDelta(tool_input),
@@ -566,7 +566,7 @@ async fn test_full_ambient_cycle_simulation() -> Result<()> {
     provider.queue_response(vec![
         StreamEvent::TextDelta("Starting ambient cycle...\n".to_string()),
         StreamEvent::ToolUseStart {
-            id: "call_end".to_string(),
+            id: "call_end".to_string().into(),
             name: "end_ambient_cycle".to_string(),
         },
         StreamEvent::ToolInputDelta(end_cycle_input),

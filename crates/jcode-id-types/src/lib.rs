@@ -26,6 +26,16 @@
 //! **`#[serde(transparent)]`**: it serializes/deserializes as the bare string,
 //! so the on-disk / on-wire format is byte-for-byte identical to the previous
 //! `String` fields and persisted data round-trips unchanged.
+//!
+//! The branded types are structurally distinct, so cross-type assignment is a
+//! compile error (compile-time checked by the doctest below):
+//!
+//! ```compile_fail
+//! use jcode_id_types::{SessionId, ToolCallId};
+//!
+//! let tool_call_id = ToolCallId::from("call_1");
+//! let session_id: SessionId = tool_call_id; // mismatched types
+//! ```
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
