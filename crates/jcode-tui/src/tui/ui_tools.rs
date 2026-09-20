@@ -53,35 +53,6 @@ pub(crate) fn show_bash_output() -> bool {
     tests_show_bash_output_override::get()
 }
 
-/// Whether bash tool rows should render the verbose details block (full
-/// command, working directory, execution time, and output).
-#[cfg(not(test))]
-pub(crate) fn show_bash_details() -> bool {
-    crate::config::config().display.show_bash_details
-}
-
-#[cfg(test)]
-pub(crate) fn show_bash_details() -> bool {
-    tests_show_bash_details_override::get()
-}
-
-#[cfg(test)]
-pub(crate) mod tests_show_bash_details_override {
-    use std::cell::Cell;
-
-    thread_local! {
-        static SHOW_DETAILS: Cell<bool> = const { Cell::new(false) };
-    }
-
-    pub(crate) fn get() -> bool {
-        SHOW_DETAILS.with(Cell::get)
-    }
-
-    pub(crate) fn set(value: bool) {
-        SHOW_DETAILS.with(|cell| cell.set(value));
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod tests_show_bash_output_override {
     use std::cell::Cell;

@@ -84,17 +84,12 @@ pub struct DisplayConfig {
     /// no bash output is shown at all.
     #[serde(default = "default_true")]
     pub show_bash_output: bool,
-    /// Enrich bash tool rows into a verbose details block showing the working
-    /// directory (when known), execution time, the full executed command, and
-    /// the exit code (default: true). This flag controls bash metadata only;
-    /// it never renders the command output, which is governed solely by
-    /// `show_bash_output`.
-    #[serde(default = "default_true")]
-    pub show_bash_details: bool,
-    /// Show the dimmed technical detail (command, path, args) after the
-    /// model-provided intent on tool rows (default: false). When off, rows
-    /// that have an intent show only the intent; rows without an intent
-    /// always fall back to the technical detail.
+    /// Show the technical detail on tool rows (default: false). When on, bash
+    /// tool rows render a verbose block with the full executed command (wrapped),
+    /// the working directory (when known), the execution time, and the exit code;
+    /// other tool rows show their technical detail (command, path, args) after
+    /// the intent. When off, rows with an intent show only the intent; rows
+    /// without an intent always fall back to the technical detail.
     #[serde(default)]
     pub tool_call_details: bool,
     /// Native terminal scrollbar configuration for scrollable panes
@@ -165,7 +160,6 @@ impl Default for DisplayConfig {
             copy_badge_alt_label: String::new(),
             show_agentgrep_output: false,
             show_bash_output: true,
-            show_bash_details: true,
             tool_call_details: false,
             native_scrollbars: NativeScrollbarConfig::default(),
             keybinding_hints: true,
@@ -254,33 +248,36 @@ mod tests {
     }
 
     #[test]
-    fn bash_details_defaults_on_and_parses_explicit_value() {
+    fn bash_output_defaults_on_and_tool_call_details_defaults_off() {
         let default = DisplayConfig::default();
-        assert!(default.show_bash_details, "verbose bash details should default on");
         assert!(
             default.show_bash_output,
             "bash output should default on (full untrimmed render)"
         );
+        assert!(
+            !default.tool_call_details,
+            "tool_call_details should default off"
+        );
 
-        // Omitting the field keeps the default (on).
+        // Omitting the fields keeps the defaults.
         let missing: DisplayConfig = serde_json::from_str("{}").expect("display config");
-        assert!(missing.show_bash_details);
         assert!(missing.show_bash_output);
+        assert!(!missing.tool_call_details);
 
-        // Explicit on/off round-trips.
-        let on: DisplayConfig =
-            serde_json::from_str(r#"{"show_bash_details":true}"#).expect("display config");
-        assert!(on.show_bash_details);
-        let off: DisplayConfig =
-            serde_json::from_str(r#"{"show_bash_details":false}"#).expect("display config");
-        assert!(!off.show_bash_details);
-
+        // Explicit on/off round-trips for both.
         let out_on: DisplayConfig =
             serde_json::from_str(r#"{"show_bash_output":true}"#).expect("display config");
         assert!(out_on.show_bash_output);
         let out_off: DisplayConfig =
             serde_json::from_str(r#"{"show_bash_output":false}"#).expect("display config");
         assert!(!out_off.show_bash_output);
+
+        let tc_on: DisplayConfig =
+            serde_json::from_str(r#"{"tool_call_details":true}"#).expect("display config");
+        assert!(tc_on.tool_call_details);
+        let tc_off: DisplayConfig =
+            serde_json::from_str(r#"{"tool_call_details":false}"#).expect("display config");
+        assert!(!tc_off.tool_call_details);
     }
 
     #[test]

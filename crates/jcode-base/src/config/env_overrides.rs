@@ -304,11 +304,6 @@ impl Config {
                 self.display.show_bash_output = parsed;
             }
         }
-        if let Ok(v) = std::env::var("JCODE_SHOW_BASH_DETAILS") {
-            if let Some(parsed) = parse_env_bool(&v) {
-                self.display.show_bash_details = parsed;
-            }
-        }
         if let Ok(v) = std::env::var("JCODE_TOOL_CALL_DETAILS") {
             if let Some(parsed) = parse_env_bool(&v) {
                 self.display.tool_call_details = parsed;
