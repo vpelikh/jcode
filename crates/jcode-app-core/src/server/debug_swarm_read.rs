@@ -1,8 +1,6 @@
+use super::services::SwarmServiceHandle;
 use super::swarm_channels::list_channels_for_swarm;
-use super::{
-    FileTouchService, ServerIdentity, SharedContext, SwarmMember, SwarmState, VersionedPlan,
-    git_common_dir_for, swarm_id_for_dir,
-};
+use super::{ServerIdentity, SwarmState, git_common_dir_for, swarm_id_for_dir};
 use crate::agent::Agent;
 use crate::plan::{next_runnable_item_ids, summarize_plan_graph};
 use anyhow::Result;
@@ -12,7 +10,6 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
 type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
-type ChannelSubscriptions = Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
 
 #[expect(
     clippy::too_many_arguments,
@@ -21,15 +18,19 @@ type ChannelSubscriptions = Arc<RwLock<HashMap<String, HashMap<String, HashSet<S
 pub(super) async fn maybe_handle_swarm_read_command(
     cmd: &str,
     sessions: &SessionAgents,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    shared_context: &Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-    file_touch: &FileTouchService,
-    channel_subscriptions: &ChannelSubscriptions,
+    swarm: &SwarmServiceHandle,
     server_identity: &ServerIdentity,
 ) -> Result<Option<String>> {
+    // Swarm-domain state is reached through the swarm service handle. These
+    // locals keep the body single-homed on the handle's fields instead of a
+    // flat pass-through argument bag (server service split, Slice 4).
+    let swarm_members = &swarm.swarm_state.members;
+    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let shared_context = &swarm.shared_context;
+    let swarm_plans = &swarm.swarm_state.plans;
+    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let file_touch = &swarm.file_touch;
+    let channel_subscriptions = &swarm.channel_subscriptions;
     let swarm_state = SwarmState {
         members: Arc::clone(swarm_members),
         swarms_by_id: Arc::clone(swarms_by_id),
