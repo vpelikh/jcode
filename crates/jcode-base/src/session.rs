@@ -36,7 +36,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
 pub mod event_types;
+pub use invariants::{
+    InvariantLog, InvariantRegistry, InvariantViolation, LogInvariant, LogProjection,
+    MessageCountProjection, fold_projection, project_map,
+};
 mod crash;
+mod invariants;
 mod journal;
 mod load_telemetry;
 mod maintenance;

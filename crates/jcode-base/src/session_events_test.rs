@@ -292,6 +292,109 @@ fn test_event_op_serialization() {
     }
 }
 
+/// Escape hatch (takeaway #13): an unknown `op` tag must deserialize into
+/// `Unknown` with its full payload preserved, rather than erroring, so a future
+/// plugin can add event kinds without editing the core enum.
+#[test]
+fn test_unknown_op_escape_hatch_preserves_payload() {
+    let raw = r#"{"op":"plugin_custom_note","note":"hello","count":3,"nested":{"a":[1,2]}}"#;
+    let op: SessionEventOp = serde_json::from_str(raw).expect("unknown op must deserialize");
+    match &op {
+        SessionEventOp::Unknown { event_type, data } => {
+            assert_eq!(event_type, "plugin_custom_note");
+            let data = data.as_object().expect("payload must be an object");
+            assert_eq!(data.get("note").and_then(|v| v.as_str()), Some("hello"));
+            assert_eq!(data.get("count").and_then(|v| v.as_u64()), Some(3));
+            assert!(data.contains_key("nested"));
+            // The `op` key itself must not be duplicated inside the payload.
+            assert!(data.get("op").is_none());
+        }
+        other => panic!("expected Unknown, got {other:?}"),
+    }
+    // Round-trip must re-emit the original `op` and all fields.
+    let json = serde_json::to_string(&op).expect("serialize Unknown");
+    let round: SessionEventOp = serde_json::from_str(&json).expect("round-trip deserialize");
+    match (&op, &round) {
+        (
+            SessionEventOp::Unknown { event_type: a, data: da },
+            SessionEventOp::Unknown { event_type: b, data: db },
+        ) => {
+            assert_eq!(a, b);
+            assert_eq!(da, db);
+        }
+        _ => panic!("round trip changed kind"),
+    }
+}
+
+/// A plugin event flowing through the session log append/derive path must be
+/// tolerated: appending an `Unknown` event keeps the log valid and replayable
+/// even though the core does not interpret its payload.
+#[test]
+fn test_unknown_op_flows_through_event_log() {
+    let mut map = SessionEventMap::default();
+    let unknown = SessionEventOp::Unknown {
+        event_type: "plugin/checkpoint".to_string(),
+        data: serde_json::json!({ "turns": 42, "sha": "abc" }),
+    };
+    map.append_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "unknown_1".to_string(),
+        op: unknown.clone(),
+        parent_id: None,
+        version: 1,
+    });
+    // The unknown op does not change the derived transcript but must remain in
+    // the append-only log.
+    assert_eq!(map.events.len(), 1);
+    assert_eq!(map.derive_messages().len(), 0);
+    assert!(matches!(&map.events[0].op, SessionEventOp::Unknown { .. }));
+
+    // It must survive a full round trip through serialization of the map.
+    let json = serde_json::to_string(&map).expect("serialize map");
+    let back: SessionEventMap = serde_json::from_str(&json).expect("deserialize map");
+    assert_eq!(back.events.len(), 1);
+    match &back.events[0].op {
+        SessionEventOp::Unknown { event_type, data } => {
+            assert_eq!(event_type, "plugin/checkpoint");
+            assert_eq!(data.get("turns").and_then(|v| v.as_u64()), Some(42));
+        }
+        _ => panic!("unknown op not preserved through map round trip"),
+    }
+}
+
+/// Unknown ops must still be rejected by validation if their event id is empty,
+/// and accepted when the payload is well formed, so plugin events do not
+/// silently corrupt the log invariants.
+#[test]
+fn test_unknown_op_validation() {
+    // Empty event id is rejected even for an unknown (plugin) op.
+    let mut map = SessionEventMap::default();
+    map.append_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: String::new(),
+        op: SessionEventOp::Unknown {
+            event_type: "plugin/x".to_string(),
+            data: serde_json::json!({}),
+        },
+        parent_id: None,
+        version: 1,
+    });
+    assert_eq!(map.events.len(), 0, "empty event id must still be rejected");
+
+    // A well-formed unknown op with a valid id is accepted.
+    map.append_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "unknown_ok".to_string(),
+        op: SessionEventOp::Unknown {
+            event_type: "plugin/x".to_string(),
+            data: serde_json::json!({ "k": "v" }),
+        },
+        parent_id: None,
+        version: 1,
+    });
+    assert_eq!(map.events.len(), 1);
+}
+
 #[test]
 fn test_session_event_map_indices() {
     let mut session1 = Session::create_with_id(
