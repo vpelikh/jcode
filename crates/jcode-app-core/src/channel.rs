@@ -740,32 +740,30 @@ impl TelegramChannel {
     /// `/new [prompt]`: create a fresh session, make it the active one for this
     /// chat, and (optionally) run the first turn with `prompt`.
     async fn new_session_reply(&self, arg: &str) -> String {
-        // If an opening prompt is supplied, run the first turn headlessly with
-        // the typing indicator so the user sees the bot working.
-        if arg.is_empty() {
-            return match crate::server::telegram_control::create_session_for_control(None).await {
-                Ok((id, _)) => {
-                    crate::server::telegram_control::set_active_session(&self.chat_id, &id);
-                    format!(
-                        "✅ Created new session `{}`. Send a message to talk to it.",
-                        short_id(&id)
-                    )
-                }
-                Err(e) => format!("⚠️ Could not create a session: {}", escape_markdown_v2(&e.to_string())),
-            };
-        }
-        match self
-            .with_typing(async {
-                crate::server::telegram_control::create_session_for_control(Some(arg)).await
-            })
-            .await
+        // Create the session headlessly. If an opening prompt is supplied, don't
+        // run it under the plain typing indicator (no progress, no way to stop);
+        // instead create the session empty, select it, and stream the prompt so
+        // the user sees live progress and gets the 🛑 Stop button, matching the
+        // quick-start path.
+        let (id, _) = match crate::server::telegram_control::create_session_for_control(None).await
         {
-            Ok((id, reply)) => {
-                crate::server::telegram_control::set_active_session(&self.chat_id, &id);
-                agent_reply_message(&id, &reply)
+            Ok(pair) => pair,
+            Err(e) => {
+                return format!(
+                    "⚠️ Could not create a session: {}",
+                    escape_markdown_v2(&e.to_string())
+                )
             }
-            Err(e) => format!("⚠️ Could not create a session: {}", escape_markdown_v2(&e.to_string())),
+        };
+        crate::server::telegram_control::set_active_session(&self.chat_id, &id);
+        if arg.trim().is_empty() {
+            return format!(
+                "✅ Created new session `{}`. Send a message to talk to it.",
+                short_id(&id)
+            );
         }
+        self.stream_reply_to_session(None, &id, arg.trim()).await;
+        String::new()
     }
 
     /// `/history [n]`: show recent messages of the active session.
@@ -1022,23 +1020,6 @@ impl TelegramChannel {
         };
         drop(tracker);
         match action {
-            "abort" => {
-                // Backwards compatibility for a prompt issued before this build
-                // made /abort immediate: honor it directly.
-                let signaled =
-                    crate::server::telegram_control::request_graceful_shutdown_for_control(&session_id).await;
-                if signaled {
-                    format!(
-                        "🛑 Stopped the active turn on `{}`.",
-                        short_id(&session_id)
-                    )
-                } else {
-                    format!(
-                        "ℹ️ No running turn on `{}` to stop.",
-                        short_id(&session_id)
-                    )
-                }
-            }
             "free" => {
                 let removed = crate::server::telegram_control::free_session_for_control(&session_id).await;
                 if removed {
@@ -1053,7 +1034,9 @@ impl TelegramChannel {
                     format!("⚠️ Could not free `{}` (already gone, or Telegram control is not wired).", short_id(&session_id))
                 }
             }
-            _ => unreachable!(),
+            // Only `/free` queues a pending confirmation. `/abort` stopped using
+            // confirmation many builds ago, so no other action can reach here.
+            _ => unreachable!("unexpected confirmed action: {action}"),
         }
     }
 
@@ -1321,34 +1304,6 @@ impl TelegramChannel {
             reply_to_message_id,
         )
         .await
-    }
-
-    /// Run `fut`, showing a periodic `typing` indicator the whole time and
-    /// cancelling it when the future completes. Returns the future's output.
-    async fn with_typing<Fut, T>(&self, fut: Fut) -> T
-    where
-        Fut: std::future::Future<Output = T>,
-    {
-        let client = self.client_or_default().await;
-        let token = self.token.clone();
-        let chat_id = self.chat_id.clone();
-        let api_base = self.api_base.clone();
-        let typing = tokio::spawn(async move {
-            loop {
-                let _ = crate::telegram::send_chat_action(
-                    &client,
-                    &token,
-                    &chat_id,
-                    "typing",
-                    api_base.as_deref(),
-                )
-                .await;
-                tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-            }
-        });
-        let result = fut.await;
-        typing.abort();
-        result
     }
 
     /// Process one inbound Telegram message. Runs under the per-channel
@@ -1752,6 +1707,36 @@ fn agent_reply_message(session_id: &str, reply: &str) -> String {
     )
 }
 
+/// MarkdownV2 placeholder shown while a session reply is streaming. The `[` `]`
+/// around the short id are escaped; the `_thinking…_` is literal italic.
+fn streaming_placeholder(short: &str) -> String {
+    format!("💭 \\[{short}] _thinking…_")
+}
+
+/// MarkdownV2 end-state shown when a turn settles with no assistant output
+/// (typically a Stop tapped before any tokens arrived). Replaces the dangling
+/// placeholder/empty prefix with an honest "stopped" note.
+fn streaming_stopped_message(short: &str) -> String {
+    format!("💬 \\[{short}] ⏹ _stopped — no output produced_")
+}
+
+/// Cap a MarkdownV2 message body so it never exceeds Telegram's per-message
+/// limit. `editMessageText` over the limit fails silently (the message freezes
+/// at the last accepted length with no user indication), so a long streamed
+/// reply must be clipped. A trailing backslash is dropped so a truncation
+/// cannot leave an incomplete escape sequence.
+fn clip_to_telegram_max(text: String) -> String {
+    let mut out = text;
+    if out.chars().count() > crate::telegram::MAX_MESSAGE_CHARS {
+        out = out.chars().take(crate::telegram::MAX_MESSAGE_CHARS).collect();
+    }
+    // An escape immediately before the cut would dangle a lone backslash.
+    if out.ends_with('\\') {
+        out.pop();
+    }
+    out
+}
+
 impl TelegramChannel {
     /// Run a prompt against `session_id` and stream partial assistant text into a
 /// single Telegram message (so the user sees live progress), then leave the
@@ -1773,7 +1758,7 @@ async fn stream_reply_to_session(
     // session, so the user can interrupt the run with one tap (the callback
     // fires the lock-free abort). The button is cleared from the final message
     // when the turn settles.
-    let placeholder = format!("💭 \\[{}] _thinking…_", short_id(session_id));
+    let placeholder = streaming_placeholder(&short_id(session_id));
     use crate::telegram::{InlineKeyboardButton, InlineKeyboardRow};
     let stop_button = InlineKeyboardButton {
         text: "🛑 Stop".to_string(),
@@ -1836,7 +1821,7 @@ async fn stream_reply_to_session(
                 &token,
                 chat_id.parse::<i64>().unwrap_or(0),
                 sent_id,
-                &body,
+                &clip_to_telegram_max(body),
                 api_base.as_deref(),
             )
             .await;
@@ -1854,20 +1839,77 @@ async fn stream_reply_to_session(
         self.api_base.as_deref(),
     )
     .await;
-    if let Err(e) = stream_result {
-        let _ = crate::telegram::edit_message_text(
-            &client,
-            &self.token,
-            self.chat_id.parse::<i64>().unwrap_or(0),
-            sent_id,
-            &format!(
-                "⚠️ Could not reach session `{}`: {}",
+    match stream_result {
+        Err(e) => {
+            let _ = crate::telegram::edit_message_text(
+                &client,
+                &self.token,
+                self.chat_id.parse::<i64>().unwrap_or(0),
+                sent_id,
+                &format!(
+                    "⚠️ Could not reach session `{}`: {}",
+                    short_id(session_id),
+                    escape_markdown_v2(&e.to_string())
+                ),
+                self.api_base.as_deref(),
+            )
+            .await;
+        }
+        Ok(reply) if reply.trim().is_empty()
+            || reply == "Message processed; no assistant text was produced." =>
+        {
+            // The turn settled with no output (typically a Stop tapped before
+            // any tokens arrived). Replace the dangling "thinking…" / empty
+            // prefix with a clear, honest end state so the message reads as
+            // intentionally empty rather than broken.
+            let _ = crate::telegram::edit_message_text(
+                &client,
+                &self.token,
+                self.chat_id.parse::<i64>().unwrap_or(0),
+                sent_id,
+                &streaming_stopped_message(&short_id(session_id)),
+                self.api_base.as_deref(),
+            )
+            .await;
+        }
+        Ok(reply) => {
+            // Normal completion. The on_progress closure streamed a clipped
+            // version of the reply into the message (aligned to Telegram's 4096
+            // limit) and Stop was cleared above. If the full reply was clipped,
+            // mark it so the user knows the live preview is not the whole
+            // answer and can open `/history` for the rest.
+            let full = format!(
+                "💬 \\[{}] {}",
                 short_id(session_id),
-                escape_markdown_v2(&e.to_string())
-            ),
-            self.api_base.as_deref(),
-        )
-        .await;
+                escape_markdown_v2(&reply)
+            );
+            if full.chars().count() > crate::telegram::MAX_MESSAGE_CHARS {
+                let note = "\n\n✂️ _clipped — /history shows the full reply_";
+                let budget = crate::telegram::MAX_MESSAGE_CHARS
+                    .saturating_sub(note.chars().count());
+                let mut clipped_body_text = escape_markdown_v2(&reply)
+                    .chars()
+                    .take(budget)
+                    .collect::<String>();
+                if clipped_body_text.ends_with('\\') {
+                    clipped_body_text.pop();
+                }
+                let clipped_body = format!(
+                    "💬 \\[{}] {}{note}",
+                    short_id(session_id),
+                    clipped_body_text
+                );
+                let _ = crate::telegram::edit_message_text(
+                    &client,
+                    &self.token,
+                    self.chat_id.parse::<i64>().unwrap_or(0),
+                    sent_id,
+                    &clipped_body,
+                    self.api_base.as_deref(),
+                )
+                .await;
+            }
+        }
     }
 }
 
@@ -2048,7 +2090,19 @@ impl MessageChannel for TelegramChannel {
                         offset = Some(update.update_id + 1);
 
                         if let Some(cb) = update.callback_query {
-                            let _ = self.handle_callback_query(cb).await;
+                            // Handle callbacks in their own task, mirroring the
+                            // message path below, so a slow callback (or one that
+                            // panics) cannot block `getUpdates` polling or kill
+                            // the reply loop and leave the bot silent. The offset
+                            // advanced above before we spawn, so no update is
+                            // lost. State-mutating callbacks still serialize on
+                            // process_lock inside handle_callback_query; the
+                            // pre-lock stop-button fast-path is lock-free by
+                            // design, so it stays responsive even during a turn.
+                            let callback_channel = Arc::clone(&self);
+                            tokio::spawn(async move {
+                                callback_channel.handle_callback_query(cb).await;
+                            });
                             continue;
                         }
 
@@ -3531,5 +3585,41 @@ mod tests {
         // A body with no role prefix is escaped wholesale.
         let plain = escape_history_entries("solo _line_");
         assert_eq!(plain, "solo \\_line\\_");
+    }
+
+    #[test]
+    fn test_streaming_message_templates_are_markdown_v2_safe() {
+        // These are sent with parse_mode=MarkdownV2. The `[` around the id is
+        // escaped (`\[`); a bare `]` after the id is tolerated by Telegram the
+        // same way the pre-existing agent_reply_message (`💬 \[sid] …`) works.
+        // Everything else in the templates must be non-reserved (or the `_`
+        // italic delimiters). Pin the exact output so a change to escaping is
+        // caught.
+        assert_eq!(streaming_placeholder("fox"), "💭 \\[fox] _thinking…_");
+        assert_eq!(
+            streaming_stopped_message("fox"),
+            "💬 \\[fox] ⏹ _stopped — no output produced_"
+        );
+        // Round-trip the dynamic short id through the templates: a short id with
+        // no reserved chars must survive unchanged (no accidental double-escape
+        // or injected parsed markup).
+        assert_eq!(
+            streaming_stopped_message(&crate::telegram::escape_markdown_v2("fox")),
+            streaming_stopped_message("fox")
+        );
+    }
+
+    #[test]
+    fn test_clip_to_telegram_max() {
+        // Short text is left untouched.
+        assert_eq!(clip_to_telegram_max("hello".to_string()), "hello");
+        // Over-limit text is capped at Telegram's per-message limit.
+        let long = "x".repeat(crate::telegram::MAX_MESSAGE_CHARS + 100);
+        let clipped = clip_to_telegram_max(long);
+        assert_eq!(clipped.chars().count(), crate::telegram::MAX_MESSAGE_CHARS);
+        assert!(!clipped.ends_with('\\'), "no dangling escape after clip");
+        // A cap that would end in an escape is trimmed so no lone backslash.
+        assert!(!clip_to_telegram_max("abc\\".to_string()).ends_with('\\'));
+        assert_eq!(clip_to_telegram_max("abc\\".to_string()), "abc");
     }
 }
