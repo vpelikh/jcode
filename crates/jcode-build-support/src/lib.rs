@@ -344,10 +344,9 @@ fn prune_old_versions_protecting(extra_protected: &[String]) -> Result<()> {
                 if let Ok(target) = std::fs::read_link(&link_path)
                     && let Ok(target) = target.canonicalize()
                     && target.starts_with(&versions_canon)
+                    && let Some(parent) = target.parent()
                 {
-                    if let Some(parent) = target.parent() {
-                        protected.push(parent.to_path_buf());
-                    }
+                    protected.push(parent.to_path_buf());
                 }
             }
         }
@@ -364,7 +363,7 @@ fn prune_old_versions_protecting(extra_protected: &[String]) -> Result<()> {
         // holds even when the jcode home path traverses a symlink.
         let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
         // Exclude protected channels from the "remove oldest" pool.
-        if protected.iter().any(|p| *p == canonical) {
+        if protected.contains(&canonical) {
             continue;
         }
         if let Ok(meta) = entry.metadata()
@@ -376,7 +375,9 @@ fn prune_old_versions_protecting(extra_protected: &[String]) -> Result<()> {
 
     // Newest first; delete everything beyond the newest `VERSIONS_KEEP_NEWEST`.
     if installs.len() > VERSIONS_KEEP_NEWEST {
-        installs.sort_by(|a, b| b.0.cmp(&a.0));
+        // Sort newest-first (descending mtime) via Reverse so the newest retained
+        // installs are the ones kept.
+        installs.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
         for (_mtime, path) in installs.into_iter().skip(VERSIONS_KEEP_NEWEST) {
             let _ = std::fs::remove_dir_all(&path);
         }
