@@ -517,6 +517,154 @@ fn shared_server_tracks_stable_when_marker_missing() {
     });
 }
 
+// Immutable `builds/versions/<version>/` installs must be pruned after
+// promotion so they do not accumulate (~611 MB each). `prune_old_versions`
+// keeps the promoted channels (current/stable/shared-server) plus the newest
+// `VERSIONS_KEEP_NEWEST` other installs, and deletes the rest.
+#[test]
+fn prune_old_versions_keeps_protected_channels_and_newest() {
+    with_temp_jcode_home(|| {
+        let exe = std::env::current_exe().unwrap();
+        // Install several versions; promote the three that must survive.
+        install_binary_at_version(&exe, "old-1").expect("install old-1");
+        install_binary_at_version(&exe, "old-2").expect("install old-2");
+        install_binary_at_version(&exe, "old-3").expect("install old-3");
+        install_binary_at_version(&exe, "old-4").expect("install old-4");
+        install_binary_at_version(&exe, "stable-keep").expect("install stable-keep");
+        install_binary_at_version(&exe, "current-keep").expect("install current-keep");
+        install_binary_at_version(&exe, "shared-keep").expect("install shared-keep");
+        update_current_symlink("current-keep").expect("promote current");
+        update_stable_symlink("stable-keep").expect("promote stable");
+        update_shared_server_symlink("shared-keep").expect("promote shared");
+
+        let before = std::fs::read_dir(builds_dir().unwrap().join("versions"))
+            .unwrap()
+            .count();
+        assert!(before >= 7, "fixture should install 7+ versions, got {before}");
+
+        prune_old_versions().expect("prune");
+
+        let versions_dir = builds_dir().unwrap().join("versions");
+        let names: std::collections::HashSet<String> = std::fs::read_dir(&versions_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        // Protected channels always survive.
+        assert!(names.contains("current-keep"), "current must survive");
+        assert!(names.contains("stable-keep"), "stable must survive");
+        assert!(names.contains("shared-keep"), "shared-server must survive");
+        // The four unprotected installs are capped to the newest VERSIONS_KEEP_NEWEST
+        // (2). mtimes for installs created in the same second may tie, so assert the
+        // count bound rather than exactly which pair survives.
+        let unprotected: Vec<_> = ["old-1", "old-2", "old-3", "old-4"]
+            .iter()
+            .filter(|n| names.contains(**n))
+            .collect();
+        assert!(
+            unprotected.len() <= 2,
+            "at most VERSIONS_KEEP_NEWEST unprotected installs may survive, got {}",
+            unprotected.len()
+        );
+    });
+}
+
+// The canary channel has no `-version` marker, so `prune_old_versions` must
+// protect it via the `builds/canary/` symlink target. A smoke-testing canary
+// binary must never be pruned even though it is neither current, stable, nor
+// shared-server.
+#[test]
+fn prune_old_versions_protects_canary_channel_via_symlink() {
+    with_temp_jcode_home(|| {
+        let exe = std::env::current_exe().unwrap();
+        // Install enough versions that an unprotected one would be pruned.
+        let canary = "canary-hash";
+        install_binary_at_version(&exe, "old-1-canary").unwrap();
+        install_binary_at_version(&exe, "old-2-canary").unwrap();
+        install_binary_at_version(&exe, "old-3-canary").unwrap();
+        install_binary_at_version(&exe, canary).unwrap();
+        // Promote canary via its channel symlink (no marker file is written).
+        update_canary_symlink(canary).unwrap();
+
+        prune_old_versions().unwrap();
+
+        let versions_dir = builds_dir().unwrap().join("versions");
+        let names: std::collections::HashSet<String> = std::fs::read_dir(&versions_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        // The canary version must always survive, even though it is the oldest
+        // and not covered by current/stable/shared markers.
+        assert!(names.contains(canary), "canary channel must survive pruning");
+        // The unprotected installs are capped to VERSIONS_KEEP_NEWEST. mtimes may
+        // tie (same-second installs), so assert the count bound, not a specific one.
+        let unprotected = ["old-1-canary", "old-2-canary", "old-3-canary"];
+        let surviving_unprotected = unprotected
+            .iter()
+            .filter(|n| names.contains(**n))
+            .count();
+        assert!(
+            surviving_unprotected <= 2,
+            "at most VERSIONS_KEEP_NEWEST unprotected installs may survive, got {}",
+            surviving_unprotected
+        );
+    });
+}
+
+// The `jcode` home can be reached through a symlink (e.g. a container mount or
+// a relocated install). `prune_old_versions` must still protect the promoted
+// current/stable/shared versions in that case: this exercises the canonical-path
+// matching so a marker-backed channel is never deleted just because its path
+// and the candidate path differ lexically.
+#[cfg(unix)]
+#[test]
+fn prune_old_versions_protects_promoted_channels_when_home_is_symlinked() {
+    let _guard = test_env_lock();
+    let real = tempfile::tempdir().expect("tempdir");
+    // Create a symlink that points at the real home dir.
+    let link_parent = tempfile::tempdir().expect("tempdir");
+    let link = link_parent.path().join("home-link");
+    std::os::unix::fs::symlink(real.path(), &link).expect("symlink");
+
+    let prev_home = std::env::var_os("JCODE_HOME");
+    jcode_core::env::set_var("JCODE_HOME", &link);
+
+    let exe = std::env::current_exe().unwrap();
+    install_binary_at_version(&exe, "promoted-a").unwrap();
+    install_binary_at_version(&exe, "promoted-b").unwrap();
+    install_binary_at_version(&exe, "relink-current").unwrap();
+    install_binary_at_version(&exe, "old-1-relink").unwrap();
+    install_binary_at_version(&exe, "old-2-relink").unwrap();
+    update_current_symlink("relink-current").unwrap();
+    update_stable_symlink("promoted-a").unwrap();
+    update_shared_server_symlink("promoted-b").unwrap();
+
+    prune_old_versions().unwrap();
+
+    let versions_dir = builds_dir().unwrap().join("versions");
+    let names: std::collections::HashSet<String> = std::fs::read_dir(&versions_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(names.contains("relink-current"), "current must survive symlink home");
+    assert!(names.contains("promoted-a"), "stable must survive symlink home");
+    assert!(names.contains("promoted-b"), "shared-server must survive symlink home");
+    // old-1/old-2 are unprotected; cap = VERSIONS_KEEP_NEWEST=2 → at most 2 survive.
+    let survivors = ["old-1-relink", "old-2-relink"]
+        .iter()
+        .filter(|n| names.contains(**n))
+        .count();
+    assert!(
+        survivors <= 2,
+        "at most VERSIONS_KEEP_NEWEST unprotected may survive, got {survivors}"
+    );
+
+    if let Some(prev_home) = prev_home {
+        jcode_core::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        jcode_core::env::remove_var("JCODE_HOME");
+    }
+}
+
 #[test]
 fn shared_server_tracks_stable_when_equal_to_stable() {
     with_temp_jcode_home(|| {

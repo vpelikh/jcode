@@ -79,6 +79,15 @@ const WORKSPACE_DIR: &str = "workspace";
 /// as a user visits many commits over time.
 const SHA_RETENTION_TTL: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 
+/// Maximum number of per-SHA index dirs kept under one project, regardless of
+/// reachability. Beyond this, only the newest `SHA_INDEX_MAX_KEPT` dirs plus the
+/// current HEAD's are retained. Without a cap, per-commit graphs that remain
+/// *reachable* from any ref (e.g. a backup branch) accumulate forever — each is
+/// ~0.9 GB for a large repo — so a repo with many long-lived branches can grow
+/// `~/.jcode/compass/<project>/` unbounded. Each large per-SHA dir is ~0.9 GB,
+/// so the default keeps the per-project Compass cache to a few GB.
+const SHA_INDEX_MAX_KEPT: usize = 3;
+
 /// Resolved Compass cache paths for a working directory.
 ///
 /// * `output_dir` — Compass's *output root*. Compass writes its output under
@@ -430,6 +439,18 @@ fn prune_stale_sha_outputs(project_root: &Path, working_dir: &Path, current_sha:
     let Ok(entries) = std::fs::read_dir(project_root) else {
         return;
     };
+
+    // Collect all per-SHA dirs, then apply two GC rules:
+    //   1. Unreachable dirs older than SHA_RETENTION_TTL are removed outright.
+    //   2. If the number of surviving per-SHA dirs still exceeds SHA_INDEX_MAX_KEPT,
+    //      keep only the newest SHA_INDEX_MAX_KEPT (plus current_sha) and remove the
+    //      rest — even if they are reachable from some (e.g. backup) ref. Otherwise
+    //      reachable per-commit graphs accumulate forever (~0.9 GB each on a large
+    //      repo) and `~/.jcode/compass/<project>/` grows unbounded.
+    let mut candidates: Vec<(SystemTime, PathBuf, String)> = Vec::new();
+    // Scan all per-SHA dirs (no truncation): the hard cap below prunes the
+    // oldest survivors. Limiting the scan could hide old dirs from the cap in
+    // pathological repos with very long visit histories.
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
@@ -443,24 +464,39 @@ fn prune_stale_sha_outputs(project_root: &Path, working_dir: &Path, current_sha:
         if name == current_sha {
             continue;
         }
-        // Reachable commits (any branch/tag) are kept regardless of age.
+        let Some(age) = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|mtime| now.duration_since(mtime).ok())
+        else {
+            continue;
+        };
+        // Reachable commits (any branch/tag) are kept regardless of age, but their dir
+        // still counts toward the max-kept cap below.
         if reachable.contains(name) {
+            candidates.push((now - age, entry.path(), name.to_string()));
             continue;
         }
         // Unreachable dirs must be older than the retention window before being
         // removed, so a recent checkout that happens to be unreachable from refs
         // is not deleted immediately.
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        let Ok(mtime) = meta.modified() else {
-            continue;
-        };
-        let Ok(age) = now.duration_since(mtime) else {
-            continue;
-        };
         if age >= SHA_RETENTION_TTL {
             let _ = std::fs::remove_dir_all(entry.path());
+        } else {
+            // Freshly-produced unreachable dir may still be reused after a branch
+            // switch; count it toward the cap so a burst of SHA visits cannot
+            // exceed the bound.
+            candidates.push((now - age, entry.path(), name.to_string()));
+        }
+    }
+
+    // Enforce the hard cap: drop the oldest survivors beyond the newest `MAX_KEPT`.
+    if candidates.len() > SHA_INDEX_MAX_KEPT {
+        // Newest first; drop from the tail (oldest) keeping the newest MAX_KEPT.
+        candidates.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_mtime, path, _name) in candidates.into_iter().skip(SHA_INDEX_MAX_KEPT) {
+            let _ = std::fs::remove_dir_all(&path);
         }
     }
 }
@@ -2315,6 +2351,101 @@ mod tests {
         assert!(
             project_root.join(&detached_sha).exists(),
             "detached current HEAD must be kept even though it is unreachable and old"
+        );
+    }
+
+    // Per-commit graph dirs can remain *reachable* from any ref (e.g. a backup
+    // branch) and would otherwise accumulate forever (~0.9 GB each on a large
+    // repo). The hard cap must still prune the oldest beyond `SHA_INDEX_MAX_KEPT`
+    // survivors, while always keeping the current HEAD — even when the HEAD is
+    // itself unreachable. This is what actually bounds `~/.jcode/compass/` when
+    // the 14-day TTL cannot (reachable SHAs never age out of that rule).
+    #[test]
+    fn prune_caps_total_kept_shas_regardless_of_reachability() {
+        let (_home, _home_path) = HomeGuard::set();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        let git = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init", "-q"]) {
+            return;
+        }
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(root.join("main.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "."]);
+        if !git(&["commit", "-qm", "init"]) {
+            return;
+        }
+
+        // Create more *reachable* commits than the cap by making a backup branch
+        // and advancing it: these SHAs are in `git rev-list --all`, so the old
+        // TTL-only GC would keep them forever. The hard cap must still prune the
+        // oldest once we exceed SHA_INDEX_MAX_KEPT.
+        for i in 0..(SHA_INDEX_MAX_KEPT + 2) {
+            std::fs::write(root.join("main.rs"), format!("fn a{}() {{}}\n", i)).unwrap();
+            git(&["add", "."]);
+            // First advance off the current branch; keep committing on `backup`.
+            if i == 0 {
+                git(&["checkout", "-qb", "backup"]);
+            }
+            if !git(&["commit", "-qm", &format!("backup {i}")]) {
+                return;
+            }
+        }
+        let Some(reachable) = git_reachable_shas(&root) else {
+            return;
+        };
+        // HEAD is now the last backup commit; `git_reachable_shas` returns all.
+        assert!(
+            reachable.len() >= SHA_INDEX_MAX_KEPT + 3,
+            "expected >= {} reachable commits, got {}",
+            SHA_INDEX_MAX_KEPT + 3,
+            reachable.len()
+        );
+        let head_sha = current_git_sha(&root).expect("HEAD sha");
+
+        // Create a per-SHA dir for every reachable commit, each stamped with a
+        // distinct mtime so the survivors are well-defined.
+        let project_root = root.join("compass/proj");
+        for (i, sha) in reachable.iter().enumerate() {
+            std::fs::create_dir_all(project_root.join(sha)).unwrap();
+            let mtime = std::time::SystemTime::now()
+                .checked_sub(std::time::Duration::from_secs((i as u64) * 3600))
+                .unwrap();
+            filetime::set_file_mtime(
+                project_root.join(sha),
+                filetime::FileTime::from_system_time(mtime),
+            )
+            .unwrap();
+        }
+
+        prune_stale_sha_outputs(&project_root, &root, &head_sha);
+
+        // HEAD always survives.
+        assert!(
+            project_root.join(&head_sha).exists(),
+            "current HEAD must survive the cap"
+        );
+        // HEAD is always kept; every other reachable dir is eligible for the cap,
+        // so at most SHA_INDEX_MAX_KEPT non-HEAD reachable dirs may survive. This
+        // is the whole point: the old TTL-only GC kept reachable dirs forever.
+        let surviving: Vec<_> = reachable
+            .iter()
+            .filter(|n| *n != &head_sha && project_root.join(n).exists())
+            .collect();
+        assert!(
+            surviving.len() <= SHA_INDEX_MAX_KEPT,
+            "cap violated: {} non-HEAD reachable dirs survived, cap is {}",
+            surviving.len(),
+            SHA_INDEX_MAX_KEPT
         );
     }
 
