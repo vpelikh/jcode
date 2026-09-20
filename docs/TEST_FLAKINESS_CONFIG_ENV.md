@@ -47,11 +47,16 @@ The env fingerprint is an in-memory scan of the process environment (no file
 I/O), so compare it on **every** `config()` call, independently of the throttle.
 Keep the throttle only for the config-file `fs::metadata` stat.
 
-- `ConfigCache` gained an `env_fingerprint: Vec<(String, String)>` field.
-- `config()` computes `config_env_fingerprint()` up front and compares it to the
-  cache's snapshot. If it changed, the fast-path throttle is bypassed and the
+- `config()` computes `config_env_fingerprint()` up front and compares it to
+  `ConfigCacheFingerprint.env` (the env snapshot already stored in the cache's
+  `fingerprint`). If it changed, the fast-path throttle is bypassed and the
   config reloads immediately.
-- After reloading, both `fingerprint` and `env_fingerprint` are refreshed.
+- The snapshot is taken only after `CONFIG_CACHE` is initialized
+  (`LazyLock::force`). Config::load() can set env vars itself (e.g.
+  copilot_premium -> JCODE_COPILOT_PREMIUM); snapshotting before init would
+  miss those and spuriously reload on the very first `config()` call.
+- After reloading, `fingerprint` is refreshed (which re-reads the env snapshot),
+  so the next comparison sees the post-load environment.
 
 Preserves the throttle's purpose (avoid re-statting config.toml on every read)
 while making env-driven runtime config immediate, which is the correct behavior
@@ -65,19 +70,26 @@ for both tests and live process env overrides.
 
 ## Second issue: HOME mutation race in bash gate tests
 
-`crates/jcode-app-core/src/tool/bash_tests.rs` had two tests that mutate the
-process `HOME` env var via `std::env::set_var` without taking the shared
-test-env lock:
+Three tests mutate the process `HOME` env var via `std::env::set_var` without
+taking the shared test-env lock, so under the default parallel harness another
+test that reads `HOME` can observe a mid-mutation value:
 
-- `bash_refuses_to_delete_the_home_directory`
-- `indirect_dispatch_paths_cannot_bypass_the_gate`
+- `crates/jcode-app-core/src/tool/bash_tests.rs`:
+  `bash_refuses_to_delete_the_home_directory`,
+  `indirect_dispatch_paths_cannot_bypass_the_gate`
+- `crates/jcode-app-core/src/tool/apply_patch_tests.rs`:
+  `apply_patch_refuses_to_delete_a_protected_path` (same Issue #604 gate class)
+- `crates/jcode-app-core/src/agent/provider.rs`:
+  `resolve_working_dir_tests::tilde_expands_to_home`
 
-Under the default parallel harness another test can read `HOME` mid-mutation, so
-the gate detects the wrong HOME and the test intermittently fails. Every other
-HOME/`JCODE_HOME`-mutating test in the crate takes
-`crate::storage::lock_test_env()`; these two were the exceptions. Fixed by adding
-the lock to both, matching the established convention. Validated: 3 clean
-parallel runs of `cargo test -p jcode-app-core --lib tool::bash::tests`.
+Each now takes `crate::storage::lock_test_env()`, matching the established
+convention used by every other HOME/`JCODE_HOME`-mutating test in the crate.
+Validated: clean parallel runs of the affected modules and of
+`cargo test -p jcode-app-core --lib server::tests:: -- --test-threads=1`.
+
+Note: `jcode-base/src/auth/tests.rs` also mutates `HOME`/`JCODE_HOME`, but there
+the mutation lives in a helper invoked only by tests that already hold
+`lock_test_env()`, so no change was needed there.
 
 ## Residual known flake (not fixed)
 
