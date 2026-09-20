@@ -300,14 +300,8 @@ pub(super) async fn cleanup_client_connection(
             .set_member_status(client_session_id, status, detail)
             .await;
 
-        let (swarm_id, removed_name) = {
-            let mut members = swarm_members.write().await;
-            if let Some(member) = members.remove(client_session_id) {
-                (member.swarm_id, member.friendly_name)
-            } else {
-                (None, None)
-            }
-        };
+        let removed_member = swarm.remove_session_member(client_session_id).await;
+        let (swarm_id, removed_name) = (removed_member.swarm_id, removed_member.friendly_name);
         crate::session_metrics::forget(client_session_id);
         crate::session_effort::forget_session_effort(client_session_id);
 
