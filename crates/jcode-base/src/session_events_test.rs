@@ -4313,4 +4313,96 @@ fn test_prune_transcript_uses_policy_and_keeps_event_log_consistent() {
     // ReplaceMessages event to keep the log the source of truth.
     assert_eq!(session.messages.len(), before_msgs);
     assert_eq!(session.event_map.events.len(), before_events + 1);
+
+    // The single appended event must be a ReplaceMessages carrying the pruned
+    // transcript, so replaying the event log reconstructs the pruned state.
+    let last = session.event_map.events.last().expect("one event appended");
+    match &last.op {
+        SessionEventOp::ReplaceMessages { start_index, messages, .. } => {
+            assert_eq!(*start_index, 0);
+            // messages[0] is the oversized image (appended first); it must have
+            // been replaced with a prune text marker in the replayed event.
+            let image = &messages[0].content[0];
+            assert!(
+                matches!(image, ContentBlock::Text { text, .. } if text.contains("Image omitted during context pruning")),
+                "replayed ReplaceMessages must contain the prune marker"
+            );
+        }
+        other => panic!("expected ReplaceMessages event, got {:?}", other),
+    }
+    // Event-log replay stays consistent with the legacy vector.
+    session
+        .rederive_all_checked()
+        .expect("event log must agree with legacy vector after prune");
+}
+
+#[test]
+fn scheduled_prune_preserves_unconsumed_results_and_images() {
+    use crate::compaction::prune::PrunePolicy;
+    let mut session = Session::create_with_id("scheduled-prune-boundary".into(), None, None);
+    let fresh = vec![
+        ContentBlock::ToolResult {
+            tool_use_id: "fresh".into(),
+            content: "x".repeat(10_000),
+            is_error: None,
+        },
+        ContentBlock::Image {
+            media_type: "image/png".into(),
+            data: "a".repeat(5000),
+        },
+    ];
+    let mut append = |role, content| {
+        session.append_stored_message(StoredMessage {
+            id: crate::id::new_id("prune-test"),
+            role,
+            content,
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    };
+    append(Role::User, fresh.clone());
+    let before = session.event_map.events.len();
+    assert!(
+        session
+            .prune_consumed_transcript(&PrunePolicy::node_caps())
+            .is_empty(),
+        "no assistant response means no content has been consumed yet"
+    );
+    assert_eq!(session.event_map.events.len(), before);
+    session.append_stored_message(StoredMessage {
+        id: crate::id::new_id("prune-test"),
+        role: Role::Assistant,
+        content: vec![text_block("I read the first result")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    session.append_stored_message(StoredMessage {
+        id: crate::id::new_id("prune-test"),
+        role: Role::User,
+        content: fresh.clone(),
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    let report = session.prune_consumed_transcript(&PrunePolicy::node_caps());
+    assert_eq!(report.images_stripped, 1);
+    assert_eq!(report.tool_results_truncated, 1);
+    assert_eq!(
+        serde_json::to_value(&session.messages[2].content).unwrap(),
+        serde_json::to_value(&fresh).unwrap(),
+        "new tool results and screenshots must survive their first model call"
+    );
+    session
+        .rederive_all_checked()
+        .expect("scheduled mutation must replay");
+    assert!(
+        session
+            .prune_consumed_transcript(&PrunePolicy::node_caps())
+            .is_empty()
+    );
 }

@@ -363,6 +363,11 @@ pub enum Request {
     #[serde(rename = "compact")]
     Compact { id: u64 },
 
+    /// Trigger manual deterministic prune (model-free node-caps shrink), the
+    /// counterpart to compaction that never summarizes.
+    #[serde(rename = "prune")]
+    Prune { id: u64 },
+
     /// Trigger immediate memory extraction for the current session
     #[serde(rename = "trigger_memory_extraction")]
     TriggerMemoryExtraction { id: u64 },
@@ -1524,6 +1529,18 @@ pub enum ServerEvent {
         message: String,
         /// Whether compaction was started successfully
         success: bool,
+    },
+
+    /// Response to prune request — deterministic context reclamation status
+    #[serde(rename = "prune_result")]
+    PruneResult {
+        id: u64,
+        /// Number of oversized inline images replaced with text markers.
+        images_stripped: usize,
+        /// Number of oversized tool results truncated to their cap.
+        tool_results_truncated: usize,
+        /// Human-readable status message.
+        message: String,
     },
 
     /// Response to resume_all_sessions — summary of which sessions were continued.

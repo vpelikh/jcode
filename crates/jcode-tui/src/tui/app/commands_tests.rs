@@ -842,3 +842,172 @@ fn local_handoff_listing_surfaces_archived_and_requires_server_for_resume() {
         "local /handoffres should explain a server is needed: {msg}"
     );
 }
+
+mod prune {
+    struct PruneTestHome {
+        previous: Option<std::ffi::OsString>,
+        home: tempfile::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl PruneTestHome {
+        fn new() -> Self {
+            let lock = crate::storage::lock_test_env();
+            let home = tempfile::tempdir().unwrap();
+            let previous = std::env::var_os("JCODE_HOME");
+            crate::env::set_var("JCODE_HOME", home.path());
+            Self {
+                previous,
+                home,
+                _lock: lock,
+            }
+        }
+    }
+    impl Drop for PruneTestHome {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => crate::env::set_var("JCODE_HOME", value),
+                None => crate::env::remove_var("JCODE_HOME"),
+            }
+        }
+    }
+
+    use crate::message::{ContentBlock, Role};
+    use crate::tui::app::commands_dispatch::dispatch_local_command;
+    use crate::tui::app::tests::create_test_app;
+
+    fn last_message(app: &crate::tui::app::App) -> String {
+        app.display_messages
+            .last()
+            .map(|m| m.content.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn prune_claims_and_reports_when_oversized_image_present() {
+        let _home = PruneTestHome::new();
+        let mut app = create_test_app();
+        // Seed an oversized inline image (payload >> the 1024-char per-node cap).
+        app.session
+            .append_stored_message(crate::session::StoredMessage {
+                id: "msg-bigimg".to_string(),
+                role: Role::User,
+                content: vec![ContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: "x".repeat(5000),
+                }],
+                display_role: None,
+                timestamp: None,
+                tool_duration_ms: None,
+                token_usage: None,
+            });
+
+        assert!(
+            dispatch_local_command(&mut app, "/prune"),
+            "/prune must be claimed by the shared dispatch table"
+        );
+        let text = last_message(&app);
+        assert!(
+            text.contains("Pruned transcript") && text.contains("1 oversized image"),
+            "expected a prune report for the oversized image, got: {text}"
+        );
+
+        // Behavioral proof the node was actually replaced, not just reported:
+        // the oversized `Image` block must now be a short `Text` marker, and the
+        // 5k base64 payload must no longer be present anywhere in the transcript.
+        // (`create_test_app` seeds a system-reminder message at index 0, so the
+        // image we pushed lives at index 1.)
+        let stored = app
+            .session
+            .messages
+            .iter()
+            .find(|m| m.id == "msg-bigimg")
+            .expect("the seeded image message must still exist");
+        assert!(
+            matches!(stored.content.first(), Some(ContentBlock::Text { text, .. }) if text.contains("Image omitted during context pruning")),
+            "the oversized image block must be replaced with a prune marker"
+        );
+        let full = stored
+            .content
+            .iter()
+            .map(|b| match b {
+                ContentBlock::Text { text, .. } => text.clone(),
+                _ => String::new(),
+            })
+            .collect::<String>();
+        assert!(
+            !full.contains("xxxxx"),
+            "the 5000-char base64 payload must not survive pruning"
+        );
+        let loaded =
+            crate::session::Session::load(&app.session.id).expect("local prune survives reload");
+        assert_eq!(
+            serde_json::to_value(&loaded.messages).unwrap(),
+            serde_json::to_value(&app.session.messages).unwrap()
+        );
+    }
+
+    #[test]
+    fn prune_claims_and_reports_noop_when_nothing_oversized() {
+        let _home = PruneTestHome::new();
+        let mut app = create_test_app();
+        assert!(
+            dispatch_local_command(&mut app, "/prune"),
+            "/prune must be claimed by the shared dispatch table"
+        );
+        let text = last_message(&app);
+        assert!(
+            text.contains("nothing oversized to shrink"),
+            "expected a no-op report, got: {text}"
+        );
+    }
+
+    #[test]
+    fn prune_reports_save_failure() {
+        let home = PruneTestHome::new();
+        let mut app = create_test_app();
+        app.session
+            .append_stored_message(crate::session::StoredMessage {
+                id: "save-failure".into(),
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "persist me".into(),
+                    cache_control: None,
+                }],
+                display_role: None,
+                timestamp: None,
+                tool_duration_ms: None,
+                token_usage: None,
+            });
+        let sessions = home.home.path().join("sessions");
+        if sessions.exists() {
+            std::fs::remove_dir_all(&sessions).unwrap();
+        }
+        std::fs::write(&sessions, "blocked").unwrap();
+        assert!(dispatch_local_command(&mut app, "/prune"));
+        assert!(last_message(&app).contains("failed to save session"));
+    }
+
+    #[test]
+    fn prune_is_discoverable_via_help() {
+        let _home = PruneTestHome::new();
+        let mut app = create_test_app();
+        assert!(
+            crate::tui::app::state_ui_input_helpers::registered_command_entries()
+                .any(|(name, _)| name == "/prune")
+        );
+        app.input = "/prun".into();
+        app.cursor_pos = app.input.len();
+        assert!(
+            app.command_suggestions()
+                .iter()
+                .any(|(name, _)| name == "/prune")
+        );
+        let help = app
+            .command_help("prune")
+            .expect("/prune should have detailed help");
+        assert!(
+            help.to_lowercase().contains("no model call") && help.contains("/prune"),
+            "prune help should describe the model-free nature and command, got: {help}"
+        );
+    }
+}

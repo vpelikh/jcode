@@ -348,6 +348,29 @@ impl CrossProviderFailoverMode {
     }
 }
 
+/// Loop-hygiene / runaway-loop guard configuration (deepseek-harness takeaway #7).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoopGuardConfig {
+    /// How many *consecutive identical* tool calls trip the repeat-tool reminder.
+    ///
+    /// The model-free guard (see `jcode-app-core`'s repeat-tool reminder) injects a
+    /// short prompt-visible nudge telling the model to change approach or finish
+    /// once the same tool call (name + canonicalized input) has been issued this
+    /// many times in a row without progress. Defaults to 4. Set to a larger value
+    /// to be less aggressive, or to 0 to disable the guard entirely.
+    #[serde(default)]
+    pub repeat_tool_threshold: usize,
+}
+
+impl Default for LoopGuardConfig {
+    fn default() -> Self {
+        Self {
+            repeat_tool_threshold: 4,
+        }
+    }
+}
+
 /// Compaction configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -382,7 +405,7 @@ pub struct CompactionConfig {
     /// [semantic] Number of recent turns to look at for building the "current goal" embedding
     pub goal_window_turns: usize,
 
-    /// Hard cap on the token budget compaction measures against, regardless of
+/// Hard cap on the token budget compaction measures against, regardless of
     /// the model's advertised context window. 0 = no cap (use the model window).
     ///
     /// Every turn re-sends the whole transcript, so on a 1M-window model the
@@ -391,6 +414,39 @@ pub struct CompactionConfig {
     /// on large-window providers. This bounds the compaction trigger budget,
     /// not the final request size when recent messages cannot be compacted.
     pub max_context_tokens: usize,
+
+    /// [prune] Per-tool-result UTF-8 byte cap for the deterministic prune stage.
+    /// A single tool result larger than this is truncated to its head+tail.
+    ///
+    /// Default 16 KiB, applied by the scheduled per-step prune and the manual
+    /// `/prune` command (via `PrunePolicy::node_caps_with`). In a real coding
+    /// session (a multi-turn Kotlin/Java task) ~20% of tool results were 4–18 KiB
+    /// source-file reads that are legitimately worth retaining whole; the cap is
+    /// set to cover those while still bounding larger dumps. The separate
+    /// emergency-truncation cap (`EMERGENCY_TOOL_RESULT_MAX_CHARS`) stays at 4 KiB
+    /// as a harder recovery bound, and `PrunePolicy::node_caps()` (used by some
+    /// unit tests and the emergency path) still reflects that 4 KiB value.
+    pub prune_tool_result_max_bytes: usize,
+
+    /// [prune] Per-image base64 byte cap for the deterministic prune stage.
+    /// A single inline image larger than this is replaced with a text marker.
+    /// (`PrunePolicy::node_caps` default.)
+    pub prune_image_max_bytes: usize,
+
+    /// When true, the live producer physically consolidates `session.messages`
+    /// into `[summary_message, recent_tail...]` on compaction completion (both
+    /// auto-compaction and manual `/compact`), using the log-bracketed seam
+    /// (`Session::compact_transcript_with_bracket`, deepseek-harness takeaway
+    /// #5) instead of the legacy virtual model that keeps the full transcript
+    /// and prepends a synthetic summary at request time.
+    ///
+    /// Physical consolidation makes the transcript the single source of truth:
+    /// replay reproduces exactly what the provider saw, and reload needs no
+    /// separate `compacted_count` resume bookkeeping (the state is marked
+    /// `physically_consolidated`). It is a behavior- and persistence-changing
+    /// opt-in; the default keeps the historical virtual model.
+    #[serde(default)]
+    pub physically_consolidate: bool,
 }
 
 impl Default for CompactionConfig {
@@ -407,6 +463,9 @@ impl Default for CompactionConfig {
             relevance_keep_threshold: 0.65,
             goal_window_turns: 5,
             max_context_tokens: 0,
+            prune_tool_result_max_bytes: 16384,
+            prune_image_max_bytes: 1024,
+            physically_consolidate: false,
         }
     }
 }
@@ -1670,6 +1729,30 @@ pub struct LaunchHotkeysConfig {
     /// Set true once auto-import has populated `entries`, so we only bake the
     /// per-repo mapping a single time and never clobber later user edits.
     pub imported: bool,
+}
+
+/// Route-degradation auto-mitigation configuration.
+///
+/// The model-degradation tracker auto-compacts at the `Compact` rung regardless
+/// of this section. The *route fallback* action it controls is strictly
+/// opt-in: when `route_fallback_enabled` is false (the default), a degrading
+/// session escalates to `Escalated` and surfaces the situation rather than
+/// changing the user's model. Enable it and set `fallback_model` to retarget a
+/// persistently-degrading session onto a pinned fallback model.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct DegradationSettings {
+    /// Allow the mitigation ladder to switch the session to a pinned fallback
+    /// model once the route reaches the `RouteFallback` rung. Default: false.
+    /// Set false to keep auto-route-switching off and instead surface to the
+    /// user.
+    pub route_fallback_enabled: bool,
+    /// Optional pinned fallback model spec (e.g. `"claude-3.5-sonnet"` or an
+    /// OpenRouter `model@provider` spec) to switch to when
+    /// `route_fallback_enabled` is true and the route degrades past compaction.
+    /// When `None` and fallback is enabled, the tracker logs that no fallback
+    /// is configured and does not switch.
+    pub fallback_model: Option<String>,
 }
 
 #[cfg(test)]

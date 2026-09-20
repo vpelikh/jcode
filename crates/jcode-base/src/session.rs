@@ -1734,7 +1734,7 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         let mut contents: Vec<&mut Vec<ContentBlock>> =
             self.messages.iter_mut().map(|m| &mut m.content).collect();
         let truncated =
-            jcode_compaction_core::emergency_truncate_tool_results_in_contents(
+            jcode_compaction_core::prune_truncate_tool_results_in_contents(
                 &mut contents,
                 target_total_chars,
             );
@@ -1756,15 +1756,23 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
     /// for a run-every-step cadence (`PrunePolicy::node_caps`) or for the
     /// aggregate-body budget case (`PrunePolicy::payload_413`).
     ///
-    /// Mutates and persists the authoritative transcript and invalidates the
-    /// provider-message cache when anything changed. Returns a report of what
-    /// was pruned.
+    /// Mutates the authoritative transcript, records a replacement event, and
+    /// invalidates the provider-message cache when anything changed. The caller
+    /// must save the session to persist the mutation to disk.
     pub fn prune_transcript(
         &mut self,
         policy: &jcode_compaction_core::prune::PrunePolicy,
     ) -> jcode_compaction_core::prune::PruneReport {
+        self.prune_transcript_prefix(policy, self.messages.len())
+    }
+
+    fn prune_transcript_prefix(
+        &mut self,
+        policy: &jcode_compaction_core::prune::PrunePolicy,
+        end: usize,
+    ) -> jcode_compaction_core::prune::PruneReport {
         let mut contents: Vec<&mut Vec<ContentBlock>> =
-            self.messages.iter_mut().map(|m| &mut m.content).collect();
+            self.messages[..end].iter_mut().map(|m| &mut m.content).collect();
         let report = jcode_compaction_core::prune::prune_contents(&mut contents, policy);
         if !report.is_empty() {
             self.mark_memory_profile_dirty();
@@ -1772,6 +1780,22 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
             self.record_transcript_replacement();
         }
         report
+    }
+
+    /// Prune only history preceding the latest assistant response. Tool results,
+    /// screenshots and interrupts appended after that response have not yet been
+    /// seen by the model and must survive at least their first provider call.
+    /// With no assistant response there is no known consumed prefix to prune.
+    pub fn prune_consumed_transcript(
+        &mut self,
+        policy: &jcode_compaction_core::prune::PrunePolicy,
+    ) -> jcode_compaction_core::prune::PruneReport {
+        let end = self
+            .messages
+            .iter()
+            .rposition(|m| m.role == Role::Assistant)
+            .unwrap_or(0);
+        self.prune_transcript_prefix(policy, end)
     }
 
     pub fn visible_conversation_message_count(&self) -> usize {

@@ -17,6 +17,7 @@ public enum Request: Equatable, Sendable {
     case setModel(id: UInt64, model: String)
     case setReasoningEffort(id: UInt64, effort: String)
     case compact(id: UInt64)
+    case prune(id: UInt64)
     case renameSession(id: UInt64, title: String?)
     case clear(id: UInt64)
 
@@ -26,7 +27,7 @@ public enum Request: Equatable, Sendable {
             let .softInterrupt(id, _, _), let .cancelSoftInterrupts(id),
             let .ping(id), let .getHistory(id), let .resumeSession(id, _),
             let .setModel(id, _), let .setReasoningEffort(id, _), let .compact(id),
-            let .renameSession(id, _), let .clear(id):
+            let .prune(id), let .renameSession(id, _), let .clear(id):
             return id
         }
     }
@@ -66,6 +67,8 @@ public enum Request: Equatable, Sendable {
             object["effort"] = effort
         case .compact:
             object["type"] = "compact"
+        case .prune:
+            object["type"] = "prune"
         case let .renameSession(_, title):
             object["type"] = "rename_session"
             if let title {
@@ -145,6 +148,7 @@ public enum ServerEvent: Equatable, Sendable {
     case modelChanged(id: UInt64, model: String, error: String?)
     case reasoningEffortChanged(id: UInt64, effort: String?, error: String?)
     case compactResult(id: UInt64, message: String, success: Bool)
+    case pruneResult(id: UInt64, imagesStripped: UInt64, toolResultsTruncated: UInt64, message: String)
     case availableModelsUpdated(models: [String], providerModel: String?)
     case compaction(trigger: String, tokensSaved: UInt64?)
     case notification(fromName: String?, message: String)
@@ -300,6 +304,13 @@ public enum ServerEvent: Equatable, Sendable {
                 id: json.uint64("id"),
                 message: json.string("message"),
                 success: json.bool("success")
+            )
+        case "prune_result":
+            return .pruneResult(
+                id: json.uint64("id"),
+                imagesStripped: json.uint64("images_stripped"),
+                toolResultsTruncated: json.uint64("tool_results_truncated"),
+                message: json.string("message")
             )
         case "available_models_updated":
             return .availableModelsUpdated(

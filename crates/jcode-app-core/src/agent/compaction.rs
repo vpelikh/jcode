@@ -1,9 +1,23 @@
 use super::*;
+use anyhow::Context;
 
 impl Agent {
     pub(super) fn note_compaction_applied(&mut self) {
         self.cache_tracker.reset();
         self.locked_tools = None;
+        self.provider_session_id = None;
+        self.session.provider_session_id = None;
+    }
+
+    /// Invalidate provider context after a deterministic prune. Unlike a real
+    /// compaction, a prune does not change tool definitions, so it preserves
+    /// the locked tool surface (which `note_compaction_applied` clears). It
+    /// still resets the provider session and cache, because the shrunk
+    /// transcript no longer matches what the provider cached. This path runs
+    /// on the frequent scheduled per-step prune, so preserving `locked_tools`
+    /// avoids churning the tool surface mid-turn.
+    pub(super) fn note_prune_applied(&mut self) {
+        self.cache_tracker.reset();
         self.provider_session_id = None;
         self.session.provider_session_id = None;
     }
@@ -85,6 +99,35 @@ impl Agent {
                 false,
             ),
         }
+    }
+
+    /// Run a deterministic, model-free prune over the session transcript
+    /// (takeaway #6): shrink any oversized tool result / inline image under the
+    /// per-node caps, without invoking the summarizer. Returns a report of what
+    /// was pruned and a human-readable message.
+    pub fn request_manual_prune(&mut self) -> Result<(crate::compaction::prune::PruneReport, String)> {
+        let report = self
+            .session
+            .prune_transcript(&crate::compaction::prune::PrunePolicy::node_caps_with(
+                crate::config::config().compaction.prune_tool_result_max_bytes,
+                crate::config::config().compaction.prune_image_max_bytes,
+            ));
+        let message = if report.is_empty() {
+            "Prune: nothing oversized to shrink (context already within per-node caps).".to_string()
+        } else {
+            format!(
+                "Pruned transcript: replaced {} oversized image(s) and truncated {} oversized tool result(s).",
+                report.images_stripped, report.tool_results_truncated
+            )
+        };
+        if !report.is_empty() {
+            self.note_compaction_applied();
+        }
+        // Also retry persistence on a no-op after a previous failed save.
+        self.session
+            .save()
+            .context("Prune applied in memory but failed to save session")?;
+        Ok((report, message))
     }
 
     fn is_context_limit_error(error: &str) -> bool {
@@ -284,6 +327,15 @@ impl Agent {
                 "Request-too-large recovery skipped: no oversized inline images or tool results to strip",
             );
             return false;
+        }
+
+        // Persist the prune immediately so the mutation survives even if the
+        // retry is interrupted; the caller also saves on a successful retry.
+        if let Err(err) = self.session.save() {
+            logging::warn(&format!(
+                "Failed to persist 413 prune for session {}: {}",
+                self.session.id, err
+            ));
         }
 
         // The transcript changed; reseed compaction bookkeeping and reset

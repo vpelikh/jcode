@@ -264,6 +264,7 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
         "/compact",
         "Summarize old messages to free context",
     ));
+    lines.push(help_entry("/prune", "Shrink oversized context without summarizing"));
     lines.push(help_entry(
         "/rewind",
         "Show numbered history, /rewind N to rewind",

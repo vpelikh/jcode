@@ -21,7 +21,7 @@ use jcode_message_types::ContentBlock;
 use crate::{
     EMERGENCY_IMAGE_MAX_CHARS, EMERGENCY_TOOL_RESULT_MAX_CHARS,
     PAYLOAD_IMAGE_EMERGENCY_CHAR_BUDGET, PAYLOAD_TOOL_RESULT_CHAR_BUDGET,
-    emergency_truncate_tool_results_in_contents, emergency_truncated_tool_result,
+    prune_truncate_tool_results_in_contents, prune_truncated_tool_result,
     strip_large_images_in_contents,
 };
 
@@ -58,6 +58,28 @@ impl PrunePolicy {
         Self {
             image_max_chars: Some(EMERGENCY_IMAGE_MAX_CHARS),
             tool_result_max_chars: Some(EMERGENCY_TOOL_RESULT_MAX_CHARS),
+            image_total_budget: None,
+            tool_result_total_budget: None,
+        }
+    }
+
+    /// Per-node caps from explicit configs (e.g. loaded from config). Falls back
+    /// to the built-in defaults when a value is zero. Keeps aggregate budgets
+    /// off, exactly like [`Self::node_caps`], so it never performs surgery.
+    pub fn node_caps_with(tool_result_max_bytes: usize, image_max_bytes: usize) -> Self {
+        let tool_result_max_chars = if tool_result_max_bytes == 0 {
+            EMERGENCY_TOOL_RESULT_MAX_CHARS
+        } else {
+            tool_result_max_bytes
+        };
+        let image_max_chars = if image_max_bytes == 0 {
+            EMERGENCY_IMAGE_MAX_CHARS
+        } else {
+            image_max_bytes
+        };
+        Self {
+            image_max_chars: Some(image_max_chars),
+            tool_result_max_chars: Some(tool_result_max_chars),
             image_total_budget: None,
             tool_result_total_budget: None,
         }
@@ -135,7 +157,7 @@ pub fn prune_contents(
     if report.images_stripped == 0 {
         if let Some(budget) = policy.tool_result_total_budget {
             report.tool_results_truncated +=
-                emergency_truncate_tool_results_in_contents(contents, budget);
+                prune_truncate_tool_results_in_contents(contents, budget);
         }
     }
 
@@ -166,7 +188,20 @@ fn strip_oversized_images_node(contents: &mut [&mut Vec<ContentBlock>], max_char
         for block in content.iter_mut() {
             if let ContentBlock::Image { media_type, data } = block {
                 if data.len() > max_chars {
-                    let marker = prune_image_marker(media_type.clone(), data.len());
+                    let mut marker = prune_image_marker(media_type.clone(), data.len());
+                    if marker.len() > max_chars {
+                        // Tiny configured caps cannot hold the descriptive
+                        // marker. Use a compact marker and reserve its bytes
+                        // first so the stored node stays <= cap.
+                        let icon = crate::truncate_str_boundary("[img]", max_chars);
+                        let remaining = max_chars - icon.len();
+                        let head_bytes = remaining - remaining / 3;
+                        let full_suffix = format!("{}B", data.len());
+                        let suffix_bytes =
+                            crate::tail_str_boundary(&full_suffix, remaining / 3).to_string();
+                        let prefix = crate::truncate_str_boundary(&media_type, head_bytes);
+                        marker = format!("{}{}{}", prefix, icon, suffix_bytes);
+                    }
                     *block = ContentBlock::Text {
                         text: marker,
                         cache_control: None,
@@ -190,7 +225,22 @@ fn truncate_oversized_tool_results_node(
         for block in content.iter_mut() {
             if let ContentBlock::ToolResult { content: text, .. } = block {
                 if text.len() > max_chars {
-                    *text = emergency_truncated_tool_result(text, max_chars);
+                    let mut shortened = prune_truncated_tool_result(text, max_chars);
+                    if shortened.len() > max_chars {
+                        // Tiny configured caps cannot hold the recovery marker.
+                        // Use a compact marker and reserve its bytes first so
+                        // the next scheduled pass is a true no-op.
+                        let marker = crate::truncate_str_boundary("[pruned]", max_chars);
+                        let remaining = max_chars - marker.len();
+                        let head_bytes = remaining - remaining / 3;
+                        shortened = format!(
+                            "{}{}{}",
+                            crate::truncate_str_boundary(text, head_bytes),
+                            marker,
+                            crate::tail_str_boundary(text, remaining / 3),
+                        );
+                    }
+                    *text = shortened;
                     truncated += 1;
                 }
             }
@@ -288,6 +338,61 @@ mod tests {
         assert_eq!(report.images_stripped, 0);
         // The two 9 MB results are trimmed under the 8 MiB tool budget.
         assert!(report.tool_results_truncated > 0);
+    }
+
+    #[test]
+    fn configured_image_marker_is_bounded_and_idempotent() {
+        for cap in [1, 2, 8, 24, 64, 256, 1024, 4096] {
+            let mut blocks = vec![vec![image_block(20_000)]];
+            let policy = PrunePolicy::node_caps_with(4000, cap);
+            let report = prune_contents(&mut to_contents(&mut blocks), &policy);
+            assert_eq!(
+                report.images_stripped, 1,
+                "cap {cap} must strip the 20k image"
+            );
+            let block = &blocks[0][0];
+            let ContentBlock::Text { text, .. } = block else {
+                panic!("oversized image must be replaced with a text marker");
+            };
+            assert!(text.len() <= cap, "cap {cap}, marker {}", text.len());
+            // The replacement is Text, so a second pass is a no-op.
+            assert!(prune_contents(&mut to_contents(&mut blocks), &policy).is_empty());
+        }
+    }
+
+    #[test]
+    fn configured_caps_and_zero_fallback_match_policy() {
+        let custom = PrunePolicy::node_caps_with(256, 2048);
+        assert_eq!(custom.tool_result_max_chars, Some(256));
+        assert_eq!(custom.image_max_chars, Some(2048));
+        assert_eq!(custom.image_total_budget, None);
+        assert_eq!(custom.tool_result_total_budget, None);
+        let fallback = PrunePolicy::node_caps_with(0, 0);
+        let defaults = PrunePolicy::node_caps();
+        assert_eq!(
+            fallback.tool_result_max_chars,
+            defaults.tool_result_max_chars
+        );
+        assert_eq!(fallback.image_max_chars, defaults.image_max_chars);
+    }
+
+    #[test]
+    fn configured_small_caps_are_bounded_and_idempotent() {
+        for cap in [1, 2, 3, 16, 64, 128, 4000] {
+            let mut blocks = vec![vec![ContentBlock::ToolResult {
+                tool_use_id: "utf8".into(),
+                content: "尾é".repeat(2000),
+                is_error: None,
+            }]];
+            let policy = PrunePolicy::node_caps_with(cap, 1024);
+            let report = prune_contents(&mut to_contents(&mut blocks), &policy);
+            assert_eq!(report.tool_results_truncated, 1);
+            let ContentBlock::ToolResult { content, .. } = &blocks[0][0] else {
+                panic!("tool result must be preserved");
+            };
+            assert!(content.len() <= cap, "cap {cap}, actual {}", content.len());
+            assert!(prune_contents(&mut to_contents(&mut blocks), &policy).is_empty());
+        }
     }
 
     #[test]

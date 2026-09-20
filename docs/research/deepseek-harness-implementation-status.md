@@ -31,7 +31,7 @@ policy and report so every consumer stays in lockstep.
     budget (oldest-first) → aggregate tool-result budget (largest-first, only if
     no image was reclaimed) → per-node caps. It reuses the existing
     `strip_large_images_in_contents` and
-    `emergency_truncate_tool_results_in_contents` as building blocks, so the
+    `prune_truncate_tool_results_in_contents` as building blocks, so the
     numbers and the escalation order are behavior-preserving.
 - **`jcode-base` reusable seam:** `Session::prune_transcript(&PrunePolicy) ->
   PruneReport`, re-exported through `jcode_base::compaction::prune`. It records
@@ -44,15 +44,106 @@ policy and report so every consumer stays in lockstep.
   `prune_transcript(PrunePolicy::payload_413())` instead of tracing
   `strip_oversized_images` then `emergency_truncate_tool_results`. The policy
   and escalation order now live in exactly one place.
+- **`/prune` slash command.** `jcode-tui` `commands.rs` + `input_help.rs`: runs
+  the model-free node-caps pass on demand (policy built from the configurable
+  caps), reports `PruneReport`, and is discoverable via `/help prune`. 2 dispatch tests.
+- **Scheduled per-step prune.** Wired at the top of both agent loops
+  (`agent/turn_streaming_mpsc.rs`, `agent/turn_loops.rs`), before each next API
+  call, over the prefix preceding the latest assistant response. Fresh tool
+  results, screenshots and interrupts appended after the latest assistant are
+  in the unconsumed suffix and remain intact until the model has read them once.
+  Both the **image** and **tool-result** per-node caps run on **every** step: a
+  consumed oversized node from a prior turn must be reclaimed even on pure-text
+  follow-ups, or it lingers in every subsequent prompt. No-op when within caps.
+  A prune invalidates the provider session/cache but preserves the locked tool
+  surface (`note_prune_applied`).
+- **Configurable per-node caps.** `CompactionConfig` gains
+  `prune_tool_result_max_bytes` / `prune_image_max_bytes` (defaults 4000/1024,
+  `#[serde(default)]` so existing configs parse) and `PrunePolicy::node_caps_with`
+  builds the policy from them, falling back to the built-in defaults on zero.
+  Wired at all 4 live call sites (`/prune`, agent, streaming Point-D, headless).
 
-**Verification:** `jcode-compaction-core` 27 tests green (incl. 5 new `prune`
-tests). `jcode-base` **full lib 1556 green** (0 failed; incl. new
-`test_prune_transcript_uses_policy_and_keeps_event_log_consistent`).
-`jcode-app-core` full lib 1465 passed, 0 regressions — the only two failures are
-environment-load timing flakes that pass in isolation (see flake note below).
-`cargo build` green for `jcode-compaction-core`, `jcode-base`, `jcode-app-core`,
-`jcode-tui`, and the full `jcode` binary (which links all prune-consuming
-crates and runs).
+  **Scope note on `/prune`: remote wire support delivered.** `/compact` works
+  over SSH/remote via `Request::Compact` → `ServerEvent::CompactResult`. `/prune`
+  now has the same parity: `Request::Prune` → `ServerEvent::PruneResult` gets a
+  server-side `Agent::request_manual_prune` + `handle_prune` + lifecycle route, a
+  TUI `backend.prune()` transport + remote key-handling + `ServerEvent::PruneResult`
+  handler, and iOS `Wire.swift`/`SessionReducer` mirrors. The scheduled per-step
+  prune already ran server-side regardless of client; the on-demand `/prune`
+  command now works locally and over SSH/remote alike.
+
+**Branch review fixes (2026-09-13):**
+
+- **Fresh content loss:** scheduled pruning previously stripped newly generated
+  screenshots and truncated tool output before the next model request. Both
+  loops now call `Session::prune_consumed_transcript`, which protects the suffix
+  starting at the latest assistant response. No assistant response means no
+  eligible prefix. The regression failed against full-transcript pruning and
+  passed after the boundary fix, including replay and idempotence checks.
+  Runtime evidence: `scheduled_prune_preserves_fresh_oversized_results_at_runtime`
+  drives the real streaming loop through a bash tool call that returns a 6202-char
+  result and asserts that fresh oversized result survives the loop-head prune
+  while a consumed oversized image is replaced. This closes the loop-wiring coverage gap
+  end-to-end rather than relying only on the session-unit boundary test.
+- **Manual persistence and errors:** local and server `/prune` now save changes.
+  A failed save reports an error instead of success, and a subsequent no-op
+  retries persistence. Isolated temporary-home tests exercise real disk reloads,
+  blocked storage paths, and the server handler's request-ID/error response.
+- **413-recovery persistence:** the HTTP request-too-large prune paths (TUI
+  manual + auto-retry, and server `try_recover_after_payload_too_large`) save
+  the pruned transcript immediately, so the mutation is not lost if the retry
+  is interrupted or the user does not resubmit.
+- **Stale provider sessions:** changes invalidate native provider session IDs
+  and agent cache/tool state. Local TUI pruning clears its materialized message
+  cache and reseeds the compaction view. The agent disk-reload regression checks
+  the cleared native session ID as well as the pruned transcript.
+- **Discoverability:** `/prune` was missing from the registered command catalog
+  and help overlay. Both are now populated, and autocomplete is tested.
+- Added Swift request/result codec and reducer tests. `swift test` passed all
+  73 JCodeKit tests on macOS. This is not a device/iOS app acceptance run.
+
+**Review regression gate:** `prune` filters passed 16 app-core, 6 base and 5 TUI
+ tests. Full compaction-core/config-types/protocol libraries passed 29/19/82.
+ App-core loop/streaming/compaction filters passed 39/7/7. These filters overlap
+ and include unrelated tests, so their counts must not be summed as unique
+ prune acceptance cases. Live SSH transport and device UI remain outside this
+ pass; the server handler, persistence, Rust wire and Swift reducer were tested.
+
+The review build (`scripts/dev_cargo.sh build --profile selfdev -p jcode
+--bin jcode`) and direct `target/selfdev/jcode --version` smoke check passed.
+The SSH-mode command guard test also passed with `/prune` in its allowed wire
+command list. The shared daemon was not reloaded.
+
+**Fresh validation (2026-09-11/12):**
+
+- Full `jcode-compaction-core`, `jcode-config-types`, and `jcode-protocol`
+  library suites passed: 29, 19, and 82 tests respectively. The final
+  `prune` filter passed 15 app-core, 5 base, and 4 TUI tests.
+- The small-cap regression first failed: a configured cap of 1 produced a
+  56-byte result. The per-node path now reserves space for a compact marker
+  when the historical recovery marker cannot fit. UTF-8 inputs at byte caps
+  1, 2, 3, 16, 64, 128, and 4000 stay bounded and a second pass is a no-op.
+  The aggregate 413 recovery path is unchanged.
+- Added explicit policy tests for custom caps and zero-value fallback, plus a
+  Rust wire roundtrip test for `prune` requests and both no-op and changed
+  `prune_result` responses.
+- Targeted `prune` tests passed in base and TUI. The new direct agent test
+  checks provider-view refresh, event-log replay, and second-pass idempotence.
+  Broad name filters also match unrelated tests and are not proof of remote
+  end-to-end coverage.
+- App-core filters `turn_loops` (39), `turn_streaming` (7), and `compaction`
+  (7) passed. These are regression coverage, not dedicated acceptance tests
+  for every scheduled-prune branch.
+- `scripts/dev_cargo.sh build --profile selfdev -p jcode --bin jcode` passed
+  in this worktree. The shared daemon was not replaced or restarted, so this
+  build is not a live runtime acceptance result.
+
+**Earlier validation limits (superseded in part by the review above):** Live
+SSH command execution, iOS compilation, and save/restart persistence were not
+exercised in the September 11/12 pass. Wire roundtrips and
+agent-level tests provide component evidence, not proof of those workflows.
+The full-suite counts and flake descriptions below are historical observations,
+not fresh full-suite results.
 
 **Flake note (the full-suite run surfaced a 4th timing-sensitive test).** Under
 parallel load the app-core suite is missing 2 (not 3) timeout wall-clock tests,
@@ -86,12 +177,16 @@ prune change:
   is not touched by the prune commits either; it is an environment-dependent
   SSH/hang in the same pre-existing class as the others.
 
-**Interpretation noted (deviation from the literal doc).** The doc's literal
-recommendation is about scheduling: run `prune` *on a cheap cadence* (every step)
-and `summarize` less often. This deliverable built the **seam and policy** and
-wired the existing on-demand recovery paths through it, but it did **not** add a
-scheduled run-every-step prune at a turn boundary (a loop/behavior change). A
-scheduled prune is a documented follow-up; the seam is the deliverable here.
+**Interpretation noted (scheduled prune now delivered).** The doc's literal
+recommendation is to run `prune` *on a cheap cadence* (every step). This is now
+delivered: a scheduled per-step prune using `PrunePolicy::node_caps()` runs at
+the streaming loop's Injection Point D and in the headless `run_turn`, before
+each next API call, shrinking eligible already-consumed history. A `/prune`
+slash command exposes the same node-caps pass on demand. It remains a cheap,
+model-free per-node-cap pass (no aggregate surgery) and a no-op when within
+caps. The build-level and token-accounting interaction with the summarizer on
+very large sessions is flagged as an observation follow-up, not an unimplemented
+recommendation.
 
 ## Takeaway #7 (loop hygiene)
 

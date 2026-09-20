@@ -3804,6 +3804,42 @@ pub(super) fn handle_config_command(app: &mut App, trimmed: &str) -> bool {
         return true;
     }
 
+    if trimmed == "/prune" {
+        // Deterministic, model-free context reclamation (takeaway #6): shrink
+        // oversized tool results and replace oversized inline screenshots with
+        // short text markers, without invoking the summarizer. Complements
+        // `/compact` (which collapses older turns via a model summary).
+        let report = app
+            .session
+            .prune_transcript(&crate::compaction::prune::PrunePolicy::node_caps_with(
+                crate::config::config().compaction.prune_tool_result_max_bytes,
+                crate::config::config().compaction.prune_image_max_bytes,
+            ));
+        if !report.is_empty() {
+            app.messages.clear();
+            app.reseed_compaction_from_provider_messages();
+            app.provider_session_id = None;
+            app.session.provider_session_id = None;
+        }
+        if let Err(error) = app.session.save() {
+            app.push_display_message(DisplayMessage::error(format!(
+                "Prune applied in memory but failed to save session: {error:#}"
+            )));
+            return true;
+        }
+        if report.is_empty() {
+            app.push_display_message(DisplayMessage::system(
+                "Prune: nothing oversized to shrink (context already within per-node caps).".to_string(),
+            ));
+        } else {
+            app.push_display_message(DisplayMessage::system(format!(
+                "🧹 **Pruned transcript:** replaced {} oversized image(s) and truncated {} oversized tool result(s). Deterministic, no model call; summarization is unaffected.",
+                report.images_stripped, report.tool_results_truncated
+            )));
+        }
+        return true;
+    }
+
     if trimmed == "/compact" {
         if !app.provider.supports_compaction() {
             app.push_display_message(DisplayMessage::system(

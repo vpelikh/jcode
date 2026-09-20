@@ -373,6 +373,14 @@ public enum SessionReducer {
                 state.errorBanner = message
             }
 
+        case .pruneResult(_, let imagesStripped, let toolResultsTruncated, let message):
+            if imagesStripped > 0 || toolResultsTruncated > 0 {
+                state.notices.append(
+                    Notice(message: "Pruned context (\(imagesStripped) img, \(toolResultsTruncated) result)"))
+            } else {
+                state.notices.append(Notice(message: message))
+            }
+
         case .availableModelsUpdated(let models, let providerModel):
             state.availableModels = models
             if let providerModel {
