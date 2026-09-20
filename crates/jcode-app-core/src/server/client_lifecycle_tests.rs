@@ -194,6 +194,53 @@ async fn busy_agent_request_rejection_does_not_wait_for_agent_lock() {
 }
 
 #[tokio::test]
+async fn set_working_dir_rejected_when_agent_is_busy() {
+    let provider: Arc<dyn Provider> = Arc::new(PanicOnForkProvider {
+        forked: Arc::new(AtomicBool::new(false)),
+    });
+    let registry = Registry::new(Arc::clone(&provider)).await;
+    let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
+    let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel::<ServerEvent>();
+
+    // A /cd while the agent mutex is held (an in-flight turn) must be rejected
+    // without waiting, and surface a retryable busy Error.
+    let busy_agent_lock = agent.lock().await;
+    let rejected = tokio::time::timeout(Duration::from_millis(100), async {
+        reject_if_agent_busy_for_request(
+            19,
+            "set_working_dir",
+            "session_set_working_dir_busy",
+            false,
+            &agent,
+            &client_event_tx,
+        )
+    })
+    .await
+    .expect("set_working_dir busy rejection must not wait for the agent mutex");
+    assert!(rejected, "a busy agent must reject set_working_dir");
+    assert!(matches!(
+        client_event_rx.recv().await,
+        Some(ServerEvent::Error {
+            id: 19,
+            retry_after_secs: Some(1),
+            ..
+        })
+    ));
+    drop(busy_agent_lock);
+
+    // Once the agent is free, the same request is not rejected.
+    assert!(!reject_if_agent_busy_for_request(
+        20,
+        "set_working_dir",
+        "session_set_working_dir_busy",
+        false,
+        &agent,
+        &client_event_tx,
+    ));
+    assert!(client_event_rx.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn context_message_persists_without_starting_turn() {
     let _guard = crate::storage::lock_test_env();
     let _env = IsolatedReloadRecoveryEnv::new();
