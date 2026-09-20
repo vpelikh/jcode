@@ -319,6 +319,7 @@ impl App {
             covers_up_to_turn: compacted_count,
             original_turn_count: compacted_count,
             compacted_count,
+            physically_consolidated: false,
         };
 
         self.session.compaction = Some(state.clone());
@@ -388,11 +389,68 @@ impl App {
         if let Ok(mut manager) = compaction.try_write()
             && let Some(event) = manager.poll_compaction_event_with(&provider_messages)
         {
-            self.sync_session_compaction_state_from_manager(&manager);
+            let consolidated = self.physically_consolidate_if_enabled(&mut manager);
+            if !consolidated {
+                self.sync_session_compaction_state_from_manager(&manager);
+            }
             self.handle_compaction_event(event);
             return true;
         }
         false
+    }
+
+    /// Physically consolidate a just-completed compaction in the LOCAL TUI
+    /// producer when `[compaction] physically_consolidate` is enabled
+    /// (deepseek-harness takeaway #5). Mirrors the daemon-side
+    /// `Agent::physically_consolidate_if_enabled`: it rewrites
+    /// `session.messages` to `[summary_message, recent_tail...]` via the
+    /// log-bracketed seam and marks the manager physically consolidated so
+    /// subsequent provider-view derivation returns the transcript as-is rather
+    /// than double-prepending the summary.
+    ///
+    /// No-op in remote mode (the server owns compaction there) or when the
+    /// feature is disabled. Returns `true` when a physical consolidation was
+    /// applied.
+    pub(super) fn physically_consolidate_if_enabled(
+        &mut self,
+        manager: &mut crate::compaction::CompactionManager,
+    ) -> bool {
+        if self.is_remote || !crate::config::config().compaction.physically_consolidate {
+            return false;
+        }
+        let Some(state) = manager.persisted_state() else {
+            return false;
+        };
+        let manager_compacted = manager.compacted_count();
+        if manager_compacted == 0 {
+            return false;
+        }
+        let start = manager_compacted.min(self.session.messages.len());
+        let tail = self.session.messages[start..].to_vec();
+        let applied = self
+            .session
+            .physically_consolidate_compaction(
+                id::new_id("compact"),
+                state.summary_text.clone(),
+                state.openai_encrypted_content.clone(),
+                state.covers_up_to_turn,
+                state.original_turn_count,
+                state.compacted_count,
+                tail,
+            )
+            .is_some();
+        if applied {
+            manager.mark_physically_consolidated();
+            // The TUI's provider-message cache (`self.messages`) still reflects
+            // the pre-consolidation full transcript. Refresh it to the new
+            // consolidated view WITHOUT reseeding the manager (the manager is
+            // already marked physically consolidated; `replace_provider_messages`
+            // would reset that). `session.messages_for_provider_uncached()` now
+            // yields `[summary_message, recent_tail...]`, exactly the provider
+            // view.
+            self.messages = self.session.messages_for_provider_uncached();
+        }
+        applied
     }
 
     pub(super) fn handle_compaction_event(&mut self, event: CompactionEvent) {

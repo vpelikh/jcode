@@ -303,6 +303,25 @@ pub struct StoredCompactionState {
     pub covers_up_to_turn: usize,
     pub original_turn_count: usize,
     pub compacted_count: usize,
+    /// Whether the transcript was PHYSICALLY consolidated (via
+    /// `Session::compact_transcript_with_bracket`) so `session.messages` holds
+    /// `[summary_message, recent_tail...]`, as opposed to the legacy *virtual*
+    /// model where the summary is synthesized at request time and the full
+    /// transcript is left in place.
+    ///
+    /// `#[serde(default)]` keeps older snapshots (and any in-memory state
+    /// compiled before this field existed) decoding as virtual, so the manager
+    /// keeps its historical behavior unless a consumer explicitly opts into
+    /// physical consolidation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub physically_consolidated: bool,
+}
+
+/// Serde `skip_serializing_if` helper: omit a `bool` field when it is `false`,
+/// so the common (virtual) case stays on the wire as before and only
+/// physically-consolidated snapshots carry the field.
+pub(crate) fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl StoredMessage {

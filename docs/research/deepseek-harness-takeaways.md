@@ -176,6 +176,14 @@ dsh's own priority.
 
 **Still open (deliberately not forced).** The *live* compaction producer (`jcode-tui`/`jcode-app-core`) currently runs a prefix-summary model — it does **not** physically consolidate `session.messages` into a summary + recent tail, so `compact_transcript_with_bracket()` is the *integration point* to adopt, not something the live path calls yet. Migrating the live producer onto the seam is a behavior-changing, cross-crate change and is tracked separately from this report's design deliverable. This is an explicit, documented follow-up rather than an unimplemented recommendation.
 
+**Current status (2026-09-17).** The live producer can now adopt the physical-consolidation seam, gated behind a new opt-in config flag:
+- `StoredCompactionState` gained a `physically_consolidated` marker (`#[serde(default)]`, so existing virtual sessions decode unchanged). The `CompactionManager` reconciles a physical transcript: on restore it zeroes the live skip offset (`compacted_count`) because the summary already sits at `messages[0]`, and `messages_for_api_with` returns the consolidated transcript as-is instead of double-prepending a synthetic summary. New manager APIs: `is_physically_consolidated`, `mark_physically_consolidated`, `recent_tail`.
+- `Session::physically_consolidate_compaction(...)` builds `[summary_message, recent_tail...]`, applies it via `compact_transcript_with_bracket` (balanced `Start` → `replace` → `End`, replay-safe, crash-retry handles the orphan), and returns the flagged state so the producer can reseed its manager to the same view.
+- Both live producers expose `physically_consolidate_if_enabled(...)`, called at compaction completion (background auto-compaction via `poll_compaction_completion_event`/`poll_compaction_completion`, and the hard-compact emergency path — for app-core also the `messages_for_provider` manual-poll funnel). It is on only when `[compaction] physically_consolidate = true`; the default keeps the historical virtual summary model unchanged.
+- The provider-message cache invalidates automatically: `replace_messages` marks the session full-dirty, so the next provider view is rebuilt from the shrunken transcript. The TUI local producer also refreshes its `self.messages` cache without re-seeding the manager (which would undo the physical mark).
+
+Turning the flag on makes the transcript the single source of truth: replay reproduces exactly what the provider saw, and reload needs no separate `compacted_count` resume bookkeeping. It is a behavior- and persistence-changing opt-in, kept off by default so existing sessions and tests are unaffected.
+
 ## 6. Separate "prune" from "summarize"
 
 - **dsh:** `ctx.toolResultPruner` rewrites oversized *current* tool results through replayable

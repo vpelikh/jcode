@@ -2304,6 +2304,79 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         compaction_id
     }
 
+    /// Physically consolidate the live producer's compaction through the
+    /// log-bracketed seam (deepseek-harness takeaway #5).
+    ///
+    /// The legacy live producer runs a *virtual* model: the manager holds the
+    /// summary + `compacted_count` and `messages_for_api_with` prepends a
+    /// synthetic summary at request time over an un-rewritten transcript. This
+    /// helper is the physical counterpart: it builds a consolidated transcript
+    /// `[summary_message, recent_tail...]`, applies it via
+    /// [`Session::compact_transcript_with_bracket`], and returns the resulting
+    /// `StoredCompactionState` (with `physically_consolidated: true`) so the
+    /// caller can reseed its manager to the same physical view.
+    ///
+    /// `summary_text`/`openai_encrypted_content` come from the manager's
+    /// completed summary; `covers_up_to_turn`/`compacted_count`/`original_turn_count`
+    /// describe the summarized span in the *pre-compaction* (virtual) transcript,
+    /// exactly as `compact_transcript_with_bracket` expects for its
+    /// `StoredCompactionState`.
+    ///
+    /// `recent_tail` is the slice of the pre-compaction transcript that survives
+    /// (i.e. the active messages the manager chose to keep). It becomes indices
+    /// `1..` of the new transcript, after the summary message.
+    pub fn physically_consolidate_compaction(
+        &mut self,
+        compaction_id: impl Into<CompactionId>,
+        summary_text: String,
+        openai_encrypted_content: Option<String>,
+        covers_up_to_turn: usize,
+        original_turn_count: usize,
+        compacted_count: usize,
+        recent_tail: Vec<StoredMessage>,
+    ) -> Option<StoredCompactionState> {
+        let compaction = StoredCompactionState {
+            summary_text: summary_text.clone(),
+            openai_encrypted_content,
+            covers_up_to_turn,
+            original_turn_count,
+            compacted_count,
+            // This state describes a transcript that now physically carries the
+            // summary, so the manager must reconcile it as such.
+            physically_consolidated: true,
+        };
+        if SessionEventMap::validate_compaction(&compaction).is_err() {
+            return None;
+        }
+        let summary_content = if summary_text.trim().is_empty() {
+            // A degenerate empty summary still yields one message so the bracket
+            // surface (ReplaceMessages) is well-formed; compact_transcript_with_bracket
+            // requires a non-empty content block.
+            vec![ContentBlock::Text {
+                text: crate::compaction::compacted_summary_text_block("(empty summary)"),
+                cache_control: None,
+            }]
+        } else {
+            vec![ContentBlock::Text {
+                text: crate::compaction::compacted_summary_text_block(&summary_text),
+                cache_control: None,
+            }]
+        };
+        let mut transcript = Vec::with_capacity(recent_tail.len() + 1);
+        transcript.push(StoredMessage {
+            id: crate::id::new_id("compaction_summary").into(),
+            role: Role::User,
+            content: summary_content,
+            display_role: None,
+            timestamp: Some(chrono::Utc::now()),
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+        transcript.extend(recent_tail);
+        self.compact_transcript_with_bracket(compaction_id, transcript, compaction.clone(), covers_up_to_turn);
+        Some(compaction)
+    }
+
     /// Fork session up to a boundary (returns new session with prefix of events)
     pub fn fork_up_to_boundary(&self, boundary_index: usize) -> Self {
         let mut fork = self.clone();
