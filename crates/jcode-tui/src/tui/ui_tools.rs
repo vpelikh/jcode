@@ -116,7 +116,7 @@ pub(crate) mod tests_show_compass_query_output_override {
     use std::cell::Cell;
 
     thread_local! {
-        static SHOW_COMPASS_QUERY_OUTPUT: Cell<bool> = const { Cell::new(false) };
+        static SHOW_COMPASS_QUERY_OUTPUT: Cell<bool> = const { Cell::new(true) };
     }
 
     pub(crate) fn get() -> bool {
