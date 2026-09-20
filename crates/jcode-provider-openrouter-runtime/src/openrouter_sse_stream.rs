@@ -19,6 +19,18 @@ fn local_endpoint_troubleshooting_hint(api_base: &str, model: &str) -> &'static 
     "Hint: check network connectivity, DNS/TLS, that the base URL includes the API version (usually /v1), and that the model exists on the provider."
 }
 
+/// A troubleshooting hint for a provider that rejected the request because its
+/// serialized body was too large (HTTP 413). The generic network hint is
+/// misleading here: a 413 payload rejection is a *request-body size* failure,
+/// not a connectivity fault, so we point the user at shrinking the transcript
+/// (dropping images or large tool outputs) instead.
+fn payload_too_large_hint() -> &'static str {
+    "Hint: the provider rejected the request because the serialized body exceeded \
+its size limit (not a network error). Reduce the payload: keep recent turns, drop \
+or re-run image-heavy tools, shorten large tool outputs, or start a fresh \
+conversation with /new and /compact."
+}
+
 // ============================================================================
 // SSE Stream Parser
 // ============================================================================
@@ -242,7 +254,11 @@ async fn stream_response(
         let status = response.status();
         let retry_after = jcode_provider_core::retry_after::retry_after(response.headers());
         let body = jcode_base::util::http_error_body(response, "HTTP error").await;
-        let hint = local_endpoint_troubleshooting_hint(&api_base, &model);
+        let hint = if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+            payload_too_large_hint()
+        } else {
+            local_endpoint_troubleshooting_hint(&api_base, &model)
+        };
 
         // A 422 from an OpenAI-compatible endpoint with a token-limit body is a
         // transient exhaustion, not a permanent rejection: the request was
@@ -398,6 +414,20 @@ mod tests {
         assert!(hint.contains("LM Studio"));
         assert!(hint.contains("Local Server"));
         assert!(hint.contains("/v1/models"));
+    }
+
+    #[test]
+    fn payload_too_large_hint_is_about_request_size_not_network() {
+        // A 413 is a request-body-size rejection; the hint must not blame
+        // DNS/TLS or network connectivity, and should point at shrinking the
+        // transcript (images / tool outputs).
+        let hint = payload_too_large_hint();
+        assert!(hint.contains("serialized body exceeded"));
+        assert!(hint.contains("not a network error"));
+        assert!(hint.contains("tool outputs"));
+        assert!(!hint.contains("DNS/TLS"));
+        assert!(!hint.contains("network connectivity"));
+        assert!(!hint.to_lowercase().contains("dns"));
     }
 
     #[test]
