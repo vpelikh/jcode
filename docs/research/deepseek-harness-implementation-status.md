@@ -538,3 +538,92 @@ constructed at 96 sites, too invasive for one tool's benefit).
 
 The core F8 "promote-on-timeout" seam for `bash`/`bg`/`webfetch` remains a
 separate, behavior-changing follow-up as described above.
+
+### Alternative considered: a reusable cancel-scope primitive
+
+Rather than keeping `CheckAbort`/`AbortOnDrop` local to `session_search`, a
+credible alternative is to lift the "drop-arms-cancel-flag" pattern into a
+shared, reusable type (e.g. a `JournalingCancelScope` / `AbortOnDrop`) in
+`jcode-tool-core` that any hang-prone tool could adopt the same way. Weighed
+against what was built:
+
+- **Reuse / maintenance.** `AtomicBool` + a `Drop`-armed flag already exists
+  ad-hoc in the repo (`server/runtime.rs` has a `DropFlag`, `client_lifecycle.rs`
+  a `done: Arc<AtomicBool>`), so the idiom is proven but currently duplicated at
+  three sites. A shared primitive would remove that duplication and make the next
+  consumer one type-import instead of a reimplementation.
+- **Cost / complexity.** A shared type must sit in a leaf crate both
+  app-core-internal tooling and server runtime can depend on, and requires
+  converting the existing two server sites to it — a small but cross-cutting
+  change outside the F8 Part A scope. It also risks an interface that is *just*
+  `Arc<AtomicBool>` in disguise, earning its abstraction less than it costs
+  unless the semantics (drop-arms, `never()` helper) are the real
+  deliverable.
+- **Compatibility / behavior.** Either approach leaves the observable contract
+  identical (a timed-out call returns the model-visible timeout and reclaims the
+  blocking thread); the only difference is where the type lives.
+- **Decision.** Keeping it local was chosen for this follow-up: it stays
+  behavior-identical and zero-risk to the two existing server sites, and the
+  unification is a natural companion to the already-parked F8 promote-on-timeout
+  seam, which is the right place to introduce the shared type across tools.
+  Revisited there.
+
+### Alternative considered: async `select!` cancellation at a finer grain
+
+A more fundamental alternative is to make the scan cancellable **inside** a
+candidate rather than only between candidates — e.g. move the scan onto async
+paths and use `tokio::select!` against a deadline so the runtime drops the work
+mid-candidate. Weighed against the cooperative flag:
+
+- **Performance / responsiveness.** This would reclaim a blocked thread during a
+  single long deserialize rather than waiting for the next candidate boundary.
+  It is genuinely finer-grained.
+- **Feasibility / implementation.** `Session::load_from_path`
+  (`persistence.rs:269`) is a **synchronous** `-> Result<Self>` that does blocking
+  disk read + JSON deserialize + journal replay with **no internal `await` point**.
+  An async `select!` has no yield to cancel at mid-candidate; the work would have
+  to be rewritten to async, chunked deserialization — a major, invasive change to
+  the persistence layer and every caller — to gain anything. The candidate boundary
+  is the natural, and effectively the only cheap, preemption point.
+- **Compatibility / maintenance.** Rewriting session load as async touches
+  `jcode-base` persistence and ripples into every `Session::load*` caller; the
+  cooperative flag changes only `session_search.rs`.
+- **Decision.** Rejected for this follow-up: the finer granularity is not
+  achievable without rewriting synchronous `load_from_path` into async, chunked
+  deserialization, which is a large cross-crate refactor well outside F8 Part A
+  and not justified by the marginal thread-reclaim gain. The cooperative flag
+  yields the same model-visible outcome and reclaims threads at the practical
+  preemption point the load API provides.
+
+### Alternative considered: time-bounded joins on detached per-candidate threads
+
+The cooperative flag still waits for the current candidate's synchronous
+`load_from_path` to finish before honoring a cancellation. A distinct alternative
+is to abandon a stuck candidate directly: spawn each candidate (or small batch)
+on its own **detached** thread and wait on each join with a timeout, so a single
+pathological deserialize is dropped instead of only waiting for the next
+boundary. Weighed against the cooperative flag:
+
+- **Performance / responsiveness.** This reclaims a blocked thread *during* a
+  long deserialize, which the cooperative flag deliberately does not. It is
+  closer to the finer-granularity ideal.
+- **Compatibility / safety.** jcode's parallel scan uses `std::thread::scope`,
+  whose core guarantee is that **every spawned thread is joined before the scope
+  returns**. A detached, timeout-joined worker breaks that — a candidate can be
+  left running after `search_sessions_blocking` returns (it only reads files, so
+  no write corruption, but the thread is unattended). That is a real behavioral
+  change from the current code's "all workers completed" contract, and it means
+  the timeout is no longer fire-once-cleanly: a thread that finished but lost a
+  timeout race would carry on scoring a session the caller has already left.
+- **Maintenance / complexity.** Detaching workers requires reworking the
+  `std::thread::scope` block into managed handles with channels, adds a
+  join-timeout constant, and complicates the `parse_errors`/results fold (partial
+  outcomes from abandoned workers must be reconciled). The cooperative flag keeps
+  all of that under the scope's lifetime discipline.
+- **Decision.** Rejected for this follow-up. The `std::thread::scope` lifetime
+  guarantee is worth more than the marginal mid-deserialize reclaim: it keeps
+  cancellation exactly-once and deterministic (workers always complete and their
+  outcomes are always folded), which is the property the model-visible contract
+  leans on. Timeout-joining a *leaf* worker is a reasonable future enhancement if
+  a candidate is ever observed to hang in practice, but there is no evidence of
+  that today, so it is not adopted as part of F8 Part A.
