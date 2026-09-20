@@ -145,6 +145,11 @@ impl Tool for ReadTool {
         "Read a file. Supports text files, image files, and PDFs."
     }
 
+    fn concurrency_safe_marker(&self) -> bool {
+        // Read-only: pure function of its input plus the filesystem.
+        true
+    }
+
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",

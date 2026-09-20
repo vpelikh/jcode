@@ -191,6 +191,11 @@ impl Tool for AgentGrepTool {
         "Search code and file names. Defaults to grep mode when mode is omitted."
     }
 
+    fn concurrency_safe_marker(&self) -> bool {
+        // Read-only: pure function of its input plus the filesystem.
+        true
+    }
+
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",

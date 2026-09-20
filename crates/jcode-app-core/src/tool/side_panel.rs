@@ -41,6 +41,12 @@ impl Tool for SidePanelTool {
         "Legacy panel management. Prefer panel to spawn, update, focus, close or list desktop panels. Load accepts Markdown or PDF files. Write and append accept Markdown only."
     }
 
+    fn concurrency_safe_marker(&self) -> bool {
+        // Read-only view/manifest mutations (local page state), no shared
+        // session state observed by other calls in flight.
+        true
+    }
+
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
