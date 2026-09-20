@@ -111,14 +111,12 @@ async fn interactive_desktop_hello_sets_crash_on_disconnect_on_subscribe() {
     daemon.read_until(b'\n', &mut out).await.unwrap();
     let request: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(request["type"], "subscribe");
-    assert_eq!(request["crash_on_disconnect"], true);
+    assert!(request["crash_on_disconnect"].as_bool().unwrap());
 
     drop(listener);
     let _ = std::fs::remove_dir_all(&root);
-    let _ = task.abort();
-    let _ = line;
-    let _ = read;
-    let _ = write;
+    task.abort();
+    drop((line, read, write));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -173,10 +171,8 @@ async fn background_helper_hello_does_not_set_crash_on_disconnect() {
 
     drop(listener);
     let _ = std::fs::remove_dir_all(&root);
-    let _ = task.abort();
-    let _ = line;
-    let _ = read;
-    let _ = write;
+    task.abort();
+    drop((line, read, write));
 }
 
 #[tokio::test]
