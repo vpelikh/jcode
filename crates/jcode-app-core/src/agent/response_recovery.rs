@@ -337,8 +337,23 @@ impl Agent {
     /// with them ("Let me ... Let me ... Let me run ..."). A single "let me"
     /// in a normal answer is not treated as stalling.
     pub(crate) fn is_stalled_promise_text(text: &str) -> bool {
-        let low = text.to_ascii_lowercase();
-        let phrases = ["let me", "i'll", "i will", "let's", "i am going to"];
+        // Collapse runs of whitespace to a single space before matching so a
+        // stall is still detected if streamed/degenerate output introduces
+        // extra spaces, tabs, or newlines inside the phrase ("let  me run",
+        // "let\tme run"). This mirrors inline_tail's whitespace flattening.
+        let low = text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        let phrases = [
+            "let me",
+            "i'll",
+            "i will",
+            "let's",
+            "i am going to",
+            "i'm going to",
+        ];
         let mut count = 0usize;
         for p in phrases {
             count += low.matches(p).count();
@@ -411,7 +426,7 @@ impl Agent {
         self.add_message(
             Role::User,
             vec![ContentBlock::Text {
-                text: "<system-reminder>Your previous response repeatedly said you would perform an action (e.g. \"Let me...\") but ended without doing any of it - no tool was called and nothing was executed. If a further step is needed, emit the tool call now and continue the task instead of restating your intent. If the task is genuinely complete, give the final answer directly. Do not repeat the same preparatory filler.</system-reminder>"
+                text: "<system-reminder>Your previous response repeatedly said you would perform an action (e.g. \"Let me...\") but ended without making the promised tool call. If a further step is needed, emit the tool call now and continue the task instead of restating your intent. If the task is genuinely complete, give the final answer directly. Do not repeat the same preparatory filler.</system-reminder>"
                     .to_string(),
                 cache_control: None,
             }],
