@@ -1520,6 +1520,77 @@ mod tests {
     }
 
     #[test]
+    fn stalled_promise_text_survives_stray_unclosed_fence() {
+        // A degenerate/streamed model may emit a stray unclosed "```" before
+        // (or after) the real "I'll invoke..." promise. If the fence-stripper
+        // treated that as swallowing the rest of the turn, it would hide a
+        // genuine stall. The stripper must NOT strip when fences are
+        // unbalanced, so the promise remains detectable.
+        let with_stray_fence = "Here is what I need to do:\n```\n\
+                                I'll invoke bash now.";
+        assert!(
+            Agent::is_stalled_promise_text(with_stray_fence),
+            "a stall after a stray unclosed fence must still be detectable"
+        );
+    }
+
+    #[test]
+    fn stalled_promise_stray_fence_mid_turn_never_hides_stall() {
+        // A stray unclosed "```" can appear in the MIDDLE of a turn (a streamed
+        // or degenerate model), not only at the end. When the fence count is odd
+        // the stripper is deliberately all-or-nothing (recall-first): it cannot
+        // know which marker is the stray one, so ANY greedy pairing could strip
+        // a block that actually contains the stall. It must therefore NOT strip
+        // at all, leaving the stall visible regardless of where the stray marker
+        // landed (before, inside, or after the promise).
+        let cases = [
+            // stray marker BEFORE the stall
+            "```\n(unfinished)\nI'll invoke bash now.",
+            // genuine stall then a stray marker AFTER it
+            "I'll invoke bash now.\n```\n(stream cut off)",
+        ];
+        for turn in cases {
+            assert!(
+                Agent::is_stalled_promise_text(turn),
+                "a stall must remain detectable when a stray unclosed fence is present: {turn:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stalled_promise_lets_is_not_an_action_promise() {
+        // "Let's X" is collaborative/suggestive, not a first-person promise the
+        // agent then fails to complete. A genuine explanatory final answer that
+        // walks the reader through reasoning with several "let's" phrases must
+        // not be flagged as a stall.
+        let diag = "Let's assume the failure is in the harness. Let's look at the log. \
+                    Let's check the env. Let's compare the diff. Let's review the config. \
+                    Let's confirm the import. Let's verify the schema. Let's run the linter. \
+                    That is the whole picture.";
+        assert!(
+            !Agent::is_stalled_promise_text(diag),
+            "an explanatory answer using 'let's' must not be flagged as a stall"
+        );
+    }
+
+    #[test]
+    fn stalled_promise_i_will_explanation_is_not_a_stall() {
+        // Formal spelled-out "I will" is PREDICTIVE/EXPLANATORY ("I will note
+        // that...", "I will say the import is the cause"), not a first-person
+        // promise the agent then fails to complete. A genuine diagnosis that
+        // walks through reasoning with several "I will" constructions must not
+        // cross the stalled-promise density threshold and be flagged.
+        let diag = "I will assume the failure is in the harness. I will note the log shows \
+                    an error. I will say the import is the cause. I will observe the env is \
+                    fine. I will remark the diff is small. I will mention the schema mismatch. \
+                    I will point out the config. I will conclude it is env-related.";
+        assert!(
+            !Agent::is_stalled_promise_text(diag),
+            "an explanatory answer using 'I will' must not be flagged as a stall"
+        );
+    }
+
+    #[test]
     fn stalled_promise_density_threshold_is_bracketed() {
         // Exactly MIN_PHRASE=8 occurrences, but the density must still decide:
         // padded short => dense (above 2.0) must flag; padded long => sparse
@@ -1540,6 +1611,272 @@ mod tests {
     }
 
     #[test]
+    fn compact_unfulfilled_tool_request_ignores_cross_clause_disjoint() {
+        // The first-person invoke frame and the bound-to-verb tool target must
+        // come from the SAME clause. A merely-disjoint conjunction lets "i'll
+        // invoke" (abstract, sentence 1) combine with "invoke the shell"
+        // (third-person, sentence 2), falsely flagging a genuine answer. The
+        // detector must require the first-person verb to be immediately bound
+        // to the tool target.
+        let legitimate = [
+            "I'll invoke the policy. The harness will invoke the shell hook on deploy.",
+            "Let me invoke the review. This setup invokes the tool on every commit.",
+        ];
+        for turn in legitimate {
+            assert!(
+                !Agent::is_stalled_promise_text(turn),
+                "a first-person abstract 'invoke' must not pair with a third-person tool description: {turn:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_unfulfilled_tool_request_detects_run_and_script_targets() {
+        // The tool-target list must keep `run` and `script` (beyond
+        // bash/tool/command), because a short turn can promise to "invoke the
+        // run command" or "call the script" and stop without doing so. These
+        // are the same stall with a synonym target and must be detected.
+        let stalls = [
+            "Let me invoke the run command to check the pipeline now.",
+            "I'll call the script to verify the output now.",
+            "Let me invoke a script to finish this step now.",
+        ];
+        for turn in stalls {
+            assert!(
+                Agent::is_stalled_promise_text(turn),
+                "compact stall with a run/script target must be flagged: {turn:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_unfulfilled_tool_request_ignores_possessive_target_reference() {
+        // A POSSESSIVE form of a tool target ("the tool's", "the command's")
+        // is a reference to the tool, not a commitment to invoke it now. A
+        // naive substring match would catch "i'll call the tool" inside "i'll
+        // call the tool's documentation", falsely flagging a genuine answer
+        // that merely plans to read/review. The detector must require a real
+        // word boundary after the target (an apostrophe signals a possessive).
+        let legitimate = [
+            "I'll call the tool's documentation when reviewing the next step.",
+            "I'll call the command's output below for your reference.",
+            "I'll call the command_line utility when I get to it.",
+            "I'll call the command-line tool during the review.",
+        ];
+        for turn in legitimate {
+            assert!(
+                !Agent::is_stalled_promise_text(turn),
+                "a possessive tool-target reference must not be flagged as a stall: {turn:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stalled_promise_large_fenced_block_does_not_inflate_density() {
+        // A genuine diagnosis that embeds large fenced code blocks (diffs,
+        // repros) alongside a handful of prose "let me" phrases must not be
+        // flagged. If density were measured against the fence-STRIPPED length,
+        // the collapsed denominator would spike the ratio above the threshold.
+        // It must be measured against the ORIGINAL (un-stripped) length.
+        let mut diag = "Here is the full patch:\n```\n".to_string();
+        for _ in 0..200 {
+            diag.push_str("x y z filler line here\n");
+        }
+        diag.push_str("```\nLet me review. I'll check. I will verify. Let me test. \
+                       I'm going to run. Let me inspect. I will confirm. Let me parse. Let's look.\n");
+        diag.push_str("```\nmore\nbig\nblock\n```\n");
+        assert!(
+            !Agent::is_stalled_promise_text(&diag),
+            "a genuine diagnosis with large fenced blocks and prose must not be flagged"
+        );
+    }
+
+    #[test]
+    fn compact_unfulfilled_tool_request_ignores_long_recount_hidden_in_fence() {
+        // A genuinely long legitimate recount can bury most of its length in a
+        // balanced fenced code block. If the compact detector bounded length on
+        // the fence-STRIPPED text, it would shrink below the max and falsely
+        // flag a recount of past "i'll invoke bash" actions as a stall. The
+        // length bound must use the ORIGINAL turn length.
+        let mut recap = "Let me recap what happened earlier in the session.\n```\n".to_string();
+        for _ in 0..500 {
+            recap.push_str("large diff block content lines here\n");
+        }
+        recap.push_str("```\nEarlier I'll invoke bash to do X, and I'll invoke bash for Y.");
+        assert!(
+            !Agent::is_stalled_promise_text(&recap),
+            "a long recount hidden inside a fenced block must not be flagged as a compact stall"
+        );
+    }
+
+    #[test]
+    fn compact_unfulfilled_tool_request_finds_later_valid_invocation() {
+        // A real stall can mention the target possessively first, then commit
+        // to invoking it bare later in the same short turn. The boundary check
+        // must scan ALL occurrences: the FIRST "i'll call the tool" here is
+        // followed by an apostrophe (possessive), but the SECOND is a clear
+        // invocation ("call the tool.") and must be honored.
+        let stall = "I'll call the tool's help if needed, then I'll call the tool.";
+        assert!(
+            Agent::is_stalled_promise_text(stall),
+            "a later valid 'call the tool' invocation must be detected even if an earlier possessive occurs"
+        );
+    }
+
+    #[test]
+    fn compact_unfulfilled_tool_request_ignores_future_form_completed_step() {
+        // Full future/conditional spellings ("I will invoke bash", "I'm going
+        // to invoke") usually DESCRIBE a completed step or a conditional offer,
+        // not an imminent promise to act now. These must not be flagged as a
+        // stall; every observed real stall uses the contraction "i'll invoke".
+        let legitimate = [
+            "I will invoke bash to run the test suite; the green results are above.",
+            "I'm going to invoke the command only if you want a rerun.",
+            "I am going to invoke the script during the next deploy.",
+        ];
+        for turn in legitimate {
+            assert!(
+                !Agent::is_stalled_promise_text(turn),
+                "a full future/conditional invoke form must not be flagged as a stall: {turn:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_unfulfilled_tool_request_detects_bracketed_or_quoted_target() {
+        // A short real stall can quote or bracket the tool target ("I'll invoke
+        // [bash]", "I'll invoke bash] now"), and the boundary must still treat
+        // the closing bracket as a genuine word boundary. The reject-list only
+        // excludes word-continuation characters (letter/digit/apostrophe/
+        // underscore/hyphen), so these remain detectable.
+        let stalls = [
+            "I'll invoke bash",
+            "I'll invoke bash] now",
+            "I'll invoke bash) and finish",
+            "I'll invoke bash. next",
+        ];
+        for turn in stalls {
+            assert!(
+                Agent::is_stalled_promise_text(turn),
+                "a compact stall with a quoted/bracketed target must be detected: {turn:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_unfulfilled_tool_request_ignores_call_as_naming() {
+        // "call" can mean NAME something rather than invoke it. "Let me call
+        // the tool the 'verifier'" or "I'll call the command a success" assign a
+        // name/label and are NOT a promise to invoke the tool now. The detector
+        // must distinguish the invoking "call bash to run" from these.
+        let legitimate = [
+            "Let me call the tool the 'verifier' for short.",
+            "I'll call the command a success.",
+            "Let me call the bash script 'nightly'.",
+            // presentational/prepositional "to", not an action infinitive
+            "I'll call the shell script to your attention.",
+            "I'll call bash in to the meeting.",
+            // interposed-adverb call forms must ALSO preserve the naming guard
+            "I'll just call the tool a success.",
+            "Let me now call the command the 'final' one.",
+            "I'll just call the tool the helper now.",
+        ];
+        for turn in legitimate {
+            assert!(
+                !Agent::is_stalled_promise_text(turn),
+                "a naming use of 'call' must not be flagged as a stall: {turn:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_unfulfilled_tool_request_detects_call_invocation() {
+        // "call" used to INVOKE must still be detected (observed real phrasing).
+        let stalls = [
+            "Let me call bash to run the check now.",
+            "I'll call bash to run it.",
+            "Let me call the bash tool to run.",
+            // "now" with an intervening multi-word target ("bash tool")
+            "I'll call the bash tool now.",
+            "Let me call the bash tool now.",
+            // bare multi-word target ending ("call the bash tool.")
+            "I'll call the bash tool.",
+            "I'll call the run command.",
+            // broader action verbs after " to "
+            "I'll call the script to build the project.",
+            "Let me call bash to start the server now.",
+        ];
+        for turn in stalls {
+            assert!(
+                Agent::is_stalled_promise_text(turn),
+                "a 'call <tool> to run' invocation must be flagged as a stall: {turn:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_unfulfilled_tool_request_detects_curly_apostrophe() {
+        // A localization-aware model can emit a curly apostrophe (U+2019) in
+        // "I'll". flatten_whitespace normalizes it to ASCII so the compact
+        // (and dense) detectors still match.
+        let stall = "I\u{2019}ll invoke bash now.";
+        assert!(
+            Agent::is_stalled_promise_text(stall),
+            "a compact stall with a curly apostrophe must be detected"
+        );
+    }
+
+    #[test]
+    fn compact_unfulfilled_tool_request_ignores_non_tool_nouns() {
+        // A non-tool NOUN is not a tool/command target: "invoke the memory",
+        // "call the app", "invoke a plan", "call the team" are abstract or
+        // animate subjects, not a tool the agent promised to invoke now. The
+        // target list must not broaden to common nouns or future over-tuning
+        // regresses here.
+        let legitimate = [
+            "I'll invoke the memory now.",
+            "I'll call the app to run.",
+            "Let me invoke a plan.",
+            "I'll call the team to review.",
+            "Let me invoke the meeting.",
+        ];
+        for turn in legitimate {
+            assert!(
+                !Agent::is_stalled_promise_text(turn),
+                "a non-tool noun target must not be flagged as a stall: {turn:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_unfulfilled_tool_request_detects_interposed_adverb() {
+        // A degenerate/stalling model can insert an adverb or filler before
+        // "invoke" ("let me NOW invoke bash", "let me JUST invoke", "let me GO
+        // AHEAD AND invoke"). These are the same compact stall with different
+        // verb-frame wording and must still be detected so long as a concrete
+        // tool target immediately follows.
+        let stalls = [
+            "Let me now invoke bash.",
+            "I'll now invoke bash.",
+            "Let me just invoke the command.",
+            "I'll just invoke the tool.",
+            "Let me go ahead and invoke the script.",
+            "I'll go ahead and invoke bash now.",
+            // interposed-adverb "call" forms (symmetrical coverage)
+            "Let me now call bash.",
+            "I'll now call bash.",
+            "I'll just call the command.",
+            "Let me go ahead and call bash.",
+        ];
+        for turn in stalls {
+            assert!(
+                Agent::is_stalled_promise_text(turn),
+                "a compact stall with an interposed adverb must be detected: {turn:?}"
+            );
+        }
+    }
+
+    #[test]
     fn compact_unfulfilled_tool_request_is_stalled() {
         // The exact compact degradation observed in a real long-context session
         // (DeepSeek via OpenRouter): a SHORT turn explicitly says it will invoke a
@@ -1552,6 +1889,7 @@ mod tests {
             "I keep failing to actually invoke the tool. Let me directly grep and view `rename_session_title`.\n\nI'll invoke bash now.",
             "Let me grep and view `rename_session_title`.\n\n<system-warning>Run the grep command.</system-warning>\n\nI'll invoke bash.",
             "Let me invoke bash now.",
+            "Let me call bash to run the check now.",
         ];
         for turn in turns {
             assert!(
@@ -1591,11 +1929,35 @@ mod tests {
             // third-person/descriptive "will invoke" is not a promise by the agent
             "This setup will invoke shell hooks on commit; review the config when ready.",
             "The plugin will invoke run mode automatically. That is the summary.",
+            // bare non-first-person invoke frames describe tooling, not the
+            // agent promising to act NOW; these must not be flagged.
+            "The cron job will invoke bash now each night before committing. Summary is above.",
+            "This harness will invoke the tool now when tests run. That's the whole report.",
         ];
         for turn in legitimate {
             assert!(
                 !Agent::is_stalled_promise_text(turn),
                 "legitimate short final answer must not be flagged as stalled: {turn:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_unfulfilled_tool_request_ignores_disjoint_abstraction() {
+        // The invoke frame and an unrelated common tool word must not combine
+        // into a false positive. Here "I'll invoke the policy" is abstract and
+        // the "run" refers to the release pipeline, not a tool the agent
+        // promised to call now. A naively DISJOINT target check (any common
+        // tool word anywhere in the short turn) would flag this; the detector
+        // must require the target to be bound to the invoke verb.
+        let legitimate = [
+            "I'll invoke the team's policy on this. The release pipeline will run after CI passes.",
+            "Let me invoke our review process. The build tool runs for every commit.",
+        ];
+        for turn in legitimate {
+            assert!(
+                !Agent::is_stalled_promise_text(turn),
+                "an abstract 'invoke' with an unrelated tool word must not be flagged: {turn:?}"
             );
         }
     }
@@ -1611,6 +1973,115 @@ mod tests {
         assert!(
             !Agent::is_stalled_promise_text(&recap),
             "long legitimate recap must not be flagged by the length-bounded compact detector"
+        );
+    }
+
+    #[test]
+    fn compact_unfulfilled_tool_request_now_must_be_leading() {
+        // The invoking " now" signal must be the token IMMEDIATELY after the
+        // matched "call <target>" phrase, not merely somewhere later in the
+        // turn. A bare substring match fired on "now" in an unrelated later
+        // clause ("I'll call the tool for the setup, and now the test
+        // suite will run in CI"), falsely flagging a genuine short answer.
+        // Leading-position matching preserves every genuine stall while
+        // dropping that cross-clause false positive.
+        let genuine = [
+            "I'll call bash now.",
+            "Let me call bash now.",
+            "I'll call bash now then continue.",
+            "Let me call bash.",
+        ];
+        for t in genuine {
+            assert!(
+                Agent::is_stalled_promise_text(t),
+                "a genuine 'call <tool> now' stall must be detected: {t:?}"
+            );
+        }
+        // Cross-clause "now" after an unrelated comma is not an imminent
+        // invocation and must not be flagged.
+        let cross_clause = [
+            "Let me call bash for the setup, and now the test suite will run in CI.",
+        ];
+        for t in cross_clause {
+            assert!(
+                !Agent::is_stalled_promise_text(t),
+                "a 'now' in a later unrelated clause must not be flagged: {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_detector_length_bound_counts_chars_not_bytes() {
+        // The compact detector's length bound and the density denominator must
+        // measure CHARACTERS, not bytes. The comment documents the bound as
+        // "flattened char length", and density is "phrases per 100 chars".
+        // Using .len() (bytes) inflates both for non-ASCII text: a genuinely
+        // short turn (well under 700 chars) that contains multi-byte unicode
+        // could exceed 700 BYTES and be wrongly excluded from the compact
+        // stall detector. Counting chars restores the documented intent and is
+        // a recall gain with no precision cost for ASCII (bytes == chars).
+        let stall = "I'll invoke bash now.".to_string();
+        // ~240 CJK chars (720 bytes) pushes total to 742 bytes but only ~262
+        // chars, so it must still be detected as a compact stall.
+        let padded = format!("{} {}", stall, "\u{52a9}\u{8a00}".repeat(120));
+        assert!(
+            padded.len() > 700,
+            "fixture must actually exceed the byte bound: {} bytes",
+            padded.len()
+        );
+        assert!(
+            padded.chars().count() < 700,
+            "fixture must stay under the char bound: {} chars",
+            padded.chars().count()
+        );
+        assert!(
+            Agent::is_stalled_promise_text(&padded),
+            "a compact stall with non-ASCII text must be measured by char count"
+        );
+        // A genuinely long reply with multi-byte chars is still not a stall.
+        let cjk_long = format!("{}", "\u{52a9}\u{8a00}".repeat(500)); // 1000 chars
+        let legit = format!("Let me know if you need more. {cjk_long}");
+        assert!(
+            !Agent::is_stalled_promise_text(&legit),
+            "a long non-ASCII final answer must not be flagged"
+        );
+    }
+
+
+    #[test]
+    fn stalled_promise_detects_gonna_frame() {
+        // "I'm gonna <action>" is a contraction of "I'm going to <action>" (a
+        // counted action promise) with the same imminent-action intent, so a
+        // dense turn of it must be flagged like "i'm going to".
+        assert!(
+            Agent::is_stalled_promise_text(
+                "I'm gonna run the check. I'm gonna view the file. I'm gonna grep. \
+                 I'm gonna read. I'm gonna execute. I'm gonna verify. I'm gonna inspect. \
+                 I'm gonna list.",
+            ),
+            "a dense 'I'm gonna' stall must be detected"
+        );
+        // "I'm about to <verb>" is NOT an action promise on its own: it is
+        // frequently explanatory ("I'm about to say/mention/explain..."). A
+        // dense turn of explanatory 'about to' must NOT be flagged, and it
+        // must not be counted toward a mixed stall's density.
+        assert!(
+            !Agent::is_stalled_promise_text(
+                "I'm about to mention the cause. I'm about to note the schema. I'm about \
+                 to say the fix. I'm about to explain the flow. I'm about to observe the \
+                 env. I'm about to remark the diff. I'm about to point out the config. \
+                 I'm about to conclude.",
+            ),
+            "explanatory 'I'm about to ...' must not be flagged as a stall"
+        );
+        // Explanatory "I will ..." constructions must also still be excluded.
+        assert!(
+            !Agent::is_stalled_promise_text(
+                "I will note the log. I will assume the cause. I will say the fix. \
+                 I will observe. I will mention. I will point out. I will conclude. \
+                 I will explain.",
+            ),
+            "explanatory 'I will ...' must not be flagged as a stall"
         );
     }
 }

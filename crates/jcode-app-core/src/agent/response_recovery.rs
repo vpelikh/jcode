@@ -334,14 +334,31 @@ impl Agent {
     /// fenced blocks only removes quoting false-positives. Returns a new
     /// String only when a fence was found; otherwise returns the input slice.
     fn without_fenced_code_blocks(text: &str) -> std::borrow::Cow<'_, str> {
-        if !text.contains("```") {
+        let is_fence = |line: &str| line.trim_start().starts_with("```");
+        if !text.lines().any(is_fence) {
+            return std::borrow::Cow::Borrowed(text);
+        }
+        // Only strip fenced blocks when they are BALANCED (each opening has a
+        // closing delimiter). A stray unclosed "```" (common from a streamed or
+        // degenerate model) must not swallow the rest of the turn: that would
+        // hide a genuine "I'll invoke..." stall behind an accidental fence.
+        //
+        // This is deliberately all-or-nothing (recall-first): when the marker
+        // count is ODD, we cannot know which marker is the stray one, so ANY
+        // greedy pairing could strip a block that actually contains the stall.
+        // Returning the whole text as prose guarantees a stall is never hidden.
+        // Each real observed stall streams filler as visible prose (never inside
+        // a balanced code fence), so this loses no genuine coverage.
+        let total = text.lines().filter(|line| is_fence(line)).count();
+        if total % 2 != 0 {
+            // Unbalanced fence delimiters: treat the whole text as prose so a
+            // stall embedded around/after the stray marker stays detectable.
             return std::borrow::Cow::Borrowed(text);
         }
         let mut out = String::with_capacity(text.len());
         let mut in_fence = false;
-        for line in text.split('\n') {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("```") {
+        for line in text.lines() {
+            if is_fence(line) {
                 in_fence = !in_fence;
                 continue;
             }
@@ -366,10 +383,29 @@ impl Agent {
     pub(crate) fn is_stalled_promise_text(text: &str) -> bool {
         // Drop fenced code blocks first so quoting/reproducing a stalled
         // excerpt (common in review/diagnosis answers) does not count as a
-        // stall. This runs on every check; without_fenced_code_blocks is a
-        // cheap no-op when there is no "```".
-        let text = Self::without_fenced_code_blocks(text);
-        let low = Self::flatten_whitespace(&text);
+        // stall. without_fenced_code_blocks is a cheap no-op (Borrowed) when
+        // there is no "```".
+        let stripped = Self::without_fenced_code_blocks(text);
+        let low = Self::flatten_whitespace(&stripped);
+        // Keep the ORIGINAL flattened length for the density denominator. A
+        // genuine diagnosis can embed large fenced code blocks (diffs, repros)
+        // alongside a handful of prose "let me" phrases. Counting density over
+        // the fence-STRIPPED text would collapse the denominator and spike the
+        // ratio, falsely flagging a legitimate answer. Measuring against the
+        // full original length keeps the ratio honest. Real stalls stream prose
+        // with no fences, so for them original == stripped and this is a no-op.
+        // When no fence was present the stripped Cow is Borrowed, so its length
+        // already equals the original and the flatten above is the only one.
+        //
+        // Both the density denominator and the compact detector's length bound
+        // are documented in terms of CHARACTERS ("per 100 chars"; "flattened
+        // char length"), so measure chars (not bytes) here. Using bytes would
+        // inflate the two metrics for multi-byte non-ASCII text, hiding a
+        // genuinely short compact stall that happens to contain unicode.
+        let original_low_len = match &stripped {
+            std::borrow::Cow::Borrowed(_) => low.chars().count(),
+            std::borrow::Cow::Owned(_) => Self::flatten_whitespace(text).chars().count(),
+        };
         // Two independent failure modes produce "it promises an action but does
         // nothing". Each gets its own detector so one heuristic can't miss what
         // the other catches:
@@ -383,7 +419,7 @@ impl Agent {
         //    "I'll invoke bash now."). Such turns have only one or two promise
         //    phrases and would fall under the dense-rambling minimum count below,
         //    so we need a separate, much more specific signal.
-        if Self::is_compact_unfulfilled_tool_request(&low) {
+        if Self::is_compact_unfulfilled_tool_request(&low, original_low_len) {
             return true;
         }
         let count = Self::count_action_promise_phrases(&low);
@@ -395,8 +431,9 @@ impl Agent {
         // Density: number of promise phrases per 100 chars. Measured failing
         // turns sit at ~4.4+ (224/4948, 107/2482). Legitimate turns, even huge
         // ones with a few "let me"s, stay below ~1. Require a healthy margin
-        // above that.
-        let density = count as f64 / text.len().max(1) as f64 * 100.0;
+        // above that. Uses the ORIGINAL (un-stripped) length so large balanced
+        // fenced code blocks in a genuine answer do not inflate the ratio.
+        let density = count as f64 / original_low_len.max(1) as f64 * 100.0;
         density >= Self::STALLED_PROMISE_DENSITY_THRESHOLD
     }
 
@@ -404,23 +441,58 @@ impl Agent {
     /// is still detected if streamed/degenerate output introduces extra spaces,
     /// tabs, or newlines inside a phrase ("let  me run", "let\tme run"). This
     /// mirrors inline_tail's whitespace flattening.
+    ///
+    /// Also normalizes curly/typographic quotes and apostrophes (U+2018, U+2019,
+    /// U+201C, U+201D) to their ASCII forms. Some localization-aware models or
+    /// text pipelines emit "I\u{2019}ll invoke bash now" with a curly apostrophe,
+    /// which would otherwise evade both detectors that match on the ASCII
+    /// "i'll" / "let's" spellings.
     fn flatten_whitespace(text: &str) -> String {
-        text.split_whitespace()
+        let mut s = text
+            .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")
-            .to_ascii_lowercase()
+            .to_ascii_lowercase();
+        if s.contains('\u{2018}')
+            || s.contains('\u{2019}')
+            || s.contains('\u{201C}')
+            || s.contains('\u{201D}')
+        {
+            s = s
+                .replace(['\u{2018}', '\u{2019}'], "'")
+                .replace(['\u{201C}', '\u{201D}'], "\"");
+        }
+        s
     }
 
     /// Count matched action-promise phrases, subtracting the "let me know"
     /// closing/sign-off phrasing which is not an action promise.
     fn count_action_promise_phrases(low: &str) -> usize {
+        // NOTE: `let's` and full-form `i will` are deliberately NOT counted.
+        // "Let's X" is collaborative/suggestive, and "I will note/assume/observe
+        // that X" is PREDICTIVE/EXPLANATORY ("I will say the import is the
+        // cause"); neither is a first-person promise by the agent to perform an
+        // action it then fails to complete. Counting them lets a genuine
+        // explanatory final answer that walks the reader through reasoning cross
+        // the stalled-promise density threshold and be falsely flagged. Observed
+        // stalls never depend on them; they use "let me"/"i'll"/"i'm going to"/"i'm
+        // gonna".
+        // The contraction "i'll" (e.g. "I'll run/check/verify") is kept because
+        // it is far more action-committal than the formal spelled-out "I will".
         let phrases = [
             "let me",
             "i'll",
-            "i will",
-            "let's",
             "i am going to",
             "i'm going to",
+            // "I'm gonna <action>" is a contraction of "I'm going to <action>"
+            // (already a counted promise) and carries the same imminent-action
+            // intent, so a dense turn of it must be flagged. NOTE: "I'm about
+            // to <verb>" is deliberately NOT added: it is frequently
+            // EXPLANATORY ("I'm about to say/mention/explain...") and counting
+            // it would re-introduce the explanatory-frame false positive on
+            // genuine diagnoses. "gonna" has no such explanatory reading, so
+            // the recall gain is clean.
+            "i'm gonna",
         ];
         let mut count = 0usize;
         for p in phrases {
@@ -444,55 +516,361 @@ impl Agent {
     ///
     /// This is deliberately strict to avoid flagging a genuine short final answer
     /// that happens to mention a tool in passing or in the past tense:
-    ///  - The turn must be short (bounded length, after fences are stripped), so
-    ///    long legitimate prose that recounts an earlier "I'll invoke..." does not
-    ///    match.
-    ///  - It must contain a first-person future/volitional invoke frame ("let me
-    ///    invoke", "i'll invoke", "i will invoke", "i'm going to invoke", or an
-    ///    imperative "invoke <tool> now"). A bare third-person/descriptive "will
-    ///    invoke" (e.g. "this setup will invoke shell hooks") is NOT a promise by
-    ///    the agent to act, so it must not match.
-    ///  - It must reference an actual tool target (bash / tool / command / run /
-    ///    grep / sed / a specific action verb), so philosophical or past-tense
-    ///    uses of "invoke" do not match.
-    fn is_compact_unfulfilled_tool_request(low: &str) -> bool {
-        if low.len() > Self::COMPACT_STALLED_TOOL_REQUEST_MAX_LEN {
+    ///  - The turn must be short (bounded ORIGINAL length, before fences are
+    ///    stripped), so long legitimate prose that recounts an earlier
+    ///    "I'll invoke..." does not match—even if it hides part of its length
+    ///    inside a fenced code block.
+    ///  - It must contain a first-person present/contraction invoke frame either
+    ///    "let me invoke"/"i'll invoke" (including common interposed-adverb
+    ///    degenerate phrasings like "let me now invoke", "i'll just invoke",
+    ///    "let me go ahead and invoke") or "let me call"/"i'll call". For the
+    ///    "call" forms the turn must clearly intend to INVOKE a tool ("call bash
+    ///    to run", "call bash now") and not merely NAMING something ("call the
+    ///    tool the 'verifier'", "call it a success") or a completed/conditional
+    ///    step. Full future spellings ("I will invoke bash", "I'm going to
+    ///    invoke bash") are NOT treated as a stall: they more often describe a
+    ///    completed step than an imminent promise to act now. Every observed
+    ///    stall (giraffe 5/5, sabertooth) uses a contraction/present form, so
+    ///    dropping the future spellings loses no measured coverage. A bare
+    ///    third-person/descriptive "will invoke" (e.g. "this setup will
+    ///    invoke shell hooks") is likewise NOT a promise by the agent to act,
+    ///    so it must not match.
+    ///  - The first-person verb must be immediately bound to an actual tool
+    ///    target in the SAME phrase (e.g. "i'll invoke bash", "let me call the
+    ///    bash tool"). This rejects a genuine answer like "I'll invoke the
+    ///    policy; the release pipeline will run after CI", where the first-person
+    ///    "i'll invoke" is abstract and the common word "run" belongs to a
+    ///    different clause. It also rejects pairing a first-person abstract
+    ///    "invoke" with a third-person tool description elsewhere ("I'll invoke
+    ///    the policy. The harness will invoke the shell hook."). All observed
+    ///    stalls name the tool right after the first-person verb, so this
+    ///    same-clause coupling loses no coverage.
+    ///
+    /// NOTE: this uses EXACT multi-word phrase matching by design. On real
+    /// archived sessions it yields zero false positives (only the true
+    /// sabertooth stall); a looser structural "starter + verb + target" matcher
+    /// was tried (round 9) but exploded to ~369 false positives on the same
+    /// data because "let me"/"i'll" appear in ordinary turns. Exact matching is
+    /// the empirically correct point on the precision/recall line for the
+    /// observed degradation.
+    fn is_compact_unfulfilled_tool_request(low: &str, original_low_len: usize) -> bool {
+        // The length bound must use the ORIGINAL (un-stripped) turn length. A
+        // genuinely long recount that buries most of its text inside a balanced
+        // fenced code block would otherwise shrink below the bound after fence
+        // stripping and be falsely flagged as a compact stall.
+        if original_low_len > Self::COMPACT_STALLED_TOOL_REQUEST_MAX_LEN {
             return false;
         }
-        // Reciprocal contractions ("i'm", "i've") are hard to match with a
-        // fixed token in flattened text; handle the common future/volitional
-        // forms explicitly and leave the pure "memorize"/digress cases alone.
-        let has_future_invoke = [
+        // Detect a first-person, present-tense promise to invoke a tool. Only
+        // these reliably signal that the AGENT intends to act right now; bare
+        // non-first-person forms ("the harness will invoke bash now", "the cron
+        // job invokes the tool") describe tooling or a dependency and are NOT a
+        // promise by the agent, so they must not be treated as a stall. All real
+        // observed stalls (giraffe 5/5, sabertooth) use a first-person frame, so
+        // this tightening loses no coverage.
+        //
+        // The first-person verb must be IMMEDIATELY bound to a concrete
+        // tool/command target (e.g. "i'll invoke bash", "let me call the bash
+        // tool"). Coupling them into a single conjunct is essential: a check
+        // that merely ANDs "a first-person frame somewhere" with "a tool word
+        // somewhere" lets the two come from DIFFERENT clauses, falsely flagging
+        // a genuine answer like "I'll invoke the policy. The harness will invoke
+        // the shell hook on deploy." Here the first-person "i'll invoke" is
+        // abstract and the "invoke the shell" is a third-person description.
+        // Requiring them in the same phrase (verb then target) rejects that
+        // false positive while keeping every observed stall, which always names
+        // the tool right after the verb.
+        const FIRST_PERSON_INVOKE: [&str; 8] = [
             "let me invoke",
             "i'll invoke",
-            "i will invoke",
-            "i'm going to invoke",
-            "i am going to invoke",
-            "invoke the bash tool now",
-            "invoke bash now",
-            "invoke the tool now",
-            "call the bash tool",
-            "call bash",
-        ]
-        .iter()
-        .any(|p| low.contains(p));
-        if !has_future_invoke {
-            return false;
-        }
-        // Must reference a concrete tool/command target so "invoke" in an
-        // abstract/past context is not a stall.
-        let tool_target = [
+            // degenerate/stalling models often insert an adverb or filler before
+            // the verb ("let me NOW invoke bash", "let me GO AHEAD AND invoke"),
+            // so cover the common interposed forms. All still require a concrete
+            // tool target immediately after, so precision is unchanged.
+            "let me now invoke",
+            "i'll now invoke",
+            "let me just invoke",
+            "i'll just invoke",
+            "let me go ahead and invoke",
+            "i'll go ahead and invoke",
+        ];
+        // "call" starters are ambiguous between INVOKING a tool and NAMING
+        // something ("call the tool the 'verifier'", "call it a success"). They
+        // count as a tool-invocation only when clearly followed by an intent to
+        // act ("call bash to run...", "call bash now") or the end of the turn,
+        // never when the target is being given a name. Mirror the invoke branch
+        // by also covering common interposed-adverb degenerate phrasings.
+        const FIRST_PERSON_CALL: [&str; 8] = [
+            "let me call",
+            "i'll call",
+            "let me now call",
+            "i'll now call",
+            "let me just call",
+            "i'll just call",
+            "let me go ahead and call",
+            "i'll go ahead and call",
+        ];
+        const TOOL_TARGETS: [&str; 20] = [
             "bash",
+            "the bash",
             "tool",
+            "the tool",
+            "a tool",
             "command",
+            "the command",
+            "a command",
             "grep",
             "sed",
             "run",
+            "the run",
             "shell",
+            "the shell",
+            "a shell",
             "script",
+            "the script",
+            "a script",
             "cmd",
+            "a cmd",
         ];
-        tool_target.iter().any(|t| low.contains(t))
+        // The detector runs on one short (<=700 char) turn per recovery check,
+        // so building the few candidate phrases here is negligible.
+        FIRST_PERSON_INVOKE.iter().any(|starter| {
+            TOOL_TARGETS
+                .iter()
+                .any(|target| Self::contains_invoke_boundary(low, &format!("{starter} {target}")))
+        }) // "invoke" forms are unambiguous.
+            || FIRST_PERSON_CALL.iter().any(|starter| {
+                TOOL_TARGETS.iter().any(|target| {
+                    let phrase = format!("{starter} {target}");
+                    // For "call", require a clearly-invoking continuation (" to
+                    // ...", " now", or end-of-turn) so naming ("call the tool the
+                    // X") is never treated as a stall.
+                    Self::contains_call_invoke_boundary(low, &phrase)
+                })
+            })
+    }
+
+    /// Boundaries for a plain "invoke"/"call" tool-invocation phrase: the
+    /// target must not run on into a longer word (apostrophe/letter/digit/
+    /// underscore/hyphen are rejected). Everything else is a boundary.
+    fn contains_invoke_boundary(haystack: &str, needle: &str) -> bool {
+        Self::contains_phrase_boundary(haystack, needle)
+    }
+
+    /// Like `contains_phrase_boundary`, but additionally requires that a "call"
+    /// phrase be followed by a clearly-invoking continuation—an infinitive
+    /// (" call bash to run"), " now", or the end of the turn. This rejects the
+    /// NAMING reading ("call the tool the 'verifier'", "call it a success"),
+    /// which is not a promise to invoke a tool.
+    fn contains_call_invoke_boundary(haystack: &str, needle: &str) -> bool {
+        // Reuse the plain boundary scan (rejects word-continuations).
+        if !Self::contains_phrase_boundary(haystack, needle) {
+            return false;
+        }
+        if needle.is_empty() || haystack.is_empty() {
+            return false;
+        }
+        let mut start = 0;
+        while let Some(rel) = haystack[start..].find(needle) {
+            let at = start + rel;
+            let end = at + needle.len();
+            let after = &haystack[end..];
+            // Naming continuation: the target is being GIVEN a name
+            // ("call the tool the 'verifier'", "call the tool a success"),
+            // which is not a promise to invoke it. A quoted name also signals
+            // naming rather than an imminent invocation.
+            let names_something = after.starts_with(" the ")
+                || after.starts_with(" a ")
+                || after.starts_with(" an ")
+                || after.starts_with('\'')
+                || after.starts_with('"');
+            if names_something {
+                start = end;
+                continue;
+            }
+            // Invoking signal: " call X now" (immediate or with the word "tool"
+            // in between, e.g. "call the bash tool now"), or a natural end of
+            // the utterance. The naming rejection above already guards against
+            // "call the tool a/the <label> now".
+            //
+            // The "now" must be the token IMMEDIATELY after the matched target,
+            // not merely somewhere later in the turn. A bare substring
+            // " contains(\" now\") " would fire on "now" in an unrelated later
+            // clause ("I'll call the tool, and now we can review..."), flagging
+            // a genuine short answer. The word directly following the target is
+            // the reliable signal ("call bash now."). Multi-word targets whose
+            // tail is a tool-kind noun then "now" ("call the bash tool now")
+            // are handled below by call_tail_is_tool_kind_end, so only the
+            // leading immediate "now" (plus optional punctuation) belongs here.
+            let trimmed_now = after.trim_start();
+            let now_is_leading = trimmed_now == "now"
+                || trimmed_now.strip_prefix("now").is_some_and(|rest| {
+                    // End, or a genuine word boundary after "now" (" now.",
+                    // " now, ", " now !"). Reject continuations like "now2".
+                    rest.as_bytes()
+                        .first()
+                        .is_none_or(|b| {
+                            !(b.is_ascii_alphanumeric() || *b == b'\'' || *b == b'-')
+                        })
+                });
+            let invokes_now_or_end = after.is_empty()
+                || now_is_leading
+                || after.starts_with('.')
+                || after.starts_with(',')
+                || after.starts_with('!')
+                || after.starts_with('?');
+            if invokes_now_or_end {
+                return true;
+            }
+            // Infinitive intent: "call bash to RUN/CHECK/...". The action verb
+            // may come a word after the needle (multi-word targets like "the
+            // bash tool to run"), so scan the remainder. Crucially require an
+            // ACTION verb afterwards and reject prepositional/presentational
+            // "to" ("to your attention", "in to the meeting"), which are not a
+            // promise to act on the tool.
+            if Self::call_followed_by_action_infinitive(after) {
+                return true;
+            }
+            // A multi-word TARGET whose tail is a tool-kind noun and then the
+            // turn ends ("call the bash tool.", "call the run command now").
+            // The needle stops at the earlier word ("the bash"/"the run") but
+            // the whole noun phrase still names the tool being invoked, not
+            // something given a label.
+            if Self::call_tail_is_tool_kind_end(after) {
+                return true;
+            }
+            start = end;
+        }
+        false
+    }
+
+    /// True when the text right after the matched "call <target>" phrase is a
+    /// tool-kind noun (tool/command/script/shell/cmd...) that completes the
+    /// multi-word target and then the turn ends (" the bash tool.", " the run
+    /// command now"). The needle matched only the earlier word, but the trailing
+    /// noun is the actual tool being invoked, so reject nothing more.
+    fn call_tail_is_tool_kind_end(after: &str) -> bool {
+        const TOOL_KINDS: [&str; 6] = ["tool", "command", "script", "shell", "cmd", "utility"];
+        let first = after
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .next()
+            .unwrap_or("");
+        if !TOOL_KINDS.contains(&first) {
+            return false;
+        }
+        // The noun must then hit end/punctuation or "now" (a bare invocation),
+        // not continue into a name or an action-infinitive we'd handle above.
+        let tail = after.trim_start();
+        let rest = tail[first.len()..].trim_start();
+        rest.is_empty()
+            || rest.starts_with("now")
+            || rest.starts_with('.')
+            || rest.starts_with(',')
+            || rest.starts_with('!')
+            || rest.starts_with('?')
+    }
+
+    /// After the matched "call <target>" phrase, accept a " to <action-verb>"
+    /// infinitive intent (e.g. "to run", "to check"), the observed stall shape.
+    /// Reject a prepositional/presentational "to" that refers to a person or
+    /// place ("to your attention", "in to the meeting"), which is not a promise
+    /// to act on the tool.
+    fn call_followed_by_action_infinitive(after: &str) -> bool {
+        const ACTION_VERBS: [&str; 30] = [
+            "run",
+            "execute",
+            "check",
+            "grep",
+            "view",
+            "verify",
+            "inspect",
+            "read",
+            "show",
+            "display",
+            "print",
+            "list",
+            "search",
+            "test",
+            "parse",
+            "review",
+            "look",
+            "fetch",
+            "generate",
+            "start",
+            "stop",
+            "build",
+            "compile",
+            "apply",
+            "create",
+            "update",
+            "write",
+            "use",
+            "compare",
+            "diff",
+        ];
+        let mut rest = after;
+        while let Some(idx) = rest.find(" to ") {
+            let tail = &rest[idx + " to ".len()..];
+            // The very next token must be an action verb (allowing a trailing
+            // period/punctuation, e.g. "to run."), for this to be an infinitive
+            // intent. "to the ..." / "to your ..." are not.
+            let first_word = tail
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .next()
+                .unwrap_or("");
+            if ACTION_VERBS.contains(&first_word) {
+                return true;
+            }
+            rest = tail;
+        }
+        false
+    }
+
+    /// True when `haystack` contains `needle` and the character immediately
+    /// following it is a word boundary (anything EXCEPT a word-continuation
+    /// character). This rejects POSSESSIVE and word-joined forms of a tool
+    /// target: "the tool's docs", "the command_line", "command-line", or
+    /// "tool2" contain the target as a substring but are *references*, not a
+    /// first-person commitment to invoke it now. Everything else (space,
+    /// end-of-string, sentence punctuation, closing quotes/brackets, backticks)
+    /// is a genuine boundary, so a short stall that quotes or brackets the
+    /// target ("I'll invoke [bash]") is still detected.
+    fn contains_phrase_boundary(haystack: &str, needle: &str) -> bool {
+        // Guard against an empty needle: find() on an empty string would match
+        // at every index and never advance, looping forever. Callers always pass
+        // a non-empty "{starter} {target}", but never loop on a logical invariant.
+        if needle.is_empty() || haystack.is_empty() {
+            return false;
+        }
+        let mut start = 0;
+        // Iterate ALL occurrences: the FIRST match may have a poor boundary
+        // (e.g. a possessive "the tool's"), while a LATER occurrence is a bare
+        // invocation ("then i'll call the tool."). Return true if ANY occurrence
+        // has a valid boundary so a real stall is never missed.
+        while let Some(rel) = haystack[start..].find(needle) {
+            let at = start + rel;
+            let end = at + needle.len();
+            let next = haystack.as_bytes().get(end);
+            // Reject only characters that CONTINUE the word, which signal a
+            // reference rather than a bare target: an alphanumeric (letter/
+            // digit, "tool2"), an apostrophe (possessive, "tool's"), or a join
+            // character ('_' or '-', "tool_x", "command-line"). Everything
+            // else is a genuine boundary (space, end-of-string, sentence
+            // punctuation, closing quotes/brackets, backticks, etc.), so a
+            // short stall that quotes or brackets the target still matches.
+            let ok = match next {
+                None => true,
+                Some(b) => !(b.is_ascii_alphanumeric() || *b == b'\'' || *b == b'_' || *b == b'-'),
+            };
+            if ok {
+                return true;
+            }
+            start = end;
+        }
+        false
     }
 
     /// Request a single bounded continuation when the model stopped after
@@ -544,7 +922,7 @@ impl Agent {
         self.add_message(
             Role::User,
             vec![ContentBlock::Text {
-                text: "<system-reminder>Your previous response repeatedly said you would perform an action (e.g. \"Let me...\") but ended without making the promised tool call. If a further step is needed, emit the tool call now and continue the task instead of restating your intent. If the task is genuinely complete, give the final answer directly. Do not repeat the same preparatory filler.</system-reminder>"
+                text: "<system-reminder>Your previous response said you would perform an action (e.g. \"Let me...\" or \"I'll invoke...\") but ended without making the tool call. If a further step is needed, emit the tool call now and continue the task instead of restating your intent. If the task is genuinely complete, give the final answer directly.</system-reminder>"
                     .to_string(),
                 cache_control: None,
             }],

@@ -2501,7 +2501,7 @@ async fn tool_calls_stranded_stop_routes_to_continuation() {
             m.role == Role::User
                 && m.content.iter().any(|block| match block {
                     ContentBlock::Text { text, .. } => {
-                        text.contains("repeatedly said you would perform an action")
+                        text.contains("said you would perform an action")
                     }
                     _ => false,
                 })
@@ -2765,7 +2765,7 @@ async fn stalled_promise_turn_gives_up_after_bounded_continuations() {
                 && m.content.iter().any(|block| match block {
                     ContentBlock::Text { text, .. } => {
                         text.starts_with("<system-reminder>")
-                            && text.contains("repeatedly said you would perform an action")
+                            && text.contains("said you would perform an action")
                     }
                     _ => false,
                 })
@@ -2861,7 +2861,7 @@ async fn stalled_promise_turn_bounded_in_non_streaming_loop() {
                 && m.content.iter().any(|block| match block {
                     ContentBlock::Text { text, .. } => {
                         text.starts_with("<system-reminder>")
-                            && text.contains("repeatedly said you would perform an action")
+                            && text.contains("said you would perform an action")
                     }
                     _ => false,
                 })
@@ -2999,7 +2999,7 @@ async fn stalled_promise_skips_turns_that_emit_a_tool_call() {
             m.role == Role::User
                 && m.content.iter().any(|block| match block {
                     ContentBlock::Text { text, .. } => {
-                        text.contains("repeatedly said you would perform an action")
+                        text.contains("said you would perform an action")
                     }
                     _ => false,
                 })
@@ -3117,7 +3117,7 @@ async fn compact_stall_recovered_via_streaming_loop() {
     // dense-filler path does; the correct contract is that the real completion
     // is surfaced after it, which is asserted above.)
     assert!(
-        !text.contains("repeatedly said you would perform an action"),
+        !text.contains("said you would perform an action"),
         "client stream must not leak the recovery reminder, got {text:?}"
     );
 
@@ -3131,7 +3131,7 @@ async fn compact_stall_recovered_via_streaming_loop() {
                 && m.content.iter().any(|block| match block {
                     ContentBlock::Text { text, .. } => {
                         text.starts_with("<system-reminder>")
-                            && text.contains("repeatedly said you would perform an action")
+                            && text.contains("said you would perform an action")
                     }
                     _ => false,
                 })
@@ -3219,7 +3219,7 @@ async fn compact_stall_bounded_in_non_streaming_loop() {
                 && m.content.iter().any(|block| match block {
                     ContentBlock::Text { text, .. } => {
                         text.starts_with("<system-reminder>")
-                            && text.contains("repeatedly said you would perform an action")
+                            && text.contains("said you would perform an action")
                     }
                     _ => false,
                 })
@@ -3341,7 +3341,7 @@ async fn compact_frame_skips_turns_that_emit_tool_call() {
             m.role == Role::User
                 && m.content.iter().any(|block| match block {
                     ContentBlock::Text { text, .. } => {
-                        text.contains("repeatedly said you would perform an action")
+                        text.contains("said you would perform an action")
                     }
                     _ => false,
                 })
