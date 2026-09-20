@@ -554,6 +554,30 @@ mod review_tests {
     }
 
     #[test]
+    fn parse_last_verdict_wins() {
+        // A mixed report that changes its mind resolves to the LAST verdict line.
+        // Clean first, then findings with items -> Findings.
+        let switched_to_findings = "VERDICT: CLEAN\nVERDICT: FINDINGS\nFINDING: HIGH|a.rs|bug\n";
+        match ReviewReport::parse(switched_to_findings).unwrap() {
+            ReviewReport::Findings(items) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].path, "a.rs");
+            }
+            other => panic!("expected findings (last verdict wins), got {other:?}"),
+        }
+        // Findings first, then Clean -> Clean (stray FINDING lines are ignored
+        // because the final verdict is CLEAN).
+        let switched_to_clean = "VERDICT: FINDINGS\nFINDING: HIGH|a.rs|b\nVERDICT: CLEAN\n";
+        assert!(
+            matches!(
+                ReviewReport::parse(switched_to_clean),
+                Ok(ReviewReport::Clean)
+            ),
+            "a trailing CLEAN must win over earlier findings"
+        );
+    }
+
+    #[test]
     fn parse_errors() {
         assert!(matches!(
             ReviewReport::parse("no verdict here"),
