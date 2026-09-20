@@ -1187,3 +1187,113 @@ fn prune_age_cutoff_excludes_exact_boundary() {
     );
     assert!(load_snapshot("live").is_some(), "live handoff survives");
 }
+
+/// Fix #8: import mints a readable id echoing the source session
+/// (`import-<source>`), not an opaque UUID, so `/handoffres <id>` is
+/// human-understandable.
+#[test]
+fn import_uses_readable_session_id() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let cwd = env._home.path();
+    std::fs::create_dir_all(&cwd).ok();
+    let key = project_key(Some(&cwd)).unwrap();
+
+    write_snapshot(&fixture("chatty-session-42", &key)).unwrap();
+    let payload = export_handoff("chatty-session-42").expect("export");
+    let imported = import_handoff(&payload, Some(&cwd), "closed").unwrap();
+
+    assert_eq!(
+        imported, "import-chatty-session-42",
+        "import id should echo the source session, not be an opaque UUID"
+    );
+    assert!(load_snapshot(&imported).is_some());
+}
+
+/// Fix #8: when the readable stem already exists, import disambiguates with a
+/// short suffix while keeping the stem, and both snapshots remain distinct.
+#[test]
+fn import_disambiguates_colliding_readable_id() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let cwd = env._home.path();
+    std::fs::create_dir_all(&cwd).ok();
+    let key = project_key(Some(&cwd)).unwrap();
+
+    write_snapshot(&fixture("shared", &key)).unwrap();
+    let payload = export_handoff("shared").expect("export");
+
+    let first = import_handoff(&payload, Some(&cwd), "closed").unwrap();
+    let second = import_handoff(&payload, Some(&cwd), "closed").unwrap();
+    assert_eq!(first, "import-shared", "first import takes the readable id");
+    assert_ne!(first, second, "second import must not collide");
+    assert!(
+        second.starts_with("import-shared-"),
+        "second import keeps the stem plus a disambiguator"
+    );
+    assert!(load_snapshot(&first).is_some());
+    assert!(load_snapshot(&second).is_some());
+}
+
+/// Fix #8: a pathological source session id (uppercase, dots, slashes) is
+/// sanitized into a valid, bounded, importable filename stem.
+#[test]
+fn import_sanitizes_pathological_source_id() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let cwd = env._home.path();
+    std::fs::create_dir_all(&cwd).ok();
+    let key = project_key(Some(&cwd)).unwrap();
+    let pathological = "Weird.Session/NAME!";
+    // Build a payload carrying a pathological source id (simulating an
+    // out-of-band handoff whose id the regular file_path validation would
+    // reject), then adopt it.
+    let payload = {
+        let mut snap = fixture(pathological, &key);
+        snap.session_id = pathological.into();
+        serde_json::to_string(&snap).unwrap()
+    };
+    let imported = import_handoff(&payload, Some(&cwd), "closed").unwrap();
+    assert!(imported.starts_with("import-"), "sane prefix");
+    // The stem is sanitized: only [a-z0-9_-] plus the import- prefix.
+    assert!(
+        imported
+            .chars()
+            .all(|c| c.is_ascii_lowercase()
+                || c.is_ascii_digit()
+                || c == '-'
+                || c == '_'),
+        "import filename must only contain safe characters, got {imported:?}"
+    );
+    assert!(load_snapshot(&imported).is_some(), "imported snapshot loads");
+}
+
+/// Fix #1: the startup sweep calls the retention policy and prunes stale
+/// archived snapshots (and is idempotent — running it twice is harmless).
+#[test]
+fn startup_sweep_prunes_stale_archived() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let home = env._home.path();
+    let cwd = home.join("project");
+    std::fs::create_dir_all(&cwd).ok();
+    let key = project_key(Some(&cwd)).unwrap();
+    let now = Utc::now();
+
+    write_snapshot(&fixture("live", &key)).unwrap();
+    let mut stale = fixture("stale", &key);
+    stale.ended_at = now - chrono::Duration::days(MAX_ARCHIVED_SNAPSHOT_AGE_DAYS + 10);
+    write_snapshot(&stale).unwrap();
+
+    // Before the sweep both exist.
+    assert!(load_snapshot("stale").is_some());
+
+    sweep_stale_handoffs();
+
+    // Live survives; stale is pruned.
+    assert!(load_snapshot("live").is_some());
+    assert!(load_snapshot("stale").is_none());
+
+    // Idempotent: a second sweep is harmless.
+    sweep_stale_handoffs();
+}
