@@ -1352,6 +1352,39 @@ mod tests {
     }
 
     #[test]
+    fn registry_introspection_api_is_consistent() {
+        // Cover the registry/results introspection surface so it is not
+        // dead-and-untested public API.
+        let mut map = SessionEventMap::default();
+        append(&mut map, "e1", text_msg_user("m1"));
+        append(&mut map, "e2", text_msg_assistant("m2"));
+
+        // Empty registry: len 0, is_empty, names empty, no projections.
+        let empty = ProjectionRegistry::default();
+        assert_eq!(empty.len(), 0);
+        assert!(empty.is_empty());
+        assert!(empty.names().is_empty());
+
+        let mut reg = ProjectionRegistry::builtin();
+        assert_eq!(reg.len(), 3);
+        assert!(!reg.is_empty());
+        let names = reg.names();
+        assert!(names.contains(&"session.message_count"));
+        assert!(names.contains(&"session.live_transcript"));
+        assert!(names.contains(&"session.role_counts"));
+
+        reg.fold(&map.events).expect("fold ok");
+        let view = reg.current();
+        // Results::names lists every folded projection.
+        let result_names = view.names();
+        assert_eq!(result_names.len(), 3);
+        assert!(result_names.contains(&"session.live_transcript"));
+
+        // validate_all is green for a well-formed sequence.
+        assert!(reg.validate_all().is_empty());
+    }
+
+    #[test]
     fn role_counts_track_splices() {
         // Role counts must stay correct across a replace (splice) that reshapes
         // the transcript, not just append-at-end.
