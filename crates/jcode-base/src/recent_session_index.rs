@@ -24,12 +24,19 @@ pub struct RecentSessionMetadata {
 }
 
 impl RecentSessionMetadata {
+    /// Best human-facing title for this session, mirroring the TUI session
+    /// picker's resolution: an explicit rename wins, then a todo-derived title,
+    /// then the generated/imported title. When none exist, fall back to the
+    /// memorable short name mined from the session id (e.g. `session_mushroom_…`
+    /// -> `mushroom`) so recent-session surfaces such as the Telegram `/list`
+    /// picker never label every session `<untitled>`.
     pub fn display_title(&self) -> Option<&str> {
         self.custom_title
             .as_deref()
             .and_then(non_empty)
             .or_else(|| self.todo_title.as_deref().and_then(non_empty))
             .or_else(|| self.generated_title.as_deref().and_then(non_empty))
+            .or_else(|| crate::id::extract_session_name(&self.session_id))
     }
 }
 
@@ -68,10 +75,17 @@ fn open() -> Result<Connection> {
 
 pub fn recent(limit: usize) -> Result<Vec<RecentSessionMetadata>> {
     let connection = open()?;
+    // Only surface real, resumable jcode sessions (`session_…` ids). Internal
+    // control sessions (`coord`, `req`) and imported-external transcripts
+    // (`imported_*`) are persisted locally but aren't resumable through the
+    // session picker, and the TUI resume list excludes them too. Filtering here
+    // (rather than in each caller) keeps the numbered /list buttons and /use <n>
+    // index consistent.
     let mut statement = connection.prepare(
         "SELECT session_id, working_dir, generated_title, custom_title,
                 todo_title, saved, updated_at_ms, last_active_at_ms
          FROM recent_sessions
+         WHERE session_id LIKE 'session_%'
          ORDER BY COALESCE(last_active_at_ms, updated_at_ms) DESC
          LIMIT ?1",
     )?;
@@ -173,5 +187,35 @@ mod tests {
         assert_eq!(entry.display_title(), Some("Todo goal"));
         entry.custom_title = Some("Renamed".into());
         assert_eq!(entry.display_title(), Some("Renamed"));
+    }
+
+    #[test]
+    fn display_title_falls_back_to_short_session_name() {
+        let entry = RecentSessionMetadata {
+            session_id: "session_mushroom_1234567890_abcdef1234567890".into(),
+            working_dir: None,
+            generated_title: None,
+            custom_title: None,
+            todo_title: None,
+            saved: false,
+            updated_at_ms: 1,
+            last_active_at_ms: None,
+        };
+        assert_eq!(entry.display_title(), Some("mushroom"));
+    }
+
+    #[test]
+    fn display_title_is_none_when_session_name_cannot_be_mined() {
+        let entry = RecentSessionMetadata {
+            session_id: "not-a-session-id".into(),
+            working_dir: None,
+            generated_title: None,
+            custom_title: None,
+            todo_title: None,
+            saved: false,
+            updated_at_ms: 1,
+            last_active_at_ms: None,
+        };
+        assert_eq!(entry.display_title(), None);
     }
 }
