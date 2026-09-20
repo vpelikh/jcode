@@ -1,7 +1,7 @@
 use super::{
-    AmbientConfig, Config, DiffDisplayMode, DisplayConfig, HookCommands, LatexRenderingMode,
-    McpToolsMode, ProviderConfig, SessionPickerResumeAction, SwarmSpawnMode, ToolConfig,
-    config_env_fingerprint, populate_context_limits_from_config_ref,
+    AmbientConfig, Config, DiffDisplayMode, DisplayConfig, HookCommands,
+    LatexRenderingMode, LoopGuardConfig, McpToolsMode, ProviderConfig, SessionPickerResumeAction,
+    SwarmSpawnMode, ToolConfig, config_env_fingerprint, populate_context_limits_from_config_ref,
 };
 use std::ffi::OsString;
 use std::path::Path;
@@ -573,6 +573,24 @@ fn tool_config_defaults_to_full_toolset() {
     assert!(selection.disabled_tools.is_empty());
     assert_eq!(config.mcp_tools, McpToolsMode::Auto);
     assert_eq!(config.mcp_tools_token_threshold, 8_000);
+    // The compass_query-first enforcement is on by default, matching the
+    // built-in preferred-tools guidance that tells agents to try semantic
+    // search first. An operator can turn it off via [tools] below.
+    assert!(config.prefer_compass_query);
+}
+
+#[test]
+fn tool_config_prefer_compass_query_round_trips_through_toml() {
+    // Explicitly off.
+    let off: Config = toml::from_str("[tools]\nprefer_compass_query = false\n").unwrap();
+    assert!(!off.tools.prefer_compass_query);
+    // Explicitly on.
+    let on: Config = toml::from_str("[tools]\nprefer_compass_query = true\n").unwrap();
+    assert!(on.tools.prefer_compass_query);
+    // Absent key falls back to the default (on) for backward compatibility
+    // with config files written before the flag existed.
+    let absent: Config = toml::from_str("[tools]\nread_dedup = true\n").unwrap();
+    assert!(absent.tools.prefer_compass_query);
 }
 
 #[test]
@@ -798,6 +816,24 @@ fn test_generated_default_config_has_expected_user_defaults() {
     let parsed: Config =
         toml::from_str(&content).expect("generated default config should parse as Config");
     assert_eq!(parsed.agents.swarm_spawn_mode, SwarmSpawnMode::Inline);
+    // The compass_query-first enforcement knob ships documented and defaults on.
+    assert!(
+        content.contains("prefer_compass_query"),
+        "generated default config should document prefer_compass_query"
+    );
+    assert!(
+        parsed.tools.prefer_compass_query,
+        "generated default config keeps compass_query-first enforcement on"
+    );
+    // The pre-warm knob ships documented and defaults on.
+    assert!(
+        content.contains("prewarm_compass_index"),
+        "generated default config should document prewarm_compass_index"
+    );
+    assert!(
+        parsed.tools.prewarm_compass_index,
+        "generated default config keeps Compass pre-warm on"
+    );
     assert!(
         parsed.display.show_thinking,
         "freshly created user config should request model reasoning"
@@ -1627,4 +1663,179 @@ fn swarm_root_effort_env_overrides_and_shared_resolution() {
     for (key, value) in keys.into_iter().zip(previous) {
         restore_env_var(key, value);
     }
+
+fn test_autoreview_loop_mode_and_stall_defaults() {
+    // Phase 1b: review-loop config scaffolding on AutoReviewConfig.
+    let cfg = Config::default();
+    assert!(cfg.autoreview.loop_mode, "loop_mode must default to true");
+    assert_eq!(
+        cfg.autoreview.max_stalled_turns, 3,
+        "max_stalled_turns must default to 3"
+    );
+}
+
+#[test]
+fn test_autoreview_enabled_and_loop_default_on_for_empty_config() {
+    // A brand-new user with no [autoreview] section (or an empty config) must
+    // get the default-on behavior: review runs as part of the flow. This is the
+    // public Config parse boundary for new installs.
+    let cfg: Config = toml::from_str("")
+        .expect("empty config must deserialize");
+    assert!(
+        cfg.autoreview.enabled,
+        "empty config: autoreview must default to enabled"
+    );
+    assert!(
+        cfg.autoreview.loop_mode,
+        "empty config: review loop must default on"
+    );
+
+    // An other-sections-only config (no [autoreview] table) behaves the same.
+    let cfg2: Config = toml::from_str("[features]\nmermaid = false\n")
+        .expect("config without autoreview section must deserialize");
+    assert!(cfg2.autoreview.enabled);
+    assert!(cfg2.autoreview.loop_mode);
+}
+
+#[test]
+fn test_autoreview_loop_mode_and_stall_deserialize() {
+    let cfg: Config = toml::from_str(
+        r#"
+        [autoreview]
+        enabled = true
+        loop_mode = true
+        max_stalled_turns = 0
+        "#,
+    )
+    .expect("config should deserialize with review-loop fields");
+
+    assert!(cfg.autoreview.enabled);
+    assert!(cfg.autoreview.loop_mode);
+    assert_eq!(cfg.autoreview.max_stalled_turns, 0);
+}
+
+#[test]
+fn test_autoreview_loop_mode_stall_tolerates_missing_fields() {
+    // Existing sessions/configs without the new fields must load tolerantly.
+    let cfg: Config = toml::from_str(
+        r#"
+        [autoreview]
+        enabled = false
+        "#,
+    )
+    .expect("config without loop fields must still deserialize");
+
+    assert!(cfg.autoreview.loop_mode);
+    assert_eq!(cfg.autoreview.max_stalled_turns, 3);
+}
+
+#[test]
+fn test_autoreview_stale_timeout_default_and_tolerates_missing() {
+    // stale_reviewer_timeout_secs drives dead-but-persisted reviewer recovery.
+    let cfg = Config::default();
+    assert_eq!(
+        cfg.autoreview.stale_reviewer_timeout_secs, 1800,
+        "stale_reviewer_timeout_secs must default to 30 minutes (1800)"
+    );
+
+    // A config without the field must load tolerantly (serde default).
+    let cfg: Config = toml::from_str(
+        r#"
+        [autoreview]
+        enabled = true
+        "#,
+    )
+    .expect("config without stale timeout field must deserialize");
+    assert_eq!(cfg.autoreview.stale_reviewer_timeout_secs, 1800);
+}
+
+#[test]
+fn test_autoreview_stale_timeout_round_trip_and_zero_disables() {
+    // Explicit value survives the config path and reaches the runtime default path.
+    let cfg: Config = toml::from_str(
+        r#"
+        [autoreview]
+        stale_reviewer_timeout_secs = 60
+        "#,
+    )
+    .expect("config with stale timeout must deserialize");
+    assert_eq!(cfg.autoreview.stale_reviewer_timeout_secs, 60);
+
+    // 0 disables stale detection (loop waits on a dead reviewer indefinitely).
+    let cfg0: Config = toml::from_str(
+        r#"
+        [autoreview]
+        stale_reviewer_timeout_secs = 0
+        "#,
+    )
+    .expect("config with 0 stale timeout must deserialize");
+    assert_eq!(cfg0.autoreview.stale_reviewer_timeout_secs, 0);
+}
+
+#[test]
+fn test_telegram_connectivity_fields_round_trip_and_env_override() {
+    // The anti-censorship connectivity fields (mirror base, proxy, pinned IP)
+    // carry routing semantics, so they must survive a Config serialize/parse
+    // round trip and be reachable via their env overrides.
+    let src = r#"
+        [safety]
+        telegram_api_base = "https://mirror.example.com/bot"
+        telegram_proxy = "socks5://127.0.0.1:1080"
+        telegram_api_ip = "149.154.167.220"
+    "#;
+    let cfg: Config = toml::from_str(src).expect("telegram connectivity config parses");
+    assert_eq!(
+        cfg.safety.telegram_api_base.as_deref(),
+        Some("https://mirror.example.com/bot")
+    );
+    assert_eq!(
+        cfg.safety.telegram_proxy.as_deref(),
+        Some("socks5://127.0.0.1:1080")
+    );
+    assert_eq!(
+        cfg.safety.telegram_api_ip.as_deref(),
+        Some("149.154.167.220")
+    );
+
+    // Round-trip through TOML: none of the three fields may be dropped.
+    let serialized = toml::to_string(&cfg).expect("serialize config");
+    let restored: Config = toml::from_str(&serialized).expect("re-parse config");
+    assert_eq!(restored.safety.telegram_api_base, cfg.safety.telegram_api_base);
+    assert_eq!(restored.safety.telegram_proxy, cfg.safety.telegram_proxy);
+    assert_eq!(restored.safety.telegram_api_ip, cfg.safety.telegram_api_ip);
+
+    // Env override wiring reaches the mirror-base field.
+    let _guard = crate::storage::lock_test_env();
+    let prev = std::env::var_os("JCODE_TELEGRAM_API_BASE");
+    crate::env::set_var("JCODE_TELEGRAM_API_BASE", "https://env.example.com/bot");
+    let mut cfg2 = Config::default();
+    cfg2.apply_env_overrides();
+    assert_eq!(
+        cfg2.safety.telegram_api_base.as_deref(),
+        Some("https://env.example.com/bot")
+    );
+    restore_env_var("JCODE_TELEGRAM_API_BASE", prev);
+}
+
+#[test]
+fn loop_guard_config_defaults_repeat_tool_threshold_to_four() {
+    assert_eq!(LoopGuardConfig::default().repeat_tool_threshold, 4);
+    // A Config default carries the same threshold, and it round-trips through
+    // serde so a user can configure it without breaking the rest of the file.
+    assert_eq!(Config::default().loop_guard.repeat_tool_threshold, 4);
+    let cfg = Config::default();
+    let json = serde_json::to_string(&cfg.loop_guard).unwrap();
+    let back: LoopGuardConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.repeat_tool_threshold, 4);
+}
+
+#[test]
+fn loop_guard_round_trips_a_custom_threshold() {
+    let cfg = LoopGuardConfig {
+        repeat_tool_threshold: 2,
+    };
+    let json = serde_json::to_string(&cfg).unwrap();
+    let back: LoopGuardConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.repeat_tool_threshold, 2);
+}
 }

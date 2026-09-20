@@ -694,14 +694,6 @@ mod batch_crash_tests {
         let mut session =
             Session::create_with_id(imported_id.to_string(), None, Some("Imported".to_string()));
         session.status = SessionStatus::Closed;
-        // Add a message so save() does not early-return (persist guard).
-        session.add_message(
-            crate::message::Role::User,
-            vec![crate::message::ContentBlock::Text {
-                text: "placeholder".to_string(),
-                cache_control: None,
-            }],
-        );
         session.save()?;
 
         let resolved = find_session_by_name_or_id(imported_id)?;
@@ -732,14 +724,6 @@ mod batch_crash_tests {
         session.status = SessionStatus::Closed;
         session.provider_session_id = Some(provider_id.to_string());
         session.provider_key = Some("opencode".to_string());
-        // Add a message so save() does not early-return (persist guard).
-        session.add_message(
-            crate::message::Role::User,
-            vec![crate::message::ContentBlock::Text {
-                text: "placeholder".to_string(),
-                cache_control: None,
-            }],
-        );
         session.save()?;
 
         // No external OpenCode store exists under JCODE_HOME/external, so the only
