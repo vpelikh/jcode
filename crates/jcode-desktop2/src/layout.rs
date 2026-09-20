@@ -943,18 +943,26 @@ mod tests {
             );
             assert!(frame.column() > 0.0, "at ({width},{scale}) collapsed");
         }
-        // Windows too narrow to hold the sidebar and any column must degrade
-        // on-paper: the column stays above zero and never runs off the right
-        // edge, even though the sidebar overhangs the leftover width.
-        for (width, scale) in [(300usize, 1.0), (260, 1.0), (240, 1.0)] {
+        // Sweep every logical width from the 240-unit floor up to the point
+        // where the sidebar fits alongside the minimum column, so any
+        // threshold that would overflow or collapse the page is caught rather
+        // than only the few hand-picked samples above.
+        for width in 240usize..=372 {
             let frame =
-                Frame::with_content_sidebar((width as u32, 720), scale, 1, false, 0.0, SIDEBAR);
+                Frame::with_content_sidebar((width as u32, 720), 1.0, 1, false, 0.0, SIDEBAR);
             assert!(
                 frame.right <= frame.width + 0.001,
-                "at ({width},{scale}) the column ran off-paper"
+                "at W={width} the column ran off-paper"
             );
-            assert!(frame.column() > 0.0, "at ({width},{scale}) collapsed");
+            assert!(frame.column() > 0.0, "at W={width} the column collapsed");
         }
+        // One zoomed narrow case, to confirm the guard holds under scaling too.
+        let frame = Frame::with_content_sidebar((300, 720), 2.0, 1, false, 0.0, SIDEBAR);
+        assert!(
+            frame.right <= frame.width + 0.001,
+            "at zoomed width the column ran off-paper"
+        );
+        assert!(frame.column() > 0.0, "the zoomed column collapsed");
     }
 
     #[test]
