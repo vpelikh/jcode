@@ -115,8 +115,10 @@ pub fn build_workspace_scene(
         output.pop_layer();
 
         // The ring sits outside the clip so it stays crisp at every corner.
+        // A focused page takes the accent like every other focused surface, so
+        // "the keys will land in this page" reads the same way everywhere.
         let (color, weight) = if column.focused {
-            (model.theme.field_border_focus, PAGE_RING_FOCUS)
+            (model.theme.accent, PAGE_RING_FOCUS)
         } else {
             (model.theme.rule, PAGE_RING)
         };

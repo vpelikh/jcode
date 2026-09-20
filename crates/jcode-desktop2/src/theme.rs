@@ -42,9 +42,6 @@ pub struct Theme {
     pub field: Color,
     /// Hairline around an unfocused field.
     pub field_border: Color,
-    /// Hairline around the focused field. Stronger than `field_border` so
-    /// focus is visible without a colour accent.
-    pub field_border_focus: Color,
     /// Errors. The print theme keeps this ink-only per the style guide;
     /// other themes may use hue.
     pub error: Color,
@@ -56,11 +53,11 @@ pub struct Theme {
     /// tuned to contrast with paper nearly vanishes on a wash, and a
     /// highlight you cannot see is the same as no highlight.
     pub selection_on_wash: Color,
-    /// Ink for an added line of a diff, and for a removed one. The one place
-    /// the print theme spends hue: a diff is read by scanning for which side a
-    /// line is on, and `+`/`-` alone makes that a character-by-character job.
-    /// Kept desaturated so a card full of them still reads as a document
-    /// rather than as a terminal.
+    /// Ink for an added line of a diff, and for a removed one. A diff is read
+    /// by scanning for which side a line is on, and `+`/`-` alone makes that
+    /// a character-by-character job, so added/removed are the *scanning* hue
+    /// pair ([`Self::accent`] is the one *state* hue). Kept desaturated so a
+    /// card full of them still reads as a document rather than as a terminal.
     pub added: Color,
     pub removed: Color,
     /// Fill behind a whole added line of a diff, and behind a removed one.
@@ -79,6 +76,15 @@ pub struct Theme {
     /// file.
     pub added_mark: Color,
     pub removed_mark: Color,
+    /// The one semantic accent hue, used only for *state* (focus, active,
+    /// busy, selection) rather than decoration, so it stays loud where it is
+    /// and quiet where the print page must dominate. A single hue keeps the
+    /// ink-on-paper language intact while giving the eye one thread to follow.
+    pub accent: Color,
+    /// A faint, saturation-light wash of the accent, for a selected or active
+    /// tile that must not shout. One density below [`Self::accent`], so the
+    /// two read as the same colour doing two jobs (a marker and a field).
+    pub accent_wash: Color,
 }
 
 impl Theme {
@@ -95,7 +101,6 @@ impl Theme {
             code_wash: Color::from_rgb8(0xea, 0xea, 0xea),
             field: Color::from_rgb8(0xff, 0xff, 0xff),
             field_border: Color::from_rgb8(0xd4, 0xd4, 0xd4),
-            field_border_focus: Color::from_rgb8(0x77, 0x77, 0x77),
             error: Color::from_rgb8(0x11, 0x11, 0x11),
             selection: Color::from_rgb8(0xd8, 0xd8, 0xd8),
             selection_on_wash: Color::from_rgb8(0xc4, 0xc4, 0xc4),
@@ -105,6 +110,12 @@ impl Theme {
             removed_wash: Color::from_rgb8(0xfb, 0xe9, 0xe9),
             added_mark: Color::from_rgb8(0xb4, 0xe4, 0xc4),
             removed_mark: Color::from_rgb8(0xf6, 0xc4, 0xc4),
+            // Deep green: the same family as the diff's "added" ink, so the
+            // state colour never fights the language the app already uses for
+            // progress. Saturated enough to read as a colour at 1px, dark
+            // enough to hold on paper.
+            accent: Color::from_rgb8(0x2e, 0x7d, 0x4f),
+            accent_wash: Color::from_rgb8(0xe8, 0xf3, 0xec),
         }
     }
 
@@ -121,7 +132,6 @@ impl Theme {
             code_wash: Color::from_rgb8(0x24, 0x24, 0x24),
             field: Color::from_rgb8(0x10, 0x10, 0x10),
             field_border: Color::from_rgb8(0x3a, 0x3a, 0x3a),
-            field_border_focus: Color::from_rgb8(0x88, 0x88, 0x88),
             error: Color::from_rgb8(0xee, 0xee, 0xee),
             selection: Color::from_rgb8(0x3a, 0x3a, 0x3a),
             selection_on_wash: Color::from_rgb8(0x4c, 0x4c, 0x4c),
@@ -131,6 +141,13 @@ impl Theme {
             removed_wash: Color::from_rgb8(0x2a, 0x14, 0x16),
             added_mark: Color::from_rgb8(0x1d, 0x4a, 0x30),
             removed_mark: Color::from_rgb8(0x53, 0x22, 0x26),
+            // The same green family as light, brightened for the dark page so
+            // it holds its hue against black without getting muddy. The wash sits
+            // ~0.13 luma off pure black — clearly lighter than the page but
+            // still faint enough that the muted label on the current card
+            // keeps ~3.6:1 contrast.
+            accent: Color::from_rgb8(0x5b, 0xbf, 0x85),
+            accent_wash: Color::from_rgb8(0x14, 0x26, 0x1c),
         }
     }
 
@@ -223,6 +240,8 @@ mod tests {
                 ("rule", theme.rule),
                 ("error", theme.error),
                 ("selection", theme.selection),
+                ("accent", theme.accent),
+                ("accent_wash", theme.accent_wash),
             ] {
                 assert_ne!(
                     role.components, theme.background.components,
@@ -283,6 +302,80 @@ mod tests {
             assert!(
                 against_page > 0.03,
                 "the selection band is invisible in {:?}",
+                theme.mode
+            );
+        }
+    }
+
+    /// The accent is a *state* colour, so it has to do two jobs it is tuned
+    /// for separately: read against the paper as a marker (a focused border, a
+    /// caret), and read as a calm field underneath text when used as a wash.
+    ///
+    /// - On paper it must be legible ink (the marker job), and unmistakably
+    ///   coloured rather than a gray, or accenting focus would buy nothing over
+    ///   the old ink-only weights.
+    /// - The wash must be faint enough that paper-coloured body text stays
+    ///   readable on it, but still carry the accent's hue so a selected tile
+    ///   and a neutral-tinted tile read as different things.
+    #[test]
+    fn the_accent_is_a_readable_state_colour() {
+        let luma = |color: Color| {
+            let [r, g, b, _] = color.components;
+            0.2126 * f64::from(r) + 0.7152 * f64::from(g) + 0.0722 * f64::from(b)
+        };
+        let saturation = |c: Color| {
+            let [r, g, b, _] = c.components;
+            let max = r.max(g).max(b);
+            let min = r.min(g).min(b);
+            if max < 1e-6 { 0.0 } else { (max - min) / max }
+        };
+        for theme in [Theme::print_light(), Theme::print_dark()] {
+            // The marker accent holds a real hue (not a gray).
+            assert!(
+                saturation(theme.accent) > 0.25,
+                "the accent is so desaturated it reads as gray in {:?}",
+                theme.mode
+            );
+            // The accent ink is readable against paper.
+            let mark = (luma(theme.accent) - luma(theme.background)).abs();
+            assert!(
+                mark > 0.3,
+                "the accent marker is unreadable against paper in {:?} (contrast {mark:.2})",
+                theme.mode
+            );
+            // The wash is one density below the mark, so a selected tile sits
+            // visibly under text without shouting.
+            let wash = (luma(theme.accent_wash) - luma(theme.background)).abs();
+            assert!(
+                wash < mark,
+                "the accent wash is no fainter than the accent in {:?}",
+                theme.mode
+            );
+            // The wash must be *perceptibly* distinct from the page, or a
+            // selected tile is indistinguishable from its siblings and the role
+            // (marking "current") silently fails. 0.03 luma is the smallest gap
+            // most eyes reliably notice on a contiguous surface.
+            assert!(
+                wash > 0.03,
+                "the accent wash is not perceptible against paper in {:?} (luma {wash:.3})",
+                theme.mode
+            );
+            // Wash and mark share a hue family: the same colour doing two jobs,
+            // not two unrelated accents. Same dominant channel proves the hue
+            // (both are green-dominant here), not just that the two differ.
+            let dominant = |c: Color| {
+                let [r, g, b, _] = c.components;
+                if r >= g && r >= b {
+                    0usize
+                } else if g >= b {
+                    1usize
+                } else {
+                    2usize
+                }
+            };
+            assert!(
+                dominant(theme.accent) == dominant(theme.accent_wash),
+                "accent and accent_wash are not the same hue in {:?}",
                 theme.mode
             );
         }
