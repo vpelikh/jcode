@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# Remember where the caller invoked cargo so the build runs in that directory.
+# The wrapper must NOT force everything into the main repo: when called from a
+# git worktree (e.g. /private/tmp/jcode-*), `cargo` must resolve that worktree's
+# Cargo.toml, not the primary checkout. Internal helpers below keep using
+# $repo_root explicitly, so we only need to restore the caller's cwd right
+# before the actual `cargo` invocation.
+caller_cwd="$(pwd)"
+cd "$repo_root"
 
 # `selfdev test` installs a shell-level `cargo` shim so raw `cargo test/check`
 # commands receive this wrapper's memory, linker, feature, and toolchain policy.
@@ -108,6 +116,7 @@ feature_profile_status="default"
 build_jobs_status="cargo-default"
 git_meta_status="not-configured"
 build_tmpdir_status="system-default"
+shared_target_dir_status="off"
 
 path_is_memory_backed() {
   local path="$1"
@@ -182,6 +191,28 @@ selected_profile() {
     esac
   done
   printf '%s\n' "$profile"
+}
+
+# When JCODE_SHARED_TARGET_DIR is set, point every worktree-soaked cargo build
+# at that one directory instead of each worktree's own `<repo>/target/`. This
+# stops the same crate graph from being compiled and stored many times over.
+#
+# The Rust side (crates/jcode-build-support/src/paths.rs::shared_target_dir)
+# resolves the identical env var when locating built binaries for reload and
+# newest-binary discovery, so the two stay consistent. The per-worktree target
+# dir remains the default when this is unset, preserving current behavior.
+#
+# Deliberately runs after acquire_cargo_gate so a shared dir cannot be written
+# concurrently by two builds that the gate would otherwise serialize anyway.
+export_shared_target_dir() {
+  local shared="${JCODE_SHARED_TARGET_DIR:-}"
+  if [[ -z "$shared" ]]; then
+    shared_target_dir_status="off"
+    return 0
+  fi
+  export CARGO_TARGET_DIR="$shared"
+  shared_target_dir_status="shared"
+  log "using shared target dir (${CARGO_TARGET_DIR})"
 }
 
 # Determine whether the effective build will use incremental compilation.
@@ -777,6 +808,8 @@ cargo_gate_mode=$cargo_gate_mode
 cargo_gate_path=${JCODE_CARGO_GATE_PATH:-$cargo_gate_dir/jcode-cargo-build.lock}
 build_tmpdir_status=$build_tmpdir_status
 tmpdir=${TMPDIR:-<unset>}
+shared_target_dir_status=$shared_target_dir_status
+cargo_target_dir=${CARGO_TARGET_DIR:-<per-worktree>}
 feature_profile_status=$feature_profile_status
 git_meta_status=$git_meta_status
 build_git_hash=${JCODE_BUILD_GIT_HASH:-<unset>}
@@ -1107,6 +1140,7 @@ if [[ "$(uname -s)" == "Linux" ]] && [[ "$(uname -m)" == "x86_64" ]]; then
 fi
 
 if [[ "${1:-}" == "--print-setup" ]]; then
+  export_shared_target_dir
   select_build_jobs
   print_setup
   exit 0
@@ -1123,6 +1157,7 @@ if [[ "${JCODE_REMOTE_CARGO:-0}" == "1" ]]; then
   if remote_cargo_preflight; then
     log "using remote cargo via scripts/remote_build.sh"
     rust_action_log_execution="remote"
+    cd "$caller_cwd"
     "$repo_root/scripts/remote_build.sh" "${cargo_argv[@]}"
     exit $?
   fi
@@ -1135,8 +1170,12 @@ if [[ "${JCODE_REMOTE_CARGO:-0}" == "1" ]]; then
 fi
 
 acquire_cargo_gate
+export_shared_target_dir
 # Size the in-process parallelism only after competing jcode Cargo processes
 # have drained. Measuring before the wait would preserve an unnecessarily low
 # one-job decision even after memory becomes available.
 select_build_jobs
+# Restore the caller's working directory so `cargo` resolves the worktree the
+# user actually invoked it from, not the primary checkout the script cd'd into.
+cd "$caller_cwd"
 run_local_cargo
