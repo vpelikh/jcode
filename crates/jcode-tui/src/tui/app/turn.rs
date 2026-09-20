@@ -25,7 +25,7 @@ impl App {
     /// Run turn with interactive input handling (redraws UI, accepts input during streaming)
     pub(super) async fn run_turn_interactive(
         &mut self,
-        terminal: &mut DefaultTerminal,
+        terminal: &mut AppTerminal,
         event_stream: &mut EventStream,
         mut bus_receiver: Option<&mut tokio::sync::broadcast::Receiver<crate::bus::BusEvent>>,
     ) -> Result<()> {

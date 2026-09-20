@@ -385,7 +385,7 @@ impl StatusSpinnerRenderer {
     pub(super) fn draw_idle_animation_only(
         &mut self,
         app: &App,
-        terminal: &mut DefaultTerminal,
+        terminal: &mut AppTerminal,
     ) -> Result<bool> {
         let Some(previous_frame) = self.last_frame.as_ref() else {
             return Ok(false);
@@ -470,7 +470,7 @@ impl StatusSpinnerRenderer {
     pub(super) fn draw_full(
         &mut self,
         app: &mut App,
-        terminal: &mut DefaultTerminal,
+        terminal: &mut AppTerminal,
     ) -> Result<()> {
         self.draw_full_with(app, terminal)
     }
@@ -478,7 +478,7 @@ impl StatusSpinnerRenderer {
     /// The synchronized-update wrapper shared by every full-frame repaint.
     ///
     /// Splitting this out generically (rather than inlining it in
-    /// [`Self::draw_full`], which is pinned to `DefaultTerminal = CrosstermBackend<Stdout>`)
+    /// [`Self::draw_full`], which is pinned to `AppTerminal = CrosstermBackend<TerminalWriter>`)
     /// lets a test drive the exact wrapper — the `BeginSynchronizedUpdate` /
     /// `EndSynchronizedUpdate` window and the error-path cursor re-show — against a
     /// captured `CrosstermBackend<Vec<u8>>`, instead of leaving it untestable on
@@ -559,7 +559,15 @@ impl StatusSpinnerRenderer {
         // invalidation has already happened), so the error is deliberately ignored.
         let _ = terminal.backend_mut().hide_cursor();
 
-        let invalidation = full_frame_invalidation(app.force_full_redraw, app.force_full_repaint);
+        // If the writer dropped output while the pty was wedged, ratatui's
+        // internal previous buffer no longer matches the real terminal. Force a
+        // full re-emit (soft repaint) so the screen and ratatui's model are
+        // realigned once the pty can drain again.
+        let resync_requested = crate::tui::terminal_writer::take_resync_requested();
+        let invalidation = full_frame_invalidation(
+            app.force_full_redraw,
+            app.force_full_repaint || resync_requested,
+        );
         let force_full_redraw = invalidation != FullFrameInvalidation::None;
         match invalidation {
             FullFrameInvalidation::HardClear => {
@@ -633,7 +641,7 @@ impl StatusSpinnerRenderer {
     pub(super) fn draw_status_spinner_only(
         &mut self,
         app: &App,
-        terminal: &mut DefaultTerminal,
+        terminal: &mut AppTerminal,
     ) -> Result<bool> {
         let status_symbol = status_spinner_only_symbol(app);
         if status_symbol.is_none() {
@@ -717,7 +725,7 @@ fn render_status_spinner_into_buffer_mut(buffer: &mut Buffer, area: Rect, symbol
 impl App {
     /// Run the TUI application
     /// Returns Some(session_id) if hot-reload was requested
-    pub async fn run(mut self, mut terminal: DefaultTerminal) -> Result<RunResult> {
+    pub async fn run(mut self, mut terminal: AppTerminal) -> Result<RunResult> {
         super::terminal_liveness::capture_initial_tty();
         let mut event_stream = EventStream::new();
         let mut redraw_period = crate::tui::redraw_interval(&self);
@@ -850,7 +858,7 @@ impl App {
     /// Run the TUI in remote mode, connecting to a server
     pub async fn run_remote(
         mut self,
-        mut terminal: DefaultTerminal,
+        mut terminal: AppTerminal,
         remote_working_dir: Option<String>,
     ) -> Result<RunResult> {
         if crate::tui::is_ssh_remote() {
@@ -1088,7 +1096,7 @@ impl App {
     /// Run the TUI in replay mode, playing back a timeline of events.
     pub async fn run_replay(
         self,
-        terminal: DefaultTerminal,
+        terminal: AppTerminal,
         timeline: Vec<crate::replay::TimelineEvent>,
         speed: f64,
     ) -> Result<RunResult> {
@@ -1097,7 +1105,7 @@ impl App {
 
     /// Run an interactive swarm replay, rendering multiple sessions in tiled panes.
     pub async fn run_swarm_replay(
-        terminal: DefaultTerminal,
+        terminal: AppTerminal,
         panes: Vec<crate::replay::PaneReplayInput>,
         speed: f64,
         centered_override: Option<bool>,
