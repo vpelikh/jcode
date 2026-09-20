@@ -73,7 +73,7 @@ impl Tool for WebSearchTool {
     /// error instead of stalling the turn. The request futures are async
     /// reqwest I/O and drop cleanly on cancellation, so no background work is
     /// orphaned.
-    fn execution_timeout(&self) -> Option<std::time::Duration> {
+    fn execution_timeout(&self, _input: &Value) -> Option<std::time::Duration> {
         Some(std::time::Duration::from_secs(Self::EXECUTION_TIMEOUT_SECS))
     }
 
@@ -865,7 +865,7 @@ mod tests {
         // upstream that connects but never finishes its body read), so
         // `websearch` declares a deadline that the registry wrap point turns
         // into a model-visible timeout instead of an indefinite hang.
-        let timeout = WebSearchTool::new().execution_timeout().expect(
+        let timeout = WebSearchTool::new().execution_timeout(&json!({})).expect(
             "websearch must declare an execution_timeout so a stalled engine \
              cannot block the turn indefinitely",
         );

@@ -720,7 +720,7 @@ fn session_search_declares_a_whole_call_execution_timeout() {
     // self-managed bound of its own. Assert it declares a deadline the registry
     // wrap point can honor.
     let timeout = SessionSearchTool::new()
-        .execution_timeout()
+        .execution_timeout(&json!({}))
         .expect("session_search must declare an execution_timeout");
 
     assert_eq!(
@@ -731,6 +731,59 @@ fn session_search_declares_a_whole_call_execution_timeout() {
     assert!(
         timeout.as_secs() > 0,
         "declared timeout must be a positive, bounded duration"
+    );
+}
+
+#[test]
+fn session_search_timeout_scales_with_exhaustive_scope() {
+    // takeaway #7 Part B: the budget is input-dependent. An `exhaustive` scan
+    // (every session, not the indexed subset) or an explicitly raised
+    // `max_scan_sessions` warrants a larger budget than a default-scope call.
+    let tool = SessionSearchTool::new();
+    let default_secs = tool
+        .execution_timeout(&json!({}))
+        .expect("default-scope call must declare a timeout")
+        .as_secs();
+    let exhaustive_secs = tool
+        .execution_timeout(&json!({ "exhaustive": true }))
+        .expect("exhaustive call must declare a timeout")
+        .as_secs();
+    let raised_cap_secs = tool
+        .execution_timeout(&json!({
+            "max_scan_sessions": DEFAULT_MAX_SCAN_SESSIONS as i64 + 1
+        }))
+        .expect("raised scan-cap call must declare a timeout")
+        .as_secs();
+    // A negative/invalid max_scan_sessions is not expanded scope: execute would
+    // reject it via bounded validation, and the budget must not treat the i64
+    // overflow as a huge positive cap.
+    let invalid_cap_secs = tool
+        .execution_timeout(&json!({ "max_scan_sessions": -1 }))
+        .expect("invalid-cap call must still declare a timeout")
+        .as_secs();
+    assert_eq!(
+        invalid_cap_secs,
+        SessionSearchTool::EXECUTION_TIMEOUT_SECS,
+        "a negative max_scan_sessions must fall back to the base budget, not scale up"
+    );
+    assert_eq!(
+        default_secs,
+        SessionSearchTool::EXECUTION_TIMEOUT_SECS,
+        "default-scope must use the base budget"
+    );
+    assert_eq!(
+        exhaustive_secs,
+        SessionSearchTool::EXHAUSTIVE_EXECUTION_TIMEOUT_SECS,
+        "exhaustive-scope must use the larger budget"
+    );
+    assert_eq!(
+        raised_cap_secs,
+        SessionSearchTool::EXHAUSTIVE_EXECUTION_TIMEOUT_SECS,
+        "an explicitly raised max_scan_sessions must also use the larger budget"
+    );
+    assert!(
+        exhaustive_secs > default_secs,
+        "exhaustive budget must be strictly larger than the default"
     );
 }
 
