@@ -528,6 +528,17 @@ pub(crate) fn registered_command_entries() -> impl Iterator<Item = (&'static str
         .map(|command| (command.name, command.help))
 }
 
+/// The non-hidden registered commands and their declared subcommand
+/// completions. Exposed so the suggestion tests can pin the invariant that
+/// every registered command is discoverable while typing.
+pub(crate) fn registered_command_specs()
+-> impl Iterator<Item = (&'static str, &'static [CommandCompletion])> {
+    REGISTERED_COMMANDS
+        .iter()
+        .filter(|command| !command.hidden)
+        .map(|command| (command.name, command.subcommands))
+}
+
 impl App {
     /// Find word boundary going backward (for Ctrl+W, Alt+B)
     pub(super) fn find_word_boundary_back(&self) -> usize {
@@ -1133,8 +1144,11 @@ impl App {
         }
 
         // Table-driven fallback: any registered command that declares subcommand
-        // completions surfaces them while typing, even when it has no hand-written
-        // branch above. This keeps suggestions connected to the registry: adding
+        // completions surfaces them back into the typed suggestions, even when it
+        // has no hand-written branch above. The bare command itself is included
+        // too so an actionable bare form (e.g. `/cache`, which toggles when run
+        // with no argument) remains selectable from the palette alongside its
+        // subcommands. This keeps suggestions connected to the registry: adding
         // `subcommands` to a command below makes them show up while typing with no
         // further wiring.
         let head = prefix_trimmed
@@ -1144,11 +1158,10 @@ impl App {
         if let Some(spec) = RegisteredCommand::spec_for(head)
             && !spec.subcommands.is_empty()
         {
-            let completions: Vec<(String, &'static str)> = spec
-                .subcommands
-                .iter()
-                .map(|(c, h)| ((*c).to_string(), *h))
-                .collect();
+            let mut completions: Vec<(String, &'static str)> =
+                Vec::with_capacity(spec.subcommands.len() + 1);
+            completions.push((head.to_string(), spec.help));
+            completions.extend(spec.subcommands.iter().map(|(c, h)| ((*c).to_string(), *h)));
             return self.rank_suggestions(input, completions);
         }
 
