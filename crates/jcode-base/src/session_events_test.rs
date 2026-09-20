@@ -4176,3 +4176,57 @@ fn test_derive_messages_fuzz_matches_reference() {
         );
     }
 }
+/// Backward-compatibility regression (takeaway #12): events persisted *before*
+/// ID branding serialized their `event_id` / `message_id` / `compaction_id` as
+/// plain JSON strings. The branded newtypes are `#[serde(transparent)]`, so a
+/// literal old-format payload (raw strings, no wrapper object) must (a) still
+/// deserialize into the branded types and (b) re-serialize to the exact same
+/// bytes — proving existing on-disk journals load unchanged.
+#[test]
+fn branded_id_fields_deserialize_legacy_raw_string_wire_format_verbatim() {
+    // A real AppendMessage event as it would have been persisted pre-branding:
+    // `message_id` is a bare string under `data`.
+    let append_raw = r#"{"op":"append_message","data":{"message_id":"msg_legacy","message":{"id":"msg_legacy","role":"user","content":[{"type":"text","text":"hi"}]}}}"#;
+    let op: SessionEventOp = serde_json::from_str(append_raw)
+        .expect("legacy AppendMessage (raw message_id) must deserialize");
+    // The `message_id` must deserialize into the branded `MessageId` (not be
+    // lost or wrapped): the semantic JSON payload must round-trip unchanged.
+    let original: serde_json::Value =
+        serde_json::from_str(append_raw).expect("original is valid JSON");
+    let re_emitted = serde_json::to_value(&op).expect("re-serialize");
+    assert_eq!(
+        original["data"], re_emitted["data"],
+        "AppendMessage payload must round-trip unchanged (key/type/value identical)"
+    );
+    assert_eq!(
+        re_emitted["data"]["message_id"], "msg_legacy",
+        "message_id must survive as a bare string"
+    );
+
+    // A legacy CompactionStart: `compaction_id` is a bare string.
+    let compact_raw = r#"{"op":"compaction_start","data":{"compaction_id":"comp_legacy","covers_up_to_turn":5}}"#;
+    let op: SessionEventOp = serde_json::from_str(compact_raw)
+        .expect("legacy CompactionStart (raw compaction_id) must deserialize");
+    let original: serde_json::Value =
+        serde_json::from_str(compact_raw).expect("original is valid JSON");
+    let re_emitted = serde_json::to_value(&op).expect("re-serialize");
+    assert_eq!(
+        original["data"], re_emitted["data"],
+        "CompactionStart payload must round-trip unchanged"
+    );
+    assert_eq!(
+        re_emitted["data"]["compaction_id"], "comp_legacy",
+        "compaction_id must survive as a bare string"
+    );
+
+    // A legacy CompactionStart is the persisting op that recovery reads; also
+    // cover the envelope with an event_id top-level field (bare string).
+    let event_raw = r#"{"timestamp":"2024-01-01T00:00:00Z","event_id":"e_legacy","op":{"op":"clear_all","data":{}},"version":1}"#;
+    let event: SessionEvent = serde_json::from_str(event_raw)
+        .expect("legacy SessionEvent (raw event_id) must deserialize");
+    let re_emitted_event = serde_json::to_string(&event).expect("re-serialize");
+    let round: SessionEvent = serde_json::from_str(&re_emitted_event)
+        .expect("round-tripped event must re-deserialize");
+    assert_eq!(round.event_id.as_str(), "e_legacy", "event_id must survive");
+    assert_eq!(round.version, 1);
+}
