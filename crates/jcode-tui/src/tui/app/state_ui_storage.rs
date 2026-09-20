@@ -12,12 +12,15 @@ fn compact_tool_input_for_display(name: &str, input: &serde_json::Value) -> serd
     };
 
     match crate::tui::ui::tools_ui::canonical_tool_name(name) {
+        // Preserve the full command (no truncation). The bash verbose block
+        // wraps long commands to fit the row, so cutting it here to 160 would
+        // permanently lose the real command text from both the live transcript
+        // and persisted history.
         "bash" => obj(vec![(
             "command",
             input
                 .get("command")
-                .and_then(|v| v.as_str())
-                .map(|s| serde_json::Value::String(crate::util::truncate_str(s, 160).to_string()))
+                .cloned()
                 .unwrap_or(serde_json::Value::Null),
         )]),
         "read" => obj(vec![
@@ -728,6 +731,30 @@ mod tests {
         assert!(
             summary.contains("open") && summary.contains("example.com"),
             "summary should keep the browser action and url: {summary:?}"
+        );
+    }
+
+    #[test]
+    fn compaction_keeps_full_bash_command_replacing_null_fields_only() {
+        // A bash command far longer than the old 160-char cap must survive
+        // display compaction intact so the wrapped command line renders fully.
+        let long_command = format!(
+            "cd /repo && echo \"{}\" && cargo test -p jcode-tui --lib {}",
+            "0123456789 ".repeat(40),
+            "some_long_full_module_path::tests::whatever_name"
+        );
+        assert!(
+            long_command.len() > 200,
+            "fixture must exceed the old cap (got {})",
+            long_command.len()
+        );
+        let mut message = tool_message("bash", serde_json::json!({ "command": long_command }));
+        compact_display_message_tool_data(&mut message);
+        let tool = message.tool_data.expect("tool data");
+        let stored = tool.input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        assert_eq!(
+            stored, long_command,
+            "compact_tool_input_for_display must keep the full bash command"
         );
     }
 }
