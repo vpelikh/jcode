@@ -619,7 +619,7 @@ pub fn prune_truncate_tool_results_in_contents(
     // Shorten the largest tool results first to get the most size reduction per
     // block, while still trying to preserve head/tail of the newly large ones.
     // Sort by payload length descending (largest first).
-    results.sort_by(|a, b| b.2.cmp(&a.2));
+    results.sort_by_key(|result| std::cmp::Reverse(result.2));
 
     // Per-tool-result cap so no single result can dominate the budget: keep the
     // head and tail but bound each block. The target budget is split across the
@@ -633,14 +633,13 @@ pub fn prune_truncate_tool_results_in_contents(
             break;
         }
         let block = &mut contents[ci][bi];
-        if let ContentBlock::ToolResult { content, .. } = block {
-            if content.len() > per_result_cap {
+        if let ContentBlock::ToolResult { content, .. } = block
+            && content.len() > per_result_cap {
                 let shortened = prune_truncated_tool_result(content, per_result_cap);
                 total = total.saturating_sub(content.len()).saturating_add(shortened.len());
                 *content = shortened;
                 truncated += 1;
             }
-        }
     }
 
     truncated
@@ -1122,7 +1121,7 @@ mod tests {
 
     #[test]
     fn truncate_tool_results_in_contents_noop_when_under_budget() {
-        let mut messages = vec![tool_result_msg(1000), tool_result_msg(2000)];
+        let mut messages = [tool_result_msg(1000), tool_result_msg(2000)];
         let mut contents: Vec<&mut Vec<ContentBlock>> = messages
             .iter_mut()
             .map(|m| &mut m.content)
@@ -1137,7 +1136,7 @@ mod tests {
     fn truncate_tool_results_in_contents_handles_single_huge_result() {
         // A single result far over budget still gets shortened so the request
         // ships (better than re-sending a rejected oversized body).
-        let mut messages = vec![tool_result_msg(100_000)];
+        let mut messages = [tool_result_msg(100_000)];
         let mut contents: Vec<&mut Vec<ContentBlock>> = messages
             .iter_mut()
             .map(|m| &mut m.content)
@@ -1201,11 +1200,9 @@ mod tests {
         // The reactive 413 path must strip harder than the pre-emptive budget so
         // a request that was actually rejected as too large reliably fits on the
         // retry (gateway caps are often well below Anthropic's ~32 MB body cap).
-        assert!(
-            PAYLOAD_IMAGE_EMERGENCY_CHAR_BUDGET < PAYLOAD_IMAGE_CHAR_BUDGET,
-            "emergency budget {} must be tighter than regular budget {}",
-            PAYLOAD_IMAGE_EMERGENCY_CHAR_BUDGET,
-            PAYLOAD_IMAGE_CHAR_BUDGET
-        );
+        // Both budgets are pub consts, so this invariant is enforced at compile
+        // time; the test keeps the documentation adjacent to the definition.
+        const _: () =
+            assert!(PAYLOAD_IMAGE_EMERGENCY_CHAR_BUDGET < PAYLOAD_IMAGE_CHAR_BUDGET);
     }
 }
