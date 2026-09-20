@@ -269,8 +269,18 @@ pub fn build_digest(state: &ReviewLoopState) -> String {
     };
     let total_rounds = record.rounds.len();
     let findings_reported: usize = record.rounds.iter().map(|r| r.findings.len()).sum();
+    // Only count lenses that were actually reviewed (have at least one round).
+    // Reporting `ALL.len()` here would claim all six lenses were reviewed even
+    // when the loop stopped early (e.g. a user stop or a stall in the first
+    // lens), which is misleading.
+    let lenses_reviewed: usize = record
+        .rounds
+        .iter()
+        .map(|r| r.lens)
+        .collect::<std::collections::HashSet<_>>()
+        .len();
     let mut out = String::from("## Review rounds complete\n\n");
-    out.push_str(&format!("- Lenses reviewed: {}\n", ReviewLens::ALL.len()));
+    out.push_str(&format!("- Lenses reviewed: {}\n", lenses_reviewed));
     out.push_str(&format!("- Review/fix rounds: {}\n", total_rounds));
     out.push_str(&format!("- Findings reported: {}\n", findings_reported));
     out.push_str(&format!("- Files touched: {}\n", record.files_touched.len()));
@@ -538,6 +548,32 @@ mod review_loop_tests {
         assert!(digest.contains("Review/fix rounds"));
         assert!(digest.contains("Can't fix"));
         assert!(digest.contains("a.rs"));
+        // Only the Correctness lens ran, so the digest must count one lens,
+        // not claim all six were reviewed.
+        assert!(
+            digest.contains("Lenses reviewed: 1"),
+            "digest must count only reviewed lenses, got:\n{digest}"
+        );
+    }
+
+    #[test]
+    fn digest_lens_count_reflects_distinct_reviewed_lenses() {
+        // Two distinct lenses reviewed must report 2, even though ALL has six.
+        let mut s = clean_state();
+        // Lens 0 (Correctness): a clean verdict advances to the next lens.
+        next_action(&mut s);
+        apply_verdict(&mut s, &ReviewReport::Clean, 3);
+        assert_eq!(s.current_lens, Some(ReviewLens::ALL[1]));
+        // Lens 1 (EdgesErrors): report findings, then mark can't-fix (adds a
+        // round for the second lens).
+        next_action(&mut s);
+        apply_verdict(&mut s, &findings("y"), 3);
+        mark_cant_fix(&mut s, vec![Finding::new("HIGH", "b.rs", "y")]);
+        let digest = build_digest(&s);
+        assert!(
+            digest.contains("Lenses reviewed: 2"),
+            "digest must count distinct reviewed lenses, got:\n{digest}"
+        );
     }
 
     #[test]

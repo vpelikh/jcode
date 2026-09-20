@@ -96,6 +96,10 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/autoreview", "Show/toggle automatic end-of-turn review"),
     RegisteredCommand::public("/autojudge", "Show/toggle automatic end-of-turn judging"),
     RegisteredCommand::public("/review", "Launch a one-shot headed review session"),
+    RegisteredCommand::public(
+        "/review-loop",
+        "Start/stop/post-completion per-lens review loop",
+    ),
     RegisteredCommand::public("/judge", "Launch a one-shot headed judge session"),
     RegisteredCommand::public("/effort", crate::tui::keybind::EFFORT_HELP),
     RegisteredCommand::public("/fast", "Toggle fast mode"),
@@ -632,6 +636,51 @@ impl App {
 
         if prefix_trimmed == "/review" {
             return vec![("/review".into(), "Launch a one-shot review immediately")];
+        }
+
+        if prefix.starts_with("/review-loop ") {
+            return self.rank_suggestions(
+                input,
+                vec![
+                    (
+                        "/review-loop status".into(),
+                        "Show current review loop status",
+                    ),
+                    (
+                        "/review-loop start".into(),
+                        "Run the per-lens review loop on this session",
+                    ),
+                    (
+                        "/review-loop run".into(),
+                        "Alias for /review-loop start",
+                    ),
+                    (
+                        "/review-loop stop".into(),
+                        "Stop the active review loop",
+                    ),
+                ],
+            );
+        }
+
+        if prefix_trimmed == "/review-loop" {
+            return vec![
+                (
+                    "/review-loop status".into(),
+                    "Show current review loop status",
+                ),
+                (
+                    "/review-loop start".into(),
+                    "Run the per-lens review loop on this session",
+                ),
+                (
+                    "/review-loop run".into(),
+                    "Alias for /review-loop start",
+                ),
+                (
+                    "/review-loop stop".into(),
+                    "Stop the active review loop",
+                ),
+            ];
         }
 
         if prefix.starts_with("/judge ") {
@@ -2106,5 +2155,17 @@ mod external_cli_suggestion_tests {
         ] {
             assert!(names.contains(alias), "{alias} is not registered");
         }
+    }
+
+    /// Working commands that users type directly must stay in the registry so
+    /// the palette, `/help`, and command completion do not silently omit them.
+    #[test]
+    fn review_loop_command_is_registered() {
+        let names: std::collections::HashSet<&str> =
+            REGISTERED_COMMANDS.iter().map(|c| c.name).collect();
+        assert!(
+            names.contains("/review-loop"),
+            "/review-loop must be registered (was missing from suggestions while typing)"
+        );
     }
 }
