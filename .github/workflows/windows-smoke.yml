@@ -1,5 +1,10 @@
 name: Windows Smoke
 
+env:
+  JCODE_CI: "1"
+  CARGO_TERM_COLOR: always
+  SCCACHE_GHA_ENABLED: "true"
+
 on:
   workflow_dispatch:
     inputs:
@@ -16,11 +21,6 @@ on:
 concurrency:
   group: windows-smoke-${{ github.ref }}-${{ github.event.inputs.target || 'x64' }}
   cancel-in-progress: true
-
-env:
-  JCODE_CI: "1"
-  CARGO_TERM_COLOR: always
-  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   smoke-x64:
