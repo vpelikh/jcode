@@ -11,6 +11,14 @@ pub struct WebSearchTool {
 }
 
 impl WebSearchTool {
+    /// Whole-call budget for a search (execution_timeout, takeaway #7).
+    ///
+    /// Deliberately longer than the shared client's 15s connect timeout so a
+    /// normal engine round-trip (connect + body) fits comfortably, while a
+    /// stalled engine that would otherwise hold the turn indefinitely is cut
+    /// off at the registry wrap point and surfaced model-visibly.
+    pub const EXECUTION_TIMEOUT_SECS: u64 = 30;
+
     pub fn new() -> Self {
         Self {
             client: crate::provider::shared_http_client(),
@@ -51,6 +59,22 @@ impl Tool for WebSearchTool {
 
     fn description(&self) -> &str {
         "Search the web."
+    }
+
+    /// A whole-call execution deadline for the search (deepseek-harness
+    /// takeaway #7, opt-in).
+    ///
+    /// `websearch` loops over engines (DuckDuckGo / Bing / SearxNG), and each
+    /// request relies only on the shared HTTP client's 15s *connect* timeout —
+    /// there is no deadline on the response body read once the connection is
+    /// established, and a stalled upstream can otherwise hold the call (and the
+    /// session turn) indefinitely. The registry wraps execution in this bound,
+    /// so exceeding it surfaces a clear, model-visible "timed out after Ns"
+    /// error instead of stalling the turn. The request futures are async
+    /// reqwest I/O and drop cleanly on cancellation, so no background work is
+    /// orphaned.
+    fn execution_timeout(&self) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_secs(Self::EXECUTION_TIMEOUT_SECS))
     }
 
     fn parameters_schema(&self) -> Value {
@@ -833,5 +857,48 @@ mod tests {
             Some(WebSearchEngine::Searxng)
         );
         assert_eq!(WebSearchEngine::Searxng.as_str(), "searxng");
+    }
+
+    #[test]
+    fn websearch_declares_a_whole_call_execution_timeout() {
+        // takeaway #7 opt-in: a search engine can legitimately stall (a slow
+        // upstream that connects but never finishes its body read), so
+        // `websearch` declares a deadline that the registry wrap point turns
+        // into a model-visible timeout instead of an indefinite hang.
+        let timeout = WebSearchTool::new().execution_timeout().expect(
+            "websearch must declare an execution_timeout so a stalled engine \
+             cannot block the turn indefinitely",
+        );
+        assert_eq!(
+            timeout.as_secs(),
+            WebSearchTool::EXECUTION_TIMEOUT_SECS,
+            "declared timeout must match the documented constant"
+        );
+        assert!(timeout.as_secs() > 15, "must exceed the client's 15s connect timeout");
+    }
+
+    #[tokio::test]
+    async fn websearch_deadline_is_model_visible_on_hang() {
+        // The registry wrap point (`execute_with_deadline`) is what makes the
+        // declared timeout actionable. Pin that a call that exceeds the bound
+        // surfaces the model-visible "timed out after Ns" error rather than
+        // returning a value. (The real tool's execute does async reqwest I/O and
+        // drops cleanly on cancellation; we exercise the shared wrap point with
+        // a hung future to prove the error contract.)
+        let err = jcode_tool_core::execute_with_deadline(
+            Some(std::time::Duration::from_millis(20)),
+            WebSearchTool::new().name(),
+            async {
+                std::future::pending::<()>().await;
+                Ok::<_, anyhow::Error>(())
+            },
+        )
+        .await
+        .expect_err("a hung websearch must time out, not hang");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("timed out after"),
+            "expected a model-visible timeout error, got: {text}"
+        );
     }
 }
