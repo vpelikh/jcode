@@ -77,7 +77,7 @@ mod tests {
                 Err(io::Error::new(io::ErrorKind::BrokenPipe, "stderr closed"))
             }
             fn flush(&mut self) -> io::Result<()> {
-                Err(io::Error::new(io::ErrorKind::Other, "flush failed"))
+                Err(io::Error::other("flush failed"))
             }
         }
 

@@ -862,6 +862,7 @@ pub(super) fn resolve_auth_input(value: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
+#[allow(clippy::too_many_arguments)] // Cohesive scriptable-prompt fields; grouping would obscure the fixed wire shape.
 pub(super) fn emit_scriptable_auth_prompt(
     provider: &str,
     auth_url: &str,

@@ -58,6 +58,7 @@ pub(crate) enum LinuxCompositor {
 }
 
 impl LinuxCompositor {
+    #[allow(dead_code)] // Accessor used by tests and platform hint tooling; keep for compositor-name lookups.
     pub(crate) fn name(&self) -> &'static str {
         match self {
             LinuxCompositor::Niri => "niri",
