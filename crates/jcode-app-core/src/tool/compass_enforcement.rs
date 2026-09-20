@@ -1,19 +1,21 @@
-//! Per-session bookkeeping for the `compass_query`-first enforcement tier.
+//! Compass-query-first enforcement: redirect `agentgrep` grep calls to
+//! `compass_query` and refuse a raw-grep fallback until it is attempted.
 //!
-//! The redirect in [`Registry::execute`] turns a full-text `agentgrep` grep call
-//! into a message telling the model to call `compass_query` first. That message
-//! also documents an escape hatch (`allow_raw_fallback`) for searches raw grep
-//! genuinely needs to serve. As observed in production, a model can take the
-//! escape hatch on the *very next* turn without ever attempting `compass_query`,
-//! effectively bypassing the enforcement the tool tier exists to provide.
+//! This module is the single owner of the whole tier. It contains the pure
+//! decision policy (`decide_enforcement`), the availability preconditions
+//! (`CompassAvailability`), the input classifiers and guidance output builders
+//! (`agentgrep_requests_raw_fallback`, `agentgrep_call_is_grep_mode`,
+//! `compass_redirect_output`), the per-session pending-redirect state, the
+//! lifecycle phase labels, and the `Registry` integration (`enforce_compass_first`
+//! / `clear_compass_redirect_after_run`) so `Registry::execute` in `tool::mod`
+//! stays a thin dispatch loop.
 //!
-//! This module records, per session, the moment a redirect was issued and waits
-//! for that session to make a genuine `compass_query` attempt before allowing the
-//! raw-grep fallback again. Until the redirect is satisfied, a retried `agentgrep`
-//! that asks for the raw fallback is itself refused with a coercive message
-//! pointing back at `compass_query`. The flag is cleared by any executed
-//! `compass_query` call, whether it returns a warm result or a "building, try
-//! again" hint, so the model is never stuck if Compass itself fails.
+//! Why it exists: the redirect tells the model to call `compass_query` first,
+//! but a model can take the documented `allow_raw_fallback` escape hatch on the
+//! *very next* turn without ever attempting compass. This module records, per
+//! session, that a redirect was issued and refuses the raw-fallback bypass until
+//! the session makes a genuine `compass_query` attempt (any execution, even a
+//! "building, try again" fail-fast, clears the flag).
 //!
 //! State is scoped to the owning session id and is never persisted. The set is
 //! bounded in practice by the small overlap between a redirect and the compass
@@ -102,10 +104,11 @@ pub enum EnforcementDecision {
 }
 
 /// The conditions under which `compass_query` is authoritative enough to be
-/// worth redirecting/blocking an `agentgrep` call. Resolved by
-/// [`Registry::execute`] once (it holds the tools lock and reads session
-/// policy), then passed in so the preconditions are computed in one place
-/// rather than duplicated across decision branches.
+/// worth redirecting/blocking an `agentgrep` call. Built once by
+/// [`Registry::enforce_compass_first`] (which holds the tools lock and reads
+/// session policy), then passed into the pure `decide_enforcement` so the
+/// preconditions are computed in one place rather than duplicated across
+/// decision branches.
 #[derive(Clone, Copy)]
 pub struct CompassAvailability {
     /// The operator enabled the enforcement tier.
@@ -127,6 +130,117 @@ impl CompassAvailability {
     }
 }
 
+/// The input key that disables the "redirect agentgrep to compass_query"
+/// enforcement for a single call. Mirrored in the agentgrep schema.
+pub(crate) const AGENTGREP_RAW_FALLBACK_KEY: &str = "allow_raw_fallback";
+
+/// Whether an agentgrep call explicitly opted out of `compass_query`-first
+/// enforcement. This is the caller's documented escape hatch for searches that
+/// Compass cannot serve: building outputs, logs, and files outside the indexed
+/// tree (see the redirected message and the agentgrep schema).
+pub(crate) fn agentgrep_requests_raw_fallback(input: &serde_json::Value) -> bool {
+    match input.get(AGENTGREP_RAW_FALLBACK_KEY) {
+        Some(serde_json::Value::Bool(opted_out)) => *opted_out,
+        Some(serde_json::Value::String(raw)) => raw.trim().eq_ignore_ascii_case("true"),
+        _ => false,
+    }
+}
+
+/// Whether an agentgrep call is a full-text/pattern grep search (mode "grep"
+/// or omitted, which defaults to grep). Filename (`find`), single-file
+/// (`outline`), and relationship (`trace`) lookups are distinct operations that
+/// Compass's semantic search does not replace, so enforcement targets only the
+/// grep mode.
+pub(crate) fn agentgrep_call_is_grep_mode(input: &serde_json::Value) -> bool {
+    match input.get("mode").and_then(|v| v.as_str()) {
+        Some(m) => m.eq_ignore_ascii_case("grep"),
+        None => true,
+    }
+}
+
+/// The redirecting output returned when an `agentgrep` call is intercepted by
+/// the `compass_query`-first code-enforcement tier. It explains why grep did
+/// not run, directs the model to `compass_query`, and gives the explicit,
+/// self-documenting escape hatch (retry with `allow_raw_fallback`) for searches
+/// that genuinely need raw grep.
+pub(crate) fn compass_redirect_output(input: &serde_json::Value) -> super::ToolOutput {
+    let query = input
+        .get("query")
+        .or_else(|| input.get("pattern")) // legacy grep-alias calls pass `pattern`
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let query_text = if query.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" (query: {})", truncate_middle(query, 200))
+    };
+    // Preserve explicit search filters so the follow-up compass_query stays
+    // confined to the same subset the grep call was targeting.
+    //
+    // Only `path` maps cleanly onto `compass_query`'s `path` filter (a file or
+    // directory substring). `glob` is a filename pattern that has no direct
+    // compass_query equivalent, so it is surfaced separately as a narrowing
+    // hint rather than as a `path` value the model would blindly re-use.
+    let path = input
+        .get("path")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+    let glob = input
+        .get("glob")
+        .or_else(|| input.get("include")) // legacy grep-alias calls pass `include`
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+    let path_text = path
+        .map(|s| format!(", keeping the search path `{}`", truncate_middle(s, 120)))
+        .unwrap_or_default();
+    let glob_text = glob
+        .map(|s| format!(", and only files matching `{}`", truncate_middle(s, 120)))
+        .unwrap_or_default();
+    super::ToolOutput::new(format!(
+        "⚠️ `agentgrep` was intercepted before running: `compass_query` is available \
+         for this workspace and must be attempted before raw grep.\n\n\
+         Do not repeat this `agentgrep` call unchanged. Instead call `compass_query` \
+         with the same intent (natural language query + optional `path`{path_text}) to search the \
+         code graph first{query_text}{glob_text}. The first call may build the index for this \
+         workspace; that is expected.\n\n\
+         Only if `compass_query` genuinely cannot answer (for example you need to search \
+         files outside the indexed tree, build outputs, or logs; or the index fails to \
+         build) retry `agentgrep` with `\"allow_raw_fallback\": true` to force raw grep \
+         for this one call."
+    ))
+    .with_title("agentgrep redirected to compass_query")
+    .with_metadata(serde_json::json!({
+        "redirected_to": "compass_query",
+        "reason": "compass-first enforcement",
+    }))
+}
+
+pub(crate) fn truncate_middle(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    // Below 3 chars the ellipsis itself cannot fit, so fall back to a plain
+    // prefix to preserve the invariant that the result is at most `max` chars.
+    if max < 3 {
+        return s.chars().take(max).collect();
+    }
+    let half = (max.saturating_sub(3)) / 2;
+    let mut prefix: Vec<char> = s.chars().take(half).collect();
+    let mut suffix: Vec<char> = s.chars().rev().take(half).collect();
+    suffix.reverse();
+    let mut out: String = prefix.drain(..).collect();
+    out.push_str("...");
+    out.push_str(&suffix.iter().collect::<String>());
+    out
+}
+
+/// TOOL_LIFECYCLE `phase` value recorded when an `agentgrep` grep is redirected
+/// to `compass_query`.
+pub(crate) const REDIRECT_PHASE: &str = "redirected_to_compass";
+/// TOOL_LIFECYCLE `phase` value recorded when a raw-fallback grep is refused
+/// because a `compass_query` redirect is still outstanding for the session.
+pub(crate) const BLOCKED_PHASE: &str = "raw_fallback_blocked_pending_compass";
+
 /// Decide the `compass_query`-first enforcement for one `agentgrep` call.
 ///
 /// Takes the call input, the availability snapshot, and the session id, and
@@ -141,9 +255,6 @@ pub fn decide_enforcement(
     availability: CompassAvailability,
     session_id: &str,
 ) -> EnforcementDecision {
-    use super::agentgrep_call_is_grep_mode;
-    use super::agentgrep_requests_raw_fallback;
-
     if !availability.prefer_compass_query || !availability.compass_invokable() {
         return EnforcementDecision::PassThrough;
     }
@@ -154,7 +265,7 @@ pub fn decide_enforcement(
     if grep_mode && !agentgrep_requests_raw_fallback(input) {
         return EnforcementDecision::Intercept {
             redirect: true,
-            output: super::compass_redirect_output(input),
+            output: compass_redirect_output(input),
         };
     }
 
@@ -171,6 +282,84 @@ pub fn decide_enforcement(
     }
 
     EnforcementDecision::PassThrough
+}
+
+/// Registry integration for the compass-query-first enforcement tier.
+///
+/// Kept here (an inherent impl from a submodule) so `Registry::execute` in
+/// `tool::mod` stays a thin dispatch loop with no inline compass specifics; the
+/// whole interception policy + side effects live in this module.
+impl super::Registry {
+    /// Apply the compass-query-first enforcement tier to the current tool call.
+    ///
+    /// For an `agentgrep` call, decides whether to redirect it to `compass_query`
+    /// (a plain grep with Compass invokable) or refuse a raw-fallback bypass
+    /// (retried before any compass attempt). When it intercepts, this applies the
+    /// side effects (mark the pending flag for a redirect, telemetry, post-tool
+    /// hook, lifecycle log) and returns `Some(output)` for `execute` to
+    /// short-circuit with. Returns `None` to run the tool normally. Takes the
+    /// tools read guard by value so it can drop it before observable work.
+    pub(crate) fn enforce_compass_first(
+        &self,
+        tools_guard: tokio::sync::RwLockReadGuard<
+            '_,
+            std::collections::HashMap<String, std::sync::Arc<dyn super::Tool>>,
+        >,
+        name: &str,
+        resolved_name: &str,
+        input: &serde_json::Value,
+        prefer_compass_query: bool,
+        ctx: &super::ToolContext,
+    ) -> Option<super::ToolOutput> {
+        // The short-circuit only applies to agentgrep; other tools run normally.
+        if resolved_name != "agentgrep" {
+            return None;
+        }
+        let availability = CompassAvailability {
+            prefer_compass_query,
+            compass_registered: tools_guard.contains_key("compass_query"),
+            compass_not_disabled: !super::session_tool_is_disabled(
+                &ctx.session_id,
+                "compass_query",
+            ),
+            has_working_dir: ctx.working_dir.is_some(),
+        };
+        let (redirect, output) = match decide_enforcement(input, availability, &ctx.session_id) {
+            EnforcementDecision::PassThrough => {
+                return None;
+            }
+            EnforcementDecision::Intercept { redirect, output } => (redirect, output),
+        };
+        // A redirect arms the per-session pending flag so a later raw-fallback
+        // grep (before any compass attempt) is refused by the block decision.
+        drop(tools_guard);
+        if redirect {
+            mark_redirect_pending(&ctx.session_id);
+        }
+        let phase = if redirect { REDIRECT_PHASE } else { BLOCKED_PHASE };
+        crate::telemetry::record_tool_execution(resolved_name, input, true, 0);
+        Self::fire_post_tool_hook(resolved_name, ctx, &Ok(output.clone()), 0);
+        crate::logging::event_info(
+            "TOOL_LIFECYCLE",
+            Self::tool_lifecycle_fields(phase, name, resolved_name, input, ctx),
+        );
+        Some(output)
+    }
+
+    /// Release any outstanding compass-redirect after a real `compass_query`
+    /// attempt. A genuine attempt satisfies the redirect whether it returned a
+    /// warm result or a "building, try again" hint, letting a
+    /// genuinely-unindexable project fall back to raw grep after one real
+    /// compass call.
+    pub(crate) fn clear_compass_redirect_after_run(
+        &self,
+        resolved_name: &str,
+        ctx: &super::ToolContext,
+    ) {
+        if resolved_name == "compass_query" {
+            clear_redirect_pending(&ctx.session_id);
+        }
+    }
 }
 
 #[cfg(test)]
