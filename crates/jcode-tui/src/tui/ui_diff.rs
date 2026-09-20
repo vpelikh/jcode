@@ -272,6 +272,33 @@ pub(super) fn collect_diff_lines(content: &str) -> Vec<ParsedDiffLine> {
     lines
 }
 
+/// Whether a parsed diff line carries a numeric line number in its prefix.
+///
+/// Edit-family tools emit numbered prefixes like `42- ` / `42+ `. A line whose
+/// prefix has no leading number came from the bare `- `/`+ ` glyph fallback in
+/// [`parse_diff_line`], which also matches markdown bullets such as the ones a
+/// config-edit notice appends ("- `key`: old -> new"). Those are prose, not
+/// deletions, and must not be surfaced as unnumbered diff lines.
+fn has_line_number(line: &ParsedDiffLine) -> bool {
+    line.prefix.chars().any(|c| c.is_ascii_digit())
+}
+
+/// Drop unnumbered (prose) lines from a set of parsed diff lines when at least
+/// one numbered line is present.
+///
+/// In an edit-family tool's output the numbered lines are the real diff; any
+/// unnumbered `- `/`+ ` line alongside them is a markdown bullet or notice
+/// prose and would only blank out a line number in the rendered diff. When no
+/// numbered line is present we keep everything, so plain (legitimately
+/// unnumbered) diffs are unaffected.
+pub(super) fn filter_unnumbered_prose_lines(lines: Vec<ParsedDiffLine>) -> Vec<ParsedDiffLine> {
+    if lines.iter().any(has_line_number) {
+        lines.into_iter().filter(has_line_number).collect()
+    } else {
+        lines
+    }
+}
+
 fn diff_file_path(raw_line: &str) -> Option<String> {
     let trimmed = raw_line.trim();
     if let Some(path) = trimmed
@@ -405,7 +432,8 @@ pub(super) fn tint_span_with_diff_color(span: Span<'static>, diff_color: Color) 
 mod tests {
     use super::{
         DiffLineKind, collect_diff_lines, diff_change_counts_for_tool,
-        diff_counts_from_apply_patch_input, generate_diff_lines_from_strings,
+        diff_counts_from_apply_patch_input, filter_unnumbered_prose_lines,
+        generate_diff_lines_from_strings,
     };
     use crate::message::ToolCall;
     use serde_json::json;
@@ -485,5 +513,33 @@ mod tests {
         assert_eq!(lines[1].prefix, "3+ ");
         assert_eq!(lines[2].kind, DiffLineKind::Add);
         assert_eq!(lines[2].prefix, "4+ ");
+    }
+
+    #[test]
+    fn config_notice_markdown_bullets_are_stripped_from_edit_diff() {
+        // The config-edit notice appends markdown bullets like
+        // "- `x`: a -> b (live now)" to the edit tool body. They parse as
+        // unnumbered diff lines and would blank out their line numbers in the
+        // rendered diff. When a numbered diff is present, the consumer filter
+        // must drop these unnumbered prose lines.
+        let lines = collect_diff_lines(&format!(
+            "2- two\n2+ TWO\n\nConfig changes:\n- `key`: old -> new (live now)\n"
+        ));
+        // Raw parse keeps the numbered diff plus the unnumbered bullet.
+        assert_eq!(lines.len(), 3, "unexpected parse: {:?}", lines);
+
+        let filtered = filter_unnumbered_prose_lines(lines);
+        assert_eq!(filtered.len(), 2, "markdown bullet leaked into diff: {:?}", filtered);
+        assert!(filtered.iter().all(|l| l.prefix.chars().any(|c| c.is_ascii_digit())));
+        assert!(!filtered.iter().any(|l| l.content.contains("Config changes")));
+    }
+
+    #[test]
+    fn filter_keeps_plain_unnumbered_diff_when_no_numbered_lines() {
+        // A genuinely unnumbered diff (no numbered lines at all) keeps all its
+        // deletions, so the filter never discards real edits.
+        let lines = collect_diff_lines("- only\n+ pair");
+        let filtered = filter_unnumbered_prose_lines(lines);
+        assert_eq!(filtered.len(), 2, "plain diff was wrongly pruned: {:?}", filtered);
     }
 }
