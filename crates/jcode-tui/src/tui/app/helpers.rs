@@ -18,8 +18,28 @@ static AMBIENT_INFO_CACHE: Mutex<Option<AmbientInfoCacheEntry>> = Mutex::new(Non
 /// Stale-while-revalidate cache for the git status widget. Module-level so the
 /// app can force a refresh the moment it mutates the repo (commit, shell, file
 /// edits) instead of waiting out the TTL with a stale branch/dirty count.
+///
+/// Keyed by working directory so sessions running in separate git worktrees
+/// each resolve the branch/dirty state of their own directory instead of the
+/// daemon's CWD. A `None` working dir (no session yet) collapses to a
+/// `<cwd>` sentinel key backed by the process's current directory.
 type GitInfoCacheEntry = (std::time::Instant, Option<GitInfo>, bool);
-static GIT_INFO_CACHE: Mutex<Option<GitInfoCacheEntry>> = Mutex::new(None);
+type GitInfoCache = std::collections::HashMap<String, GitInfoCacheEntry>;
+static GIT_INFO_CACHE: std::sync::LazyLock<Mutex<GitInfoCache>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Cache key for `gather_git_info`. Canonicalizes the working dir when
+/// available so equivalent paths share one entry; falls back to a
+/// `<cwd>` sentinel so callers without a session dir still get a stable entry.
+fn git_info_cache_key(work_dir: Option<&Path>) -> String {
+    match work_dir {
+        Some(dir) => std::fs::canonicalize(dir)
+            .unwrap_or_else(|_| dir.to_path_buf())
+            .to_string_lossy()
+            .into_owned(),
+        None => "<cwd>".to_string(),
+    }
+}
 
 /// Stale-while-revalidate cache for per-session todos plus their goal-level
 /// assessments (closed feedback loop etc.). Module-level so the app can force a
@@ -63,15 +83,28 @@ pub(crate) fn backdated_now(amount: Duration) -> std::time::Instant {
 /// shell commands, file edits) so the info widget reflects the new repo state
 /// immediately rather than after the 5s TTL. Stale-while-revalidate still
 /// applies: the next read returns the last value and kicks a background refresh.
-pub(crate) fn invalidate_git_info_cache() {
-    if let Ok(mut guard) = GIT_INFO_CACHE.lock()
-        && let Some((ts, _cached, refreshing)) = guard.as_mut()
-    {
-        // Backdate the timestamp past the TTL so the next `gather_git_info`
-        // treats the entry as expired and spawns a refresh, while still
-        // returning the last-known value (no flicker to empty).
-        *ts = backdated_now(Duration::from_secs(3600));
-        *refreshing = false;
+///
+/// `work_dir` selects which per-directory cache entry to invalidate. When `None`,
+/// every cached entry is invalidated so the daemon CWD entry and any worktree
+/// entries all refetch; prefer passing the session's working dir when available
+/// so only the relevant entry is touched.
+pub(crate) fn invalidate_git_info_cache(work_dir: Option<&Path>) {
+    if let Ok(mut cache) = GIT_INFO_CACHE.lock() {
+        let key = git_info_cache_key(work_dir);
+        let selected: Vec<String> = if work_dir.is_some() {
+            vec![key]
+        } else {
+            cache.keys().cloned().collect()
+        };
+        for key in selected {
+            if let Some((ts, _cached, refreshing)) = cache.get_mut(&key) {
+                // Backdate the timestamp past the TTL so the next `gather_git_info`
+                // treats the entry as expired and spawns a refresh, while still
+                // returning the last-known value (no flicker to empty).
+                *ts = backdated_now(Duration::from_secs(3600));
+                *refreshing = false;
+            }
+        }
     }
 }
 
@@ -81,10 +114,14 @@ pub(crate) fn invalidate_git_info_cache() {
 /// capture the live ahead/behind/dirty counts of whatever repo the generator
 /// happens to run in. Marking the entry as `refreshing` keeps the TTL path
 /// from spawning a background probe that overwrites the seed mid-render.
+///
+/// `work_dir` selects which per-directory cache entry to seed; `None` seeds the
+/// daemon-CWD (`<cwd>`) entry.
 #[cfg(test)]
-pub(crate) fn seed_git_info_cache_for_tests(info: Option<GitInfo>) {
-    if let Ok(mut guard) = GIT_INFO_CACHE.lock() {
-        *guard = Some((std::time::Instant::now(), info, true));
+pub(crate) fn seed_git_info_cache_for_tests(info: Option<GitInfo>, work_dir: Option<&Path>) {
+    if let Ok(mut cache) = GIT_INFO_CACHE.lock() {
+        let key = git_info_cache_key(work_dir);
+        cache.insert(key, (std::time::Instant::now(), info, true));
     }
 }
 
@@ -225,6 +262,9 @@ pub(super) fn ctrl_bracket_fallback_to_esc(code: &mut KeyCode, modifiers: &mut K
     if *code == KeyCode::Esc {
         *code = KeyCode::Char('[');
     }
+    // NOTE: Ctrl+1..9 are now prompt recency-rank jumps (see
+    // ctrl_prompt_rank), so Ctrl+5 is no longer a legacy tty alias for
+    // Ctrl+]; it must reach the recency handler untouched on macOS.
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -404,7 +444,7 @@ pub(super) fn copy_to_clipboard(text: &str) -> bool {
                 None => *sink = Some(text.to_string()),
             }
         }
-        return true;
+        true
     }
 
     #[cfg(not(test))]
@@ -454,7 +494,7 @@ pub(super) fn copy_to_clipboard(text: &str) -> bool {
                     }
                 }
             }
-            return copy_to_clipboard_osc52(text);
+            copy_to_clipboard_osc52(text)
         }
 
         // Linux has the same failure class (issue #504, Kali/X11): wl-copy fails
@@ -505,18 +545,23 @@ pub(super) fn copy_to_clipboard(text: &str) -> bool {
 /// terminal emulator to set the system clipboard without needing a local
 /// display server, making it work over SSH, inside Docker, and under tmux
 /// (with `set -g set-clipboard on`). Returns false if stdout is not a TTY.
+#[allow(dead_code)] // OSC-52 fallback; reachable via the clipboard module on configurations without a native path.
 fn copy_to_clipboard_osc52(text: &str) -> bool {
     use base64::Engine as _;
-    use std::io::{IsTerminal, Write};
+    use std::io::IsTerminal;
 
-    let mut out = std::io::stdout();
-    if !out.is_terminal() {
+    if !std::io::stdout().is_terminal() {
         return false;
     }
     let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
     // OSC 52: ESC ] 52 ; c ; <base64> BEL
     let seq = format!("\x1b]52;c;{}\x07", encoded);
-    out.write_all(seq.as_bytes()).is_ok() && out.flush().is_ok()
+    // Route through the serialized writer so the OSC-52 sequence cannot
+    // interleave with a concurrently-draining frame's cell bytes (which would
+    // otherwise corrupt both on the terminal). Report whether the bytes were
+    // actually handed off, so a failed write is not reported as a successful
+    // copy.
+    crate::tui::terminal_writer::write_serialized(seq.as_bytes())
 }
 
 pub(crate) fn effort_display_label(effort: &str) -> &str {
@@ -930,15 +975,14 @@ pub(super) fn clipboard_image() -> Option<(String, String)> {
             .output()
         {
             let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if result == "ok" {
-                if let Ok(data) = std::fs::read(&temp_path) {
+            if result == "ok"
+                && let Ok(data) = std::fs::read(&temp_path) {
                     let _ = std::fs::remove_file(&temp_path);
                     if !data.is_empty() {
                         let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
                         return Some(("image/png".to_string(), b64));
                     }
                 }
-            }
         }
     }
 
@@ -1091,54 +1135,56 @@ pub(super) fn encode_rgba_as_png(width: usize, height: usize, rgba: &[u8]) -> Op
     Some(buf)
 }
 
-#[cfg(test)]
-pub(super) fn gather_git_info() -> Option<GitInfo> {
-    if crate::tui::is_ssh_remote() {
-        return None;
-    }
-    GIT_INFO_CACHE
-        .lock()
-        .ok()
-        .and_then(|guard| guard.as_ref().and_then(|(_, cached, _)| cached.clone()))
-}
-
-#[cfg(not(test))]
-pub(super) fn gather_git_info() -> Option<GitInfo> {
-    if crate::tui::is_ssh_remote() {
-        return None;
-    }
-    use std::time::Instant;
-
+/// Gather git status for the info widget, scoped to `work_dir`.
+///
+/// When `work_dir` is `Some`, git runs against that directory so a session
+/// attached to a git worktree reports its own branch/dirty state rather than
+/// the daemon process's CWD. When `None`, git runs against the process's
+/// current directory (matching legacy behavior for callers with no session).
+///
+/// Stale-while-revalidate: within the TTL this returns the cached entry for
+/// `work_dir`; after the TTL it returns the last value and kicks a background
+/// refresh. Each working directory keeps an independent entry, so separate
+/// worktrees never share the wrong branch.
+pub(super) fn gather_git_info(work_dir: Option<&Path>) -> Option<GitInfo> {
     const TTL: Duration = Duration::from_secs(5);
 
-    if let Ok(mut guard) = GIT_INFO_CACHE.lock() {
-        if let Some((ts, cached, refreshing)) = guard.as_mut() {
-            if ts.elapsed() < TTL {
-                return cached.clone();
-            }
-            if *refreshing {
-                return cached.clone();
-            }
-            let stale = cached.clone();
-            *refreshing = true;
-            std::thread::spawn(|| {
-                let result = gather_git_info_inner();
-                if let Ok(mut guard) = GIT_INFO_CACHE.lock() {
-                    *guard = Some((Instant::now(), result, false));
+    let key = git_info_cache_key(work_dir);
+    if let Ok(mut cache) = GIT_INFO_CACHE.lock() {
+        match cache.get_mut(&key) {
+            Some((ts, cached, refreshing)) => {
+                if ts.elapsed() < TTL || *refreshing {
+                    return cached.clone();
                 }
-            });
-            return stale;
-        }
-
-        *guard = Some((backdated_now(TTL + Duration::from_secs(1)), None, true));
-        std::thread::spawn(|| {
-            let result = gather_git_info_inner();
-            if let Ok(mut guard) = GIT_INFO_CACHE.lock() {
-                *guard = Some((Instant::now(), result, false));
+                let stale = cached.clone();
+                *refreshing = true;
+                spawn_git_refresh(key, work_dir);
+                return stale;
             }
-        });
+            None => {
+                cache.insert(
+                    key.clone(),
+                    (backdated_now(TTL + Duration::from_secs(1)), None, true),
+                );
+                spawn_git_refresh(key, work_dir);
+            }
+        }
     }
     None
+}
+
+/// Run `gather_git_info_inner` off the render path for `key` and store the
+/// result back into the per-directory cache. Shared by the cold-cache and
+/// stale-entry refresh branches of `gather_git_info`.
+fn spawn_git_refresh(key: String, work_dir: Option<&Path>) {
+    let key_for_thread = key;
+    let work_dir = work_dir.map(std::path::PathBuf::from);
+    std::thread::spawn(move || {
+        let result = gather_git_info_inner(work_dir.as_deref());
+        if let Ok(mut cache) = GIT_INFO_CACHE.lock() {
+            cache.insert(key_for_thread, (std::time::Instant::now(), result, false));
+        }
+    });
 }
 
 /// Fetch a session's todos plus its goal-level assessments through the same
@@ -1355,11 +1401,18 @@ pub(crate) fn format_countdown_until(target: chrono::DateTime<chrono::Utc>) -> S
     }
 }
 
-#[cfg(not(test))]
-fn gather_git_info_inner() -> Option<GitInfo> {
-    use std::process::Command;
+/// Build a `git` command scoped to `work_dir` when provided, else to the
+/// process's current directory.
+fn git_cmd(work_dir: Option<&Path>) -> std::process::Command {
+    let mut cmd = std::process::Command::new("git");
+    if let Some(dir) = work_dir {
+        cmd.current_dir(dir);
+    }
+    cmd
+}
 
-    let in_repo = Command::new("git")
+fn gather_git_info_inner(work_dir: Option<&Path>) -> Option<GitInfo> {
+    let in_repo = git_cmd(work_dir)
         .args(["rev-parse", "--is-inside-work-tree"])
         .output()
         .ok()
@@ -1370,7 +1423,32 @@ fn gather_git_info_inner() -> Option<GitInfo> {
         return None;
     }
 
-    let branch = Command::new("git")
+    // A linked worktree has a private git dir at `<common>/.git/worktrees/<name>`
+    // while the main checkout's git dir is `<common>/.git`, so a git-dir that
+    // differs from the common dir means we are in a linked worktree and its
+    // basename is the registered worktree name.
+    let worktree = git_cmd(work_dir)
+        .args(["rev-parse", "--git-dir", "--git-common-dir"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            // Each of `--git-dir` and `--git-common-dir` is on its own line.
+            // Read by line (not whitespace) so a repo path that itself contains
+            // spaces (e.g. `/Users/me/my repo/.git`) cannot corrupt the parse.
+            let mut lines = stdout.lines().map(str::trim);
+            let (git_dir, common_dir) = (lines.next()?, lines.next()?);
+            if git_dir != common_dir {
+                std::path::Path::new(git_dir)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            } else {
+                None
+            }
+        });
+
+    let branch = git_cmd(work_dir)
         .args(["branch", "--show-current"])
         .output()
         .ok()
@@ -1389,7 +1467,9 @@ fn gather_git_info_inner() -> Option<GitInfo> {
     let mut untracked = 0;
     let mut dirty_files = Vec::new();
 
-    if let Ok(output) = Command::new("git").args(["status", "--porcelain"]).output()
+    if let Ok(output) = git_cmd(work_dir)
+        .args(["status", "--porcelain"])
+        .output()
         && output.status.success()
     {
         let status = String::from_utf8_lossy(&output.stdout);
@@ -1418,7 +1498,7 @@ fn gather_git_info_inner() -> Option<GitInfo> {
         }
     }
 
-    let (ahead, behind) = Command::new("git")
+    let (ahead, behind) = git_cmd(work_dir)
         .args(["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])
         .output()
         .ok()
@@ -1441,6 +1521,7 @@ fn gather_git_info_inner() -> Option<GitInfo> {
 
     Some(GitInfo {
         branch,
+        worktree,
         modified,
         staged,
         untracked,
