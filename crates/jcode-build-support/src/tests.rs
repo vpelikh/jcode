@@ -653,6 +653,43 @@ fn prune_old_versions_protects_manifest_referenced_versions() {
     });
 }
 
+// `prune_old_versions_protecting` must preserve an explicitly-listed version
+// that is neither a promoted channel, manifest-referenced, nor channel-symlinked.
+// This mirrors the self-dev publisher preserving the previous current version,
+// which is recorded as a rollback target only after publish returns.
+#[test]
+fn prune_old_versions_protecting_keeps_extra_version() {
+    with_temp_jcode_home(|| {
+        let exe = std::env::current_exe().unwrap();
+        let prev = "prev-current-rollback";
+        install_binary_at_version(&exe, prev).unwrap();
+        // Plenty of plain installs so pruning would otherwise remove the oldest.
+        for i in 0..(VERSIONS_KEEP_NEWEST + 3) {
+            install_binary_at_version(&exe, &format!("plain-prot-{i}")).unwrap();
+        }
+        // prev is NOT promoted, NOT in the manifest, and NOT channel-symlinked.
+        prune_old_versions_protecting(&[prev.to_string()]).unwrap();
+
+        let names: std::collections::HashSet<String> =
+            std::fs::read_dir(builds_dir().unwrap().join("versions"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+        assert!(
+            names.contains(prev),
+            "extra-protected version must survive pruning"
+        );
+        // Plain installs are still capped to VERSIONS_KEEP_NEWEST.
+        let plain = (0..(VERSIONS_KEEP_NEWEST + 3))
+            .filter(|i| names.contains(&format!("plain-prot-{i}")))
+            .count();
+        assert_eq!(
+            plain, VERSIONS_KEEP_NEWEST,
+            "plain unprotected installs must still be capped"
+        );
+    });
+}
+
 // The `jcode` home can be reached through a symlink (e.g. a container mount or
 // a relocated install). `prune_old_versions` must still protect the promoted
 // current/stable/shared versions in that case: this exercises the canonical-path
