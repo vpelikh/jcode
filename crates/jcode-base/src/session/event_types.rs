@@ -8,7 +8,10 @@ use std::fmt;
 /// Maximum acceptable skew between an event's timestamp and "now" when
 /// validating an event at insert time. Generous enough for normal sessions,
 /// but rejects wildly improbable clocks. (Forking and rehydration use
-/// unvalidated `push_event`, so this never drops already-trusted history.)
+/// unvalidated `push_event`, so this never drops already-trusted history.
+/// Additionally, `ReplayEvent`s are exempt from the PAST window because their
+/// event timestamp mirrors the replay event's historical timestamp; only their
+/// future bound is enforced.)
 const MAX_EVENT_AGE_SECS: i64 = 86400 * 365; // ~1 year
 
 /// Errors that can occur when working with session events
@@ -423,7 +426,9 @@ pub struct SessionEventMap {
     /// exactly the dual-source hazard this event log exists to avoid.
     /// `current_compaction` therefore reverse-scans `events` when the cache is
     /// empty (e.g. after deserialization). This bounds the cost to O(n) on a
-    /// fresh load rather than risking a stale cache.
+    /// fresh load rather than risking a stale cache or an interior-mutable type
+    /// (which would make `SessionEventMap` non-`Send`, breaking app-core's async
+    /// boundaries).
     #[serde(skip)]
     cached_compaction: Option<StoredCompactionState>,
 }
@@ -456,11 +461,14 @@ impl SessionEventMap {
 
     /// Append a new event to the map.
     ///
-    /// Events are validated before insertion. Invalid events are skipped with a
-    /// stderr diagnostic (the event log must stay append-only and corruption-tolerant).
+    /// Events are validated before insertion. Invalid events are skipped via the
+    /// logging channel (the event log must stay append-only and corruption-tolerant).
     pub fn append_event(&mut self, event: SessionEvent) {
         if let Err(err) = Self::validate_event(&event) {
-            eprintln!("session_event: skipping invalid event {}: {}", event.event_id, err);
+            crate::logging::warn(&format!(
+                "session_event: skipping invalid event {}: {}",
+                event.event_id, err
+            ));
             return;
         }
         self.update_caches(&event);
@@ -535,12 +543,12 @@ impl SessionEventMap {
         // (the persisting op of a bracketed compaction). If a ClearAll appears
         // after that, the compaction is considered cleared and we return None.
         // `events` is the sole authority, so this scan is always correct.
-        let mut found_compaction = None;
+        let mut found = None;
         for event in self.events.iter().rev() {
             match &event.op {
                 SessionEventOp::SetCompaction { compaction }
                 | SessionEventOp::CompactionEnd { compaction } => {
-                    found_compaction = Some(compaction.clone());
+                    found = Some(compaction.clone());
                     break;
                 }
                 SessionEventOp::ClearAll => {
@@ -550,7 +558,7 @@ impl SessionEventMap {
                 _ => {}
             }
         }
-        found_compaction
+        found
     }
     
     /// Get memory injections from events
@@ -718,10 +726,24 @@ impl SessionEventMap {
             });
         }
         
-        // Validate timestamp (not too far in future or past)
+        // Validate timestamp (not too far in future or past). `ReplayEvent` is
+        // exempt from the PAST window: its event timestamp mirrors the replay
+        // event's timestamp, which may legitimately be historical (an event
+        // recorded for replay visualization, not wall-clock activity). Its
+        // future bound is enforced by `validate_replay_event` below. Exempting
+        // it keeps `record_replay_event` from silently dropping a valid
+        // old-timestamped replay event, which the load/fork paths already
+        // tolerate by not re-validating.
         let now = chrono::Utc::now();
-        let timestamp_diff = (event.timestamp - now).num_seconds().abs();
-        if timestamp_diff > MAX_EVENT_AGE_SECS {
+        let in_past = (now - event.timestamp).num_seconds();
+        if in_past > MAX_EVENT_AGE_SECS && !matches!(event.op, SessionEventOp::ReplayEvent { .. })
+        {
+            return Err(SessionEventError::InvalidTimestamp {
+                timestamp: event.timestamp
+            });
+        }
+        let in_future = (event.timestamp - now).num_seconds();
+        if in_future > MAX_EVENT_AGE_SECS {
             return Err(SessionEventError::InvalidTimestamp {
                 timestamp: event.timestamp
             });

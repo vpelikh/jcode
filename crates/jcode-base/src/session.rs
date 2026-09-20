@@ -118,6 +118,71 @@ pub fn is_scheduled_task_message(message: &StoredMessage) -> bool {
         })
 }
 
+/// True for messages that were injected internally (system reminders, scheduled
+/// tasks, or cross-agent notifications) rather than typed by the human, so they
+/// are never used as the session's generated title.
+fn is_injected_internal_message(message: &StoredMessage) -> bool {
+    if is_internal_system_reminder_message(message) || is_scheduled_task_message(message) {
+        return true;
+    }
+    message.content.iter().any(|block| {
+        matches!(block, ContentBlock::Text { text, .. } if text.trim_start().starts_with("[NOTIFICATION]"))
+    })
+}
+
+/// True if a raw text block begins with one of the internal-injection markers.
+fn is_injected_marker_text(text: &str) -> bool {
+    let text = text.trim_start();
+    // `[Scheduled task]` matches the prior `is_scheduled_task_message` shape
+    // (requires the newline) so a user prompt that merely begins with those
+    // words is not misclassified as an injected internal message.
+    text.starts_with("[NOTIFICATION]")
+        || text.starts_with("[Scheduled task]\n")
+        || text.starts_with("<system-reminder>")
+}
+
+/// Content-level variant of `is_injected_internal_message` used when evaluating
+/// an as-yet-unpersisted message against the same exclusion rules.
+fn content_has_injected_marker(content: &[ContentBlock]) -> bool {
+    content.iter().any(|block| {
+        matches!(block, ContentBlock::Text { text, .. } if is_injected_marker_text(text))
+    })
+}
+
+/// A genuine user prompt that is a valid source for a generated session title:
+/// a visible conversation message authored by the human (never an injected
+/// system reminder, scheduled task, or cross-agent notification).
+fn is_generated_title_candidate(message: &StoredMessage) -> bool {
+    message.role == Role::User
+        && message.display_role.is_none()
+        && !is_injected_internal_message(message)
+}
+
+/// Maximum character length for a generated session title.
+const GENERATED_TITLE_MAX_CHARS: usize = 72;
+
+/// Derive a generated session title from a message's content blocks.
+///
+/// Uses the first non-empty line of the first text block, trimmed and truncated
+/// to `GENERATED_TITLE_MAX_CHARS` characters. Returns `None` when there is no
+/// usable text (e.g. an image-only message).
+fn generated_title_from_content(content: &[ContentBlock]) -> Option<String> {
+    for block in content {
+        if let ContentBlock::Text { text, .. } = block {
+            let line = text.lines().next().unwrap_or_default().trim();
+            if line.is_empty() {
+                continue;
+            }
+            let title = line
+                .chars()
+                .take(GENERATED_TITLE_MAX_CHARS)
+                .collect::<String>();
+            return Some(title);
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -1367,6 +1432,7 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         token_usage: Option<StoredTokenUsage>,
         display_role: Option<StoredDisplayRole>,
     ) -> String {
+        self.maybe_generate_title_from_first_user_message(&role, &content, display_role);
         let id = new_id("message");
         self.append_stored_message(StoredMessage {
             id: id.clone(),
@@ -1378,6 +1444,50 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
             token_usage,
         });
         id
+    }
+
+    /// Derive a generated session title from the first genuine user prompt.
+    ///
+    /// Native jcode sessions are created title-less; the generated title (used
+    /// as the fallback display title and indexed as `generated_title`) is
+    /// inferred from the first real user message. Injected internal messages
+    /// (session context, scheduled tasks, cross-agent notifications) never seed
+    /// the title.
+    ///
+    /// First tries to backfill from an existing genuine user prompt in the
+    /// transcript, which covers sessions that predate this behavior (loaded
+    /// with a conversation but no generated title) and avoids letting an
+    /// image-only first message permanently block later text messages. Only if
+    /// there is no usable existing prompt does the incoming message seed the
+    /// title (the fresh-session case). A no-op once a generated title exists.
+    fn maybe_generate_title_from_first_user_message(
+        &mut self,
+        role: &Role,
+        content: &[ContentBlock],
+        display_role: Option<StoredDisplayRole>,
+    ) {
+        if self.title.is_some() {
+            return;
+        }
+        // Prefer an existing genuine user prompt already in the transcript.
+        // Skips image-only/candidate messages that yield no text.
+        if let Some(title) = self
+            .messages
+            .iter()
+            .filter(|message| is_generated_title_candidate(message))
+            .find_map(|message| generated_title_from_content(&message.content))
+        {
+            self.title = Some(title);
+            return;
+        }
+        if *role == Role::User
+            && display_role.is_none()
+            && !content_has_injected_marker(content)
+        {
+            if let Some(title) = generated_title_from_content(content) {
+                self.title = Some(title);
+            }
+        }
     }
 
     /// Emit a `ReplaceMessages` event capturing the full current transcript.
@@ -1836,9 +1946,7 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         // skips invalid events internally).
         let before = self.event_map.events.len();
         // Capture the op before `append_event` moves it (needed for the
-        // debug-only self-check below). Only computed in debug builds so release
-        // does not pay the clone.
-        #[cfg(debug_assertions)]
+        // dual-source self-check below).
         let op_kind = event.op.clone();
         self.event_map.append_event(event);
         let recorded = self.event_map.events.len() > before;
@@ -1848,36 +1956,44 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
             // `append_stored_message`). Cheap flag-only; the profile rebuilds
             // lazily on the next snapshot.
             self.mark_memory_profile_dirty();
-            // Debug-only self-check for the dual-source-of-truth contract. The
-            // API warns that a state-carrying op (`AppendMessage`/`InsertMessage`/
-            // `ReplaceMessages`/`ClearAll`) requires the caller to keep the legacy
-            // `messages` vector in sync. Verify that contract here so a forgetful
-            // caller is caught in dev instead of silently desyncing the two
-            // sources (which would otherwise force a divergent-load rebuild that
-            // drops log-only markers). Log-only events (`Unknown`, brackets,
-            // `SetCompaction`, `ReplayEvent`, `MemoryInjection`) do not count into
-            // `messages`, so they never trip the check.
-            #[cfg(debug_assertions)]
-            {
-                let message_ops = matches!(
-                    op_kind,
-                    SessionEventOp::AppendMessage { .. }
-                        | SessionEventOp::InsertMessage { .. }
-                        | SessionEventOp::ReplaceMessages { .. }
-                        | SessionEventOp::ClearAll
-                );
-                if message_ops {
-                    // Compare only lengths to keep the check cheap and avoid
-                    // requiring `PartialEq` (which `StoredMessage` deliberately
-                    // lacks). A caller that synced the legacy vector exactly (or
-                    // used the dedicated Session methods) matches here.
-                    let derived = self.event_map.derive_messages().len();
-                    assert!(
-                        derived == self.messages.len(),
+            // Dual-source-of-truth self-check. The API contract says a state-carrying
+            // op (`AppendMessage`/`InsertMessage`/`ReplaceMessages`/`ClearAll`)
+            // requires the caller to keep the legacy `messages` vector in sync.
+            // Verify here so a forgetful caller is caught: in debug builds this
+            // is a hard assert; in release it logs a warning (without crashing,
+            // since a release-shipped caller's mismatch must not take down the
+            // process) so the desync is surfaced instead of silently forcing a
+            // later divergent-load rebuild that drops log-only markers.
+            // Log-only events (`Unknown`, brackets, `SetCompaction`,
+            // `ReplayEvent`, `MemoryInjection`) do not count into `messages`,
+            // so they never trip the check.
+            let message_ops = matches!(
+                op_kind,
+                SessionEventOp::AppendMessage { .. }
+                    | SessionEventOp::InsertMessage { .. }
+                    | SessionEventOp::ReplaceMessages { .. }
+                    | SessionEventOp::ClearAll
+            );
+            if message_ops {
+                // Compare only lengths to keep the check cheap and avoid
+                // requiring `PartialEq` (which `StoredMessage` deliberately
+                // lacks). A caller that synced the legacy vector exactly (or
+                // used the dedicated Session methods) matches here.
+                let derived = self.event_map.derive_messages().len();
+                if derived != self.messages.len() {
+                    let msg = format!(
                         "session event-log/legacy desync after append_session_event: \
                          log derives {derived} messages but session.messages has {}",
                         self.messages.len()
                     );
+                    #[cfg(debug_assertions)]
+                    {
+                        panic!("{msg}");
+                    }
+                    #[cfg(not(debug_assertions))]
+                    {
+                        crate::logging::warn(&msg);
+                    }
                 }
             }
         }
@@ -2210,14 +2326,21 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
     /// when it was rebuilt from the legacy vectors.
     pub fn reconcile_event_map_after_load(&mut self) -> bool {
         if self.event_map.is_empty() {
-            if !self.messages.is_empty()
+            let has_legacy_state = !self.messages.is_empty()
                 || !self.memory_injections.is_empty()
                 || !self.replay_events.is_empty()
-                || self.compaction.is_some()
-            {
+                || self.compaction.is_some();
+            if has_legacy_state {
+                // A pre-persistence snapshot migrates by rebuilding the log from
+                // the legacy vectors.
                 self.rebuild_event_map();
+                return false;
             }
-            return false;
+            // The log is empty AND the legacy state is empty: there is nothing
+            // to rebuild or lose, so the (trivially empty) log is "preserved".
+            // Returning true here avoids a spurious "event log was not preserved"
+            // warning when loading a genuinely empty session.
+            return true;
         }
         match self.rederive_all_checked() {
             Ok(_) => true,
@@ -2282,6 +2405,51 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
             .into_iter()
             .cloned()
             .collect();
+        // Also preserve MATCHED (closed) bracket pairs whose final
+        // `CompactionEnd` carries the CURRENT authoritative compaction. A
+        // divergent-load rebuild would otherwise collapse the compaction
+        // *narrative* (Start…End) into a single `SetCompaction`, losing the
+        // bracket run. Preserve the full matched pair (all events from the
+        // first Start through the matching End), but ONLY when its persisting
+        // End agrees with `self.compaction` — preserving a stale/mismatched End
+        // would make `rederive_all_checked` diverge from the legacy vector and
+        // trigger a second rebuild. The preserved pair is re-appended AFTER the
+        // reconstructed `SetCompaction` (same compaction), so `current_compaction`
+        // stays correct and `rederive_all_checked` stays green.
+        let preserved_bracket_pairs: Vec<SessionEvent> = {
+            let events = &self.event_map.events;
+            let current = self.compaction.clone();
+            let mut depth = 0usize;
+            let mut run_start = usize::MAX;
+            let mut pairs: Vec<SessionEvent> = Vec::new();
+            for (i, e) in events.iter().enumerate() {
+                match &e.op {
+                    SessionEventOp::CompactionStart { .. } => {
+                        if depth == 0 {
+                            run_start = i;
+                        }
+                        depth += 1;
+                    }
+                    SessionEventOp::CompactionEnd { compaction } => {
+                        if depth == 0 {
+                            // Dangling End; not part of a matched pair.
+                            continue;
+                        }
+                        depth -= 1;
+                        if depth == 0 && Some(compaction.clone()) == current {
+                            // A fully-closed pair whose End matches the current
+                            // authoritative compaction: preserve the whole run.
+                            for ev in &events[run_start..=i] {
+                                pairs.push(ev.clone());
+                            }
+                            run_start = usize::MAX;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            pairs
+        };
 
         for (i, message) in self.messages.iter().enumerate() {
             map.push_event(SessionEvent {
@@ -2332,12 +2500,17 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
             });
         }
 
-        // Re-append the preserved log-only events: plugin `Unknown` events and
-        // orphaned `CompactionStart` markers. They are appended LAST so their
-        // relative order is unchanged and they sit after any reconstructed state
-        // events (their position in the log never matters to derivation, but
-        // keeping them contiguous at the tail preserves the append-only narrative
-        // for any downstream reader).
+        // Re-append the preserved log-only events: matched bracket pairs, plugin
+        // `Unknown` events, and orphaned `CompactionStart` markers. They are
+        // appended LAST so their relative order is unchanged and they sit after
+        // any reconstructed state events (their position in the log never matters
+        // to derivation, but keeping them contiguous at the tail preserves the
+        // append-only narrative for any downstream reader). Matched pairs come
+        // first so their `CompactionEnd` remains the last persisting compaction
+        // op (agreeing with the reconstructed `SetCompaction` and `self.compaction`).
+        for event in preserved_bracket_pairs {
+            map.push_event(event);
+        }
         for event in preserved_orphan_starts {
             map.push_event(event);
         }

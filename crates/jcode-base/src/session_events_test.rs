@@ -811,6 +811,59 @@ fn test_rebuild_event_map_preserves_orphaned_compaction_start() {
         .expect("rebuilt log with preserved orphan must stay consistent");
 }
 
+/// `rebuild_event_map` must preserve a COMPLETED bracket run (Start…End) whose
+/// `CompactionEnd` carries the current authoritative compaction, not just orphan
+/// starts and `Unknown` events. Previously a divergent-load rebuild collapsed the
+/// compaction narrative into a single `SetCompaction`, losing the bracket run.
+#[test]
+fn test_rebuild_event_map_preserves_completed_bracket_run() {
+    let mut session = Session::create_with_id("rebuild_bracket_pair".to_string(), None, None);
+    session.append_stored_message(StoredMessage {
+        id: "m1".to_string(),
+        role: Role::User,
+        content: vec![text_block("hello")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    let comp = StoredCompactionState {
+        summary_text: "brief".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 1,
+    };
+    // A balanced bracket: Start -> replace -> End.
+    session.compact_transcript_with_bracket("run", session.messages.clone(), comp.clone(), 1);
+    assert!(
+        session.event_map.orphaned_compaction().is_none(),
+        "precondition: the bracket is closed"
+    );
+
+    // Rebuild from the legacy vectors (simulating reconcile / sanitize-clear).
+    session.rebuild_event_map();
+
+    // The full bracket run (Start and End, not just a SetCompaction) is preserved.
+    let has_start = session
+        .event_map
+        .events
+        .iter()
+        .any(|e| matches!(e.op, SessionEventOp::CompactionStart { .. }));
+    let has_end = session
+        .event_map
+        .events
+        .iter()
+        .any(|e| matches!(e.op, SessionEventOp::CompactionEnd { .. }));
+    assert!(has_start, "completed bracket Start must survive the rebuild");
+    assert!(has_end, "completed bracket End must survive the rebuild");
+    // Balanced + consistent with legacy.
+    assert!(session.event_map.orphaned_compaction().is_none());
+    session
+        .rederive_all_checked()
+        .expect("rebuilt log with preserved bracket run must stay consistent");
+}
+
 /// Unknown ops must still be rejected by validation if their event id is empty,
 /// and accepted when the payload is well formed, so plugin events do not
 /// silently corrupt the log invariants.
@@ -2239,6 +2292,88 @@ fn test_rederive_all_checked_flags_reordered_injection() {
     assert!(
         err.contains("memory injections diverge"),
         "expected the injection-divergence message, got: {err}"
+    );
+}
+
+/// A `ReplayEvent` may legitimately carry a HISTORICAL timestamp (it is recorded
+/// for replay visualization, not wall-clock activity; the load/fork paths already
+/// tolerate old timestamps by not re-validating). `validate_event` must NOT drop
+/// such a replay event on the live `record_*` path just because it is older than
+/// the ~1-year wall-clock window. Its FUTURE bound is still enforced by
+/// `validate_replay_event`.
+#[test]
+fn test_old_timestamp_replay_event_is_accepted() {
+    use crate::session::event_types::SessionEventMap;
+
+    let mut map = SessionEventMap::default();
+    let old = chrono::Utc::now() - chrono::Duration::days(400); // > 365d window
+    let op = SessionEventOp::ReplayEvent {
+        replay_event: crate::session::StoredReplayEvent {
+            timestamp: old,
+            kind: crate::session::StoredReplayEventKind::DisplayMessage {
+                role: "user".to_string(),
+                title: None,
+                content: "historical".to_string(),
+            },
+        },
+    };
+    map.append_event(SessionEvent {
+        timestamp: old,
+        event_id: "old_replay".to_string(),
+        op,
+        parent_id: None,
+        version: 1,
+    });
+    assert_eq!(
+        map.events.len(),
+        1,
+        "an old-timestamped replay event must be accepted, not dropped by the age gate"
+    );
+
+    // A non-replay event with the same old timestamp must still be rejected.
+    let mut map2 = SessionEventMap::default();
+    map2.append_event(SessionEvent {
+        timestamp: old,
+        event_id: "old_msg".to_string(),
+        op: SessionEventOp::AppendMessage {
+            message_id: "m1".to_string(),
+            message: StoredMessage {
+                id: "m1".to_string(),
+                role: Role::User,
+                content: vec![text_block("x")],
+                display_role: None,
+                timestamp: None,
+                tool_duration_ms: None,
+                token_usage: None,
+            },
+        },
+        parent_id: None,
+        version: 1,
+    });
+    assert_eq!(
+        map2.events.len(),
+        0,
+        "a non-replay event older than the age window must still be rejected"
+    );
+}
+
+/// A genuinely empty session (no events AND no legacy state) is trivially
+/// "preserved" by `reconcile_event_map_after_load` — it must return `true` so a
+/// loader does not emit a spurious "event log was not preserved; rebuilt from
+/// legacy vectors" warning for a session that has nothing to rebuild or lose.
+#[test]
+fn test_reconcile_empty_clean_session_is_preserved() {
+    let mut session = Session::create_with_id("reconcile_empty".to_string(), None, None);
+    assert!(session.messages.is_empty());
+    assert!(session.event_map.is_empty());
+    // Must return true (trivially preserved) without rebuilding or warning.
+    assert!(
+        session.reconcile_event_map_after_load(),
+        "an empty-clean session must be reported as preserved (no spurious rebuild warning)"
+    );
+    assert!(
+        session.event_map.is_empty(),
+        "reconcile must not fabricate events for an empty-clean session"
     );
 }
 #[test]
@@ -3763,4 +3898,132 @@ fn test_public_event_log_accessor_exposes_committed_events() {
         )),
         "the public accessor must expose the plugin Unknown event"
     );
+}
+
+/// Deterministic, seeded property test: feed a pseudo-random sequence of
+/// message ops (append/insert/clear/replace) into a `SessionEventMap` and
+/// assert `derive_messages` always matches a directly-maintained reference
+/// `Vec<StoredMessage>` — on every prefix AND the full sequence. This exercises
+/// adversarial interleavings (out-of-range inserts, full/partial replaces,
+/// clears mid-stream) that hand-written cases omit, catching any latent
+/// divergance between the event log fold and the reference transcript.
+#[test]
+fn test_derive_messages_fuzz_matches_reference() {
+    let mut map = SessionEventMap::default();
+    let mut reference: Vec<StoredMessage> = Vec::new();
+    let mut next_id = 0u64;
+    let mut seed: u64 = 0x9E37_79B9_7F4A_7C15; // deterministic
+    let next = |seed: &mut u64| {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (*seed >> 33) as u64
+    };
+    let mut message = |next_id: &mut u64| {
+        let id = format!("m{}", *next_id);
+        *next_id += 1;
+        StoredMessage {
+            id,
+            role: Role::User,
+            content: vec![text_block(if *next_id % 2 == 0 { "even" } else { "odd" })],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        }
+    };
+
+    for step in 0..400u64 {
+        let op = (next(&mut seed) % 5) as u8;
+        let n = (next(&mut seed) % 9) as usize; // steps often small
+        match op {
+            // Append
+            0 => {
+                let m = message(&mut next_id);
+                let id = m.id.clone();
+                map.events.push(SessionEvent {
+                    timestamp: Utc::now(),
+                    event_id: id.clone(),
+                    op: SessionEventOp::AppendMessage {
+                        message_id: id,
+                        message: m.clone(),
+                    },
+                    parent_id: None,
+                    version: 1,
+                });
+                reference.push(m);
+            }
+            // Insert at index (possibly out-of-range or end)
+            1 => {
+                let m = message(&mut next_id);
+                let idx = n.min(reference.len());
+                // Mirror derive_messages clamping.
+                map.events.push(SessionEvent {
+                    timestamp: Utc::now(),
+                    event_id: format!("ins_{step}"),
+                    op: SessionEventOp::InsertMessage {
+                        index: n,
+                        message: m.clone(),
+                    },
+                    parent_id: None,
+                    version: 1,
+                });
+                reference.insert(idx, m);
+            }
+            // Replace messages in [start,end)
+            2 => {
+                let replace_with: Vec<StoredMessage> =
+                    (0..n).map(|_| message(&mut next_id)).collect();
+                let start = (next(&mut seed) % (reference.len() as u64 + 1)) as usize;
+                let end = (next(&mut seed) % (reference.len() as u64 + 1)) as usize;
+                let (a, b) = (start.min(end), start.max(end).min(reference.len()));
+                map.events.push(SessionEvent {
+                    timestamp: Utc::now(),
+                    event_id: format!("repl_{step}"),
+                    op: SessionEventOp::ReplaceMessages {
+                        start_index: a,
+                        end_index: b,
+                        messages: replace_with.clone(),
+                    },
+                    parent_id: None,
+                    version: 1,
+                });
+                reference.splice(a..b, replace_with);
+            }
+            // Insert at end (position == len)
+            3 => {
+                let m = message(&mut next_id);
+                map.events.push(SessionEvent {
+                    timestamp: Utc::now(),
+                    event_id: format!("end_{step}"),
+                    op: SessionEventOp::InsertMessage {
+                        index: reference.len(),
+                        message: m.clone(),
+                    },
+                    parent_id: None,
+                    version: 1,
+                });
+                reference.push(m);
+            }
+            // ClearAll
+            4 => {
+                map.events.push(SessionEvent {
+                    timestamp: Utc::now(),
+                    event_id: format!("clr_{step}"),
+                    op: SessionEventOp::ClearAll,
+                    parent_id: None,
+                    version: 1,
+                });
+                reference.clear();
+            }
+            _ => unreachable!(),
+        }
+
+        // At every prefix, the derived ids must match the reference.
+        let derived: Vec<String> =
+            map.derive_messages().iter().map(|m| m.id.clone()).collect();
+        let expect: Vec<String> = reference.iter().map(|m| m.id.clone()).collect();
+        assert_eq!(
+            derived, expect,
+            "fuzz mismatch at step {step} (op kind {op})"
+        );
+    }
 }
