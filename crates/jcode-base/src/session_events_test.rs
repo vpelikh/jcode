@@ -2799,6 +2799,16 @@ fn test_compact_transcript_with_bracket_produces_balanced_durable_bracket() {
 
     let id = session.compact_transcript_with_bracket("comp_a", tail.clone(), compaction.clone(), 3);
 
+    // The returned CompactionId is the bracket's opening marker id.
+    assert!(
+        session
+            .event_map
+            .events
+            .iter()
+            .any(|e| matches!(&e.op, SessionEventOp::CompactionStart { compaction_id, .. } if compaction_id == &id)),
+        "returned CompactionId must identify the CompactionStart marker"
+    );
+
     // Balanced bracket, no orphan, and a single persisting state.
     assert!(
         session.event_map.orphaned_compaction().is_none(),
