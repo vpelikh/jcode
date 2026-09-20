@@ -764,7 +764,7 @@ async fn build_server_memory_payload(
     let shared_context = swarm.shared_context_map();
     let swarm_plans = &swarm.swarm_state.plans;
     let swarm_coordinators = &swarm.swarm_state.coordinators;
-    let file_touch = &swarm.file_touch;
+    let file_touch = swarm.file_touch();
     let channel_subscriptions = swarm.channel_subscriptions_map();
     let channel_subscriptions_by_session = swarm.channel_subscriptions_by_session_map();
     let event_history = swarm.read_event_sources().0;

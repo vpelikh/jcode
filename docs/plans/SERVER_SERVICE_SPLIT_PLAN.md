@@ -1020,6 +1020,30 @@ Two more `pub(super)` handlers dropped flat swarm-map params for
 Zero behavior change; the full `jcode-app-core` lib suite stays green
 (1480 passing) and clippy introduces no new warnings.
 
+### Tier 3 encapsulation: `SwarmServiceHandle.file_touch` privatized (landed 2026-09)
+
+The first true Tier 3 encapsulation: the `SwarmServiceHandle.file_touch` field
+is no longer `pub(crate)`.
+
+- The `file_touch` field on `SwarmServiceHandle` is now private, with a
+  `file_touch()` accessor returning `&FileTouchService`, mirroring the
+  established `channel_subscriptions_map()` / `read_event_sources()` precedent:
+  the field stays hidden and all reads/writes continue to route through the
+  encapsulated `FileTouchService` method surface (`record_touch`, `snapshot`,
+  `reverse_snapshot`, `clear_session`, `expire_older_than`,
+  `sorted_file_strings_for_session`, `accesses_for_path`).
+- All seven external field-access sites now go through the accessor instead of
+  reaching into `.file_touch`: `debug_server_state.rs`, `debug_swarm_read.rs`,
+  `client_comm_context.rs`, `comm_sync.rs`, `client_session.rs`,
+  `client_lifecycle.rs` and the `server.rs` file-touch expiry monitor. The
+  owned-value sites (`client_lifecycle.rs::handle_client` and the `server.rs`
+  monitor) clone the cheap `Arc`-backed service via the accessor before the
+  flat-local `swarm_state` destructuring, preserving the original single-homed
+  body.
+
+Zero behavior change; the `jcode-app-core` lib suite stays green (server module
+473 passing, swarm-services 6 passing) and clippy adds no new warnings.
+
 ## Tier 1 convergence status (landed 2026-09)
 
 The flat swarm-map argument convergence on the swarm/client router boundary is
