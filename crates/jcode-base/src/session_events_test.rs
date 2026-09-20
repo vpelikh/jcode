@@ -1284,6 +1284,43 @@ fn test_remove_tool_use_blocks_keeps_event_log_consistent() {
     assert_eq!(derived[0].content.len(), before_msg_content_len - 1);
 }
 
+/// A fork truncates the event log to the boundary, so its derived transcript is
+/// (usually) smaller than the parent's. The fork must not inherit the parent's
+/// cached memory profile: `memory_profile_snapshot` reads the cached counts, so
+/// a fork that keeps the parent's clean cache would report the parent's larger
+/// message count. This pins that forking invalidates the memory-profile cache.
+#[test]
+fn test_fork_invalidates_memory_profile_cache() {
+    let mut parent = Session::create_with_id("fork_mp_parent".to_string(), None, None);
+    for i in 0..6 {
+        parent.append_stored_message(StoredMessage {
+            id: format!("m{i}"),
+            role: Role::User,
+            content: vec![text_block(&format!("msg {i}"))],
+            display_role: None,
+            timestamp: Some(Utc::now()),
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+    // Ensure the parent's memory-profile cache is clean (built).
+    parent.memory_profile_snapshot();
+    assert_eq!(parent.messages.len(), 6);
+
+    // Fork at a boundary that keeps only the first 2 messages (first 2 events).
+    let mut fork = parent.fork_up_to_boundary(1);
+    assert_eq!(fork.messages.len(), 2, "fork truncates to the boundary");
+    // The fork's memory profile must reflect 2 messages, NOT the parent's 6.
+    let fork_profile = fork.memory_profile_snapshot();
+    assert_eq!(
+        fork_profile.message_count, 2,
+        "fork memory profile must reflect the truncated transcript, not the parent's"
+    );
+    // The parent is unaffected.
+    let parent_profile = parent.memory_profile_snapshot();
+    assert_eq!(parent_profile.message_count, 6);
+}
+
 #[test]
 fn test_refresh_initial_session_context_message_keeps_event_log_consistent() {
     let mut session = Session::create_with_id("test_context".to_string(), None, None);
