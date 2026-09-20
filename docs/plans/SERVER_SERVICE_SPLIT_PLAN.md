@@ -488,7 +488,12 @@ What HAS landed: the breadth-level file split (many focused modules), `runtime.r
 already isolates accept loops, `state.rs` centralizes delivery types and
 `SwarmState`, `swarm.rs` is already a stateful domain service. Slices 1-3 added
 the service-handle structs, wired `ServerRuntime`, and narrowed the handler
-signatures. The remaining work is the ownership-move slices (Slice 4+).
+signatures. Slice 4 (swarm-membership extraction) is underway: the three session
+lifecycle functions (`handle_subscribe`, `handle_clear_session`,
+`handle_resume_session`) now take the `SwarmServiceHandle` instead of a flat
+swarm-domain argument bag, and the member-rename + should-mark-ready reads have
+moved onto `SwarmServiceHandle` methods. The remaining work is the ownership-move
+slices still pending (`monitor_bus` to service APIs, debug snapshots).
 
 ---
 
@@ -517,7 +522,9 @@ without risking the runtime model. It is deliberately a **slice**, not a PR:
   with no behavior change. *(landed)*
 - **Slice 4+ — ownership moves.** Swarm-membership extraction out of
   `client_session.rs`, `monitor_bus` to service APIs, and debug snapshot
-  readers. Each is mechanical now that the handles exist.
+  readers. Each is mechanical now that the handles exist. *(partially landed:
+  `handle_subscribe`/`handle_clear_session`/`handle_resume_session` now take the
+  `SwarmServiceHandle`, and member rename + should-mark-ready live on the handle)*
 
 Each slice is independently reviewable and behavior-preserving; none is gated on
 the rest.
