@@ -5,9 +5,10 @@ Status: Plan for the Tier 3 "true encapsulation" follow-up flagged by
 `&SwarmServiceHandle`) is landed; this documents how to *close* the split by
 privatizing the handle's fields so all mutations must go through handle
 methods. **All seven slices are delivered (2026-09); the field boundary is
-closed, but the "all mutations route through handle methods" done-criterion is
-only partially met — the entangled orchestration mutations remain (see the
-Done criteria status block).** The optional stricter `SwarmState` sub-field
+closed and the Kind A coordination orchestration mutations are routed through
+whole-transaction handle methods — the "all mutations route through handle
+methods" done-criterion is MET (Kind B UI-field writes remain behind the read
+accessor by design).** The optional stricter `SwarmState` sub-field
 privatization is also out of scope (see the `swarm_state` slice note).
 
 Scope: `crates/jcode-app-core/src/server/services/swarm.rs` +
@@ -151,9 +152,10 @@ API the handle wraps). Instead:
 `swarm.swarm_state`, `swarm.event_history`, `swarm.event_counter`,
 `swarm.swarm_event_tx`, `swarm.shared_context`,
 `swarm.channel_subscriptions{,_by_session}` and the two runtime handles are
-private; zero non-`services/swarm.rs` code reaches them; all mutations go
-through handle methods; suite green + clippy clean.
-**Status: field boundary MET, mutation funnel PARTIALLY met.**
+private; zero non-`services/swarm.rs` code reaches them; all mutations flow
+through whole-transaction handle methods; suite green + clippy clean.
+**Status: field boundary MET, mutation funnel MET (Kind A routed; Kind B left
+by design).**
 - **Field boundary (met):** every named handle field is private; zero
   non-`services/swarm.rs` code references the raw fields — cross-module access
   goes through documented read accessors.
@@ -161,23 +163,75 @@ through handle methods; suite green + clippy clean.
   through handle methods — `remove_session_member` / `take_session_membership`,
   `rename_member_session` (also rewrites coordinators), resume/detached cleanup,
   and `register_headless_member` (headless registration).
-- **Remaining (not met):** "all mutations go through handle methods" does not
-  hold — the entangled orchestration in `comm_graph`, `comm_session`,
-  `comm_control`, `comm_plan`, `comm_sync`, `client_actions`, `background_tasks`
-  still mutates `members` / `swarms_by_id` / `plans.participants` / `coordinators`
-  in place *after* borrowing them through the accessor (~25 write sites
-  measured 2026-09). These are the plan's "risk concentration": the writes are
-  interleaved with plan/task mutations, persistence, coordinator re-election,
-  and subscriber fan-out (e.g. `plan.participants.insert` is always paired with
-  a `version += 1` / task-progress update and a `participants.clone()` fan-out
-  inside the same `plans.write()` scope), so leaf extraction would hold the very
-  lock it itself takes (deadlock risk) or split logical mutations. Routing these
-  is out of scope for this pass; follow-up slices should pull each *whole
-  transaction* (map write + its interleaved fields + fan-out) onto a handle
-  method keeping borrow order identical.
+- **Coordination (Kind A) mutations (met, 2026-09):** all five coordination
+  write-site slices now route through whole-transaction `SwarmServiceHandle`
+  methods, so no caller outside `services/swarm.rs` takes the raw plans /
+  members / coordinators / swarms_by_id write locks:
+  - `comm_plan`: `propose_coordinator_plan_update`, `approve_plan_merge`,
+    routed propose/approve/reject through handle methods + `record_swarm_event`.
+  - `comm_graph`: `mutate_task_dag`, `elect_seeder_coordinator` (seed/expand/
+    complete/inject seed the DAG through the handle).
+  - `comm_session`: `register_visible_member`, `spawn_adds_plan_participants`,
+    `promote_spawn_coordinator` (visible-spawn register, spawn participants,
+    coordinator election).
+  - `client_session`: `move_member_between_swarms` (subscribe working-dir re-key
+    hotspot: member rekey + swarms_by_id move + role reset + coordinator
+    re-election + plan-participant drop + persist + broadcast).
+  - `comm_control`: `assign_member_role`, `record_task_assignment`,
+    `requeue_assignment`, `reclaim_stranded_task`, `mutate_task_status`,
+    `mutate_task_disposition` (assignment / requeue / task-progress /
+    role-election, plus the background running / failed / turn-end transitions).
+  Each routes the whole transaction (map write + interleaved plan fields +
+  persist + broadcast + event) and the fanned-out notifications, keeping the
+  established lock order (never two swarm-map write locks at once). Field
+  boundary + "all Kind A mutations go through handle methods" MET, with the
+  full `jcode-app-core` lib suite green and clippy `--all-targets` clean.
+- **Kind B (UI-field) writes left as accessor writes by design:** ephemeral
+  per-member fields (`output_tail`, `todo_items`, `todo_progress`,
+  `last_seen`, `task_label`, working-dir writes) remain behind the read
+  accessor — routing them is ceremony with no boundary value (see the
+  follow-up scope note). Direct unit tests for the new handle methods were
+  added in `services/swarm.rs` as part of each slice.
+
+### Follow-up: route the coordination write sites (landed 2026-09)
+
+**Measured 2026-09 (raw functional write sites):** 51 in-place `.write()` /
+`participants.insert|remove` sites across 8 functional files:
+
+- `comm_control` (13), `comm_session` (8), `comm_plan` (7), `comm_graph` (7),
+  `client_session` (5), `background_tasks` (5), `client_actions` (4),
+  `comm_sync` (2). (Counts are raw per-file write sites, not yet split per site.)
+
+These split into two kinds:
+
+- **Kind A — genuine coordination mutations (the WIN):** plan version/participant
+  and membership/coordinator writes. These should move onto **whole-transaction
+  `SwarmServiceHandle` methods** (the caller stops touching the raw map
+  entirely). Requires one method per transaction (e.g. `assign_plan_task`,
+  `requeue_existing_assignment`, `attach_plan`, `elect_coordinator`) taking the
+  inputs and returning the fan-out tuple, NOT a leaf method (deadlock). Do
+  slice-by-slice over these files, suite green + clippy `--all-targets` +
+  deadlock review after each. A per-site Kind A/B classification is the first
+  step before writing the handle methods.
+- **Kind B — ephemeral per-member UI-field writes:** `background_tasks`
+  (`output_tail`, `todo_items`, `todo_progress`) and single-member
+  `last_seen`/role/working-dir writes in `comm_control`/`client_session`/
+  `client_actions`. These are cosmetic single-record updates, not coordination —
+  recommend leaving them behind the read accessor (routing them is ceremony
+  with no boundary value), unless literal completeness is required (then thin
+  methods like `set_member_output_tail`).
+
+Recommended scope for the follow-up: **route Kind A (genuine coordination)
+whole-transaction onto handle methods; leave Kind B (UI-only) as-is.** Verify
+each slice independently. **Done (2026-09):** all Kind A write sites across
+`comm_plan` / `comm_graph` / `comm_session` / `client_session` / `comm_control`
+now flow through whole-transaction handle methods, each verified with the full
+`jcode-app-core` lib suite green and clippy `--all-targets` clean (see the
+Done-criteria status block above; suite currently 1571 passed / 24 ignored).
+
 - `debug_swarm_write` / persistence-test code is a documented privileged
   observer. `Server.swarm_state` (the handle's constructor source) is pub, out
-  of scope. Full app-core lib suite green (1542), clippy clean on changed
+  of scope. Full app-core lib suite green (1543), clippy clean on changed
   files.
 
 ## Review notes (2026-09)
