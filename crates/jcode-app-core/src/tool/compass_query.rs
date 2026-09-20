@@ -146,7 +146,7 @@ impl Tool for CompassQueryTool {
     }
 
     fn description(&self) -> &str {
-        "Semantic code search and structural analysis via Compass's knowledge graph."
+        "Semantic code search via the code graph; prefer over agentgrep."
     }
 
     fn concurrency_safe_marker(&self) -> bool {
@@ -209,18 +209,16 @@ impl Tool for CompassQueryTool {
             )));
         }
 
-        // A session-subscribe pre-warm may still be building this project's
-        // index in the background. If so, joining it from here would hold the
-        // same per-project build lock and turn this otherwise-instant query
-        // into a multi-minute blocking build — the exact stall pre-warming is
-        // meant to remove. Instead, fail fast with a retryable message so the
-        // agent can use `agentgrep` now (for keyword searches) and
-        // `compass_query` again once the pre-warm has populated the index. For
-        // structural intents (callers/callees/impact/discovery/traverse)
-        // agentgrep cannot substitute, so we point the agent at retrying
-        // compass_query after the warm-up rather than at a grep that cannot
-        // produce structural results.
-        if prewarm_in_flight(&cache.graph_path, &cache.output_dir) {
+        // A session-subscribe pre-warm may still be building this project's index in
+        // the background. If so, prefer to wait (bounded) for that already-running
+        // build to finish so this query returns the answer in the same turn,
+        // rather than starting its own blocking build or failing fast and relying
+        // on the model to retry. Only if the build is not ready in time do we fall
+        // back to the non-blocking "still building" hint.
+        if prewarm_in_flight(&cache.graph_path, &cache.output_dir)
+            && !wait_for_prewarm(&cache.graph_path, &cache.output_dir, PREWARM_JOIN_TIMEOUT)
+                .await
+        {
             let structural = !params
                 .intent
                 .as_deref()
@@ -1051,7 +1049,8 @@ fn build_compass_index(
 /// swarm of sessions that all subscribe to the same repo (and thus the same
 /// SHA) don't each spawn a duplicate cold build. Tolerant of poisoning (a panic
 /// in a pre-warm thread must not brick later dedup).
-static PREWARM_IN_FLIGHT: OnceLock<Mutex<HashMap<PathBuf, ()>>> = OnceLock::new();
+static PREWARM_IN_FLIGHT: OnceLock<Mutex<HashMap<PathBuf, std::sync::Arc<tokio::sync::Notify>>>> =
+    OnceLock::new();
 
 /// True when a background pre-warm is currently building the Compass index for
 /// `output_dir`'s per-SHA index. Used by `CompassQueryTool::execute` to
@@ -1070,6 +1069,42 @@ fn prewarm_in_flight(graph_path: &Path, output_dir: &Path) -> bool {
     }
     lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())))
         .contains_key(output_dir)
+}
+
+/// Bound within which a `compass_query` will wait for an already-running
+/// background pre-warm to finish, rather than failing fast and relying on the
+/// model to retry. Short enough not to stall a turn indefinitely; long enough
+/// to absorb a typical cold build so the answer is served in the same turn.
+const PREWARM_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Wait (bounded) for an in-flight background pre-warm of `output_dir` to
+/// finish and produce a ready index, so the calling query can serve from the
+/// warm graph instead of failing fast. Returns `true` if the index became ready
+/// (or was already ready), `false` if there was no pre-warm running or the wait
+/// timed out and the caller should fall back to its non-blocking path.
+///
+/// This is an async helper: waiting must not block a Tokio worker, so it awaits
+/// the completion signal rather than spinning.
+async fn wait_for_prewarm(graph_path: &Path, output_dir: &Path, timeout: std::time::Duration) -> bool {
+    // Already ready.
+    if graph_path.is_file() {
+        return true;
+    }
+    let done = {
+        let map = lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())));
+        map.get(output_dir).cloned()
+    };
+    let Some(done) = done else {
+        return false; // no pre-warm in flight; nothing to wait for
+    };
+    // Wait (bounded) for the pre-warm's completion signal. `notify_waiters` wakes
+    // all currently-registered waiters but leaves no permit, so a `notified()`
+    // registered *after* the build finished would wait until timeout. Rather than
+    // depend on the signal, always re-check the ready graph afterwards: either
+    // the wait was interrupted by completion, or it timed out, and in both cases
+    // the graph having appeared is the ground truth that the index is warm.
+    let _ = tokio::time::timeout(timeout, done.notified()).await;
+    graph_path.is_file()
 }
 
 /// Best-effort, off-the-query-path pre-warm of the Compass knowledge graph for
@@ -1147,7 +1182,11 @@ pub(crate) fn prewarm_compass_index(working_dir: &Path) -> bool {
     if map.contains_key(&cache.output_dir) {
         return true; // already being built by another subscriber
     }
-    map.insert(cache.output_dir.clone(), ());
+    // A per-build completion signal so a `compass_query` that arrives while this
+    // build is running can wait for it (bounded) and then serve from the warm
+    // index, instead of failing fast and relying on the model to retry.
+    let done = std::sync::Arc::new(tokio::sync::Notify::new());
+    map.insert(cache.output_dir.clone(), done.clone());
 
     let out_dir = cache.output_dir.clone();
     let error_out_dir = out_dir.clone(); // for cleanup if spawn fails
@@ -1162,13 +1201,18 @@ pub(crate) fn prewarm_compass_index(working_dir: &Path) -> bool {
     // ends the borrow at last use, it does not move the `Drop` to the end of the
     // block on its own here because the guard's drop is deferred.)
     drop(map);
+    let done_wake = done.clone();
     std::thread::Builder::new()
         .name("compass-prewarm".to_string())
         .spawn(move || {
-            // Remove the in-flight marker on BOTH normal completion and panic
-            // unwind. A leaked marker would make every subsequent query for this
-            // project fail-fast with "still building" until process restart.
-            let _guard = PrewarmMarkerGuard(out_dir.clone());
+            // Remove the in-flight marker (and wake any waiting query) on BOTH
+            // normal completion and panic unwind. A leaked marker would make
+            // every subsequent query for this project fail-fast with "still
+            // building" until process restart.
+            let _guard = PrewarmMarkerGuard {
+                output_dir: out_dir.clone(),
+                done: done_wake,
+            };
             // Serialize against any on-query build AND other pre-warm threads
             // sharing this project's `.ast-cache` via the same per-project flock
             // that `ensure_fresh_engine` uses. A bare `build_compass_index`
@@ -1199,9 +1243,12 @@ pub(crate) fn prewarm_compass_index(working_dir: &Path) -> bool {
                 "COMPASS_PREWARM",
                 vec![("error", format!("failed to spawn pre-warm thread: {e}"))],
             );
-            // Do not leave a stale in-flight marker behind if the spawn failed.
+            // Do not leave a stale in-flight marker behind if the spawn failed, and wake
+            // any query waiting on this build so it doesn't hang on a notify
+            // that will never fire.
             lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())))
                 .remove(&error_out_dir);
+            done.notify_waiters();
         })
         .is_ok()
 }
@@ -1217,16 +1264,22 @@ const PREWARM_FAIL_COOLDOWN: Duration = Duration::from_secs(300);
 static PREWARM_LAST_FAILED: OnceLock<Mutex<HashMap<PathBuf, SystemTime>>> = OnceLock::new();
 
 /// RAII guard that removes this project's pre-warm in-flight marker when it is
-/// dropped. Created at the top of the pre-warm thread so the marker is released
-/// on normal completion AND on panic unwind (a panic anywhere in
+/// dropped, and wakes any `compass_query` that is waiting on this build to
+/// finish. Created at the top of the pre-warm thread so the cleanup runs on
+/// normal completion AND on panic unwind (a panic anywhere in
 /// `build_compass_index` / `build_graph_with_layers` must not permanently wedge
-/// every later query for the project with a stale "building" marker).
-struct PrewarmMarkerGuard(PathBuf);
+/// every later query for the project with a stale "building" marker, nor strand
+/// a waiting query forever).
+struct PrewarmMarkerGuard {
+    output_dir: PathBuf,
+    done: std::sync::Arc<tokio::sync::Notify>,
+}
 
 impl Drop for PrewarmMarkerGuard {
     fn drop(&mut self) {
         lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())))
-            .remove(&self.0);
+            .remove(&self.output_dir);
+        self.done.notify_waiters();
     }
 }
 
@@ -2747,7 +2800,7 @@ mod tests {
 
         // Simulate a background pre-warm still in flight for this project.
         lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())))
-            .insert(edge.output_dir.clone(), ());
+            .insert(edge.output_dir.clone(), std::sync::Arc::new(tokio::sync::Notify::new()));
 
         let ctx = ToolContext {
             session_id: "s".into(),
@@ -2850,7 +2903,7 @@ mod tests {
 
         // Simulate a build already in flight for this project.
         lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())))
-            .insert(edge.output_dir.clone(), ());
+            .insert(edge.output_dir.clone(), std::sync::Arc::new(tokio::sync::Notify::new()));
         // Cleanup guard to avoid leaking the marker for the rest of the suite.
         struct Cleanup(PathBuf);
         impl Drop for Cleanup {
@@ -2868,7 +2921,7 @@ mod tests {
         );
         // Still exactly one marker present (no duplicate insert).
         let map = lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())));
-        assert_eq!(map.get(&edge.output_dir), Some(&()), "one in-flight marker");
+        assert!(map.get(&edge.output_dir).is_some(), "one in-flight marker");
     }
 
     // Real-concurrency version of the dedup guarantee: N threads call
@@ -2927,9 +2980,8 @@ mod tests {
         // Exactly one in-flight marker survives the race (check + insert is
         // atomic under the process-global mutex).
         let map = lock_cached(PREWARM_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())));
-        assert_eq!(
-            map.get(&edge.output_dir),
-            Some(&()),
+        assert!(
+            map.get(&edge.output_dir).is_some(),
             "exactly one in-flight marker must exist after the race"
         );
         // Clean up the marker; there is no real build backing it in this test.
