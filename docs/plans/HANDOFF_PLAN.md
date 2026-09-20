@@ -11,8 +11,8 @@ a fresh session's first message receives the saved handoff exactly once.
 Live model continuation was exercised end to end with a working provider: a
 fresh session recovered the exact pending marker from the saved handoff.
 
-**Planned:** wire the new import/export portability into remote fallback (and the
-interactive `/handoff` overlay remains an open enhancement).
+**Planned:** wire the new import/export portability into remote fallback. The
+interactive `/handoff` overlay is now implemented (see below).
 
 ## Purpose
 
@@ -27,9 +27,12 @@ can use on its first turn.
 - A project-keyed index for finding the latest unfinished handoff.
 - First-message context injection, including image-first conversations.
 - Promotion of a saved handoff into a durable project initiative.
-- A `/handoff` picker that lists saved handoffs (all snapshots, newest first)
-  and a `/handoffres <session_id>` command that boots a fresh conversation from
-  a selected handoff, overriding the automatic latest-for-project injection.
+- A `/handoff` picker — an interactive overlay (the session picker generalized
+  to a handoff data source) that lists saved handoffs (all snapshots, newest
+  first) with arrow-key navigation, filtering, and a preview of each snapshot's
+  open todos — plus a `/handoffres <session_id>` command that boots a fresh
+  conversation from a selected handoff, overriding the automatic
+  latest-for-project injection.
 
 Manual selection is implemented. Snapshot pruning is implemented. Portability
 (export/import for remote adoption) is implemented as the foundation for the
@@ -40,12 +43,22 @@ remote-fallback future work, which remains open.
 ### Manual selection
 
 `handoff::list_saved_handoffs()` reads the index (newest first, one per
-project) for the `/handoff` picker, and `handoff::render_handoff(id)` renders a
-specific snapshot for `list_saved_handoffs`-driven resume.
-`handoff::list_all_handoffs()` scans the snapshot directory so archived
-handoffs that are no longer the latest for their project stay selectable
-(marked `[archived]` in `/handoff`). The selected snapshot is carried from the
-TUI to the server via the `set_handoff_resume` protocol request and stored as a
+project) and `handoff::list_all_handoffs()` scans the snapshot directory so
+archived handoffs that are no longer the latest for their project stay
+selectable. Both feed `render_handoff(id)` for a specific snapshot's preview.
+
+`/handoff` now opens an **interactive picker overlay**: the shared
+`SessionPicker` is generalized to a handoff data source via
+`SessionPicker::for_handoffs(snapshots)`. Each saved snapshot becomes a row
+(title = intent, id, "closed <ago>" label, working dir), and its open todos +
+trailing assistant text render in the preview pane, reusing the session picker's
+list, arrow-key navigation, incremental filter/search, preview scroll, and mouse
+support unchanged. `s/S` filter cycling, `d` test-toggle, `Space` multi-select,
+and `T` Claude takeover are session-only and are disabled in handoff mode.
+Selecting a row emits
+`PickerResult::HandoffSelected(session_id)`. The selected snapshot's id is
+carried (via a pending-handoff-resume on the App, drained on the async pump) to
+the server via the `set_handoff_resume` protocol request and stored as a
 transient, one-shot override on the agent.
 
 `/handoffres` clears the current conversation in place (like `/clear`) so the
@@ -53,12 +66,19 @@ next message is the first visible one, then sets the override; always clearing
 guarantees the override fires even right after a reconnect when the client's
 display cache has not yet loaded server history. `/handoff-clear`
 (alias `/handoffcancel`) sends `set_handoff_resume(None)` to restore automatic
-injection. `/handoff` lists handoffs locally by reading the shared handoff
-store — the same client-side filesystem pattern the session picker uses for its
-listing — while the mutating `set_handoff_resume` path goes through the server
-because it changes the live agent. The commands also have a local fallback that
-lists handoffs (and notes that resume needs a connected server), so they degrade
-gracefully while disconnected.
+injection. Selecting from the interactive `/handoff` overlay performs the same
+`/handoffres` sequence (clear + set override) through the async pump. While
+disconnected, `/handoff` still opens the overlay from the shared local handoff
+store; resume then needs a connected server, and the commands degrade
+gracefully.
+
+Note on SSH-backed sessions: the `/handoff` overlay is unavailable over SSH
+because it lists the client host's local handoff store, which is the wrong host
+for an SSH-backed session (resuming sends the id to the server-side store). It
+shows an "unavailable in SSH mode" notice instead. `/handoffres <id>` still works
+over SSH when the user knows an id that exists on the server's store, since it
+routes through the remote connection. Reading the server-side handoff store from
+the client is out of scope; run `jcode` on the host to list its handoffs.
 
 At first-message injection ([`render_first_message_handoff`]), the override is
 honored if present and consumed immediately; otherwise the default
@@ -212,7 +232,7 @@ for choosing among multiple work streams.
 | Disconnect hook | `crates/jcode-app-core/src/server/client_disconnect_cleanup.rs` |
 | First-message injection and manual override | `crates/jcode-app-core/src/agent/turn_execution.rs` |
 | `set_handoff_resume` protocol + server handler | `crates/jcode-protocol/src/wire.rs`, `crates/jcode-app-core/src/server/client_actions.rs`, `client_lifecycle.rs` |
-| TUI `/handoff`, `/handoffres`, `/handoff-clear` commands + local fallback | `crates/jcode-tui/src/tui/app/remote/key_handling.rs`, `commands.rs`, `backend.rs`, `state_ui_input_helpers.rs` |
+| TUI `/handoff`, `/handoffres`, `/handoff-clear` commands + interactive handoff picker overlay | `crates/jcode-tui/src/tui/session_picker.rs`, `session_picker_tests.rs` (handoff data source), `crates/jcode-tui/src/tui/app/inline_interactive.rs` (overlay open/routing/pending resume), `crates/jcode-tui/src/tui/app/remote/key_handling.rs`, `commands.rs`, `remote.rs` (async drain) |
 | Storage and public-API tests | `crates/jcode-base/src/handoff_tests.rs` |
 | Injection + override tests | `crates/jcode-app-core/src/agent_tests.rs` |
 | Disconnect integration tests | `crates/jcode-app-core/src/server/client_disconnect_grace_tests.rs` |
@@ -241,8 +261,10 @@ auto-inject instead of booting context-less, and the stale id is consumed), the
 `set_handoff_resume` server handler (valid set replies `Done` and wins over
 auto-inject; unknown id replies `Error`; `None` restores auto-injection), a
 no-regression guard that a manual selection does not disturb the default, the
-TUI local `/handoff` fallback (surfaces archived handoffs; `/handoffres`
-explains a server is needed), snapshot pruning (per-project archived count
+interactive `/handoff` overlay (opens in handoff mode over the saved store,
+newest first with archived snapshots visible, recency sorted) and that
+`/handoffres` explains a server is needed locally, snapshot pruning
+(per-project archived count
 cap, archived age cap, live handoffs never pruned, and per-project scoping),
 and portability (export/import round trip adopts a remote snapshot and makes it
 injectable, malformed payloads are rejected, and import mints a fresh id so a
@@ -253,6 +275,40 @@ the prior environment.
 
 - Wire `import_handoff` into the remote-fallback flow after a failed live-session
   migration, consuming handoff files already available on the target host.
+
+- **Picker reality check (open abstraction step).** The interactive overlay is a
+  "reuse the session picker" milestone: each `HandoffSnapshot` is mapped onto a
+  synthetic `SessionInfo` row so the shared list/render/filter/preview pipeline
+  is reused unchanged. That is a deliberate trade-off — maximum reuse, minimal
+  risk — but it means many `SessionInfo` fields are dummy (status, message
+  counts, estimated tokens) and anything handoff-specific (`disposition`,
+  project grouping, one-shot export-in-place) can only live in app plumbing or
+  hacked session fields. If the overlay grows, consider replacing the
+  session-shaped rows with a thin, picker-agnostic row model (e.g. trait or enum
+  over a `SessionInfo`-like row), decoupling the handoff surface from the
+  session-shaped one. Not needed for the current flat-intent+preview picker. This
+  is the *row-model/architecture* follow-up, orthogonal to the wire features below.
+
+- **Atomic handoff apply (non-atomic clear+set is a known gap).** The overlay
+  applies a selection as `remote.clear()` then `set_handoff_resume` — two
+  requests that can split if the transport drops between them, leaving a cleared
+  conversation with no override (auto-inject wins). This mirrors the manual
+  `/handoffres` flow. A protocol feature (a combined apply request, or a
+  rollback/recovery) would make it atomic. Independent of the row model.
+
+- **SSH handoff discovery is blocked.** Over SSH the `/handoff` overlay is
+  unavailable because it lists the *client host's* local store, which is the
+  wrong host for an SSH-backed session. `/handoffres <id>` still works over SSH
+  for a known server-side id, but a client cannot list the server's handoffs.
+  Closing this needs a wire request to read the server-side handoff store.
+
+- **Standalone `--resume` has no handoff picker.** The interactive overlay is
+  TUI-only; `jcode --resume` treats a handoff selection as an inert no-op. Adding
+  handoff selection to the standalone resume CLI is a separate feature.
+
+These are *feature/protocol* follow-ups (wire surface + commands), orthogonal to
+the row-model abstraction above. Each is shippable independently on the current
+architecture.
 
 ## Relationship to remote handoff
 

@@ -747,13 +747,15 @@ mod worktree {
 }
 
 
-/// The local `/handoff` fallback lists saved handoffs (including archived ones)
-/// from the shared store, and `/handoffres` reports that a connected server is
-/// required — all without a socket.
+/// The local `/handoff` fallback opens the interactive picker over the saved
+/// handoff store (including archived ones) without a socket, and `/handoffres`
+/// reports that a connected server is required. The selected handoff is applied
+/// later on the async pump, which requires a live connection.
 #[test]
 fn local_handoff_listing_surfaces_archived_and_requires_server_for_resume() {
     use crate::tui::app::commands_dispatch::dispatch_local_command;
     use crate::tui::app::tests::create_test_app;
+    use crate::tui::app::SessionPickerMode;
 
     // Isolated home so capture writes to a throwaway store.
     struct Restore;
@@ -804,28 +806,37 @@ fn local_handoff_listing_surfaces_archived_and_requires_server_for_resume() {
 
     let mut app = create_test_app();
 
-    // /handoff is claimed locally and lists newest first with the archived tag.
+    // /handoff is claimed locally and opens the interactive handoff picker
+    // over the saved store (newest first, archived ones still selectable).
     assert!(
         dispatch_local_command(&mut app, "/handoff"),
         "/handoff should be claimed in local dispatch"
     );
-    let listing = app
-        .display_messages
-        .last()
-        .map(|m| m.content.clone())
-        .unwrap_or_default();
-    assert!(
-        listing.contains("latest-handoff"),
-        "listing should show the latest handoff: {listing}"
+    assert_eq!(
+        app.session_picker_mode,
+        SessionPickerMode::Handoff,
+        "/handoff should switch the picker into handoff mode"
     );
-    assert!(
-        listing.contains("archived-handoff") && listing.contains("[archived]"),
-        "listing should surface the archived handoff: {listing}"
-    );
-    assert!(
-        listing.contains("needs a server connection"),
-        "local listing should note resume needs a server: {listing}"
-    );
+    {
+        let picker = app
+            .session_picker_overlay
+            .as_ref()
+            .expect("handoff picker should be open")
+            .borrow();
+        assert!(picker.is_handoff(), "the handoff picker should report handoff mode");
+        assert_eq!(picker.visible_session_count(), 2, "both snapshots should be listed");
+        // Rows are recency-sorted, so the newest handoff is the first visible one.
+        let first_id = picker
+            .visible_session_iter_for_test()
+            .map(|session| session.id.clone())
+            .next()
+            .expect("at least one visible handoff");
+        assert_eq!(
+            first_id.as_str(),
+            "latest-handoff",
+            "handoffs should be listed newest first"
+        );
+    }
 
     // `/handoffres` is claimed locally but explains a server is required.
     assert!(
@@ -840,6 +851,183 @@ fn local_handoff_listing_surfaces_archived_and_requires_server_for_resume() {
     assert!(
         msg.contains("requires a live server connection"),
         "local /handoffres should explain a server is needed: {msg}"
+    );
+}
+
+/// `handoff_headline` returns the snapshot's intent as the headline (line after
+/// the "[Handoff from previous session]" header), shared by `/handoffres` and
+/// the interactive overlay, and falls back to a stable marker when unknown.
+#[test]
+fn handoff_headline_returns_intent_and_falls_back_for_unknown() {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match std::env::var_os("JCODE_HOME") {
+                Some(v) => crate::env::set_var("JCODE_HOME", v),
+                None => crate::env::remove_var("JCODE_HOME"),
+            }
+        }
+    }
+    let _guard = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().expect("temp home");
+    crate::env::set_var("JCODE_HOME", home.path());
+    let wd = home.path().join("project");
+    std::fs::create_dir_all(&wd).unwrap();
+    let _restore = Restore;
+
+    crate::todo::save_plan(
+        "handoff-abc",
+        &crate::todo::TodoPlan {
+            user_intention: Some("Fix the login bug".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    crate::todo::save_todos(
+        "handoff-abc",
+        &[crate::todo::TodoItem {
+            id: "t".into(),
+            content: "fix the login".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: None,
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    crate::handoff::capture("handoff-abc", Some(&wd), "closed", None).expect("capture");
+
+    assert_eq!(
+        super::handoff_headline("handoff-abc"),
+        "Intent: Fix the login bug",
+        "headline should be the intent line from the rendered handoff"
+    );
+    assert_eq!(
+        super::handoff_headline("does-not-exist"),
+        "[Handoff from previous session]",
+        "unknown handoffs should fall back to the stable marker"
+    );
+}
+
+/// With no saved handoffs, `/handoff` explains that and does not open an
+/// interactive overlay (there is nothing to select).
+#[test]
+fn local_handoff_empty_store_pushes_message_without_opening_picker() {
+    use crate::tui::app::commands_dispatch::dispatch_local_command;
+    use crate::tui::app::tests::create_test_app;
+
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match std::env::var_os("JCODE_HOME") {
+                Some(v) => crate::env::set_var("JCODE_HOME", v),
+                None => crate::env::remove_var("JCODE_HOME"),
+            }
+        }
+    }
+    let _guard = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().expect("temp home");
+    crate::env::set_var("JCODE_HOME", home.path());
+    let _restore = Restore;
+
+    let mut app = create_test_app();
+
+    assert!(
+        dispatch_local_command(&mut app, "/handoff"),
+        "/handoff should be claimed in local dispatch"
+    );
+    let msg = app
+        .display_messages
+        .last()
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("No saved handoffs"),
+        "empty /handoff should explain no snapshots exist: {msg}"
+    );
+    assert!(
+        app.session_picker_overlay.is_none(),
+        "empty /handoff must not open a selectable picker"
+    );
+}
+
+/// Full client-flow regression guard: opening the `/handoff` overlay and
+/// pressing Enter must queue a handoff resume (not a live-session resume), and
+/// must not leave any session-only picker state behind. This exercises the App
+/// routing (`open_handoff_picker` → `handle_session_picker_key`) that the
+/// picker-level unit tests and socket integration tests don't cover directly.
+#[test]
+fn handoff_overlay_enter_queues_handoff_resume_and_leaves_no_session_state() {
+    use crate::tui::app::tests::create_test_app;
+
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match std::env::var_os("JCODE_HOME") {
+                Some(v) => crate::env::set_var("JCODE_HOME", v),
+                None => crate::env::remove_var("JCODE_HOME"),
+            }
+        }
+    }
+    let _guard = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().expect("temp home");
+    crate::env::set_var("JCODE_HOME", home.path());
+    let wd = home.path().join("project");
+    std::fs::create_dir_all(&wd).unwrap();
+    let _restore = Restore;
+
+    crate::todo::save_todos(
+        "handoff-flow",
+        &[crate::todo::TodoItem {
+            id: "t".into(),
+            content: "flow work".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: None,
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    crate::todo::save_plan(
+        "handoff-flow",
+        &crate::todo::TodoPlan {
+            user_intention: Some("flow intent".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    crate::handoff::capture("handoff-flow", Some(&wd), "closed", None).expect("capture");
+
+    let mut app = create_test_app();
+
+    // Open the interactive handoff overlay.
+    app.open_handoff_picker();
+    assert!(
+        app.session_picker_overlay.is_some(),
+        "handoff picker should be open"
+    );
+
+    // Press Enter to select the single (or currently selected) handoff.
+    app.handle_session_picker_key(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::empty(),
+    )
+    .expect("handoff picker enter should succeed");
+
+    // The overlay closes and a handoff resume is queued, not a session resume.
+    assert!(
+        app.session_picker_overlay.is_none(),
+        "handoff picker should close after selection"
+    );
+    let pending = app
+        .take_pending_handoff_resume()
+        .expect("a handoff resume should be queued");
+    assert_eq!(pending.session_id, "handoff-flow");
+    assert!(
+        app.workspace_client.take_pending_resume_session().is_none(),
+        "a handoff selection must not route to a live-session resume"
     );
 }
 

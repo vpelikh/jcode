@@ -782,7 +782,11 @@ pub fn list_sessions() -> Result<()> {
         }
         None
         | Some(tui::session_picker::PickerResult::StartNewSession)
-        | Some(tui::session_picker::PickerResult::ReviewRecentProject) => {
+        | Some(tui::session_picker::PickerResult::ReviewRecentProject)
+        | Some(tui::session_picker::PickerResult::HandoffSelected(_)) => {
+            // Handoff selection only arises from the interactive TUI overlay's
+            // handoff mode; the standalone `--resume` picker never runs in that
+            // mode, so treat it like the other inert variants.
             eprintln!("No session selected.");
             Ok(())
         }
