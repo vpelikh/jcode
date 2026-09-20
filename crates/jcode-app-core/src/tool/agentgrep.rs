@@ -249,7 +249,7 @@ impl Tool for AgentGrepTool {
                 },
                 "allow_raw_fallback": {
                     "type": "boolean",
-                    "description": "Skip the compass_query-first redirect and run raw grep for this call."
+                    "description": "Skip the compass_query-first redirect and run raw grep for this call. Note: after an agentgrep grep call was redirected in this session, the raw fallback is refused until a compass_query has actually been attempted (the tool-level redirect enforcement)."
                 }
             }
         })
