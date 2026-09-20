@@ -265,12 +265,21 @@ impl App {
         let new_state = manager.persisted_state();
         if self.session.compaction != new_state {
             self.session.compaction = new_state;
-            // Emit a SetCompaction event so the event log stays in sync with
-            // the compaction mutation. `set_compaction` also updates
-            // `self.compaction`, so the direct assignment above is redundant
-            // but makes the intent explicit.
-            if let Some(state) = self.session.compaction.clone() {
-                self.session.set_compaction(state);
+            match self.session.compaction.clone() {
+                Some(state) => {
+                    // Emit a SetCompaction event so the event log stays in sync
+                    // with the compaction mutation. `set_compaction` also
+                    // updates `self.compaction`, so the direct assignment above
+                    // is redundant but makes the intent explicit.
+                    self.session.set_compaction(state);
+                }
+                None => {
+                    // Compaction was cleared (active_summary is None). There is
+                    // no dedicated clear op, so rebuild the event log from the
+                    // legacy vectors to drop any stale SetCompaction event;
+                    // otherwise derive_compaction() would still return it.
+                    self.session.rebuild_event_map();
+                }
             }
             if let Err(err) = self.session.save() {
                 crate::logging::error(&format!(

@@ -329,6 +329,10 @@ fn apply_judge_visible_context_if_needed(session: &mut Session, title_override: 
     session.replace_messages(transcript);
     session.compaction = None;
     session.provider_session_id = None;
+    // `replace_messages` emits a ReplaceMessages event but the compaction clear
+    // above is a direct write; rebuild the event log so derive_compaction()
+    // agrees with the cleared legacy state.
+    session.rebuild_event_map();
 }
 
 /// Drop every side panel page belonging to the discarded session (#605).

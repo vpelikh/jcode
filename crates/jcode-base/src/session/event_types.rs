@@ -149,9 +149,14 @@ impl SessionEventMap {
                     messages.push(message.clone());
                 }
                 SessionEventOp::InsertMessage { index, message, .. } => {
-                    if *index < messages.len() {
-                        messages.insert(*index, message.clone());
-                    }
+                    // `Vec::insert` accepts `index == len` (append-at-end); the
+                    // legacy `insert_message` path uses it directly. Excluding
+                    // that case would drop an end-append from the derived
+                    // transcript and desync the log from `self.messages`.
+                    // Clamp any larger index (defensive only, the legacy path
+                    // cannot produce it without panicking) to len.
+                    let idx = (*index).min(messages.len());
+                    messages.insert(idx, message.clone());
                 }
                 SessionEventOp::ReplaceMessages { start_index, end_index, messages: replace_with, .. } => {
                     // Clamp so the splice is always valid. `start_index` may

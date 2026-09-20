@@ -249,8 +249,6 @@ impl Session {
         session.mark_memory_profile_dirty();
         // Hydrate the event-sourced log from the legacy vectors so that
         // `event_map` is the single source of truth for resumed sessions.
-        // `rebuild_event_map` is a no-op when the log is already populated
-        // (in-process sessions append events directly).
         session.rebuild_event_map();
         // Development-only invariant check: the rehydrated event log must
         // agree with the legacy transcript vector. This catches any code path
@@ -357,8 +355,6 @@ impl Session {
         session.mark_memory_profile_dirty();
         // Hydrate the event-sourced log from the legacy vectors so that
         // `event_map` is the single source of truth for resumed sessions.
-        // `rebuild_event_map` is a no-op when the log is already populated
-        // (in-process sessions append events directly).
         session.rebuild_event_map();
         let finalize_ms = finalize_start.elapsed().as_millis();
         crate::logging::info(&format!(
