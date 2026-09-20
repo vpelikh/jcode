@@ -1208,7 +1208,9 @@ pub(super) enum RefactorCommand {
 // The actual state machine lives in `review_loop.rs` (pure, unit-tested). This
 // section only translates between that state machine and the App/TUI: spawning
 // the per-lens reviewer child sessions, polling them for a `VERDICT`, and
-// feeding the result back. The auto loop runs for local sessions only.
+// feeding the result back. The auto loop runs for the normal TUI (including
+// remote server-clients, matching the manual `/review-loop`); replay sessions
+// are excluded.
 // ============================================================================
 
 /// Per-lens reviewer startup message. Independent per-lens reviewers each get a
@@ -1260,7 +1262,11 @@ pub(super) fn is_review_loop_active(app: &App) -> bool {
 /// Enter the review loop after the completion gates pass. Seeded on the session
 /// so it survives reloads; the actual reviewing is driven by turn-end followups.
 pub(super) fn maybe_enter_review_loop(app: &mut App) {
-    if app.is_remote || app.is_replay || !app.autoreview_enabled {
+    // The review loop auto-seeds for the normal TUI (server-client with
+    // `is_remote`), matching the manual `/review-loop` command, which already
+    // works there using the same local clone/spawn mechanism. Replay sessions
+    // are excluded (deterministic playback, never reviews live work).
+    if app.is_replay || !app.autoreview_enabled {
         return;
     }
     // Skip auto-seeding under the unit-test harness: the loop drives

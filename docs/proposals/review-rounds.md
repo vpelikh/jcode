@@ -17,9 +17,10 @@ Phases 1–6 are implemented and unit-tested on branch `jc/review-rounds`.
   hook, `input.rs` turn-end followup arm, `/review-loop` command, double-review
   guard, mutual exclusion) is in `crates/jcode-tui/src/tui/app/commands_review.rs`.
 
-The loop entry is gated behind `loop_mode` and local-session scope, matching the
-proposal. The final confirmation pass re-runs all six lenses against the final code
-state; only an all-CLEAN final pass converges.
+The loop entry is gated behind `loop_mode` and the normal-TUI scope (the manual
+`/review-loop` also runs in remote server-clients); only replay is excluded. The
+final confirmation pass re-runs all six lenses against the final code state;
+only an all-CLEAN final pass converges.
 
 As of the default-on change (`jc/review-flow`), `AutoReviewConfig.enabled` and
 `loop_mode` both default to `true`, so the review loop runs as part of the normal
@@ -237,9 +238,11 @@ session at a time; starting one clears/refuses the others. (Improve/refactor sha
 one-shot autoreview hooks `maybe_trigger_autoreview_local`. When `loop_mode`, the
 one-shot is suppressed so both don't fire on the same turn.
 
-**Session scope.** Auto `/autoreview` (and therefore the auto loop) runs for local
-sessions only (`!is_remote && !is_replay`), matching current autoreview. Remote
-auto-loop is out of scope.
+**Session scope.** Auto `/autoreview` and the auto loop run for normal TUI
+sessions (server-client, including `is_remote`), matching the manual
+`/review-loop` command which already spawned local reviewer windows there.
+Only replay sessions are excluded (`is_replay`), and the unit-test harness is
+excluded from auto-seeding for determinism.
 
 ## Ordering vs completion gates
 
@@ -341,8 +344,8 @@ per-pass budget (`max_review_turns` or unit token cap) that force-stops with a
 4. Add mutual-exclusion logic: starting a review loop clears `improve_mode`
    and vice versa; starting an improve/refactor mode refuses if a review
    loop is active.
-5. Scope the auto loop to local sessions only (`!is_remote && !is_replay`),
-   matching current autoreview.
+5. Scope the auto loop to normal TUI sessions (matching manual `/review-loop`;
+   exclude replay and the unit-test harness from auto-seeding).
 
 ### Phase 6 — digest + review record
 

@@ -360,12 +360,25 @@ fn review_loop_auto_seed_respects_defaults_and_guards() {
         "TestHarness runtime must not auto-seed"
     );
 
-    // (4) Remote sessions never auto-seed.
+    // (4) The normal product TUI is a remote server-client: it MUST auto-seed
+    //     too (matching the already-working manual `/review-loop`), so review
+    //     rounds run by default in the main client.
     let mut app = fresh();
     app.is_remote = true;
+    app.runtime_mode = AppRuntimeMode::RemoteClient;
+    super::commands::maybe_enter_review_loop(&mut app);
+    assert!(
+        app.session.review_loop.as_ref().is_some_and(|s| !s.finished),
+        "remote client (normal TUI) must auto-seed the review loop"
+    );
+
+    // (5) Replay sessions never auto-seed (deterministic playback).
+    let mut app = fresh();
+    app.is_replay = true;
+    app.runtime_mode = AppRuntimeMode::Replay;
     super::commands::maybe_enter_review_loop(&mut app);
     assert!(
         app.session.review_loop.is_none(),
-        "remote session must not auto-seed"
+        "replay session must not auto-seed"
     );
 }
