@@ -7,7 +7,8 @@ use std::time::Instant;
 use super::journal::{PersistVectorMode, SessionJournalEntry, metadata_requires_snapshot};
 use super::storage_paths::{file_len_or_zero, session_journal_path_from_snapshot, session_path};
 use super::{
-    MAX_SESSION_JOURNAL_BYTES, RemoteStartupSessionSnapshot, Session, SessionStartupStub,
+    MAX_SESSION_JOURNAL_BYTES, RemoteStartupSessionSnapshot, Session, SessionEventOp,
+    SessionStartupStub,
 };
 use crate::storage;
 
