@@ -33,8 +33,10 @@ static PENDING_REDIRECT: LazyLock<Mutex<HashMap<String, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Record that an `agentgrep` call for `session_id` was redirected to
-/// `compass_query`. Returns a guard that clears the mark when the next
-/// `compass_query` attempt (or an explicit acknowledgement) releases it.
+/// `compass_query`. The mark is cleared by the next `compass_query` execution
+/// for the session, whether that query succeeds or fails (see
+/// [`Registry::execute`]); a redirect is also cleared when the session is
+/// switched away (see `crate::agent` turn restore).
 pub fn mark_redirect_pending(session_id: &str) {
     if session_id.is_empty() {
         return;
