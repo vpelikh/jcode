@@ -26,6 +26,13 @@ degradation-management system.
   true), which is treated as the user's standing authorization. Confirmation is
   not implemented.
 
+**Integration/landing note (2026-09):** the branch merges cleanly into current
+`master` with one trivial additive conflict in `crates/jcode-base/src/config.rs`
+(both this feature's `DegradationSettings` and master's `LoopGuardConfig` are
+added to the same `pub use jcode_config_types` list and the `Config` struct). The
+resolution keeps both entries; it was validated in a throwaway merge that builds
+`jcode-base` and `jcode-app-core` cleanly. No other files conflict.
+
 > **Trigger for this plan (2026-09):** a long-running session with a live
 > language model degraded into a classic stalled-promise loop. The session
 > stayed `Active`
