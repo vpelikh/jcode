@@ -336,6 +336,27 @@ pub(crate) fn reserve_copy_badge_margins(
     }
 }
 
+/// Guard against silent right-edge clipping. The transcript Paragraph is
+/// rendered without `wrap`, so any line wider than `content_width` would have
+/// its overflow silently cut off (a long bash command such as `cargo` turning
+/// into a truncated `carg` with no visible marker). Convert each overflowing
+/// line to an ellipsized form so the cut is always signaled. Lines that fit are
+/// left untouched. Copy/selection is unaffected: it resolves against the
+/// un-truncated wrapped plain text recorded during prepare.
+pub(super) fn ellipsize_overflowing_lines(
+    lines: &mut [Line<'static>],
+    content_width: usize,
+) {
+    if content_width == 0 {
+        return;
+    }
+    for line in lines {
+        if line.width() > content_width {
+            *line = truncate_line_with_ellipsis_to_width(line, content_width);
+        }
+    }
+}
+
 pub(super) fn draw_messages(
     frame: &mut Frame,
     app: &dyn TuiState,
@@ -962,6 +983,9 @@ pub(super) fn draw_messages(
             }
         }
     }
+
+    // Guard against silent right-edge clipping (see `ellipsize_overflowing_lines`).
+    ellipsize_overflowing_lines(&mut visible_lines, content_area.width as usize);
 
     frame.render_widget(Paragraph::new(visible_lines), content_area);
 
@@ -1672,5 +1696,31 @@ mod tests {
             "Option"
         );
         assert_eq!(super::copy_badge_alt_label_from_config("⌥"), "⌥");
+    }
+
+    #[test]
+    fn ellipsize_overflowing_lines_signals_cuts_once_boundary_is_crossed() {
+        use ratatui::text::Line;
+        // Fits exactly: unchanged.
+        let mut lines = vec![Line::from("abc")];
+        super::ellipsize_overflowing_lines(&mut lines, 3);
+        assert_eq!(crate::tui::ui::line_plain_text(&lines[0]), "abc");
+
+        // One over: ellipsized to the boundary, keeping a visible '…' marker so
+        // a silently clipped `cargo` -> `carg` is never possible again.
+        let mut lines = vec![Line::from("abcdef")];
+        super::ellipsize_overflowing_lines(&mut lines, 4);
+        let out = crate::tui::ui::line_plain_text(&lines[0]);
+        assert_eq!(out, "abc…", "overflow must be ellipsized, got: {out}");
+        assert!(out.ends_with('…'));
+
+        // Zero width is a no-op (nothing to draw anyway).
+        let mut lines = vec![Line::from("abcdef")];
+        super::ellipsize_overflowing_lines(&mut lines, 0);
+        assert_eq!(
+            crate::tui::ui::line_plain_text(&lines[0]),
+            "abcdef",
+            "content_width 0 must leave lines untouched"
+        );
     }
 }
