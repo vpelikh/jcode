@@ -144,71 +144,9 @@ fn test_model_command_provider_suggestions_include_auto_for_normalized_bare_open
 
 #[test]
 fn test_remote_fallback_provider_suggestions_normalize_bare_openai_openrouter_routes() {
-    // RAII guard that pins the OpenRouter transport to a deterministic
-    // "BYOK OpenRouter is configured" state for the duration of the test and
-    // restores the developer's environment on drop (even on panic). Without
-    // this the test reads whatever the host has set in
-    // JCODE_OPENROUTER_API_BASE / JCODE_RUNTIME_PROVIDER /
-    // JCODE_OPENROUTER_PROVIDER_FEATURES / JCODE_OPENROUTER_API_KEY_NAME /
-    // JCODE_OPENROUTER_ENV_FILE: on a machine whose OpenRouter slot points at
-    // a direct OpenAI-compatible endpoint (or whose key name/env-file has been
-    // redirected), `has_openrouter_credentials()` comes back false and the
-    // `@OpenAI` fallback route the test pins disappears, failing the assertion
-    // only in that environment.
-    struct OpenRouterEnvGuard {
-        api_base: Option<std::ffi::OsString>,
-        provider_features: Option<std::ffi::OsString>,
-        dynamic_bearer: Option<std::ffi::OsString>,
-        runtime_provider: Option<std::ffi::OsString>,
-        api_key_name: Option<std::ffi::OsString>,
-        env_file: Option<std::ffi::OsString>,
-        api_key: Option<std::ffi::OsString>,
-    }
-    impl OpenRouterEnvGuard {
-        fn new() -> Self {
-            let guard = Self {
-                api_base: std::env::var_os("JCODE_OPENROUTER_API_BASE"),
-                provider_features: std::env::var_os("JCODE_OPENROUTER_PROVIDER_FEATURES"),
-                dynamic_bearer: std::env::var_os("JCODE_OPENROUTER_DYNAMIC_BEARER_PROVIDER"),
-                runtime_provider: std::env::var_os("JCODE_RUNTIME_PROVIDER"),
-                api_key_name: std::env::var_os("JCODE_OPENROUTER_API_KEY_NAME"),
-                env_file: std::env::var_os("JCODE_OPENROUTER_ENV_FILE"),
-                api_key: std::env::var_os("OPENROUTER_API_KEY"),
-            };
-            crate::env::set_var("JCODE_OPENROUTER_API_BASE", "https://openrouter.ai/api/v1");
-            crate::env::remove_var("JCODE_OPENROUTER_PROVIDER_FEATURES");
-            crate::env::remove_var("JCODE_OPENROUTER_DYNAMIC_BEARER_PROVIDER");
-            crate::env::remove_var("JCODE_RUNTIME_PROVIDER");
-            crate::env::set_var("JCODE_OPENROUTER_API_KEY_NAME", "OPENROUTER_API_KEY");
-            crate::env::remove_var("JCODE_OPENROUTER_ENV_FILE");
-            crate::env::set_var("OPENROUTER_API_KEY", "test-openrouter-key");
-            guard
-        }
-    }
-    impl Drop for OpenRouterEnvGuard {
-        fn drop(&mut self) {
-            let restore = |key: &str, value: &Option<std::ffi::OsString>| match value {
-                Some(v) => crate::env::set_var(key, v),
-                None => crate::env::remove_var(key),
-            };
-            restore("JCODE_OPENROUTER_API_BASE", &self.api_base);
-            restore(
-                "JCODE_OPENROUTER_PROVIDER_FEATURES",
-                &self.provider_features,
-            );
-            restore(
-                "JCODE_OPENROUTER_DYNAMIC_BEARER_PROVIDER",
-                &self.dynamic_bearer,
-            );
-            restore("JCODE_RUNTIME_PROVIDER", &self.runtime_provider);
-            restore("JCODE_OPENROUTER_API_KEY_NAME", &self.api_key_name);
-            restore("JCODE_OPENROUTER_ENV_FILE", &self.env_file);
-            restore("OPENROUTER_API_KEY", &self.api_key);
-        }
-    }
-
     with_temp_jcode_home(|| {
-        let _openrouter_env = OpenRouterEnvGuard::new();
+        let prev_api_key = std::env::var_os("OPENROUTER_API_KEY");
+        crate::env::set_var("OPENROUTER_API_KEY", "test-openrouter-key");
         crate::auth::AuthStatus::invalidate_cache();
 
         let mut app = create_test_app();
@@ -222,6 +160,13 @@ fn test_remote_fallback_provider_suggestions_normalize_bare_openai_openrouter_ro
 
         assert!(commands.contains(&"/model openai/gpt-5.4@auto"));
         assert!(commands.contains(&"/model openai/gpt-5.4@OpenAI"));
+
+        if let Some(prev_api_key) = prev_api_key {
+            crate::env::set_var("OPENROUTER_API_KEY", prev_api_key);
+        } else {
+            crate::env::remove_var("OPENROUTER_API_KEY");
+        }
+        crate::auth::AuthStatus::invalidate_cache();
     });
 }
 
