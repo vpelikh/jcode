@@ -21,3 +21,6 @@ captures/
 /*.avif
 /*.mp4
 /*.png
+
+# JetBrains IDE workspace files
+/.idea/
