@@ -85,9 +85,7 @@ pub(super) async fn handle_lightweight_control_request(
     // split, Slice 3).
     let swarm_members = &swarm.swarm_state.members;
     let swarms_by_id = &swarm.swarm_state.swarms_by_id;
-    let event_history = &swarm.event_history;
-    let event_counter = &swarm.event_counter;
-    let swarm_event_tx = &swarm.swarm_event_tx;
+    let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
     let await_members_runtime = &swarm.await_members_runtime;
     if let Request::Ping { id } = request {
         write_direct_event(

@@ -1,7 +1,6 @@
 use super::services::SwarmServiceHandle;
 use super::{
-    SwarmEventType, SwarmMember, record_swarm_event, subscribe_session_to_channel,
-    unsubscribe_session_from_channel,
+    SwarmEventType, SwarmMember, record_swarm_event,
 };
 use crate::protocol::{AgentInfo, ServerEvent, SwarmChannelInfo};
 use jcode_swarm_core::ChannelIndex;
@@ -24,7 +23,7 @@ pub(super) async fn handle_comm_list_channels(
     swarm: &SwarmServiceHandle,
 ) {
     let swarm_members = &swarm.swarm_state.members;
-    let channel_subscriptions = &swarm.channel_subscriptions;
+    let channel_subscriptions = swarm.channel_subscriptions_map();
     let swarm_id = swarm_id_for_session(&req_session_id, swarm_members).await;
 
     if let Some(swarm_id) = swarm_id {
@@ -65,7 +64,7 @@ pub(super) async fn handle_comm_channel_members(
     swarm: &SwarmServiceHandle,
 ) {
     let swarm_members = &swarm.swarm_state.members;
-    let channel_subscriptions = &swarm.channel_subscriptions;
+    let channel_subscriptions = swarm.channel_subscriptions_map();
     let swarm_id = swarm_id_for_session(&req_session_id, swarm_members).await;
 
     if let Some(swarm_id) = swarm_id {
@@ -121,11 +120,7 @@ pub(super) async fn handle_comm_subscribe_channel(
     swarm: &SwarmServiceHandle,
 ) {
     let swarm_members = &swarm.swarm_state.members;
-    let channel_subscriptions = &swarm.channel_subscriptions;
-    let channel_subscriptions_by_session = &swarm.channel_subscriptions_by_session;
-    let event_history = &swarm.event_history;
-    let event_counter = &swarm.event_counter;
-    let swarm_event_tx = &swarm.swarm_event_tx;
+    let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
     let started = std::time::Instant::now();
     let swarm_id = swarm_id_for_session(&req_session_id, swarm_members).await;
 
@@ -140,14 +135,9 @@ pub(super) async fn handle_comm_subscribe_channel(
                 ("channel", channel.clone()),
             ],
         );
-        subscribe_session_to_channel(
-            &req_session_id,
-            &swarm_id,
-            &channel,
-            channel_subscriptions,
-            channel_subscriptions_by_session,
-        )
-        .await;
+        swarm
+            .subscribe_session_to_channel(&req_session_id, &swarm_id, &channel)
+            .await;
 
         record_swarm_event(
             event_history,
@@ -203,11 +193,7 @@ pub(super) async fn handle_comm_unsubscribe_channel(
     swarm: &SwarmServiceHandle,
 ) {
     let swarm_members = &swarm.swarm_state.members;
-    let channel_subscriptions = &swarm.channel_subscriptions;
-    let channel_subscriptions_by_session = &swarm.channel_subscriptions_by_session;
-    let event_history = &swarm.event_history;
-    let event_counter = &swarm.event_counter;
-    let swarm_event_tx = &swarm.swarm_event_tx;
+    let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
     let started = std::time::Instant::now();
     let swarm_id = swarm_id_for_session(&req_session_id, swarm_members).await;
 
@@ -222,14 +208,9 @@ pub(super) async fn handle_comm_unsubscribe_channel(
                 ("channel", channel.clone()),
             ],
         );
-        unsubscribe_session_from_channel(
-            &req_session_id,
-            &swarm_id,
-            &channel,
-            channel_subscriptions,
-            channel_subscriptions_by_session,
-        )
-        .await;
+        swarm
+            .unsubscribe_session_from_channel(&req_session_id, &swarm_id, &channel)
+            .await;
 
         record_swarm_event(
             event_history,

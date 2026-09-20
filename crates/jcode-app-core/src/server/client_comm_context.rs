@@ -1,12 +1,11 @@
 use super::debug::ClientConnectionInfo;
 use super::services::SwarmServiceHandle;
 use super::{
-    SharedContext, SwarmEventType, SwarmMember, fanout_session_event, record_swarm_event,
+    SwarmEventType, SwarmMember, fanout_session_event, record_swarm_event,
 };
 use crate::protocol::{AgentInfo, ContextEntry, NotificationType, ServerEvent};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::sync::{RwLock, mpsc};
 
 async fn swarm_id_for_session(
@@ -41,46 +40,22 @@ pub(super) async fn handle_comm_share(
     // split, convergence slice).
     let swarm_members = &swarm.swarm_state.members;
     let swarms_by_id = &swarm.swarm_state.swarms_by_id;
-    let shared_context = &swarm.shared_context;
-    let event_history = &swarm.event_history;
-    let event_counter = &swarm.event_counter;
-    let swarm_event_tx = &swarm.swarm_event_tx;
+    let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
     let swarm_id = swarm_id_for_session(&req_session_id, swarm_members).await;
 
     if let Some(swarm_id) = swarm_id {
         let friendly_name = friendly_name_for_session(&req_session_id, swarm_members).await;
 
-        {
-            let mut ctx = shared_context.write().await;
-            let swarm_ctx = ctx.entry(swarm_id.clone()).or_insert_with(HashMap::new);
-            let now = Instant::now();
-            let created_at = swarm_ctx.get(&key).map(|c| c.created_at).unwrap_or(now);
-            let stored_value = if append {
-                swarm_ctx
-                    .get(&key)
-                    .map(|existing| {
-                        if existing.value.is_empty() {
-                            value.clone()
-                        } else {
-                            format!("{}\n{}", existing.value, value)
-                        }
-                    })
-                    .unwrap_or_else(|| value.clone())
-            } else {
-                value.clone()
-            };
-            swarm_ctx.insert(
-                key.clone(),
-                SharedContext {
-                    key: key.clone(),
-                    value: stored_value.clone(),
-                    from_session: req_session_id.clone(),
-                    from_name: friendly_name.clone(),
-                    created_at,
-                    updated_at: now,
-                },
-            );
-        }
+        swarm
+            .set_shared_context(
+                &swarm_id,
+                &key,
+                value.clone(),
+                &req_session_id,
+                friendly_name.clone(),
+                append,
+            )
+            .await;
 
         let swarm_session_ids: Vec<String> = {
             let swarms = swarms_by_id.read().await;
@@ -171,37 +146,33 @@ pub(super) async fn handle_comm_read(
     swarm: &SwarmServiceHandle,
 ) {
     let swarm_members = &swarm.swarm_state.members;
-    let shared_context = &swarm.shared_context;
     let swarm_id = swarm_id_for_session(&req_session_id, swarm_members).await;
 
     let entries = if let Some(swarm_id) = swarm_id {
-        let ctx = shared_context.read().await;
-        if let Some(swarm_ctx) = ctx.get(&swarm_id) {
-            if let Some(k) = key {
-                swarm_ctx
-                    .get(&k)
-                    .map(|c| {
-                        vec![ContextEntry {
-                            key: c.key.clone(),
-                            value: c.value.clone(),
-                            from_session: c.from_session.clone(),
-                            from_name: c.from_name.clone(),
-                        }]
-                    })
-                    .unwrap_or_default()
-            } else {
-                swarm_ctx
-                    .values()
-                    .map(|c| ContextEntry {
-                        key: c.key.clone(),
-                        value: c.value.clone(),
-                        from_session: c.from_session.clone(),
-                        from_name: c.from_name.clone(),
-                    })
-                    .collect()
-            }
-        } else {
-            Vec::new()
+        match key {
+            Some(k) => swarm
+                .get_shared_context(&swarm_id, &k)
+                .await
+                .map(|c| {
+                    vec![ContextEntry {
+                        key: c.key,
+                        value: c.value,
+                        from_session: c.from_session,
+                        from_name: c.from_name,
+                    }]
+                })
+                .unwrap_or_default(),
+            None => swarm
+                .shared_context_entries(&swarm_id)
+                .await
+                .into_iter()
+                .map(|c| ContextEntry {
+                    key: c.key,
+                    value: c.value,
+                    from_session: c.from_session,
+                    from_name: c.from_name,
+                })
+                .collect(),
         }
     } else {
         Vec::new()

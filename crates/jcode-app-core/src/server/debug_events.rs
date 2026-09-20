@@ -9,7 +9,7 @@ pub(super) async fn maybe_handle_event_query_command(
     cmd: &str,
     swarm: &SwarmServiceHandle,
 ) -> Option<String> {
-    let event_history = &swarm.event_history;
+    let event_history = swarm.read_event_sources().0;
     if cmd == "events:recent" || cmd.starts_with("events:recent:") {
         let count: usize = cmd
             .strip_prefix("events:recent:")

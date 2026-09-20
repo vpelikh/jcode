@@ -8,7 +8,7 @@
 use crate::plan::VersionedPlan;
 use crate::server::services::SwarmServiceHandle;
 use crate::server::{
-    AwaitMembersRuntime, FileTouchService, SharedContext, SwarmEvent, SwarmMember,
+    SharedContext, SwarmEvent, SwarmMember,
     SwarmMutationRuntime, SwarmState,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -104,8 +104,8 @@ impl TestSwarmBuilder {
     }
 
     pub(crate) fn build(self) -> SwarmServiceHandle {
-        SwarmServiceHandle {
-            swarm_state: SwarmState {
+        let mut handle = SwarmServiceHandle::test_with_state(
+            SwarmState {
                 members: self
                     .members
                     .unwrap_or_else(|| Arc::new(RwLock::new(HashMap::new()))),
@@ -119,27 +119,21 @@ impl TestSwarmBuilder {
                     .coordinators
                     .unwrap_or_else(|| Arc::new(RwLock::new(HashMap::new()))),
             },
-            shared_context: self
-                .shared_context
+            self.shared_context
                 .unwrap_or_else(|| Arc::new(RwLock::new(HashMap::new()))),
-            file_touch: FileTouchService::new(),
-            channel_subscriptions: self
-                .channel_subscriptions
+            self.channel_subscriptions
                 .unwrap_or_else(|| Arc::new(RwLock::new(HashMap::new()))),
-            channel_subscriptions_by_session: self
-                .channel_subscriptions_by_session
+            self.channel_subscriptions_by_session
                 .unwrap_or_else(|| Arc::new(RwLock::new(HashMap::new()))),
-            event_history: self
-                .event_history
+            self.swarm_mutation_runtime.unwrap_or_default(),
+        );
+        handle = handle.with_event_sources(
+            self.event_history
                 .unwrap_or_else(|| Arc::new(RwLock::new(VecDeque::new()))),
-            event_counter: self
-                .event_counter
+            self.event_counter
                 .unwrap_or_else(|| Arc::new(AtomicU64::new(0))),
-            swarm_event_tx: self
-                .swarm_event_tx
-                .unwrap_or_else(|| broadcast::channel(16).0),
-            await_members_runtime: AwaitMembersRuntime::default(),
-            swarm_mutation_runtime: self.swarm_mutation_runtime.unwrap_or_default(),
-        }
+            self.swarm_event_tx.unwrap_or_else(|| broadcast::channel(16).0),
+        );
+        handle
     }
 }

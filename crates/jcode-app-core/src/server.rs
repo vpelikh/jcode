@@ -70,8 +70,7 @@ use self::swarm::{
     swarm_is_self_or_ancestor, update_member_status_with_report_tldr,
 };
 use self::swarm_channels::{
-    remove_session_channel_subscriptions, subscribe_session_to_channel,
-    unsubscribe_session_from_channel,
+    remove_session_channel_subscriptions,
 };
 pub(super) use self::swarm_mutation_state::SwarmMutationRuntime;
 use self::swarm_persistence::{
@@ -1973,9 +1972,6 @@ impl Server {
         let file_touch = swarm.file_touch.clone();
         let swarm_members = Arc::clone(&swarm.swarm_state.members);
         let swarms_by_id = Arc::clone(&swarm.swarm_state.swarms_by_id);
-        let event_history = swarm.event_history.clone();
-        let event_counter = Arc::clone(&swarm.event_counter);
-        let swarm_event_tx = swarm.swarm_event_tx.clone();
         let mut receiver = Bus::global().subscribe();
         let mut last_cleanup = Instant::now();
         const TOUCH_EXPIRY: Duration = Duration::from_secs(30 * 60); // 30 min
@@ -2017,22 +2013,20 @@ impl Server {
                         let swarm_id = member.and_then(|m| m.swarm_id.clone());
 
                         drop(members);
-                        record_swarm_event(
-                            &event_history,
-                            &event_counter,
-                            &swarm_event_tx,
-                            session_id.clone(),
-                            session_name,
-                            swarm_id,
-                            SwarmEventType::FileTouch {
-                                path: path.to_string_lossy().to_string(),
-                                op: touch.op.as_str().to_string(),
-                                intent: touch.intent.clone(),
-                                summary: touch.summary.clone(),
-                                detail: touch.detail.clone(),
-                            },
-                        )
-                        .await;
+                        swarm
+                            .record_swarm_event(
+                                session_id.clone(),
+                                session_name,
+                                swarm_id,
+                                SwarmEventType::FileTouch {
+                                    path: path.to_string_lossy().to_string(),
+                                    op: touch.op.as_str().to_string(),
+                                    intent: touch.intent.clone(),
+                                    summary: touch.summary.clone(),
+                                    detail: touch.detail.clone(),
+                                },
+                            )
+                            .await;
                     }
 
                     // Find the swarm this session belongs to

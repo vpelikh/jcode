@@ -22,11 +22,11 @@ pub(super) async fn maybe_handle_swarm_read_command(
     // flat pass-through argument bag (server service split, Slice 4).
     let swarm_members = &swarm.swarm_state.members;
     let swarms_by_id = &swarm.swarm_state.swarms_by_id;
-    let shared_context = &swarm.shared_context;
+    let shared_context = swarm.shared_context_map();
     let swarm_plans = &swarm.swarm_state.plans;
     let swarm_coordinators = &swarm.swarm_state.coordinators;
     let file_touch = &swarm.file_touch;
-    let channel_subscriptions = &swarm.channel_subscriptions;
+    let channel_subscriptions = swarm.channel_subscriptions_map();
     let swarm_state = SwarmState {
         members: Arc::clone(swarm_members),
         swarms_by_id: Arc::clone(swarms_by_id),

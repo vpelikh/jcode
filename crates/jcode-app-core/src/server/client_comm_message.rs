@@ -112,7 +112,7 @@ pub(super) async fn handle_comm_message(
 ) {
     let swarm_members = &swarm.swarm_state.members;
     let swarms_by_id = &swarm.swarm_state.swarms_by_id;
-    let channel_subscriptions = &swarm.channel_subscriptions;
+    let channel_subscriptions = swarm.channel_subscriptions_map();
     let sessions = &session.sessions;
     let started = std::time::Instant::now();
     crate::logging::event_info(

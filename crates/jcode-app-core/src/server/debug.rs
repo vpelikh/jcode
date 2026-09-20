@@ -270,7 +270,7 @@ pub(super) async fn handle_debug_client(
     let client_debug_state = debug_service.client_debug_state;
     let client_debug_response_tx = debug_service.client_debug_response_tx;
     let debug_jobs = debug_service.debug_jobs;
-    let swarm_event_tx = swarm_service.swarm_event_tx;
+    let swarm_event_tx = swarm_service_handle.read_event_sources().2.clone();
     let shutdown_signals = session_service.shutdown_signals;
     let soft_interrupt_queues = session_service.soft_interrupt_queues;
     let (reader, mut writer) = stream.into_split();

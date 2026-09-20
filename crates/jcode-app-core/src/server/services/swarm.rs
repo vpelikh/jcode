@@ -15,6 +15,14 @@ use tokio::sync::{RwLock, broadcast, mpsc};
 /// Channel subscriptions (swarm_id -> channel -> session_ids).
 type ChannelSubscriptions = Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
 
+/// Borrowed view of the swarm event emission sources handed to read callers:
+/// the ring-buffer history, the event-id counter, and the broadcast sender.
+type EventSources<'a> = (
+    &'a Arc<RwLock<VecDeque<SwarmEvent>>>,
+    &'a Arc<AtomicU64>,
+    &'a broadcast::Sender<SwarmEvent>,
+);
+
 /// Owns swarm membership, plans, shared context, channel subscriptions,
 /// event history/broadcast, file-touch tracking, and the persisted coordination
 /// runtimes.
@@ -27,19 +35,19 @@ pub(crate) struct SwarmServiceHandle {
     /// Shared ownership of core swarm coordination state.
     pub(crate) swarm_state: SwarmState,
     /// Shared context by swarm (swarm_id -> key -> SharedContext).
-    pub(crate) shared_context: Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
+    shared_context: Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
     /// File-touch tracking service (forward path index + reverse session index).
     pub(crate) file_touch: FileTouchService,
     /// Channel subscriptions forward index.
-    pub(crate) channel_subscriptions: ChannelSubscriptions,
+    channel_subscriptions: ChannelSubscriptions,
     /// Channel subscriptions reverse index (session_id -> swarm_id -> channels).
-    pub(crate) channel_subscriptions_by_session: ChannelSubscriptions,
+    channel_subscriptions_by_session: ChannelSubscriptions,
     /// Event history for real-time event subscription (ring buffer).
-    pub(crate) event_history: Arc<RwLock<VecDeque<SwarmEvent>>>,
+    event_history: Arc<RwLock<VecDeque<SwarmEvent>>>,
     /// Counter for event IDs.
-    pub(crate) event_counter: Arc<AtomicU64>,
+    event_counter: Arc<AtomicU64>,
     /// Broadcast channel for swarm event subscriptions.
-    pub(crate) swarm_event_tx: broadcast::Sender<SwarmEvent>,
+    swarm_event_tx: broadcast::Sender<SwarmEvent>,
     /// Persisted communicate await_members wait registry.
     pub(crate) await_members_runtime: AwaitMembersRuntime,
     /// Persisted dedupe registry for mutating swarm coordinator operations.
@@ -68,6 +76,59 @@ impl SwarmServiceHandle {
             swarm_event_tx: server.swarm_event_tx.clone(),
             await_members_runtime: server.await_members_runtime.clone(),
             swarm_mutation_runtime: server.swarm_mutation_runtime.clone(),
+        }
+    }
+
+    /// Borrow the swarm event emission sources (`history`, `counter`,
+    /// `broadcast sender`). Reads only: mutations route through
+    /// `record_swarm_event`. Exists so the private event-sink fields stay
+    /// encapsulated (Tier 3).
+    pub(crate) fn read_event_sources(&self) -> EventSources<'_> {
+        (
+            &self.event_history,
+            &self.event_counter,
+            &self.swarm_event_tx,
+        )
+    }
+
+    /// Construct an otherwise-default handle with specific event sources.
+    /// Test-only: lets `TestSwarmBuilder` seed the (now-private) event sinks
+    /// without exposing them as mutable fields.
+    #[cfg(test)]
+    pub(crate) fn with_event_sources(
+        mut self,
+        event_history: Arc<RwLock<VecDeque<SwarmEvent>>>,
+        event_counter: Arc<AtomicU64>,
+        swarm_event_tx: broadcast::Sender<SwarmEvent>,
+    ) -> Self {
+        self.event_history = event_history;
+        self.event_counter = event_counter;
+        self.swarm_event_tx = swarm_event_tx;
+        self
+    }
+
+    /// Build an all-default handle for tests. Test-only: provides a
+    /// constructor for the (now-private) fields while callers configure them
+    /// through `with_event_sources` / `with_swarm_state`.
+    #[cfg(test)]
+    pub(crate) fn test_with_state(
+        swarm_state: SwarmState,
+        shared_context: Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
+        channel_subscriptions: ChannelSubscriptions,
+        channel_subscriptions_by_session: ChannelSubscriptions,
+        swarm_mutation_runtime: SwarmMutationRuntime,
+    ) -> Self {
+        Self {
+            swarm_state,
+            shared_context,
+            file_touch: FileTouchService::new(),
+            channel_subscriptions,
+            channel_subscriptions_by_session,
+            event_history: Arc::new(RwLock::new(VecDeque::new())),
+            event_counter: Arc::new(AtomicU64::new(0)),
+            swarm_event_tx: broadcast::channel(16).0,
+            await_members_runtime: AwaitMembersRuntime::default(),
+            swarm_mutation_runtime,
         }
     }
 
@@ -388,6 +449,92 @@ impl SwarmServiceHandle {
         .await;
     }
 
+    /// Upsert a shared-context entry for `swarm_id` / `key`. `append` toggles
+    /// the append semantics of `comm_context:write` (a trailing line joined to
+    /// the existing value). Preserves the original `created_at` on refresh.
+    /// Routes the shared-context map mutation through the swarm service so
+    /// callers do not touch the raw map (Tier 3).
+    pub(crate) async fn set_shared_context(
+        &self,
+        swarm_id: &str,
+        key: &str,
+        value: String,
+        from_session: &str,
+        from_name: Option<String>,
+        append: bool,
+    ) {
+        let mut shared_ctx = self.shared_context.write().await;
+        let swarm_ctx = shared_ctx.entry(swarm_id.to_string()).or_default();
+        let now = Instant::now();
+        let created_at = swarm_ctx.get(key).map(|c| c.created_at).unwrap_or(now);
+        let stored_value = if append {
+            swarm_ctx
+                .get(key)
+                .map(|existing| {
+                    if existing.value.is_empty() {
+                        value.clone()
+                    } else {
+                        format!("{}\n{}", existing.value, value)
+                    }
+                })
+                .unwrap_or_else(|| value.clone())
+        } else {
+            value.clone()
+        };
+        swarm_ctx.insert(
+            key.to_string(),
+            SharedContext {
+                key: key.to_string(),
+                value: stored_value.clone(),
+                from_session: from_session.to_string(),
+                from_name,
+                created_at,
+                updated_at: now,
+            },
+        );
+    }
+
+    /// Read a single shared-context entry for `swarm_id` / `key`, if present.
+    pub(crate) async fn get_shared_context(
+        &self,
+        swarm_id: &str,
+        key: &str,
+    ) -> Option<SharedContext> {
+        self.shared_context
+            .read()
+            .await
+            .get(swarm_id)
+            .and_then(|swarm_ctx| swarm_ctx.get(key))
+            .cloned()
+    }
+
+    /// Read a snapshot of all shared-context entries for `swarm_id`.
+    pub(crate) async fn shared_context_entries(&self, swarm_id: &str) -> Vec<SharedContext> {
+        self.shared_context
+            .read()
+            .await
+            .get(swarm_id)
+            .map(|swarm_ctx| swarm_ctx.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Borrow the whole shared-context map for read-only snapshot consumers
+    /// (debug `swarm:context` / `server_state` observation paths). Callers
+    /// must not mutate through this handle; all writes route through
+    /// `set_shared_context` / `remove_shared_context`.
+    pub(crate) fn shared_context_map(
+        &self,
+    ) -> &Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>> {
+        &self.shared_context
+    }
+
+    /// Remove a single shared-context entry for `swarm_id` / `key`.
+    pub(crate) async fn remove_shared_context(&self, swarm_id: &str, key: &str) {
+        if let Some(swarm_ctx) = self.shared_context.write().await.get_mut(swarm_id) {
+            swarm_ctx.remove(key);
+        }
+    }
+
     /// Record a swarm event into the ring buffer and broadcast it. Routes event
     /// emission through the swarm service so callers do not touch the event
     /// sinks directly. Deferred to `swarm::record_swarm_event`.
@@ -420,6 +567,59 @@ impl SwarmServiceHandle {
             &self.channel_subscriptions_by_session,
         )
         .await;
+    }
+
+    /// Subscribe a session to a channel within a swarm. Routes the channel
+    /// index updates through the swarm service (Tier 3).
+    pub(crate) async fn subscribe_session_to_channel(
+        &self,
+        session_id: &str,
+        swarm_id: &str,
+        channel: &str,
+    ) {
+        super::super::swarm_channels::subscribe_session_to_channel(
+            session_id,
+            swarm_id,
+            channel,
+            &self.channel_subscriptions,
+            &self.channel_subscriptions_by_session,
+        )
+        .await;
+    }
+
+    /// Unsubscribe a session from a channel within a swarm. Routes the channel
+    /// index updates through the swarm service (Tier 3).
+    pub(crate) async fn unsubscribe_session_from_channel(
+        &self,
+        session_id: &str,
+        swarm_id: &str,
+        channel: &str,
+    ) {
+        super::super::swarm_channels::unsubscribe_session_from_channel(
+            session_id,
+            swarm_id,
+            channel,
+            &self.channel_subscriptions,
+            &self.channel_subscriptions_by_session,
+        )
+        .await;
+    }
+
+    /// Borrow the channel-subscription forward index for read-only consumers
+    /// (channel list / member resolution, debug snapshots). Callers must not
+    /// mutate through this handle; all writes route through
+    /// `subscribe_session_to_channel` / `unsubscribe_session_from_channel` /
+    /// `remove_session_channel_subscriptions`.
+    pub(crate) fn channel_subscriptions_map(&self) -> &ChannelSubscriptions {
+        &self.channel_subscriptions
+    }
+
+    /// Borrow the channel-subscription reverse index (session_id -> swarm_id ->
+    /// channels) for read-only consumers. Callers must not mutate through this
+    /// handle; all writes route through the subscribe/unsubscribe/remove
+    /// methods.
+    pub(crate) fn channel_subscriptions_by_session_map(&self) -> &ChannelSubscriptions {
+        &self.channel_subscriptions_by_session
     }
 
     /// Rebroadcast the current membership of a swarm to its channel
