@@ -265,6 +265,13 @@ impl App {
         let new_state = manager.persisted_state();
         if self.session.compaction != new_state {
             self.session.compaction = new_state;
+            // Emit a SetCompaction event so the event log stays in sync with
+            // the compaction mutation. `set_compaction` also updates
+            // `self.compaction`, so the direct assignment above is redundant
+            // but makes the intent explicit.
+            if let Some(state) = self.session.compaction.clone() {
+                self.session.set_compaction(state);
+            }
             if let Err(err) = self.session.save() {
                 crate::logging::error(&format!(
                     "Failed to persist compaction state for session {}: {}",
@@ -306,6 +313,10 @@ impl App {
         };
 
         self.session.compaction = Some(state.clone());
+        // Emit a SetCompaction event so the event log stays in sync with the
+        // compaction mutation. `set_compaction` also updates `self.compaction`,
+        // but the direct assignment above keeps the intent explicit.
+        self.session.set_compaction(state.clone());
         let provider_messages = self.materialized_provider_messages();
         let compaction = self.registry.compaction();
         if let Ok(mut manager) = compaction.try_write() {

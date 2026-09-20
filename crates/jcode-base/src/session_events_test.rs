@@ -236,7 +236,7 @@ fn test_event_op_serialization() {
         message: StoredMessage {
             id: "msg_123".to_string(),
             role: Role::User,
-            content: vec![],
+            content: vec![text_block("hello")],
             display_role: None,
             timestamp: None,
             tool_duration_ms: None,
