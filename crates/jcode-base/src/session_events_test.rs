@@ -413,6 +413,52 @@ fn test_orphaned_compaction_reports_innermost_unmatched_start() {
     }
 }
 
+/// For a malformed log with several unclosed brackets, `orphaned_compactions()`
+/// enumerates ALL unmatched `CompactionStart` markers (not just the innermost,
+/// which is what `orphaned_compaction()` reports for crash-recovery).
+#[test]
+fn test_orphaned_compactions_reports_all_unmatched_starts() {
+    let mut map = SessionEventMap::default();
+    // Two distinct interrupted runs: [Start A] ... [Start B] with no closes.
+    let start_a = SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "a".to_string(),
+        op: SessionEventOp::CompactionStart {
+            compaction_id: "run_a".to_string(),
+            covers_up_to_turn: 5,
+        },
+        parent_id: None,
+        version: 1,
+    };
+    let start_b = SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "b".to_string(),
+        op: SessionEventOp::CompactionStart {
+            compaction_id: "run_b".to_string(),
+            covers_up_to_turn: 5,
+        },
+        parent_id: None,
+        version: 1,
+    };
+    map.push_event(start_a);
+    map.push_event(start_b);
+
+    let orphans = map.orphaned_compactions();
+    assert_eq!(
+        orphans.len(),
+        2,
+        "both unmatched starts must be reported"
+    );
+    let ids: Vec<&str> = orphans
+        .iter()
+        .filter_map(|e| match &e.op {
+            SessionEventOp::CompactionStart { compaction_id, .. } => Some(compaction_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, vec!["run_a", "run_b"], "orphans reported in log order");
+}
+
 /// A `CompactionEnd` without a preceding `CompactionStart` is itself an orphan
 /// (an "unpaired close") and must be flagged by the bracket invariant.
 #[test]
@@ -598,7 +644,8 @@ fn test_event_op_serialization() {
 /// plugin can add event kinds without editing the core enum.
 #[test]
 fn test_unknown_op_escape_hatch_preserves_payload() {
-    let raw = r#"{"op":"plugin_custom_note","note":"hello","count":3,"nested":{"a":[1,2]}}"#;
+    // Envelope wire format: the plugin payload lives verbatim under `data`.
+    let raw = r#"{"op":"plugin_custom_note","data":{"note":"hello","count":3,"nested":{"a":[1,2]}}}"#;
     let op: SessionEventOp = serde_json::from_str(raw).expect("unknown op must deserialize");
     match &op {
         SessionEventOp::Unknown { event_type, data } => {
@@ -607,8 +654,6 @@ fn test_unknown_op_escape_hatch_preserves_payload() {
             assert_eq!(data.get("note").and_then(|v| v.as_str()), Some("hello"));
             assert_eq!(data.get("count").and_then(|v| v.as_u64()), Some(3));
             assert!(data.contains_key("nested"));
-            // The `op` key itself must not be duplicated inside the payload.
-            assert!(data.get("op").is_none());
         }
         other => panic!("expected Unknown, got {other:?}"),
     }
@@ -722,6 +767,48 @@ fn test_rebuild_event_map_preserves_plugin_unknown_events() {
     session
         .rederive_all_checked()
         .expect("rebuilt log must stay consistent");
+}
+
+/// `rebuild_event_map` must preserve an **orphaned `CompactionStart`** marker
+/// through a rebuild from the legacy vectors. An unmatched open bracket is the
+/// durable "incomplete compaction" signal (takeaway #5); erasing it on a
+/// divergent-load rebuild would silently hide an interrupted compaction. An open
+/// `Start` affects neither `derive_messages` nor `current_compaction`, so
+/// preserving it keeps the rebuilt log deriving the same state as the legacy
+/// vectors while retaining the orphan signal.
+#[test]
+fn test_rebuild_event_map_preserves_orphaned_compaction_start() {
+    let mut session = Session::create_with_id("rebuild_orphan".to_string(), None, None);
+    session.append_stored_message(StoredMessage {
+        id: "m1".to_string(),
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    // Simulate a crash mid-compaction: an open `CompactionStart` with no close.
+    session.event_map.start_compaction("orphan_run", 3);
+    assert!(
+        session.event_map.orphaned_compaction().is_some(),
+        "precondition: an orphaned bracket is present"
+    );
+
+    // Rebuild from the legacy vectors (simulating reconcile / sanitize-clear).
+    session.rebuild_event_map();
+
+    assert!(
+        session.event_map.orphaned_compaction().is_some(),
+        "rebuild_event_map must preserve the orphaned CompactionStart marker"
+    );
+    // Derived state still agrees with the legacy vectors (orphan is log-only).
+    session
+        .rederive_all_checked()
+        .expect("rebuilt log with preserved orphan must stay consistent");
 }
 
 /// Unknown ops must still be rejected by validation if their event id is empty,
@@ -1611,6 +1698,61 @@ fn test_append_and_insert_empty_content_message_stay_consistent() {
     assert_eq!(session.derive_messages().len(), session.messages.len());
 }
 
+/// `append_session_event` carries a debug-only self-check: appending a
+/// message-carrying op (`AppendMessage`) that the caller does NOT also push onto
+/// the legacy `messages` vector must trip an assertion in debug builds — the
+/// dual-source-of-truth contract enforced in dev rather than silently desyncing
+/// (which would later force a divergent-load rebuild). Log-only ops (`Unknown`,
+/// brackets) never trip it.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "session event-log/legacy desync")]
+fn test_append_session_event_appends_checks_desync_in_debug() {
+    let mut session = Session::create_with_id("append_desync_debug".to_string(), None, None);
+    // Append a state-carrying AppendMessage WITHOUT updating session.messages.
+    // This violates the documented contract and must be caught by the check.
+    session.append_session_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "m_desync".to_string(),
+        op: SessionEventOp::AppendMessage {
+            message_id: "m_desync".to_string(),
+            message: StoredMessage {
+                id: "m_desync".to_string(),
+                role: Role::User,
+                content: vec![text_block("oops")],
+                display_role: None,
+                timestamp: None,
+                tool_duration_ms: None,
+                token_usage: None,
+            },
+        },
+        parent_id: None,
+        version: 1,
+    });
+}
+
+/// Appending a **log-only** op (`Unknown`) through `append_session_event` must
+/// NOT trip the debug self-check: it does not count into `messages`, so a plugin
+/// event append stays valid even though the caller does not touch `messages`.
+#[test]
+#[cfg(debug_assertions)]
+fn test_append_session_event_log_only_op_does_not_check_desync() {
+    let mut session = Session::create_with_id("append_logonly_debug".to_string(), None, None);
+    let recorded = session.append_session_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "plugin_debug".to_string(),
+        op: SessionEventOp::Unknown {
+            event_type: "plugin/x".to_string(),
+            data: serde_json::json!({}),
+        },
+        parent_id: None,
+        version: 1,
+    });
+    assert!(recorded, "log-only Unknown must be recorded");
+    // messages untouched; no panic.
+    assert!(session.messages.is_empty());
+}
+
 #[test]
 fn test_replace_messages_then_direct_compaction_clear_stays_consistent() {
     // Mirrors apply_judge_visible_context_if_needed: replace the transcript
@@ -2461,20 +2603,18 @@ fn test_compact_transcript_with_bracket_produces_balanced_durable_bracket() {
         .expect("reloaded bracket producer log must stay consistent");
 }
 
-/// An `Unknown` event constructed in-memory with a **non-object** `data` payload
-/// (e.g. `data: json!(123)`) must serialize to exactly one top-level `op` key.
-/// Regression for a bug where the non-object branch emitted `op` inside the
-/// match *and* again after it, producing invalid JSON with duplicate keys:
-/// `{"op":"x","data":123,"op":"x"}`. The serialized form is also shape-stable
-/// after the first round-trip (a scalar becomes the object-wrapped form, matching
-/// the on-wire shape, and stays stable on subsequent round-trips).
+/// An `Unknown` whose payload is a non-object value (e.g. `data: json!(123)`)
+/// serializes to exactly one top-level `op` key, with the bare value under
+/// `data`. The envelope encoding makes a scalar/array payload unambiguous: it
+/// lives verbatim under `data`, so no object-wrapping heuristic is needed and
+/// the shape is stable across round-trips.
 #[test]
 fn test_unknown_op_in_memory_non_object_serializes_single_op() {
     let op = SessionEventOp::Unknown {
         event_type: "plugin_scalar".to_string(),
         data: serde_json::json!(123),
     };
-    // The RAW serialized string must contain exactly one `op` key (no duplicates).
+    // The RAW serialized string must contain exactly one `op` key.
     let json = serde_json::to_string(&op).expect("serialize in-memory non-object");
     let raw_op_count = json.matches("\"op\":").count();
     assert_eq!(
@@ -2482,8 +2622,12 @@ fn test_unknown_op_in_memory_non_object_serializes_single_op() {
         1,
         "in-memory non-object Unknown must serialize exactly one op key; got: {json}"
     );
-    // The round-trip must be lossless AND stable: the scalar/bare payload is
-    // preserved (not object-wrapped) and stays unchanged on further round-trips.
+    // The bare scalar must be preserved verbatim under `data`.
+    assert!(
+        json.contains("\"data\":123"),
+        "scalar payload must be emitted verbatim under data; got: {json}"
+    );
+    // The round-trip must be lossless AND stable.
     let back: SessionEventOp = serde_json::from_str(&json).expect("deserialize");
     let json2 = serde_json::to_string(&back).expect("re-serialize");
     assert_eq!(
@@ -2496,17 +2640,12 @@ fn test_unknown_op_in_memory_non_object_serializes_single_op() {
     assert_eq!(json2.matches("\"op\":").count(), 1);
 }
 
-/// The `Unknown` escape hatch must round-trip **stably** even when the remaining
-/// payload is not a flat JSON object (e.g. `{"op":"x","data":123}`). The
-/// serializer emission-encodes a non-object payload as a lone `data` field, and
-/// the deserializer unwraps it back to the bare value, so a scalar/array payload
-/// round-trips losslessly (no unbounded nesting growth, no spurious object
-/// wrapper). This pins the documented behavior of the non-object branch.
+/// The `Unknown` escape hatch must round-trip **stably** when the payload is not
+/// a flat JSON object (a scalar or array). With the envelope encoding the bare
+/// value lives verbatim under `data`, so it round-trips losslessly with no
+/// object-wrapping and no ambiguity.
 #[test]
 fn test_unknown_op_non_object_payload_round_trips_losslessly() {
-    // A non-object payload (scalar or array) must deserialize to the bare value,
-    // NOT collapse into `{"data":123}` (the serializer's emission shape), and
-    // round-trip losslessly.
     for (raw_tag, payload) in [
         (r#"{"op":"plugin_scalar","data":123}"#, serde_json::json!(123)),
         (
@@ -2520,7 +2659,7 @@ fn test_unknown_op_non_object_payload_round_trips_losslessly() {
             SessionEventOp::Unknown { event_type, data } => {
                 assert_eq!(
                     data, &payload,
-                    "raw non-object payload must not be wrapped under `data`"
+                    "raw non-object payload must be preserved verbatim under data"
                 );
                 // Round-trip: the bare value must serialize back to the same
                 // wire form and deserialize to the identical value.
@@ -2780,10 +2919,10 @@ fn test_compact_transcript_invalid_compaction_state_opens_no_bracket() {
 }
 
 /// The `Unknown` escape hatch must not corrupt a plugin payload that happens to
-/// contain an `op` field of its own: `op` is the **reserved** wire discriminator,
-/// so a top-level payload field named `op` is dropped deterministically (exactly
-/// one `op` = the tag) rather than producing duplicate `op` keys — which would be
-/// invalid/ambiguous JSON on the wire. Other payload fields survive.
+/// contain an `op` field of its own. With the envelope encoding the payload lives
+/// verbatim under `data`, so a payload field named `op` no longer collides with
+/// the tag — it is preserved losslessly instead of being dropped (the earlier
+/// reserved-key contract is eliminated).
 #[test]
 fn test_unknown_op_with_reserved_op_key_in_payload() {
     let op = SessionEventOp::Unknown {
@@ -2793,9 +2932,6 @@ fn test_unknown_op_with_reserved_op_key_in_payload() {
             "x": 1,
         }),
     };
-    // Serialize should produce ONE top-level `op` (the tag) and keep the payload's
-    // `op` intact under the same object (it collides on the wire, so we assert the
-    // round-trip preserves the payload value rather than hard-failing).
     let json = serde_json::to_string(&op).expect("serialize");
     let back: SessionEventOp = serde_json::from_str(&json).expect("round-trip");
     match back {
@@ -2806,20 +2942,12 @@ fn test_unknown_op_with_reserved_op_key_in_payload() {
                 Some(1),
                 "non-reserved payload field must survive"
             );
-            // `op` is the reserved wire discriminator, so a payload field named
-            // `op` is not representable at the top level. The serializer must
-            // drop it deterministically (one `op` = the tag) rather than emit
-            // duplicate `op` keys (invalid/ambiguous JSON). This is the documented
-            // reserved-key contract, not silent corruption.
+            // `op` lives nested under `data`, so it does not collide with the tag
+            // and is preserved verbatim.
             assert_eq!(
-                event_type.as_str(),
-                "plugin_complex",
-                "the tag stays the discriminator (payload op is reserved)"
-            );
-            assert_eq!(
-                data.get("op"),
-                None,
-                "reserved payload 'op' is dropped deterministically (avoid duplicate keys)"
+                data.get("op").and_then(|v| v.as_str()),
+                Some("not-the-discriminator"),
+                "payload 'op' field must be preserved under the envelope's data (no longer dropped)"
             );
         }
         other => panic!("expected Unknown, got {other:?}"),
@@ -2978,8 +3106,8 @@ fn test_current_compaction_cache_matches_reverse_scan_after_reload() {
         }
         let live_compaction = live.current_compaction();
 
-        // Reload drops the in-memory cache (serde(skip)) -> reverse-scan is the
-        // authority. Both paths must report identical compaction state.
+        // Reload drops the in-memory cache (serde(skip)) -> the reverse-scan fallback
+        // is the authority, and it must agree with the live (warmed) cache.
         let json = serde_json::to_string(&live).expect("serialize");
         let reloaded: SessionEventMap = serde_json::from_str(&json).expect("deserialize");
         let reloaded_compaction = reloaded.current_compaction();
@@ -3132,6 +3260,63 @@ fn test_memory_profile_snapshot_includes_event_log() {
     );
 }
 
+/// The cached `memory_profile_snapshot` total and the live `debug_memory_profile`
+/// total must agree on a session carrying every footprint component (messages,
+/// injection, replay event, compaction, plus an appended plugin `Unknown`). This
+/// pins that the two observability surfaces are consistent and that the snapshot
+/// cache is not stale after the various event-appending paths.
+#[test]
+fn test_memory_profile_snapshot_total_matches_debug_total() {
+    use crate::session::{StoredReplayEvent, StoredReplayEventKind};
+
+    let mut session = Session::create_with_id("mp_total_equiv".to_string(), None, None);
+    session.append_stored_message(StoredMessage {
+        id: "m0".to_string(),
+        role: Role::User,
+        content: vec![text_block("hello")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    session.record_memory_injection("inj".to_string(), "content".to_string(), 1, 0, vec![]);
+    session.record_replay_event(&StoredReplayEvent {
+        timestamp: Utc::now(),
+        kind: StoredReplayEventKind::DisplayMessage {
+            role: "system".to_string(),
+            title: None,
+            content: "notice".to_string(),
+        },
+    });
+    session.set_compaction(StoredCompactionState {
+        summary_text: "s".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 1,
+    });
+    session.append_session_event(SessionEvent {
+        timestamp: Utc::now(),
+        event_id: "plugin".to_string(),
+        op: SessionEventOp::Unknown {
+            event_type: "plugin/probe".to_string(),
+            data: serde_json::json!({ "n": 1 }),
+        },
+        parent_id: None,
+        version: 1,
+    });
+
+    let snapshot_total = session.memory_profile_snapshot().total_json_bytes;
+    let debug_total = session
+        .debug_memory_profile()["totals"]["json_bytes"]
+        .as_u64()
+        .expect("debug totals.json_bytes is a number");
+    assert_eq!(
+        snapshot_total as u64, debug_total,
+        "cached snapshot total must match the live debug total (event log + all components)"
+    );
+}
+
 /// Regression: recording a memory injection or replay event must refresh the
 /// cached memory profile's `event_log_count`/`event_log_json_bytes`. These
 /// event-log fields are derived from `event_map.events` only on a full profile
@@ -3238,7 +3423,7 @@ fn test_memory_profile_event_log_refresh_after_injection_and_replay() {
 fn test_known_tag_with_mismatched_shape_degrades_to_unknown() {
     // `append_message` normally requires {message_id, message}. A payload with a
     // different shape (here `message_id` only) must NOT hard-error; it degrades.
-    let raw = r#"{"op":"append_message","message_id":"m_x"}"#;
+    let raw = r#"{"op":"append_message","data":{"message_id":"m_x"}}"#;
     let back: SessionEventOp = serde_json::from_str(raw).expect("must not error");
     match &back {
         SessionEventOp::Unknown { event_type, data } => {
@@ -3255,6 +3440,85 @@ fn test_known_tag_with_mismatched_shape_degrades_to_unknown() {
     let re = serde_json::to_string(&back).expect("reserialize");
     let again: SessionEventOp = serde_json::from_str(&re).expect("re-deserialize");
     assert!(matches!(again, SessionEventOp::Unknown { .. }));
+}
+
+/// Forward-compat: a FUTURE core build may add a NEW field to an existing known
+/// variant (e.g. `append_message` gains a `metadata` field). An older build that
+/// still parses that tag must keep the KNOWN variant and drop the unrecognized
+/// field (serde ignores unknown struct fields by default) — only a MISSING
+/// required field is grounds for degrading to `Unknown`. This pins the two
+/// distinct forward-compat behaviors.
+#[test]
+fn test_known_tag_with_extra_field_stays_known_but_missing_field_degrades() {
+    // Extra field -> the known variant is preserved (future field dropped).
+    let raw_extra = r#"{"op":"append_message","data":{"message_id":"m1","message":{"id":"m1","role":"user","content":[{"type":"text","text":"hi"}]},"metadata":"future"}}"#;
+    let extra: SessionEventOp = serde_json::from_str(raw_extra).expect("must not error");
+    match &extra {
+        SessionEventOp::AppendMessage { message_id, message } => {
+            assert_eq!(message_id, "m1");
+            assert_eq!(message.id, "m1", "known variant must be preserved, extra field dropped");
+        }
+        other => panic!("expected AppendMessage (extra field dropped), got {other:?}"),
+    }
+
+    // Missing required field -> degrades to Unknown.
+    let raw_missing = r#"{"op":"append_message","data":{"message_id":"m1"}}"#;
+    let missing: SessionEventOp = serde_json::from_str(raw_missing).expect("must not error");
+    assert!(
+        matches!(missing, SessionEventOp::Unknown { .. }),
+        "missing a required known-variant field must degrade to Unknown"
+    );
+}
+
+/// The merge-extensibility fields on `SessionEvent` — `parent_id` (with
+/// `skip_serializing_if = "Option::is_none"`) and `version` — must round-trip
+/// losslessly. `parent_id` links an event to an earlier one (merge support) and
+/// `version` is the conflict-resolution counter, so neither may be dropped or
+/// altered by a save/load cycle.
+#[test]
+fn test_session_event_parent_id_and_version_round_trip() {
+    let event = SessionEvent {
+        timestamp: Utc::now(),
+        event_id: "e1".to_string(),
+        op: SessionEventOp::ReplaceMessages {
+            start_index: 0,
+            end_index: 1,
+            messages: Vec::new(),
+        },
+        parent_id: Some("parent_event".to_string()),
+        version: 7,
+    };
+
+    let json = serde_json::to_string(&event).expect("serialize with parent_id");
+    assert!(
+        json.contains("parent_event"),
+        "parent_id must be serialized when present: {json}"
+    );
+    let back: SessionEvent = serde_json::from_str(&json).expect("deserialize parent_id");
+    assert_eq!(
+        back.parent_id.as_deref(),
+        Some("parent_event"),
+        "parent_id must round-trip"
+    );
+    assert_eq!(back.version, 7, "version must round-trip");
+    assert_eq!(back.event_id, "e1");
+
+    // When parent_id is None it must be omitted from the wire form.
+    let none_event = SessionEvent {
+        timestamp: Utc::now(),
+        event_id: "e2".to_string(),
+        op: SessionEventOp::ClearAll,
+        parent_id: None,
+        version: 1,
+    };
+    let none_json = serde_json::to_string(&none_event).expect("serialize without parent_id");
+    assert!(
+        !none_json.contains("parent_id"),
+        "parent_id=None must be skipped on the wire: {none_json}"
+    );
+    let none_back: SessionEvent = serde_json::from_str(&none_json).expect("deserialize");
+    assert_eq!(none_back.parent_id, None, "absent parent_id deserializes to None");
+    assert_eq!(none_back.version, 1);
 }
 
 /// The public `Session::event_log()` read accessor lets plugins (and callers
