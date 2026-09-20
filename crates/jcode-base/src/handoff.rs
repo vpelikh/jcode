@@ -202,7 +202,9 @@ pub fn capture(
     };
     match write_snapshot_locked(&snapshot) {
         Ok(()) => {
-            prune_archived_snapshots();
+            // Already holding the store lock from the top of `capture`, so run
+            // the unlocked body directly (avoiding a self-deadlock).
+            prune_archived_snapshots_locked();
             Some(snapshot)
         }
         Err(err) => {
@@ -453,8 +455,9 @@ pub fn export_handoff(session_id: &str) -> Option<String> {
 /// when the imported snapshot is the newest for the project does it become the
 /// automatic latest-for-project pick.
 ///
-/// Returns the adopted session id (a fresh UUID that does not collide with an
-/// existing snapshot), or `None` when the payload is malformed or the working
+/// Returns the adopted session id (a readable `import-<source>` that stays
+/// recognizable for `/handoffres`, with a short disambiguating suffix only on
+/// collision), or `None` when the payload is malformed or the working
 /// directory has no resolvable project key.
 pub fn import_handoff(
     payload: &str,
@@ -473,35 +476,41 @@ pub fn import_handoff(
     // for the same id while staying recognizable: `import-<source>[-<suffix>]`
     // mirrors the source session so `/handoffres <id>` is not an opaque UUID.
     let source = snapshot.session_id.clone();
-    let base = format!(
-        "import-{}",
-        sanitize_import_source(&source)
-    );
-    if file_path(&dir, &base).is_ok() && load_snapshot(&base).is_none() {
-        snapshot.session_id = base.clone();
-    } else {
-        // Collision (a previous import or a local session sharing the id):
-        // disambiguate with a short suffix while keeping the readable stem.
+    let base = format!("import-{}", sanitize_import_source(&source));
+    // Walk up to a bounded number of candidates so a persistent collision
+    // (a previous import or a local session sharing the stem) still mints a
+    // fresh, distinct id rather than silently overwriting an existing file.
+    let mut candidate = base.clone();
+    for _ in 0..8 {
+        if file_path(&dir, &candidate).is_ok() && load_snapshot(&candidate).is_none() {
+            break;
+        }
         let short = uuid::Uuid::new_v4().simple().to_string();
-        snapshot.session_id = if short.len() > 8 {
-            format!("{}-{}", base, &short[..8])
+        let suffix = if short.len() > 8 {
+            &short[..8]
         } else {
-            format!("{}-{}", base, short)
+            short.as_str()
         };
+        candidate = format!("{}-{}", base, suffix);
     }
+    snapshot.session_id = candidate;
     let session_id = snapshot.session_id.clone();
     crate::storage::write_json_fast(&file_path(&dir, &session_id).ok()?, &snapshot).ok()?;
     upsert_index(&snapshot).ok()?;
+    // Keep the archive bounded during import-heavy flows, consistent with
+    // capture (which also prunes after a write). The lock is already held.
+    prune_archived_snapshots_locked();
     Some(session_id)
 }
 
 /// Make a session id safe to embed in an `import-<source>` filename. The
 /// regular filenames are already restricted to `[a-z0-9_-]`, so out-of-band
-/// payloads could contain anything; lower-case and drop characters that
-/// `file_path` rejects so the readable stem never aliases another session.
+/// payloads could contain anything; normalize to lowercase and drop characters
+/// that `file_path` rejects so the readable stem never aliases another session
+/// while staying close to the original for recognizability.
 fn sanitize_import_source(source: &str) -> String {
     let mut out = String::new();
-    for ch in source.chars() {
+    for ch in source.to_ascii_lowercase().chars() {
         if ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_' {
             out.push(ch);
         }
@@ -537,7 +546,25 @@ fn sanitize_import_source(source: &str) -> String {
 /// [`sweep_stale_handoffs`]). Removals and a per-run summary are logged.
 /// Failures to read or delete individual files are ignored (best-effort), and
 /// a missing or unreadable store is a no-op.
+///
+/// Acquires the store lock so it is safe to call concurrently with captures.
+/// Internal callers that already hold the lock use [`prune_archived_snapshots_locked`].
 pub fn prune_archived_snapshots() {
+    let _lock = match lock_store() {
+        Ok(lock) => lock,
+        Err(error) => {
+            crate::logging::warn(&format!(
+                "[handoff] cannot lock store for prune: {error}"
+            ));
+            return;
+        }
+    };
+    prune_archived_snapshots_locked();
+}
+
+/// The pruning body, run with the store lock already held (by [`capture`] via
+/// `prune_archived_snapshots_locked` or by [`prune_archived_snapshots`]).
+fn prune_archived_snapshots_locked() {
     let Ok(index) = load_index_opt() else {
         return;
     };

@@ -1255,7 +1255,11 @@ fn import_sanitizes_pathological_source_id() {
     };
     let imported = import_handoff(&payload, Some(&cwd), "closed").unwrap();
     assert!(imported.starts_with("import-"), "sane prefix");
-    // The stem is sanitized: only [a-z0-9_-] plus the import- prefix.
+    // The stem is sanitized: lowercase + safe [a-z0-9_-] only.
+    assert_eq!(
+        imported, "import-weirdsessionname",
+        "pathological source id is lowercased and stripped to a safe stem"
+    );
     assert!(
         imported
             .chars()
@@ -1296,4 +1300,51 @@ fn startup_sweep_prunes_stale_archived() {
 
     // Idempotent: a second sweep is harmless.
     sweep_stale_handoffs();
+}
+
+/// Concurrency: the lock-wrapping prune (used by the startup sweep and in
+/// tests) must not deadlock when it runs concurrently with snapshot writes
+/// (which also hold the store lock), and it keeps the archive bounded.
+#[test]
+fn concurrent_prune_and_writes_do_not_deadlock_or_overrun() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let home = env._home.path();
+    let cwd = home.join("project");
+    std::fs::create_dir_all(&cwd).ok();
+    let key = project_key(Some(&cwd)).unwrap();
+
+    // Seed a live handoff plus one project so pruning has a bounded bucket.
+    write_snapshot(&fixture("live", &key)).unwrap();
+    let now = Utc::now();
+    let mut stale = fixture("stale", &key);
+    stale.ended_at = now - chrono::Duration::days(MAX_ARCHIVED_SNAPSHOT_AGE_DAYS + 5);
+    write_snapshot(&stale).unwrap();
+
+    // Interleave the lock-wrapped prune with concurrent snapshot writes.
+    std::thread::scope(|scope| {
+        let pruner = scope.spawn(|| {
+            for _ in 0..10 {
+                prune_archived_snapshots();
+            }
+        });
+        let writer = scope.spawn(|| {
+            for n in 0..10 {
+                write_snapshot(&fixture(&format!("w-{n}"), "git:https://example.com/w.git"))
+                    .unwrap();
+            }
+        });
+        let _ = pruner.join();
+        let _ = writer.join();
+    });
+
+    // No deadlock occurred; the live handoff survives any prune.
+    assert!(load_snapshot("live").is_some(), "live handoff survives");
+    // Every writer's snapshot landed.
+    for n in 0..10 {
+        assert!(
+            load_snapshot(&format!("w-{n}")).is_some(),
+            "writer snapshot w-{n} persisted"
+        );
+    }
 }
