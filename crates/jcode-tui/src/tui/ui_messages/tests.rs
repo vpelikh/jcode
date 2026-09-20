@@ -2411,6 +2411,58 @@ fn bash_row_has_no_trimmed_command_summary_when_details_are_on() {
     crate::tui::ui::tools_ui::tests_show_bash_output_override::set(false);
 }
 
+#[test]
+fn exact_long_command_renders_full_across_wrapped_lines() {
+    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(true);
+    crate::tui::ui::tools_ui::tests_show_bash_output_override::set(true);
+
+    // A real-world multiline command that previously got its tail trimmed by the
+    // one-line summary path. It must survive in full, wrapped across the pane.
+    let command = "export PATH=\"$HOME/.cargo/bin:$PATH\"; cd /Users/vasilypelikh/IdeaProjects/vpelikh/github/jcode && cargo test -p jcode-tui --lib bash_row_has_no_trimmed_command_summary_when_details_are_on";
+
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "test result: ok\n\nWorking directory: /Users/vasilypelikh/IdeaProjects/vpelikh/github/jcode\n\nExecution time: 1ms\n\nExit code: 0".to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_bash_exact".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({ "command": command }),
+            intent: None,
+            thought_signature: None,
+        }),
+    };
+
+    let rendered = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // The rendered text must contain every non-whitespace token of the command
+    // (wrapping splits lines, so compare with whitespace removed).
+    let compact = without_whitespace(&rendered);
+    let expected = without_whitespace(command);
+    assert!(
+        compact.contains(&expected),
+        "full command must be present across wrapped lines:\n{rendered}"
+    );
+    // The commit command lines themselves must be ellipsis-free. Note: the tool
+    // row may still show an ellipsis on a *metadata* suffix (e.g. the working
+    // directory), so scope the check to exact command lines starting with "$".
+    for line in rendered.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("$ ") && trimmed.contains("…") {
+            panic!("command line was ellipsis-trimmed: {line:?}\n{rendered}");
+        }
+    }
+
+    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(false);
+    crate::tui::ui::tools_ui::tests_show_bash_output_override::set(false);
+}
+
 fn gmail_draft_message(content: &str, input: serde_json::Value) -> DisplayMessage {
     DisplayMessage {
         role: "tool".to_string(),
@@ -3579,4 +3631,98 @@ fn render_empty_todo_tool_result_collapses_to_compact_line() {
 
     assert!(!plain.contains("No tasks yet"), "{plain}");
     assert!(plain.contains("no tasks"), "{plain}");
+}
+
+#[test]
+fn push_wrapped_indented_wraps_on_narrow_available_width() {
+    let mut lines = Vec::new();
+    super::push_wrapped_indented(
+        &mut lines,
+        "  ",
+        "abcdefghij",
+        ratatui::style::Style::default(),
+        6, // indent=2 -> content_width=4
+    );
+    let texts: Vec<String> = lines.iter().map(extract_line_text).collect();
+    assert!(!texts.is_empty(), "must emit at least one row");
+    // Every physical row (indent + content) must be <= the available width.
+    for t in &texts {
+        assert!(
+            t.width() <= 6,
+            "row wider than available width: {t:?} (width {})",
+            t.width()
+        );
+    }
+    // Strip the leading indent from each row and concat: full text must survive.
+    let joined: String = texts
+        .iter()
+        .map(|t| t.trim_start_matches("  "))
+        .collect();
+    assert_eq!(&joined, "abcdefghij", "all text must be preserved, got: {texts:?}");
+}
+
+#[test]
+fn push_wrapped_indented_empty_text_emits_no_dangling_indent_only_row() {
+    let mut lines = Vec::new();
+    super::push_wrapped_indented(
+        &mut lines,
+        "      ",
+        "",
+        ratatui::style::Style::default(),
+        40,
+    );
+    // Empty text should not render a dangling indent-only row.
+    assert!(
+        lines.is_empty(),
+        "empty text must emit no rows, got {lines:?}"
+    );
+}
+
+#[test]
+fn push_wrapped_indented_extreme_narrow_falls_back_to_single_row() {
+    let mut lines = Vec::new();
+    // available_width (0) <= indent_width (2): the content_width==0 guard path.
+    super::push_wrapped_indented(
+        &mut lines,
+        "  ",
+        "abc",
+        ratatui::style::Style::default(),
+        0,
+    );
+    // Degenerate width: must still emit the full text on a single row (never lose it).
+    let texts: Vec<String> = lines.iter().map(extract_line_text).collect();
+    assert!(!texts.is_empty(), "must emit at least one row");
+    assert!(
+        texts.concat().contains("abc"),
+        "full text must survive even at zero width: {texts:?}"
+    );
+}
+
+#[test]
+fn push_wrapped_indented_respects_wide_unicode_glyph_width() {
+    let mut lines = Vec::new();
+    // CJK chars are width 2; a full-width string must wrap so no physical row
+    // exceeds `available_width`.
+    let text = "日本語テキスト日本語テキスト日本語"; // 14 CJK chars * 2 = 28 cols
+    super::push_wrapped_indented(
+        &mut lines,
+        "  ",
+        text,
+        ratatui::style::Style::default(),
+        10, // indent=2 -> content_width=8, so rows must be <= 8 content cols
+    );
+    let texts: Vec<String> = lines.iter().map(extract_line_text).collect();
+    assert!(!texts.is_empty(), "must emit rows");
+    for t in &texts {
+        assert!(
+            t.width() <= 10,
+            "row exceeded width with wide glyphs: {t:?} (width {})",
+            t.width()
+        );
+    }
+    let joined: String = texts
+        .iter()
+        .map(|t| t.trim_start_matches("  "))
+        .collect();
+    assert_eq!(&joined, text, "wide-char text must be fully preserved: {texts:?}");
 }
