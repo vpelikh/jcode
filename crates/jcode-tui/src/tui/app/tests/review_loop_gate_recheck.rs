@@ -615,7 +615,6 @@ fn remote_done_seeds_review_loop_on_remote_product_path() {
 fn idle_tick_self_drives_review_loop_advance() {
     with_temp_jcode_home(|| {
         let mut app = create_test_app();
-        let parent_session_id = app.session_id().to_string();
 
         // Seed a live review loop at the first lens (Correctness).
         let mut state = jcode_session_types::ReviewLoopState::new();
