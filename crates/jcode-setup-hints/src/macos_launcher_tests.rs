@@ -179,3 +179,40 @@ fn macos_notification_bundle_validity_is_version_gated() {
         .expect("write stale marker");
     assert!(!macos_notification_broker_is_valid(&app));
 }
+
+#[test]
+fn macos_desktop_bundle_execs_the_native_desktop_binary() {
+    let plist = macos_desktop_info_plist();
+    assert!(plist.contains("<string>Jcode Desktop</string>"));
+    assert!(plist.contains("<string>com.jcode.desktop</string>"));
+    assert!(plist.contains("<string>jcode-desktop2</string>"));
+    assert!(plist.contains(jcode_build_meta::version()));
+}
+
+#[test]
+fn macos_desktop_bundle_is_valid_when_binary_plist_and_icon_present() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let app = temp.path().join("Jcode Desktop.app");
+    std::fs::create_dir_all(app.join("Contents/MacOS")).expect("create MacOS");
+    std::fs::create_dir_all(app.join("Contents/Resources")).expect("create Resources");
+    std::fs::write(
+        app.join("Contents/Info.plist"),
+        macos_desktop_info_plist(),
+    )
+    .expect("write plist");
+    std::fs::write(
+        app.join("Contents/MacOS").join(MACOS_DESKTOP_APP_EXECUTABLE),
+        "binary",
+    )
+    .expect("write executable");
+    std::fs::write(
+        app.join("Contents/Resources").join(MACOS_APP_ICON_FILE_NAME),
+        MACOS_APP_ICON_BYTES,
+    )
+    .expect("write icon");
+    assert!(macos_desktop_app_launcher_is_valid(&app));
+
+    std::fs::remove_file(app.join("Contents/MacOS").join(MACOS_DESKTOP_APP_EXECUTABLE))
+        .expect("remove executable");
+    assert!(!macos_desktop_app_launcher_is_valid(&app));
+}
