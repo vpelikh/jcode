@@ -258,15 +258,15 @@ pub(super) async fn handle_debug_client(
     // Destructure the service handles back into the flat locals the body uses,
     // preserving every downstream reference (Slice 3 of the server service split).
     // Clone the swarm handle so the debug read/write hops can route through it
-    // (Slice 4) even though the flat-local destructuring moves its fields out of
-    // the original.
+    // (Slice 4); the swarm maps are cloned from the accessor below (cheap Arc
+    // handles), so `swarm_service` is not partially moved and stays usable.
     let swarm_service_handle = swarm_service.clone();
     let sessions = session_service.sessions;
     let is_processing = session_service.is_processing;
     let session_id = session_service.session_id;
     let provider = client_service.provider;
     let client_connections = client_service.client_connections;
-    let swarm_members = swarm_service.swarm_state.members;
+    let swarm_members = swarm_service.swarm_state().members.clone();
     let client_debug_state = debug_service.client_debug_state;
     let client_debug_response_tx = debug_service.client_debug_response_tx;
     let debug_jobs = debug_service.debug_jobs;

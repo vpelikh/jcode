@@ -36,8 +36,8 @@ pub(super) async fn handle_comm_share(
     // Swarm-domain state is reached through the swarm service handle. These
     // locals keep the body single-homed on the handle's fields (server service
     // split, convergence slice).
-    let swarm_members = &swarm.swarm_state.members;
-    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let swarm_members = &swarm.swarm_state().members;
+    let swarms_by_id = &swarm.swarm_state().swarms_by_id;
     let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
     let swarm_id = swarm_id_for_session(&req_session_id, swarm_members).await;
 
@@ -143,7 +143,7 @@ pub(super) async fn handle_comm_read(
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
     swarm: &SwarmServiceHandle,
 ) {
-    let swarm_members = &swarm.swarm_state.members;
+    let swarm_members = &swarm.swarm_state().members;
     let swarm_id = swarm_id_for_session(&req_session_id, swarm_members).await;
 
     let entries = if let Some(swarm_id) = swarm_id {
@@ -187,8 +187,8 @@ pub(super) async fn handle_comm_list(
     sessions: &super::SessionAgents,
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
 ) {
-    let swarm_members = &swarm.swarm_state.members;
-    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let swarm_members = &swarm.swarm_state().members;
+    let swarms_by_id = &swarm.swarm_state().swarms_by_id;
     let file_touch = swarm.file_touch();
     let swarm_id = swarm_id_for_session(&req_session_id, swarm_members).await;
 

@@ -201,7 +201,7 @@ pub(super) async fn handle_comm_summary(
     swarm: &SwarmServiceHandle,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
-    let swarm_members = &swarm.swarm_state.members;
+    let swarm_members = &swarm.swarm_state().members;
     if !ensure_same_swarm_access(
         id,
         &req_session_id,
@@ -253,7 +253,7 @@ pub(super) async fn handle_comm_status(
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
-    let swarm_members = &swarm.swarm_state.members;
+    let swarm_members = &swarm.swarm_state().members;
     let file_touch = swarm.file_touch();
     if !ensure_same_swarm_access(
         id,
@@ -330,7 +330,7 @@ pub(super) async fn handle_comm_read_context(
     swarm: &SwarmServiceHandle,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
-    let swarm_members = &swarm.swarm_state.members;
+    let swarm_members = &swarm.swarm_state().members;
     if !ensure_same_swarm_access(
         id,
         &req_session_id,
@@ -387,8 +387,8 @@ pub(super) async fn handle_comm_plan_status(
     swarm: &SwarmServiceHandle,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
-    let swarm_members = &swarm.swarm_state.members;
-    let swarm_plans = &swarm.swarm_state.plans;
+    let swarm_members = &swarm.swarm_state().members;
+    let swarm_plans = &swarm.swarm_state().plans;
     let swarm_id = {
         let members = swarm_members.read().await;
         members
@@ -425,10 +425,10 @@ pub(super) async fn handle_comm_resync_plan(
 ) {
     let client_event_tx = ctx.client_event_tx;
     let swarm = ctx.swarm;
-    let swarm_members = &swarm.swarm_state.members;
-    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
-    let swarm_plans = &swarm.swarm_state.plans;
-    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let swarm_members = &swarm.swarm_state().members;
+    let swarms_by_id = &swarm.swarm_state().swarms_by_id;
+    let swarm_plans = &swarm.swarm_state().plans;
+    let swarm_coordinators = &swarm.swarm_state().coordinators;
     let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
     let swarm_id = {
         let members = swarm_members.read().await;

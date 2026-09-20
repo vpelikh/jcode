@@ -104,7 +104,7 @@ pub(super) async fn maybe_handle_server_state_command(
     // Swarm-domain state is reached through the swarm service handle. This
     // local keeps the body single-homed on the handle's field instead of a
     // flat pass-through argument bag (server service split, Slice 4).
-    let swarm_members = &swarm.swarm_state.members;
+    let swarm_members = &swarm.swarm_state().members;
     if cmd == "sessions" {
         let (connected_agents, members) =
             connected_session_snapshot(sessions, client_connections, swarm_members).await;
@@ -386,7 +386,7 @@ async fn build_server_memory_incident_payload(
     server_start_time: Instant,
 ) -> serde_json::Value {
     // Swarm-domain state is reached through the swarm service handle (Slice 4).
-    let swarm_members = &swarm.swarm_state.members;
+    let swarm_members = &swarm.swarm_state().members;
     // This command intentionally avoids locking any Agent. It must remain usable
     // when thousands of sessions are resident and the full server:memory walk is
     // slow or contended.
@@ -759,11 +759,11 @@ async fn build_server_memory_payload(
     soft_interrupt_queues: &SessionInterruptQueues,
 ) -> serde_json::Value {
     // Swarm-domain state is reached through the swarm service handle (Slice 4).
-    let swarm_members = &swarm.swarm_state.members;
-    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let swarm_members = &swarm.swarm_state().members;
+    let swarms_by_id = &swarm.swarm_state().swarms_by_id;
     let shared_context = swarm.shared_context_map();
-    let swarm_plans = &swarm.swarm_state.plans;
-    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let swarm_plans = &swarm.swarm_state().plans;
+    let swarm_coordinators = &swarm.swarm_state().coordinators;
     let file_touch = swarm.file_touch();
     let channel_subscriptions = swarm.channel_subscriptions_map();
     let channel_subscriptions_by_session = swarm.channel_subscriptions_by_session_map();

@@ -39,12 +39,11 @@ pub(super) async fn handle_comm_propose_plan(
     session: &SessionServiceHandle,
     swarm: &SwarmServiceHandle,
 ) {
-    let swarm_members = &swarm.swarm_state.members;
-    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
-    let swarm_plans = &swarm.swarm_state.plans;
-    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let swarm_members = &swarm.swarm_state().members;
+    let swarms_by_id = &swarm.swarm_state().swarms_by_id;
+    let swarm_plans = &swarm.swarm_state().plans;
+    let swarm_coordinators = &swarm.swarm_state().coordinators;
     let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
-    let _swarm_mutation_runtime = swarm.swarm_mutation_runtime();
     let swarm_id = {
         let members = swarm_members.read().await;
         members
@@ -297,10 +296,10 @@ pub(super) async fn handle_comm_approve_plan(
     session: &SessionServiceHandle,
     swarm: &SwarmServiceHandle,
 ) {
-    let swarm_members = &swarm.swarm_state.members;
-    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
-    let swarm_plans = &swarm.swarm_state.plans;
-    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let swarm_members = &swarm.swarm_state().members;
+    let swarms_by_id = &swarm.swarm_state().swarms_by_id;
+    let swarm_plans = &swarm.swarm_state().plans;
+    let swarm_coordinators = &swarm.swarm_state().coordinators;
     let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
     let swarm_mutation_runtime = swarm.swarm_mutation_runtime();
     let swarm_id = match require_coordinator_swarm(
@@ -512,8 +511,8 @@ pub(super) async fn handle_comm_reject_plan(
     session: &SessionServiceHandle,
     swarm: &SwarmServiceHandle,
 ) {
-    let swarm_members = &swarm.swarm_state.members;
-    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let swarm_members = &swarm.swarm_state().members;
+    let swarm_coordinators = &swarm.swarm_state().coordinators;
     let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
     let swarm_mutation_runtime = swarm.swarm_mutation_runtime();
     let swarm_id = match require_coordinator_swarm(

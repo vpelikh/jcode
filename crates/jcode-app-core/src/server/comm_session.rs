@@ -107,7 +107,7 @@ async fn resolve_spawn_working_dir(
     sessions: &SessionAgents,
     swarm: &SwarmServiceHandle,
 ) -> Option<String> {
-    let swarm_members = &swarm.swarm_state.members;
+    let swarm_members = &swarm.swarm_state().members;
     if requested_working_dir
         .as_deref()
         .is_some_and(|dir| !dir.trim().is_empty())
@@ -477,8 +477,8 @@ async fn register_visible_spawned_member(
     report_back_to_session_id: Option<&str>,
     swarm: &SwarmServiceHandle,
 ) {
-    let swarm_members = &swarm.swarm_state.members;
-    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let swarm_members = &swarm.swarm_state().members;
+    let swarms_by_id = &swarm.swarm_state().swarms_by_id;
     let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
     let (event_tx, _event_rx) = mpsc::unbounded_channel();
     let now = Instant::now();
@@ -581,10 +581,10 @@ pub(super) async fn spawn_swarm_agent(
     soft_interrupt_queues: &SessionInterruptQueues,
     client_connections: &ClientConnections,
 ) -> anyhow::Result<String> {
-    let swarm_members = &swarm.swarm_state.members;
-    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
-    let swarm_coordinators = &swarm.swarm_state.coordinators;
-    let swarm_plans = &swarm.swarm_state.plans;
+    let swarm_members = &swarm.swarm_state().members;
+    let swarms_by_id = &swarm.swarm_state().swarms_by_id;
+    let swarm_coordinators = &swarm.swarm_state().coordinators;
+    let swarm_plans = &swarm.swarm_state().plans;
     let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
     let resolved_working_dir =
         resolve_spawn_working_dir(working_dir, req_session_id, sessions, swarm).await;
@@ -837,7 +837,7 @@ pub(super) async fn handle_comm_spawn(
     soft_interrupt_queues: &SessionInterruptQueues,
     client_connections: &ClientConnections,
 ) {
-    let swarm_members = &swarm.swarm_state.members;
+    let swarm_members = &swarm.swarm_state().members;
     let swarm_mutation_runtime = swarm.swarm_mutation_runtime();
     // Hold this swarm's admission through member registration so concurrent
     // recursive requests cannot all pass the population check against stale
@@ -972,7 +972,7 @@ pub(super) async fn handle_comm_stop(
     // Swarm-domain state is reached through the swarm service handle. These
     // locals keep the body single-homed on the handle's fields (server service
     // split, Slice 4).
-    let swarm_members = &swarm.swarm_state.members;
+    let swarm_members = &swarm.swarm_state().members;
     let swarm_mutation_runtime = swarm.swarm_mutation_runtime();
     // Stopping is authorized per-target by ownership (the requester is the
     // target's spawner or a transitive ancestor) rather than by the swarm-level
@@ -1138,7 +1138,7 @@ async fn resolve_stop_target_session(
         return Err("target_session is required.".to_string());
     }
 
-    let swarm_members = &swarm.swarm_state.members;
+    let swarm_members = &swarm.swarm_state().members;
     let members = swarm_members.read().await;
     if members
         .get(target)
@@ -1199,10 +1199,10 @@ async fn ensure_spawn_coordinator_swarm(
     swarm: &SwarmServiceHandle,
     configured_live_agent_limit: usize,
 ) -> Option<String> {
-    let swarm_members = &swarm.swarm_state.members;
-    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
-    let swarm_coordinators = &swarm.swarm_state.coordinators;
-    let swarm_plans = &swarm.swarm_state.plans;
+    let swarm_members = &swarm.swarm_state().members;
+    let swarms_by_id = &swarm.swarm_state().swarms_by_id;
+    let swarm_coordinators = &swarm.swarm_state().coordinators;
+    let swarm_plans = &swarm.swarm_state().plans;
     let (
         swarm_id,
         from_name,

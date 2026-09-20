@@ -325,8 +325,8 @@ pub(super) async fn handle_comm_await_members(
     wake: bool,
     ctx: CommAwaitMembersContext<'_>,
 ) {
-    let swarm_members = &ctx.swarm.swarm_state.members;
-    let swarms_by_id = &ctx.swarm.swarm_state.swarms_by_id;
+    let swarm_members = &ctx.swarm.swarm_state().members;
+    let swarms_by_id = &ctx.swarm.swarm_state().swarms_by_id;
     let (_, _, swarm_event_tx) = ctx.swarm.read_event_sources();
     let swarm_id = {
         let members = swarm_members.read().await;
@@ -611,8 +611,8 @@ pub(super) async fn resume_background_awaits(
     swarm: &SwarmServiceHandle,
     await_members_runtime: &AwaitMembersRuntime,
 ) {
-    let swarm_members = &swarm.swarm_state.members;
-    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let swarm_members = &swarm.swarm_state().members;
+    let swarms_by_id = &swarm.swarm_state().swarms_by_id;
     let (_, _, swarm_event_tx) = swarm.read_event_sources();
     let pending: Vec<PersistedAwaitMembersState> = all_pending_await_members_including_expired()
         .into_iter()

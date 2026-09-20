@@ -38,7 +38,7 @@ pub(super) async fn dispatch_background_task_completion(
     swarm: &SwarmServiceHandle,
 ) {
     let sessions = &session.sessions;
-    let swarm_members = &swarm.swarm_state.members;
+    let swarm_members = &swarm.swarm_state().members;
     let notification = format_background_task_notification_markdown(task);
 
     if task.notify
@@ -111,7 +111,7 @@ pub(super) async fn dispatch_background_task_stalled(
     swarm: &SwarmServiceHandle,
 ) {
     let sessions = &session.sessions;
-    let swarm_members = &swarm.swarm_state.members;
+    let swarm_members = &swarm.swarm_state().members;
     let notification = crate::message::format_background_task_stalled_markdown(task);
 
     if task.notify
@@ -183,7 +183,7 @@ pub(super) async fn dispatch_swarm_await_completion(
     swarm: &SwarmServiceHandle,
 ) {
     let sessions = &session.sessions;
-    let swarm_members = &swarm.swarm_state.members;
+    let swarm_members = &swarm.swarm_state().members;
     if event.notify
         && fanout_session_event(
             swarm_members,
@@ -255,7 +255,7 @@ pub(super) async fn dispatch_background_task_progress(
     swarm: &SwarmServiceHandle,
 ) {
     let notification = format_background_task_progress_markdown(task);
-    let members = &swarm.swarm_state.members;
+    let members = &swarm.swarm_state().members;
     if fanout_session_event(
         members,
         &task.session_id,
@@ -287,7 +287,7 @@ pub(super) async fn dispatch_swarm_output_tail(
     tail: &crate::bus::SwarmOutputTail,
     swarm: &SwarmServiceHandle,
 ) {
-    let members = &swarm.swarm_state.members;
+    let members = &swarm.swarm_state().members;
     let swarm_id = {
         let mut members = members.write().await;
         let Some(member) = members.get_mut(&tail.session_id) else {
@@ -310,7 +310,7 @@ pub(super) async fn dispatch_swarm_todo_progress(
     event: &crate::bus::TodoEvent,
     swarm: &SwarmServiceHandle,
 ) {
-    let members = &swarm.swarm_state.members;
+    let members = &swarm.swarm_state().members;
     let total = event.todos.len() as u32;
     let completed = event
         .todos
@@ -359,7 +359,7 @@ pub(super) async fn dispatch_swarm_tool_activity(
     event: &crate::bus::ToolEvent,
     swarm: &SwarmServiceHandle,
 ) {
-    let members = &swarm.swarm_state.members;
+    let members = &swarm.swarm_state().members;
     let swarm_id = {
         let mut members = members.write().await;
         let Some(member) = members.get_mut(&event.session_id) else {
@@ -380,7 +380,7 @@ pub(super) async fn dispatch_swarm_runtime_status(
     event: &crate::bus::SubagentStatus,
     swarm: &SwarmServiceHandle,
 ) {
-    let members = &swarm.swarm_state.members;
+    let members = &swarm.swarm_state().members;
     let Some(model) = event
         .model
         .as_ref()
@@ -411,7 +411,7 @@ pub(super) async fn dispatch_swarm_batch_progress(
     if progress.total == 0 {
         return;
     }
-    let members = &swarm.swarm_state.members;
+    let members = &swarm.swarm_state().members;
     let swarm_id = {
         let mut members = members.write().await;
         let Some(member) = members.get_mut(&progress.session_id) else {
@@ -549,7 +549,7 @@ pub(super) async fn dispatch_ui_activity(
         return;
     };
 
-    let members = &swarm.swarm_state.members;
+    let members = &swarm.swarm_state().members;
     if fanout_session_event(
         members,
         session_id,
@@ -664,3 +664,4 @@ mod tests {
         assert!(!update_active_todo_batch_progress(&mut items, &progress));
     }
 }
+

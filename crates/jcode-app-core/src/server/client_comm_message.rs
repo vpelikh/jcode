@@ -110,8 +110,8 @@ pub(super) async fn handle_comm_message(
     swarm: &SwarmServiceHandle,
     _client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
 ) {
-    let swarm_members = &swarm.swarm_state.members;
-    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let swarm_members = &swarm.swarm_state().members;
+    let swarms_by_id = &swarm.swarm_state().swarms_by_id;
     let channel_subscriptions = swarm.channel_subscriptions_map();
     let sessions = &session.sessions;
     let started = std::time::Instant::now();

@@ -34,9 +34,9 @@ reduce argument fanout **without changing the single-process runtime model**.
 > `background_tasks`, `client_actions`, `comm_plan`, `comm_control`,
 > `client_comm_message`) now route through `SessionServiceHandle::
 > queue_soft_interrupt`. The Tier 3 field-privatization pass is complete: every
-> `SwarmServiceHandle` field is private except `swarm_state` (see the landed-slice
-> sections below). This summary describes the problems the split set out to
-> solve and the current state.
+> `SwarmServiceHandle` field is now private (see the landed-slice sections below).
+> This summary describes the problems the split set out to solve and the current
+> state.
 
 The architecture was a single broad state owner, now incrementally moved onto
 service handles:
@@ -66,10 +66,10 @@ that yet, and the current pain is ownership fanout, not runtime topology.
 > have mostly been split into a fine-grained `server/**` module tree inside
 > `jcode-app-core`. What has **not** changed is the *state ownership*: the
 > individual module files are still thin slices over one giant state bag passed
-> by hand. Tier 3 has since privatized every `SwarmServiceHandle` field except
-> `swarm_state`, so the handle is now a method surface rather than a raw field
-> bag; the `swarm_state` maps remain the main body-local re-binding that later
-> method-API slices will move behind services.
+> by hand. Tier 3 has since privatized every `SwarmServiceHandle` field, so the
+> handle is now a method surface rather than a raw field bag; the `swarm_state`
+> maps remain the main body-local re-binding that later method-API slices will
+> move behind services.
 
 ---
 
@@ -1106,11 +1106,38 @@ privatization: the `SwarmServiceHandle.await_members_runtime` field is no longer
 
 With this slice, `file_touch`, `swarm_mutation_runtime`, `await_members_runtime`,
 the event-history/counter/broadcast sinks, the shared-context map, and the
-channel-subscription indexes are all private on `SwarmServiceHandle`. The only
-remaining `pub(crate)` field is `swarm_state` itself.
+channel-subscription indexes are all private on `SwarmServiceHandle`.
 
 Zero behavior change; the `jcode-app-core` lib suite stays green (server module
 473 passing) and clippy adds no new warnings.
+
+### Tier 3 encapsulation: `SwarmServiceHandle.swarm_state` privatized (landed 2026-09)
+
+The fourth Tier 3 encapsulation slice completes the field-privatization pass: the
+`SwarmServiceHandle.swarm_state` field is now private — the last `pub(crate)`
+field on the handle.
+
+- The `swarm_state` field on `SwarmServiceHandle` is now private, with a
+  `swarm_state()` accessor returning `&SwarmState` (the shared members /
+  swarms_by_id / plans / coordinators maps). It mirrors the earlier accessor
+  precedent.
+- All ~171 handle-field access sites now go through `swarm_state()` instead of
+  reaching into `.swarm_state` directly, across 22 files. The owned-value sites
+  (`client_lifecycle.rs::handle_client`, `debug.rs`, and the `SwarmState { .. }`
+  struct-literal reconstructions in `debug_swarm_write.rs`, `comm_control.rs`,
+  `live_turn.rs`, etc.) clone the `Arc`-backed map handle via `.clone()`
+  (`Arc::clone`) rather than moving it out, which is what makes the accessor
+  (a shared borrow) usable at those call sites. reads / writes to the individual
+  maps still go through the shared `Arc<RwLock<..>>` handles.
+- `self.swarm_state` uses inside `services/swarm.rs` (the handle's own methods,
+  21 sites) and the `Server.swarm_state` field (3 sites) are unaffected.
+
+Zero behavior change; the full `jcode-app-core` lib suite stays green (1537
+passing), 473 server-module tests pass, and clippy adds no new warnings. With
+this slice every `SwarmServiceHandle` field is private; the remaining Tier 3
+follow-up is the plan items #2/#3 work of moving the direct `swarm_state` map
+reads/writes onto dedicated behavior methods (and the Seam E debug ownership
+decision), which remains a separate design slice.
 
 ## Tier 1 convergence status (landed 2026-09)
 
