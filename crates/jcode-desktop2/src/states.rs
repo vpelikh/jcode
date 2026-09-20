@@ -73,6 +73,8 @@ pub const NODES: &[(&str, NodeBuilder)] = &[
     ("settings_panel", settings_panel),
     ("settings_panel_hover", settings_panel_hover),
     ("model_picker", model_picker),
+    ("palette", palette),
+    ("model_caption", model_caption),
     ("notice", notice),
     ("error", error),
     ("offline", offline),
@@ -125,6 +127,7 @@ fn connecting() -> Model {
         editor: crate::editor::Editor::default(),
         resume: crate::resume::Picker::default(),
         help_open: false,
+        palette: crate::palette::Palette::default(),
         caret: fixed_caret(),
         // Nodes render the focused case: an unfocused window hides the caret,
         // which would make most caret nodes indistinguishable.
@@ -182,6 +185,7 @@ fn connecting() -> Model {
             reasoning: crate::reasoning::ReasoningMode::Current,
             motion: true,
             copy_on_select: false,
+            resume_landing_seen: false,
         },
         panel: crate::settings::Panel::default(),
     }
@@ -294,6 +298,7 @@ fn attached_empty() -> Model {
         editor: crate::editor::Editor::default(),
         resume: crate::resume::Picker::default(),
         help_open: false,
+        palette: crate::palette::Palette::default(),
         caret: fixed_caret(),
         // Nodes render the focused case: an unfocused window hides the caret,
         // which would make most caret nodes indistinguishable.
@@ -349,6 +354,7 @@ fn attached_empty() -> Model {
             reasoning: crate::reasoning::ReasoningMode::Current,
             motion: true,
             copy_on_select: false,
+            resume_landing_seen: false,
         },
         panel: crate::settings::Panel::default(),
     }
@@ -967,6 +973,7 @@ fn settings_panel_hover() -> Model {
             reasoning: crate::reasoning::ReasoningMode::Full,
             motion: false,
             copy_on_select: false,
+            resume_landing_seen: false,
         },
         ..attached_empty()
     }
@@ -998,6 +1005,33 @@ fn model_picker() -> Model {
                 "The picker will open with Ctrl+M, move with the arrow keys, and close without disturbing your draft.".into(),
             ),
         ]),
+        ..attached_empty()
+    }
+}
+
+/// The command palette open over a conversation: a centred card with the query
+/// line and the command list. The cursor starts on the first row.
+fn palette() -> Model {
+    let mut palette = crate::palette::Palette::default();
+    palette.open();
+    Model {
+        palette,
+        transcript: conversation(vec![(
+            "How do I switch sessions?".into(),
+            "Hit Ctrl/Cmd+P and type to filter; Enter runs the highlighted command.".into(),
+        )]),
+        ..attached_empty()
+    }
+}
+
+/// A session with an active model, so the caption right of the footnote is
+/// visible: the one permanent line that names what is answering.
+fn model_caption() -> Model {
+    Model {
+        model: Some(crate::ModelId {
+            provider: Some("anthropic".into()),
+            model: Some("claude-sonnet-4-5".into()),
+        }),
         ..attached_empty()
     }
 }

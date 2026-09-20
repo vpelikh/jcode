@@ -9,6 +9,7 @@ mod activity;
 mod app_harness;
 mod app_model_picker;
 mod app_overview;
+mod app_palette;
 mod app_resume;
 mod app_selection;
 mod app_settings;
@@ -38,6 +39,7 @@ mod meta;
 mod model_picker;
 mod overview;
 mod paint;
+mod palette;
 mod place;
 mod png;
 mod profile;
@@ -48,6 +50,7 @@ mod scene;
 mod scene_file_tree;
 mod scene_help;
 mod scene_overview;
+mod scene_palette;
 mod scene_resume;
 mod scene_workspace;
 mod scroll;
@@ -197,6 +200,22 @@ struct App {
     /// session; reconnects and later attaches already have a session id and do
     /// not create more panels.
     startup_panel_pending: bool,
+    /// Set when the connection is lost: on the next idle re-attach the live
+    /// transcript is backfilled from stored history, because the daemon never
+    /// re-streams a turn that finished while disconnected.
+    reload_pending: bool,
+    /// Length (in messages) of the live transcript when a history reload was
+    /// requested, so the reply only replaces the page when nothing new has
+    /// streamed in since (which would be clobbered by the stale snapshot).
+    reload_len: Option<usize>,
+    /// When the window first attaches, a store scan is kicked off so a
+    /// returning user's sessions can surface without another keystroke. This
+    /// latches once the first scan with stored sessions lands: the resume
+    /// picker opens over the fresh session so "continue what I was doing" is
+    /// the first thing a returning user sees. Cleared as soon as it is spent
+    /// (or once the user has dismissed the picker), so a reconnect never
+    /// re-opens it.
+    resume_auto_open_pending: bool,
     /// Geometry of the most recently built frame. Pointer hit-testing reads
     /// this instead of the GPU state, so input handling is testable without a
     /// window and can never disagree with what was actually drawn.
@@ -241,6 +260,9 @@ impl Default for App {
             workspace_frame: None,
             new_session_transition_pending: false,
             startup_panel_pending: true,
+            reload_pending: false,
+            reload_len: None,
+            resume_auto_open_pending: false,
             // A sensible frame until the first real one is built, so input
             // before the first paint is still handled sanely.
             frame: layout::Frame::new((1100, 720), 1.0),
@@ -417,6 +439,10 @@ pub struct Model {
     /// Desktop-native keyboard and local-command reference. This is deliberately
     /// local state: help must be available before a daemon session attaches.
     pub help_open: bool,
+    /// The command palette: one fuzzy type-to-act surface over the desktop's
+    /// real actions. Part of the model so a frame stays a pure function of it
+    /// and the open palette is capturable without a window.
+    pub palette: palette::Palette,
     /// Working directory of the attached session, as the daemon reports it.
     /// `None` until attach, because a guess here is worse than silence: it is
     /// the fact that decides whether an answer applies to your project.
@@ -517,6 +543,7 @@ impl Default for Model {
             peeks: overview::Peeks::default(),
             resume: resume::Picker::default(),
             help_open: false,
+            palette: palette::Palette::default(),
             working_dir: None,
             file_tree: file_tree::FileTree::default(),
             model: None,
@@ -1045,6 +1072,29 @@ impl App {
                 return;
             }
         }
+        // The palette is modal and drawn on top, so it gets the press before
+        // any overlay or the page: a click on a row commits it, a click on the
+        // dimmed paper dismisses, and a click inside the card but off a row is
+        // ignored so the keyboard keeps the highlight.
+        if self.model.palette.is_open() {
+            let rows = self.model.palette.rows().len();
+            match self.frame.palette_row_at(rows, x, y) {
+                Some(index) => {
+                    self.model.palette.select_row(index);
+                    self.palette_commit();
+                }
+                None if !self
+                    .frame
+                    .palette_card(rows)
+                    .contains(vello::kurbo::Point::new(x, y)) =>
+                {
+                    self.model.palette.close();
+                    self.request_redraw();
+                }
+                None => {}
+            }
+            return;
+        }
         // The picker is modal: a click on a row takes it, a click on a project
         // heading opens or shuts it, and a click on the dimmed page around the
         // card dismisses, like any overlay.
@@ -1253,6 +1303,24 @@ impl App {
     fn update_cursor_icon(&mut self) {
         let (x, y) = self.focused_pointer();
         let panel_rows = self.model.panel.rows().len();
+        // The palette's rows are the only clickable thing while it is up, so
+        // the pointer says so there and stays an arrow over the dimmed page.
+        if self.model.palette.is_open() {
+            let wanted = match self
+                .frame
+                .palette_row_at(self.model.palette.rows().len(), x, y)
+            {
+                Some(_) => winit::window::CursorIcon::Pointer,
+                None => winit::window::CursorIcon::Default,
+            };
+            if self.cursor_icon != wanted {
+                self.cursor_icon = wanted;
+                if let Some(state) = self.state.as_ref() {
+                    state.set_cursor_icon(wanted);
+                }
+            }
+            return;
+        }
         // The picker's rows are the only clickable thing while it is up, so the
         // pointer says so there and stays an arrow over the dimmed page.
         if self.model.resume.is_open() {
@@ -1285,6 +1353,7 @@ impl App {
         let wanted = if self.frame.hits_gear(x, y)
             || self.frame.hits_sessions(x, y)
             || self.strip_session_at(x, y).is_some()
+            || self.over_model_caption(x, y)
             || (self.model.model_picker.is_open()
                 && self
                     .frame
@@ -1323,6 +1392,21 @@ impl App {
     }
 
     fn on_pointer_moved(&mut self) {
+        // The palette owns the pointer while it is up: hovering a row moves the
+        // highlight so the mouse and the keyboard drive one selection. A hover
+        // off the list leaves the highlight where it was.
+        if self.model.palette.is_open() {
+            let (x, y) = self.focused_pointer();
+            let rows = self.model.palette.rows().len();
+            if let Some(row) = self.frame.palette_row_at(rows, x, y)
+                && row != self.model.palette.cursor()
+            {
+                self.model.palette.select_row(row);
+                self.request_redraw();
+            }
+            self.update_cursor_icon();
+            return;
+        }
         // The picker owns the pointer while it is up: hovering a row moves the
         // highlight, so the mouse and the keyboard drive one selection and the
         // preview follows the cursor. A hover off the list leaves the highlight
@@ -1817,6 +1901,11 @@ impl App {
             }
 
             Action::ToggleModelPicker => self.toggle_model_picker(),
+
+            // The palette opens over everything as the single discoverable
+            // entry point to the chord map; committing a row re-dispatches the
+            // action it names.
+            Action::TogglePalette => self.toggle_palette(),
 
             // The palette, on a key. The notice names what it landed on, so
             // the chord is self-documenting the first time it is hit by

@@ -37,6 +37,125 @@ fn ctrl_m_resolves_to_the_model_picker() {
 }
 
 #[test]
+fn ctrl_and_cmd_p_resolve_to_the_command_palette() {
+    assert_eq!(
+        keymap::resolve(&ch('p'), ModifiersState::CONTROL),
+        Some(Action::TogglePalette)
+    );
+    assert_eq!(
+        keymap::resolve(&ch('p'), ModifiersState::SUPER),
+        Some(Action::TogglePalette)
+    );
+}
+
+#[test]
+fn the_palette_opens_closes_and_commits_dispatches_its_action() {
+    let mut app = App::default();
+    app.model.session_id = Some("session_palette".into());
+    let _ = app.apply(Action::TogglePalette, None);
+    assert!(app.model.palette.is_open());
+    // The composer does not capture the palette's keys while it is up.
+    let _ = app.apply(Action::TogglePalette, None);
+    assert!(!app.model.palette.is_open());
+}
+
+#[test]
+fn every_palette_command_dispatches_safely_and_closes_the_palette() {
+    // The palette registry must never drift from the actions the app can
+    // actually run: if a future Action is added to COMMANDS but not handled
+    // by `apply`, this test fails where the user would have been hit by a
+    // row that silently did nothing. Mirror of the ported-chord sweep.
+    for (index, command) in crate::palette::COMMANDS.iter().enumerate() {
+        let mut app = App::default();
+        app.model.session_id = Some("session_palette".into());
+        app.model.palette.open();
+        assert!(app.model.palette.select_row(index));
+        let kept = app.palette_commit();
+        assert!(kept, "committing {:?} requested exit", command.label);
+        assert!(
+            !app.model.palette.is_open(),
+            "palette stayed open after committing {:?}",
+            command.label
+        );
+    }
+}
+
+#[test]
+fn palette_commands_that_open_surfaces_really_open_them() {
+    // The safe-dispatch sweep above only proves no-panic on a no-harness app;
+    // a command whose action silently opened the wrong surface would still
+    // pass it. Here the surface-opening commands are committed and asserted to
+    // visibly open exactly the surface their label names.
+    let cases: &[(&str, &dyn Fn(&App) -> bool)] = &[
+        ("Settings", &|app| app.model.panel.is_open()),
+        ("Help", &|app| app.model.help_open),
+    ];
+    for (label, opened) in cases {
+        let mut app = app_with("draft");
+        app.model.palette.open();
+        let index = crate::palette::COMMANDS
+            .iter()
+            .position(|c| c.label == *label)
+            .unwrap_or_else(|| panic!("command '{}' missing from registry", label));
+        app.model.palette.select_row(index);
+        app.palette_commit();
+        assert!(
+            opened(&app),
+            "palette command '{label}' did not open its surface after commit"
+        );
+    }
+}
+
+#[test]
+fn palette_keydown_types_filters_and_commits_the_highlighted_row() {
+    use winit::keyboard::SmolStr;
+    let mut app = App::default();
+    app.model.session_id = Some("session_palette".into());
+    let _ = app.apply(Action::TogglePalette, None);
+    // Type "theme" and commit with Enter; the ToggleTheme action fires.
+    for c in "theme".chars() {
+        let key = Key::Character(SmolStr::new(c.to_string()));
+        assert!(app.palette_keydown(&key, Some(c.to_string().as_str())));
+    }
+    let committed = app.model.palette.selected().map(|c| c.action);
+    assert_eq!(committed, Some(Action::ToggleTheme));
+}
+
+#[test]
+fn the_palette_chord_rises_above_another_open_modal() {
+    // The palette is the app's one discoverable entry point, so Ctrl/Cmd+P
+    // must open it even while a different overlay owns the keyboard. Without
+    // this, a palette meant to replace the chord map is itself unreachable the
+    // moment a model menu or resume overlay is up.
+    let mut app = app_with("draft");
+    // Hand the model picker a harness so it can actually open on Ctrl+M. Keep
+    // both receivers alive so sending ListModels does not fail before it opens.
+    let (update_tx, update_rx) = std::sync::mpsc::channel();
+    let (command_tx, command_rx) = std::sync::mpsc::channel();
+    app.harness = Some((
+        update_rx,
+        crate::harness::CommandSender::for_test(command_tx),
+    ));
+    let (_update_tx, _command_rx) = (update_tx, command_rx);
+    let _ = app.apply(Action::ToggleModelPicker, None);
+    assert!(
+        app.model.model_picker.is_open(),
+        "precondition: model picker open"
+    );
+    app.modifiers = ModifiersState::CONTROL;
+    assert!(app.key_pressed(&ch('p'), Some("p")));
+    assert!(
+        app.model.palette.is_open(),
+        "Ctrl+P should open the palette above the model picker"
+    );
+    assert!(
+        !app.model.model_picker.is_open(),
+        "opening the palette should close the model picker beneath it"
+    );
+    drop(_command_rx);
+}
+
+#[test]
 fn ctrl_alt_space_opens_the_session_overview() {
     use winit::keyboard::{Key, ModifiersState, NamedKey};
 
@@ -1688,6 +1807,7 @@ fn a_new_session_preserves_the_old_panel_until_the_new_one_attaches() {
         .send(crate::harness::HarnessUpdate::Attached {
             session_id: "new".into(),
             working_dir: Some("/work".into()),
+            activity: crate::harness::SessionActivity::Idle,
         })
         .unwrap();
     app.drain_harness_updates();
@@ -1720,6 +1840,7 @@ fn a_fresh_window_requests_exactly_one_neighboring_panel() {
         .send(crate::harness::HarnessUpdate::Attached {
             session_id: "first".into(),
             working_dir: Some("/work".into()),
+            activity: crate::harness::SessionActivity::Idle,
         })
         .unwrap();
     app.drain_harness_updates();

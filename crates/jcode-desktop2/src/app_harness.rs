@@ -18,17 +18,42 @@ impl App {
         let mut turn_ended = false;
         let mut begin_new_panel_slide = false;
         let mut create_startup_panel = false;
+        let mut resume_auto_open = false;
         while let Ok(update) = updates.try_recv() {
             match update {
                 harness::HarnessUpdate::Status(status) => self.model.status = status,
                 harness::HarnessUpdate::ConnectionLost(message) => {
                     // The harness worker reattaches automatically. Keep the
-                    // transcript and in-flight turn intact while it does so.
-                    // Turning this into `Failed` used to add two scary error
-                    // cards for one routine daemon reload.
+                    // transcript and the message that was sent so a reconnect
+                    // does not look like a dropped submission. Turning this
+                    // into `Failed` used to add two scary error cards for one
+                    // routine daemon reload.
+                    //
+                    // Deliberately leave `busy` alone here: the in-flight turn
+                    // is reconciled authoritatively on the re-attach, from the
+                    // daemon's reported session status. The daemon does not
+                    // replay a finished turn's events to a fresh subscription,
+                    // so clearing busy now would both wrongly mark a still-
+                    // running turn idle and strand nothing in the finished case
+                    // (the re-attach handles that). Let the reconnect decide.
                     self.model.status = message;
                     self.model
                         .set_notice("connection interrupted, reconnecting");
+                    // A fresh disconnect invalidates any in-flight reload's
+                    // snapshot window: if reload_len were kept, a History reply
+                    // from a reload issued before this drop could still apply
+                    // against the later state.
+                    self.reload_len = None;
+                    // Backfill the live transcript once the worker re-attaches:
+                    // a turn that finished during the gap is not re-streamed, so
+                    // the stored history is the only record of it. Only worth it
+                    // if a turn was actually running; a clean disconnect (e.g. a
+                    // routine daemon reload) has nothing to backfill. Only replayed
+                    // for an idle re-attach to the *same* session (see the
+                    // `Attached` arm).
+                    if self.model.busy {
+                        self.reload_pending = true;
+                    }
                 }
                 // A failure goes into the conversation, not only the status
                 // line: the status line is suppressed once a session is
@@ -50,13 +75,20 @@ impl App {
                     // queued behind the failed turn gets its chance now
                     // rather than waiting forever.
                     turn_ended = true;
+                    // The transcript reflects the outcome, so a pending history
+                    // reload (which was for the drop that preceded this) is now
+                    // stale.
+                    self.reload_pending = false;
+                    self.reload_len = None;
                 }
                 harness::HarnessUpdate::Attached {
                     session_id,
                     working_dir,
+                    activity,
                 } => {
                     let initial_attach = self.model.session_id.is_none();
                     let reconnected = self.model.failure.is_some();
+                    let same_session = self.model.session_id.as_deref() == Some(session_id.as_str());
                     // SessionNew is a panel creation, not a destructive clear of
                     // the panel under the pointer. Keep that old panel visible
                     // while the daemon creates its replacement, then reset the
@@ -73,6 +105,55 @@ impl App {
                     // reconnected window must not keep reporting the outage it
                     // just recovered from.
                     self.model.failure = None;
+                    // Reconcile the turn with the daemon's reported state. The
+                    // daemon does not replay a finished turn's stream events to
+                    // a freshly re-attached subscription, so a connection that
+                    // dropped around a completed turn would otherwise strand
+                    // `busy` under an infinite "thinking" spinner. If the daemon
+                    // still reports the session processing, a turn is genuinely
+                    // in flight and its events keep streaming; otherwise the turn
+                    // (and any stranded thinking row) is over.
+                    let processing = activity.is_processing();
+                    self.model.busy = processing;
+                    // A session change cancels any pending reload: it targeted a
+                    // conversation the user is no longer looking at.
+                    if !same_session {
+                        self.reload_pending = false;
+                        self.reload_len = None;
+                    }
+                    if !processing {
+                        self.model.activity.finish();
+                        self.model.transcript.clear_live_tool();
+                        // An idle re-attach after a disconnect is the one case
+                        // where the daemon will not re-send the reply that
+                        // finished while we were out; ask the worker to backfill
+                        // it from stored history. (Skipped when a message is still
+                        // queued: the flush below starts a new turn that would
+                        // invalidate the snapshot, so the fetch would be wasted.)
+                        if self.reload_pending && same_session && !self.model.transcript.has_queued() {
+                            self.reload_pending = false;
+                            // Remember how much conversation was on screen so the
+                            // history reply only replaces the page if nothing new
+                            // has streamed in since (which it would clobber).
+                            self.reload_len = Some(self.model.transcript.messages().len());
+                            if let Some((_, outgoing)) = self.harness.as_ref() {
+                                let _ = outgoing.send(harness::Command::Reload(
+                                    session_id.clone(),
+                                ));
+                            }
+                        }
+                        // A genuine reconnect to an idle session is a fresh turn
+                        // boundary for any message queued before the drop: the
+                        // daemon is free again, so the oldest waiting message
+                        // goes now (flushed once, at the end of this drain).
+                        if same_session && self.model.transcript.has_queued() {
+                            turn_ended = true;
+                            // The queued message supersedes the backfill: it is
+                            // what gets sent now, so there is nothing to reload.
+                            self.reload_pending = false;
+                            self.reload_len = None;
+                        }
+                    }
                     // A reconnect re-attaches the same session; the transcript
                     // on screen is the one that was being read, so it stays.
                     self.model.strips.focus_session(&session_id);
@@ -85,6 +166,10 @@ impl App {
                         // sending so a reconnect can never multiply panels.
                         self.startup_panel_pending = false;
                         create_startup_panel = true;
+                        // Guard the resume auto-open behind the attach: open
+                        // only once, when the workspace first comes up, not on
+                        // a later reconnect.
+                        resume_auto_open = true;
                     }
                     if reconnected {
                         self.model.set_notice("reconnected");
@@ -207,6 +292,12 @@ impl App {
                     // there is none, and a card left behind would claim work
                     // is still happening.
                     self.model.transcript.clear_live_tool();
+                    // A real turn boundary makes any pending history reload
+                    // stale: this turn streamed its outcome (or the previous
+                    // idle reconnect already applied its). Drop it so it cannot
+                    // fire against a later idle reconnect.
+                    self.reload_pending = false;
+                    self.reload_len = None;
                     // Progress cards deliberately survive the turn: a
                     // backgrounded build keeps running after the agent stops
                     // waiting on it, and its own completion event is what
@@ -221,6 +312,42 @@ impl App {
                     // stream, so a peek reply for it is only ever cache: it
                     // must not overwrite the live page.
                     self.model.peeks.insert(&session_id, transcript);
+                }
+                harness::HarnessUpdate::History {
+                    session_id,
+                    transcript,
+                } => {
+                    // Only the live page is reloaded, and only while idle: a
+                    // busy turn is still streaming and history is a stale
+                    // snapshot that would clobber it.
+                    if self.model.session_id.as_deref() != Some(session_id.as_str()) {
+                        self.model.peeks.insert(&session_id, transcript);
+                    } else if let Some(len_at_issue) = self.reload_len {
+                        // Apply only if nothing new streamed in since the reload
+                        // was requested: a changed page means a new turn is in
+                        // flight or queued work appeared, and a stale snapshot
+                        // must not clobber it. The reload is only ever requested
+                        // when no message is queued (see the `Attached` arm), and
+                        // `unchanged` keeps it that way until the reply lands.
+                        //
+                        // The incoming history need not contain every live-only
+                        // decoration (edit/todo/progress cards, reasoning), so
+                        // its length is not compared against the live page's.
+                        let unchanged =
+                            self.model.transcript.messages().len() == len_at_issue;
+                        if !self.model.busy && unchanged {
+                            let reasoning = self.model.transcript.reasoning_mode();
+                            self.model.transcript = transcript;
+                            self.model.transcript.set_reasoning_mode(reasoning);
+                            self.model.stream.reveal_all();
+                            // The reload dropped in a page's worth of history; jump
+                            // to the live tail rather than stranding the old scroll.
+                            self.model.scroll = 0.0;
+                        }
+                    }
+                    // Whether or not the snapshot was applied, the reload window
+                    // is over: it must not replace a later turn.
+                    self.reload_len = None;
                 }
                 harness::HarnessUpdate::Sessions(entries) => {
                     let had_panels = !self.model.strips.is_empty();
@@ -252,6 +379,13 @@ impl App {
         }
         if create_startup_panel {
             self.new_session();
+        }
+        if resume_auto_open {
+            // Ask the store whether this user is returning to work. If it
+            // finds stored sessions, the resume picker opens over the fresh
+            // page on the first scan (see `drain_resume_scans`). Only when the
+            // workspace first comes up, so a reconnect never re-opens it.
+            self.resume_auto_open_pending = self.start_resume_scan();
         }
         self.model
             .file_tree

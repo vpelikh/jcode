@@ -305,6 +305,18 @@ impl App {
             self.request_redraw();
             return true;
         }
+        // The command palette is the app's one discoverable entry point, so its
+        // chord must also rise above whichever overlay currently owns the
+        // keyboard. Otherwise a palette that exists to replace the chord map
+        // could not be summoned while the model picker or resume overlay was
+        // up, which would be the very failure the palette is meant to fix.
+        if !self.model.palette.is_open()
+            && keymap::resolve(logical_key, self.modifiers) == Some(keymap::Action::TogglePalette)
+        {
+            self.toggle_palette();
+            self.request_redraw();
+            return true;
+        }
         if self.model.help_open {
             if let Some(action) = keymap::resolve_help(logical_key) {
                 self.apply(action, typed);
@@ -313,6 +325,9 @@ impl App {
             // leaking into the composer hidden beneath it.
             self.request_redraw();
             return true;
+        }
+        if self.model.palette.is_open() {
+            return self.palette_keydown(logical_key, typed);
         }
         if self.model.resume.is_open() {
             return self.resume_keydown(logical_key, typed);

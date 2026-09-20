@@ -133,6 +133,21 @@ pub const MODEL_MENU_RADIUS: f64 = 6.0;
 pub const MODEL_MENU_GAP: f64 = 6.0;
 pub const MODEL_MENU_TEXT_PAD: f64 = 10.0;
 
+/// The command palette card, and a row within it.
+///
+/// A centred card like the help overlay, sized to hold the command list without
+/// eating the page: the whole point of an overlay is that the conversation
+/// stays visible around it. Fractions of the window's short side, clamped so it
+/// is neither unreadable nor a wall.
+pub const PALETTE_WIDTH_FRACTION: f64 = 0.44;
+pub const PALETTE_WIDTH_MIN: f64 = 300.0;
+pub const PALETTE_WIDTH_MAX: f64 = 460.0;
+pub const PALETTE_ROW_HEIGHT: f64 = 30.0;
+pub const PALETTE_SEARCH_HEIGHT: f64 = 34.0;
+pub const PALETTE_PAD: f64 = 10.0;
+pub const PALETTE_RADIUS: f64 = 8.0;
+pub const PALETTE_TEXT_PAD: f64 = 12.0;
+
 /// The resume overlay: a left panel of stored sessions, a preview to its
 /// right, both floating over the conversation rather than replacing it.
 ///
@@ -517,6 +532,62 @@ impl Frame {
         }
         let index = (offset / MODEL_MENU_ROW_HEIGHT) as usize;
         (index < rows).then_some(index)
+    }
+
+    /// The command-palette card: a centred box sized to `rows` + the query
+    /// line. Clamped so a tall list never touches the page header or the
+    /// composer's footnote.
+    pub fn palette_card(&self, rows: usize) -> vello::kurbo::Rect {
+        let short = self.width.min(self.height).max(1.0);
+        // Never wider than the page the card is drawn on: on a window narrower
+        // than the 300px floor the card must shrink to fit, not spill off the
+        // left edge. The floor is a target, not a guarantee, on tiny windows.
+        let width = (short * PALETTE_WIDTH_FRACTION)
+            .clamp(PALETTE_WIDTH_MIN, PALETTE_WIDTH_MAX)
+            .min(self.width);
+        let rows = rows.max(1);
+        let body = rows as f64 * PALETTE_ROW_HEIGHT;
+        let height = PALETTE_SEARCH_HEIGHT + PALETTE_PAD + body + PALETTE_PAD;
+        // Cap the card to the vertical space the page allows, so a short
+        // window does not push its top and bottom off-paper. The floor keeps a
+        // degenerate page from shrinking the card to nothing; the list simply
+        // over-clips to the card rather than scrolling.
+        let available = (self.height - 80.0).max(120.0);
+        let height = height.min(available);
+        let x0 = (self.width - width) / 2.0;
+        let y0 = (self.height - height) / 2.0;
+        vello::kurbo::Rect::new(x0, y0, x0 + width, y0 + height)
+    }
+
+    /// Row `index` inside the palette card, below the query line.
+    pub fn palette_row(&self, rows: usize, index: usize) -> vello::kurbo::Rect {
+        let card = self.palette_card(rows);
+        let y0 = card.y0 + PALETTE_SEARCH_HEIGHT + PALETTE_PAD + index as f64 * PALETTE_ROW_HEIGHT;
+        vello::kurbo::Rect::new(
+            card.x0 + PALETTE_TEXT_PAD,
+            y0,
+            card.x1 - PALETTE_TEXT_PAD,
+            y0 + PALETTE_ROW_HEIGHT,
+        )
+    }
+
+    /// Row at a point inside the palette card, for pointer hit-testing.
+    pub fn palette_row_at(&self, rows: usize, x: f64, y: f64) -> Option<usize> {
+        let rows = rows.max(1);
+        let card = self.palette_card(rows);
+        if !card.contains(vello::kurbo::Point::new(x, y)) {
+            return None;
+        }
+        let list_top = card.y0 + PALETTE_SEARCH_HEIGHT + PALETTE_PAD;
+        if y < list_top {
+            return None;
+        }
+        let index = ((y - list_top) / PALETTE_ROW_HEIGHT) as usize;
+        // A card height-capped to a short window clips rows whose full band
+        // would extend past its bottom; the hit test must agree with what the
+        // renderer draws, so a row that is half-hidden is not selectable.
+        let band_end = list_top + (index + 1) as f64 * PALETTE_ROW_HEIGHT;
+        (index < rows && band_end <= card.y1 + 1e-9).then_some(index)
     }
 
     /// The caret must stay inside the composer well at any size.
@@ -1284,6 +1355,99 @@ mod tests {
             assert!(frame.column() > 0.0);
             assert!(frame.body_top <= frame.body_bottom);
             assert!(frame.composer_top < frame.composer_bottom);
+        }
+    }
+
+    #[test]
+    fn palette_rows_stay_ordered_and_inside_the_card() {
+        // The palette card and its rows must be well-formed at any size: rows
+        // strictly ordered, each row inside the card, and neither inverted nor
+        // off-paper on degenerate windows. Locked like the other geometry so a
+        // future tweak cannot push the list over the card's own edge.
+        let sizes: &[(u32, u32)] = &[(200, 400), (300, 200), (320, 240), (640, 480)];
+        for &size in sizes {
+            for &scale in SCALES {
+                let frame = Frame::new(size, scale);
+                let rows = 7;
+                let card = frame.palette_card(rows);
+                assert!(
+                    card.width() > 0.0 && card.height() > 0.0,
+                    "palette card inverted at {size:?} x{scale}"
+                );
+                assert!(
+                    card.x0 >= 0.0 && card.x1 <= frame.width,
+                    "palette card spilled off-paper at {size:?} x{scale}"
+                );
+                let mut prev_bottom = card.y0;
+                // Rows beyond the card's bottom are legitimate when the card is
+                // height-capped on a short window (the list is clipped there
+                // rather than scrolled); only rows inside the card must stay
+                // ordered and contained.
+                for index in 0..rows {
+                    let row = frame.palette_row(rows, index);
+                    if row.y1 > card.y1 + 1e-9 {
+                        continue;
+                    }
+                    assert!(
+                        row.y0 >= prev_bottom - 1e-9,
+                        "palette row {index} overlapped the one above at {size:?}"
+                    );
+                    assert!(
+                        row.x0 >= card.x0 && row.x1 <= card.x1,
+                        "palette row {index} escaped the card horizontally at {size:?}"
+                    );
+                    assert!(
+                        row.y0 >= card.y0,
+                        "palette row {index} started above the card at {size:?}"
+                    );
+                    prev_bottom = row.y1;
+                }
+            }
+        }
+    }
+
+    /// A height-capped card must not be hit-testable on a row the renderer
+    /// clipped away: clicking a half-hidden (or absent) row selects nothing,
+    /// so the pointer and the pixels agree.
+    #[test]
+    fn palette_hit_test_agrees_with_the_clipped_rows() {
+        for &scale in SCALES {
+            // No matter the card height (it may cap on a short logical frame),
+            // any row whose full band fits inside the card is hit-testable at
+            // its centre, and any row that does not fit is not: the pointer
+            // and the pixels always agree.
+            let frame = Frame::new((800, 900), scale);
+            let rows = 7;
+            let card = frame.palette_card(rows);
+            for index in 0..rows {
+                let band = frame.palette_row(rows, index);
+                let fits = band.y0 >= card.y0 - 1e-9 && band.y1 <= card.y1 + 1e-9;
+                let hit = frame.palette_row_at(rows, band.x0 + 1.0, (band.y0 + band.y1) / 2.0);
+                assert_eq!(
+                    hit.is_some(),
+                    fits,
+                    "row {index} hit-testability disagreed with its clip @ {scale}"
+                );
+            }
+            // A very short card: rows past its bottom are neither drawn nor
+            // hit-testable, and clicking off-paper selects nothing.
+            let short = Frame::new((800, 120), scale);
+            let first_shown = short.palette_row(rows, 0);
+            assert!(
+                short
+                    .palette_row_at(
+                        rows,
+                        first_shown.x0 + 1.0,
+                        (first_shown.y0 + first_shown.y1) / 2.0
+                    )
+                    .is_some(),
+                "first row should be hit-testable on the short card @ {scale}"
+            );
+            assert_eq!(
+                short.palette_row_at(rows, 1.0, short.height + 1.0),
+                None,
+                "off-paper click hit a row @ {scale}"
+            );
         }
     }
 

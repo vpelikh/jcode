@@ -11,6 +11,7 @@ use crate::ack::{Delivery, WIGGLE};
 use crate::keymap::Action;
 use crate::transcript::Role;
 use crate::{App, harness};
+use crate::harness::SessionActivity;
 use std::time::Instant;
 
 fn app_with_session() -> App {
@@ -443,4 +444,538 @@ fn the_delivery_tone_ramps_with_the_acknowledgement() {
     );
     assert_eq!(acked.tone(now + WIGGLE), 1.0);
     assert_eq!(acked.tone(now + WIGGLE * 3), 1.0);
+}
+
+/// The daemon does not replay a finished turn's events to a freshly
+/// re-attached connection: `attached`+`session_status` arrive with no
+/// `text_delta`, no `tool_*`, and crucially no `turn_done`. So a connection
+/// that drops mid-turn must retire the in-flight turn itself, or the message
+/// it was about to deliver would sit under an infinite "thinking" spinner with
+/// `busy` never cleared.
+#[test]
+fn a_connection_loss_retires_the_in_flight_turn() {
+    let mut app = app_with_session();
+    let (updates, update_rx) = std::sync::mpsc::channel();
+    let (commands, _command_rx) = std::sync::mpsc::channel();
+    app.harness = Some((update_rx, harness::CommandSender::for_test(commands)));
+
+    app.apply(Action::Insert, Some("hello"));
+    app.apply(Action::Submit, None);
+    assert!(app.model.busy, "the send started a turn");
+    assert_eq!(
+        app.model.transcript.messages().last().map(|m| m.source.as_str()),
+        Some("thinking"),
+        "the turn showed its provisional thinking row"
+    );
+
+    // The connection dies mid-turn and the worker re-attaches to the same
+    // (now idle) session. The daemon never re-emits the finished turn's end.
+    updates
+        .send(harness::HarnessUpdate::ConnectionLost("surprise".into()))
+        .expect("queue the disconnect");
+    updates
+        .send(harness::HarnessUpdate::Attached {
+            session_id: "session_test".into(),
+            working_dir: Some("/tmp".into()),
+            activity: SessionActivity::Idle,
+        })
+        .expect("queue the re-attach");
+    app.drain_harness_updates();
+
+    assert!(
+        !app.model.busy,
+        "re-attaching to an idle session must not leave the turn running"
+    );
+    assert!(
+        app.model
+            .transcript
+            .messages()
+            .iter()
+            .all(|m| m.role != Role::Tool),
+        "a stranded thinking row survived the reconnect"
+    );
+    // The user's message was sent before the drop; it stays on the page, just
+    // no longer claiming a turn is in flight.
+    assert_eq!(deliveries(&app), vec![Some(Delivery::Sent)]);
+}
+
+/// A connection loss must retire the *in-flight* turn but must not flush queued
+/// messages: the messages waiting behind a busy turn expect a real turn
+/// boundary before being sent, and a dead connection is not one. Sending into
+/// it would lose them to the disconnect rather than deliver them after a
+/// reconnect. Queuing survives the drop and waits on the next honest boundary.
+#[test]
+fn a_connection_loss_does_not_flush_queued_messages() {
+    let mut app = app_with_session();
+    let (updates, update_rx) = std::sync::mpsc::channel();
+    let (commands, command_rx) = std::sync::mpsc::channel();
+    app.harness = Some((update_rx, harness::CommandSender::for_test(commands)));
+
+    // Start a turn, then queue a second message while it is busy.
+    app.apply(Action::Insert, Some("first"));
+    app.apply(Action::Submit, None);
+    let _ = command_rx.try_recv();
+    app.apply(Action::Insert, Some("second"));
+    app.apply(Action::Submit, None);
+    assert_eq!(
+        deliveries(&app),
+        vec![Some(Delivery::Sent), Some(Delivery::Queued)],
+        "prereq: second message queued behind the busy turn"
+    );
+
+    // The connection drops. Busy is left untouched (the re-attach reconciles it
+    // authoritatively), so a still-in-flight turn is not wrongly marked idle --
+    // and neither is the queue flushed into a dead connection.
+    updates
+        .send(harness::HarnessUpdate::ConnectionLost("surprise".into()))
+        .expect("queue the disconnect");
+    app.drain_harness_updates();
+
+    // The queued message must not be sent while disconnected.
+    assert!(
+        command_rx
+            .try_iter()
+            .all(|command| !matches!(command, harness::Command::Send { .. })),
+        "a queued message was flushed into a disconnected harness"
+    );
+    // The in-flight turn is only retired once the re-attach reports the daemon
+    // state. Until then it stays running so nothing is spuriously marked idle.
+    assert!(app.model.busy, "busy is not cleared by connection loss alone");
+    assert_eq!(
+        deliveries(&app),
+        vec![Some(Delivery::Sent), Some(Delivery::Queued)],
+        "a disconnected connection must not send the queued message"
+    );
+}
+
+/// Attach is authoritative for whether a turn is running: a session the daemon
+/// still reports as busy keeps the spinner, and one it reports idle ends the
+/// stranded "thinking" row. Without the busy field the app could neither tell
+/// them apart nor recover a finished turn.
+#[test]
+fn a_reconnect_reconciles_busy_from_the_daemon() {
+    let mut app = app_with_session();
+    let (updates, update_rx) = std::sync::mpsc::channel();
+    let (commands, _command_rx) = std::sync::mpsc::channel();
+    app.harness = Some((update_rx, harness::CommandSender::for_test(commands)));
+
+    app.apply(Action::Insert, Some("hello"));
+    app.apply(Action::Submit, None);
+    assert!(app.model.busy, "the send started a turn");
+
+    // Re-attach while the daemon still reports the session busy: the turn is
+    // genuinely in flight and must not be marked idle.
+    updates
+        .send(harness::HarnessUpdate::Attached {
+            session_id: "session_test".into(),
+            working_dir: Some("/tmp".into()),
+            activity: SessionActivity::Processing,
+        })
+        .expect("queue the busy re-attach");
+    app.drain_harness_updates();
+    assert!(
+        app.model.busy,
+        "a daemon-reported-busy session must keep the turn running"
+    );
+
+    // The session finishes and re-attaches idle: the stranded turn is retired.
+    updates
+        .send(harness::HarnessUpdate::ConnectionLost("flap".into()))
+        .expect("queue the next disconnect");
+    updates
+        .send(harness::HarnessUpdate::Attached {
+            session_id: "session_test".into(),
+            working_dir: Some("/tmp".into()),
+            activity: SessionActivity::Idle,
+        })
+        .expect("queue the idle re-attach");
+    app.drain_harness_updates();
+    assert!(
+        !app.model.busy,
+        "a daemon-reported-idle session must retire the turn"
+    );
+    assert!(
+        app.model
+            .transcript
+            .messages()
+            .iter()
+            .all(|m| m.role != Role::Tool),
+        "the stranded thinking row must not survive an idle re-attach"
+    );
+}
+
+/// An idle re-attach after a disconnect backfills the live transcript from
+/// stored history, because the daemon never re-streams a turn that finished
+/// while the connection was down. The worker is asked to reload, and the
+/// history reply lands on the live page.
+#[test]
+fn an_idle_reconnect_backfills_stored_history() {
+    let mut app = app_with_session();
+    let (updates, update_rx) = std::sync::mpsc::channel();
+    let (commands, command_rx) = std::sync::mpsc::channel();
+    app.harness = Some((update_rx, harness::CommandSender::for_test(commands)));
+    app.model.session_id = Some("session_test".into());
+
+    // A turn is running when the connection drops, which is what makes a
+    // reload worthwhile.
+    app.apply(Action::Insert, Some("hello"));
+    app.apply(Action::Submit, None);
+    // (the send command itself is consumed below; also consume any peek)
+    let _ = command_rx.try_iter().count();
+
+    // A disconnect leaves a reload pending.
+    updates
+        .send(harness::HarnessUpdate::ConnectionLost("drop".into()))
+        .expect("queue the disconnect");
+    app.drain_harness_updates();
+
+    // The worker re-attaches to an idle session; it should be asked to reload.
+    updates
+        .send(harness::HarnessUpdate::Attached {
+            session_id: "session_test".into(),
+            working_dir: Some("/tmp".into()),
+            activity: SessionActivity::Idle,
+        })
+        .expect("queue the idle re-attach");
+    app.drain_harness_updates();
+    assert!(
+        command_rx
+            .try_iter()
+            .any(|c| matches!(c, harness::Command::Reload(s) if s == "session_test")),
+        "an idle reconnect must ask the worker to reload history"
+    );
+
+    // The history arrives and replaces the live page.
+    let mut history = crate::transcript::Transcript::default();
+    history.push(crate::transcript::Message::user("hello"));
+    history.push(crate::transcript::Message::assistant("the reply"));
+    updates
+        .send(harness::HarnessUpdate::History {
+            session_id: "session_test".into(),
+            transcript: history.clone(),
+        })
+        .expect("queue the history");
+    app.drain_harness_updates();
+    assert_eq!(app.model.transcript.plain_text(), "hello\n\nthe reply");
+}
+
+/// A busy re-attach must not backfill history: the turn is still streaming and
+/// the stored history is a stale snapshot that would clobber it.
+#[test]
+fn a_busy_reconnect_does_not_backfill() {
+    let mut app = app_with_session();
+    let (updates, update_rx) = std::sync::mpsc::channel();
+    let (commands, command_rx) = std::sync::mpsc::channel();
+    app.harness = Some((update_rx, harness::CommandSender::for_test(commands)));
+    app.model.session_id = Some("session_test".into());
+
+    app.apply(Action::Insert, Some("hello"));
+    app.apply(Action::Submit, None);
+    let _ = command_rx.try_recv(); // the send itself
+
+    updates
+        .send(harness::HarnessUpdate::ConnectionLost("drop".into()))
+        .expect("queue the disconnect");
+    app.drain_harness_updates();
+
+    updates
+        .send(harness::HarnessUpdate::Attached {
+            session_id: "session_test".into(),
+            working_dir: Some("/tmp".into()),
+            activity: SessionActivity::Processing,
+        })
+        .expect("queue the busy re-attach");
+    app.drain_harness_updates();
+    assert!(
+        app.model.busy,
+        "a session still in flight keeps its turn"
+    );
+    assert!(
+        command_rx.try_iter().all(|c| !matches!(c, harness::Command::Reload(_))),
+        "a busy re-attach must not request a history reload"
+    );
+}
+
+/// A stale history snapshot must not erase a newer turn. If the user sends a
+/// new message and its reply streams in *after* the reload was requested but
+/// *before* the history reply lands, the live page has grown past the snapshot
+/// and the reload must be dropped rather than clobbering that fresh exchange.
+#[test]
+fn a_history_snapshot_does_not_clobber_newer_content() {
+    let mut app = app_with_session();
+    let (updates, update_rx) = std::sync::mpsc::channel();
+    let (commands, command_rx) = std::sync::mpsc::channel();
+    app.harness = Some((update_rx, harness::CommandSender::for_test(commands)));
+    app.model.session_id = Some("session_test".into());
+
+    app.apply(Action::Insert, Some("first"));
+    app.apply(Action::Submit, None);
+    let _ = command_rx.try_iter().count();
+
+    updates
+        .send(harness::HarnessUpdate::ConnectionLost("drop".into()))
+        .expect("queue the disconnect");
+    app.drain_harness_updates();
+
+    updates
+        .send(harness::HarnessUpdate::Attached {
+            session_id: "session_test".into(),
+            working_dir: Some("/tmp".into()),
+            activity: SessionActivity::Idle,
+        })
+        .expect("queue the idle re-attach");
+    app.drain_harness_updates();
+    assert!(
+        command_rx
+            .try_iter()
+            .any(|c| matches!(c, harness::Command::Reload(_))),
+        "the idle reconnect requested a reload"
+    );
+
+    // Before the history reply, a brand-new turn happens and completes.
+    updates
+        .send(harness::HarnessUpdate::Text("a fresh reply".into()))
+        .expect("queue the new turn");
+    app.drain_harness_updates();
+
+    // The stale snapshot arrives; the live page has grown, so it is ignored.
+    let mut history = crate::transcript::Transcript::default();
+    history.push(crate::transcript::Message::user("first"));
+    history.push(crate::transcript::Message::assistant("stale reply"));
+    updates
+        .send(harness::HarnessUpdate::History {
+            session_id: "session_test".into(),
+            transcript: history.clone(),
+        })
+        .expect("queue the stale history");
+    app.drain_harness_updates();
+
+    let text = app.model.transcript.plain_text();
+    assert!(
+        text.contains("a fresh reply") && !text.contains("stale reply"),
+        "a stale history snapshot clobbered the newer turn: {text:?}"
+    );
+}
+
+/// Switching to a different session cancels a pending reload: it targeted the
+/// conversation the user just left, and must not fire against another one.
+#[test]
+fn a_session_change_cancels_a_pending_reload() {
+    let mut app = app_with_session();
+    let (updates, update_rx) = std::sync::mpsc::channel();
+    let (commands, command_rx) = std::sync::mpsc::channel();
+    app.harness = Some((update_rx, harness::CommandSender::for_test(commands)));
+    app.model.session_id = Some("session_test".into());
+
+    app.apply(Action::Insert, Some("hello"));
+    app.apply(Action::Submit, None);
+    let _ = command_rx.try_iter().count();
+
+    updates
+        .send(harness::HarnessUpdate::ConnectionLost("drop".into()))
+        .expect("queue the disconnect");
+    app.drain_harness_updates();
+
+    // The worker re-attaches to a *different* session and finds it idle.
+    updates
+        .send(harness::HarnessUpdate::Attached {
+            session_id: "another_session".into(),
+            working_dir: Some("/tmp".into()),
+            activity: SessionActivity::Idle,
+        })
+        .expect("queue the re-attach");
+    app.drain_harness_updates();
+
+    assert!(
+        command_rx.try_iter().all(|c| !matches!(c, harness::Command::Reload(_))),
+        "a session switch must not request a reload for the new session"
+    );
+}
+
+/// A fresh disconnect invalidates an in-flight reload's snapshot window. A
+/// History reply from a reload issued *before* that disconnect must not still
+/// replace the page afterwards.
+#[test]
+fn a_disconnect_invalidates_an_in_flight_reload() {
+    let mut app = app_with_session();
+    let (updates, update_rx) = std::sync::mpsc::channel();
+    let (commands, command_rx) = std::sync::mpsc::channel();
+    app.harness = Some((update_rx, harness::CommandSender::for_test(commands)));
+    app.model.session_id = Some("session_test".into());
+
+    app.apply(Action::Insert, Some("hello"));
+    app.apply(Action::Submit, None);
+    let _ = command_rx.try_iter().count();
+
+    // First drop arms a reload; the idle re-attach fires it (reload_len set).
+    updates
+        .send(harness::HarnessUpdate::ConnectionLost("drop".into()))
+        .expect("queue the disconnect");
+    app.drain_harness_updates();
+    updates
+        .send(harness::HarnessUpdate::Attached {
+            session_id: "session_test".into(),
+            working_dir: Some("/tmp".into()),
+            activity: SessionActivity::Idle,
+        })
+        .expect("queue the idle re-attach");
+    app.drain_harness_updates();
+    assert!(
+        command_rx
+            .try_iter()
+            .any(|c| matches!(c, harness::Command::Reload(_))),
+        "the first idle reconnect requested a reload"
+    );
+
+    // A second drop invalidates that reload's snapshot window.
+    updates
+        .send(harness::HarnessUpdate::ConnectionLost("drop again".into()))
+        .expect("queue the second disconnect");
+    app.drain_harness_updates();
+
+    // The (now stale) History reply from the first reload arrives; it must not
+    // replace the page because the disconnect invalidated the window.
+    let mut history = crate::transcript::Transcript::default();
+    history.push(crate::transcript::Message::user("hello"));
+    history.push(crate::transcript::Message::assistant("stale reply"));
+    updates
+        .send(harness::HarnessUpdate::History {
+            session_id: "session_test".into(),
+            transcript: history.clone(),
+        })
+        .expect("queue the stale history");
+    app.drain_harness_updates();
+
+    let text = app.model.transcript.plain_text();
+    assert!(
+        !text.contains("stale reply"),
+        "a reload invalidated by a later disconnect still replaced the page: {text:?}"
+    );
+}
+
+/// A queued (unsent) message must survive a reconnect, and be sent once the
+/// session reattaches idle. Queued messages live only in the local transcript,
+/// not in the daemon's stored history, so a history backfill must be skipped
+/// (it would drop them); instead the queued message is flushed on the idle
+/// re-attach.
+#[test]
+fn a_reload_never_erases_a_queued_message() {
+    let mut app = app_with_session();
+    let (updates, update_rx) = std::sync::mpsc::channel();
+    let (commands, command_rx) = std::sync::mpsc::channel();
+    app.harness = Some((update_rx, harness::CommandSender::for_test(commands)));
+    app.model.session_id = Some("session_test".into());
+
+    app.apply(Action::Insert, Some("first"));
+    app.apply(Action::Submit, None);
+    let _ = command_rx.try_iter().count();
+    // While the first turn is busy, a second message is queued, not sent.
+    app.apply(Action::Insert, Some("second"));
+    app.apply(Action::Submit, None);
+    assert_eq!(
+        deliveries(&app),
+        vec![Some(Delivery::Sent), Some(Delivery::Queued)],
+        "prereq: second message queued behind a busy turn"
+    );
+
+    updates
+        .send(harness::HarnessUpdate::ConnectionLost("drop".into()))
+        .expect("queue the disconnect");
+    app.drain_harness_updates();
+
+    updates
+        .send(harness::HarnessUpdate::Attached {
+            session_id: "session_test".into(),
+            working_dir: Some("/tmp".into()),
+            activity: SessionActivity::Idle,
+        })
+        .expect("queue the idle re-attach");
+    app.drain_harness_updates();
+
+    // The queued message was flushed: it is promoted to Sent, and the oldest
+    // queued one (with its content) is sent down the wire.
+    assert_eq!(
+        deliveries(&app),
+        vec![Some(Delivery::Sent), Some(Delivery::Sent)],
+        "the re-attached idle session must flush the queued message, not erase it"
+    );
+    assert!(
+        command_rx
+            .try_iter()
+            .any(|c| matches!(c, harness::Command::Send { content, .. } if content == "second")),
+        "the queued message was not actually sent after the reconnect"
+    );
+    // A history backfill is skipped entirely when a message is queued: it would
+    // only erase the local-only queued message.
+    assert!(
+        command_rx
+            .try_iter()
+            .all(|c| !matches!(c, harness::Command::Reload(_))),
+        "no reload should be requested while a queued message is pending"
+    );
+    let text = app.model.transcript.plain_text();
+    assert!(
+        text.contains("second"),
+        "the queued 'second' message disappeared: {text:?}"
+    );
+}
+
+/// A history backfill must still apply when the live page carries live-only
+/// decoration (notices) that the daemon history does not include. Earlier the
+/// reload compared history length against the live page's, so any equality or
+/// shortfall on a decorated page silently dropped the backfill and the reply
+/// never came back. Only the no-new-content guard should gate the replacement.
+#[test]
+fn a_history_reload_applies_despite_live_only_decoration() {
+    let mut app = app_with_session();
+    let (updates, update_rx) = std::sync::mpsc::channel();
+    let (commands, command_rx) = std::sync::mpsc::channel();
+    app.harness = Some((update_rx, harness::CommandSender::for_test(commands)));
+    app.model.session_id = Some("session_test".into());
+
+    app.apply(Action::Insert, Some("hello"));
+    app.apply(Action::Submit, None);
+    let _ = command_rx.try_iter().count();
+    // Live-only notices the daemon history will not contain.
+    app.model.transcript.push_notice("live note 1");
+    app.model.transcript.push_notice("live note 2");
+
+    updates
+        .send(harness::HarnessUpdate::ConnectionLost("drop".into()))
+        .expect("queue the disconnect");
+    app.drain_harness_updates();
+
+    updates
+        .send(harness::HarnessUpdate::Attached {
+            session_id: "session_test".into(),
+            working_dir: Some("/tmp".into()),
+            activity: SessionActivity::Idle,
+        })
+        .expect("queue the idle re-attach");
+    app.drain_harness_updates();
+    assert!(
+        command_rx
+            .try_iter()
+            .any(|c| matches!(c, harness::Command::Reload(_))),
+        "the idle reconnect requested a reload"
+    );
+
+    // The daemon history is shorter than the live page (notices excluded) but
+    // must still replace it so the missing reply is backfilled.
+    let mut history = crate::transcript::Transcript::default();
+    history.push(crate::transcript::Message::user("hello"));
+    history.push(crate::transcript::Message::assistant("the reply"));
+    updates
+        .send(harness::HarnessUpdate::History {
+            session_id: "session_test".into(),
+            transcript: history.clone(),
+        })
+        .expect("queue the history");
+    app.drain_harness_updates();
+
+    assert_eq!(
+        app.model.transcript.plain_text(),
+        "hello\n\nthe reply",
+        "the reload was dropped because of live-only decoration"
+    );
 }

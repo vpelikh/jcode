@@ -11,6 +11,7 @@ anyhow = "1"
 arboard = { version = "3", features = ["wayland-data-control"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 jcode-build-meta = { path = "../jcode-build-meta" }
+jcode-fuzzy = { path = "../jcode-fuzzy" }
 jcode-math = { path = "../jcode-math" }
 jcode-sdk = { path = "../jcode-sdk" }
 jcode-render-core = { path = "../jcode-render-core" }

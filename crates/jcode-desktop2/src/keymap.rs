@@ -168,6 +168,11 @@ pub enum Action {
     /// action rather than a pointer-only control.
     ToggleModelPicker,
 
+    /// Ctrl/Cmd+P: open or shut the command palette. The one discoverable
+    /// type-to-act surface over the desktop's actions, for anyone who has not
+    /// memorised the chord map yet.
+    TogglePalette,
+
     /// Cycle how much of the model's thinking the transcript keeps (`current`
     /// -> `full` -> `off`). This remains available from the settings panel.
     CycleReasoningDisplay,
@@ -655,7 +660,6 @@ pub const NOT_PORTED: &[(&str, &str)] = &[
     ),
     ("ctrl+a as start-of-line", "web select-all wins; use Home"),
     ("ctrl+s", "no input stash yet"),
-    ("ctrl+p", "no auto-poke yet"),
     ("ctrl+g", "no diagram overlay yet"),
     (
         "ctrl+[ / ctrl+]",
@@ -973,6 +977,7 @@ pub fn resolve(key: &Key, mods: ModifiersState) -> Option<Action> {
                     // you are in stays legible while you pick another.
                     'r' => Some(Action::ToggleResume),
                     'm' => Some(Action::ToggleModelPicker),
+                    'p' => Some(Action::TogglePalette),
                     'd' => Some(Action::InterruptOrQuit),
                     _ => None,
                 };

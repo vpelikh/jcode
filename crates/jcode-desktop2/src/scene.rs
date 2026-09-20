@@ -5,7 +5,7 @@
 //! possible.
 
 use crate::text::ParagraphStyle;
-use crate::{Model, donut, icons, layout, text};
+use crate::{Model, ModelId, donut, icons, layout, text};
 use vello::Scene;
 use vello::kurbo::{Affine, BezPath, Circle, Rect, RoundedRect, Shape};
 use vello::peniko::Color;
@@ -1780,6 +1780,19 @@ pub fn build_scene(
     // a masthead, so the top of the page stays clear while a failure to attach
     // is still visible.
     let footnote = model.footnote().map(|line| {
+        // A caption shares this row only when one is actually drawn: a
+        // `Some(ModelId)` whose provider and model are both empty draws
+        // nothing, so the footnote keeps the whole row in that case.
+        let caption_present = model.model.as_ref().and_then(ModelId::caption).is_some();
+        // The footnote and the active-model caption share this row: the caption
+        // is right-aligned from the column midline, so the footnote must stay
+        // in the left half when a caption is shown, otherwise a long notice
+        // would run under the model id. Without a caption the footnote may use
+        // the whole row.
+        if caption_present {
+            let chars = (frame.column() / (f64::from(layout::CAPTION_SIZE) * 0.72)) as usize / 2;
+            return elide(&line, chars.max(6));
+        }
         let chars = (frame.column() / (f64::from(layout::CAPTION_SIZE) * 0.72)) as usize;
         elide(&line, chars.max(12))
     });
@@ -1793,6 +1806,37 @@ pub fn build_scene(
                 font_size: layout::CAPTION_SIZE,
                 color: theme.faint,
                 letter_spacing_em: 0.1,
+                ..Default::default()
+            },
+            scale,
+        );
+    }
+
+    // The active model, right-aligned on the same footnote row. It is the one
+    // piece of permanent chrome that names what is answering, and clicking it
+    // opens the model catalog, so it takes a slightly stronger ink than the
+    // transient footnote and glows with the accent while hovered (the same
+    // hint `button_hover` tracks for the pointer). It is drawn after the
+    // footnote so a long footnote and the caption each hold half the row
+    // without colliding (both elide to their own half).
+    if let Some(caption) = model.model.as_ref().and_then(ModelId::caption) {
+        let hovered = model.model_picker.button_hover();
+        // Elide the caption to its half of the footnote row, exactly as the
+        // transient footnote elides to the other half. The width budget is half
+        // the column; without this, a long model id would wrap to a second line
+        // below the row and collide with whatever the page draws beneath it.
+        let half_chars =
+            ((frame.column() / (f64::from(layout::CAPTION_SIZE) * 0.72)) as usize / 2).max(6);
+        let caption = elide(&caption, half_chars);
+        text.draw_paragraph_scaled(
+            scene,
+            &caption,
+            (frame.left + frame.column() * 0.5, frame.footnote_top),
+            (frame.column() * 0.5) as f32,
+            ParagraphStyle {
+                font_size: layout::CAPTION_SIZE,
+                color: if hovered { theme.accent } else { theme.muted },
+                align: text::Align::End,
                 ..Default::default()
             },
             scale,
@@ -1892,6 +1936,11 @@ pub fn build_scene(
     // Draw outside the boot reveal layer and after every other overlay. Help is
     // a modal reference, not part of the page fading in underneath it.
     crate::scene_help::draw_help(scene, text, model, &frame, scale);
+
+    // The command palette is drawn on top of everything: it is the single
+    // discoverable entry point, and it closed any other overlay when it opened,
+    // so nothing can legitimately cover it.
+    crate::scene_palette::draw_palette(scene, text, model, &frame, scale);
 }
 
 /// Middle-elide `text` to at most `max_chars` characters, keeping the head and
