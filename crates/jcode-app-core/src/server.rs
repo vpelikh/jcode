@@ -2405,3 +2405,6 @@ pub use self::client_api::Client;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod test_util;

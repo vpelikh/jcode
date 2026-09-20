@@ -52,7 +52,10 @@ fn auto_pick_with_only_busy_workers_reports_no_target_for_spawn_fallback() {
         err.starts_with("No ready or completed swarm agents are available"),
         "unexpected error: {err}"
     );
-    assert!(err.contains("Skipped 1 worker(s)"), "unexpected error: {err}");
+    assert!(
+        err.contains("Skipped 1 worker(s)"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -151,16 +154,16 @@ async fn assign_task_does_not_stack_on_busy_worker() {
     let mutation_runtime = SwarmMutationRuntime::default();
 
     let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
-    let swarm = swarm_handle(
-        &swarm_members,
-        &swarms_by_id,
-        &swarm_plans,
-        &swarm_coordinators,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
-        &mutation_runtime,
-    );
+    let swarm = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .swarms_by_id(Arc::clone(&swarms_by_id))
+        .plans(Arc::clone(&swarm_plans))
+        .coordinators(Arc::clone(&swarm_coordinators))
+        .event_history(Arc::clone(&event_history))
+        .event_counter(Arc::clone(&event_counter))
+        .swarm_event_tx(swarm_event_tx.clone())
+        .swarm_mutation_runtime(mutation_runtime.clone())
+        .build();
     handle_comm_assign_task(
         104,
         requester.to_string(),

@@ -1,4 +1,3 @@
-use crate::server::services::SwarmServiceHandle;
 use super::{
     apply_or_defer_subscribe_working_dir, claim_live_target_agent, effective_subscribe_working_dir,
     handle_clear_session, handle_reload, handle_resume_session, handle_subscribe,
@@ -12,8 +11,8 @@ use crate::message::{Message, ToolDefinition};
 use crate::protocol::ServerEvent;
 use crate::provider::{EventStream, Provider};
 use crate::server::{
-    AwaitMembersRuntime, ClientConnectionInfo, ClientDebugState, FileTouchService,
-    SessionInterruptQueues, SwarmEvent, SwarmMember, SwarmMutationRuntime, SwarmState, VersionedPlan,
+    ClientConnectionInfo, ClientDebugState, FileTouchService, SessionInterruptQueues, SwarmEvent,
+    SwarmMember, VersionedPlan,
 };
 use crate::tool::Registry;
 use anyhow::Result;
@@ -123,65 +122,15 @@ fn test_swarm_member(session_id: &str, status: &str) -> SwarmMember {
     }
 }
 
-/// Build a minimal `SwarmServiceHandle` from a members map for testing the
-/// swarm service's membership reads in isolation.
-fn swarm_handle_from_members(
-    members: Arc<RwLock<HashMap<String, SwarmMember>>>,
-) -> SwarmServiceHandle {
-    swarm_handle_full(
-        members,
-        Arc::new(RwLock::new(HashMap::new())),
-        Arc::new(RwLock::new(HashMap::new())),
-        Arc::new(RwLock::new(HashMap::new())),
-        Arc::new(RwLock::new(HashMap::new())),
-        Arc::new(RwLock::new(HashMap::new())),
-        Arc::new(RwLock::new(VecDeque::new())),
-        Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        broadcast::channel(8).0,
-    )
-}
-
-/// Build a `SwarmServiceHandle` from the constituent swarm maps. Tests that
-/// exercise swarm behavior pass their real maps so membership/plan/channel
-/// state is shared with the code under test.
-#[allow(clippy::too_many_arguments)]
-fn swarm_handle_full(
-    members: Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    plans: Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    coordinators: Arc<RwLock<HashMap<String, String>>>,
-    channel_subscriptions: Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>,
-    channel_subscriptions_by_session: Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>,
-    event_history: Arc<RwLock<VecDeque<SwarmEvent>>>,
-    event_counter: Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: broadcast::Sender<SwarmEvent>,
-) -> SwarmServiceHandle {
-    SwarmServiceHandle {
-        swarm_state: SwarmState {
-            members,
-            swarms_by_id,
-            plans,
-            coordinators,
-        },
-        shared_context: Arc::new(RwLock::new(HashMap::new())),
-        file_touch: FileTouchService::new(),
-        channel_subscriptions,
-        channel_subscriptions_by_session,
-        event_history,
-        event_counter,
-        swarm_event_tx,
-        await_members_runtime: AwaitMembersRuntime::default(),
-        swarm_mutation_runtime: SwarmMutationRuntime::default(),
-    }
-}
-
 #[tokio::test]
 async fn subscribe_does_not_mark_running_startup_worker_ready() {
     let swarm_members = Arc::new(RwLock::new(HashMap::from([(
         "worker".to_string(),
         test_swarm_member("worker", "running"),
     )])));
-    let handle = swarm_handle_from_members(swarm_members);
+    let handle = crate::server::test_util::TestSwarmBuilder::default()
+        .members(swarm_members)
+        .build();
     assert!(!handle.member_should_mark_ready("worker").await);
 }
 
@@ -191,7 +140,9 @@ async fn subscribe_marks_non_running_member_ready() {
         "worker".to_string(),
         test_swarm_member("worker", "spawned"),
     )])));
-    let handle = swarm_handle_from_members(swarm_members);
+    let handle = crate::server::test_util::TestSwarmBuilder::default()
+        .members(swarm_members)
+        .build();
     assert!(handle.member_should_mark_ready("worker").await);
 }
 
@@ -200,17 +151,10 @@ async fn ensure_member_registers_new_member_and_eager_swarm_access() {
     let swarm_members = Arc::new(RwLock::new(HashMap::new()));
     let swarms_by_id = Arc::new(RwLock::new(HashMap::new()));
     let (event_tx, _event_rx) = mpsc::unbounded_channel::<ServerEvent>();
-    let handle = swarm_handle_full(
-        Arc::clone(&swarm_members),
-        Arc::clone(&swarms_by_id),
-        Arc::new(RwLock::new(HashMap::new())),
-        Arc::new(RwLock::new(HashMap::new())),
-        Arc::new(RwLock::new(HashMap::new())),
-        Arc::new(RwLock::new(HashMap::new())),
-        Arc::new(RwLock::new(VecDeque::new())),
-        Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        broadcast::channel(8).0,
-    );
+    let handle = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .swarms_by_id(Arc::clone(&swarms_by_id))
+        .build();
 
     let inserted = handle
         .ensure_member(
@@ -249,28 +193,13 @@ async fn ensure_member_refresh_existing_member_adds_connection_without_reinserti
     let swarms_by_id: Arc<RwLock<HashMap<String, HashSet<String>>>> =
         Arc::new(RwLock::new(HashMap::new()));
     let (event_tx, _event_rx) = mpsc::unbounded_channel::<ServerEvent>();
-    let handle = swarm_handle_full(
-        Arc::clone(&swarm_members),
-        Arc::clone(&swarms_by_id),
-        Arc::new(RwLock::new(HashMap::new())),
-        Arc::new(RwLock::new(HashMap::new())),
-        Arc::new(RwLock::new(HashMap::new())),
-        Arc::new(RwLock::new(HashMap::new())),
-        Arc::new(RwLock::new(VecDeque::new())),
-        Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        broadcast::channel(8).0,
-    );
+    let handle = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .swarms_by_id(Arc::clone(&swarms_by_id))
+        .build();
 
     let inserted = handle
-        .ensure_member(
-            "session-b",
-            "conn-b",
-            None,
-            None,
-            None,
-            false,
-            &event_tx,
-        )
+        .ensure_member("session-b", "conn-b", None, None, None, false, &event_tx)
         .await;
     assert!(!inserted, "an existing member should not be re-inserted");
 
@@ -296,30 +225,32 @@ async fn take_session_membership_removes_member_and_returns_identity() {
         String,
         HashMap<String, HashSet<String>>,
     >::new()));
-    let channel_subscriptions_by_session =
-        Arc::new(RwLock::new(HashMap::from([(
-            session_id.to_string(),
-            HashMap::from([(
-                "swarm-test".to_string(),
-                HashSet::from(["chan-a".to_string()]),
-            )]),
-        )])));
+    let channel_subscriptions_by_session = Arc::new(RwLock::new(HashMap::from([(
+        session_id.to_string(),
+        HashMap::from([(
+            "swarm-test".to_string(),
+            HashSet::from(["chan-a".to_string()]),
+        )]),
+    )])));
     let (tx, _rx) = mpsc::unbounded_channel::<ServerEvent>();
     let handle = {
-        let h = swarm_handle_full(
-            Arc::clone(&swarm_members),
-            Arc::clone(&swarms_by_id),
-            Arc::new(RwLock::new(HashMap::new())),
-            Arc::new(RwLock::new(HashMap::new())),
-            Arc::clone(&channel_subscriptions),
-            Arc::clone(&channel_subscriptions_by_session),
-            Arc::new(RwLock::new(VecDeque::new())),
-            Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            broadcast::channel(8).0,
-        );
+        let h = crate::server::test_util::TestSwarmBuilder::default()
+            .members(Arc::clone(&swarm_members))
+            .swarms_by_id(Arc::clone(&swarms_by_id))
+            .channel_subscriptions(Arc::clone(&channel_subscriptions))
+            .channel_subscriptions_by_session(Arc::clone(&channel_subscriptions_by_session))
+            .build();
         // ensure a member is registered so teardown has a membership to remove
-        h.ensure_member(session_id, "conn-x", None, None, Some("swarm-test".to_string()), true, &tx)
-            .await;
+        h.ensure_member(
+            session_id,
+            "conn-x",
+            None,
+            None,
+            Some("swarm-test".to_string()),
+            true,
+            &tx,
+        )
+        .await;
         h
     };
 
@@ -362,17 +293,10 @@ async fn resume_rename_releases_member_lock_before_waiting_for_swarm_map() {
     // Force the rename to wait for swarms_by_id. While it waits, the member map
     // must remain readable or coordinator cleanup can form a permanent cycle.
     let swarm_map_guard = swarms_by_id.write().await;
-    let handle = swarm_handle_full(
-        Arc::clone(&swarm_members),
-        Arc::clone(&swarms_by_id),
-        Arc::new(RwLock::new(HashMap::new())),
-        Arc::new(RwLock::new(HashMap::new())),
-        Arc::new(RwLock::new(HashMap::new())),
-        Arc::new(RwLock::new(HashMap::new())),
-        Arc::new(RwLock::new(VecDeque::new())),
-        Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        broadcast::channel(8).0,
-    );
+    let handle = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .swarms_by_id(Arc::clone(&swarms_by_id))
+        .build();
     let rename_task = tokio::spawn(async move {
         handle
             .rename_member_session(old_session_id, new_session_id)

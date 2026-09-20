@@ -8,10 +8,10 @@ use crate::plan::PlanItem;
 use crate::protocol::ServerEvent;
 use crate::provider::{EventStream, Provider};
 use crate::server::comm_await::{CommAwaitMembersContext, handle_comm_await_members};
-use crate::server::services::{SessionServiceHandle, SwarmServiceHandle};
+use crate::server::services::SessionServiceHandle;
 use crate::server::{
-    AwaitMembersRuntime, FileTouchService, SwarmEvent, SwarmEventType, SwarmMember,
-    SwarmMutationRuntime, SwarmState, VersionedPlan,
+    AwaitMembersRuntime, SwarmEvent, SwarmEventType, SwarmMember, SwarmMutationRuntime,
+    VersionedPlan,
 };
 use crate::tool::Registry;
 use anyhow::Result;
@@ -159,39 +159,6 @@ fn session_handle(
         is_processing: Arc::new(RwLock::new(false)),
         shutdown_signals: Arc::new(RwLock::new(HashMap::new())),
         soft_interrupt_queues,
-    }
-}
-
-/// A minimal swarm service handle sharing the supplied maps/sinks, mirroring
-/// the handle the runtime constructs. Only the fields the assignment handlers
-/// reach are populated; the rest are inert defaults.
-#[allow(clippy::too_many_arguments)]
-fn swarm_handle(
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-    event_history: &Arc<RwLock<VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
-    mutation_runtime: &SwarmMutationRuntime,
-) -> SwarmServiceHandle {
-    SwarmServiceHandle {
-        swarm_state: SwarmState {
-            members: Arc::clone(swarm_members),
-            swarms_by_id: Arc::clone(swarms_by_id),
-            plans: Arc::clone(swarm_plans),
-            coordinators: Arc::clone(swarm_coordinators),
-        },
-        shared_context: Arc::new(RwLock::new(HashMap::new())),
-        file_touch: FileTouchService::new(),
-        channel_subscriptions: Arc::new(RwLock::new(HashMap::new())),
-        channel_subscriptions_by_session: Arc::new(RwLock::new(HashMap::new())),
-        event_history: Arc::clone(event_history),
-        event_counter: Arc::clone(event_counter),
-        swarm_event_tx: swarm_event_tx.clone(),
-        await_members_runtime: AwaitMembersRuntime::default(),
-        swarm_mutation_runtime: mutation_runtime.clone(),
     }
 }
 
