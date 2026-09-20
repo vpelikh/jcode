@@ -2,8 +2,7 @@ use super::ClientConnectionInfo;
 use super::client_lifecycle::process_message_streaming_mpsc;
 use super::services::SwarmServiceHandle;
 use super::swarm_mutation_state::{
-    PersistedSwarmMutationResponse, SwarmMutationRuntime, begin_or_replay, finish_request,
-    request_key,
+    PersistedSwarmMutationResponse, begin_or_replay, finish_request, request_key,
 };
 use super::{
     SessionInterruptQueues, SwarmEventType, SwarmMember, SwarmState,
@@ -106,8 +105,9 @@ async fn resolve_spawn_working_dir(
     requested_working_dir: Option<String>,
     req_session_id: &str,
     sessions: &SessionAgents,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    swarm: &SwarmServiceHandle,
 ) -> Option<String> {
+    let swarm_members = &swarm.swarm_state.members;
     if requested_working_dir
         .as_deref()
         .is_some_and(|dir| !dir.trim().is_empty())
@@ -544,10 +544,6 @@ async fn register_visible_spawned_member(
     swarm.broadcast_swarm_status(swarm_id).await;
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "server-side swarm spawning needs session, swarm state, provider, and event sinks together"
-)]
 /// Resolve the reasoning effort for a spawned swarm worker (#1165).
 ///
 /// Precedence mirrors the model path: an explicit `effort` on the spawn call
@@ -566,6 +562,10 @@ pub(super) fn resolve_swarm_spawn_effort(
     clean(requested_effort).or_else(|| clean(configured_swarm_effort))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "server-side swarm spawning needs session, swarm state, provider, and event sinks together"
+)]
 pub(super) async fn spawn_swarm_agent(
     req_session_id: &str,
     swarm_id: &str,
@@ -591,7 +591,7 @@ pub(super) async fn spawn_swarm_agent(
     let event_counter = &swarm.event_counter;
     let swarm_event_tx = &swarm.swarm_event_tx;
     let resolved_working_dir =
-        resolve_spawn_working_dir(working_dir, req_session_id, sessions, swarm_members).await;
+        resolve_spawn_working_dir(working_dir, req_session_id, sessions, swarm).await;
     let coordinator = resolve_coordinator_spawn_identity(req_session_id, sessions).await;
     let coordinator_is_canary = coordinator.is_canary;
     // Capture the requesting client's terminal env so spawn hooks place the new
@@ -972,12 +972,12 @@ pub(super) async fn handle_comm_stop(
     sessions: &SessionAgents,
     swarm: &SwarmServiceHandle,
     soft_interrupt_queues: &SessionInterruptQueues,
-    swarm_mutation_runtime: &SwarmMutationRuntime,
 ) {
     // Swarm-domain state is reached through the swarm service handle. These
     // locals keep the body single-homed on the handle's fields (server service
     // split, Slice 4).
     let swarm_members = &swarm.swarm_state.members;
+    let swarm_mutation_runtime = &swarm.swarm_mutation_runtime;
     // Stopping is authorized per-target by ownership (the requester is the
     // target's spawner or a transitive ancestor) rather than by the swarm-level
     // coordinator slot, so that any parent can stop agents in its own subtree.
@@ -999,7 +999,7 @@ pub(super) async fn handle_comm_stop(
     };
 
     let target_session =
-        match resolve_stop_target_session(&swarm_id, &target_session, swarm_members).await {
+        match resolve_stop_target_session(&swarm_id, &target_session, swarm).await {
             Ok(target_session) => target_session,
             Err(message) => {
                 let _ = client_event_tx.send(ServerEvent::Error {
@@ -1135,13 +1135,14 @@ fn swarm_stop_allowed_by_owner(
 async fn resolve_stop_target_session(
     swarm_id: &str,
     target: &str,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    swarm: &SwarmServiceHandle,
 ) -> std::result::Result<String, String> {
     let target = target.trim();
     if target.is_empty() {
         return Err("target_session is required.".to_string());
     }
 
+    let swarm_members = &swarm.swarm_state.members;
     let members = swarm_members.read().await;
     if members
         .get(target)

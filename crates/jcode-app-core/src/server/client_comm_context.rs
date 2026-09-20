@@ -1,13 +1,13 @@
 use super::debug::ClientConnectionInfo;
+use super::services::SwarmServiceHandle;
 use super::{
-    FileTouchService, SharedContext, SwarmEvent, SwarmEventType, SwarmMember, fanout_session_event,
-    record_swarm_event,
+    SharedContext, SwarmEventType, SwarmMember, fanout_session_event, record_swarm_event,
 };
 use crate::protocol::{AgentInfo, ContextEntry, NotificationType, ServerEvent};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{RwLock, broadcast, mpsc};
+use tokio::sync::{RwLock, mpsc};
 
 async fn swarm_id_for_session(
     session_id: &str,
@@ -27,10 +27,6 @@ async fn friendly_name_for_session(
         .and_then(|member| member.friendly_name.clone())
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "comm share coordinates delivery state, sessions, swarm membership, and event fanout"
-)]
 pub(super) async fn handle_comm_share(
     id: u64,
     req_session_id: String,
@@ -38,13 +34,17 @@ pub(super) async fn handle_comm_share(
     value: String,
     append: bool,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    shared_context: &Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
+    swarm: &SwarmServiceHandle,
 ) {
+    // Swarm-domain state is reached through the swarm service handle. These
+    // locals keep the body single-homed on the handle's fields (server service
+    // split, convergence slice).
+    let swarm_members = &swarm.swarm_state.members;
+    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let shared_context = &swarm.shared_context;
+    let event_history = &swarm.event_history;
+    let event_counter = &swarm.event_counter;
+    let swarm_event_tx = &swarm.swarm_event_tx;
     let swarm_id = swarm_id_for_session(&req_session_id, swarm_members).await;
 
     if let Some(swarm_id) = swarm_id {
@@ -168,9 +168,10 @@ pub(super) async fn handle_comm_read(
     req_session_id: String,
     key: Option<String>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    shared_context: &Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
+    swarm: &SwarmServiceHandle,
 ) {
+    let swarm_members = &swarm.swarm_state.members;
+    let shared_context = &swarm.shared_context;
     let swarm_id = swarm_id_for_session(&req_session_id, swarm_members).await;
 
     let entries = if let Some(swarm_id) = swarm_id {
@@ -209,20 +210,17 @@ pub(super) async fn handle_comm_read(
     let _ = client_event_tx.send(ServerEvent::CommContext { id, entries });
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "comm list joins swarm membership, file touches, live sessions, and connection activity"
-)]
 pub(super) async fn handle_comm_list(
     id: u64,
     req_session_id: String,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    file_touch: &FileTouchService,
+    swarm: &SwarmServiceHandle,
     sessions: &super::SessionAgents,
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
 ) {
+    let swarm_members = &swarm.swarm_state.members;
+    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let file_touch = &swarm.file_touch;
     let swarm_id = swarm_id_for_session(&req_session_id, swarm_members).await;
 
     if let Some(swarm_id) = swarm_id {

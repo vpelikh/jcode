@@ -757,3 +757,120 @@ routers `client_lifecycle.rs` / `client_lightweight_control.rs` plus the
 (which build a `SwarmServiceHandle`). Zero behavior change; the server suite
 stays green (463 passing) including both role-assignment tests and the live-turn
 reservation/status tests.
+
+### LightweightControlContext slimming and comm_session migration landed (2026-09)
+
+Two more slices landed in the same ownership direction, both thin wrapper +
+call-site migrations with tests green after each.
+
+- **`LightweightControlContext` slimmed onto the service handles.** The
+  lightweight-request context previously carried the `session` /
+  `swarm` handles *and* thirteen flat swarm fields (`swarm_members`,
+  `swarms_by_id`, `shared_context`, `swarm_plans`, `swarm_coordinators`,
+  `file_touch`, `channel_subscriptions`, `channel_subscriptions_by_session`,
+  `event_history`, `event_counter`, `swarm_event_tx`, `await_members_runtime`,
+  `swarm_mutation_runtime`). Those are removed from the struct; the body
+  `handle_lightweight_control_request` now binds them as locals from the
+  `swarm` handle (design decision A), keeping every downstream call byte-identical.
+  `client_lifecycle.rs::handle_client` drops the thirteen fields from its
+  construction. Trimmed the now-unused `AwaitMembersRuntime` /
+  `ChannelSubscriptions` / `FileTouchService` / `SharedContext` / `SwarmEvent` /
+  `SwarmMember` / `SwarmMutationRuntime` / `VersionedPlan` / `HashSet` /
+  `broadcast` imports.
+
+- **`comm_session.rs` swarm-domain helpers route through the handle.** Two
+  helpers convert from the flat `swarm_members` bag to `&SwarmServiceHandle`:
+  `resolve_spawn_working_dir` (used by `spawn_swarm_agent`) and
+  `resolve_stop_target_session` (used by `handle_comm_stop`); both bind the
+  membership map as a body local. `handle_comm_stop` drops its redundant
+  `swarm_mutation_runtime` parameter (it binds `let swarm_mutation_runtime =
+  &swarm.swarm_mutation_runtime;`), and both routers
+  (`client_lifecycle.rs`, `client_lightweight_control.rs`) drop the extra
+  argument. Test call sites for the two resolvers build a `SwarmServiceHandle`
+  through the shared `TestSwarmBuilder`.
+
+The full `jcode-app-core` lib suite stays green (1480 passing) and clippy
+introduces no new warnings.
+
+### Convergence surface still open (final gate)
+
+The convergence goal — zero flat swarm-map args in any `pub`/`pub(super)`
+handler signature — still has a broad residual across roughly a dozen modules:
+`comm_graph` (4 graph handlers), `comm_plan` (propose/approve/reject),
+`comm_await` (await members + resume), `client_comm_channels`
+(4 handlers), `client_comm_context` (share/read/list), `swarm_channels`,
+`state` delivery helpers, `swarm.rs` broadcast/plan/status free functions,
+`reload.rs`, `headless`, `debug_events`, and several client-facing session
+helpers (`client_session::handle_reload`, `client_actions`, `live_turn::idle_live_agent`).
+Each is a mechanical "collapse flat bag onto `&SwarmServiceHandle`, bind as body
+locals" slice like the ones above, but the sweep is high-churn and is best done
+module-by-module as separate reviewable slices rather than one combined landing.
+The `client_lifecycle.rs::handle_client` router still `clone`-then-`destructure`
+path (router clone-then-destructure refactor) also remains a separate decision.
+
+### comm_graph convergence slice landed (2026-09)
+
+The task-DAG mutation handlers collapsed their flat 7-field swarm bag onto
+`&SwarmServiceHandle`. `handle_comm_seed_graph`, `handle_comm_expand_node`,
+`handle_comm_complete_node`, and `handle_comm_inject_gap` each dropped
+`swarm_members`/`swarms_by_id`/`swarm_plans`/`swarm_coordinators`/
+`event_history`/`event_counter`/`swarm_event_tx` for a single `swarm` handle
+and bind the maps as body locals (design decision A). The shared `finalize`
+helper stays flat because it already carries 13 args with its own satisfied
+expect. Callers migrated: `client_lifecycle.rs` and
+`client_lightweight_control.rs` routers pass `&swarm_service_handle`/`swarm`,
+and the `comm_control_tests::dag_e2e` fixture now feeds the graph handlers
+through the `GraphFixture.swarm` handle, dropping five now-unused fixture
+fields (`swarm_coordinators`, `event_history`, `event_counter`,
+`swarm_event_tx`, `mutation_runtime`). The four graph handlers drop their
+now-satisfied `too_many_arguments` expects. Zero behavior change; the
+`comm_control` suite (70) and the DAG e2e suite (20) stay green.
+
+### client_comm_context convergence slice landed (2026-09)
+
+The shared-context handlers collapsed their flat swarm bag onto
+`&SwarmServiceHandle`. `handle_comm_share` (6 flat fields), `handle_comm_read`
+(2 flat fields), and `handle_comm_list` (3 flat fields incl. `file_touch`)
+each bound their swarm maps/file-touch as body locals from the handle (design
+decision A); the non-swarm params (`sessions`, `client_connections`) stay.
+Both routers pass `&swarm_service_handle`/`swarm`; the `client_comm_tests`
+`handle_comm_list` harness seeds a `TestSwarmBuilder` handle and drops its now
+unused `file_touch` local. The two now-satisfied `too_many_arguments` expects
+(`handle_comm_share`, `handle_comm_list`) were removed; unused imports
+(`FileTouchService`, `SwarmEvent`, `HashSet`, `broadcast`) trimmed. Zero
+behavior change; `client_comm` (6) and `client_lifecycle` (27) stay green.
+
+### client_comm_channels convergence slice landed (2026-09)
+
+The channel-subscription handlers collapsed their flat swarm bag onto
+`&SwarmServiceHandle`. `handle_comm_list_channels` and
+`handle_comm_channel_members` (2 flat fields each) and
+`handle_comm_subscribe_channel` / `handle_comm_unsubscribe_channel` (6 flat
+fields each incl. `channel_subscriptions`, `channel_subscriptions_by_session`,
+event history/counter/tx) each bind the maps/event/forward indexes as body
+locals from the handle (design decision A). Both routers pass the handle and
+drop their now-unused `channel_subscriptions` /
+`channel_subscriptions_by_session` locals. The now-satisfied
+`too_many_arguments` expects were removed; the dead `ChannelSubscriptions`
+type alias and unused `SwarmEvent` / `HashSet` / `broadcast` imports trimmed.
+Zero behavior change; `client_comm` (6), `client_lifecycle` (27),
+`comm_control` (70), and `server::` (466) stay green.
+
+### comm_sync convergence slice landed (2026-09)
+
+The sync/status handlers collapsed their flat swarm bag onto
+`&SwarmServiceHandle`. `handle_comm_summary` (1 flat field),
+`handle_comm_status` (2 flat fields incl. `file_touch`),
+`handle_comm_read_context` (1 flat field), and `handle_comm_plan_status`
+(2 flat fields) each bind the maps/file-touch as body locals from the handle
+(design decision A); the non-swarm params (`sessions`,
+`client_connections`) stay. `handle_comm_resync_plan` drops its flat
+`CommResyncPlanContext` bag for the slimmed `CommResyncPlanContext {
+client_event_tx, swarm }`, binding each map/event/history field as a body
+local. Both routers pass `&swarm_service_handle`/`swarm`; the
+`client_lightweight_control.rs` router drops its now-unused `file_touch`
+local. The now-satisfied `too_many_arguments` expect
+(`handle_comm_status`) was removed; unused imports (`FileTouchService`,
+`SwarmEvent`, `VersionedPlan`, `HashSet`, `broadcast`) trimmed. Zero
+behavior change; the full `jcode-app-core` lib suite stays green (1480
+passing) and clippy introduces no new warnings.

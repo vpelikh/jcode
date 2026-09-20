@@ -8,6 +8,7 @@
 //! swarm machinery. This keeps a single source of truth and reuses the scheduler,
 //! persistence, and TUI broadcast paths.
 
+use super::services::SwarmServiceHandle;
 use super::{
     SwarmEvent, SwarmEventType, SwarmMember, SwarmState, VersionedPlan, broadcast_swarm_plan,
     persist_swarm_state_for, record_swarm_event,
@@ -214,24 +215,24 @@ async fn finalize(
 }
 
 /// Seed (or re-seed) the swarm task DAG from a batch of node specs.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "swarm op threads runtime handles"
-)]
 pub(super) async fn handle_comm_seed_graph(
     id: u64,
     req_session_id: String,
     mode: Option<String>,
     nodes: Vec<TaskGraphNodeSpec>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
+    swarm: &SwarmServiceHandle,
 ) {
+    // Swarm-domain state is reached through the swarm service handle. These
+    // locals keep the body single-homed on the handle's fields (server service
+    // split, convergence slice).
+    let swarm_members = &swarm.swarm_state.members;
+    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let swarm_plans = &swarm.swarm_state.plans;
+    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let event_history = &swarm.event_history;
+    let event_counter = &swarm.event_counter;
+    let swarm_event_tx = &swarm.swarm_event_tx;
     let Some(swarm_id) = swarm_id_for(&req_session_id, swarm_members).await else {
         err(client_event_tx, id, "Not in a swarm.".to_string());
         return;
@@ -332,24 +333,24 @@ pub(super) async fn handle_comm_seed_graph(
 }
 
 /// Decompose a node the caller owns into a child sub-DAG.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "swarm op threads runtime handles"
-)]
 pub(super) async fn handle_comm_expand_node(
     id: u64,
     req_session_id: String,
     node_id: String,
     children: Vec<TaskGraphNodeSpec>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
+    swarm: &SwarmServiceHandle,
 ) {
+    // Swarm-domain state is reached through the swarm service handle. These
+    // locals keep the body single-homed on the handle's fields (server service
+    // split, convergence slice).
+    let swarm_members = &swarm.swarm_state.members;
+    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let swarm_plans = &swarm.swarm_state.plans;
+    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let event_history = &swarm.event_history;
+    let event_counter = &swarm.event_counter;
+    let swarm_event_tx = &swarm.swarm_event_tx;
     let Some(swarm_id) = swarm_id_for(&req_session_id, swarm_members).await else {
         err(client_event_tx, id, "Not in a swarm.".to_string());
         return;
@@ -402,24 +403,24 @@ pub(super) async fn handle_comm_expand_node(
 }
 
 /// Complete a node the caller owns with a typed handoff artifact.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "swarm op threads runtime handles"
-)]
 pub(super) async fn handle_comm_complete_node(
     id: u64,
     req_session_id: String,
     node_id: String,
     artifact_json: String,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
+    swarm: &SwarmServiceHandle,
 ) {
+    // Swarm-domain state is reached through the swarm service handle. These
+    // locals keep the body single-homed on the handle's fields (server service
+    // split, convergence slice).
+    let swarm_members = &swarm.swarm_state.members;
+    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let swarm_plans = &swarm.swarm_state.plans;
+    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let event_history = &swarm.event_history;
+    let event_counter = &swarm.event_counter;
+    let swarm_event_tx = &swarm.swarm_event_tx;
     let Some(swarm_id) = swarm_id_for(&req_session_id, swarm_members).await else {
         err(client_event_tx, id, "Not in a swarm.".to_string());
         return;
@@ -475,24 +476,24 @@ pub(super) async fn handle_comm_complete_node(
 }
 
 /// Inject gap/fix nodes from a gate the caller owns.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "swarm op threads runtime handles"
-)]
 pub(super) async fn handle_comm_inject_gap(
     id: u64,
     req_session_id: String,
     gate_id: String,
     nodes: Vec<TaskGraphNodeSpec>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
+    swarm: &SwarmServiceHandle,
 ) {
+    // Swarm-domain state is reached through the swarm service handle. These
+    // locals keep the body single-homed on the handle's fields (server service
+    // split, convergence slice).
+    let swarm_members = &swarm.swarm_state.members;
+    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let swarm_plans = &swarm.swarm_state.plans;
+    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let event_history = &swarm.event_history;
+    let event_counter = &swarm.event_counter;
+    let swarm_event_tx = &swarm.swarm_event_tx;
     let Some(swarm_id) = swarm_id_for(&req_session_id, swarm_members).await else {
         err(client_event_tx, id, "Not in a swarm.".to_string());
         return;

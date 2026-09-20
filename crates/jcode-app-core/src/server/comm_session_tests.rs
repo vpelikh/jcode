@@ -94,21 +94,16 @@ async fn resolve_spawn_working_dir_prefers_explicit_then_spawner_agent_dir() {
         "req".to_string(),
         test_agent_with_working_dir("req", "/tmp/spawner-agent").await,
     );
-    let swarm_members = Arc::new(RwLock::new(HashMap::new()));
+    let swarm = crate::server::test_util::TestSwarmBuilder::default().build();
 
     assert_eq!(
-        resolve_spawn_working_dir(
-            Some("/tmp/explicit".to_string()),
-            "req",
-            &sessions,
-            &swarm_members,
-        )
-        .await
-        .as_deref(),
+        resolve_spawn_working_dir(Some("/tmp/explicit".to_string()), "req", &sessions, &swarm)
+            .await
+            .as_deref(),
         Some("/tmp/explicit")
     );
     assert_eq!(
-        resolve_spawn_working_dir(None, "req", &sessions, &swarm_members)
+        resolve_spawn_working_dir(None, "req", &sessions, &swarm)
             .await
             .as_deref(),
         Some("/tmp/spawner-agent")
@@ -125,9 +120,12 @@ async fn resolve_spawn_working_dir_falls_back_to_member_dir() {
         .write()
         .await
         .insert("req".to_string(), req_member);
+    let swarm = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .build();
 
     assert_eq!(
-        resolve_spawn_working_dir(None, "req", &sessions, &swarm_members)
+        resolve_spawn_working_dir(None, "req", &sessions, &swarm)
             .await
             .as_deref(),
         Some("/tmp/member-dir")
@@ -158,15 +156,18 @@ async fn stop_target_resolves_unique_friendly_name_and_suffix() {
         .write()
         .await
         .insert(worker.session_id.clone(), worker);
+    let swarm = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .build();
 
     assert_eq!(
-        resolve_stop_target_session("swarm-1", "jellyfish", &swarm_members)
+        resolve_stop_target_session("swarm-1", "jellyfish", &swarm)
             .await
             .as_deref(),
         Ok("session_jellyfish_1234_abcd")
     );
     assert_eq!(
-        resolve_stop_target_session("swarm-1", "abcd", &swarm_members)
+        resolve_stop_target_session("swarm-1", "abcd", &swarm)
             .await
             .as_deref(),
         Ok("session_jellyfish_1234_abcd")
@@ -184,8 +185,11 @@ async fn stop_target_rejects_ambiguous_friendly_name() {
     members.insert(first.session_id.clone(), first);
     members.insert(second.session_id.clone(), second);
     drop(members);
+    let swarm = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .build();
 
-    let err = resolve_stop_target_session("swarm-1", "bear", &swarm_members)
+    let err = resolve_stop_target_session("swarm-1", "bear", &swarm)
         .await
         .expect_err("ambiguous friendly names should be rejected");
     assert!(err.contains("Ambiguous swarm session 'bear'"));

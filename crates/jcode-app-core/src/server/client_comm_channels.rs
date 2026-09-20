@@ -1,14 +1,13 @@
+use super::services::SwarmServiceHandle;
 use super::{
-    SwarmEvent, SwarmEventType, SwarmMember, record_swarm_event, subscribe_session_to_channel,
+    SwarmEventType, SwarmMember, record_swarm_event, subscribe_session_to_channel,
     unsubscribe_session_from_channel,
 };
 use crate::protocol::{AgentInfo, ServerEvent, SwarmChannelInfo};
 use jcode_swarm_core::ChannelIndex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{RwLock, broadcast, mpsc};
-
-type ChannelSubscriptions = Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
+use tokio::sync::{RwLock, mpsc};
 
 async fn swarm_id_for_session(
     session_id: &str,
@@ -22,9 +21,10 @@ pub(super) async fn handle_comm_list_channels(
     id: u64,
     req_session_id: String,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    channel_subscriptions: &ChannelSubscriptions,
+    swarm: &SwarmServiceHandle,
 ) {
+    let swarm_members = &swarm.swarm_state.members;
+    let channel_subscriptions = &swarm.channel_subscriptions;
     let swarm_id = swarm_id_for_session(&req_session_id, swarm_members).await;
 
     if let Some(swarm_id) = swarm_id {
@@ -62,9 +62,10 @@ pub(super) async fn handle_comm_channel_members(
     req_session_id: String,
     channel: String,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    channel_subscriptions: &ChannelSubscriptions,
+    swarm: &SwarmServiceHandle,
 ) {
+    let swarm_members = &swarm.swarm_state.members;
+    let channel_subscriptions = &swarm.channel_subscriptions;
     let swarm_id = swarm_id_for_session(&req_session_id, swarm_members).await;
 
     if let Some(swarm_id) = swarm_id {
@@ -112,22 +113,19 @@ pub(super) async fn handle_comm_channel_members(
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "channel subscribe updates membership, delivery, and swarm event history together"
-)]
 pub(super) async fn handle_comm_subscribe_channel(
     id: u64,
     req_session_id: String,
     channel: String,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    channel_subscriptions: &ChannelSubscriptions,
-    channel_subscriptions_by_session: &ChannelSubscriptions,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
+    swarm: &SwarmServiceHandle,
 ) {
+    let swarm_members = &swarm.swarm_state.members;
+    let channel_subscriptions = &swarm.channel_subscriptions;
+    let channel_subscriptions_by_session = &swarm.channel_subscriptions_by_session;
+    let event_history = &swarm.event_history;
+    let event_counter = &swarm.event_counter;
+    let swarm_event_tx = &swarm.swarm_event_tx;
     let started = std::time::Instant::now();
     let swarm_id = swarm_id_for_session(&req_session_id, swarm_members).await;
 
@@ -197,22 +195,19 @@ pub(super) async fn handle_comm_subscribe_channel(
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "channel unsubscribe updates membership, delivery, and swarm event history together"
-)]
 pub(super) async fn handle_comm_unsubscribe_channel(
     id: u64,
     req_session_id: String,
     channel: String,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    channel_subscriptions: &ChannelSubscriptions,
-    channel_subscriptions_by_session: &ChannelSubscriptions,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
+    swarm: &SwarmServiceHandle,
 ) {
+    let swarm_members = &swarm.swarm_state.members;
+    let channel_subscriptions = &swarm.channel_subscriptions;
+    let channel_subscriptions_by_session = &swarm.channel_subscriptions_by_session;
+    let event_history = &swarm.event_history;
+    let event_counter = &swarm.event_counter;
+    let swarm_event_tx = &swarm.swarm_event_tx;
     let started = std::time::Instant::now();
     let swarm_id = swarm_id_for_session(&req_session_id, swarm_members).await;
 
