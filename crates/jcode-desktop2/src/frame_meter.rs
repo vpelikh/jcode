@@ -174,7 +174,7 @@ impl FrameMeter {
 
 /// A 120Hz frame's budget. Exposed so callers can compare an interval against
 /// it without restating the constant.
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)] // Used only by the profiling/disassembly diagnostics; used by the bin and profiling diagnostics.
 pub const FRAME_120HZ: Duration = Duration::from_micros(8_333);
 
 #[cfg(test)]

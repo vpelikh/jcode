@@ -11,7 +11,7 @@
 //! row off and the next one in, exactly the motion niri makes for a workspace
 //! switch. Only the focused row is ever on screen when the camera is at rest,
 //! which is what makes a column's neighbors always mean "same project".
-
+    #[allow(dead_code)] // Unused feature scaffolding/geometry kept for the desktop app; not yet wired into the render path.
 /// Focused columns occupy most, but not all, of the viewport. The remaining
 /// strip is split between the adjacent sessions so they are always
 /// discoverable.
@@ -151,7 +151,7 @@ impl Workspace {
     pub fn column_percent(&self) -> u16 {
         self.column_fraction / 10
     }
-
+    #[allow(dead_code)] // Unused feature scaffolding/geometry kept for the desktop app; not yet wired into the render path.
     pub fn column_width(&self, viewport_width: u32, session_count: usize) -> u32 {
         if session_count <= 1 {
             return viewport_width;
@@ -318,6 +318,7 @@ fn row_columns(
 /// Native pixel width used to build a session page. A row of one session
 /// keeps the legacy full-window layout; a wider row reserves enough edge
 /// space for both neighboring columns.
+#[allow(dead_code)] // Free-function helper; the impl method is what the layout uses.
 pub fn column_width(viewport_width: u32, session_count: usize) -> u32 {
     if session_count <= 1 {
         return viewport_width;

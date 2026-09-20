@@ -86,6 +86,7 @@ fn palette_commands_that_open_surfaces_really_open_them() {
     // a command whose action silently opened the wrong surface would still
     // pass it. Here the surface-opening commands are committed and asserted to
     // visibly open exactly the surface their label names.
+    #[allow(clippy::type_complexity)] // Trait-object case table; a slice of (name, closure) pairs.
     let cases: &[(&str, &dyn Fn(&App) -> bool)] = &[
         ("Settings", &|app| app.model.panel.is_open()),
         ("Help", &|app| app.model.help_open),
@@ -762,8 +763,10 @@ fn the_recorded_frame_matches_the_rendered_geometry() {
     ] {
         // Keep this baseline on a genuinely single-line hint. Wrapped hints
         // intentionally grow the well and are covered by the dedicated test.
-        let mut model = Model::default();
-        model.hint = 2; // "describe the bug, not the fix"
+        let model = Model {
+            hint: 2, // "describe the bug, not the fix"
+            ..Model::default()
+        };
         let recorded = App::frame_for_model(size, scale, &model);
         let rendered = crate::layout::Frame::new(size, scale);
         assert_eq!(

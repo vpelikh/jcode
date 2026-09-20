@@ -10,9 +10,11 @@ use crate::theme::ThemeMode;
 /// A System-preference window follows a dark desktop on first show.
 #[test]
 fn a_system_window_follows_a_dark_desktop_at_boot() {
-    let mut model = Model::default();
-    model.theme_preference = ThemeMode::System;
-    model.theme = crate::theme::Theme::print_light();
+    let mut model = Model {
+        theme_preference: ThemeMode::System,
+        theme: crate::theme::Theme::print_light(),
+        ..Default::default()
+    };
     assert!(model.resolve_theme_from_system(Some(true)));
     assert_eq!(model.theme.mode, ThemeMode::Dark);
 }
@@ -20,9 +22,11 @@ fn a_system_window_follows_a_dark_desktop_at_boot() {
 /// ...and a light desktop stays light.
 #[test]
 fn a_system_window_follows_a_light_desktop_at_boot() {
-    let mut model = Model::default();
-    model.theme_preference = ThemeMode::System;
-    model.theme = crate::theme::Theme::print_dark();
+    let mut model = Model {
+        theme_preference: ThemeMode::System,
+        theme: crate::theme::Theme::print_dark(),
+        ..Default::default()
+    };
     assert!(model.resolve_theme_from_system(Some(false)));
     assert_eq!(model.theme.mode, ThemeMode::Light);
 }
@@ -31,9 +35,11 @@ fn a_system_window_follows_a_light_desktop_at_boot() {
 /// resolution intact; the Linux probe keeps running the show.
 #[test]
 fn an_unknown_system_theme_leaves_the_resolution_alone() {
-    let mut model = Model::default();
-    model.theme_preference = ThemeMode::System;
-    model.theme = crate::theme::Theme::print_light();
+    let mut model = Model {
+        theme_preference: ThemeMode::System,
+        theme: crate::theme::Theme::print_light(),
+        ..Default::default()
+    };
     assert!(!model.resolve_theme_from_system(None));
     assert_eq!(model.theme.mode, ThemeMode::Light);
 }
@@ -47,9 +53,11 @@ fn an_explicit_preference_is_never_overridden() {
         (ThemeMode::Dark, ThemeMode::Dark, false),
         (ThemeMode::Light, ThemeMode::Light, true),
     ] {
-        let mut model = Model::default();
-        model.theme_preference = preference;
-        model.theme = crate::theme::Theme::for_mode(preference, false);
+        let mut model = Model {
+            theme_preference: preference,
+            theme: crate::theme::Theme::for_mode(preference, false),
+            ..Default::default()
+        };
         assert!(
             !model.resolve_theme_from_system(Some(told_dark)),
             "{preference:?} must not report a change (told {told_dark})"
@@ -65,9 +73,11 @@ fn an_explicit_preference_is_never_overridden() {
 /// not claim a change, so the caller can skip the redundant redraw.
 #[test]
 fn a_noop_resolution_reports_no_change() {
-    let mut model = Model::default();
-    model.theme_preference = ThemeMode::System;
-    model.theme = crate::theme::Theme::print_dark();
+    let mut model = Model {
+        theme_preference: ThemeMode::System,
+        theme: crate::theme::Theme::print_dark(),
+        ..Default::default()
+    };
     assert!(!model.resolve_theme_from_system(Some(true)));
     assert_eq!(model.theme.mode, ThemeMode::Dark);
 }

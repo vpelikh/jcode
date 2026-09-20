@@ -45,9 +45,7 @@ const IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/
 /// cheap call instead of a failed transfer, and so the type we report is the one
 /// the source actually published rather than something we inferred.
 pub fn from_wayland() -> Option<Image> {
-    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
-        return None;
-    }
+    std::env::var_os("WAYLAND_DISPLAY")?;
     let listed = std::process::Command::new("wl-paste")
         .arg("--list-types")
         .output()
@@ -75,7 +73,7 @@ pub fn from_wayland() -> Option<Image> {
         bytes: read.stdout,
     })
 }
-
+    #[allow(dead_code)] // Unused feature scaffolding/geometry kept for the desktop app; not yet wired into the render path.
 /// Which media type, if any, of those on offer we would take. Split out so the
 /// preference order is testable without a compositor: the ordering is the part
 /// with a decision in it, and it is not observable from the outside otherwise.

@@ -107,9 +107,11 @@ pub const DONUT_MIN_SIDE: f64 = 100.0;
 pub const GEAR_SIZE: f64 = 18.0;
 /// Sessions button size.
 pub const SESSIONS_SIZE: f64 = GEAR_SIZE;
+    #[allow(dead_code)] // Unused feature scaffolding/geometry kept for the desktop app; not yet wired into the render path.
 /// Radius of the gear's body, as a fraction of its box. The teeth and the hub
 /// are drawn around this, so the whole mark scales from one number.
 pub const GEAR_RADIUS: f64 = 0.30;
+    #[allow(dead_code)] // Unused feature scaffolding/geometry kept for the desktop app; not yet wired into the render path.
 /// Number of teeth. Six reads as a gear at 18 logical pixels; more turns into
 /// a blurred ring at this size.
 pub const GEAR_TEETH: usize = 6;
@@ -263,7 +265,7 @@ pub struct Frame {
     /// there is no strip and nothing above was reserved for it.
     strip_top: Option<f64>,
 }
-
+    #[allow(dead_code)] // Unused feature scaffolding/geometry kept for the desktop app; not yet wired into the render path.
 impl Frame {
     /// Resolve geometry for a surface of `size` physical pixels at `scale`,
     /// with a single-line composer.

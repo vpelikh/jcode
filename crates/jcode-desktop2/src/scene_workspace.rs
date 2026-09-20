@@ -293,16 +293,18 @@ mod tests {
     /// departing sessions that only exist as peeks.
     #[test]
     fn a_row_slide_builds_with_both_rows() {
-        let mut source = Model::default();
-        source.session_id = Some("b1".into());
-        source.strips = strip::Strips::build(
-            vec![
-                strip::Panel::new("a1", Some("/w/jcode")),
-                strip::Panel::new("a2", Some("/w/jcode")),
-                strip::Panel::new("b1", Some("/w/site")),
-            ],
-            Some("b1"),
-        );
+        let mut source = Model {
+            session_id: Some("b1".into()),
+            strips: strip::Strips::build(
+                vec![
+                    strip::Panel::new("a1", Some("/w/jcode")),
+                    strip::Panel::new("a2", Some("/w/jcode")),
+                    strip::Panel::new("b1", Some("/w/site")),
+                ],
+                Some("b1"),
+            ),
+            ..Model::default()
+        };
         source.peeks.insert("a1", transcript([Message::user("q")]));
         source.workspace.begin_row_change(
             workspace::Direction::Down,

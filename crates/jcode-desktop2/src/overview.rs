@@ -68,8 +68,8 @@ pub fn area(frame: &crate::layout::Frame) -> (f64, f64, f64, f64) {
     // cards it is supposed to compare. Clamp the field to the room the column's
     // midpoint leaves on either side of it, keeping the centred relationship
     // without ever running off-paper.
-    let width = (frame.width * 0.84).min(960.0).max(1.0);
-    let height = (frame.height * 0.68).min(620.0).max(1.0);
+    let width = (frame.width * 0.84).clamp(1.0, 960.0);
+    let height = (frame.height * 0.68).clamp(1.0, 620.0);
     let column_mid = (frame.left + frame.right) / 2.0;
     // Half-width that keeps the field symmetric about the column's midpoint
     // while never crossing either window edge. The narrower flank wins, so a
