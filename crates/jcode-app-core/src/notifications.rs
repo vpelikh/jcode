@@ -169,6 +169,28 @@ impl NotificationDispatcher {
         );
     }
 
+    /// Send a generic notification to **all** configured backends (ntfy, desktop,
+    /// email, and message channels such as Telegram/Discord). Fire-and-forget.
+    ///
+    /// `body` is used for every backend: it is the safe body for ntfy and the
+    /// detailed body for desktop/email/channels. Pass a body that is safe to send
+    /// over a potentially public channel (ntfy) — i.e. no ambient secrets.
+    ///
+    /// This is the general entry point for per-session notifications (e.g. a
+    /// completed turn) so they fan out the same way ambient notifications do.
+    /// A backend that is disabled in config simply does not fire.
+    ///
+    /// `session_id` is passed through to the fan-out for reply tracking / tracing.
+    pub fn dispatch(
+        &self,
+        title: &str,
+        body: &str,
+        priority: Priority,
+        session_id: Option<&str>,
+    ) {
+        self.send_all(title, body, body, priority, session_id);
+    }
+
     /// Send through all configured channels (fire-and-forget).
     ///
     /// `safe_body` is sanitized (no secrets) — used for ntfy (potentially public).
