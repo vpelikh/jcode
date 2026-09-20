@@ -744,7 +744,7 @@ impl SessionEventMap {
     }
     
     /// Validate compaction state
-    fn validate_compaction(compaction: &StoredCompactionState) -> Result<(), SessionEventError> {
+    pub(crate) fn validate_compaction(compaction: &StoredCompactionState) -> Result<(), SessionEventError> {
         if compaction.covers_up_to_turn > compaction.original_turn_count {
             return Err(SessionEventError::InvalidCompactionState {
                 reason: format!(

@@ -1812,6 +1812,18 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
     /// bracket around a single surface mutation and keeps the legacy
     /// `self.compaction` vector in sync with what the log derives.
     ///
+    /// If the `CompactionStart` is rejected by validation (e.g. a
+    /// `covers_up_to_turn` of zero), no bracket is opened — the method falls
+    /// back to a plain `SetCompaction` (via `set_compaction`) so the compaction
+    /// still persists in the log without a dangling `CompactionEnd` that would
+    /// violate the `CompactionBracket` invariant.
+    ///
+    /// If the `compaction` state itself is invalid (e.g. `covers_up_to_turn`
+    /// exceeding `original_turn_count`), it cannot be represented as any event,
+    /// so no bracket (and no `SetCompaction`) is written at all — the method
+    /// applies only the message replacement and leaves `self.compaction` unset,
+    /// rather than leaving an orphaned bracket that could never be closed.
+    ///
     /// Returns the compaction id of the (new) bracket, so a caller can correlate
     /// a later crash-recovery report back to the span being summarized. When an
     /// orphaned bracket is already open (a prior run crashed mid-bracket) the
@@ -1828,21 +1840,53 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         covers_up_to_turn: usize,
     ) -> String {
         let compaction_id = compaction_id.into();
+        // Pre-validate the compaction state before opening a bracket. If it's
+        // invalid (e.g. `covers_up_to_turn`/`compacted_count` exceeding
+        // `original_turn_count`), we cannot represent it in ANY event — both a
+        // `CompactionEnd` and a `SetCompaction` would be rejected by `append_event`
+        // validation — so opening a `CompactionStart` would leave an orphaned
+        // bracket (append-only log) we could never close with a valid End. Degrade
+        // to a message-only replacement and leave `self.compaction` unset instead
+        // of creating a malformed bracket.
+        if SessionEventMap::validate_compaction(&compaction).is_err() {
+            self.replace_messages(messages);
+            return compaction_id;
+        }
         // Crash-safety against a *retried* compaction: if a previous run crashed
         // mid-bracket (an orphaned `CompactionStart` is still open), do not
         // start a second, nested bracket — that would create a depth-2 malformed
         // bracket the invariant flags as silent corruption. Instead, complete the
         // in-flight bracket: the surface mutation and `CompactionEnd` below close
         // the orphan, so retry is idempotent with respect to the bracket shape.
-        if self.event_map.orphaned_compaction().is_none() {
+        let started = if self.event_map.orphaned_compaction().is_none() {
+            let before = self.event_map.events.len();
             self.event_map
                 .start_compaction(compaction_id.clone(), covers_up_to_turn);
-        }
+            // `append_event` silently skips an invalid event (e.g. a
+            // `CompactionStart` with `covers_up_to_turn == 0` fails validation).
+            // Detect that by event-count growth so we never close a bracket whose
+            // opening marker was dropped — that would emit a dangling
+            // `CompactionEnd` and violate the `CompactionBracket` invariant.
+            self.event_map.events.len() > before
+        } else {
+            // Completing an existing orphaned bracket; the opening marker is
+            // already in the log, so closing it is valid.
+            true
+        };
         // One surface mutation inside the bracket: replace the transcript with
         // the summarized tail. This is the only change replay needs to apply.
         self.replace_messages(messages);
-        self.event_map.end_compaction(compaction.clone());
-        self.compaction = Some(compaction);
+        if started {
+            self.event_map.end_compaction(compaction.clone());
+            self.compaction = Some(compaction);
+        } else {
+            // The `CompactionStart` was rejected by validation (e.g. an invalid
+            // `covers_up_to_turn`), so no bracket is open. Persist the compaction
+            // as a plain `SetCompaction` instead — this keeps `derive_compaction`
+            // in agreement with `self.compaction` without creating a malformed
+            // bracket (no dangling `CompactionEnd`).
+            self.set_compaction(compaction);
+        }
         compaction_id
     }
 
