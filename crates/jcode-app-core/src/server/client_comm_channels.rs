@@ -1,7 +1,5 @@
 use super::services::SwarmServiceHandle;
-use super::{
-    SwarmEventType, SwarmMember, record_swarm_event,
-};
+use super::{SwarmEventType, SwarmMember, record_swarm_event};
 use crate::protocol::{AgentInfo, ServerEvent, SwarmChannelInfo};
 use jcode_swarm_core::ChannelIndex;
 use std::collections::HashMap;

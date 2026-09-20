@@ -7,10 +7,7 @@
 
 use crate::plan::VersionedPlan;
 use crate::server::services::SwarmServiceHandle;
-use crate::server::{
-    SharedContext, SwarmEvent, SwarmMember,
-    SwarmMutationRuntime, SwarmState,
-};
+use crate::server::{SharedContext, SwarmEvent, SwarmMember, SwarmMutationRuntime, SwarmState};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
