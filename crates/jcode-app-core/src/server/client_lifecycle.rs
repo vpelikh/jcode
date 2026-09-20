@@ -2970,6 +2970,69 @@ pub(super) async fn handle_client(
             Request::ClientDebugResponse { id, output } => {
                 handle_client_debug_response(id, output, &client_debug_response_tx);
             }
+
+            Request::HeadlessReview {
+                id,
+                parent_session_id,
+                lens,
+                lens_prompt,
+                working_dir,
+            } => {
+                // Run a silent (headless) review lens on the running server's
+                // provider in a BACKGROUND task. The review runs a full agent
+                // turn with tool calls and can take minutes; awaiting it inline
+                // here would block this connection's request loop (no Cancel /
+                // stdin / ping / new-message service) for the whole turn. This
+                // mirrors normal message processing (start_processing_message
+                // spawns a processing_task). The HeadlessReviewResult is sent
+                // when the review completes.
+                let tx = client_event_tx.clone();
+                let provider = provider_template.clone();
+                tokio::spawn(async move {
+                    let run = match crate::session::Session::load(&parent_session_id) {
+                        Ok(session) => {
+                            crate::headless_review::run_review_lens_headless(
+                                provider,
+                                &session,
+                                &lens,
+                                lens_prompt,
+                                working_dir,
+                            )
+                            .await
+                        }
+                        Err(e) => crate::headless_review::HeadlessReviewOutcome::Failed(format!(
+                            "parent session {parent_session_id} not loadable: {e}"
+                        )),
+                    };
+                    use crate::headless_review::HeadlessReviewOutcome;
+                    let (kind, findings, message) = match run {
+                        HeadlessReviewOutcome::Report(jcode_session_types::ReviewReport::Clean) => {
+                            (String::from("clean"), Vec::new(), String::new())
+                        }
+                        HeadlessReviewOutcome::Report(jcode_session_types::ReviewReport::Findings(fs)) => {
+                            let rendered = fs
+                                .iter()
+                                .map(|f| format!("{}|{}|{}", f.severity, f.path, f.text))
+                                .collect();
+                            (String::from("findings"), rendered, String::new())
+                        }
+                        HeadlessReviewOutcome::Failed(msg) => {
+                            (String::from("failed"), Vec::new(), msg)
+                        }
+                        HeadlessReviewOutcome::NoVerdict(msg) => {
+                            (String::from("no_verdict"), Vec::new(), msg)
+                        }
+                    };
+                    let _ = tx.send(ServerEvent::HeadlessReviewResult {
+                        id,
+                        session_id: parent_session_id,
+                        lens: lens.clone(),
+                        kind,
+                        findings,
+                        message,
+                    });
+                });
+            }
         }
         if request_lifecycle_logged {
             log_request_lifecycle_handled(

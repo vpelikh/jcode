@@ -216,11 +216,16 @@ lens rather than pretend to resume.
 ## Terminal UX (option 2, locked)
 
 - **Auto `/autoreview`** (`loop_mode`): each lens is its own fresh child review
-  session (keeps per-lens independence, reuses the one-shot `client-input-<id>`
-  startup), but auto **processes the 6 lens sessions in-process (headless)** via
-  the existing `Agent`/`AmbientRunner` pattern — no 6-terminal spam. `loop_mode`
-  suppresses the one-shot autoreview (loop replaces, not adds).
-- **Manual `/review-loop`**: full per-lens independent windows for transparency.
+  session, but the loop runs **headlessly, in-process on the server** — no
+  terminal windows, no headed client. The client review loop dispatches a
+  `Request::HeadlessReview`; the server runs an `Agent` over a fresh reviewer
+  child of the parent session and replies with a
+  `ServerEvent::HeadlessReviewResult`, which the client applies to advance the
+  loop. This implements the "no 6-terminal spam" decision and removes the
+  terminal-window dependence the headed approach had. `loop_mode` suppresses the
+  one-shot autoreview (loop replaces, not adds).
+- **Manual `/review-loop`**: same headless per-lens runner for consistency (no
+  per-lens terminal windows).
 
 ## Command surface
 

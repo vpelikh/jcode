@@ -1480,6 +1480,82 @@ pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteC
         return;
     }
 
+    // Drain a queued headless review-lens dispatch. The review loop set
+    // `app.pending_headless_review` (lens label) and marked the loop
+    // `awaiting_headless`; rebuild the lens prompt and send the server request.
+    // The verdict comes back as a `ServerEvent::HeadlessReviewResult` which the
+    // event handler feeds into the loop.
+    if let Some(lens_label) = app.pending_headless_review.take() {
+        if !app.is_processing {
+            let parent_session_id =
+                crate::tui::app::commands_review::current_feedback_target_session_id(app);
+            // Validate the queued lens is a known machine name (see
+            // spawn_review_loop_reviewer, which stores ReviewLens::name()).
+            // We do NOT build a client-side prompt: the server rebuilds the
+            // lens prompt itself from the lens name (build_lens_prompt in
+            // headless_review.rs), so any lens_prompt sent here would be
+            // discarded. Send an empty one instead.
+            if jcode_session_types::ReviewLens::from_name(&lens_label).is_some() {
+                let lens_prompt = String::new();
+                let working_dir =
+                    crate::tui::app::commands::active_working_dir(app).map(|p| p.to_string_lossy().into_owned());
+                // Mark the dispatch as still-queued/in-flight during the send.
+                // The review loop's orphaned-recovery (step_review_loop ->
+                // maybe_recover_stalled_headless) treats a lens with no queued
+                // dispatch AND no in-flight request id as "orphaned" and would
+                // re-dispatch it. Without this marker, a concurrent step (e.g.
+                // the input/poke path) running while the request is being sent
+                // would see no pending dispatch and no id yet (the id is only
+                // set after the await succeeds) and wrongly re-send the same
+                // lens. Keeping pending set for the duration of the send makes
+                // recovery park until the send resolves.
+                app.pending_headless_review = Some(lens_label.clone());
+                match remote
+                    .headless_review(parent_session_id, lens_label.clone(), lens_prompt, working_dir)
+                    .await
+                {
+                    Ok(request_id) => {
+                        // Correlate the eventual result to this request so a
+                        // stale/late HeadlessReviewResult is not mis-applied.
+                        app.active_headless_request_id = Some(request_id);
+                        // Persist the dispatch time so a reloaded client (whose
+                        // in-memory request id reset to None) can still recover
+                        // via the stale timeout instead of waiting forever. The
+                        // stale-timeout recovery is bounded separately by
+                        // `reviewer_respawn_count` in the loop state.
+                        if let Some(state) = app.session.review_loop.as_mut() {
+                            state.headless_dispatched_at =
+                                Some(crate::tui::test_harness::now_ms());
+                        }
+                        let _ = app.session.save();
+                    }
+                    Err(error) => {
+                        crate::logging::warn(&format!(
+                            "Headless review dispatch failed for '{}': {error}",
+                            lens_label
+                        ));
+                        // Un-mark awaiting so the loop can surface a failure / retry.
+                        if let Some(state) = app.session.review_loop.as_mut() {
+                            state.awaiting_headless = false;
+                        }
+                        let _ = app.session.save();
+                        app.set_status_notice(format!("Review loop: dispatch failed ({lens_label})"));
+                    }
+                }
+                // The dispatch (or its failure) is settled; clear the in-flight
+                // marker so a later stray result is correctly seen as one.
+                app.pending_headless_review = None;
+            } else {
+                app.push_display_message(DisplayMessage::error(format!(
+                    "Review loop: unknown lens {lens_label}"
+                )));
+            }
+        } else {
+            // still processing; keep the pending lens for the next tick.
+            app.pending_headless_review = Some(lens_label);
+        }
+    }
+
     if app.is_processing {
         if let Some(interleave_msg) = app.interleave_message.take()
             && !interleave_msg.trim().is_empty()
