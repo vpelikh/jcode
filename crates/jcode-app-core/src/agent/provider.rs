@@ -317,11 +317,16 @@ impl Agent {
     /// Grouped working-directory change invoked from a user `/cd` request.
     ///
     /// Beyond [`Self::set_working_dir`], this persists the session, refreshes
-    /// project-scoped skills, and appends a model-visible notice about the
-    /// change so the agent re-scopes even after a conversation has progressed
-    /// (the plain `refresh_initial_session_context_message` no-ops once visible
-    /// history exists).
-    pub fn set_working_dir_grouped(&mut self, dir: &str) -> anyhow::Result<()> {
+    /// project-scoped skills, and carries the change to the model. For a
+    /// session with no visible conversation yet, the initial session-context
+    /// system-reminder is rewritten with the new directory. For a session that
+    /// has progressed, that reminder is left untouched and a model-visible
+    /// notice is appended instead.
+    ///
+    /// Returns `Ok(true)` when the working directory actually changed (and
+    /// events should be fanned out), or `Ok(false)` when the request resolved
+    /// to the directory already bound (a no-op that should not spam the UI).
+    pub fn set_working_dir_grouped(&mut self, dir: &str) -> anyhow::Result<bool> {
         let old_dir = self
             .session
             .working_dir
@@ -334,20 +339,33 @@ impl Agent {
             .map(std::path::Path::new)
             .unwrap_or_else(|| std::path::Path::new("."));
         let normalized = resolve_working_dir(base, dir)?;
-        if self.session.working_dir.as_deref() == Some(normalized.as_str()) {
-            return Ok(());
+        // Idempotent: treat a change to a directory that is already the
+        // session's working dir (in either its stored or canonical form) as a
+        // no-op, so repeated `/cd` to the same tree never appends a redundant
+        // notice. The stored form can be non-canonical (set by the subscribe
+        // re-bind), so compare against the canonicalized current path too.
+        let current_is_target = self.session.working_dir.as_deref() == Some(normalized.as_str())
+            || self
+                .session
+                .working_dir
+                .as_deref()
+                .and_then(|p| std::fs::canonicalize(p).ok())
+                .map(|p| p.to_string_lossy() == normalized)
+                .unwrap_or(false);
+        if current_is_target {
+            return Ok(false);
         }
         self.session.working_dir = Some(normalized.clone());
         self.refresh_agents_md_snapshot();
-        // Rebuild the initial context system-reminder when there is still no
-        // visible conversation; otherwise the appended notice below carries the
-        // change to the model. Best-effort: both are tolerant of a missing
-        // initial context message.
-        self.session.refresh_initial_session_context_message();
-        self.session.append_working_dir_notice(&old_dir, &normalized);
+        // Rewrite the initial session-context system-reminder when there is
+        // still no visible conversation; otherwise append a one-off notice so
+        // the change reaches the model without rewriting history.
+        if !self.session.refresh_initial_session_context_message() {
+            self.session.append_working_dir_notice(&old_dir, &normalized);
+        }
         self.session.save()?;
         self.log_env_snapshot("working_dir");
-        Ok(())
+        Ok(true)
     }
 
     /// Get the working directory for this session

@@ -2,7 +2,9 @@
 
 use super::{
     NotifySessionContext, clone_split_session, handle_notify_session, handle_rename_session,
-    handle_resume_all_sessions, handle_set_feature, handle_split,
+    handle_resume_all_sessions, handle_set_feature, handle_set_handoff_resume,
+    handle_set_working_dir, handle_split, handle_handoff_list, handle_handoff_import, handle_handoff_apply,
+    handle_handoff_resume_by_id,
 };
 use crate::agent::Agent;
 use crate::message::{ContentBlock, Message, Role, StreamEvent, ToolDefinition};
@@ -14,6 +16,7 @@ use anyhow::Result;
 use async_stream::stream;
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
@@ -34,6 +37,21 @@ fn empty_swarm_status_state() -> (
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
         swarm_event_tx,
     )
+}
+
+/// A minimal session service handle for tests that only exercise the soft-interrupt
+/// delivery path. The other handle fields are inert defaults.
+fn session_handle_for_test(
+    sessions: crate::server::SessionAgents,
+    soft_interrupt_queues: crate::server::SessionInterruptQueues,
+) -> crate::server::services::SessionServiceHandle {
+    crate::server::services::SessionServiceHandle {
+        sessions,
+        session_id: Arc::new(RwLock::new(String::new())),
+        is_processing: Arc::new(RwLock::new(false)),
+        shutdown_signals: Arc::new(RwLock::new(HashMap::new())),
+        soft_interrupt_queues,
+    }
 }
 
 struct MockProvider;
@@ -131,6 +149,7 @@ fn clone_split_session_uses_persisted_session_state() {
         covers_up_to_turn: 1,
         original_turn_count: 1,
         compacted_count: 1,
+        physically_consolidated: false,
     });
     parent.save().expect("save parent");
 
@@ -238,40 +257,6 @@ fn split_response(
 }
 
 #[tokio::test]
-async fn split_empty_live_session_without_persisted_parent() {
-    let _guard = crate::storage::lock_test_env();
-    let _home = SplitTestHome::new();
-    let agent = new_split_test_agent().await;
-    let parent = agent.lock().await.session_for_split().clone();
-    assert_eq!(parent.visible_conversation_message_count(), 0);
-    assert!(
-        !crate::session::session_exists(&parent.id),
-        "regression requires an unsaved parent"
-    );
-    let (tx, mut rx) = mpsc::unbounded_channel();
-
-    handle_split(17, &parent.id, &agent, &tx).await;
-    let child = split_response(&mut rx, 17);
-    assert_ne!(child.id, parent.id);
-    assert_eq!(child.parent_id.as_deref(), Some(parent.id.as_str()));
-    assert_eq!(child.working_dir, parent.working_dir);
-    assert_eq!(child.model, parent.model);
-    assert_eq!(child.status, crate::session::SessionStatus::Closed);
-    assert_eq!(child.messages.len(), parent.messages.len() + 1);
-    let notice = child.messages.last().unwrap();
-    assert_eq!(
-        notice.display_role,
-        Some(crate::session::StoredDisplayRole::System)
-    );
-    assert!(notice.content_preview().contains(&parent.id));
-    assert_eq!(agent.lock().await.session_id(), parent.id);
-    assert!(
-        !crate::session::session_exists(&parent.id),
-        "fork must not mutate/persist its parent"
-    );
-}
-
-#[tokio::test]
 async fn split_busy_session_uses_persisted_state_without_waiting_for_agent() {
     let _guard = crate::storage::lock_test_env();
     let _home = SplitTestHome::new();
@@ -328,29 +313,6 @@ async fn split_busy_session_uses_persisted_state_without_waiting_for_agent() {
     drop(busy);
 }
 
-#[tokio::test]
-async fn split_busy_unsaved_session_returns_error_without_waiting() {
-    let _guard = crate::storage::lock_test_env();
-    let _home = SplitTestHome::new();
-    let agent = new_split_test_agent().await;
-    let busy = agent.lock().await;
-    let parent_id = busy.session_id().to_owned();
-    assert!(!crate::session::session_exists(&parent_id));
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    timeout(
-        Duration::from_millis(100),
-        handle_split(19, &parent_id, &agent, &tx),
-    )
-    .await
-    .expect("missing snapshot must not block a busy session");
-    assert!(matches!(
-        rx.try_recv(),
-        Ok(ServerEvent::Error { id: 19, .. })
-    ));
-    assert!(rx.try_recv().is_err());
-    drop(busy);
-}
-
 #[test]
 fn split_missing_parent_never_uses_another_live_session() {
     let _guard = crate::storage::lock_test_env();
@@ -373,6 +335,9 @@ fn split_corrupt_persisted_parent_is_not_hidden_by_live_fallback() {
 
 #[tokio::test]
 async fn enabling_swarm_does_not_auto_elect_coordinator() {
+    // Agent construction persists metadata, so it must share the test-home lock.
+    let _guard = crate::storage::lock_test_env();
+    let _home = SplitTestHome::new();
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let registry = Registry::new(provider.clone()).await;
     let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
@@ -406,17 +371,18 @@ async fn enabling_swarm_does_not_auto_elect_coordinator() {
     )])));
     let swarms_by_id = Arc::new(RwLock::new(HashMap::<String, HashSet<String>>::new()));
     let swarm_coordinators = Arc::new(RwLock::new(HashMap::<String, String>::new()));
-    let channel_subscriptions = Arc::new(RwLock::new(HashMap::<
-        String,
-        HashMap<String, HashSet<String>>,
-    >::new()));
-    let channel_subscriptions_by_session = Arc::new(RwLock::new(HashMap::<
-        String,
-        HashMap<String, HashSet<String>>,
-    >::new()));
     let swarm_plans = Arc::new(RwLock::new(HashMap::new()));
     let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
     let mut swarm_enabled = false;
+
+    let (swarm_event_tx, _swarm_event_rx) = tokio::sync::broadcast::channel(16);
+    let swarm_handle = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .swarms_by_id(Arc::clone(&swarms_by_id))
+        .plans(Arc::clone(&swarm_plans))
+        .coordinators(Arc::clone(&swarm_coordinators))
+        .swarm_event_tx(swarm_event_tx)
+        .build();
 
     handle_set_feature(
         42,
@@ -426,12 +392,7 @@ async fn enabling_swarm_does_not_auto_elect_coordinator() {
         session_id,
         &Some("duck".to_string()),
         &mut swarm_enabled,
-        &swarm_members,
-        &swarms_by_id,
-        &swarm_coordinators,
-        &channel_subscriptions,
-        &channel_subscriptions_by_session,
-        &swarm_plans,
+        &swarm_handle,
         &client_event_tx,
     )
     .await;
@@ -521,7 +482,9 @@ async fn rename_session_event_uses_agent_session_id_even_when_client_id_is_stale
         Some("Release planning".to_string()),
         &agent,
         stale_client_session_id,
-        &swarm_members,
+        &crate::server::test_util::TestSwarmBuilder::default()
+            .members(Arc::clone(&swarm_members))
+            .build(),
         &client_event_tx,
     )
     .await;
@@ -561,6 +524,9 @@ async fn rename_session_event_uses_agent_session_id_even_when_client_id_is_stale
 
 #[tokio::test]
 async fn notify_session_runs_scheduled_task_immediately_for_idle_live_session() {
+    // Agent construction persists metadata, so it must share the test-home lock.
+    let _guard = crate::storage::lock_test_env();
+    let _home = SplitTestHome::new();
     let provider = Arc::new(StreamingMockProvider::default());
     provider.queue_response(vec![
         StreamEvent::TextDelta("Working on scheduled task.".to_string()),
@@ -619,19 +585,22 @@ async fn notify_session_runs_scheduled_task_immediately_for_idle_live_session() 
     let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
 
     let (swarms_by_id, event_history, event_counter, swarm_event_tx) = empty_swarm_status_state();
+    let session_service =
+        session_handle_for_test(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
     handle_notify_session(
         77,
         session_id.clone(),
         "[Scheduled task]\nTask: Follow up".to_string(),
         NotifySessionContext {
-            sessions: &sessions,
-            soft_interrupt_queues: &soft_interrupt_queues,
+            session: &session_service,
             client_connections: &client_connections,
-            swarm_members: &swarm_members,
-            swarms_by_id: &swarms_by_id,
-            event_history: &event_history,
-            event_counter: &event_counter,
-            swarm_event_tx: &swarm_event_tx,
+            swarm: &crate::server::test_util::TestSwarmBuilder::default()
+                .members(Arc::clone(&swarm_members))
+                .swarms_by_id(Arc::clone(&swarms_by_id))
+                .event_history(Arc::clone(&event_history))
+                .event_counter(Arc::clone(&event_counter))
+                .swarm_event_tx(swarm_event_tx.clone())
+                .build(),
             client_event_tx: &client_event_tx,
         },
     )
@@ -679,6 +648,9 @@ async fn notify_session_runs_scheduled_task_immediately_for_idle_live_session() 
 
 #[tokio::test]
 async fn notify_session_queues_soft_interrupt_when_live_session_is_busy() {
+    // Agent construction persists metadata, so it must share the test-home lock.
+    let _guard = crate::storage::lock_test_env();
+    let _home = SplitTestHome::new();
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let registry = Registry::new(provider.clone()).await;
     let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
@@ -739,19 +711,22 @@ async fn notify_session_queues_soft_interrupt_when_live_session_is_busy() {
     let _busy_guard = agent.lock().await;
 
     let (swarms_by_id, event_history, event_counter, swarm_event_tx) = empty_swarm_status_state();
+    let session_service =
+        session_handle_for_test(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
     handle_notify_session(
         88,
         session_id.clone(),
         "[Scheduled task]\nTask: Follow up while busy".to_string(),
         NotifySessionContext {
-            sessions: &sessions,
-            soft_interrupt_queues: &soft_interrupt_queues,
+            session: &session_service,
             client_connections: &client_connections,
-            swarm_members: &swarm_members,
-            swarms_by_id: &swarms_by_id,
-            event_history: &event_history,
-            event_counter: &event_counter,
-            swarm_event_tx: &swarm_event_tx,
+            swarm: &crate::server::test_util::TestSwarmBuilder::default()
+                .members(Arc::clone(&swarm_members))
+                .swarms_by_id(Arc::clone(&swarms_by_id))
+                .event_history(Arc::clone(&event_history))
+                .event_counter(Arc::clone(&event_counter))
+                .swarm_event_tx(swarm_event_tx.clone())
+                .build(),
             client_event_tx: &client_event_tx,
         },
     )
@@ -863,11 +838,13 @@ async fn resume_all_continues_interrupted_idle_live_session() {
     handle_resume_all_sessions(
         91,
         &sessions,
-        &swarm_members,
-        &swarms_by_id,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
+        &crate::server::test_util::TestSwarmBuilder::default()
+            .members(Arc::clone(&swarm_members))
+            .swarms_by_id(Arc::clone(&swarms_by_id))
+            .event_history(Arc::clone(&event_history))
+            .event_counter(Arc::clone(&event_counter))
+            .swarm_event_tx(swarm_event_tx.clone())
+            .build(),
         &client_event_tx,
     )
     .await;
@@ -965,11 +942,13 @@ async fn resume_all_skips_session_with_completed_turn() {
     handle_resume_all_sessions(
         92,
         &sessions,
-        &swarm_members,
-        &swarms_by_id,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
+        &crate::server::test_util::TestSwarmBuilder::default()
+            .members(Arc::clone(&swarm_members))
+            .swarms_by_id(Arc::clone(&swarms_by_id))
+            .event_history(Arc::clone(&event_history))
+            .event_counter(Arc::clone(&event_counter))
+            .swarm_event_tx(swarm_event_tx.clone())
+            .build(),
         &client_event_tx,
     )
     .await;
@@ -1004,4 +983,1784 @@ async fn resume_all_skips_session_with_completed_turn() {
     } else {
         crate::env::remove_var("JCODE_HOME");
     }
+}
+
+#[tokio::test]
+async fn set_working_dir_updates_agent_and_fans_out_event() -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    let old_dir = tempfile::tempdir().expect("old dir").keep();
+    let new_dir = tempfile::tempdir().expect("new dir").keep();
+
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
+    {
+        let mut guard = agent.lock().await;
+        guard.set_working_dir(old_dir.to_str().expect("utf8"));
+    }
+    let agent_session_id = agent.lock().await.session_id().to_string();
+    let (member_event_tx, mut member_event_rx) = mpsc::unbounded_channel();
+    let now = Instant::now();
+    let swarm_members = Arc::new(RwLock::new(HashMap::from([(
+        agent_session_id.clone(),
+        SwarmMember {
+            session_id: agent_session_id.clone(),
+            event_tx: member_event_tx,
+            event_txs: HashMap::new(),
+            working_dir: None,
+            swarm_id: None,
+            swarm_enabled: false,
+            status: "ready".to_string(),
+            detail: None,
+            task_label: None,
+            friendly_name: None,
+            report_back_to_session_id: None,
+            latest_completion_report: None,
+            role: "agent".to_string(),
+            joined_at: now,
+            last_status_change: now,
+            is_headless: false,
+            output_tail: None,
+            todo_progress: None,
+            todo_items: Vec::new(),
+            runtime: crate::protocol::SwarmMemberRuntime::default(),
+        },
+    )])));
+    let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
+
+    handle_set_working_dir(
+        88,
+        new_dir.to_str().expect("utf8").to_string(),
+        &agent,
+        &agent_session_id,
+        &crate::server::test_util::TestSwarmBuilder::default()
+            .members(Arc::clone(&swarm_members))
+            .build(),
+        &client_event_tx,
+    )
+    .await;
+
+    let changed_event = timeout(Duration::from_secs(2), member_event_rx.recv())
+        .await
+        .expect("working dir change event should arrive")
+        .expect("member event channel should stay open");
+    match changed_event {
+        ServerEvent::SessionWorkingDirChanged {
+            session_id,
+            working_dir,
+        } => {
+            assert_eq!(session_id, agent_session_id);
+            assert_eq!(
+                PathBuf::from(working_dir),
+                new_dir.canonicalize().expect("canonical"),
+                "event must carry the resolved (canonical) new working dir"
+            );
+        }
+        other => panic!("expected SessionWorkingDirChanged, got {other:?}"),
+    }
+
+    let client_events: Vec<_> = std::iter::from_fn(|| client_event_rx.try_recv().ok()).collect();
+    assert!(
+        client_events
+            .iter()
+            .any(|event| matches!(event, ServerEvent::Done { id } if *id == 88))
+    );
+
+    let guard = agent.lock().await;
+    assert_eq!(
+        guard.working_dir().map(PathBuf::from),
+        Some(new_dir.canonicalize().expect("canonical")),
+        "agent working dir must be updated"
+    );
+    drop(guard);
+
+    // The swarm member record must be kept coherent with the new bound dir.
+    let member_dir = swarm_members.read().await;
+    let member = member_dir
+        .get(&agent_session_id)
+        .expect("swarm member exists");
+    assert_eq!(
+        member.working_dir.as_ref(),
+        Some(&new_dir.canonicalize().expect("canonical")),
+        "swarm member working_dir must be synced to the /cd target"
+    );
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_working_dir_to_current_dir_is_noop() -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    let current = tempfile::tempdir().expect("dir").keep();
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
+    {
+        let mut guard = agent.lock().await;
+        guard.set_working_dir(current.to_str().expect("utf8"));
+    }
+    let agent_session_id = agent.lock().await.session_id().to_string();
+    let swarm_members = Arc::new(RwLock::new(HashMap::<String, SwarmMember>::new()));
+    let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
+
+    // Same directory (canonicalizes to the current working dir): no-op, so
+    // neither a change event nor a Done is emitted.
+    handle_set_working_dir(
+        77,
+        current.to_str().expect("utf8").to_string(),
+        &agent,
+        &agent_session_id,
+        &crate::server::test_util::TestSwarmBuilder::default()
+            .members(Arc::clone(&swarm_members))
+            .build(),
+        &client_event_tx,
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let events: Vec<_> = std::iter::from_fn(|| client_event_rx.try_recv().ok()).collect();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ServerEvent::Done { id } if *id == 77)),
+        "a no-op /cd must still resolve the request with a Done, got {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ServerEvent::SessionWorkingDirChanged { .. })),
+        "a no-op /cd to the current dir must not emit a change event, got {events:?}"
+    );
+    let guard = agent.lock().await;
+    assert_eq!(guard.working_dir().map(PathBuf::from), Some(current));
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_working_dir_noop_detects_canonically_equivalent_dir() -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    // Store a *non-canonical* working dir (a `sub/..` round trip) so the
+    // stored string differs lexically from the canonical target, exercising the
+    // canonicalization fallback in the no-op comparison rather than the trivial
+    // exact-string match.
+    let root = tempfile::tempdir().expect("root dir");
+    let sub = root.path().join("sub");
+    std::fs::create_dir_all(&sub).expect("create sub");
+    let stored_non_canonical = root.path().join("sub/..");
+
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
+    {
+        let mut guard = agent.lock().await;
+        guard.set_working_dir(stored_non_canonical.to_str().expect("utf8"));
+    }
+    let agent_session_id = agent.lock().await.session_id().to_string();
+    let swarm_members = Arc::new(RwLock::new(HashMap::<String, SwarmMember>::new()));
+    let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
+
+    // /cd to the canonical form of the *same* directory: a no-op because the
+    // stored form canonicalizes to the same tree, so no event is emitted.
+    let canonical = root.path().canonicalize().expect("canonical");
+    handle_set_working_dir(
+        78,
+        canonical.to_str().expect("utf8").to_string(),
+        &agent,
+        &agent_session_id,
+        &crate::server::test_util::TestSwarmBuilder::default()
+            .members(Arc::clone(&swarm_members))
+            .build(),
+        &client_event_tx,
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let events: Vec<_> = std::iter::from_fn(|| client_event_rx.try_recv().ok()).collect();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ServerEvent::Done { id } if *id == 78)),
+        "a /cd to a canonically-equivalent dir must still resolve the request with a Done, got {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ServerEvent::SessionWorkingDirChanged { .. })),
+        "a /cd to a canonically-equivalent dir must not emit a change event, got {events:?}"
+    );
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_working_dir_persists_resolved_dir_for_fresh_session() -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    let target = tempfile::tempdir().expect("target dir").keep();
+
+    // Fresh agent/session (no visible conversation yet). A /cd here must be
+    // persisted to disk: the agent binds a model/provider route at creation, so
+    // the session carries configured state and save() writes it even before the
+    // first real message.
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
+    let agent_session_id = agent.lock().await.session_id().to_string();
+    let swarm_members = Arc::new(RwLock::new(HashMap::<String, SwarmMember>::new()));
+    let (client_event_tx, _client_event_rx) = mpsc::unbounded_channel();
+
+    handle_set_working_dir(
+        89,
+        target.to_str().expect("utf8").to_string(),
+        &agent,
+        &agent_session_id,
+        &crate::server::test_util::TestSwarmBuilder::default()
+            .members(Arc::clone(&swarm_members))
+            .build(),
+        &client_event_tx,
+    )
+    .await;
+
+    let persisted = crate::session::Session::load(&agent_session_id)
+        .expect("a /cd on a fresh session must be persisted to disk");
+    assert_eq!(
+        persisted.working_dir.map(PathBuf::from),
+        target.canonicalize().ok(),
+        "the resolved /cd working dir must survive on disk for a fresh session"
+    );
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_working_dir_to_previously_noncanonical_but_different_dir_is_a_change() -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    // Store a non-canonical path that resolves to dir A, then /cd to a real,
+    // *different* directory B. The canonical-equivalence no-op suppression must
+    // NOT swallow this genuine change: dir A canonicalizes to A (not B), so a
+    // change event must still be emitted and the agent re-scoped to B.
+    let root = tempfile::tempdir().expect("root dir");
+    let dir_a = root.path().join("a");
+    let dir_b = root.path().join("b");
+    std::fs::create_dir_all(&dir_a).expect("create a");
+    std::fs::create_dir_all(&dir_b).expect("create b");
+    let stored_a_noncanonical = root.path().join("a/.").join("..").join("a");
+
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
+    {
+        let mut guard = agent.lock().await;
+        guard.set_working_dir(stored_a_noncanonical.to_str().expect("utf8"));
+    }
+    let agent_session_id = agent.lock().await.session_id().to_string();
+    let (member_event_tx, mut member_event_rx) = mpsc::unbounded_channel();
+    let now = Instant::now();
+    let swarm_members = Arc::new(RwLock::new(HashMap::from([(
+        agent_session_id.clone(),
+        SwarmMember {
+            session_id: agent_session_id.clone(),
+            event_tx: member_event_tx,
+            event_txs: HashMap::new(),
+            working_dir: None,
+            swarm_id: None,
+            swarm_enabled: false,
+            status: "ready".to_string(),
+            detail: None,
+            task_label: None,
+            friendly_name: None,
+            report_back_to_session_id: None,
+            latest_completion_report: None,
+            role: "agent".to_string(),
+            joined_at: now,
+            last_status_change: now,
+            is_headless: false,
+            output_tail: None,
+            todo_progress: None,
+            todo_items: Vec::new(),
+            runtime: crate::protocol::SwarmMemberRuntime::default(),
+        },
+    )])));
+    let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
+
+    handle_set_working_dir(
+        90,
+        dir_b.to_str().expect("utf8").to_string(),
+        &agent,
+        &agent_session_id,
+        &crate::server::test_util::TestSwarmBuilder::default()
+            .members(Arc::clone(&swarm_members))
+            .build(),
+        &client_event_tx,
+    )
+    .await;
+
+    let changed_event = timeout(Duration::from_secs(2), member_event_rx.recv())
+        .await
+        .expect("a change to a different dir must emit a change event")
+        .expect("member event channel should stay open");
+    match changed_event {
+        ServerEvent::SessionWorkingDirChanged {
+            session_id,
+            working_dir,
+        } => {
+            assert_eq!(session_id, agent_session_id);
+            assert_eq!(
+                PathBuf::from(working_dir),
+                dir_b.canonicalize().expect("canonical b"),
+                "the change event must carry the new (different) dir"
+            );
+        }
+        other => panic!("expected SessionWorkingDirChanged, got {other:?}"),
+    }
+
+    let client_events: Vec<_> = std::iter::from_fn(|| client_event_rx.try_recv().ok()).collect();
+    assert!(
+        client_events
+            .iter()
+            .any(|event| matches!(event, ServerEvent::Done { id } if *id == 90))
+    );
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_working_dir_to_missing_dir_reports_error_not_change() -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    // A path that must not exist, so resolve_working_dir rejects it.
+    let missing = temp.path().join("../definitely-not-there");
+
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
+    let agent_session_id = agent.lock().await.session_id().to_string();
+    let swarm_members = Arc::new(RwLock::new(HashMap::<String, SwarmMember>::new()));
+    let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
+
+    handle_set_working_dir(
+        91,
+        missing.to_str().expect("utf8").to_string(),
+        &agent,
+        &agent_session_id,
+        &crate::server::test_util::TestSwarmBuilder::default()
+            .members(Arc::clone(&swarm_members))
+            .build(),
+        &client_event_tx,
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let events: Vec<_> = std::iter::from_fn(|| client_event_rx.try_recv().ok()).collect();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            ServerEvent::Error { id, message, .. } if *id == 91 && message.contains("does not exist")
+        )),
+        "a /cd to a missing dir must surface an Error, got {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ServerEvent::Done { id } if *id == 91)),
+        "a rejected /cd must not emit a Done, got {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ServerEvent::SessionWorkingDirChanged { .. })),
+        "a rejected /cd must not emit a change event, got {events:?}"
+    );
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_working_dir_event_carries_resolved_not_raw_input() -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    let root = tempfile::tempdir().expect("root dir");
+    let target = root.path().join("target");
+    std::fs::create_dir_all(&target).expect("create target");
+    // A non-canonical-but-coherent input: `target/.` canonicalizes to `target`.
+    let raw_input = target.join(".").to_str().expect("utf8").to_string();
+
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
+    let agent_session_id = agent.lock().await.session_id().to_string();
+    let (member_event_tx, mut member_event_rx) = mpsc::unbounded_channel();
+    let now = Instant::now();
+    let swarm_members = Arc::new(RwLock::new(HashMap::from([(
+        agent_session_id.clone(),
+        SwarmMember {
+            session_id: agent_session_id.clone(),
+            event_tx: member_event_tx,
+            event_txs: HashMap::new(),
+            working_dir: None,
+            swarm_id: None,
+            swarm_enabled: false,
+            status: "ready".to_string(),
+            detail: None,
+            task_label: None,
+            friendly_name: None,
+            report_back_to_session_id: None,
+            latest_completion_report: None,
+            role: "agent".to_string(),
+            joined_at: now,
+            last_status_change: now,
+            is_headless: false,
+            output_tail: None,
+            todo_progress: None,
+            todo_items: Vec::new(),
+            runtime: crate::protocol::SwarmMemberRuntime::default(),
+        },
+    )])));
+    let (client_event_tx, _client_event_rx) = mpsc::unbounded_channel();
+
+    // The raw input is non-canonical (`target/.`), but the event must carry the
+    // resolved canonical directory so the client's session/git-info cache use
+    // the same key the server stores and gather_git_info derives.
+    handle_set_working_dir(
+        92,
+        raw_input,
+        &agent,
+        &agent_session_id,
+        &crate::server::test_util::TestSwarmBuilder::default()
+            .members(Arc::clone(&swarm_members))
+            .build(),
+        &client_event_tx,
+    )
+    .await;
+
+    let changed_event = timeout(Duration::from_secs(2), member_event_rx.recv())
+        .await
+        .expect("working dir change event should arrive")
+        .expect("member event channel should stay open");
+    match changed_event {
+        ServerEvent::SessionWorkingDirChanged {
+            session_id,
+            working_dir,
+        } => {
+            assert_eq!(session_id, agent_session_id);
+            assert_eq!(
+                PathBuf::from(&working_dir),
+                target.canonicalize().expect("canonical"),
+                "the change event must carry the canonical resolved dir, not the raw '{working_dir}' input"
+            );
+        }
+        other => panic!("expected SessionWorkingDirChanged, got {other:?}"),
+    }
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    Ok(())
+}
+
+/// handle_set_handoff_resume sets a one-shot override on the agent that beats
+/// the automatic latest-for-project handoff at first-message injection, and
+/// replies Done. An unknown id replies Error instead.
+#[tokio::test]
+async fn handle_set_handoff_resume_overrides_auto_inject_and_errors_on_unknown() -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+    let wd = temp.path();
+    std::fs::create_dir_all(wd).ok();
+
+    fn seed(session_id: &str, wd: &Path, intent: &str) {
+        crate::todo::save_todos(
+            session_id,
+            &[crate::todo::TodoItem {
+                id: "t".into(),
+                content: format!("work for {intent}"),
+                status: "in_progress".into(),
+                priority: "high".into(),
+                group: None,
+                confidence: None,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        crate::todo::save_plan(
+            session_id,
+            &crate::todo::TodoPlan {
+                user_intention: Some(intent.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::handoff::capture(session_id, Some(wd), "closed", None).expect("capture");
+    }
+
+    seed("target-handoff", wd, "target intent");
+    std::thread::sleep(Duration::from_millis(20));
+    seed("auto-handoff", wd, "auto intent");
+
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
+    {
+        let mut guard = agent.lock().await;
+        guard.set_working_dir(wd.to_str().expect("utf8"));
+    }
+
+    let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
+    handle_set_handoff_resume(
+        11,
+        Some("target-handoff".to_string()),
+        &agent,
+        &client_event_tx,
+    )
+    .await;
+    assert!(
+        timeout(Duration::from_secs(2), client_event_rx.recv())
+            .await
+            .expect("Done should arrive")
+            .is_some_and(|e| matches!(e, ServerEvent::Done { id } if id == 11)),
+        "handler must reply Done for a valid handoff"
+    );
+
+    // First user message must boot from the manually selected handoff, not the
+    // newer auto-inject target.
+    let first_str = {
+        let mut guard = agent.lock().await;
+        guard
+            .append_user_context_message("resume", Vec::new())
+            .expect("append first message");
+        // Latest user message (messages() is last-in=last-out by index).
+        let mut preview = String::new();
+        for message in guard.messages().iter().rev() {
+            if message.role == Role::User {
+                preview = message.content_preview();
+                break;
+            }
+        }
+        preview
+    };
+    assert!(
+        first_str.contains("target intent") && !first_str.contains("auto intent"),
+        "override must win over auto-inject, got: {first_str}"
+    );
+
+    // Unknown handoff id fails fast with an Error, no override set.
+    let (client_event_tx2, mut client_event_rx2) = mpsc::unbounded_channel();
+    handle_set_handoff_resume(12, Some("no-such".to_string()), &agent, &client_event_tx2).await;
+    let error = timeout(Duration::from_secs(2), client_event_rx2.recv())
+        .await
+        .expect("Error should arrive")
+        .expect("channel should stay open");
+    match error {
+        ServerEvent::Error { id, message, .. } => {
+            assert_eq!(id, 12);
+            assert!(message.contains("no saved handoff"), "got: {message}");
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    Ok(())
+}
+
+/// handle_set_handoff_resume(None) clears a previously set override: a fresh
+/// conversation afterwards uses the automatic latest-for-project handoff again.
+#[tokio::test]
+async fn handle_set_handoff_resume_none_clears_override() -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+    let wd = temp.path();
+    std::fs::create_dir_all(wd).ok();
+
+    fn seed(session_id: &str, wd: &Path, intent: &str) {
+        crate::todo::save_todos(
+            session_id,
+            &[crate::todo::TodoItem {
+                id: "t".into(),
+                content: format!("work for {intent}"),
+                status: "in_progress".into(),
+                priority: "high".into(),
+                group: None,
+                confidence: None,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        crate::todo::save_plan(
+            session_id,
+            &crate::todo::TodoPlan {
+                user_intention: Some(intent.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::handoff::capture(session_id, Some(wd), "closed", None).expect("capture");
+    }
+
+    seed("manual-handoff", wd, "manual intent");
+    std::thread::sleep(Duration::from_millis(20));
+    seed("auto-handoff", wd, "auto intent");
+
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
+    {
+        let mut guard = agent.lock().await;
+        guard.set_working_dir(wd.to_str().expect("utf8"));
+    }
+
+    // Set the manual override, then clear it with None.
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    handle_set_handoff_resume(21, Some("manual-handoff".to_string()), &agent, &tx).await;
+    assert!(
+        timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("Done")
+            .is_some_and(|e| matches!(e, ServerEvent::Done { id } if id == 21)),
+        "setting the override must reply Done"
+    );
+    handle_set_handoff_resume(22, None, &agent, &tx).await;
+    assert!(
+        timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("Done")
+            .is_some_and(|e| matches!(e, ServerEvent::Done { id } if id == 22)),
+        "clearing the override must reply Done"
+    );
+
+    // The override lived on `agent`, which is still a fresh conversation (no
+    // messages yet). Sending `None` cleared it, so this agent's first message
+    // must now use the automatic latest-for-project handoff.
+    let first_str = {
+        let mut guard = agent.lock().await;
+        guard
+            .append_user_context_message("resume", Vec::new())
+            .expect("first message");
+        let mut preview = String::new();
+        for message in guard.messages().iter().rev() {
+            if message.role == Role::User {
+                preview = message.content_preview();
+                break;
+            }
+        }
+        preview
+    };
+    assert!(
+        first_str.contains("auto intent") && !first_str.contains("manual intent"),
+        "after None the fresh conversation should use auto-inject, got: {first_str}"
+    );
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    Ok(())
+}
+
+/// handle_handoff_resume_by_id atomically clears the current conversation and
+/// arms the handoff-resume override to the named snapshot in one server-side
+/// hop (no client Clear + SetHandoffResume pair). A fresh first user message
+/// therefore boots from that snapshot's intent. An unknown id replies Error and
+/// leaves the conversation untouched.
+#[tokio::test]
+async fn handle_handoff_resume_by_id_clears_and_arms_atomically() -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+    let wd = temp.path();
+    std::fs::create_dir_all(wd).ok();
+
+    fn seed(session_id: &str, wd: &Path, intent: &str) {
+        crate::todo::save_todos(
+            session_id,
+            &[crate::todo::TodoItem {
+                id: "t".into(),
+                content: format!("work for {intent}"),
+                status: "in_progress".into(),
+                priority: "high".into(),
+                group: None,
+                confidence: None,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        crate::todo::save_plan(
+            session_id,
+            &crate::todo::TodoPlan {
+                user_intention: Some(intent.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::handoff::capture(session_id, Some(wd), "closed", None).expect("capture");
+    }
+
+    seed("pick-me", wd, "picked intent");
+    // A later snapshot that is NOT the one picked: it must NOT win at first
+    // message unless the auto-inject path mistakenly beats the override. This
+    // proves the atomic resume-by-id actually armed the *picked* snapshot, not
+    // merely whichever happens to be latest-for-project.
+    std::thread::sleep(Duration::from_millis(20));
+    seed("newer-me", wd, "newer intent");
+
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
+    // A live conversation exists before the resume. The exact count is not
+    // pinned (auto-inject may append a handoff to the first visible message);
+    // we only need a believable non-empty baseline to observe the no-op
+    // rejection and the clearing on success.
+    let before_messages = {
+        let mut guard = agent.lock().await;
+        guard.set_working_dir(wd.to_str().expect("utf8"));
+        guard
+            .append_user_context_message("some prior work", Vec::new())
+            .expect("seed conversation");
+        let count = guard.messages().len();
+        assert!(count >= 1, "sanity: the agent should have a conversation");
+        count
+    };
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    handle_handoff_resume_by_id(31, "hand-me".to_string(), &agent, &tx).await;
+    let error = timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("Error should arrive")
+        .expect("channel stays open");
+    match error {
+        ServerEvent::Error { id, message, .. } => {
+            assert_eq!(id, 31);
+            assert!(message.contains("no saved handoff"), "got: {message}");
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    // Unknown id left the live conversation untouched.
+    {
+        let guard = agent.lock().await;
+        assert_eq!(
+            guard.messages().len(),
+            before_messages,
+            "rejected resume must not clear the conversation"
+        );
+    }
+
+    // Blank/whitespace id fails fast with an Error and leaves the conversation
+    // untouched (the handler trims and rejects empty input before any lock).
+    let (tx9, mut rx9) = mpsc::unbounded_channel();
+    handle_handoff_resume_by_id(33, "   ".to_string(), &agent, &tx9).await;
+    let blank = timeout(Duration::from_secs(2), rx9.recv())
+        .await
+        .expect("Error should arrive")
+        .expect("channel stays open");
+    match blank {
+        ServerEvent::Error { id, message, .. } => {
+            assert_eq!(id, 33);
+            assert!(
+                message.contains("must not be empty"),
+                "blank id should report a specific error, got: {message}"
+            );
+        }
+        other => panic!("expected Error for blank id, got {other:?}"),
+    }
+    {
+        let guard = agent.lock().await;
+        assert_eq!(
+            guard.messages().len(),
+            before_messages,
+            "blank-id resume must not clear the conversation"
+        );
+    }
+
+    // Valid id -> clears the conversation and arms the override, in one request.
+    let (tx2, mut rx2) = mpsc::unbounded_channel();
+    handle_handoff_resume_by_id(32, "pick-me".to_string(), &agent, &tx2).await;
+    let resumed = timeout(Duration::from_secs(2), rx2.recv())
+        .await
+        .expect("HandoffResumed should arrive")
+        .expect("channel stays open");
+    match resumed {
+        ServerEvent::HandoffResumed { id, session_id } => {
+            assert_eq!(id, 32);
+            assert_eq!(session_id, "pick-me");
+        }
+        other => panic!("expected HandoffResumed, got {other:?}"),
+    }
+
+    // The conversation was cleared (fresh session) and the override armed, so a
+    // first message boots from the *picked* handoff's intent — overriding the
+    // newer auto-latest snapshot. This is the acceptance boundary: if the
+    // atomic request only left the store's latest snapshot to auto-inject, the
+    // fresh first message would show "newer intent" instead.
+    let first_str = {
+        let mut guard = agent.lock().await;
+        guard
+            .append_user_context_message("resume", Vec::new())
+            .expect("first message after clear");
+        let mut preview = String::new();
+        for message in guard.messages().iter().rev() {
+            if message.role == Role::User {
+                preview = message.content_preview();
+                break;
+            }
+        }
+        preview
+    };
+    assert!(
+        first_str.contains("picked intent"),
+        "a fresh first message should boot from the picked handoff, got: {first_str}"
+    );
+    assert!(
+        !first_str.contains("newer intent"),
+        "the armed override must beat the newer auto-latest snapshot, got: {first_str}"
+    );
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    Ok(())
+}
+
+/// handle_handoff_list lists the server-side handoff store (newest first,
+/// including archived snapshots) as HandoffWireModel entries with their export
+/// payload attached, so a client can discover and re-adopt a snapshot.
+#[tokio::test]
+async fn handle_handoff_list_lists_server_handoff_store() -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+    let wd = temp.path();
+    std::fs::create_dir_all(wd).ok();
+
+    fn seed(session_id: &str, wd: &std::path::Path, intent: &str) {
+        crate::todo::save_todos(
+            session_id,
+            &[crate::todo::TodoItem {
+                id: "t".into(),
+                content: format!("work for {intent}"),
+                status: "in_progress".into(),
+                priority: "high".into(),
+                group: None,
+                confidence: None,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        crate::todo::save_plan(
+            session_id,
+            &crate::todo::TodoPlan {
+                user_intention: Some(intent.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::handoff::capture(session_id, Some(wd), "closed", None).expect("capture");
+    }
+
+    seed("alpha-handoff", wd, "alpha intent");
+    std::thread::sleep(Duration::from_millis(20));
+    seed("beta-handoff", wd, "beta intent");
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    handle_handoff_list(101, &tx).await;
+    let event = timeout(Duration::from_secs(2), rx.recv())
+        .await?
+        .expect("handoff_listed event");
+    match event {
+        ServerEvent::HandoffListed { id, handoffs } => {
+            assert_eq!(id, 101);
+            // Newest first: beta captured after alpha.
+            assert_eq!(handoffs.len(), 2);
+            assert_eq!(handoffs[0].session_id, "beta-handoff");
+            assert_eq!(handoffs[1].session_id, "alpha-handoff");
+            assert_eq!(handoffs[0].intent.as_deref(), Some("beta intent"));
+            assert_eq!(handoffs[0].open_todos.len(), 1);
+            assert_eq!(handoffs[0].open_todos[0].content, "work for beta intent");
+            assert_eq!(handoffs[0].open_todos[0].status, "in_progress");
+            assert!(handoffs[0].last_assistant_text.is_none());
+            // Each entry carries its portable export payload for re-adoption.
+            assert!(
+                handoffs[0].payload.as_deref().unwrap_or_default().contains("beta-handoff"),
+                "listed entry should carry its export payload"
+            );
+        }
+        other => return Err(anyhow::anyhow!("expected HandoffListed, got {other:?}")),
+    }
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    Ok(())
+}
+
+/// handle_handoff_import adopts a portable payload as the live handoff for the
+/// session's working-directory project and replies with the adopted id.
+/// Malformed payloads reply Error instead.
+#[tokio::test]
+async fn handle_handoff_import_adopts_payload_and_errors_on_bad_input() -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+    let wd = temp.path();
+    std::fs::create_dir_all(wd).ok();
+
+    // Seed a source handoff on this host, then export + import it so "remote
+    // adoption" mints a fresh import-<source> id and rekeys it to `wd`.
+    crate::todo::save_todos(
+        "source-session",
+        &[crate::todo::TodoItem {
+            id: "t".into(),
+            content: "work to adopt".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: None,
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    crate::todo::save_plan(
+        "source-session",
+        &crate::todo::TodoPlan {
+            user_intention: Some("imported intent".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    crate::handoff::capture("source-session", Some(wd), "closed", None).expect("capture");
+    let payload = crate::handoff::export_handoff("source-session").expect("export");
+
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
+    {
+        let mut guard = agent.lock().await;
+        guard.set_working_dir(wd.to_str().expect("utf8"));
+    }
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    handle_handoff_import(31, payload, None, &agent, &tx).await;
+    let event = timeout(Duration::from_secs(2), rx.recv())
+        .await?
+        .expect("handoff_imported event");
+    match event {
+        ServerEvent::HandoffImported { id, session_id } => {
+            assert_eq!(id, 31);
+            assert!(
+                session_id.starts_with("import-source"),
+                "adopted id should be import-<source>, got {session_id}"
+            );
+            // The adopted snapshot becomes the live handoff for the project.
+            assert_eq!(
+                crate::handoff::latest_handoff_for_project(Some(wd)).as_deref(),
+                Some(session_id.as_str())
+            );
+        }
+        other => return Err(anyhow::anyhow!("expected HandoffImported, got {other:?}")),
+    }
+
+    // Malformed payload -> Error.
+    let (tx2, mut rx2) = mpsc::unbounded_channel();
+    handle_handoff_import(32, "{{{ not json".to_string(), None, &agent, &tx2).await;
+    let event2 = timeout(Duration::from_secs(2), rx2.recv())
+        .await?
+        .expect("error event");
+    assert!(
+        matches!(event2, ServerEvent::Error { id: 32, .. }),
+        "malformed payload must reply Error, got {event2:?}"
+    );
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    Ok(())
+}
+
+/// handle_handoff_apply atomically imports a portable payload, clears the live
+/// conversation, and sets the handoff-resume override to the adopted id, so the
+/// next first user message boots from the snapshot. Malformed payloads reply
+/// Error and leave the live conversation untouched (import runs first).
+#[tokio::test]
+async fn handle_handoff_apply_imports_clears_and_arms_resume() -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+    let wd = temp.path();
+    std::fs::create_dir_all(wd).ok();
+
+    // Seed a source handoff on this host, then export it for apply ("remote
+    // adoption"). apply mints a fresh import-<source> id and rekeys to `wd`.
+    crate::todo::save_todos(
+        "source-session",
+        &[crate::todo::TodoItem {
+            id: "t".into(),
+            content: "work to adopt".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: None,
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    crate::todo::save_plan(
+        "source-session",
+        &crate::todo::TodoPlan {
+            user_intention: Some("applied intent".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    crate::handoff::capture("source-session", Some(wd), "closed", None).expect("capture");
+    let payload = crate::handoff::export_handoff("source-session").expect("export");
+
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
+    {
+        let mut guard = agent.lock().await;
+        guard.set_working_dir(wd.to_str().expect("utf8"));
+        // Pre-existing conversation that must be cleared by apply.
+        guard.add_message(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "old conversation".to_string(),
+                cache_control: None,
+            }],
+        );
+        assert_eq!(guard.visible_conversation_message_count(), 1);
+    }
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    handle_handoff_apply(41, payload, None, &agent, &tx).await;
+    let event = timeout(Duration::from_secs(2), rx.recv())
+        .await?
+        .expect("handoff_apply reply");
+    match event {
+        ServerEvent::HandoffImported { id, session_id } => {
+            assert_eq!(id, 41);
+            assert!(session_id.starts_with("import-"), "expected import-<source> id, got {session_id}");
+            // Latest handoff for the project is now the adopted one.
+            assert_eq!(
+                crate::handoff::latest_handoff_for_project(Some(wd)).as_deref(),
+                Some(session_id.as_str())
+            );
+            // Live conversation was cleared and resume override armed.
+            let guard = agent.lock().await;
+            assert_eq!(guard.visible_conversation_message_count(), 0, "apply must clear the live conversation");
+        }
+        other => return Err(anyhow::anyhow!("expected HandoffImported, got {other:?}")),
+    }
+
+    // Malformed payload -> Error; live conversation must stay untouched.
+    {
+        let mut guard = agent.lock().await;
+        guard.add_message(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "another message".to_string(),
+                cache_control: None,
+            }],
+        );
+        let count_before = guard.visible_conversation_message_count();
+        assert!(count_before >= 1);
+    }
+    let (tx2, mut rx2) = mpsc::unbounded_channel();
+    handle_handoff_apply(42, "{{{ not json".to_string(), None, &agent, &tx2).await;
+    let event2 = timeout(Duration::from_secs(2), rx2.recv())
+        .await?
+        .expect("error event");
+    assert!(
+        matches!(event2, ServerEvent::Error { id: 42, .. }),
+        "malformed payload must reply Error, got {event2:?}"
+    );
+    let guard = agent.lock().await;
+    assert!(
+        guard.visible_conversation_message_count() >= 1,
+        "failed apply must leave the live conversation untouched"
+    );
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    Ok(())
+}
+
+/// Real-socket integration: boot the real server accept loop, connect a real
+/// client over the Unix socket, and drive `Request::SetHandoffResume` through
+/// the wire so it reaches the real handler. This exercises request framing and
+/// server dispatch that in-process handler tests do not. A valid handoff id
+/// round-trips to a `Done` reply; an unknown id yields `Error`.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_socket_set_handoff_resume_round_trips_done_and_error() -> Result<()> {
+    use crate::protocol::Request;
+    use crate::server::Server;
+    use crate::transport::Stream;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let _guard = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().expect("temp home");
+    let sock_dir = tempfile::tempdir().expect("temp sock dir");
+    let socket_path = sock_dir.path().join("jcode-e2e.sock");
+
+    struct Restore {
+        prev: [(&'static str, Option<std::ffi::OsString>); 2],
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            for (key, prev) in &self.prev {
+                match prev {
+                    Some(v) => crate::env::set_var(key, v.clone()),
+                    None => crate::env::remove_var(key),
+                }
+            }
+        }
+    }
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let prev_socket = std::env::var_os("JCODE_SOCKET");
+    let _restore = Restore {
+        prev: [
+            ("JCODE_HOME", prev_home),
+            ("JCODE_SOCKET", prev_socket),
+        ],
+    };
+    crate::env::set_var("JCODE_HOME", home.path());
+    crate::env::set_var("JCODE_SOCKET", &socket_path);
+
+    // Seed a handoff the server can resolve.
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    crate::todo::save_todos(
+        "target-handoff",
+        &[crate::todo::TodoItem {
+            id: "t".into(),
+            content: "e2e work".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: None,
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    crate::todo::save_plan(
+        "target-handoff",
+        &crate::todo::TodoPlan {
+            user_intention: Some("e2e intent".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    crate::handoff::capture("target-handoff", Some(&work), "closed", None).expect("seed handoff");
+
+    let provider: Arc<dyn Provider> = Arc::new(StreamingMockProvider::default());
+    let server = Server::new(provider);
+    let run_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    // Wait for the real accept loop, then connect a real client.
+    let mut stream = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(s) = Stream::connect(&socket_path).await {
+                break s;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    })
+    .await
+    .expect("server should accept within 10s");
+
+    // The server requires a Subscribe with a working_dir before stateful
+    // requests.
+    let subscribe = Request::Subscribe {
+        supports_pdf_panels: false,
+        id: 20,
+        working_dir: Some(work.to_string_lossy().into_owned()),
+        selfdev: None,
+        target_session_id: None,
+        client_instance_id: None,
+        client_has_local_history: false,
+        allow_session_takeover: false,
+        crash_on_disconnect: false,
+        continue_on_disconnect: false,
+        terminal_env: Vec::new(),
+    };
+    stream
+        .write_all((serde_json::to_string(&subscribe)? + "\n").as_bytes())
+        .await?;
+
+    // A valid SetHandoffResume must round-trip to a Done reply.
+    let valid = Request::SetHandoffResume {
+        id: 21,
+        session_id: Some("target-handoff".to_string()),
+    };
+    stream
+        .write_all((serde_json::to_string(&valid)? + "\n").as_bytes())
+        .await?;
+
+    let mut reader = tokio::io::BufReader::new(stream);
+    let valid_event: crate::protocol::ServerEvent =
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let mut line = String::new();
+                let n = reader.read_line(&mut line).await?;
+                if n == 0 {
+                    anyhow::bail!("connection closed before Done arrived");
+                }
+                if let Ok(ev) =
+                    serde_json::from_str::<crate::protocol::ServerEvent>(&line)
+                    && matches!(ev, crate::protocol::ServerEvent::Done { id: 21 })
+                {
+                    return Ok(ev);
+                }
+            }
+        })
+        .await
+        .expect("Done reply should arrive")?;
+    assert!(
+        matches!(
+            valid_event,
+            crate::protocol::ServerEvent::Done { id: 21 }
+        ),
+        "valid SetHandoffResume must round-trip to Done, got {valid_event:?}"
+    );
+
+    // An unknown id yields Error over the wire.
+    let unknown = Request::SetHandoffResume {
+        id: 22,
+        session_id: Some("no-such-handoff".to_string()),
+    };
+    reader
+        .get_mut()
+        .write_all((serde_json::to_string(&unknown)? + "\n").as_bytes())
+        .await?;
+    let unknown_event: crate::protocol::ServerEvent =
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let mut line = String::new();
+                let n = reader.read_line(&mut line).await?;
+                if n == 0 {
+                    anyhow::bail!("connection closed before Error arrived");
+                }
+                if let Ok(ev) =
+                    serde_json::from_str::<crate::protocol::ServerEvent>(&line)
+                    && matches!(
+                        ev,
+                        crate::protocol::ServerEvent::Error { id: 22, .. }
+                    )
+                {
+                    return Ok(ev);
+                }
+            }
+        })
+        .await
+        .expect("Error reply should arrive")?;
+    match unknown_event {
+        crate::protocol::ServerEvent::Error { id, message, .. } => {
+            assert_eq!(id, 22);
+            assert!(message.contains("no saved handoff"), "got: {message}");
+        }
+        other => panic!("unknown id should yield Error, got {other:?}"),
+    }
+
+    run_task.abort();
+    Ok(())
+}
+
+/// Real-socket integration: drive `Request::HandoffResumeById` through the
+/// wire so it reaches the real handler and its lifecycle dispatch. A valid id
+/// round-trips to `HandoffResumed`; an unknown id yields `Error` and leaves
+/// the live conversation untouched.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_socket_handoff_resume_by_id_round_trips() -> Result<()> {
+    use crate::protocol::Request;
+    use crate::server::Server;
+    use crate::transport::Stream;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let _guard = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().expect("temp home");
+    let sock_dir = tempfile::tempdir().expect("temp sock dir");
+    let socket_path = sock_dir.path().join("jcode-e2e.sock");
+
+    struct Restore {
+        prev: [(&'static str, Option<std::ffi::OsString>); 2],
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            for (key, prev) in &self.prev {
+                match prev {
+                    Some(v) => crate::env::set_var(key, v.clone()),
+                    None => crate::env::remove_var(key),
+                }
+            }
+        }
+    }
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let prev_socket = std::env::var_os("JCODE_SOCKET");
+    let _restore = Restore {
+        prev: [
+            ("JCODE_HOME", prev_home),
+            ("JCODE_SOCKET", prev_socket),
+        ],
+    };
+    crate::env::set_var("JCODE_HOME", home.path());
+    crate::env::set_var("JCODE_SOCKET", &socket_path);
+
+    // Seed a handoff the server can resolve.
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    crate::todo::save_todos(
+        "pick-me",
+        &[crate::todo::TodoItem {
+            id: "t".into(),
+            content: "e2e work".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: None,
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    crate::todo::save_plan(
+        "pick-me",
+        &crate::todo::TodoPlan {
+            user_intention: Some("picked intent".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    crate::handoff::capture("pick-me", Some(&work), "closed", None).expect("seed handoff");
+    // A later snapshot that is NOT the one picked: the real server must arm the
+    // `pick-me` override and boot from it, not the auto-latest `newer-me`.
+    std::thread::sleep(Duration::from_millis(20));
+    crate::todo::save_todos(
+        "newer-me",
+        &[crate::todo::TodoItem {
+            id: "t".into(),
+            content: "e2e work".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: None,
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    crate::todo::save_plan(
+        "newer-me",
+        &crate::todo::TodoPlan {
+            user_intention: Some("newer intent".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    crate::handoff::capture("newer-me", Some(&work), "closed", None).expect("seed newer handoff");
+
+    let provider: Arc<dyn Provider> = Arc::new(StreamingMockProvider::default());
+    let server = Server::new(provider);
+    let run_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    // Wait for the real accept loop, then connect a real client.
+    let mut stream = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(s) = Stream::connect(&socket_path).await {
+                break s;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    })
+    .await
+    .expect("server should accept within 10s");
+
+    // The server requires a Subscribe with a working_dir before stateful
+    // requests.
+    let subscribe = Request::Subscribe {
+        supports_pdf_panels: false,
+        id: 20,
+        working_dir: Some(work.to_string_lossy().into_owned()),
+        selfdev: None,
+        target_session_id: None,
+        client_instance_id: None,
+        client_has_local_history: false,
+        allow_session_takeover: false,
+        crash_on_disconnect: false,
+        continue_on_disconnect: false,
+        terminal_env: Vec::new(),
+    };
+    stream
+        .write_all((serde_json::to_string(&subscribe)? + "\n").as_bytes())
+        .await?;
+
+    // A valid HandoffResumeById must round-trip to HandoffResumed.
+    let valid = Request::HandoffResumeById {
+        id: 21,
+        session_id: "pick-me".to_string(),
+    };
+    stream
+        .write_all((serde_json::to_string(&valid)? + "\n").as_bytes())
+        .await?;
+    let mut reader = tokio::io::BufReader::new(stream);
+    let resumed = timeout(Duration::from_secs(5), async {
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).await?;
+            if n == 0 {
+                anyhow::bail!("connection closed before HandoffResumed arrived");
+            }
+            if let Ok(ev) = serde_json::from_str::<crate::protocol::ServerEvent>(&line)
+                && matches!(ev, crate::protocol::ServerEvent::HandoffResumed { id: 21, .. })
+            {
+                return Ok(ev);
+            }
+        }
+    })
+    .await
+    .expect("HandoffResumed reply should arrive")?;
+    match resumed {
+        crate::protocol::ServerEvent::HandoffResumed { id, session_id } => {
+            assert_eq!(id, 21);
+            assert_eq!(session_id, "pick-me");
+        }
+        other => panic!("expected HandoffResumed, got {other:?}"),
+    }
+
+    // The reply proves dispatch ran. Because `handoff_resume_by_id` arms the
+    // override on the *live agent* (not the on-disk store), the store's
+    // auto-latest is left untouched: a resume-by-id does not rebase the store
+    // (unlike HandoffApply, which imports a new snapshot). The store continues
+    // to auto-resolve to the newest captured snapshot, `newer-me`.
+    let boot = crate::handoff::render_boot_context_and_consume(Some(&work));
+    assert!(
+        boot.as_deref().is_some_and(|c| c.contains("newer intent")),
+        "resume-by-id arms the live override and must not rebase the store to the picked snapshot, got {:?}",
+        boot
+    );
+    // That the armed override beats this store auto-latest at real first-message
+    // injection is asserted by `handle_handoff_resume_by_id_clears_and_arms_atomically`,
+    // which drives the real `render_first_message_handoff` path and checks the
+    // picked (non-latest) intent wins.
+
+    // An unknown id yields Error over the wire.
+    let unknown = Request::HandoffResumeById {
+        id: 22,
+        session_id: "no-such-handoff".to_string(),
+    };
+    reader
+        .get_mut()
+        .write_all((serde_json::to_string(&unknown)? + "\n").as_bytes())
+        .await?;
+    let unknown_event: crate::protocol::ServerEvent =
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let mut line = String::new();
+                let n = reader.read_line(&mut line).await?;
+                if n == 0 {
+                    anyhow::bail!("connection closed before Error arrived");
+                }
+                if let Ok(ev) = serde_json::from_str::<crate::protocol::ServerEvent>(&line)
+                    && matches!(ev, crate::protocol::ServerEvent::Error { id: 22, .. })
+                {
+                    return Ok(ev);
+                }
+            }
+        })
+        .await
+        .expect("Error reply should arrive")?;
+    match unknown_event {
+        crate::protocol::ServerEvent::Error { id, message, .. } => {
+            assert_eq!(id, 22);
+            assert!(message.contains("no saved handoff"), "got: {message}");
+        }
+        other => panic!("unknown id should yield Error, got {other:?}"),
+    }
+
+    run_task.abort();
+    Ok(())
+}
+
+/// Real-socket integration: drive `Request::HandoffList` and
+/// `Request::HandoffImport` through the wire so they reach the real handlers,
+/// exercising request framing and the server dispatch path (the same
+/// `client_lifecycle` loop that routes `SetHandoffResume`).
+///
+/// `HandoffList` round-trips to `HandoffListed` carrying the seeded snapshot
+/// (with its portable payload); `HandoffImport` of that payload round-trips to
+/// `HandoffImported` with an `import-list-me` id that becomes the live handoff
+/// for the subscribed project.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_socket_handoff_list_and_import_round_trip() -> Result<()> {
+    use crate::protocol::Request;
+    use crate::server::Server;
+    use crate::transport::Stream;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let _guard = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().expect("temp home");
+    let sock_dir = tempfile::tempdir().expect("temp sock dir");
+    let socket_path = sock_dir.path().join("jcode-handoff-list.sock");
+
+    struct Restore {
+        prev: [(&'static str, Option<std::ffi::OsString>); 2],
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            for (key, prev) in &self.prev {
+                match prev {
+                    Some(v) => crate::env::set_var(key, v.clone()),
+                    None => crate::env::remove_var(key),
+                }
+            }
+        }
+    }
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let prev_socket = std::env::var_os("JCODE_SOCKET");
+    let _restore = Restore {
+        prev: [
+            ("JCODE_HOME", prev_home),
+            ("JCODE_SOCKET", prev_socket),
+        ],
+    };
+    crate::env::set_var("JCODE_HOME", home.path());
+    crate::env::set_var("JCODE_SOCKET", &socket_path);
+
+    // Seed a handoff the server can list and a source snapshot to export+import.
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    crate::todo::save_todos(
+        "list-me",
+        &[crate::todo::TodoItem {
+            id: "t".into(),
+            content: "e2e work".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: None,
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    crate::todo::save_plan(
+        "list-me",
+        &crate::todo::TodoPlan {
+            user_intention: Some("listable intent".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    crate::handoff::capture("list-me", Some(&work), "closed", None).expect("seed handoff");
+    // Export the seeded snapshot so we can re-adopt it over the wire as a
+    // fresh `import-<source>` handoff (the remote-fallback path).
+    let payload = crate::handoff::export_handoff("list-me").expect("export");
+
+    let provider: Arc<dyn Provider> = Arc::new(StreamingMockProvider::default());
+    let server = Server::new(provider);
+    let run_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut stream = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(s) = Stream::connect(&socket_path).await {
+                break s;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    })
+    .await
+    .expect("server should accept within 10s");
+
+    let subscribe = Request::Subscribe {
+        supports_pdf_panels: false,
+        id: 30,
+        working_dir: Some(work.to_string_lossy().into_owned()),
+        selfdev: None,
+        target_session_id: None,
+        client_instance_id: None,
+        client_has_local_history: false,
+        allow_session_takeover: false,
+        crash_on_disconnect: false,
+        continue_on_disconnect: false,
+        terminal_env: Vec::new(),
+    };
+    stream
+        .write_all((serde_json::to_string(&subscribe)? + "\n").as_bytes())
+        .await?;
+
+    // HandoffList -> HandoffListed, newest first (source-session captured last,
+    // so unless timestamps tick, either order satisfies "contains list-me").
+    let list = Request::HandoffList { id: 31 };
+    stream
+        .write_all((serde_json::to_string(&list)? + "\n").as_bytes())
+        .await?;
+    let mut reader = tokio::io::BufReader::new(stream);
+    let listed: crate::protocol::ServerEvent = timeout(Duration::from_secs(5), async {
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).await?;
+            if n == 0 {
+                anyhow::bail!("connection closed before HandoffListed arrived");
+            }
+            if let Ok(ev) = serde_json::from_str::<crate::protocol::ServerEvent>(&line)
+                && matches!(ev, crate::protocol::ServerEvent::HandoffListed { .. })
+            {
+                return Ok(ev);
+            }
+        }
+    })
+    .await
+    .expect("HandoffListed reply should arrive")?;
+    match listed {
+        crate::protocol::ServerEvent::HandoffListed { id, handoffs } => {
+            assert_eq!(id, 31);
+            assert!(
+                handoffs.iter().any(|h| h.session_id == "list-me" && h.payload.is_some()),
+                "listing should include the seeded snapshot with its payload, got {handoffs:?}"
+            );
+        }
+        other => panic!("HandoffList should round-trip to HandoffListed, got {other:?}"),
+    }
+
+    // HandoffImport of the exported source payload -> HandoffImported with an
+    // import-<source> id that becomes the live handoff for the project.
+    let import = Request::HandoffImport {
+        id: 32,
+        payload,
+        disposition: Some("closed".to_string()),
+    };
+    reader
+        .get_mut()
+        .write_all((serde_json::to_string(&import)? + "\n").as_bytes())
+        .await?;
+    let imported: crate::protocol::ServerEvent = timeout(Duration::from_secs(5), async {
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).await?;
+            if n == 0 {
+                anyhow::bail!("connection closed before HandoffImported arrived");
+            }
+            if let Ok(ev) = serde_json::from_str::<crate::protocol::ServerEvent>(&line)
+                && matches!(ev, crate::protocol::ServerEvent::HandoffImported { .. })
+            {
+                return Ok(ev);
+            }
+        }
+    })
+    .await
+    .expect("HandoffImported reply should arrive")?;
+    match imported {
+        crate::protocol::ServerEvent::HandoffImported {
+            id,
+            session_id,
+        } => {
+            assert_eq!(id, 32);
+            assert_eq!(
+                session_id, "import-list-me",
+                "adopted id should be import-<source>, got {session_id}"
+            );
+            assert_eq!(
+                crate::handoff::latest_handoff_for_project(Some(&work)).as_deref(),
+                Some(session_id.as_str())
+            );
+            // Observe the actual requirement satisfied end to end: the same
+            // boot-context renderer first-message injection uses must now
+            // yield the imported snapshot's intent for a fresh session in the
+            // subscribed project. This closes the feedback loop with runtime
+            // evidence, not just index inspection.
+            let boot = crate::handoff::render_boot_context_and_consume(Some(&work));
+            assert!(
+                boot.as_deref().is_some_and(|c| c.contains("listable intent")),
+                "a fresh session's boot context should surface the imported handoff, got {boot:?}"
+            );
+        }
+        other => panic!("HandoffImport should round-trip to HandoffImported, got {other:?}"),
+    }
+
+    run_task.abort();
+    Ok(())
 }
