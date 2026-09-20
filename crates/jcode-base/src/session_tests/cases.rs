@@ -428,6 +428,39 @@ fn initial_session_context_does_not_refresh_after_real_conversation() -> Result<
 }
 
 #[test]
+fn append_working_dir_notice_works_even_with_history() {
+    let mut session = Session::create_with_id(
+        "session_append_wd_notice_test".to_string(),
+        None,
+        Some("Working dir notice".to_string()),
+    );
+    // Simulate a conversation already in progress, so
+    // `refresh_initial_session_context_message` would no-op and the appended
+    // notice is the only path that carries the working-directory change to
+    // the model.
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+    );
+    let message_count = session.messages.len();
+
+    session.append_working_dir_notice("/old", "/new");
+
+    assert_eq!(
+        session.messages.len(),
+        message_count + 1,
+        "a working-dir notice must be appended even when history exists"
+    );
+    let notice = session.messages.last().unwrap().content_preview();
+    assert!(notice.contains("working directory changed"), "got: {notice}");
+    assert!(notice.contains("`/old`"), "notice should carry old dir, got: {notice}");
+    assert!(notice.contains("`/new`"), "notice should carry new dir, got: {notice}");
+}
+
+#[test]
 fn existing_non_empty_session_does_not_get_retroactive_session_context() {
     let mut session = Session::create_with_id(
         "session_context_existing_test".to_string(),

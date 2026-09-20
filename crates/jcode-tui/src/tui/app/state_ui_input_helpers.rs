@@ -360,6 +360,10 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/fix", "Recover when the model cannot continue"),
     RegisteredCommand::public("/dictate", "Run configured external dictation command"),
     RegisteredCommand::public("/dictation", "Alias for /dictate"),
+    RegisteredCommand::public(
+        "/cd",
+        "Change the session working directory (e.g. into a git worktree)",
+    ),
     RegisteredCommand::with_subcommands(
         "/memory",
         "Toggle memory feature",

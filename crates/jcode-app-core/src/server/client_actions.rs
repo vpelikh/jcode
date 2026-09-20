@@ -625,6 +625,79 @@ pub(super) async fn handle_rename_session(
     );
 }
 
+pub(super) async fn handle_set_working_dir(
+    id: u64,
+    working_dir: String,
+    agent: &Arc<Mutex<Agent>>,
+    client_session_id: &str,
+    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+) {
+    let started = Instant::now();
+    let working_dir = working_dir.trim().to_string();
+    if working_dir.is_empty() {
+        let _ = client_event_tx.send(ServerEvent::Error {
+            id,
+            message: "working directory must not be empty".to_string(),
+            retry_after_secs: None,
+        });
+        return;
+    }
+
+    let result = {
+        let mut agent_guard = agent.lock().await;
+        let session_id = agent_guard.session_id().to_string();
+        let outcome = agent_guard
+            .set_working_dir_grouped(&working_dir)
+            .map_err(|e| crate::util::format_error_chain(&e));
+        (session_id, outcome)
+    };
+
+    let (session_id, result) = result;
+    match result {
+        Ok(()) => {
+            crate::session_list_cache::invalidate();
+            let event = ServerEvent::SessionWorkingDirChanged {
+                session_id: session_id.clone(),
+                working_dir: working_dir.clone(),
+            };
+            let mut delivered =
+                fanout_session_event(swarm_members, &session_id, event.clone()).await;
+            if delivered == 0 {
+                let _ = client_event_tx.send(event);
+            }
+            let _ = client_event_tx.send(ServerEvent::Done { id });
+            crate::logging::event_info(
+                "SESSION_LIFECYCLE",
+                vec![
+                    ("phase", "working_dir_changed".to_string()),
+                    ("request_id", id.to_string()),
+                    ("session_id", session_id),
+                    ("working_dir", working_dir),
+                    ("elapsed_ms", started.elapsed().as_millis().to_string()),
+                ],
+            );
+        }
+        Err(error) => {
+            crate::logging::event_warn(
+                "SESSION_LIFECYCLE",
+                vec![
+                    ("phase", "working_dir_error".to_string()),
+                    ("request_id", id.to_string()),
+                    ("session_id", client_session_id.to_string()),
+                    ("error", error.clone()),
+                    ("elapsed_ms", started.elapsed().as_millis().to_string()),
+                ],
+            );
+            let _ = client_event_tx.send(ServerEvent::Error {
+                id,
+                message: error,
+                retry_after_secs: None,
+            });
+        }
+    }
+}
+
 pub(super) async fn handle_trigger_memory_extraction(
     id: u64,
     agent: &Arc<Mutex<Agent>>,
