@@ -277,18 +277,15 @@ pub fn findings_stalled(prev: &[Finding], next: &[Finding]) -> bool {
 /// state (cross-lens fixes can invalidate an earlier lens's clean verdict).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ReviewLoopPhase {
     /// Running the six lenses in order for the first time.
+    #[default]
     Lenses,
     /// Re-running lenses once against the final code state.
     Confirmation,
 }
 
-impl Default for ReviewLoopPhase {
-    fn default() -> Self {
-        ReviewLoopPhase::Lenses
-    }
-}
 
 /// Persisted review-loop progress on a session. Mirrors `SessionImproveMode`
 /// in that it is an optional, serializable loop marker. The accumulated
@@ -514,13 +511,11 @@ impl ReviewRecord {
         // Drop any lens whose latest round was a clean one (it advanced past
         // the open findings we just recorded).
         for lens in latest_clean_index.keys() {
-            if let Some(&ci) = latest_clean_index.get(lens) {
-                if let Some(&ni) = latest_nonclean_index.get(lens) {
-                    if ci > ni {
+            if let Some(&ci) = latest_clean_index.get(lens)
+                && let Some(&ni) = latest_nonclean_index.get(lens)
+                    && ci > ni {
                         latest_open_by_lens.remove(lens);
                     }
-                }
-            }
         }
 
         let mut open: Vec<Finding> = latest_open_by_lens.into_values().flatten().collect();
@@ -753,12 +748,14 @@ mod review_tests {
 
     #[test]
     fn productive_fix_fields_roundtrip() {
-        let mut state = ReviewLoopState::default();
-        state.last_fix_touched_files = true;
-        state.fix_baseline_tree = Some(" M src/foo.rs".to_string());
-        // The reviewer-loss respawn budget is part of the round-tripped state so
-        // a session resumed mid-respawn keeps its remaining budget.
-        state.reviewer_respawn_count = 1;
+        let state = ReviewLoopState {
+            last_fix_touched_files: true,
+            fix_baseline_tree: Some(" M src/foo.rs".to_string()),
+            // The reviewer-loss respawn budget is part of the round-tripped state
+            // so a session resumed mid-respawn keeps its remaining budget.
+            reviewer_respawn_count: 1,
+            ..ReviewLoopState::default()
+        };
         let json = serde_json::to_string(&state).unwrap();
         let back: ReviewLoopState = serde_json::from_str(&json).unwrap();
         assert!(back.last_fix_touched_files);
