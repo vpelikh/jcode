@@ -1,4 +1,5 @@
 mod agentgrep;
+mod compass_query;
 pub mod ambient;
 mod apply_patch;
 mod bash;
@@ -356,6 +357,12 @@ impl Registry {
                 &mut timings,
                 "agentgrep",
                 agentgrep::AgentGrepTool::new,
+            );
+            Self::insert_tool_timed(
+                &mut m,
+                &mut timings,
+                "compass_query",
+                compass_query::CompassQueryTool::new,
             );
             Self::insert_tool_timed(
                 &mut m,
