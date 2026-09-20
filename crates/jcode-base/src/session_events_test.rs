@@ -2202,3 +2202,52 @@ fn test_unknown_op_with_reserved_op_key_in_payload() {
         other => panic!("expected Unknown, got {other:?}"),
     }
 }
+
+/// `current_compaction` reflects the last *completed* compaction, not an open
+/// in-flight bracket. When a prior SetCompaction exists and a new
+/// `CompactionStart` is opened (not yet closed), `current_compaction` must still
+/// return the prior completed state on both the live cache and after a reload
+/// (reverse-scan), while `orphaned_compaction` reports the open bracket.
+#[test]
+fn test_current_compaction_ignores_open_bracket_and_keeps_last_completed() {
+    let mut map = SessionEventMap::default();
+    map.append_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "set1".to_string(),
+        op: SessionEventOp::SetCompaction {
+            compaction: StoredCompactionState {
+                summary_text: "completed_at_set".to_string(),
+                openai_encrypted_content: None,
+                covers_up_to_turn: 1,
+                original_turn_count: 1,
+                compacted_count: 1,
+            },
+        },
+        parent_id: None,
+        version: 1,
+    });
+    // Open a new in-flight bracket (no End yet).
+    map.start_compaction("in_flight", 2);
+
+    // Live: last completed compaction is still the SetCompaction.
+    assert_eq!(
+        map.current_compaction().map(|c| c.summary_text).as_deref(),
+        Some("completed_at_set"),
+        "an open bracket must not hide the last completed compaction (live cache)"
+    );
+    assert!(
+        map.orphaned_compaction().is_some(),
+        "the open bracket is still an orphan"
+    );
+
+    // After a full serialize round-trip (cache is serde-skipped → reverse-scan),
+    // the same semantics must hold.
+    let json = serde_json::to_string(&map).unwrap();
+    let back: SessionEventMap = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        back.current_compaction().map(|c| c.summary_text).as_deref(),
+        Some("completed_at_set"),
+        "reverse-scan must also return the last completed compaction"
+    );
+    assert!(back.orphaned_compaction().is_some());
+}
