@@ -16,6 +16,62 @@ scaffolding:
 | #5 bracket design | `CompactionStart`/`CompactionEnd`, `orphaned_compaction()`, `current_compaction()`, `compact_transcript_with_bracket()` |
 | #13 event escape hatch | `SessionEventOp::Unknown { type, data }` uniform `{"op","data"}` envelope |
 
+## Takeaway #6 (prune / summarize separation)
+
+Delivered. The deterministic, model-free reclamation layer is now a distinct,
+named `prune` stage, separated from the model-driven summarizer, with a shared
+policy and report so every consumer stays in lockstep.
+
+- **`crates/jcode-compaction-core/src/prune.rs`** — the new stage:
+  - `PrunePolicy` with `node_caps()` (per-node caps: run-every-step budget) and
+    `payload_413()` (aggregate byte budgets for request-too-large recovery).
+  - `PruneReport { images_stripped, tool_results_truncated }` + `is_empty()`.
+  - `prune_contents(&mut [&mut Vec<ContentBlock>], &PrunePolicy)` runs the
+    deterministic single-node replacements in a fixed order: aggregate image
+    budget (oldest-first) → aggregate tool-result budget (largest-first, only if
+    no image was reclaimed) → per-node caps. It reuses the existing
+    `strip_large_images_in_contents` and
+    `emergency_truncate_tool_results_in_contents` as building blocks, so the
+    numbers and the escalation order are behavior-preserving.
+- **`jcode-base` reusable seam:** `Session::prune_transcript(&PrunePolicy) ->
+  PruneReport`, re-exported through `jcode_base::compaction::prune`. It records
+  the mutation as a single `ReplaceMessages` event (event-sourced log stays the
+  source of truth) and invalidates the provider-message cache when anything
+  changed.
+- **De-duplication of the 413 recovery paths.** The three previously duplicated
+  call sites (`jcode-app-core` `agent/compaction.rs` and both `jcode-tui`
+  `model_context.rs` sites) now call
+  `prune_transcript(PrunePolicy::payload_413())` instead of tracing
+  `strip_oversized_images` then `emergency_truncate_tool_results`. The policy
+  and escalation order now live in exactly one place.
+
+**Verification:** `jcode-compaction-core` 27 tests green (incl. 5 new `prune`
+tests). `jcode-base` **full lib 1556 green** (0 failed; incl. new
+`test_prune_transcript_uses_policy_and_keeps_event_log_consistent`).
+`jcode-app-core` full lib 1465 passed, 0 regressions — the only two failures are
+environment-load timing flakes that pass in isolation (see flake note below).
+`cargo build` green for `jcode-compaction-core`, `jcode-base`, `jcode-app-core`,
+`jcode-tui`, and the full `jcode` binary (which links all prune-consuming
+crates and runs).
+
+**Flake note (the full-suite run surfaced a 4th timing-sensitive test).** Under
+parallel load the app-core suite is missing 2 (not 3) timeout wall-clock tests,
+both pre-existing and unrelated to prune/compaction. The previously-documented
+three (`channel::session_picker_menu_flow`,
+`server::external_background_task_wake…`, `tool::bash::test_detached_promoted_command_…`)
+plus a fourth, `server::debug_command_exec::tests::
+debug_tool_selfdev_reload_returns_promptly_for_direct_execution` (asserts a
+selfdev/reload signal is acked within a 2-second wall clock). It passes in
+isolation (~0.4 s) and exercises none of the prune paths. No action needed for
+this work; flagged so a future full-suite run is not mistaken for a regression.
+
+**Interpretation noted (deviation from the literal doc).** The doc's literal
+recommendation is about scheduling: run `prune` *on a cheap cadence* (every step)
+and `summarize` less often. This deliverable built the **seam and policy** and
+wired the existing on-demand recovery paths through it, but it did **not** add a
+scheduled run-every-step prune at a turn boundary (a loop/behavior change). A
+scheduled prune is a documented follow-up; the seam is the deliverable here.
+
 ## Takeaway #7 (loop hygiene)
 
 Fully implemented, tested, and committed.

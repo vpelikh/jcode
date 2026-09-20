@@ -41,6 +41,11 @@ pub use jcode_compaction_core::{
     summary_payload_char_count,
 };
 
+/// The deterministic, model-free prune stage (takeaway #6), re-exported so
+/// consumers can share the same policy and report types without reaching into
+/// the crate-path internals.
+pub use jcode_compaction_core::prune;
+
 const HARD_THRESHOLD_PENDING_WAIT_MS: u64 = 15_000;
 const HARD_THRESHOLD_PENDING_POLL_MS: u64 = 50;
 

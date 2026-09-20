@@ -4264,3 +4264,53 @@ fn branded_id_fields_deserialize_legacy_raw_string_wire_format_verbatim() {
     assert_eq!(round.event_id.as_str(), "e_legacy", "event_id must survive");
     assert_eq!(round.version, 1);
 }
+
+#[test]
+fn test_prune_transcript_uses_policy_and_keeps_event_log_consistent() {
+    use crate::compaction::prune;
+
+    let mut session = Session::create_with_id("test_prune_transcript".to_string(), None, None);
+    session.append_stored_message(StoredMessage {
+        id: "msg_bigimg".to_string(),
+        role: Role::User,
+        content: vec![ContentBlock::Image {
+            media_type: "image/png".to_string(),
+            data: "x".repeat(2_000),
+        }],
+        display_role: None,
+        timestamp: Some(Utc::now()),
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    session.append_stored_message(StoredMessage {
+        id: "msg_bigtool".to_string(),
+        role: Role::User,
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: "tool1".to_string().into(),
+            content: "y".repeat(10_000),
+            is_error: None,
+        }],
+        display_role: None,
+        timestamp: Some(Utc::now()),
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+
+    let before_events = session.event_map.events.len();
+    let before_msgs = session.messages.len();
+
+    // node_caps policy: per-node caps prune both the oversized image (>1024)
+    // and the oversized tool result (>4000).
+    let report = session.prune_transcript(&prune::PrunePolicy::node_caps());
+    assert_eq!(report.images_stripped, 1, "one oversized image pruned");
+    assert_eq!(
+        report.tool_results_truncated, 1,
+        "one oversized tool result pruned"
+    );
+    assert!(!report.is_empty());
+
+    // Legacy vector unchanged in count; the mutation emitted one
+    // ReplaceMessages event to keep the log the source of truth.
+    assert_eq!(session.messages.len(), before_msgs);
+    assert_eq!(session.event_map.events.len(), before_events + 1);
+}
