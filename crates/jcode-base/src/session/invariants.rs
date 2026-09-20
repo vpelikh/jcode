@@ -27,6 +27,8 @@
 
 use crate::session::event_types::{SessionEvent, SessionEventMap, SessionEventOp};
 use jcode_message_types::ContentBlock;
+use jcode_session_types::StoredMessage;
+use std::any::Any;
 use std::collections::HashSet;
 
 /// A named invariant check over the whole event log.
@@ -76,8 +78,14 @@ impl InvariantViolation {
 /// state (takeaway #4). This is the seam the event-sourced log should feed:
 /// many readers subscribe to derived state instead of scanning the raw stream.
 pub trait LogProjection {
-    /// The fold result type.
-    type State: Default;
+    /// The fold result type. Must be `'static`, `Send`, and `Sync` so the
+    /// [`ProjectionRegistry`] can erase it into a `Box<dyn Any + Send + Sync>`
+    /// shared across builder threads.
+    type State: Default + 'static + Send + Sync;
+
+    /// Stable name for the projection, used to address its derived state in a
+    /// [`ProjectionRegistry`] registry (safe for metrics tags and debugging).
+    fn name() -> &'static str;
 
     /// Apply one event to the running state.
     fn apply(state: &mut Self::State, event: &SessionEvent);
@@ -107,6 +115,199 @@ pub fn project_map<P: LogProjection>(
     map: &SessionEventMap,
 ) -> Result<P::State, InvariantViolation> {
     fold_projection::<P>(&map.events)
+}
+
+/// One registered projection unit inside a [`ProjectionRegistry`]: an erased
+/// `dyn Any` running state together with the concrete apply/validate closures.
+///
+/// Erasing the state lets a registry hold *many* heterogeneous projections and
+/// fold them all in a single pass, the core of dsh's "one fold, many readers"
+/// (takeaway #4).
+struct ProjectionUnit {
+    name: &'static str,
+    state: Box<dyn Any + Send + Sync>,
+    fresh: fn() -> Box<dyn Any + Send + Sync>,
+    apply: fn(&mut dyn Any, &SessionEvent),
+    validate: fn(&dyn Any) -> Result<(), InvariantViolation>,
+}
+
+impl ProjectionUnit {
+    fn new<P: LogProjection>() -> Self {
+        fn fresh_impl<P: LogProjection>() -> Box<dyn Any + Send + Sync> {
+            Box::new(P::State::default())
+        }
+        fn apply_impl<P: LogProjection>(state: &mut dyn Any, event: &SessionEvent) {
+            // Invariant: the boxed state is always P::State because we only ever
+            // insert it via `ProjectionRegistry::add::<P>()`.
+            let state = state.downcast_mut::<P::State>().expect(
+                "ProjectionRegistry internal state downcast failed: state type mismatch",
+            );
+            P::apply(state, event);
+        }
+        fn validate_impl<P: LogProjection>(state: &dyn Any) -> Result<(), InvariantViolation> {
+            let state = state
+                .downcast_ref::<P::State>()
+                .expect("ProjectionRegistry validate downcast failed: state type mismatch");
+            P::validate(state)
+        }
+        ProjectionUnit {
+            name: P::name(),
+            state: fresh_impl::<P>(),
+            fresh: fresh_impl::<P>,
+            apply: apply_impl::<P>,
+            validate: validate_impl::<P>,
+        }
+    }
+
+    fn reset_active(&mut self) {
+        self.state = (self.fresh)();
+    }
+}
+
+/// A registry of [`LogProjection`] units (takeaway #4) that folds *all* of them
+/// in a single pass over the log, then exposes each typed derived state by name.
+///
+/// This is dsh's incremental-projection pattern: consumers subscribe to derived
+/// state instead of re-scanning the raw event stream. Two usage shapes are
+/// supported:
+/// - **Bootstrap**: [`fold`](Self::fold) recomputes every state from a fresh
+///   empty default, so it is idempotent — call it once at startup over the whole
+///   log.
+/// - **Incremental**: after the initial fold, [`apply`](Self::apply) keeps the
+///   running states current by folding only newly-appended events, so the registry
+///   never refolds the whole log per append. The current folded states are read
+///   back via [`current`](Self::current).
+#[derive(Default)]
+pub struct ProjectionRegistry {
+    units: Vec<ProjectionUnit>,
+}
+
+impl ProjectionRegistry {
+    /// The default projection set. Callers may add their own with [`add`](Self::add).
+    pub fn builtin() -> Self {
+        let mut r = Self::default();
+        r.add::<MessageCountProjection>();
+        r.add::<LiveTranscriptProjection>();
+        r
+    }
+
+    /// Register an additional projection. Fold order is insert order.
+    pub fn add<P: LogProjection>(&mut self) {
+        // Re-checking avoids registering the same name twice, which would make
+        // lookups ambiguous. Skips (with a warning) if a caller tries to
+        // register a duplicate.
+        if self.units.iter().any(|u| u.name == P::name()) {
+            crate::logging::warn(&format!(
+                "projection registry: skipping duplicate projection '{}'",
+                P::name()
+            ));
+            return;
+        }
+        self.units.push(ProjectionUnit::new::<P>());
+    }
+
+    /// Number of registered projections.
+    pub fn len(&self) -> usize {
+        self.units.len()
+    }
+
+    /// True when no projections are registered.
+    pub fn is_empty(&self) -> bool {
+        self.units.is_empty()
+    }
+
+    /// Names of every registered projection, in registration order.
+    pub fn names(&self) -> Vec<&'static str> {
+        self.units.iter().map(|u| u.name).collect()
+    }
+
+    /// Fold the whole log through every registered projection, resetting each
+    /// running state to its default first so the fold is idempotent (reusable at
+    /// bootstrap). Validates every state afterwards. Postcondition: the current
+    /// running states are fully folded — read them back via [`current`](Self::current).
+    pub fn fold(&mut self, events: &[SessionEvent]) -> Result<(), InvariantViolation> {
+        // Reset all states to their default so a re-fold means "replay from empty",
+        // never "append to a stale prefix".
+        for unit in &mut self.units {
+            unit.reset_active();
+        }
+        for event in events {
+            for unit in &mut self.units {
+                (unit.apply)(&mut *unit.state, event);
+            }
+        }
+        // Validate each state after the full fold.
+        for unit in &self.units {
+            (unit.validate)(&*unit.state)?;
+        }
+        Ok(())
+    }
+
+    /// Read the current running states as a [`ProjectionResults`] view that
+    /// borrows from this registry.
+    pub fn current(&self) -> ProjectionResults<'_> {
+        ProjectionResults {
+            entries: self
+                .units
+                .iter()
+                .map(|u| ProjectionEntry {
+                    name: u.name,
+                    state: &*u.state,
+                })
+                .collect(),
+        }
+    }
+
+    /// Incremental seam: apply a single new event to every registered projection
+    /// so a running registry can stay current without refolding the log.
+    /// Equivalent to [`fold`](Self::fold) on the prefix plus this event, but O(1)
+    /// per event.
+    pub fn apply(&mut self, event: &SessionEvent) {
+        for unit in &mut self.units {
+            (unit.apply)(&mut *unit.state, event);
+        }
+    }
+
+    /// Validate every registered projection against its current running state,
+    /// collecting the first error for each.
+    pub fn validate_all(&self) -> Vec<InvariantViolation> {
+        self.units
+            .iter()
+            .filter_map(|u| (u.validate)(&*u.state).err())
+            .collect()
+    }
+}
+
+/// A borrowed, named, typed slice of derived state produced by a
+/// [`ProjectionRegistry`]. Mirrors dsh's `stateOf(key)` accessor.
+#[derive(Default)]
+pub struct ProjectionResults<'a> {
+    entries: Vec<ProjectionEntry<'a>>,
+}
+
+struct ProjectionEntry<'a> {
+    name: &'static str,
+    state: &'a dyn Any,
+}
+
+impl<'a> ProjectionResults<'a> {
+    /// The typed state for projection `P`, if it was registered and folded.
+    pub fn get<P: LogProjection>(&self) -> Option<&P::State> {
+        self.entries
+            .iter()
+            .find(|e| e.name == P::name())
+            .and_then(|e| e.state.downcast_ref::<P::State>())
+    }
+
+    /// Names of every projection present in these results.
+    pub fn names(&self) -> Vec<&'static str> {
+        self.entries.iter().map(|e| e.name).collect()
+    }
+
+    /// True when every registered projection is present.
+    pub fn contains<P: LogProjection>(&self) -> bool {
+        self.get::<P>().is_some()
+    }
 }
 
 /// A carried trace of [`InvariantViolation`]s produced by a check run.
@@ -287,6 +488,53 @@ impl LogInvariant for ReplayDeterminism {
     }
 }
 
+/// The estimated-derived-state invariant (takeaway #3 + #4): the incremental
+/// `LiveTranscriptProjection` must agree byte-for-byte with the on-demand
+/// `SessionEventMap::derive_messages()`. Both implement the same event fold,
+/// so this invariant guards against the two implementations drifting apart.
+///
+/// This is the consumer that makes the event-sourced log worthwhile: a future
+/// refactor that switches a hot path to read from the registry (instead of
+/// re-scanning the stream with `derive_messages`) can run this on the load path
+/// to prove the cheaper projection never diverges from the established source.
+pub struct ProjectionMatchesDerived;
+
+impl LogInvariant for ProjectionMatchesDerived {
+    fn name(&self) -> &'static str {
+        "session.projection_matches_derived"
+    }
+
+    fn check(&self, map: &SessionEventMap) -> Result<(), InvariantViolation> {
+        let derived = map.derive_messages();
+        let projected = project_map::<LiveTranscriptProjection>(map)?;
+        // `StoredMessage` is deliberately not `PartialEq`; compare the canonical
+        // serialized forms, which is what actually matters (identical transcripts).
+        let a = serde_json::to_vec(&derived).map_err(|e| {
+            InvariantViolation::new(
+                "session.projection_matches_derived",
+                format!("derived transcript failed to serialize: {e}"),
+            )
+        })?;
+        let b = serde_json::to_vec(&projected).map_err(|e| {
+            InvariantViolation::new(
+                "session.projection_matches_derived",
+                format!("projected transcript failed to serialize: {e}"),
+            )
+        })?;
+        if a != b {
+            return Err(InvariantViolation::new(
+                "session.projection_matches_derived",
+                format!(
+                    "LiveTranscriptProjection ({len} msgs) diverged from derive_messages ({len2} msgs)",
+                    len = projected.len(),
+                    len2 = derived.len(),
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Compaction brackets must be well-formed (takeaway #5's orphan-detection
 /// consumer of takeaway #3). Every `CompactionStart` must be closed by a later
 /// `CompactionEnd`, and a `CompactionEnd` must never appear without a preceding
@@ -347,6 +595,7 @@ impl InvariantRegistry {
         r.add(ParentEdgesResolve);
         r.add(ToolPairingBalanced);
         r.add(ReplayDeterminism);
+        r.add(ProjectionMatchesDerived);
         r.add(CompactionBracket);
         r
     }
@@ -381,6 +630,10 @@ pub struct MessageCountProjection;
 impl LogProjection for MessageCountProjection {
     type State = usize;
 
+    fn name() -> &'static str {
+        "session.message_count"
+    }
+
     fn apply(state: &mut Self::State, event: &SessionEvent) {
         match &event.op {
             SessionEventOp::AppendMessage { .. } => *state += 1,
@@ -403,6 +656,60 @@ impl LogProjection for MessageCountProjection {
                 *state = state.saturating_sub(end - start).saturating_add(messages.len());
             }
             SessionEventOp::ClearAll => *state = 0,
+            _ => {}
+        }
+    }
+}
+
+/// The **live transcript**: the ordered `Vec<StoredMessage>` currently
+/// projected from the log. This is the concrete realization of takeaway #4's
+/// "derive the transcript from the log, don't re-read it" — the same operation
+/// `SessionEventMap::derive_messages` performs on demand, kept incrementally
+/// current by the registry instead of recomputed from scratch on every read.
+///
+/// The fold mirrors `derive_messages` splice semantics exactly (capped indices,
+/// corruption-tolerant on reversed bounds) so the projection and the derived
+/// method always agree.
+pub struct LiveTranscriptProjection;
+
+impl LogProjection for LiveTranscriptProjection {
+    type State = Vec<StoredMessage>;
+
+    fn name() -> &'static str {
+        "session.live_transcript"
+    }
+
+    fn apply(state: &mut Self::State, event: &SessionEvent) {
+        match &event.op {
+            SessionEventOp::AppendMessage { message, .. } => {
+                state.push(message.clone());
+            }
+            SessionEventOp::InsertMessage {
+                index,
+                message,
+                ..
+            } => {
+                let index = (*index).min(state.len());
+                state.insert(index, message.clone());
+            }
+            SessionEventOp::ReplaceMessages {
+                start_index,
+                end_index,
+                messages,
+                ..
+            } => {
+                // Mirror `derive_messages` EXACTLY, including its clamping order,
+                // so the two implementations can never diverge. The canonical
+                // algorithm clamps each bound independently to the live length
+                // first, then forces `end >= start` so a *reversed* span
+                // (`start_index > end_index`) degrades to `start == end` — a
+                // point-insertion, never a crash.
+                let start = (*start_index).min(state.len());
+                let raw_end = (*end_index).min(state.len());
+                let end = raw_end.max(start);
+                state.splice(start..end, messages.iter().cloned());
+            }
+            SessionEventOp::ClearAll => state.clear(),
             _ => {}
         }
     }
@@ -699,6 +1006,182 @@ mod tests {
                 m.derive_messages().len(),
                 "projection diverged from derive_messages at prefix {cut}"
             );
+        }
+    }
+
+    #[test]
+    fn registry_folds_multiple_projections_in_one_pass() {
+        let mut map = SessionEventMap::default();
+        append(&mut map, "e1", text_msg("m1"));
+        append(&mut map, "e2", text_msg("m2"));
+
+        let mut reg = ProjectionRegistry::builtin();
+        reg.fold(&map.events).expect("fold should succeed");
+        let view = reg.current();
+
+        // Both built-in projections are present, one fold, two readers.
+        assert!(view.contains::<MessageCountProjection>());
+        assert!(view.contains::<LiveTranscriptProjection>());
+        assert_eq!(view.get::<MessageCountProjection>(), Some(&2));
+        assert_eq!(
+            view.get::<LiveTranscriptProjection>().map(Vec::len),
+            Some(2)
+        );
+        // The live transcript matches the derived transcript exactly.
+        let live = view
+            .get::<LiveTranscriptProjection>()
+            .expect("live transcript present");
+        let derive = map.derive_messages();
+        assert_eq!(
+            live.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+            derive.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+            "live transcript must mirror derive_messages' ordering and content"
+        );
+    }
+
+    #[test]
+    fn registry_incremental_apply_matches_full_refold() {
+        let mut map = SessionEventMap::default();
+        append(&mut map, "e1", text_msg("m1"));
+
+        // Bootstrap: fold the initial log.
+        let mut reg = ProjectionRegistry::builtin();
+        reg.fold(&map.events).expect("initial fold ok");
+        let bootstrap_cur = reg.current();
+        let bootstrap_ids = bootstrap_cur
+            .get::<LiveTranscriptProjection>()
+            .unwrap()
+            .iter()
+            .map(|m| m.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(bootstrap_ids, vec!["m1".to_string()], "bootstrap folded one message");
+
+        // Incremental: append new events and apply ONLY the delta.
+        append(&mut map, "e2", text_msg("m2"));
+        map.events.push(SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: "e_repl".to_string().into(),
+            op: SessionEventOp::ReplaceMessages {
+                start_index: 0,
+                end_index: usize::MAX,
+                messages: vec![text_msg("mnew")],
+            },
+            parent_id: None,
+            version: 1,
+        });
+        for event in &map.events[1..] {
+            reg.apply(event);
+        }
+
+        // The incremental path must equal a full re-fold of the same log.
+        let mut refold = ProjectionRegistry::builtin();
+        refold.fold(&map.events).expect("refold ok");
+        let inc_cur = reg.current();
+        let refold_cur = refold.current();
+        let inc_ids = inc_cur
+            .get::<LiveTranscriptProjection>()
+            .unwrap()
+            .iter()
+            .map(|m| m.id.clone())
+            .collect::<Vec<_>>();
+        let refold_ids = refold_cur
+            .get::<LiveTranscriptProjection>()
+            .unwrap()
+            .iter()
+            .map(|m| m.id.clone())
+            .collect::<Vec<_>>();
+        let inc_count = inc_cur.get::<MessageCountProjection>().copied();
+        let refold_count = refold_cur.get::<MessageCountProjection>().copied();
+        assert_eq!(
+            inc_ids, refold_ids,
+            "incremental apply diverged from a fresh full fold"
+        );
+        assert_eq!(inc_count, refold_count);
+        // And it must match derive_messages.
+        let derive_ids = map.derive_messages().into_iter().map(|m| m.id).collect::<Vec<_>>();
+        assert_eq!(inc_ids, derive_ids, "live transcript must match derive_messages");
+    }
+
+    #[test]
+    fn projection_matches_derived_across_malformed_sequences() {
+        // Stress the differential invariant: for a corpus of logs that exercise
+        // every splice/insert edge (full replace, clamped insert, reversed
+        // bounds, clear+rebuild), the incremental projection and the derived
+        // method must agree byte-for-byte. Guards against the two folds
+        // drifting apart.
+        let mut cases: Vec<Vec<SessionEvent>> = Vec::new();
+
+        // 1. Plain appends.
+        let mut m = SessionEventMap::default();
+        append(&mut m, "e1", text_msg("a"));
+        append(&mut m, "e2", text_msg("b"));
+        cases.push(m.events.clone());
+
+        // 2. Partial splice then clear.
+        m.events.push(SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: "sp1".to_string().into(),
+            op: SessionEventOp::ReplaceMessages {
+                start_index: 0,
+                end_index: 1,
+                messages: vec![text_msg("x"), text_msg("y")],
+            },
+            parent_id: None,
+            version: 1,
+        });
+        m.events.push(SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: "clr".to_string().into(),
+            op: SessionEventOp::ClearAll,
+            parent_id: None,
+            version: 1,
+        });
+        append(&mut m, "post", text_msg("p"));
+        cases.push(m.events.clone());
+
+        // 3. Reversed replace bounds (corruption-tolerant): start > end.
+        let mut m2 = SessionEventMap::default();
+        append(&mut m2, "e1", text_msg("a"));
+        append(&mut m2, "e2", text_msg("b"));
+        m2.events.push(SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: "rev".to_string().into(),
+            op: SessionEventOp::ReplaceMessages {
+                start_index: 5,
+                end_index: 1,
+                messages: vec![text_msg("z")],
+            },
+            parent_id: None,
+            version: 1,
+        });
+        cases.push(m2.events.clone());
+
+        // 4. Replace beyond live length (append when empty).
+        let mut m3 = SessionEventMap::default();
+        m3.events.push(SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: "full".to_string().into(),
+            op: SessionEventOp::ReplaceMessages {
+                start_index: 0,
+                end_index: usize::MAX,
+                messages: vec![text_msg("only")],
+            },
+            parent_id: None,
+            version: 1,
+        });
+        cases.push(m3.events.clone());
+
+        // The invariant must hold on every case and every prefix of it.
+        for (ci, events) in cases.iter().enumerate() {
+            for cut in 0..=events.len() {
+                let mut map = SessionEventMap::default();
+                map.events = events[..cut].to_vec();
+                let check = ProjectionMatchesDerived;
+                assert!(
+                    check.check(&map).is_ok(),
+                    "projection/derived diverged on case {ci} prefix {cut}"
+                );
+            }
         }
     }
 }

@@ -4581,3 +4581,50 @@ fn scheduled_prune_preserves_unconsumed_results_and_images() {
             .is_empty()
     );
 }
+
+#[test]
+fn projected_messages_matches_derive_messages() {
+    // The projection seam (takeaway #4) must return the same transcript as the
+    // established on-demand source, on a live session across append/insert.
+    let mut session = Session::create_with_id("proj_seam".to_string(), None, None);
+    session.append_stored_message(StoredMessage {
+        id: "a".to_string(),
+        role: Role::User,
+        content: vec![text_block("one")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    session.append_stored_message(StoredMessage {
+        id: "b".to_string(),
+        role: Role::Assistant,
+        content: vec![text_block("two")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    session.insert_message(1, StoredMessage {
+        id: "c".to_string(),
+        role: Role::User,
+        content: vec![text_block("inserted")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+
+    // The projected transcript is present and matches derive_messages exactly
+    // (compare ids: StoredMessage is not PartialEq).
+    let projected = session
+        .projected_messages()
+        .expect("projected transcript folds cleanly");
+    let derived = session.derive_messages();
+    assert_eq!(
+        projected.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+        derived.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+        "projected_messages must mirror derive_messages"
+    );
+    assert_eq!(projected.len(), 3);
+}

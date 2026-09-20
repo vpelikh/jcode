@@ -41,8 +41,9 @@ pub use branded::{
     CompactionId, EventId, JobId, MessageId, SessionId, ToolCallId,
 };
 pub use invariants::{
-    CompactionBracket, InvariantLog, InvariantRegistry, InvariantViolation, LogInvariant,
-    LogProjection, MessageCountProjection, fold_projection, project_map,
+    CompactionBracket, InvariantLog, InvariantRegistry, InvariantViolation, LiveTranscriptProjection,
+    LogInvariant, LogProjection, MessageCountProjection, ProjectionMatchesDerived, ProjectionResults,
+    ProjectionRegistry, fold_projection, project_map,
 };
 mod crash;
 mod invariants;
@@ -1973,6 +1974,22 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
     /// Get current messages from event log (derives pure state)
     pub fn derive_messages(&self) -> Vec<StoredMessage> {
         self.event_map.derive_messages()
+    }
+
+    /// Get the live transcript via the projection seam (takeaway #4).
+    ///
+    /// Returns the same transcript as [`derive_messages`](Self::derive_messages)
+    /// — the `LiveTranscriptProjection` fold is proven byte-identical by the
+    /// `ProjectionMatchesDerived` invariant — but through the registry, so
+    /// consumers get a typed projection stating their intent to read *derived*
+    /// state rather than scan the raw stream. This is the accessor future hot
+    /// paths adopt on their way off `derive_messages`.
+    ///
+    /// `None` when the log folds into an invariant violation (a structural
+    /// problem a load-path invariant run would have caught); callers that trust
+    /// the load path should `unwrap` or treat `None` as an internal error.
+    pub fn projected_messages(&self) -> Option<Vec<StoredMessage>> {
+        project_map::<LiveTranscriptProjection>(&self.event_map).ok()
     }
 
     /// Get current compaction from event log (derives pure state)
