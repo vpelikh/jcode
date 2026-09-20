@@ -14,6 +14,10 @@ use unicode_width::UnicodeWidthStr;
 const MAX_INLINE_DIFF_LINES: usize = 12;
 const MAX_DISCOVERY_DETAIL_LINES: usize = 2;
 const MAX_DISCOVERY_SETUP_LINES: usize = 3;
+/// Cap on the number of lines both tool-output bodies (agentgrep and
+/// compass_query) render inline, so a very large search result cannot balloon a
+/// single transcript row. Shared so the two renderers can't silently drift.
+const MAX_INLINE_TOOL_BODY_LINES: usize = 400;
 
 fn prefer_width_stable_system_glyphs() -> bool {
     std::env::var("TERM_PROGRAM")
@@ -519,7 +523,6 @@ fn render_plaintext_lines(content: &str, wrap_width: usize) -> Vec<Line<'static>
 /// as a nested block. Long lines are hard-split to the available width and the
 /// block is capped so a giant search result cannot flood the transcript.
 fn render_agentgrep_output_body(content: &str, row_width: usize) -> Vec<Line<'static>> {
-    const MAX_BODY_LINES: usize = 400;
     let border = "    │ ";
     let border_width = UnicodeWidthStr::width(border);
     let avail = row_width.saturating_sub(border_width).max(1);
@@ -530,7 +533,7 @@ fn render_agentgrep_output_body(content: &str, row_width: usize) -> Vec<Line<'st
     let mut truncated_extra = 0usize;
 
     for raw_line in source_lines {
-        if out.len() >= MAX_BODY_LINES {
+        if out.len() >= MAX_INLINE_TOOL_BODY_LINES {
             truncated_extra = total.saturating_sub(out.len());
             break;
         }
@@ -549,7 +552,7 @@ fn render_agentgrep_output_body(content: &str, row_width: usize) -> Vec<Line<'st
             ]));
         } else {
             for chunk in split_by_display_width(raw_line, avail) {
-                if out.len() >= MAX_BODY_LINES {
+                if out.len() >= MAX_INLINE_TOOL_BODY_LINES {
                     break;
                 }
                 out.push(Line::from(vec![
@@ -577,17 +580,15 @@ fn render_agentgrep_output_body(content: &str, row_width: usize) -> Vec<Line<'st
 /// keep the search results scannable. The output is capped so a very large
 /// result set cannot balloon a single transcript row.
 fn render_compass_query_output_body(content: &str, row_width: usize) -> Vec<Line<'static>> {
-    const MAX_BODY_LINES: usize = 400;
-
     // Single newlines inside compass output separate fields on one result and
     // should be kept as hard breaks rather than reflowed into one paragraph.
     let preserved = preserve_hard_line_breaks_for_markdown(content);
     let width = row_width.saturating_sub(4).max(1);
     let rendered = markdown::render_markdown_with_width(&preserved, Some(width));
     let mut lines = markdown::wrap_lines(rendered, width);
-    if lines.len() > MAX_BODY_LINES {
-        let truncated = lines.len().saturating_sub(MAX_BODY_LINES);
-        lines.truncate(MAX_BODY_LINES);
+    if lines.len() > MAX_INLINE_TOOL_BODY_LINES {
+        let truncated = lines.len().saturating_sub(MAX_INLINE_TOOL_BODY_LINES);
+        lines.truncate(MAX_INLINE_TOOL_BODY_LINES);
         lines.push(Line::from(Span::styled(
             format!("    … {} more lines …", truncated),
             Style::default().fg(dim_color()),
@@ -4383,7 +4384,7 @@ pub(crate) fn render_tool_message(
     // transcript. Gated behind `display.show_agentgrep_output` (default false)
     // so most users keep the compact one-line summary.
     if tools_ui::canonical_tool_name(&tc.name) == "agentgrep"
-        && crate::config::config().display.show_agentgrep_output
+        && tools_ui::show_agentgrep_output()
         && !msg.content.trim().is_empty()
     {
         for line in render_agentgrep_output_body(&msg.content, row_width) {
