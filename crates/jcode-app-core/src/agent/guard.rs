@@ -89,27 +89,6 @@ fn consecutive_identical_tail(
     count
 }
 
-/// Decide whether dispatching `candidate` would exceed the repeat threshold.
-///
-/// `transcript` is the session's committed messages, which include any identical
-/// calls already committed this same batch. `batch_prior_identical` is an extra
-/// count for identical calls in the *current* response dispatched earlier in this
-/// batch but not yet present in `transcript`; callers that commit every call
-/// before consulting the detector should pass `0`.
-///
-/// Returns the number of consecutive identical occurrences *after* adding the
-/// candidate when the threshold trips, otherwise `None`.
-pub fn check_repeat_tool(
-    transcript: &[StoredMessage],
-    candidate: (&str, &serde_json::Value),
-    batch_prior_identical: usize,
-) -> Option<usize> {
-    let (name, input) = candidate;
-    let prior = consecutive_identical_tail(transcript, name, input) + batch_prior_identical;
-    let total = prior + 1;
-    (total >= REPEAT_TOOL_THRESHOLD).then_some(total)
-}
-
 /// Inspect a fully-committed transcript and, if the *most recent* tool call has
 /// a trailing run of at least `REPEAT_TOOL_THRESHOLD` identical occurrences,
 /// return the model-visible reminder. This is the simplest wiring for loops that
@@ -127,9 +106,13 @@ pub fn repeat_reminder_from_transcript(messages: &[StoredMessage]) -> Option<Sto
         }
     }
     let (name, input) = last?;
-    check_repeat_tool(messages, (name, input), 1).map(|count| {
-        repeat_reminder_message_build(name, count)
-    })
+    // The candidate is the newest committed `ToolUse`, so `consecutive_identical_tail`
+    // already counts it (and its identical predecessors). We must NOT add a phantom
+    // `+1` for the candidate (it is already in the transcript): the run length is the
+    // full committed run, and the reminder trips once that run reaches
+    // `REPEAT_TOOL_THRESHOLD`.
+    let run_len = consecutive_identical_tail(messages, name, input);
+    (run_len >= REPEAT_TOOL_THRESHOLD).then(|| repeat_reminder_message_build(name, run_len))
 }
 
 /// Build the model-visible, user-role reminder message for a repeated tool call.
@@ -177,141 +160,6 @@ mod tests {
     }
 
     #[test]
-    fn below_threshold_is_ok() {
-        let transcript = vec![
-            stored_message("m0", tool_use("bash", json!({"command": "ls"}))),
-            stored_message("m1", tool_use("grep", json!({"query": "foo", "path": "src"}))),
-        ];
-        assert_eq!(
-            check_repeat_tool(&transcript, (&"bash", &json!({"command": "ls"})), 0),
-            None
-        );
-        // A second identical call is still below the threshold (only 2 total).
-        let transcript2 = vec![
-            stored_message("m0", tool_use("bash", json!({"command": "git status"}))),
-            stored_message("m1", tool_use("bash", json!({"command": "git status"}))),
-        ];
-        assert_eq!(
-            check_repeat_tool(&transcript2, (&"bash", &json!({"command": "git status"})), 0),
-            None
-        );
-    }
-
-    #[test]
-    fn three_prior_identical_trips() {
-        // 3 identical committed + 1 candidate = 4 >= threshold.
-        let transcript = vec![
-            stored_message("m0", tool_use("bash", json!({"command": "git status"}))),
-            stored_message("m1", tool_use("bash", json!({"command": "git status"}))),
-            stored_message("m2", tool_use("bash", json!({"command": "git status"}))),
-        ];
-        assert_eq!(
-            check_repeat_tool(&transcript, (&"bash", &json!({"command": "git status"})), 0),
-            Some(4)
-        );
-    }
-
-    #[test]
-    fn batch_prior_identical_counts() {
-        // 2 committed + 2 more in the same batch = candidate is the 5th.
-        let transcript = vec![
-            stored_message("m0", tool_use("bash", json!({"command": "x"}))),
-            stored_message("m1", tool_use("bash", json!({"command": "x"}))),
-        ];
-        assert_eq!(check_repeat_tool(&transcript, (&"bash", &json!({"command": "x"})), 2), Some(5));
-    }
-
-    #[test]
-    fn different_args_break_the_run() {
-        let transcript = vec![
-            stored_message("m0", tool_use("bash", json!({"command": "git status"}))),
-            stored_message("m1", tool_use("bash", json!({"command": "git commit"}))),
-        ];
-        // A different-args call ("git commit") is the trailing message, so the
-        // consecutive identical run for "git status" is broken at 0. Even with
-        // 1 "identical" batch_prior, the candidate is only the 1st trailing
-        // match plus 1 batch => below threshold, so no repeat.
-        assert_eq!(
-            check_repeat_tool(&transcript, (&"bash", &json!({"command": "git status"})), 0),
-            None
-        );
-        // A fresh candidate with different args is never a repeat.
-        assert_eq!(
-            check_repeat_tool(&transcript, (&"bash", &json!({"command": "git log"})), 0),
-            None
-        );
-    }
-
-    #[test]
-    fn json_key_order_is_insensitive() {
-        let transcript = vec![
-            stored_message(
-                "m0",
-                tool_use("grep", json!({"query": "foo", "path": "src"})),
-            ),
-            stored_message(
-                "m1",
-                tool_use("grep", json!({"query": "foo", "path": "src"})),
-            ),
-        ];
-        // Same content, different key order => still a consecutive run of 2.
-        // Candidate itself is the 3rd; plus one in-batch prior accounted by the
-        // caller (batch_prior_identical=1) => total 4.
-        assert_eq!(
-            check_repeat_tool(
-                &transcript,
-                (&"grep", &json!({"path": "src", "query": "foo"})),
-                1
-            ),
-            Some(4)
-        );
-    }
-
-    #[test]
-    fn interleaved_text_does_not_reset_run() {
-        let transcript = vec![
-            stored_message("m0", tool_use("bash", json!({"command": "y"}))),
-            stored_message(
-                "m1",
-                ContentBlock::Text {
-                    text: "still working".to_string(),
-                    cache_control: None,
-                },
-            ),
-        ];
-        // m1 text doesn't reset; m0 same call => 1 prior. + candidate + 2 batch = 4.
-        assert_eq!(
-            check_repeat_tool(&transcript, (&"bash", &json!({"command": "y"})), 2),
-            Some(4)
-        );
-    }
-
-    #[test]
-    fn transcript_detector_fires_on_repeat_run() {
-        // 3 committed identical calls + the newest (last) call counts once more.
-        let transcript = vec![
-            stored_message("m0", tool_use("bash", json!({"command": "ls"}))),
-            stored_message("m1", tool_use("bash", json!({"command": "ls"}))),
-            stored_message("m2", tool_use("bash", json!({"command": "ls"}))),
-            stored_message("m3", tool_use("bash", json!({"command": "ls"}))),
-        ];
-        let reminder = repeat_reminder_from_transcript(&transcript);
-        let Some(reminder) = reminder else {
-            panic!("expected a reminder for a 4x identical run");
-        };
-        assert_eq!(reminder.role, Role::User);
-        let text = match &reminder.content[0] {
-            ContentBlock::Text { text, .. } => text,
-            other => panic!("expected Text block, got {other:?}"),
-        };
-        assert!(
-            text.contains("repeated identically"),
-            "unexpected text: {text}"
-        );
-        assert!(text.contains(REPEAT_TOOL_REMINDER));
-    }
-
-    #[test]
     fn transcript_detection_stays_silent_below_threshold() {
         let transcript = vec![
             stored_message("m0", tool_use("bash", json!({"command": "ls"}))),
@@ -320,6 +168,45 @@ mod tests {
         ];
         // Newest is "grep"; no trailing run of 4 identical => silent.
         assert!(repeat_reminder_from_transcript(&transcript).is_none());
+    }
+
+    #[test]
+    fn transcript_detector_does_not_fire_below_threshold() {
+        // Regression: a repeated run strictly below REPEAT_TOOL_THRESHOLD (3
+        // committed identical calls) must NOT nudge. The caller commits the whole
+        // batch before consulting the detector, so the newest committed ToolUse
+        // is the candidate and must not be double-counted.
+        let transcript = vec![
+            stored_message("m0", tool_use("bash", json!({"command": "ls"}))),
+            stored_message("m1", tool_use("bash", json!({"command": "ls"}))),
+            stored_message("m2", tool_use("bash", json!({"command": "ls"}))),
+        ];
+        assert!(
+            repeat_reminder_from_transcript(&transcript).is_none(),
+            "3 identical calls must stay below the threshold"
+        );
+    }
+
+    #[test]
+    fn transcript_detector_fires_exactly_at_threshold() {
+        // Regression: exactly REPEAT_TOOL_THRESHOLD (4) committed identical
+        // calls must nudge exactly once, reporting a count of 4 (not 5).
+        let transcript = vec![
+            stored_message("m0", tool_use("bash", json!({"command": "ls"}))),
+            stored_message("m1", tool_use("bash", json!({"command": "ls"}))),
+            stored_message("m2", tool_use("bash", json!({"command": "ls"}))),
+            stored_message("m3", tool_use("bash", json!({"command": "ls"}))),
+        ];
+        let reminder = repeat_reminder_from_transcript(&transcript)
+            .expect("4 identical calls must trigger the reminder");
+        let text = match &reminder.content[0] {
+            ContentBlock::Text { text, .. } => text,
+            other => panic!("expected Text block, got {other:?}"),
+        };
+        assert!(
+            text.contains("repeated identically 4 times"),
+            "reported count must be exactly 4, got text: {text}"
+        );
     }
 
     #[test]
