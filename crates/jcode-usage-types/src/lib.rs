@@ -503,6 +503,9 @@ pub struct TodoSessionEvent {
     pub feedback_loop_coverage_min: Option<u8>,
     pub feedback_loop_coverage_mean: Option<f64>,
     pub feedback_loop_coverage_count: u32,
+    pub trade_off_min: Option<u8>,
+    pub trade_off_mean: Option<f64>,
+    pub trade_off_count: u32,
     pub end_to_end_ownership_min: Option<u8>,
     pub end_to_end_ownership_mean: Option<f64>,
     pub end_to_end_ownership_count: u32,
@@ -619,6 +622,8 @@ pub struct SessionLifecycleEvent {
     pub todo_gate_completion_count: u32,
     #[serde(default)]
     pub todo_gate_spike_count: u32,
+    #[serde(default)]
+    pub todo_gate_tradeoff_count: u32,
     pub command_login_used: bool,
     pub command_model_used: bool,
     pub command_usage_used: bool,
@@ -750,6 +755,8 @@ pub struct TurnEndEvent {
     pub todo_gate_completion_count: u32,
     #[serde(default)]
     pub todo_gate_spike_count: u32,
+    #[serde(default)]
+    pub todo_gate_tradeoff_count: u32,
     pub workflow_chat_only: bool,
     pub workflow_coding_used: bool,
     pub workflow_research_used: bool,

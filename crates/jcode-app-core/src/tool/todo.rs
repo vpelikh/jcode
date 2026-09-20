@@ -187,6 +187,11 @@ fn todo_telemetry_update(
                     .map(|state| state.legacy_score())
             }),
         ),
+        trade_off: crate::telemetry::TelemetryScoreSummary::from_scores(
+            goals
+                .iter()
+                .filter_map(|goal| goal.trade_off.map(|state| state.legacy_score())),
+        ),
         end_to_end_ownership: crate::telemetry::TelemetryScoreSummary::from_scores(
             goals
                 .iter()
@@ -248,6 +253,9 @@ fn merge_goals(stored: &[TodoGoal], incoming: Option<Vec<TodoGoal>>) -> Vec<Todo
         goal.delivery_state_history = previous
             .map(|prev| prev.delivery_state_history.clone())
             .unwrap_or_default();
+        goal.trade_off_history = previous
+            .map(|prev| prev.trade_off_history.clone())
+            .unwrap_or_default();
         // Field-level merge, matching `merge_plan`: a write that revises one
         // assessment must not silently erase the others. Without this the
         // turn-end digest would read a stale `None` and re-raise a point the
@@ -268,6 +276,9 @@ fn merge_goals(stored: &[TodoGoal], incoming: Option<Vec<TodoGoal>>) -> Vec<Todo
             if goal.feedback_loop_traceability.is_none() {
                 goal.feedback_loop_traceability = prev.feedback_loop_traceability;
             }
+            if goal.trade_off.is_none() {
+                goal.trade_off = prev.trade_off;
+            }
             if goal.difficulty.is_none() {
                 goal.difficulty = prev.difficulty;
             }
@@ -282,6 +293,12 @@ fn merge_goals(stored: &[TodoGoal], incoming: Option<Vec<TodoGoal>>) -> Vec<Todo
             }
             if goal.stopping_evidence.is_none() {
                 goal.stopping_evidence = prev.stopping_evidence.clone();
+            }
+            if goal.trade_offs.is_none() {
+                goal.trade_offs = prev.trade_offs.clone();
+            }
+            if goal.explored_alternative.is_none() {
+                goal.explored_alternative = prev.explored_alternative;
             }
         }
         record_score_observation(
@@ -301,6 +318,7 @@ fn merge_goals(stored: &[TodoGoal], incoming: Option<Vec<TodoGoal>>) -> Vec<Todo
             goal.feedback_loop_traceability,
         );
         record_score_observation(&mut goal.delivery_state_history, goal.delivery_state);
+        record_score_observation(&mut goal.trade_off_history, goal.trade_off);
         if let Some(slot) = merged
             .iter_mut()
             .find(|existing| existing.group == goal.group)
@@ -383,6 +401,17 @@ fn changed_goal_fields(before: Option<&TodoGoal>, after: Option<&TodoGoal>) -> V
         != after.and_then(|goal| goal.stopping_evidence.as_ref())
     {
         fields.push(TodoGoalField::StoppingEvidence);
+    }
+    if before.and_then(|goal| goal.trade_off) != after.and_then(|goal| goal.trade_off) {
+        fields.push(TodoGoalField::TradeOff);
+    } else if before.and_then(|goal| goal.trade_offs.as_ref())
+        != after.and_then(|goal| goal.trade_offs.as_ref())
+        || before.and_then(|goal| goal.explored_alternative)
+            != after.and_then(|goal| goal.explored_alternative)
+    {
+        // A revision to the rationale or the explored-alternative flag is a
+        // trade-off assessment change even when the state itself is unchanged.
+        fields.push(TodoGoalField::TradeOff);
     }
     fields
 }
@@ -559,6 +588,13 @@ fn record_reframe_observations(
                     .map(|state| state.as_str().to_string()),
             });
         }
+        if !crate::todo::trade_off_passes(goal) {
+            observations.push(GateObservation {
+                kind: GateObservationKind::TradeOff,
+                group: goal.group.clone(),
+                state: goal.trade_off.map(|state| state.as_str().to_string()),
+            });
+        }
     }
     (observations, immediate)
 }
@@ -693,6 +729,9 @@ fn normalize_todo_input(mut input: Value) -> Value {
                     "feedback_loop_traceability",
                     "difficulty",
                     "autonomy",
+                    "trade_off",
+                    "trade_offs",
+                    "explored_alternative",
                 ] {
                     if let Some(value) = fields.get_mut(key) {
                         coerce_empty_string_to_null(value);
@@ -850,6 +889,19 @@ impl Tool for TodoTool {
                             "stopping_evidence": {
                                 "type": "string",
                                 "description": "Evidence for the reported iteration_maturity: attempts, observations, or a real budget limit."
+                            },
+                            "trade_off": {
+                                "type": "string",
+                                "enum": ["none_considered", "implicit", "some_considered", "diligent", "exhaustive"],
+                                "description": "How carefully the agent weighed alternatives before choosing an approach."
+                            },
+                            "trade_offs": {
+                                "type": "string",
+                                "description": "Trade-offs of the chosen approach: cost, complexity, performance, compatibility, maintenance."
+                            },
+                            "explored_alternative": {
+                                "type": "boolean",
+                                "description": "Whether a credible alternative was explored before committing to the approach."
                             }
                         }
                     }
@@ -890,6 +942,9 @@ impl Tool for TodoTool {
                         }
                         GateObservationKind::FeedbackLoopTraceability => {
                             crate::telemetry::TodoGateKind::FeedbackLoopTraceability
+                        }
+                        GateObservationKind::TradeOff => {
+                            crate::telemetry::TodoGateKind::TradeOff
                         }
                     };
                     crate::telemetry::record_todo_gate(kind);
@@ -1033,12 +1088,25 @@ mod tests {
         assert!(goal_props.contains_key("autonomy"));
         assert!(goal_props.contains_key("iteration_maturity"));
         assert!(goal_props.contains_key("stopping_evidence"));
+        assert!(goal_props.contains_key("trade_off"));
+        assert!(goal_props.contains_key("trade_offs"));
+        assert!(goal_props.contains_key("explored_alternative"));
         assert!(!goal_props.contains_key("end_to_end_ownership"));
         // Intent lives on the plan, not per goal.
         assert!(!goal_props.contains_key("user_intention"));
         assert!(!goal_props.contains_key("alignment_score"));
         assert!(!goal_props.contains_key("objective"));
-        assert_eq!(goal_props.len(), 11);
+        assert_eq!(goal_props.len(), 14);
+        assert_eq!(
+            goal_props["trade_off"]["enum"],
+            json!([
+                "none_considered",
+                "implicit",
+                "some_considered",
+                "diligent",
+                "exhaustive"
+            ])
+        );
         assert_eq!(
             goal_props["feedback_loop_relevance"]["enum"],
             json!([
@@ -1347,6 +1415,33 @@ mod tests {
         assert_eq!(goals[1].group, None);
     }
 
+    /// An empty-string `trade_offs` and `explored_alternative` must not fail the
+    /// tool call or deserialize as `Some("")`/an invalid bool. These are lenient
+    /// inputs a provider can emit when clearing the field.
+    #[test]
+    fn accepts_empty_string_trade_off_sub_fields_as_none() {
+        let input = json!({
+            "goals": [
+                {
+                    "group": "decision",
+                    "closed_feedback_loop": "closed",
+                    "feedback_loop": "verify",
+                    "trade_off": "diligent",
+                    "trade_offs": "",
+                    "explored_alternative": ""
+                }
+            ]
+        });
+        let parsed = parse(input).expect("empty-string trade-off sub-fields should parse");
+        let goals = parsed.goals.expect("goals present");
+        assert_eq!(goals[0].trade_off, Some(crate::todo::TradeOffState::Diligent));
+        assert_eq!(goals[0].trade_offs, None, "empty trade_offs should read as absent");
+        assert_eq!(
+            goals[0].explored_alternative, None,
+            "empty explored_alternative should read as absent, not a bool error"
+        );
+    }
+
     #[test]
     fn stringified_plan_object_is_accepted() {
         let parsed = parse(json!({
@@ -1393,6 +1488,7 @@ mod tests {
             feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
             feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::MainPaths),
             feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
+            trade_off: Some(crate::todo::TradeOffState::SomeConsidered),
             ..Default::default()
         }
     }
@@ -1866,7 +1962,7 @@ mod tests {
 
         // The points were recorded for the turn-end digest instead.
         let observations = crate::todo::load_gate_observations(session).expect("observations");
-        assert_eq!(observations.len(), 5);
+        assert_eq!(observations.len(), 6);
         assert!(
             observations.iter().any(|observation| {
                 observation.kind == GateObservationKind::FeedbackLoopRelevance
@@ -1880,6 +1976,11 @@ mod tests {
         assert!(observations.iter().any(|observation| {
             observation.kind == GateObservationKind::FeedbackLoopTraceability
         }));
+        assert!(
+            observations.iter().any(|observation| {
+                observation.kind == GateObservationKind::TradeOff
+            })
+        );
 
         // Histories are accumulating, which is what the digest reasons over.
         let plan = load_plan(session).expect("plan");
@@ -1968,6 +2069,9 @@ mod tests {
                         "feedback_loop_relevance": "indirect",
                         "feedback_loop_coverage": "narrow",
                         "end_to_end_ownership": 95,
+                        "trade_off": "diligent",
+                        "trade_offs": "weighed streaming vs batch release",
+                        "explored_alternative": true,
                     }],
                 }),
                 test_ctx(session),
@@ -1992,6 +2096,16 @@ mod tests {
             saved_goal.feedback_loop_coverage,
             Some(crate::todo::FeedbackLoopCoverage::Narrow)
         );
+        assert_eq!(
+            saved_goal.trade_off,
+            Some(crate::todo::TradeOffState::Diligent),
+            "trade_off should survive an end-to-end execute write"
+        );
+        assert_eq!(
+            saved_goal.trade_offs.as_deref(),
+            Some("weighed streaming vs batch release")
+        );
+        assert_eq!(saved_goal.explored_alternative, Some(true));
         assert!(
             !output
                 .output
@@ -2039,6 +2153,44 @@ mod tests {
                 TodoGoalField::FeedbackLoopCoverage,
             ]
         );
+    }
+
+    /// A trade-off revision counts as a goal update even when only the
+    /// rationale or explored-alternative flag changed, not just the state.
+    #[test]
+    fn goal_changes_detect_trade_off_sub_field_revisions() {
+        let base = TodoGoal {
+            group: Some("decision".to_string()),
+            trade_off: Some(crate::todo::TradeOffState::SomeConsidered),
+            trade_offs: Some("weighed X vs Y".to_string()),
+            explored_alternative: Some(true),
+            ..Default::default()
+        };
+
+        // State change fires TradeOff.
+        let mut state_changed = base.clone();
+        state_changed.trade_off = Some(crate::todo::TradeOffState::Diligent);
+        let changes = goal_changes(&[base.clone()], &[state_changed]);
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].fields.contains(&TodoGoalField::TradeOff));
+
+        // Rationale-only change fires TradeOff.
+        let mut rationale_changed = base.clone();
+        rationale_changed.trade_offs = Some("weighed X vs Z".to_string());
+        let changes = goal_changes(&[base.clone()], &[rationale_changed]);
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].fields.contains(&TodoGoalField::TradeOff));
+
+        // Explored-alternative-flag-only change fires TradeOff.
+        let mut flag_changed = base.clone();
+        flag_changed.explored_alternative = Some(false);
+        let changes = goal_changes(&[base.clone()], &[flag_changed]);
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].fields.contains(&TodoGoalField::TradeOff));
+
+        // No trade-off change at all produces no goal change.
+        let changes = goal_changes(&[base.clone()], &[base.clone()]);
+        assert!(changes.is_empty());
     }
 
     /// The core behavior change: a low score records an observation for the

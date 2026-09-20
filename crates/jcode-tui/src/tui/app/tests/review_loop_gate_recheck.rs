@@ -287,6 +287,8 @@ fn passing_goal() -> crate::todo::TodoGoal {
         feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
         feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::MainPaths),
         feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
+        trade_off: Some(crate::todo::TradeOffState::SomeConsidered),
+        trade_offs: Some("weighed alternatives".to_string()),
         ..Default::default()
     }
 }

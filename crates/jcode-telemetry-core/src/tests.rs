@@ -605,6 +605,7 @@ fn test_session_end_event_serialization() {
         todo_gate_intent_count: 0,
         todo_gate_completion_count: 0,
         todo_gate_spike_count: 0,
+        todo_gate_tradeoff_count: 0,
         command_login_used: false,
         command_model_used: true,
         command_usage_used: false,
@@ -733,6 +734,7 @@ fn test_record_todo_tool_and_gates_aggregate_session_and_turn() {
     record_todo_gate(TodoGateKind::ClosedFeedbackLoop);
     record_todo_gate(TodoGateKind::FeedbackLoopRelevance);
     record_todo_gate(TodoGateKind::FeedbackLoopCoverage);
+    record_todo_gate(TodoGateKind::TradeOff);
 
     {
         let guard = SESSION_STATE.lock().unwrap();
@@ -746,6 +748,7 @@ fn test_record_todo_tool_and_gates_aggregate_session_and_turn() {
         assert_eq!(state.todo_gate_intent_count, 1);
         assert_eq!(state.todo_gate_completion_count, 1);
         assert_eq!(state.todo_gate_spike_count, 1);
+        assert_eq!(state.todo_gate_tradeoff_count, 1);
         let turn = state.current_turn.as_ref().expect("current turn");
         assert_eq!(turn.tool_cat_todo, 2);
         assert!(turn.feature_todo_used);
@@ -755,6 +758,7 @@ fn test_record_todo_tool_and_gates_aggregate_session_and_turn() {
         assert_eq!(turn.todo_gate_intent_count, 1);
         assert_eq!(turn.todo_gate_completion_count, 1);
         assert_eq!(turn.todo_gate_spike_count, 1);
+        assert_eq!(turn.todo_gate_tradeoff_count, 1);
     }
     if let Ok(mut session) = SESSION_STATE.lock() {
         *session = None;
@@ -983,6 +987,7 @@ fn todo_session_aggregates_transitions_abandonment_and_high_water_mark() {
         closed_feedback_loop: TelemetryScoreSummary::from_scores([85, 95]),
         feedback_loop_relevance: TelemetryScoreSummary::from_scores([75, 98]),
         feedback_loop_coverage: TelemetryScoreSummary::from_scores([75, 98]),
+        trade_off: TelemetryScoreSummary::from_scores([88, 96]),
         end_to_end_ownership: TelemetryScoreSummary::from_scores([96, 100]),
     });
     {
@@ -1007,6 +1012,8 @@ fn todo_session_aggregates_transitions_abandonment_and_high_water_mark() {
     assert_eq!(payload["feedback_loop_relevance_count"], 2);
     assert_eq!(payload["feedback_loop_coverage_min"], 75);
     assert_eq!(payload["feedback_loop_coverage_count"], 2);
+    assert_eq!(payload["trade_off_min"], 88);
+    assert_eq!(payload["trade_off_count"], 2);
     *SESSION_STATE.lock().unwrap() = None;
 }
 
@@ -1028,6 +1035,9 @@ fn todo_session_with_zero_todos_emits_zero_numeric_state() {
         "completion_confidence_count",
         "understands_user_intent_count",
         "closed_feedback_loop_count",
+        "feedback_loop_relevance_count",
+        "feedback_loop_coverage_count",
+        "trade_off_count",
         "end_to_end_ownership_count",
     ] {
         assert_eq!(payload[field], 0, "{field}");
