@@ -121,7 +121,14 @@ impl Agent {
         if self.try_recover_after_payload_too_large(error) {
             return true;
         }
-        if !Self::is_context_limit_error(error) {
+
+        // A 413 that image/tool-result stripping could not resolve (e.g. the
+        // payload is large because of accumulated message volume rather than any
+        // single oversized image or tool result) still needs the request body
+        // shrunk, so fall through to a hard compaction to drop older messages.
+        let is_payload_too_large = crate::compaction::is_request_payload_too_large_error(error);
+
+        if !is_payload_too_large && !Self::is_context_limit_error(error) {
             return false;
         }
         if !self.provider.supports_compaction() {
@@ -163,21 +170,48 @@ impl Agent {
         self.provider_session_id = None;
         self.session.provider_session_id = None;
 
-        logging::warn(&format!(
-            "Context limit exceeded; auto-compacted and retrying (dropped {} messages, usage was {:.1}%)",
-            dropped, usage_pct
-        ));
-        crate::runtime_memory_log::emit_event(
-            crate::runtime_memory_log::RuntimeMemoryLogEvent::new(
-                "auto_compaction_applied",
-                "context_limit_auto_compaction",
-            )
-            .with_session_id(self.session.id.clone())
-            .with_detail(format!(
-                "dropped_messages={dropped},usage_pct={usage_pct:.1}"
-            ))
-            .force_attribution(),
-        );
+        if is_payload_too_large {
+            logging::warn(&format!(
+                "Request body exceeded provider size limit; hard-compacted to shrink accumulated messages (dropped {} messages, usage was {:.1}%)",
+                dropped, usage_pct
+            ));
+            crate::runtime_memory_log::emit_event(
+                crate::runtime_memory_log::RuntimeMemoryLogEvent::new(
+                    "payload_too_large_hard_compacted",
+                    "request_payload_too_large",
+                )
+                .with_session_id(self.session.id.clone())
+                .with_detail(format!("dropped_messages={dropped},usage_pct={usage_pct:.1}"))
+                .force_attribution(),
+            );
+        } else {
+            logging::warn(&format!(
+                "Context limit exceeded; auto-compacted and retrying (dropped {} messages, usage was {:.1}%)",
+                dropped, usage_pct
+            ));
+            crate::runtime_memory_log::emit_event(
+                crate::runtime_memory_log::RuntimeMemoryLogEvent::new(
+                    "auto_compaction_applied",
+                    "context_limit_auto_compaction",
+                )
+                .with_session_id(self.session.id.clone())
+                .with_detail(format!(
+                    "dropped_messages={dropped},usage_pct={usage_pct:.1}"
+                ))
+                .force_attribution(),
+            );
+        }
+
+        // For request-too-large, only report success if hard compaction actually
+        // dropped messages. Hard compact can no-op (e.g. already compacted to
+        // the floor); if nothing was dropped, the payload would not shrink and a
+        // retry would 413 again, so report failure to avoid a pointless loop.
+        if is_payload_too_large && dropped == 0 {
+            logging::warn(
+                "Hard compaction did not drop any messages; request-too-large recovery cannot shrink the payload",
+            );
+            return false;
+        }
 
         true
     }
