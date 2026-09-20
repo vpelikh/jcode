@@ -1,10 +1,10 @@
 # Review Rounds After Work Is Complete
 
-Status: implemented (branch `jc/gate-recheck`, worktree `jcode-gate-recheck`)
+Status: implemented
 
 ## Implementation notes
 
-Phases 1–6 are implemented and unit-tested on branch `jc/gate-recheck`.
+Phases 1–6 are implemented and unit-tested.
 
 - Report-contract parser, lens definitions, fingerprint/stall helpers, and persisted
   state live in `crates/jcode-session-types/src/review.rs` (engine types) and the
@@ -22,7 +22,7 @@ The loop entry is gated behind `loop_mode` and the normal-TUI scope (the manual
 final confirmation pass re-runs all six lenses against the final code state;
 only an all-CLEAN final pass converges.
 
-As of the default-on change (`jc/review-flow`), `AutoReviewConfig.enabled` and
+As of the default-on change, `AutoReviewConfig.enabled` and
 `loop_mode` both default to `true`, so the review loop runs as part of the normal
 flow without manual opt-in. The one-shot "double-check this turn's weak points"
 digest still fires even while the loop is active (it is cheap and verifies the weak
