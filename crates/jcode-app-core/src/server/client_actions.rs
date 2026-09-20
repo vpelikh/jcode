@@ -3,9 +3,8 @@
 use super::client_lifecycle::process_message_streaming_mpsc;
 use super::services::{SessionServiceHandle, SwarmServiceHandle};
 use super::{
-    ClientConnectionInfo, SwarmEvent, SwarmMember, SwarmState, VersionedPlan,
-    broadcast_swarm_status, fanout_session_event, persist_swarm_state_for,
-    remove_session_channel_subscriptions, remove_session_from_swarm, swarm_id_for_session,
+    ClientConnectionInfo, SwarmMember, SwarmState,
+    fanout_session_event, persist_swarm_state_for, swarm_id_for_session,
     truncate_detail,
 };
 use crate::agent::Agent;
@@ -18,10 +17,9 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::process::Command;
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 
 type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
-type ChannelSubscriptions = Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
 
 const INPUT_SHELL_MAX_OUTPUT_LEN: usize = 30_000;
 
@@ -83,11 +81,7 @@ fn combine_input_shell_output(stdout: &[u8], stderr: &[u8]) -> (String, bool) {
 pub(super) struct NotifySessionContext<'a> {
     pub session: &'a SessionServiceHandle,
     pub client_connections: &'a Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
-    pub swarm_members: &'a Arc<RwLock<HashMap<String, SwarmMember>>>,
-    pub swarms_by_id: &'a Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    pub event_history: &'a Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    pub event_counter: &'a Arc<std::sync::atomic::AtomicU64>,
-    pub swarm_event_tx: &'a broadcast::Sender<SwarmEvent>,
+    pub swarm: &'a SwarmServiceHandle,
     pub client_event_tx: &'a mpsc::UnboundedSender<ServerEvent>,
 }
 
@@ -110,13 +104,7 @@ pub(super) async fn handle_notify_session(
             &session_id,
             &message,
             sessions,
-            super::live_turn::LiveTurnSwarmContext::new(
-                ctx.swarm_members,
-                ctx.swarms_by_id,
-                ctx.event_history,
-                ctx.event_counter,
-                ctx.swarm_event_tx,
-            ),
+            ctx.swarm,
         )
         .await
     } else {
@@ -126,11 +114,11 @@ pub(super) async fn handle_notify_session(
     let notified = if ran_immediately {
         false
     } else {
-        let members = ctx.swarm_members.read().await;
+        let members = ctx.swarm.swarm_state.members.read().await;
         if members.contains_key(&session_id) {
             drop(members);
             fanout_session_event(
-                ctx.swarm_members,
+                &ctx.swarm.swarm_state.members,
                 &session_id,
                 ServerEvent::Notification {
                     from_session: "schedule".to_string(),
@@ -397,14 +385,16 @@ pub(super) async fn handle_set_feature(
     client_session_id: &str,
     _friendly_name: &Option<String>,
     swarm_enabled: &mut bool,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-    channel_subscriptions: &ChannelSubscriptions,
-    channel_subscriptions_by_session: &ChannelSubscriptions,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
+    swarm: &SwarmServiceHandle,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
+    // Swarm-domain state is reached through the swarm service handle. These
+    // locals keep the body single-homed on the handle's fields instead of a
+    // flat pass-through argument bag (server service split, Slice 4).
+    let swarm_members = &swarm.swarm_state.members;
+    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let swarm_plans = &swarm.swarm_state.plans;
     match feature {
         FeatureToggle::Memory => {
             let mut agent_guard = agent.lock().await;
@@ -481,21 +471,8 @@ pub(super) async fn handle_set_feature(
             };
 
             if let Some(ref old_id) = old_swarm_id {
-                remove_session_from_swarm(
-                    client_session_id,
-                    old_id,
-                    swarm_members,
-                    swarms_by_id,
-                    swarm_coordinators,
-                    swarm_plans,
-                )
-                .await;
-                remove_session_channel_subscriptions(
-                    client_session_id,
-                    channel_subscriptions,
-                    channel_subscriptions_by_session,
-                )
-                .await;
+                swarm.remove_session_from_swarm(client_session_id, old_id).await;
+                swarm.remove_session_channel_subscriptions(client_session_id).await;
             }
 
             if enabled {
@@ -518,7 +495,7 @@ pub(super) async fn handle_set_feature(
                         }
                     }
 
-                    broadcast_swarm_status(id, swarm_members, swarms_by_id).await;
+                    swarm.broadcast_swarm_status(id).await;
                     let swarm_state = SwarmState {
                         members: Arc::clone(swarm_members),
                         swarms_by_id: Arc::clone(swarms_by_id),
@@ -1049,23 +1026,15 @@ fn live_session_owes_continuation(agent: &Agent) -> bool {
 /// the currently-live sessions, and for each idle one that still owes the model
 /// a continuation, injects the standard "continue where you left off" reminder
 /// so the session picks back up without the user having to open each one.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "resuming live sessions needs session, swarm membership, and status event state"
-)]
 pub(super) async fn handle_resume_all_sessions(
     id: u64,
     sessions: &SessionAgents,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
+    swarm: &SwarmServiceHandle,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
     // Snapshot live sessions (those with at least one live client attachment).
     let live_session_ids: Vec<String> = {
-        let members = swarm_members.read().await;
+        let members = swarm.swarm_state.members.read().await;
         members
             .iter()
             .filter(|(_, member)| !member.event_txs.is_empty() || !member.event_tx.is_closed())
@@ -1126,13 +1095,7 @@ pub(super) async fn handle_resume_all_sessions(
             Some(reminder),
             None,
             Some("resuming interrupted session".to_string()),
-            super::live_turn::LiveTurnSwarmContext::new(
-                swarm_members,
-                swarms_by_id,
-                event_history,
-                event_counter,
-                swarm_event_tx,
-            ),
+            swarm.clone(),
         )
         .await;
 

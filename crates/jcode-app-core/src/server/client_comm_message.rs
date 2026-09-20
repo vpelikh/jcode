@@ -1,17 +1,14 @@
-use super::live_turn::{LiveTurnSwarmContext, run_live_turn_if_idle};
-use super::services::SessionServiceHandle;
+use super::live_turn::run_live_turn_if_idle;
+use super::services::{SessionServiceHandle, SwarmServiceHandle};
 use super::{
-    ClientConnectionInfo, SwarmEvent, SwarmEventType, SwarmMember,
-    fanout_session_event, record_swarm_event, truncate_detail,
+    ClientConnectionInfo, SwarmEventType, SwarmMember, fanout_session_event, truncate_detail,
 };
 use crate::protocol::{CommDeliveryMode, NotificationType, ServerEvent};
 use jcode_agent_runtime::SoftInterruptSource;
 use jcode_swarm_core::ChannelIndex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{RwLock, broadcast, mpsc};
-
-type ChannelSubscriptions = Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
+use tokio::sync::{RwLock, mpsc};
 
 async fn swarm_id_for_session(
     session_id: &str,
@@ -110,14 +107,12 @@ pub(super) async fn handle_comm_message(
     tldr: Option<String>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
     session: &SessionServiceHandle,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    channel_subscriptions: &ChannelSubscriptions,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
+    swarm: &SwarmServiceHandle,
     _client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
 ) {
+    let swarm_members = &swarm.swarm_state.members;
+    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let channel_subscriptions = &swarm.channel_subscriptions;
     let sessions = &session.sessions;
     let started = std::time::Instant::now();
     crate::logging::event_info(
@@ -355,13 +350,7 @@ pub(super) async fn handle_comm_message(
                             &notification_msg,
                             reminder,
                             sessions,
-                            LiveTurnSwarmContext::new(
-                                swarm_members,
-                                swarms_by_id,
-                                event_history,
-                                event_counter,
-                                swarm_event_tx,
-                            ),
+                            swarm,
                         )
                         .await;
 
@@ -386,19 +375,17 @@ pub(super) async fn handle_comm_message(
         } else {
             scope.to_string()
         };
-        record_swarm_event(
-            event_history,
-            event_counter,
-            swarm_event_tx,
-            from_session.clone(),
-            friendly_name.clone(),
-            Some(swarm_id.clone()),
-            SwarmEventType::Notification {
-                notification_type: scope_value,
-                message: truncate_detail(&message, 220),
-            },
-        )
-        .await;
+        swarm
+            .record_swarm_event(
+                from_session.clone(),
+                friendly_name.clone(),
+                Some(swarm_id.clone()),
+                SwarmEventType::Notification {
+                    notification_type: scope_value,
+                    message: truncate_detail(&message, 220),
+                },
+            )
+            .await;
 
         let _ = client_event_tx.send(ServerEvent::Done { id });
         crate::logging::event_info(

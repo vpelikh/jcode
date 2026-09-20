@@ -1,14 +1,15 @@
+use super::services::SwarmServiceHandle;
 use super::{
-    SessionInterruptQueues, SwarmEvent, SwarmEventType, SwarmMember, SwarmState, VersionedPlan,
-    broadcast_swarm_status, create_headless_session, persist_swarm_state_for, record_swarm_event,
+    SessionInterruptQueues, SwarmEventType, SwarmState,
+    create_headless_session, persist_swarm_state_for,
     remove_background_tool_signal, remove_session_interrupt_queue,
 };
 use crate::agent::Agent;
 use crate::provider::Provider;
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock};
 
 type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
 
@@ -48,25 +49,22 @@ fn parse_create_session_command(cmd: &str) -> Option<(Option<String>, bool)> {
     None
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "session admin debug commands need sessions, swarm state, provider template, queues, and event history"
-)]
 pub(super) async fn maybe_handle_session_admin_command(
     cmd: &str,
     sessions: &SessionAgents,
     session_id: &Arc<RwLock<String>>,
     provider: &Arc<dyn Provider>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
+    swarm: &SwarmServiceHandle,
     soft_interrupt_queues: &SessionInterruptQueues,
     mcp_pool: Option<Arc<crate::mcp::SharedMcpPool>>,
 ) -> Result<Option<String>> {
+    // Swarm-domain state is reached through the swarm service handle. These
+    // locals keep the body single-homed on the handle's fields instead of a
+    // flat pass-through argument bag (server service split, Slice 4).
+    let swarm_members = &swarm.swarm_state.members;
+    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let swarm_plans = &swarm.swarm_state.plans;
     if let Some((working_dir, selfdev_requested)) = parse_create_session_command(cmd) {
         let create_command = match working_dir {
             Some(dir) => format!("create_session:{dir}"),
@@ -149,31 +147,27 @@ pub(super) async fn maybe_handle_session_admin_command(
         };
 
         if let Some(ref swarm_id) = swarm_id {
-            record_swarm_event(
-                event_history,
-                event_counter,
-                swarm_event_tx,
-                target_id.to_string(),
-                friendly_name.clone(),
-                Some(swarm_id.clone()),
-                SwarmEventType::StatusChange {
-                    old_status: "ready".to_string(),
-                    new_status: "stopped".to_string(),
-                },
-            )
-            .await;
-            record_swarm_event(
-                event_history,
-                event_counter,
-                swarm_event_tx,
-                target_id.to_string(),
-                friendly_name,
-                Some(swarm_id.clone()),
-                SwarmEventType::MemberChange {
-                    action: "left".to_string(),
-                },
-            )
-            .await;
+            swarm
+                .record_swarm_event(
+                    target_id.to_string(),
+                    friendly_name.clone(),
+                    Some(swarm_id.clone()),
+                    SwarmEventType::StatusChange {
+                        old_status: "ready".to_string(),
+                        new_status: "stopped".to_string(),
+                    },
+                )
+                .await;
+            swarm
+                .record_swarm_event(
+                    target_id.to_string(),
+                    friendly_name,
+                    Some(swarm_id.clone()),
+                    SwarmEventType::MemberChange {
+                        action: "left".to_string(),
+                    },
+                )
+                .await;
 
             {
                 let mut swarms = swarms_by_id.write().await;
@@ -213,7 +207,7 @@ pub(super) async fn maybe_handle_session_admin_command(
             };
             persist_swarm_state_for(swarm_id, &swarm_state).await;
 
-            broadcast_swarm_status(swarm_id, swarm_members, swarms_by_id).await;
+            swarm.broadcast_swarm_status(swarm_id).await;
         }
 
         return Ok(Some(format!("Session '{}' destroyed", target_id)));

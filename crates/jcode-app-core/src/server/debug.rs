@@ -267,14 +267,10 @@ pub(super) async fn handle_debug_client(
     let provider = client_service.provider;
     let client_connections = client_service.client_connections;
     let swarm_members = swarm_service.swarm_state.members;
-    let swarms_by_id = swarm_service.swarm_state.swarms_by_id;
-    let swarm_plans = swarm_service.swarm_state.plans;
-    let swarm_coordinators = swarm_service.swarm_state.coordinators;
     let client_debug_state = debug_service.client_debug_state;
     let client_debug_response_tx = debug_service.client_debug_response_tx;
     let debug_jobs = debug_service.debug_jobs;
     let event_history = swarm_service.event_history;
-    let event_counter = swarm_service.event_counter;
     let swarm_event_tx = swarm_service.swarm_event_tx;
     let shutdown_signals = session_service.shutdown_signals;
     let soft_interrupt_queues = session_service.soft_interrupt_queues;
@@ -440,13 +436,7 @@ pub(super) async fn handle_debug_client(
                             &sessions,
                             &session_id,
                             &provider,
-                            &swarm_members,
-                            &swarms_by_id,
-                            &swarm_coordinators,
-                            &swarm_plans,
-                            &event_history,
-                            &event_counter,
-                            &swarm_event_tx,
+                            &swarm_service_handle,
                             &soft_interrupt_queues,
                             mcp_pool.clone(),
                         )

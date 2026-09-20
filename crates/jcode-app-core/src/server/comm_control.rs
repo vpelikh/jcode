@@ -1,7 +1,7 @@
 #![cfg_attr(test, allow(clippy::items_after_test_module))]
 
 use super::append_swarm_completion_report_instructions;
-use super::services::SessionServiceHandle;
+use super::services::{SessionServiceHandle, SwarmServiceHandle};
 use super::swarm::{
     now_unix_ms, swarm_task_heartbeat_interval, swarm_task_stale_after, touch_swarm_task_progress,
 };
@@ -13,7 +13,7 @@ use super::swarm_mutation_state::{
 use super::{
     ClientConnectionInfo, SwarmEvent, SwarmEventType, SwarmMember, SwarmMutationRuntime,
     SwarmState, SwarmTaskProgress, VersionedPlan, broadcast_swarm_plan,
-    broadcast_swarm_plan_with_previous, broadcast_swarm_status, fanout_session_event,
+    broadcast_swarm_plan_with_previous, fanout_session_event,
     persist_swarm_state_for, record_swarm_event,
     set_member_task_label, truncate_detail, update_member_status, update_member_status_with_report,
 };
@@ -1208,10 +1208,6 @@ fn task_progress_event_sender(
     tx
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "role assignment coordinates sessions, swarm membership, coordinators, and event history"
-)]
 pub(super) async fn handle_comm_assign_role(
     id: u64,
     req_session_id: String,
@@ -1219,15 +1215,11 @@ pub(super) async fn handle_comm_assign_role(
     role: String,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
     sessions: &SessionAgents,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
-    swarm_mutation_runtime: &SwarmMutationRuntime,
+    swarm: &SwarmServiceHandle,
 ) {
+    let swarm_members = &swarm.swarm_state.members;
+    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let swarm_mutation_runtime = &swarm.swarm_mutation_runtime;
     let (swarm_id, is_coordinator) = {
         let members = swarm_members.read().await;
         let swarm_id = members
@@ -1340,19 +1332,10 @@ pub(super) async fn handle_comm_assign_role(
         }
     }
 
-    let swarm_state = SwarmState {
-        members: Arc::clone(swarm_members),
-        swarms_by_id: Arc::clone(swarms_by_id),
-        plans: Arc::clone(swarm_plans),
-        coordinators: Arc::clone(swarm_coordinators),
-    };
-    persist_swarm_state_for(&swarm_id, &swarm_state).await;
+    persist_swarm_state_for(&swarm_id, &swarm.swarm_state).await;
 
-    broadcast_swarm_status(&swarm_id, swarm_members, swarms_by_id).await;
-    record_swarm_event(
-        event_history,
-        event_counter,
-        swarm_event_tx,
+    swarm.broadcast_swarm_status(&swarm_id).await;
+    swarm.record_swarm_event(
         req_session_id,
         None,
         Some(swarm_id),

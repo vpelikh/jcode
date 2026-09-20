@@ -224,12 +224,7 @@ pub(super) async fn handle_lightweight_control_request(
                 tldr,
                 &client_event_tx,
                 session,
-                swarm_members,
-                swarms_by_id,
-                channel_subscriptions,
-                event_history,
-                event_counter,
-                swarm_event_tx,
+                swarm,
                 client_connections,
             )
             .await;
@@ -521,14 +516,7 @@ pub(super) async fn handle_lightweight_control_request(
                 role,
                 &client_event_tx,
                 sessions,
-                swarm_members,
-                swarms_by_id,
-                swarm_coordinators,
-                swarm_plans,
-                event_history,
-                event_counter,
-                swarm_event_tx,
-                swarm_mutation_runtime,
+                swarm,
             )
             .await;
         }

@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use futures::stream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::broadcast;
 
 struct IsolatedRuntimeDir {
     _prev_runtime: Option<std::ffi::OsString>,
@@ -20,6 +21,35 @@ struct IsolatedReloadRecoveryEnv {
     prev_runtime: Option<std::ffi::OsString>,
     _home: tempfile::TempDir,
     _runtime: tempfile::TempDir,
+}
+
+/// Builds a minimal `SwarmServiceHandle` backed by the given flat swarm maps,
+/// so tests of the live-turn / cancel paths can route member-status updates
+/// through the handle instead of constructing one inline.
+fn test_swarm_status_handle(
+    swarm_members: &Arc<RwLock<HashMap<String, crate::server::SwarmMember>>>,
+    swarms_by_id: &Arc<RwLock<HashMap<String, std::collections::HashSet<String>>>>,
+    event_history: &Arc<RwLock<std::collections::VecDeque<crate::server::SwarmEvent>>>,
+    event_counter: &Arc<std::sync::atomic::AtomicU64>,
+    swarm_event_tx: &broadcast::Sender<crate::server::SwarmEvent>,
+) -> crate::server::services::SwarmServiceHandle {
+    crate::server::services::SwarmServiceHandle {
+        swarm_state: SwarmState {
+            members: Arc::clone(swarm_members),
+            swarms_by_id: Arc::clone(swarms_by_id),
+            plans: Arc::new(RwLock::new(HashMap::new())),
+            coordinators: Arc::new(RwLock::new(HashMap::new())),
+        },
+        shared_context: Arc::new(RwLock::new(HashMap::new())),
+        file_touch: FileTouchService::new(),
+        channel_subscriptions: Arc::new(RwLock::new(HashMap::new())),
+        channel_subscriptions_by_session: Arc::new(RwLock::new(HashMap::new())),
+        event_history: Arc::clone(event_history),
+        event_counter: Arc::clone(event_counter),
+        swarm_event_tx: swarm_event_tx.clone(),
+        await_members_runtime: AwaitMembersRuntime::default(),
+        swarm_mutation_runtime: SwarmMutationRuntime::default(),
+    }
 }
 
 #[tokio::test]
@@ -353,6 +383,13 @@ async fn cancel_without_local_task_still_signals_session_control() {
     let event_history = Arc::new(RwLock::new(std::collections::VecDeque::new()));
     let event_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (swarm_event_tx, _) = broadcast::channel(8);
+    let swarm_service_handle = test_swarm_status_handle(
+        &swarm_members,
+        &swarms_by_id,
+        &event_history,
+        &event_counter,
+        &swarm_event_tx,
+    );
     let mut client_is_processing = true;
     let mut message_id = Some(99);
     let mut session_id = Some("session_detached_cancel".to_string());
@@ -368,11 +405,7 @@ async fn cancel_without_local_task_still_signals_session_control() {
         &control,
         &client_event_tx,
         &SwarmStatusRefs {
-            members: &swarm_members,
-            swarms_by_id: &swarms_by_id,
-            event_history: &event_history,
-            event_counter: &event_counter,
-            event_tx: &swarm_event_tx,
+            swarm: &swarm_service_handle,
         },
         Some(99),
         None,
@@ -434,12 +467,14 @@ async fn deferred_cancel_reset_does_not_erase_newer_cancel() {
             },
             &control,
             &client_event_tx,
-            &SwarmStatusRefs {
-                members: &swarm_members,
-                swarms_by_id: &swarms_by_id,
-                event_history: &event_history,
-                event_counter: &event_counter,
-                event_tx: &swarm_event_tx,
+                        &SwarmStatusRefs {
+                swarm: &test_swarm_status_handle(
+                    &swarm_members,
+                    &swarms_by_id,
+                    &event_history,
+                    &event_counter,
+                    &swarm_event_tx,
+                ),
             },
             Some(request_id),
             None,
@@ -607,12 +642,14 @@ fn cancel_aborts_detached_streaming_turn_with_stale_stop_signal() -> anyhow::Res
             },
             &control,
             &client_event_tx,
-            &SwarmStatusRefs {
-                members: &swarm_members,
-                swarms_by_id: &swarms_by_id,
-                event_history: &event_history,
-                event_counter: &event_counter,
-                event_tx: &swarm_event_tx,
+                        &SwarmStatusRefs {
+                swarm: &test_swarm_status_handle(
+                    &swarm_members,
+                    &swarms_by_id,
+                    &event_history,
+                    &event_counter,
+                    &swarm_event_tx,
+                ),
             },
             Some(1),
             None,
@@ -694,12 +731,14 @@ fn idle_cancel_does_not_arm_the_signal_for_the_next_turn() -> anyhow::Result<()>
             },
             &control,
             &client_event_tx,
-            &SwarmStatusRefs {
-                members: &swarm_members,
-                swarms_by_id: &swarms_by_id,
-                event_history: &event_history,
-                event_counter: &event_counter,
-                event_tx: &swarm_event_tx,
+                        &SwarmStatusRefs {
+                swarm: &test_swarm_status_handle(
+                    &swarm_members,
+                    &swarms_by_id,
+                    &event_history,
+                    &event_counter,
+                    &swarm_event_tx,
+                ),
             },
             Some(1),
             None,
@@ -1009,12 +1048,14 @@ fn reload_starting_rejects_new_turn_without_spawning_processing_task() {
             &client_event_tx,
             &processing_done_tx,
             Vec::new(),
-            &SwarmStatusRefs {
-                members: &swarm_members,
-                swarms_by_id: &swarms_by_id,
-                event_history: &event_history,
-                event_counter: &event_counter,
-                event_tx: &swarm_event_tx,
+                        &SwarmStatusRefs {
+                swarm: &test_swarm_status_handle(
+                    &swarm_members,
+                    &swarms_by_id,
+                    &event_history,
+                    &event_counter,
+                    &swarm_event_tx,
+                ),
             },
         )
         .await;
@@ -1110,12 +1151,14 @@ async fn client_initiated_turn_fans_out_stream_and_terminal_events_to_live_attac
         &origin_tx,
         &processing_done_tx,
         Vec::new(),
-        &SwarmStatusRefs {
-            members: &swarm_members,
-            swarms_by_id: &swarms_by_id,
-            event_history: &event_history,
-            event_counter: &event_counter,
-            event_tx: &swarm_event_tx,
+                &SwarmStatusRefs {
+            swarm: &test_swarm_status_handle(
+                &swarm_members,
+                &swarms_by_id,
+                &event_history,
+                &event_counter,
+                &swarm_event_tx,
+            ),
         },
     )
     .await;
@@ -1235,12 +1278,14 @@ fn accepted_reload_recovery_continuation_marks_intent_delivered() -> anyhow::Res
             &client_event_tx,
             &processing_done_tx,
             Vec::new(),
-            &SwarmStatusRefs {
-                members: &swarm_members,
-                swarms_by_id: &swarms_by_id,
-                event_history: &event_history,
-                event_counter: &event_counter,
-                event_tx: &swarm_event_tx,
+                        &SwarmStatusRefs {
+                swarm: &test_swarm_status_handle(
+                    &swarm_members,
+                    &swarms_by_id,
+                    &event_history,
+                    &event_counter,
+                    &swarm_event_tx,
+                ),
             },
         )
         .await;
@@ -1335,12 +1380,14 @@ fn reload_starting_rejects_new_turns_for_multiple_sessions() {
                 &client_event_tx,
                 &processing_done_tx,
                 Vec::new(),
-                &SwarmStatusRefs {
-                    members: &swarm_members,
-                    swarms_by_id: &swarms_by_id,
-                    event_history: &event_history,
-                    event_counter: &event_counter,
-                    event_tx: &swarm_event_tx,
+                                &SwarmStatusRefs {
+                    swarm: &test_swarm_status_handle(
+                        &swarm_members,
+                        &swarms_by_id,
+                        &event_history,
+                        &event_counter,
+                        &swarm_event_tx,
+                    ),
                 },
             )
             .await;

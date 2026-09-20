@@ -1,14 +1,17 @@
-use super::{handle_comm_assign_next, handle_comm_assign_task, handle_comm_task_control};
+use super::{
+    handle_comm_assign_next, handle_comm_assign_role, handle_comm_assign_task,
+    handle_comm_task_control,
+};
 use crate::agent::Agent;
 use crate::message::{Message, StreamEvent, ToolDefinition};
 use crate::plan::PlanItem;
 use crate::protocol::ServerEvent;
 use crate::provider::{EventStream, Provider};
 use crate::server::comm_await::{CommAwaitMembersContext, handle_comm_await_members};
-use crate::server::services::SessionServiceHandle;
+use crate::server::services::{SessionServiceHandle, SwarmServiceHandle};
 use crate::server::{
-    AwaitMembersRuntime, SwarmEvent, SwarmEventType, SwarmMember, SwarmMutationRuntime,
-    VersionedPlan,
+    AwaitMembersRuntime, FileTouchService, SwarmEvent, SwarmEventType, SwarmMember,
+    SwarmMutationRuntime, SwarmState, VersionedPlan,
 };
 use crate::tool::Registry;
 use anyhow::Result;
@@ -180,3 +183,4 @@ include!("comm_control_tests/await_upgrade_background.rs");
 include!("comm_control_tests/dag_e2e.rs");
 include!("comm_control_tests/auto_worker_filter.rs");
 include!("comm_control_tests/client_attached_dispatch.rs");
+include!("comm_control_tests/assign_role.rs");

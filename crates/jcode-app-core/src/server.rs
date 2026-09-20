@@ -935,6 +935,7 @@ impl Server {
     }
 
     async fn recover_headless_sessions_on_startup(&self) {
+        let swarm = services::SwarmServiceHandle::from_server(self);
         let sessions_to_restore = {
             let members = self.swarm_state.members.read().await;
             members
@@ -977,17 +978,13 @@ impl Server {
                         "Failed to load headless session {} during startup recovery: {}",
                         session_id, error
                     ));
-                    update_member_status(
-                        &session_id,
-                        "failed",
-                        Some(truncate_detail(&error.to_string(), 120)),
-                        &self.swarm_state.members,
-                        &self.swarm_state.swarms_by_id,
-                        Some(&self.event_history),
-                        Some(&self.event_counter),
-                        Some(&self.swarm_event_tx),
-                    )
-                    .await;
+                    swarm
+                        .set_member_status(
+                            &session_id,
+                            "failed",
+                            Some(truncate_detail(&error.to_string(), 120)),
+                        )
+                        .await;
                     if let Some(swarm_id) = {
                         let members = self.swarm_state.members.read().await;
                         members
@@ -1077,17 +1074,9 @@ impl Server {
                     "restored session was not interrupted by reload",
                 );
                 stats.skipped += 1;
-                update_member_status(
-                    &session_id,
-                    "ready",
-                    None,
-                    &self.swarm_state.members,
-                    &self.swarm_state.swarms_by_id,
-                    Some(&self.event_history),
-                    Some(&self.event_counter),
-                    Some(&self.swarm_event_tx),
-                )
-                .await;
+                swarm
+                    .set_member_status(&session_id, "ready", None)
+                    .await;
                 if let Some(swarm_id) = {
                     let members = self.swarm_state.members.read().await;
                     members
@@ -1127,12 +1116,9 @@ impl Server {
                 "restored interrupted headless session after reload",
             );
             let recover_swarm_members = Arc::clone(&self.swarm_state.members);
-            let recover_swarms_by_id = Arc::clone(&self.swarm_state.swarms_by_id);
-            let recover_event_history = Arc::clone(&self.event_history);
-            let recover_event_counter = Arc::clone(&self.event_counter);
-            let recover_swarm_event_tx = self.swarm_event_tx.clone();
             let recover_swarm_state = self.swarm_state.clone();
             let recovery_reload_id = stored_recovery_record.map(|record| record.reload_id);
+            let recover_swarm_handle = swarm.clone();
 
             tokio::spawn(async move {
                 if let Some(reload_id) = recovery_reload_id.as_deref() {
@@ -1145,17 +1131,13 @@ impl Server {
                         }),
                     );
                 }
-                update_member_status(
-                    &session_id,
-                    "running",
-                    Some("resuming after reload".to_string()),
-                    &recover_swarm_members,
-                    &recover_swarms_by_id,
-                    Some(&recover_event_history),
-                    Some(&recover_event_counter),
-                    Some(&recover_swarm_event_tx),
-                )
-                .await;
+                recover_swarm_handle
+                    .set_member_status(
+                        &session_id,
+                        "running",
+                        Some("resuming after reload".to_string()),
+                    )
+                    .await;
                 if let Some(swarm_id) = {
                     let members = recover_swarm_members.read().await;
                     members
@@ -1233,17 +1215,9 @@ impl Server {
                         ("failed", Some(truncate_detail(&error.to_string(), 120)))
                     }
                 };
-                update_member_status(
-                    &session_id,
-                    status,
-                    detail,
-                    &recover_swarm_members,
-                    &recover_swarms_by_id,
-                    Some(&recover_event_history),
-                    Some(&recover_event_counter),
-                    Some(&recover_swarm_event_tx),
-                )
-                .await;
+                recover_swarm_handle
+                    .set_member_status(&session_id, status, detail)
+                    .await;
                 if let Some(swarm_id) = {
                     let members = recover_swarm_members.read().await;
                     members
