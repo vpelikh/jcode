@@ -26,10 +26,9 @@ fn gate_recheck_that_fails_surfaces_and_finishes_closed() {
         // A converged loop that also fixed files must request the re-check.
         let mut state = jcode_session_types::ReviewLoopState::new();
         state.finished = true;
-        state.needs_gate_recheck = true;
         state.current_lens = Some(jcode_session_types::ReviewLens::Correctness);
 
-        super::commands_review::finish_review_loop(&mut app, &mut state);
+        super::commands_review::finish_review_loop(&mut app, &mut state, true);
 
         // The loop is left finished (never re-enters review), with the reason
         // recording that the post-review gate re-check disagreed.
@@ -78,10 +77,9 @@ fn gate_recheck_that_fails_on_ownership_surfaces_ownership_reason() {
 
         let mut state = jcode_session_types::ReviewLoopState::new();
         state.finished = true;
-        state.needs_gate_recheck = true;
         state.current_lens = Some(jcode_session_types::ReviewLens::Correctness);
 
-        super::commands_review::finish_review_loop(&mut app, &mut state);
+        super::commands_review::finish_review_loop(&mut app, &mut state, true);
 
         assert!(state.finished);
         let reason = state.finish_reason.as_deref().unwrap_or_default();
@@ -94,10 +92,9 @@ fn gate_recheck_that_fails_on_ownership_surfaces_ownership_reason() {
             "expected the ownership gate reason, got {reason:?}"
         );
         assert!(
-            app.display_messages().iter().any(|msg| {
-                msg.content
-                    .contains("completion assessment now disagrees")
-            }),
+            app.display_messages()
+                .iter()
+                .any(|msg| { msg.content.contains("completion assessment now disagrees") }),
             "expected the failure to be surfaced for the ownership gate"
         );
     });
@@ -118,10 +115,9 @@ fn gate_recheck_that_fails_on_confidence_spike_surfaces() {
 
         let mut state = jcode_session_types::ReviewLoopState::new();
         state.finished = true;
-        state.needs_gate_recheck = true;
         state.current_lens = Some(jcode_session_types::ReviewLens::Correctness);
 
-        super::commands_review::finish_review_loop(&mut app, &mut state);
+        super::commands_review::finish_review_loop(&mut app, &mut state, true);
 
         assert!(state.finished);
         let reason = state.finish_reason.as_deref().unwrap_or_default();
@@ -134,10 +130,9 @@ fn gate_recheck_that_fails_on_confidence_spike_surfaces() {
             "expected the confidence gate reason for a spike, got {reason:?}"
         );
         assert!(
-            app.display_messages().iter().any(|msg| {
-                msg.content
-                    .contains("completion assessment now disagrees")
-            }),
+            app.display_messages()
+                .iter()
+                .any(|msg| { msg.content.contains("completion assessment now disagrees") }),
             "expected the spike failure to be surfaced"
         );
     });
@@ -165,19 +160,17 @@ fn gate_recheck_that_passes_finishes_cleanly() {
 
         let mut state = jcode_session_types::ReviewLoopState::new();
         state.finished = true;
-        state.needs_gate_recheck = true;
         state.current_lens = Some(jcode_session_types::ReviewLens::Correctness);
 
-        super::commands_review::finish_review_loop(&mut app, &mut state);
+        super::commands_review::finish_review_loop(&mut app, &mut state, true);
 
         assert!(state.finished);
         assert_eq!(state.finish_reason.as_deref(), Some("converged"));
         // No failure-surfacing message.
         assert!(
-            !app.display_messages().iter().any(|msg| {
-                msg.content
-                    .contains("completion assessment now disagrees")
-            }),
+            !app.display_messages()
+                .iter()
+                .any(|msg| { msg.content.contains("completion assessment now disagrees") }),
             "a passing gate re-check must not surface a failure"
         );
     });
@@ -194,19 +187,16 @@ fn finish_without_gate_recheck_emits_digest_and_does_not_touch_gates() {
         // the loop done.
         let mut state = jcode_session_types::ReviewLoopState::new();
         state.finished = true;
-        state.needs_gate_recheck = false;
         state.current_lens = Some(jcode_session_types::ReviewLens::Correctness);
 
-        super::commands_review::finish_review_loop(&mut app, &mut state);
+        super::commands_review::finish_review_loop(&mut app, &mut state, false);
 
         assert!(state.finished);
-        assert!(!state.needs_gate_recheck);
         // No failure-surfacing message and no spurious gate evaluation.
         assert!(
-            !app.display_messages().iter().any(|msg| {
-                msg.content
-                    .contains("completion assessment now disagrees")
-            }),
+            !app.display_messages()
+                .iter()
+                .any(|msg| { msg.content.contains("completion assessment now disagrees") }),
             "a no-re-check finish must not surface a gate failure"
         );
         assert!(
@@ -245,9 +235,8 @@ fn save_completed_todo(session_id: &str, completion_confidence: Option<u8>) {
             blocked_by: Vec::new(),
             assigned_to: None,
             confidence: None,
-            completion_confidence: completion_confidence.map(|score| {
-                crate::todo::ConfidenceState::from_legacy_score(score)
-            }),
+            completion_confidence: completion_confidence
+                .map(|score| crate::todo::ConfidenceState::from_legacy_score(score)),
             confidence_history: match completion_confidence {
                 // Validated -> Verified: a single-level step, no spike.
                 Some(_) => vec![
@@ -308,9 +297,9 @@ fn passing_goal() -> crate::todo::TodoGoal {
 // the *producer*: `step_review_loop`, which is what `schedule_turn_end_followups`
 // invokes every turn while the loop is active. They exercise the real path —
 // poll the persisted reviewer child session, parse its `VERDICT`, run the engine
-// through `apply_verdict`/`advance_lens`, converge, set `needs_gate_recheck`,
-// and then evaluate the completion gates — rather than handing a finished state
-// straight to the digest/emit stage.
+// through `apply_verdict`/`advance_lens`, converge, derive whether the review
+// changed files, and then evaluate the completion gates — rather than handing a
+// finished state straight to the digest/emit stage.
 
 /// Drive the review engine to one step short of convergence: all lenses clean on
 /// the first pass, then all but the last lens clean on the confirmation pass,
@@ -398,16 +387,24 @@ fn step_review_loop_converges_with_fix_and_gate_recheck_surfaces_on_failure() {
             reason.ends_with("completion confidence needs re-validation"),
             "expected the confidence gate reason through step_review_loop, got {reason:?}"
         );
-        assert!(
-            !state.needs_gate_recheck,
-            "the one-shot gate re-check flag must be consumed"
-        );
+        // The loop is finished above, so the one-shot re-check cannot re-trigger.
         assert!(
             app.display_messages().iter().any(|msg| {
                 msg.content
                     .contains("Review fixed files, but the completion assessment now disagrees")
             }),
             "expected the failure to be surfaced through the real turn-end path"
+        );
+        // The end-of-loop digest must also reflect the disagreement in its
+        // "Finish reason" line, not just the one-off surface message. A record
+        // is present (drive_to_final_confirmation_lens seeds one), so the full
+        // digest is rendered with the failed reason.
+        assert!(
+            app.display_messages().iter().any(|msg| {
+                msg.content
+                    .contains("Finish reason: converged_gate_recheck_failed")
+            }),
+            "expected the digest to record the gate-recheck failure reason"
         );
     });
 }
@@ -447,15 +444,52 @@ fn step_review_loop_converges_with_fix_and_gate_recheck_passes_cleanly() {
         assert!(state.finished);
         assert_eq!(state.finish_reason.as_deref(), Some("converged"));
         assert!(
-            !state.needs_gate_recheck,
-            "the one-shot gate re-check flag must be consumed"
-        );
-        assert!(
-            !app.display_messages().iter().any(|msg| {
-                msg.content
-                    .contains("completion assessment now disagrees")
-            }),
+            !app.display_messages()
+                .iter()
+                .any(|msg| { msg.content.contains("completion assessment now disagrees") }),
             "a passing gate re-check must not surface a failure through step_review_loop"
+        );
+    });
+}
+
+#[test]
+fn step_review_loop_converged_without_fix_never_runs_gate_recheck() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        let parent_session_id = app.session_id().to_string();
+
+        // No todos persisted at all. The review converges WITHOUT touching any
+        // files (empty touched_files), so `review_touched_files` is false and
+        // the completion gates must NOT be re-run.
+        let mut state = drive_to_final_confirmation_lens(vec![]);
+
+        let mut reviewer = crate::session::Session::create(None, None);
+        let reviewer_id = reviewer.id.clone();
+        reviewer.add_message_with_display_role(
+            crate::message::Role::User,
+            vec![crate::message::ContentBlock::Text {
+                text: "VERDICT: CLEAN".to_string(),
+                cache_control: None,
+            }],
+            None,
+        );
+        reviewer.save().expect("save reviewer session");
+
+        state.active_reviewer_id = Some(reviewer_id);
+        app.session.review_loop = Some(state);
+
+        let followup = super::commands_review::step_review_loop(&mut app);
+
+        assert!(!followup);
+        let state = app.session.review_loop.as_ref().unwrap();
+        assert!(state.finished);
+        assert_eq!(state.finish_reason.as_deref(), Some("converged"));
+        // No gate re-check ran, so no failure surfaced and the digest is present.
+        assert!(
+            !app.display_messages()
+                .iter()
+                .any(|msg| { msg.content.contains("completion assessment now disagrees") }),
+            "a converged-without-fix review must not run the gate re-check"
         );
     });
 }
