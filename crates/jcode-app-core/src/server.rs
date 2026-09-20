@@ -63,7 +63,7 @@ use self::headless::create_headless_session;
 use self::reload::await_reload_signal;
 use self::runtime::ServerRuntime;
 use self::swarm::{
-    MAX_SWARM_MEMBERS, broadcast_swarm_plan, broadcast_swarm_plan_with_previous,
+    MAX_SWARM_MEMBERS, broadcast_swarm_plan,
     expired_terminal_member_ids, member_consumes_swarm_capacity, record_swarm_event,
     record_swarm_event_for_session, refresh_swarm_task_staleness, remove_session_from_swarm,
     run_swarm_message, send_swarm_plan_to_session, set_member_task_label,
@@ -1454,6 +1454,16 @@ impl Server {
             });
         }
 
+        // Give the decoupled Telegram/Discord control loops access to the live
+        // session registry and provider BEFORE the ambient reply loop is
+        // spawned below. The ambient loop starts the per-channel reply pollers,
+        // which can serve a `/new` (creating a headless session) or `/resume`
+        // on their very first `getUpdates` poll. If registration happened after
+        // the spawn, a fast incoming message could observe an unregistered
+        // provider and fail with "no provider registered for session creation".
+        crate::server::telegram_control::register_live_sessions(Arc::clone(&self.sessions));
+        crate::server::telegram_control::register_provider(Arc::clone(&self.provider));
+
         // Spawn the background ambient/schedule loop.
         if let Some(ref runner) = self.ambient_runner {
             let ambient_handle = runner.clone();
@@ -1463,11 +1473,6 @@ impl Server {
                 ambient_handle.run_loop(ambient_provider).await;
             });
         }
-
-        // Give the decoupled Telegram/Discord control loops access to the live
-        // session registry so `/resume`/`/use` can message a running session.
-        crate::server::telegram_control::register_live_sessions(Arc::clone(&self.sessions));
-        crate::server::telegram_control::register_provider(Arc::clone(&self.provider));
 
         // Spawn the Jade cloud relay listener independently of ambient mode. The
         // worker is strictly opt-in and requires an explicit API base, token,

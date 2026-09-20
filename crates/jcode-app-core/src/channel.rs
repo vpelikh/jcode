@@ -782,9 +782,13 @@ impl TelegramChannel {
             Ok(text) if text != "(no visible messages)" => {
                 // Escape only the dynamic message bodies so the history cannot
                 // break parse_mode=MarkdownV2, while keeping the role labels bold.
-                format!("📜 [{}]\n{}", short_id(&session_id), escape_history_entries(&text))
+                let sid = mdv2_bracketed_id(&short_id(&session_id));
+                format!("📜 {sid}\n{}", escape_history_entries(&text))
             }
-            Ok(text) => format!("[{}] {}", short_id(&session_id), text),
+            Ok(text) => {
+                let sid = mdv2_bracketed_id(&short_id(&session_id));
+                format!("{sid} {text}")
+            }
             Err(e) => format!(
                 "⚠️ Could not read history for `{}`: {}",
                 short_id(&session_id),
@@ -1711,30 +1715,39 @@ impl ConfirmationTracker {
     }
 }
 
+/// Render `[<short>]` as a MarkdownV2-safe literal bracket pair. Telegram's
+/// MarkdownV2 reserves BOTH `[` and `]` (plus `_ * ( ) ~ ` > # + - = | { } . !`
+/// and `\`), so a bare `]` triggers `Bad Request: can't parse entities:
+/// Character ']' is reserved`. Yet these templates historically escaped only the
+/// opening `[` and left the closing `]` raw, which is why every streamed/session
+/// reply was rejected before it could display. We escape both brackets AND any
+/// reserved characters inside the id here, so the prefix is always parse-safe.
+fn mdv2_bracketed_id(short: &str) -> String {
+    format!("\\[{}\\]", escape_markdown_v2(short))
+}
 
 /// Format an agent reply for a session-reply message, escaping the reply text
-/// so it cannot break Telegram's MarkdownV2 `parse_mode`. The reply
-/// follows the short session id on the same line; the id itself is a short
-/// hash and needs no escaping.
+/// so it cannot break Telegram's MarkdownV2 `parse_mode`. The reply follows the
+/// MarkdownV2-safe `[<short id>]` prefix on the same line.
 fn agent_reply_message(session_id: &str, reply: &str) -> String {
     format!(
-        "💬 \\[{}] {}",
-        short_id(session_id),
+        "💬 {} {}",
+        mdv2_bracketed_id(&short_id(session_id)),
         escape_markdown_v2(reply)
     )
 }
 
 /// MarkdownV2 placeholder shown while a session reply is streaming. The `[` `]`
-/// around the short id are escaped; the `_thinking…_` is literal italic.
+/// around the short id are both escaped; the `_thinking…_` is literal italic.
 fn streaming_placeholder(short: &str) -> String {
-    format!("💭 \\[{short}] _thinking…_")
+    format!("💭 {} _thinking…_", mdv2_bracketed_id(short))
 }
 
 /// MarkdownV2 end-state shown when a turn settles with no assistant output
 /// (typically a Stop tapped before any tokens arrived). Replaces the dangling
 /// placeholder/empty prefix with an honest "stopped" note.
 fn streaming_stopped_message(short: &str) -> String {
-    format!("💬 \\[{short}] ⏹ _stopped — no output produced_")
+    format!("💬 {} ⏹ _stopped — no output produced_", mdv2_bracketed_id(short))
 }
 
 /// Cap a MarkdownV2 message body so it never exceeds Telegram's per-message
@@ -1832,7 +1845,7 @@ async fn stream_reply_to_session(
         let chat_id = chat_id.clone();
         let sid = sid.clone();
         async move {
-            let body = format!("💬 \\[{}] {}", sid, escape_markdown_v2(&partial));
+            let body = format!("💬 {} {}", mdv2_bracketed_id(&sid), escape_markdown_v2(&partial));
             crate::telegram::edit_message_text(
                 &client,
                 &token,
@@ -1896,8 +1909,8 @@ async fn stream_reply_to_session(
             // mark it so the user knows the live preview is not the whole
             // answer and can open `/history` for the rest.
             let full = format!(
-                "💬 \\[{}] {}",
-                short_id(session_id),
+                "💬 {} {}",
+                mdv2_bracketed_id(&short_id(session_id)),
                 escape_markdown_v2(&reply)
             );
             if full.chars().count() > crate::telegram::MAX_MESSAGE_CHARS {
@@ -1912,8 +1925,8 @@ async fn stream_reply_to_session(
                     clipped_body_text.pop();
                 }
                 let clipped_body = format!(
-                    "💬 \\[{}] {}{note}",
-                    short_id(session_id),
+                    "💬 {} {}{note}",
+                    mdv2_bracketed_id(&short_id(session_id)),
                     clipped_body_text
                 );
                 let _ = crate::telegram::edit_message_text(
@@ -3654,23 +3667,39 @@ mod tests {
 
     #[test]
     fn test_streaming_message_templates_are_markdown_v2_safe() {
-        // These are sent with parse_mode=MarkdownV2. The `[` around the id is
-        // escaped (`\[`); a bare `]` after the id is tolerated by Telegram the
-        // same way the pre-existing agent_reply_message (`💬 \[sid] …`) works.
-        // Everything else in the templates must be non-reserved (or the `_`
-        // italic delimiters). Pin the exact output so a change to escaping is
-        // caught.
-        assert_eq!(streaming_placeholder("fox"), "💭 \\[fox] _thinking…_");
+        // These are sent with parse_mode=MarkdownV2. BOTH `[` and `]` around the
+        // short id are reserved in Telegram MarkdownV2 and must be escaped, or
+        // Telegram rejects the whole message with "Character ']' is reserved".
+        // Pin the exact output so a change to escaping is caught.
+        assert_eq!(streaming_placeholder("fox"), "💭 \\[fox\\] _thinking…_");
         assert_eq!(
             streaming_stopped_message("fox"),
-            "💬 \\[fox] ⏹ _stopped — no output produced_"
+            "💬 \\[fox\\] ⏹ _stopped — no output produced_"
         );
-        // Round-trip the dynamic short id through the templates: a short id with
-        // no reserved chars must survive unchanged (no accidental double-escape
-        // or injected parsed markup).
         assert_eq!(
-            streaming_stopped_message(&crate::telegram::escape_markdown_v2("fox")),
-            streaming_stopped_message("fox")
+            agent_reply_message("session_fox_1_aabbccddeeff0011", "plain reply"),
+            "💬 \\[fox\\] plain reply"
+        );
+        // A short id containing reserved characters must be escaped inside the
+        // brackets (both the id and the brackets), not pass through raw.
+        assert_eq!(
+            streaming_placeholder("fox-a (1)"),
+            "💭 \\[fox\\-a \\(1\\)\\] _thinking…_"
+        );
+        // The helper expects a RAW short id (as produced by short_id(), which is
+        // alphanumeric), and escapes the content exactly once. Passing an
+        // already-escaped id would double-escape the reserved characters, so we
+        // pin that contract to make it visible and prevent callers from feeding
+        // pre-escaped input thinking it is idempotent.
+        assert_eq!(
+            mdv2_bracketed_id("fox-a"),
+            "\\[fox\\-a\\]",
+            "raw id -> brackets + content escaped once"
+        );
+        assert_eq!(
+            mdv2_bracketed_id(&crate::telegram::escape_markdown_v2("fox-a")),
+            "\\[fox\\\\\\-a\\]",
+            "pre-escaped input would double-escape; callers must pass raw ids"
         );
     }
 
