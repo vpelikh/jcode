@@ -28,8 +28,13 @@ reduce argument fanout **without changing the single-process runtime model**.
 ## Executive Summary
 
 > **Landing status (2026-09):** Slices 1-3 are landed (service-handle structs,
-> `ServerRuntime` wiring, and handler-signature narrowing). This summary
-> describes the problems the split set out to solve and the current state.
+> `ServerRuntime` wiring, and handler-signature narrowing). The session-service
+> consolidation is also complete: all six modules that called
+> `queue_soft_interrupt_for_session` directly (`jade_relay`,
+> `background_tasks`, `client_actions`, `comm_plan`, `comm_control`,
+> `client_comm_message`) now route through `SessionServiceHandle::
+> queue_soft_interrupt`. This summary describes the problems the split set out
+> to solve and the current state.
 
 The architecture was a single broad state owner, now incrementally moved onto
 service handles:
@@ -513,14 +518,31 @@ applied end-to-end to one complete module: `jade_relay` single-homes all of its
 (`spawn_if_configured` -> `run`/`run_from_after` -> `handle_prompt`/
 `handle_cancel`/`handle_launch` -> `deliver_to_session`/`spawn_session_listener`).
 
-The remaining session-service consolidation is a distinct future slice: route
-the other five modules that still call `queue_soft_interrupt_for_session`
-(`comm_control`, `client_actions`, `background_tasks`, `comm_plan`,
-`client_comm_message`) through `SessionServiceHandle::queue_soft_interrupt`,
-plus reducing the few remaining swarm-domain free-function call sites. This is
-purely mechanical, behavior-preserving churn; each module should be converted
-and tested independently. The router clone-then-destructure refactor in
-`handle_client` remains a separate decision (cosmetic, high-churn).
+The session-service consolidation is now complete across all six modules that
+previously called `queue_soft_interrupt_for_session` directly: `jade_relay`,
+`background_tasks` (`dispatch_background_task_completion`, `_stalled`, and
+`dispatch_swarm_await_completion`), `client_actions`
+(`handle_notify_session`, via `NotifySessionContext`), `comm_plan`
+(`handle_comm_propose_plan`/`approve_plan`/`reject_plan`), `comm_control`
+(`handle_comm_assign_task`/`assign_next`/`task_control`), and
+`client_comm_message` (`handle_comm_message`). Each now takes
+`&SessionServiceHandle` (or holds it in its router context) instead of the
+`sessions`/`soft_interrupt_queues` flat pair, binds the `sessions` map from the
+handle where live-turn reads and spawns still need it, and routes every
+`queue_soft_interrupt_for_session` call through
+`SessionServiceHandle::queue_soft_interrupt`. `LightweightControlContext` gains
+a `session` field so both the normal and lightweight request routers pass the
+handle through to the comm handlers. Test fixtures in `comm_control_tests.rs`,
+`client_comm_tests.rs`, and `server/tests.rs` build a minimal session handle via
+a shared helper. This was purely mechanical, behavior-preserving churn, done
+module-by-module with tests green after each.
+
+The only remaining `queue_soft_interrupt_for_session` references in production
+are the state.rs definition and its module-root re-export; the session service
+handle's `queue_soft_interrupt` is now the single call path. Reducing the few
+remaining swarm-domain free-function call sites (e.g. `update_member_status`)
+and the router clone-then-destructure refactor in `handle_client` remain
+separate decisions (cosmetic, high-churn).
 
 ---
 
