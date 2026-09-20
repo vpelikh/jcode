@@ -1081,3 +1081,58 @@ fn test_load_path_hydrates_compaction_mem_inj_and_replay_events() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_mixed_sequence_replays_consistently_after_serialize() {
+    use std::io::Write;
+
+    // End-to-end determinism: a realistic mixed transcript mutation sequence
+    // (append, insert-at-end, clear, re-append, truncate, replace) must replay
+    // to exactly the same transcript as the legacy vector, both in memory and
+    // after persisting and reloading through the real load path.
+    let dir = std::env::temp_dir().join(format!("jcode_evt_mixed_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("session.json");
+
+    let mut session = Session::create_with_id("test_mixed".to_string(), None, None);
+    let mk = |id: &str, body: &str| StoredMessage {
+        id: id.to_string(),
+        role: Role::User,
+        content: vec![text_block(body)],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    };
+
+    session.append_stored_message(mk("a", "A"));
+    session.append_stored_message(mk("b", "B"));
+    session.insert_message(session.messages.len(), mk("c", "C")); // append-at-end insert
+    session.clear_messages();                                    // ClearAll
+    session.append_stored_message(mk("x", "X"));
+    session.append_stored_message(mk("y", "Y"));
+    session.append_stored_message(mk("z", "Z"));
+    session.truncate_messages(2);                                // keep X,Y
+    session.replace_messages(vec![mk("r1", "R1"), mk("r2", "R2")]); // full replace
+
+    // In-memory consistency between derived log and legacy vector.
+    session.rederive_all_checked().expect("mixed sequence must stay consistent in memory");
+    let expected: Vec<String> = session.messages.iter().map(|m| m.id.clone()).collect();
+    let derived: Vec<String> = session.derive_messages().iter().map(|m| m.id.clone()).collect();
+    assert_eq!(derived, expected);
+    assert_eq!(derived, vec!["r1", "r2"]);
+
+    // Persist and reload; derived state must be identical after hydration.
+    let json = serde_json::to_string(&session).expect("serialize");
+    let mut f = std::fs::File::create(&path).unwrap();
+    f.write_all(json.as_bytes()).unwrap();
+    drop(f);
+
+    let loaded = Session::load_from_path(&path).expect("load_from_path");
+    loaded.rederive_all_checked().expect("mixed sequence must stay consistent after reload");
+    let loaded_derived: Vec<String> =
+        loaded.derive_messages().iter().map(|m| m.id.clone()).collect();
+    assert_eq!(loaded_derived, vec!["r1", "r2"]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
