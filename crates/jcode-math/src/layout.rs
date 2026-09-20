@@ -429,9 +429,9 @@ impl<'a> MathLayoutEngine<'a> {
         // A big operator is set larger in display style, and centred on the
         // math axis rather than sitting on the baseline: that vertical centring
         // is what makes a displayed sum look right next to its limits.
-        if class == AtomClass::Op && context.style.is_display() {
-            if let Some(ch) = text.chars().next() {
-                if let Some(glyph) = self.face.display_variant(ch) {
+        if class == AtomClass::Op && context.style.is_display()
+            && let Some(ch) = text.chars().next()
+                && let Some(glyph) = self.face.display_variant(ch) {
                     let size = context.size(&self.constants);
                     let axis = self.constants.axis_height * size;
                     let half = (glyph.ascent - glyph.descent) / 2.0 * size;
@@ -449,8 +449,6 @@ impl<'a> MathLayoutEngine<'a> {
                     };
                     return Atom { class, boxed };
                 }
-            }
-        }
         Atom {
             class,
             boxed: self.layout_literal(text, font, context),

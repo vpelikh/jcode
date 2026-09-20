@@ -453,7 +453,7 @@ mod tests {
             // has a chance to fire, then respond and let the client resolve.
             release_rx.recv_timeout(Duration::from_secs(2)).ok();
             let body = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
-            let _ = stream.write_all(body.as_bytes()).expect("write response");
+            stream.write_all(body.as_bytes()).expect("write response");
         });
 
         let beacons = Arc::new(Mutex::new(Vec::new()));

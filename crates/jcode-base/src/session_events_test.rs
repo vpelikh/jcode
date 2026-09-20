@@ -20,7 +20,7 @@ fn test_event_map_construction() {
         None,
         Some("Test Session".to_string()),
     );
-    assert!(session.event_map.events.len() == 0);
+    assert!(session.event_map.events.is_empty());
 
     let test_message = StoredMessage {
         id: "msg_1".to_string(),
@@ -33,8 +33,8 @@ fn test_event_map_construction() {
     };
 
     session.append_stored_message(test_message.clone());
-    assert!(session.messages.len() >= 1);
-    assert!(session.event_map.events.len() >= 1);
+    assert!(!session.messages.is_empty());
+    assert!(!session.event_map.events.is_empty());
 }
 
 #[test]
@@ -512,7 +512,7 @@ fn test_event_map_memory_injection_operations() {
         30000u64,
         vec!["mem_1".to_string(), "mem_2".to_string()],
     );
-    assert!(session.memory_injections.len() >= 1);
+    assert!(!session.memory_injections.is_empty());
 
     assert!(session.event_map.events.iter().any(|e| {
         matches!(e.op, SessionEventOp::MemoryInjection { .. })
@@ -532,7 +532,7 @@ fn test_event_map_replay_event_operations() {
         Some("System Notice".to_string()),
         "This is a system notice".to_string(),
     );
-    assert!(session.replay_events.len() >= 1);
+    assert!(!session.replay_events.is_empty());
 
     assert!(session.event_map.events.iter().any(|e| {
         matches!(e.op, SessionEventOp::ReplayEvent { .. })
@@ -562,7 +562,7 @@ fn test_event_map_fork_functionality() {
 
     let fork = session.fork_up_to_boundary(2);
 
-    assert!(fork.id.len() > 0);
+    assert!(!fork.id.is_empty());
     assert!(fork.messages.len() <= 3);
     assert!(fork.event_map.events.len() <= session.event_map.events.len());
 }
@@ -983,8 +983,8 @@ fn test_session_event_map_indices() {
     };
     session2.append_stored_message(msg2);
 
-    assert!(session1.event_map.events.len() >= 1);
-    assert!(session2.event_map.events.len() >= 1);
+    assert!(!session1.event_map.events.is_empty());
+    assert!(!session2.event_map.events.is_empty());
 
     let id1 = session1.event_map.events[0].event_id.clone();
     let id2 = session2.event_map.events[0].event_id.clone();
@@ -2647,7 +2647,7 @@ fn test_multi_insert_repair_pattern_stays_consistent() {
     // offset arithmetic from repair_missing_tool_outputs. `inserted` only
     // advances per assistant message (by this message's missing count), while
     // `offset` indexes within the message's missing items.
-    let missing_for_message = vec!["t1", "t2"];
+    let missing_for_message = ["t1", "t2"];
     let inserted = 0usize;
     for (offset, tid) in missing_for_message.iter().enumerate() {
         let stored = StoredMessage {
@@ -4273,15 +4273,15 @@ fn test_derive_messages_fuzz_matches_reference() {
     let mut seed: u64 = 0x9E37_79B9_7F4A_7C15; // deterministic
     let next = |seed: &mut u64| {
         *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        (*seed >> 33) as u64
+        *seed >> 33
     };
-    let mut message = |next_id: &mut u64| {
+    let message = |next_id: &mut u64| {
         let id = format!("m{}", *next_id);
         *next_id += 1;
         StoredMessage {
             id,
             role: Role::User,
-            content: vec![text_block(if *next_id % 2 == 0 { "even" } else { "odd" })],
+            content: vec![text_block(if (*next_id).is_multiple_of(2) { "even" } else { "odd" })],
             display_role: None,
             timestamp: None,
             tool_duration_ms: None,

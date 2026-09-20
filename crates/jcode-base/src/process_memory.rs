@@ -1279,7 +1279,7 @@ mod tests {
             .expect("macOS snapshot should report phys_footprint");
         // A small test process still holds at least a handful of MB resident.
         assert!(
-            footprint > 1 * 1024 * 1024,
+            footprint > 1024 * 1024,
             "physical footprint should be a plausible resident size, got {footprint} bytes"
         );
         assert!(

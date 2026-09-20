@@ -234,11 +234,9 @@ pub fn provider_model_to_select_after_auth_with_configured_default(
                 && route.model == configured
                 && route_matches_activation(route, activation)
         })
-    {
-        if selected_model.map(str::trim) != Some(configured) {
+        && selected_model.map(str::trim) != Some(configured) {
             return Some(configured.to_string());
         }
-    }
 
     provider_model_to_select_after_auth(activation, selected_model, routes)
 }

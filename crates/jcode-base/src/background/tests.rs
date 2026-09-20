@@ -889,12 +889,11 @@ async fn cancel_adopted_task_kills_inner_child_process() -> Result<()> {
 
     let mut child_pid = None;
     for _ in 0..50 {
-        if let Ok(contents) = std::fs::read_to_string(&marker) {
-            if let Ok(pid) = contents.trim().parse::<u32>() {
+        if let Ok(contents) = std::fs::read_to_string(&marker)
+            && let Ok(pid) = contents.trim().parse::<u32>() {
                 child_pid = Some(pid);
                 break;
             }
-        }
         sleep(Duration::from_millis(20)).await;
     }
     let child_pid = child_pid.expect("child pid marker should appear");
