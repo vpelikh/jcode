@@ -1840,3 +1840,49 @@ fn command_palette_open_does_not_move_existing_rows() {
     }
     assert!(checked >= 3, "expected transcript rows to sample:\n{before}");
 }
+
+/// The scroll fix hides the terminal cursor for the full-frame diff flush so the
+/// visible caret does not sweep across the re-emitted cells. This drives the real
+/// production path (`StatusSpinnerRenderer::draw_full_core`, the shared body the
+/// scroll-triggered SoftRepaint runs) against a crossterm backend that captures the
+/// raw escape stream, and asserts:
+///   - the repaint actually re-emits cells (`MoveTo`, `ESC[<row>;<col>H`);
+///   - the cursor `Hide` (`ESC[?25l`) precedes the first `MoveTo`;
+///   - the caret is shown again (`ESC[?25h`) with a set cursor position.
+#[test]
+fn scroll_repaint_hides_cursor_before_cell_moves_via_draw_core() {
+    let mut app = create_test_app();
+    app.force_full_repaint = true; // the exact flag scroll_up/scroll_down set
+
+    let stream = {
+        let mut output: Vec<u8> = Vec::new();
+        let mut renderer = crate::tui::app::run_shell::StatusSpinnerRenderer::default();
+        let backend = ratatui::backend::CrosstermBackend::new(&mut output);
+        let mut terminal = ratatui::Terminal::new(backend).expect("capture terminal");
+        renderer
+            .draw_full_core(&mut app, &mut terminal)
+            .expect("draw_full_core");
+        drop(terminal); // release the backend borrow on `output`
+        String::from_utf8_lossy(&output).into_owned()
+    };
+
+    let hide = "\u{1b}[?25l";
+    assert!(
+        stream.contains('H'),
+        "SoftRepaint must actually emit cell moves; got: {stream:?}"
+    );
+    assert!(
+        stream.contains(hide),
+        "scroll-triggered repaint must hide the cursor for the diff flush; got: {stream:?}"
+    );
+    let hide_at = stream.find(hide).expect("hide present");
+    let first_moveto = stream.find('H').expect("move present");
+    assert!(
+        hide_at <= first_moveto,
+        "Hide must precede the first MoveTo; hide@{hide_at} move@{first_moveto}"
+    );
+    assert!(
+        stream.contains("\u{1b}[?25h"),
+        "composer frame must re-show the caret; got: {stream:?}"
+    );
+}
