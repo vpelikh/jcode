@@ -103,10 +103,13 @@ impl Agent {
             || (lower.contains("exceeded") && lower.contains("tokens"))
     }
 
-    /// Best-effort emergency recovery after a context-limit error.
+    /// Best-effort emergency recovery after a context-limit or provider
+    /// request-too-large (HTTP 413) error.
     ///
-    /// Performs a synchronous hard compaction and resets provider session state,
-    /// allowing the caller to retry the same turn immediately.
+    /// Attempts (in order): OpenAI-encrypted-content recovery, stripping oversized
+    /// inline images / truncating oversized tool results (413), then a synchronous
+    /// hard compaction. On success it resets provider session state so the caller
+    /// can retry the same turn immediately.
     pub(super) fn try_auto_compact_after_context_limit(&mut self, error: &str) -> bool {
         if crate::provider::openai_request::is_openai_encrypted_content_too_large_error(error)
             && self.try_recover_oversized_openai_native_compaction()
@@ -227,6 +230,25 @@ impl Agent {
         }
 
         true
+    }
+
+    /// Message for the terminal error surfaced after compaction retries are
+    /// exhausted. Compaction here is triggered both by token-context overflow
+    /// and by provider 413 "request too large" (byte-size) rejections, so the
+    /// wording must match the actual failure rather than always blaming the
+    /// context window.
+    pub(super) fn compaction_retry_limit_error(&self, err_str: &str) -> String {
+        if crate::compaction::is_request_payload_too_large_error(err_str) {
+            format!(
+                "Request body still exceeds provider size limit after {} compaction retries; start a new conversation (/new) or compact manually (/compact)",
+                Self::MAX_CONTEXT_LIMIT_RETRIES
+            )
+        } else {
+            format!(
+                "Context limit exceeded after {} compaction retries",
+                Self::MAX_CONTEXT_LIMIT_RETRIES
+            )
+        }
     }
 
     /// Best-effort recovery after a provider HTTP 413 "request too large" error.

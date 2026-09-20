@@ -206,12 +206,8 @@ impl Agent {
                     if self.try_auto_compact_after_context_limit(&e.to_string()) {
                         context_limit_retries += 1;
                         if context_limit_retries > Self::MAX_CONTEXT_LIMIT_RETRIES {
-                            logging::warn(
-                                "Context-limit compaction retry limit reached; giving up",
-                            );
                             return Err(anyhow::anyhow!(
-                                "Context limit exceeded after {} compaction retries",
-                                Self::MAX_CONTEXT_LIMIT_RETRIES
+                                self.compaction_retry_limit_error(&e.to_string())
                             ));
                         }
                         continue;
@@ -295,12 +291,8 @@ impl Agent {
                             );
                             context_limit_retries += 1;
                             if context_limit_retries > Self::MAX_CONTEXT_LIMIT_RETRIES {
-                                logging::warn(
-                                    "Context-limit compaction retry limit reached; giving up",
-                                );
                                 return Err(anyhow::anyhow!(
-                                    "Context limit exceeded after {} compaction retries",
-                                    Self::MAX_CONTEXT_LIMIT_RETRIES
+                                    self.compaction_retry_limit_error(&err_str)
                                 ));
                             }
                             retry_after_compaction = true;
@@ -685,12 +677,8 @@ impl Agent {
                             );
                             context_limit_retries += 1;
                             if context_limit_retries > Self::MAX_CONTEXT_LIMIT_RETRIES {
-                                logging::warn(
-                                    "Context-limit compaction retry limit reached; giving up",
-                                );
                                 return Err(anyhow::anyhow!(
-                                    "Context limit exceeded after {} compaction retries",
-                                    Self::MAX_CONTEXT_LIMIT_RETRIES
+                                    self.compaction_retry_limit_error(&message)
                                 ));
                             }
                             retry_after_compaction = true;
