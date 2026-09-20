@@ -138,7 +138,7 @@ pub fn build_snapshot(
         intent: plan.user_intention,
         open_todos,
         last_assistant_text,
-        initiative_id: load_attached_initiative(session_id),
+        initiative_id: load_attached_initiative(session_id, working_dir),
     })
 }
 
@@ -266,17 +266,6 @@ pub fn render_boot_context(working_dir: Option<&Path>) -> Option<String> {
         out.push_str(&format!("\nLinked initiative: {}", id));
     }
     Some(out)
-}
-
-/// Decide whether to inject a handoff into the system prompt at session start.
-///
-/// Mirrors the gate used by `Agent::build_system_prompt_split`: a handoff is
-/// injected only at the very start of a fresh conversation (no visible
-/// messages yet), so an already-running session does not re-announce it every
-/// turn. Exposed as a pure function so the injection decision is testable in
-/// isolation without constructing an `Agent`.
-pub fn should_inject(fresh_conversation: bool, working_dir: Option<&Path>) -> bool {
-    fresh_conversation && render_boot_context(working_dir).is_some()
 }
 
 /// Promote a handoff snapshot into a durable project-scoped `initiative` goal.
@@ -413,8 +402,8 @@ fn extract_last_assistant_text(transcript: &str) -> Option<String> {
 }
 
 /// Load the initiative id attached to a session, if any.
-fn load_attached_initiative(session_id: &str) -> Option<String> {
-    crate::goal::load_attached_goal(session_id, None)
+fn load_attached_initiative(session_id: &str, working_dir: Option<&Path>) -> Option<String> {
+    crate::goal::load_attached_goal(session_id, working_dir)
         .ok()
         .flatten()
         .map(|g| g.id)

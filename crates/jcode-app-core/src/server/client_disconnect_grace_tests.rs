@@ -232,3 +232,63 @@ async fn interrupted_session_does_not_wait_for_reconnect_grace() {
         SessionStatus::Crashed { .. }
     ));
 }
+
+/// Integration boundary through the real close path: `cleanup_client_connection`
+/// runs the handoff hook, so closing a live session with open todos must
+/// actually persist a readable, loadable handoff for that project.
+#[tokio::test]
+async fn cleanup_persists_handoff_for_session_with_open_todos() {
+    let _lock = crate::storage::lock_test_env();
+    let _home = Home::new();
+    crate::server::clear_reload_marker();
+
+    let fixture = Fixture::new(false).await;
+    let wd = std::env::temp_dir().join("jcode-close-handoff-test");
+    std::fs::create_dir_all(&wd).unwrap();
+    let sid = fixture.agent.lock().await.session_id().to_string();
+
+    // Give the live agent a real working dir and seed open todos + intent for
+    // that exact session id (the project bucket the close path will write to).
+    fixture
+        .agent
+        .lock()
+        .await
+        .set_working_dir_for_pending_context(Some(wd.to_str().unwrap().to_string()));
+    crate::todo::save_todos(
+        &sid,
+        &[crate::todo::TodoItem {
+            id: "t".into(),
+            content: "open work".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: None,
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    crate::todo::save_plan(
+        &sid,
+        &crate::todo::TodoPlan {
+            user_intention: Some("finish the handoff work".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // No handoff yet; run the real close path, which triggers handoff capture.
+    assert!(crate::handoff::load_snapshot(&sid).is_none());
+    timeout(
+        Duration::from_secs(5),
+        fixture.cleanup(true, Duration::from_secs(30)),
+    )
+    .await
+    .unwrap();
+
+    // The close path persisted a readable handoff for the agent's session.
+    let loaded = crate::handoff::load_snapshot(&sid).expect("close path wrote a handoff");
+    assert_eq!(loaded.session_id, sid);
+    assert_eq!(loaded.open_todos.len(), 1);
+    assert_eq!(loaded.intent.as_deref(), Some("finish the handoff work"));
+    assert!(loaded.project_key.starts_with("path:") || loaded.project_key.starts_with("git:"));
+}

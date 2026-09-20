@@ -3,14 +3,7 @@ use super::*;
 /// project_key prefers the git remote URL for portability across machines.
 #[test]
 fn project_key_prefers_git_remote() {
-    let timeout = std::time::Duration::from_secs(3);
-    if std::process::Command::new("git")
-        .args(["--version"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-        != true
-    {
+    if !git_available() {
         return;
     }
     let dir = tempfile::TempDir::new().expect("tempdir");
@@ -29,14 +22,19 @@ fn project_key_prefers_git_remote() {
         .args(["remote", "add", "origin", "https://example.com/acme/widget.git"])
         .output()
         .ok();
-    let key = project_key(Some(dir.path()));
-    // Give git a moment to have written the config synchronously (it has).
     assert_eq!(
-        key.as_deref(),
+        project_key(Some(dir.path())).as_deref(),
         Some("git:https://example.com/acme/widget.git"),
         "project key should be the git origin URL"
     );
-    let _ = timeout;
+}
+
+fn git_available() -> bool {
+    std::process::Command::new("git")
+        .args(["--version"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// Fallback: a file-less path hashes to the path form even without git.
@@ -191,6 +189,54 @@ async fn promote_to_initiative_creates_a_goal() {
     crate::env::remove_var("JCODE_HOME");
 }
 
+/// A session with an attached project-scoped goal must record that goal id in
+/// its handoff (F1: previously `load_attached_initiative` passed no working_dir,
+/// so project-scoped attachments never resolved).
+#[tokio::test]
+async fn build_snapshot_records_attached_project_initiative() {
+    let _guard = crate::storage::lock_test_env();
+    let home = tempfile::TempDir::new().expect("tempdir");
+    crate::env::set_var("JCODE_HOME", home.path());
+    let cwd = std::env::temp_dir().join("jcode-initiative-id-test");
+    std::fs::create_dir_all(&cwd).ok();
+
+    crate::todo::save_todos(
+        "s-ini",
+        &[TodoItem {
+            id: "i".into(),
+            content: "open work".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: None,
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .expect("todos");
+
+    // Create a project-scoped goal and attach it to the session.
+    let goal = crate::goal::create_goal(
+        crate::goal::GoalCreateInput {
+            id: Some("split-server-goal".into()),
+            title: "Split the server".into(),
+            scope: crate::goal::GoalScope::Project,
+            ..Default::default()
+        },
+        Some(&cwd),
+    )
+    .expect("create goal");
+    crate::goal::attach_goal_to_session("s-ini", &goal, Some(&cwd)).expect("attach");
+
+    let snap = build_snapshot("s-ini", Some(&cwd), "closed", None).expect("snapshot");
+    assert_eq!(
+        snap.initiative_id.as_deref(),
+        Some(goal.id.as_str()),
+        "the attached project initiative must be recorded in the handoff"
+    );
+
+    crate::env::remove_var("JCODE_HOME");
+}
+
 /// render_boot_context emits a compact block when a handoff exists.
 #[tokio::test]
 async fn render_boot_context_produces_block() {
@@ -250,12 +296,7 @@ fn git_repo_with_remote(dir: &std::path::Path, url: &str) {
 fn same_git_origin_buckets_across_paths() {
     let _guard = crate::storage::lock_test_env();
     // Skip when git is unavailable.
-    if !std::process::Command::new("git")
-        .args(["--version"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-    {
+    if !git_available() {
         return;
     }
     let checkout_a = tempfile::TempDir::new().expect("a");
@@ -317,38 +358,26 @@ fn corrupt_index_does_not_fail_capture() {
     crate::env::remove_var("JCODE_HOME");
 }
 
-fn repo_with_remote(dir: &std::path::Path) {
-    let _ = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["init", "-q"])
-        .output();
-    let _ = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["remote", "add", "origin", "https://example.com/acme/widget.git"])
-        .output();
-}
-
-/// The boot-injection gate: inject only on a fresh conversation with a handoff.
+/// The first-user-message injection consumes `render_boot_context`: it must
+/// yield the compact block exactly when a fresh session (empty conversation)
+/// has a handoff for the working dir, and none otherwise.
 #[test]
-fn should_inject_gates_on_fresh_conversation_and_handoff() {
+fn boot_context_is_present_for_fresh_session_with_handoff() {
     let _guard = crate::storage::lock_test_env();
     let before = std::env::var_os("JCODE_HOME");
     let home = tempfile::TempDir::new().expect("tempdir");
     crate::env::set_var("JCODE_HOME", home.path());
-    let cwd = std::env::temp_dir().join("jcode-gate-test");
-
-    // No handoff yet -> never inject.
-    assert!(!should_inject(true, Some(&cwd)));
-    assert!(!should_inject(false, Some(&cwd)));
-
-    // Create a handoff.
+    let cwd = std::env::temp_dir().join("jcode-boot-context-test");
     std::fs::create_dir_all(&cwd).ok();
+
+    // No handoff yet -> no boot context.
+    assert!(render_boot_context(Some(&cwd)).is_none());
+
+    // An already-running project with open work produces a handoff on close.
     crate::todo::save_todos(
-        "s-gate",
+        "s-bootctx",
         &[TodoItem {
-            id: "g".into(),
+            id: "bc".into(),
             content: "open work".into(),
             status: "in_progress".into(),
             priority: "high".into(),
@@ -358,19 +387,27 @@ fn should_inject_gates_on_fresh_conversation_and_handoff() {
         }],
     )
     .expect("todos");
-    capture("s-gate", Some(&cwd), "closed", None).expect("capture");
+    crate::todo::save_plan(
+        "s-bootctx",
+        &crate::todo::TodoPlan {
+            user_intention: Some("resume the split".into()),
+            ..Default::default()
+        },
+    )
+    .expect("plan");
+    capture("s-bootctx", Some(&cwd), "closed", None).expect("capture");
 
-    // With a handoff: fresh conversation injects, an ongoing one does not.
-    assert!(should_inject(true, Some(&cwd)), "fresh session should inject");
-    assert!(
-        !should_inject(false, Some(&cwd)),
-        "an already-running session must not re-inject"
-    );
+    // A fresh session in the same working dir now has boot context to consume.
+    let block = render_boot_context(Some(&cwd)).expect("boot context present");
+    assert!(block.contains("[Handoff from previous session]"));
+    assert!(block.contains("resume the split"));
+    assert!(block.contains("open work"));
 
-    // A different (unrelated) project never injects from another's handoff.
-    let unrelated = std::env::temp_dir().join("jcode-gate-other");
+    // The injection consumes this once; a later session in a different dir must
+    // not inherit it.
+    let unrelated = std::env::temp_dir().join("jcode-bootctx-other");
     std::fs::create_dir_all(&unrelated).ok();
-    assert!(!should_inject(true, Some(&unrelated)));
+    assert!(render_boot_context(Some(&unrelated)).is_none());
 
     match before {
         Some(value) => crate::env::set_var("JCODE_HOME", value),
@@ -384,12 +421,7 @@ fn should_inject_gates_on_fresh_conversation_and_handoff() {
 #[tokio::test]
 async fn full_workflow_capture_boot_render_promote() {
     let _guard = crate::storage::lock_test_env();
-    if !std::process::Command::new("git")
-        .args(["--version"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-    {
+    if !git_available() {
         return;
     }
     let home = tempfile::TempDir::new().expect("tempdir");
@@ -397,7 +429,7 @@ async fn full_workflow_capture_boot_render_promote() {
 
     // Session A works in checkout A, captures with open work.
     let checkout_a = tempfile::TempDir::new().expect("a");
-    repo_with_remote(checkout_a.path());
+    git_repo_with_remote(checkout_a.path(), "https://example.com/acme/widget.git");
     crate::todo::save_todos(
         "s-a",
         &[TodoItem {
@@ -426,7 +458,7 @@ async fn full_workflow_capture_boot_render_promote() {
     // A later session on a *different* checkout (= another machine/path) of the
     // same repo boots with the handoff injected, without re-explaining.
     let checkout_b = tempfile::TempDir::new().expect("b");
-    repo_with_remote(checkout_b.path());
+    git_repo_with_remote(checkout_b.path(), "https://example.com/acme/widget.git");
     let block = render_boot_context(Some(checkout_b.path()))
         .expect("boot context from cross-path checkout");
     assert!(block.contains("split server into services"), "{block}");

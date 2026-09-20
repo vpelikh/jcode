@@ -35,9 +35,12 @@ the whole transcript or requiring the user to re-explain.
    promoted into a goal once it proves durable, but the stores stay separate to
    avoid polluting the curated workspace and to keep the write patterns (server
    close path vs. model tool) independent.
-5. **Injected only at session start.** The handoff is boot context, injected into
-   the system prompt's dynamic part only when the conversation is fresh
-   (`message_count() == 0`), so it does not re-announce itself each turn.
+5. **Injected only on the first user message of a fresh conversation.** The
+   handoff is prepended to the very first user message (when the conversation is
+   empty), so it is seen on turn one and not re-announced on later turns. This
+   must happen *before* the message is added to the session: `build_system_prompt_split`
+   runs only after the first user message is already present, so gating on
+   message count there can never see an empty conversation.
 
 ## Slice 1 (implemented)
 
@@ -46,8 +49,8 @@ the whole transcript or requiring the user to re-explain.
 | `handoff` module (capture, index, project identity, boot render) | `crates/jcode-base/src/handoff.rs` |
 | Module registration | `crates/jcode-base/src/lib.rs` |
 | Session-close hook | `crates/jcode-app-core/src/server/client_disconnect_cleanup.rs::cleanup_client_connection` |
-| Session-start system-prompt injection | `crates/jcode-app-core/src/agent/prompting.rs::build_system_prompt_split` |
-| Unit + integration tests | `crates/jcode-base/src/handoff_tests.rs` |
+| First-message injection | `crates/jcode-app-core/src/agent/turn_execution.rs::append_user_context_message_with_display_role` |
+| Unit + integration tests | `crates/jcode-base/src/handoff_tests.rs`, `crates/jcode-app-core/src/agent_tests.rs` |
 
 ### Storage
 
@@ -85,6 +88,13 @@ Behavior is exercised through the public `handoff` API with an isolated
   resets cleanly and still records — it never panics or aborts the close path.
 - **Edge cases**: no handoff when all todos are completed/cancelled; path-based
   fallback when git is absent; assistant-text tail extraction.
+- **Injection** (`first_user_message_injects_handoff_once` in
+  `crates/jcode-app-core/src/agent_tests.rs`): a fresh agent with a prior
+  handoff for its working dir prepends the block to the first user message and
+  does not re-inject on subsequent messages.
+- **Close-path integration** (`cleanup_persists_handoff_for_session_with_open_todos`
+  in `crates/jcode-app-core/src/server/client_disconnect_grace_tests.rs`): the
+  real `cleanup_client_connection` close path persists a readable handoff.
 
 ## Slices 2+ (future)
 
