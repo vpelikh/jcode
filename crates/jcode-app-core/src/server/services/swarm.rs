@@ -833,6 +833,27 @@ impl SwarmServiceHandle {
         .await;
     }
 
+    /// Resolve a session's swarm membership and whether it is that swarm's
+    /// coordinator. Returns `(swarm_id, is_coordinator)`. Shared by the handle's
+    /// own `require_coordinator_swarm` and by callers (e.g. the debug plan
+    /// commands) that need the raw identity without emitting an error event.
+    pub(crate) async fn coordinator_identity(&self, session_id: &str) -> (Option<String>, bool) {
+        let members = self.swarm_state.members.read().await;
+        let swarm_id = members
+            .get(session_id)
+            .and_then(|member| member.swarm_id.clone());
+        let is_coordinator = if let Some(ref swarm_id) = swarm_id {
+            let coordinators = self.swarm_state.coordinators.read().await;
+            coordinators
+                .get(swarm_id)
+                .map(|coordinator| coordinator == session_id)
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        (swarm_id, is_coordinator)
+    }
+
     /// Require that `req_session_id` is the coordinator of its own swarm.
     ///
     /// Resolves the requesting session's swarm id, verifies the session is its
@@ -847,22 +868,7 @@ impl SwarmServiceHandle {
         permission_error: &str,
         client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
     ) -> Option<String> {
-        let (swarm_id, is_coordinator) = {
-            let members = self.swarm_state.members.read().await;
-            let swarm_id = members
-                .get(req_session_id)
-                .and_then(|member| member.swarm_id.clone());
-            let is_coordinator = if let Some(ref swarm_id) = swarm_id {
-                let coordinators = self.swarm_state.coordinators.read().await;
-                coordinators
-                    .get(swarm_id)
-                    .map(|coordinator| coordinator == req_session_id)
-                    .unwrap_or(false)
-            } else {
-                false
-            };
-            (swarm_id, is_coordinator)
-        };
+        let (swarm_id, is_coordinator) = self.coordinator_identity(req_session_id).await;
 
         if !is_coordinator {
             let _ = client_event_tx.send(ServerEvent::Error {
@@ -1813,5 +1819,43 @@ mod tests {
 
         // Clearing a missing plan is a no-op returning None.
         assert!(handle.clear_plan("swarm-nope").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn coordinator_identity_reports_swarm_and_coordinator_role() {
+        let handle = base_handle();
+        insert_member(&handle, "coord", "swarm-A", "coordinator").await;
+        insert_member(&handle, "agent", "swarm-A", "agent").await;
+        handle
+            .swarm_state()
+            .coordinators
+            .write()
+            .await
+            .insert("swarm-A".to_string(), "coord".to_string());
+
+        assert_eq!(
+            handle.coordinator_identity("coord").await,
+            (Some("swarm-A".into()), true),
+            "coordinator reports its swarm and role"
+        );
+        assert_eq!(
+            handle.coordinator_identity("agent").await,
+            (Some("swarm-A".into()), false),
+            "plain member reports its swarm but not coordinator role"
+        );
+        assert_eq!(
+            handle.coordinator_identity("ghost").await,
+            (None, false),
+            "unknown session has no swarm and is not coordinator"
+        );
+
+        // Confirm swarm_id durability follows the members map, independent of
+        // the coordinator map (e.g. after clear_coordinator).
+        handle.clear_coordinator("swarm-A").await;
+        assert_eq!(
+            handle.coordinator_identity("coord").await,
+            (Some("swarm-A".into()), false),
+            "after clear_coordinator the member keeps its swarm but loses the role"
+        );
     }
 }
