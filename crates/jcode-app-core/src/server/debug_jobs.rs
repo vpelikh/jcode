@@ -1,5 +1,6 @@
 use crate::agent::Agent;
 use crate::id;
+use crate::session::JobId;
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -28,7 +29,7 @@ impl DebugJobStatus {
 
 #[derive(Clone, Debug)]
 pub(super) struct DebugJob {
-    pub(super) id: String,
+    pub(super) id: JobId,
     pub(super) status: DebugJobStatus,
     pub(super) command: String,
     pub(super) session_id: Option<String>,
@@ -72,7 +73,7 @@ impl DebugJob {
 pub(super) async fn maybe_start_async_debug_job(
     agent: Arc<Mutex<Agent>>,
     trimmed: &str,
-    debug_jobs: Arc<RwLock<HashMap<String, DebugJob>>>,
+    debug_jobs: Arc<RwLock<HashMap<JobId, DebugJob>>>,
 ) -> Result<Option<String>> {
     if trimmed.starts_with("swarm_message_async:") {
         let msg = trimmed
@@ -143,7 +144,7 @@ pub(super) async fn maybe_start_async_debug_job(
 
 pub(super) async fn maybe_handle_job_command(
     cmd: &str,
-    debug_jobs: &Arc<RwLock<HashMap<String, DebugJob>>>,
+    debug_jobs: &Arc<RwLock<HashMap<JobId, DebugJob>>>,
 ) -> Result<Option<String>> {
     if cmd == "jobs" {
         let jobs_guard = debug_jobs.read().await;
@@ -162,8 +163,9 @@ pub(super) async fn maybe_handle_job_command(
             return Err(anyhow::anyhow!("job_status: requires a job id"));
         }
         let jobs_guard = debug_jobs.read().await;
+        let key = JobId::from(job_id);
         let output = jobs_guard
-            .get(job_id)
+            .get(&key)
             .map(|job| {
                 serde_json::to_string_pretty(&job.status_payload())
                     .unwrap_or_else(|_| "{}".to_string())
@@ -178,7 +180,8 @@ pub(super) async fn maybe_handle_job_command(
             return Err(anyhow::anyhow!("job_cancel: requires a job id"));
         }
         let mut jobs_guard = debug_jobs.write().await;
-        let output = if let Some(job) = jobs_guard.get_mut(job_id) {
+        let key = JobId::from(job_id);
+        let output = if let Some(job) = jobs_guard.get_mut(&key) {
             if matches!(job.status, DebugJobStatus::Running | DebugJobStatus::Queued) {
                 job.status = DebugJobStatus::Failed;
                 job.output = Some("[CANCELLED]".to_string());
@@ -236,7 +239,8 @@ pub(super) async fn maybe_handle_job_command(
         loop {
             {
                 let jobs_guard = debug_jobs.read().await;
-                if let Some(job) = jobs_guard.get(job_id) {
+                let key = JobId::from(job_id);
+                if let Some(job) = jobs_guard.get(&key) {
                     if matches!(
                         job.status,
                         DebugJobStatus::Completed | DebugJobStatus::Failed
@@ -262,14 +266,14 @@ pub(super) async fn maybe_handle_job_command(
 
 async fn create_job(
     agent: &Arc<Mutex<Agent>>,
-    debug_jobs: &Arc<RwLock<HashMap<String, DebugJob>>>,
+    debug_jobs: &Arc<RwLock<HashMap<JobId, DebugJob>>>,
     command: String,
-) -> String {
+) -> JobId {
     let session = {
         let agent = agent.lock().await;
         agent.session_id().to_string()
     };
-    let job_id = id::new_id("job");
+    let job_id = JobId::from(id::new_id("job"));
     {
         let mut jobs = debug_jobs.write().await;
         jobs.insert(
@@ -290,7 +294,7 @@ async fn create_job(
     job_id
 }
 
-async fn mark_job_running(debug_jobs: &Arc<RwLock<HashMap<String, DebugJob>>>, job_id: &str) {
+async fn mark_job_running(debug_jobs: &Arc<RwLock<HashMap<JobId, DebugJob>>>, job_id: &JobId) {
     let mut jobs = debug_jobs.write().await;
     if let Some(job) = jobs.get_mut(job_id) {
         job.status = DebugJobStatus::Running;
@@ -299,8 +303,8 @@ async fn mark_job_running(debug_jobs: &Arc<RwLock<HashMap<String, DebugJob>>>, j
 }
 
 async fn finish_job(
-    debug_jobs: Arc<RwLock<HashMap<String, DebugJob>>>,
-    job_id: &str,
+    debug_jobs: Arc<RwLock<HashMap<JobId, DebugJob>>>,
+    job_id: &JobId,
     result: Result<String>,
     partial_output: Option<String>,
 ) {

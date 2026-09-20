@@ -1,6 +1,7 @@
 //! Debug service handle.
 
 use crate::server::debug::ClientDebugState;
+use crate::session::JobId;
 use crate::server::debug_jobs::DebugJob;
 use crate::server::Server;
 use std::collections::HashMap;
@@ -19,7 +20,7 @@ pub(crate) struct DebugServiceHandle {
     /// Channel to receive client debug responses from TUI.
     pub(crate) client_debug_response_tx: broadcast::Sender<(u64, String)>,
     /// Background debug jobs (async debug commands).
-    pub(crate) debug_jobs: Arc<RwLock<HashMap<String, DebugJob>>>,
+    pub(crate) debug_jobs: Arc<RwLock<HashMap<JobId, DebugJob>>>,
 }
 
 impl DebugServiceHandle {

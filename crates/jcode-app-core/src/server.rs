@@ -83,6 +83,7 @@ use self::swarm_persistence::{
 };
 use self::util::get_shared_mcp_pool;
 use crate::agent::Agent;
+use crate::session::JobId;
 use crate::ambient_runner::AmbientRunnerHandle;
 use crate::bus::{Bus, BusEvent};
 use crate::protocol::{NotificationType, ServerEvent};
@@ -768,7 +769,7 @@ pub struct Server {
     /// Channel to receive client debug responses from TUI (request_id, response)
     client_debug_response_tx: broadcast::Sender<(u64, String)>,
     /// Background debug jobs (async debug commands)
-    debug_jobs: Arc<RwLock<HashMap<String, DebugJob>>>,
+    debug_jobs: Arc<RwLock<HashMap<JobId, DebugJob>>>,
     /// Channel subscriptions (swarm_id -> channel -> session_ids)
     channel_subscriptions: ChannelSubscriptions,
     /// Reverse index for channel subscriptions: session_id -> swarm_id -> channels
