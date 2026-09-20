@@ -198,9 +198,13 @@ pub struct Session {
     /// Non-conversation UI/state events persisted for higher-fidelity replay.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub replay_events: Vec<StoredReplayEvent>,
-    /// Event-sourced session log - single source of truth for all session state
+    /// Event-sourced session log - single source of truth for all session state.
+    ///
+    /// Kept `pub(crate)` so callers outside this crate must go through the
+    /// `Session` mutation API (which keeps `messages` and the event log in
+    /// sync). Direct external mutation would desync the two sources of truth.
     #[serde(skip)]
-    pub event_map: SessionEventMap,
+    pub(crate) event_map: SessionEventMap,
     #[serde(skip)]
     persist_state: SessionPersistState,
     #[serde(skip)]
@@ -1285,8 +1289,15 @@ request in this new forked session, using the inherited conversation only as con
     }
 
     pub fn append_stored_message(&mut self, message: StoredMessage) {
-        // Append to event log
-        let message_id = message.id.clone();
+        // Ensure a stable event id even when the message id is empty, so the
+        // event log and the legacy `messages` vector never diverge (an empty
+        // event_id is rejected by validation, which would skip the event while
+        // the message is still pushed below).
+        let message_id = if message.id.is_empty() {
+            crate::id::new_id("message")
+        } else {
+            message.id.clone()
+        };
         let event = SessionEvent {
             timestamp: chrono::Utc::now(),
             event_id: message_id.clone(),
@@ -1310,8 +1321,11 @@ request in this new forked session, using the inherited conversation only as con
     }
 
     pub fn insert_message(&mut self, index: usize, message: StoredMessage) {
-        // Append to event log
-        let message_id = format!("insert_{}", index);
+        // Append to event log. Use a unique event id rather than one derived
+        // from the index: inserting at the same index twice (e.g. repeated
+        // tool-output repair) would otherwise collide and be skipped by
+        // validation.
+        let message_id = crate::id::new_id("insert");
         let event = SessionEvent {
             timestamp: chrono::Utc::now(),
             event_id: message_id.clone(),
@@ -1328,13 +1342,20 @@ request in this new forked session, using the inherited conversation only as con
     }
 
     pub fn replace_messages(&mut self, messages: Vec<StoredMessage>) {
-        // Append to event log (replace all)
+        // Append to event log (replace all).
+        //
+        // `end_index` uses usize::MAX rather than the current length so that
+        // replay is deterministic: a full replacement must cover the entire
+        // derived transcript regardless of where it sits in the event stream
+        // (e.g. after a prior truncate shortened the tail). `derive_messages`
+        // caps `end_index` at the live length, so usize::MAX always means
+        // "to the end".
         let event = SessionEvent {
             timestamp: chrono::Utc::now(),
             event_id: "replace_all".to_string(),
             op: SessionEventOp::ReplaceMessages {
                 start_index: 0,
-                end_index: self.messages.len(),
+                end_index: usize::MAX,
                 messages: messages.clone(),
             },
             parent_id: None,
@@ -1349,6 +1370,16 @@ request in this new forked session, using the inherited conversation only as con
     }
 
     pub fn truncate_messages(&mut self, len: usize) {
+        // Truncating to zero messages is a full clear. Emit `ClearAll` rather
+        // than a `ReplaceMessages` with an empty prefix: a `ReplaceMessages`
+        // with `start == end` cannot clear an already-empty transcript during
+        // replay, so the event log would otherwise desync from `self.messages`.
+        if len == 0 {
+            if !self.messages.is_empty() {
+                self.clear_messages();
+            }
+            return;
+        }
         if len < self.messages.len() {
             // Append to event log
             let event = SessionEvent {
@@ -1368,6 +1399,29 @@ request in this new forked session, using the inherited conversation only as con
             self.mark_memory_profile_dirty();
             self.mark_messages_full_dirty();
         }
+    }
+
+    /// Clear every message in the transcript.
+    ///
+    /// Emits a `ClearAll` event so replay deterministically yields an empty
+    /// transcript regardless of preceding message/replace/truncate events.
+    /// Unlike `truncate_messages(0)`, this does not leave a stale snapshot of
+    /// the prefix; the event log records the intent instead.
+    pub fn clear_messages(&mut self) {
+        let event = SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: "clear_all".to_string(),
+            op: SessionEventOp::ClearAll,
+            parent_id: None,
+            version: 1,
+        };
+        self.event_map.append_event(event);
+        self.messages.clear();
+        // Also drop any persisted compaction state, since it refers to
+        // messages that no longer exist.
+        self.compaction = None;
+        self.mark_memory_profile_dirty();
+        self.mark_messages_full_dirty();
     }
 
     /// Drop oversized inline images from the stored transcript, oldest-first,
@@ -1599,6 +1653,24 @@ request in this new forked session, using the inherited conversation only as con
         self.event_map.replay_events()
     }
 
+    /// Append a session event through the validated event log.
+    ///
+    /// Callers outside `jcode-base` should use this instead of reaching into
+    /// `event_map` so the append path stays consistent. Returns `false` if the
+    /// event was rejected by validation (and therefore not recorded).
+    pub fn append_session_event(&mut self, event: SessionEvent) -> bool {
+        // Capture whether the event was recorded before mutating (append_event
+        // skips invalid events internally).
+        let before = self.event_map.events.len();
+        self.event_map.append_event(event);
+        self.event_map.events.len() > before
+    }
+
+    /// Fork the event log up to a boundary and return the prefix as a new map.
+    pub fn fork_event_log(&self, boundary_index: usize) -> SessionEventMap {
+        self.event_map.fork_up_to_boundary(boundary_index)
+    }
+
     /// Set compaction state in event log
     pub fn set_compaction(&mut self, compaction: StoredCompactionState) {
         let event = SessionEvent {
@@ -1620,7 +1692,7 @@ request in this new forked session, using the inherited conversation only as con
         let mut fork = self.clone();
         
         // Create fork with prefix of events
-        fork.event_map = self.event_map.fork_up_to_boundary(boundary_index);
+        fork.event_map = self.fork_event_log(boundary_index);
         
         // Reset the derived fields for the fork
         fork.messages = fork.derive_messages();
@@ -1642,12 +1714,113 @@ request in this new forked session, using the inherited conversation only as con
         (messages, compaction)
     }
 
-    /// Ensure backward compatibility - update messages from event log if needed
-    pub fn sync_backward_compatibility(&mut self) {
-        let derived_messages = self.derive_messages();
-        if self.messages.len() != derived_messages.len() {
-            self.messages = derived_messages;
+    /// Re-derive all state and validate internal consistency.
+    ///
+    /// The event-sourced migration relies on `event_map` being the single
+    /// source of truth. This diagnostic checks that the state derived from the
+    /// event log matches the legacy vectors (`messages`, `compaction`), and
+    /// that compaction turn bounds are internally sane. It never mutates the
+    /// session.
+    pub fn rederive_all_checked(&self) -> Result<(Vec<StoredMessage>, Option<StoredCompactionState>), String> {
+        let (messages, compaction) = self.rederive_all();
+
+        // The event log must agree with the legacy transcript vector.
+        if messages.len() != self.messages.len() {
+            return Err(format!(
+                "event_map derived {} messages but session.messages has {} (hydration mismatch)",
+                messages.len(),
+                self.messages.len()
+            ));
         }
+
+        if let Some(comp) = &compaction {
+            // covers_up_to_turn must not exceed the original turn count.
+            if comp.covers_up_to_turn > comp.original_turn_count {
+                return Err(format!(
+                    "compaction covers_up_to_turn ({}) exceeds original_turn_count ({})",
+                    comp.covers_up_to_turn,
+                    comp.original_turn_count
+                ));
+            }
+            if comp.compacted_count > comp.original_turn_count {
+                return Err(format!(
+                    "compaction compacted_count ({}) exceeds original_turn_count ({})",
+                    comp.compacted_count,
+                    comp.original_turn_count
+                ));
+            }
+        }
+
+        Ok((messages, compaction))
+    }
+
+    /// Rebuild the event log from the legacy session vectors.
+    ///
+    /// `event_map` is `#[serde(skip)]`, so after loading a session from disk
+    /// (snapshot + journal replay) the log is empty while `messages`,
+    /// `compaction`, `memory_injections`, and `replay_events` are populated.
+    /// Without this step the event log would not be the single source of truth
+    /// for resumed sessions. Call this once after load/construct-from-disk.
+    pub fn rebuild_event_map(&mut self) {
+        // Idempotent: only build from legacy vectors when the log is empty
+        // (e.g. right after loading from disk). In-process sessions already
+        // populate the log via append/insert/replace, so never clobber that.
+        if !self.event_map.events.is_empty() {
+            return;
+        }
+        let mut map = SessionEventMap::default();
+        let now = chrono::Utc::now();
+
+        for (i, message) in self.messages.iter().enumerate() {
+            map.append_event(SessionEvent {
+                timestamp: message.timestamp.unwrap_or(now),
+                event_id: format!("rehydrate_{}", i),
+                op: SessionEventOp::AppendMessage {
+                    message_id: message.id.clone(),
+                    message: message.clone(),
+                },
+                parent_id: None,
+                version: 1,
+            });
+        }
+
+        for (j, injection) in self.memory_injections.iter().enumerate() {
+            map.append_event(SessionEvent {
+                timestamp: injection.timestamp,
+                event_id: format!("rehydrate_mem_{}", j),
+                op: SessionEventOp::MemoryInjection {
+                    memory_injection: injection.clone(),
+                },
+                parent_id: None,
+                version: 1,
+            });
+        }
+
+        for (k, replay) in self.replay_events.iter().enumerate() {
+            map.append_event(SessionEvent {
+                timestamp: replay.timestamp,
+                event_id: format!("rehydrate_replay_{}", k),
+                op: SessionEventOp::ReplayEvent {
+                    replay_event: replay.clone(),
+                },
+                parent_id: None,
+                version: 1,
+            });
+        }
+
+        if let Some(compaction) = &self.compaction {
+            map.append_event(SessionEvent {
+                timestamp: now,
+                event_id: "rehydrate_compaction".to_string(),
+                op: SessionEventOp::SetCompaction {
+                    compaction: compaction.clone(),
+                },
+                parent_id: None,
+                version: 1,
+            });
+        }
+
+        self.event_map = map;
     }
 
     pub fn record_swarm_status_event(&mut self, members: Vec<crate::protocol::SwarmMemberStatus>) {
@@ -1663,10 +1836,9 @@ request in this new forked session, using the inherited conversation only as con
             timestamp: Utc::now(),
             kind,
         };
-        self.memory_profile_cache.replay_events_count += 1;
-        self.memory_profile_cache.replay_events_json_bytes += estimate_json_bytes(&event);
-        self.replay_events.push(event);
-        self.mark_replay_events_append_dirty();
+        // Route through record_replay_event so the swarm status is captured in
+        // the event log (derive_replay_events is authoritative in-process).
+        self.record_replay_event(&event);
     }
 
     pub fn record_swarm_plan_event(
@@ -1695,10 +1867,9 @@ request in this new forked session, using the inherited conversation only as con
             timestamp: Utc::now(),
             kind,
         };
-        self.memory_profile_cache.replay_events_count += 1;
-        self.memory_profile_cache.replay_events_json_bytes += estimate_json_bytes(&event);
-        self.replay_events.push(event);
-        self.mark_replay_events_append_dirty();
+        // Route through record_replay_event so the swarm plan is captured in
+        // the event log (derive_replay_events is authoritative in-process).
+        self.record_replay_event(&event);
     }
 
     pub fn provider_messages(&mut self) -> &[Message] {

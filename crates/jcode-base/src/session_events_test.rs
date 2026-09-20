@@ -2,7 +2,7 @@
 
 use crate::session::event_types::SessionEventOp;
 use crate::session::Session;
-use crate::session::event_types::SessionEventMap;
+use crate::session::event_types::{SessionEvent, SessionEventMap};
 use crate::message::ContentBlock;
 use jcode_session_types::{StoredCompactionState, StoredMemoryInjection, StoredMessage};
 use jcode_message_types::Role;
@@ -223,7 +223,6 @@ fn test_event_map_backward_compatibility() {
         session.append_stored_message(msg);
     }
 
-    session.sync_backward_compatibility();
     assert!(session.messages.len() >= 3);
     assert!(session.event_map.events.len() >= 3);
 }
@@ -265,7 +264,7 @@ fn test_session_event_map_indices() {
     let msg1 = StoredMessage {
         id: "msg_1".to_string(),
         role: Role::User,
-        content: vec![],
+        content: vec![text_block("placeholder")],
         display_role: None,
         timestamp: None,
         tool_duration_ms: None,
@@ -282,7 +281,7 @@ fn test_session_event_map_indices() {
     let msg2 = StoredMessage {
         id: "msg_2".to_string(),
         role: Role::User,
-        content: vec![],
+        content: vec![text_block("placeholder")],
         display_role: None,
         timestamp: None,
         tool_duration_ms: None,
@@ -296,4 +295,347 @@ fn test_session_event_map_indices() {
     let id1 = session1.event_map.events[0].event_id.clone();
     let id2 = session2.event_map.events[0].event_id.clone();
     assert_ne!(id1, id2);
+}
+
+#[test]
+fn test_session_event_validation_accepts_valid_events() {
+    let mut map = SessionEventMap::default();
+    let valid_event = SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "msg_valid".to_string(),
+        op: SessionEventOp::AppendMessage {
+            message_id: "0".to_string(),
+            message: StoredMessage {
+                id: "0".to_string(),
+                role: Role::User,
+                content: vec![text_block("hello")],
+                display_role: None,
+                timestamp: None,
+                tool_duration_ms: None,
+                token_usage: None,
+            },
+        },
+        parent_id: None,
+        version: 1,
+    };
+    map.append_event(valid_event);
+    assert_eq!(map.events.len(), 1);
+}
+
+#[test]
+fn test_session_event_validation_skips_invalid_event_id() {
+    let mut map = SessionEventMap::default();
+    let invalid_event = SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: String::new(), // invalid: empty
+        op: SessionEventOp::ClearAll,
+        parent_id: None,
+        version: 1,
+    };
+    map.append_event(invalid_event);
+    assert_eq!(map.events.len(), 0);
+}
+
+#[test]
+fn test_session_event_validation_skips_invalid_compaction() {
+    let mut map = SessionEventMap::default();
+    let invalid_event = SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "compact_bad".to_string(),
+        op: SessionEventOp::SetCompaction {
+            compaction: StoredCompactionState {
+                summary_text: "x".to_string(),
+                openai_encrypted_content: None,
+                covers_up_to_turn: 100,
+                original_turn_count: 10, // invalid: covers > original
+                compacted_count: 5,
+            },
+        },
+        parent_id: None,
+        version: 1,
+    };
+    map.append_event(invalid_event);
+    assert_eq!(map.events.len(), 0);
+}
+
+#[test]
+fn test_rederive_all_checked_consistency() {
+    let mut session = Session::create_with_id(
+        "test_session_rederive_checked".to_string(),
+        None,
+        Some("Re-derive checked".to_string()),
+    );
+    for i in 0..3 {
+        session.append_stored_message(StoredMessage {
+            id: format!("m_{}", i),
+            role: Role::User,
+            content: vec![text_block(&format!("msg {}", i))],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+    // No compaction: should be Ok and match message count
+    let (msgs, compaction) = session.rederive_all_checked().expect("derived state consistent");
+    assert_eq!(msgs.len(), 3);
+    assert!(compaction.is_none());
+}
+
+#[test]
+fn test_event_map_hydrated_on_disk_round_trip() {
+    use std::io::Write;
+
+    let dir = std::env::temp_dir().join(format!("jcode_event_map_rt_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("session.json");
+
+    // Build a session in memory; its event_map is populated via append path.
+    let mut session = Session::create_with_id(
+        "test_session_rt".to_string(),
+        None,
+        Some("Round-trip".to_string()),
+    );
+    for i in 0..4 {
+        session.append_stored_message(StoredMessage {
+            id: format!("rt_{}", i),
+            role: Role::User,
+            content: vec![text_block(&format!("msg {}", i))],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+    let in_memory_events = session.event_map.events.len();
+    assert!(in_memory_events >= 4);
+
+    // Serialize and reload through the real load path (snapshot + hydrate).
+    let json = serde_json::to_string(&session).expect("serialize");
+    let mut f = std::fs::File::create(&path).unwrap();
+    f.write_all(json.as_bytes()).unwrap();
+    drop(f);
+
+    let loaded = Session::load_from_path(&path).expect("load_from_path");
+    // event_map is #[serde(skip)], so without hydration it would be empty.
+    assert_eq!(
+        loaded.event_map.events.len(),
+        loaded.messages.len(),
+        "event_map must be hydrated to match the transcript on load"
+    );
+    assert_eq!(loaded.event_map.events.len(), 4);
+
+    // Derived state must equal the legacy vector after hydration.
+    let (derived, _) = loaded.rederive_all_checked().expect("hydration consistent");
+    assert_eq!(derived.len(), 4);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_replace_after_truncate_replays_deterministically() {
+    use crate::session::event_types::SessionEventMap;
+
+    let mut map = SessionEventMap::default();
+    let mk = |id: &str| StoredMessage {
+        id: id.to_string(),
+        role: Role::User,
+        content: vec![text_block(id)],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    };
+
+    // 1) append three messages
+    for id in ["a", "b", "c"] {
+        map.append_event(SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: format!("rehydrate_{}", id),
+            op: SessionEventOp::AppendMessage { message_id: id.to_string(), message: mk(id) },
+            parent_id: None,
+            version: 1,
+        });
+    }
+    // 2) truncate to first two (partial replace [0..2])
+    map.append_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "truncate".to_string(),
+        op: SessionEventOp::ReplaceMessages {
+            start_index: 0,
+            end_index: 2,
+            messages: vec![mk("a"), mk("b")],
+        },
+        parent_id: None,
+        version: 1,
+    });
+    // 3) full replacement (end_index::MAX semantics)
+    map.append_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "replace_all".to_string(),
+        op: SessionEventOp::ReplaceMessages {
+            start_index: 0,
+            end_index: usize::MAX,
+            messages: vec![mk("x"), mk("y"), mk("z")],
+        },
+        parent_id: None,
+        version: 1,
+    });
+
+    let derived = map.derive_messages();
+    let ids: Vec<&str> = derived.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, vec!["x", "y", "z"], "full replacement must drop earlier tail, not splice");
+}
+
+#[test]
+fn test_append_stored_message_with_empty_id_records_event() {
+    let mut session = Session::create_with_id(
+        "test_empty_id_append".to_string(),
+        None,
+        Some("Empty id".to_string()),
+    );
+    let empty_id_msg = StoredMessage {
+        id: String::new(),
+        role: Role::User,
+        content: vec![text_block("no id")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    };
+    session.append_stored_message(empty_id_msg);
+
+    // Both sources of truth must stay in sync.
+    assert_eq!(session.messages.len(), 1);
+    assert_eq!(session.event_map.events.len(), 1);
+    let (derived, _) = session.rederive_all_checked().expect("consistent");
+    assert_eq!(derived.len(), 1);
+}
+
+#[test]
+fn test_clear_messages_emits_clearall_and_drops_compaction() {
+    let mut session = Session::create_with_id(
+        "test_clear".to_string(),
+        None,
+        Some("Clear".to_string()),
+    );
+    session.append_stored_message(StoredMessage {
+        id: "m1".to_string(),
+        role: Role::User,
+        content: vec![text_block("hi")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    session.set_compaction(StoredCompactionState {
+        summary_text: "sum".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 1,
+    });
+    assert!(session.compaction.is_some());
+
+    session.clear_messages();
+    assert!(session.messages.is_empty());
+    assert!(session.compaction.is_none());
+    assert!(session.derive_messages().is_empty());
+    assert!(session.derive_compaction().is_none());
+}
+
+#[test]
+fn test_session_fork_event_log_prefix() {
+    // Session-level fork: derived fields reflect only the prefix events.
+    let mut session = Session::create_with_id(
+        "test_fork_session".to_string(),
+        None,
+        Some("Fork".to_string()),
+    );
+    for i in 0..5usize {
+        session.append_stored_message(StoredMessage {
+            id: format!("msg_{}", i),
+            role: Role::User,
+            content: vec![text_block(&format!("m{}", i))],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+    let fork = session.fork_up_to_boundary(2);
+    assert_eq!(fork.derive_messages().len(), 3);
+    assert_ne!(fork.id, session.id);
+}
+
+#[test]
+fn test_replace_after_clear_replays_deterministically() {
+    use crate::session::event_types::SessionEventMap;
+
+    let mut map = SessionEventMap::default();
+    let mk = |id: &str| StoredMessage {
+        id: id.to_string(),
+        role: Role::User,
+        content: vec![text_block(id)],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    };
+
+    // 1) append two messages
+    for id in ["a", "b"] {
+        map.append_event(SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: format!("rehydrate_{}", id),
+            op: SessionEventOp::AppendMessage { message_id: id.to_string(), message: mk(id) },
+            parent_id: None,
+            version: 1,
+        });
+    }
+    // 2) clear all
+    map.append_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "clear_all".to_string(),
+        op: SessionEventOp::ClearAll,
+        parent_id: None,
+        version: 1,
+    });
+    // 3) replace (a full replacement issued after a clear must populate the
+    //    transcript, not be silently dropped because the derived length is 0).
+    map.append_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "replace_all".to_string(),
+        op: SessionEventOp::ReplaceMessages {
+            start_index: 0,
+            end_index: usize::MAX,
+            messages: vec![mk("x"), mk("y")],
+        },
+        parent_id: None,
+        version: 1,
+    });
+
+    let derived = map.derive_messages();
+    let ids: Vec<&str> = derived.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, vec!["x", "y"], "replace after clear must repopulate, not stay empty");
+}
+
+#[test]
+fn test_truncate_to_zero_keeps_event_log_consistent() {
+    let mut session = Session::create_with_id("truncate_zero".to_string(), None, None);
+    for (i, id) in ["a", "b", "c"].iter().enumerate() {
+        session.append_stored_message(StoredMessage {
+            id: format!("m_{}", i),
+            role: Role::User,
+            content: vec![text_block(id)],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+    assert_eq!(session.derive_messages().len(), 3);
+    session.truncate_messages(0);
+    assert_eq!(session.messages.len(), 0, "legacy vector cleared");
+    assert_eq!(session.derive_messages().len(), 0, "event log must also be empty");
 }

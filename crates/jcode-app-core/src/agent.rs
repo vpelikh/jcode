@@ -40,7 +40,8 @@ use crate::session::{
     event_types::{SessionEvent, SessionEventOp},
 };
 use crate::skill::SkillRegistry;
-use chrono::{DateTime, Utc};
+use crate::tool::{Registry, ToolContext, ToolExecutionMode};
+use chrono::Utc;
 use anyhow::Result;
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
@@ -520,9 +521,12 @@ impl Agent {
     }
 
     fn seed_compaction_from_session(&mut self) {
+        // Read the event-sourced log once; on resume this is hydrated from disk
+        // in Session::load_from_path so it reflects the full transcript.
+        let messages = self.session.derive_messages();
         logging::info(&format!(
             "seed_compaction_from_session: session has {} messages via event log",
-            self.session.event_map.derive_messages().len()
+            messages.len()
         ));
         let compaction = self.registry.compaction();
         let mut manager = match compaction.try_write() {
@@ -537,11 +541,11 @@ impl Agent {
         manager.reset();
         let budget = self.provider.context_window();
         manager.set_budget(budget);
-        let current_compaction = self.session.event_map.current_compaction();
+        let current_compaction = self.session.derive_compaction();
         if let Some(state) = current_compaction {
-            manager.restore_persisted_stored_state_with(&state, &self.session.event_map.derive_messages());
+            manager.restore_persisted_stored_state_with(&state, &messages);
         } else {
-            manager.seed_restored_stored_messages_with(&self.session.event_map.derive_messages());
+            manager.seed_restored_stored_messages_with(&messages);
         }
         let sanitized_state = if manager.discard_oversized_openai_native_compaction() {
             Some(manager.persisted_state())
@@ -550,18 +554,20 @@ impl Agent {
         };
         logging::info(&format!(
             "seed_compaction_from_session: seeded compaction with {} messages via event log",
-            self.session.event_map.derive_messages().len()
+            messages.len()
         ));
         drop(manager);
         if let Some(state) = sanitized_state {
-            self.session.compaction = state;
-            self.session.event_map.append_event(SessionEvent {
-                timestamp: chrono::Utc::now(),
-                event_id: format!("compaction_{}", self.session.messages.len()),
-                op: SessionEventOp::SetCompaction { compaction: state.clone() },
-                parent_id: None,
-                version: 1,
-            });
+            self.session.compaction = state.clone();
+            if let Some(inner) = state {
+                self.session.append_session_event(SessionEvent {
+                    timestamp: Utc::now(),
+                    event_id: format!("compaction_{}", self.session.messages.len()),
+                    op: SessionEventOp::SetCompaction { compaction: inner },
+                    parent_id: None,
+                    version: 1,
+                });
+            }
             self.persist_session_best_effort("sanitized oversized OpenAI native compaction");
         }
     }
@@ -862,7 +868,7 @@ impl Agent {
     }
 
     fn repair_missing_tool_outputs(&mut self) -> usize {
-        let messages = self.session.event_map.derive_messages();
+        let messages = self.session.derive_messages();
         
         if self.tool_output_scan_index > messages.len() {
             self.reset_tool_output_tracking();
@@ -938,7 +944,7 @@ impl Agent {
                     role: Role::User,
                     content: vec![tool_block],
                     display_role: None,
-                    timestamp: Some(chrono::Utc::now()),
+                    timestamp: Some(Utc::now()),
                     tool_duration_ms: None,
                     token_usage: None,
                 };
@@ -949,7 +955,7 @@ impl Agent {
             inserted += missing_for_message.len();
         }
 
-        self.tool_output_scan_index = self.session.event_map.derive_messages().len();
+        self.tool_output_scan_index = self.session.derive_messages().len();
 
         if repaired > 0 {
             self.persist_session_best_effort("missing tool-output repair");
