@@ -269,6 +269,37 @@ pub fn prune_old_versions() -> Result<()> {
             );
         }
     }
+    // 1b) Versions referenced by the build manifest that are not (yet) channel
+    //     symlinks: a canary being smoke-tested, and a pending activation's
+    //     new / previous / shared-server rollback targets. These must not be
+    //     deleted even though their channel symlink may not exist yet — deleting
+    //     one would break canary testing or a queued rollback.
+    if let Ok(manifest) = BuildManifest::load() {
+        let mut labels = Vec::new();
+        if let Some(canary) = manifest.canary {
+            labels.push(canary);
+        }
+        if let Some(activation) = manifest.pending_activation {
+            labels.push(activation.new_version.clone());
+            if let Some(prev) = activation.previous_current_version {
+                labels.push(prev);
+            }
+            if let Some(prev) = activation.previous_shared_server_version {
+                labels.push(prev);
+            }
+        }
+        for version in labels {
+            if let Ok(bin) = storage_helpers::version_binary_path(&version)
+                && let Some(parent) = bin.parent()
+            {
+                protected.push(
+                    parent
+                        .canonicalize()
+                        .unwrap_or_else(|_| parent.to_path_buf()),
+                );
+            }
+        }
+    }
     // 2) Any channel symlink under `builds/<channel>/` that resolves into
     //    `versions/`. This covers canary (which has no `-version` marker) and
     //    any future channel, so a smoke-testing/promoted binary is never pruned.
