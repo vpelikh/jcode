@@ -147,10 +147,17 @@ impl Agent {
                     let dropped = match manager.hard_compact_with(all_messages) {
                         Ok(dropped) => dropped,
                         Err(reason) => {
-                            logging::warn(&format!(
-                                "Context-limit auto-recovery failed: hard compact failed ({})",
-                                reason
-                            ));
+                            if is_payload_too_large {
+                                logging::warn(&format!(
+                                    "Request-too-large recovery failed: hard compact failed ({})",
+                                    reason
+                                ));
+                            } else {
+                                logging::warn(&format!(
+                                    "Context-limit auto-recovery failed: hard compact failed ({})",
+                                    reason
+                                ));
+                            }
                             return false;
                         }
                     };
@@ -160,7 +167,13 @@ impl Agent {
                 (dropped, usage_pct)
             }
             Err(_) => {
-                logging::warn("Context-limit auto-recovery skipped: compaction manager lock busy");
+                if is_payload_too_large {
+                    logging::warn(
+                        "Request-too-large recovery skipped: compaction manager lock busy",
+                    );
+                } else {
+                    logging::warn("Context-limit auto-recovery skipped: compaction manager lock busy");
+                }
                 return false;
             }
         };
