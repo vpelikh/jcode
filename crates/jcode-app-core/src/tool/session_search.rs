@@ -1633,7 +1633,48 @@ fn metadata_text(session: &Session) -> String {
         fields.push(format!("Model: {model}"));
     }
 
+    if let Some(review_text) = review_search_text(session) {
+        fields.push(review_text);
+    }
+
     fields.join("\n")
+}
+
+/// Render the review-loop record (if any) into searchable text so a session that
+/// went through the post-completion review rounds surfaces in `session_search`.
+fn review_search_text(session: &Session) -> Option<String> {
+    let state = session.review_loop.as_ref()?;
+    let record = state.record.as_ref()?;
+    let total_rounds = record.rounds.len();
+    let findings_reported: usize = record.rounds.iter().map(|r| r.findings.len()).sum();
+    let mut lines = vec![
+        "Review loop:".to_string(),
+        format!(
+            "review status: {}",
+            state
+                .finish_reason
+                .as_deref()
+                .unwrap_or(if state.finished { "finished" } else { "active" })
+        ),
+        format!("review rounds: {total_rounds}"),
+        format!("review findings: {findings_reported}"),
+        format!("review can't-fix: {}", record.cant_fix.len()),
+        format!("review files touched: {}", record.files_touched.len()),
+    ];
+    for f in &record.cant_fix {
+        lines.push(format!("review can't-fix: [{}] {}: {}", f.severity, f.path, f.text));
+    }
+    // Include the actual finding content so a search for an issue the review
+    // surfaced (e.g. a bug description) matches this session.
+    for round in &record.rounds {
+        for f in &round.findings {
+            lines.push(format!(
+                "review finding: [{}] {}: {}",
+                f.severity, f.path, f.text
+            ));
+        }
+    }
+    Some(lines.join("\n"))
 }
 
 fn source_matches_filter(source: &str, options: &SearchOptions) -> bool {
