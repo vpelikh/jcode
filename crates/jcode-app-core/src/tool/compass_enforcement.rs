@@ -215,6 +215,20 @@ pub(crate) fn compass_redirect_output(input: &serde_json::Value) -> super::ToolO
     }))
 }
 
+/// Whether the operator has `compass_query`-first enforcement enabled for an
+/// `agentgrep` call. Reads the `tools.prefer_compass_query` config value.
+///
+/// This must be called *before* the registry's tools read lock is taken:
+/// `config()` can trigger a reload (disk read + listener dispatch), and doing
+/// that while holding the lock could deadlock if a reload listener re-entered
+/// the tool registry. Keeping the read here (rather than in
+/// `enforce_compass_first`, which runs under the lock) preserves that
+/// property and also avoids paying a config read on every unrelated tool call.
+pub(crate) fn prefer_compass_query_for(resolved_name: &str) -> bool {
+    resolved_name == "agentgrep"
+        && crate::config::config().tools.prefer_compass_query
+}
+
 pub(crate) fn truncate_middle(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
