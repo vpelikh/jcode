@@ -317,16 +317,21 @@ impl Agent {
     /// Grouped working-directory change invoked from a user `/cd` request.
     ///
     /// Beyond [`Self::set_working_dir`], this persists the session, refreshes
-    /// project-scoped skills, and carries the change to the model. For a
-    /// session with no visible conversation yet, the initial session-context
-    /// system-reminder is rewritten with the new directory. For a session that
-    /// has progressed, that reminder is left untouched and a model-visible
-    /// notice is appended instead.
+    /// the AGENTS.md snapshot, and carries the change to the model. Project
+    /// skills do not need an eager reload here: they are resolved dynamically
+    /// from the tool context's working_dir on each call, so changing the dir
+    /// re-scopes them automatically. For a session with no visible
+    /// conversation yet, the initial session-context system-reminder is
+    /// rewritten with the new directory. For a session that has progressed,
+    /// that reminder is left untouched and a model-visible notice is appended
+    /// instead.
     ///
-    /// Returns `Ok(true)` when the working directory actually changed (and
-    /// events should be fanned out), or `Ok(false)` when the request resolved
-    /// to the directory already bound (a no-op that should not spam the UI).
-    pub fn set_working_dir_grouped(&mut self, dir: &str) -> anyhow::Result<bool> {
+    /// Returns `Ok(Some(resolved))` when the working directory actually changed,
+    /// with the canonicalized path that was stored (so callers can fan out a
+    /// change event carrying the *resolved* directory). Returns `Ok(None)` when
+    /// the request resolved to the directory already bound (a no-op that should
+    /// not spam the UI).
+    pub fn set_working_dir_grouped(&mut self, dir: &str) -> anyhow::Result<Option<String>> {
         let old_dir = self
             .session
             .working_dir
@@ -353,7 +358,7 @@ impl Agent {
                 .map(|p| p.to_string_lossy() == normalized)
                 .unwrap_or(false);
         if current_is_target {
-            return Ok(false);
+            return Ok(None);
         }
         self.session.working_dir = Some(normalized.clone());
         self.refresh_agents_md_snapshot();
@@ -365,7 +370,7 @@ impl Agent {
         }
         self.session.save()?;
         self.log_env_snapshot("working_dir");
-        Ok(true)
+        Ok(Some(normalized))
     }
 
     /// Get the working directory for this session
@@ -470,5 +475,58 @@ mod resolve_working_dir_tests {
         let expected = std::fs::canonicalize(std::env::temp_dir().join("jcode-wd-dotdot-base")).unwrap();
         assert_eq!(std::path::Path::new(&result), expected.as_path());
         std::fs::remove_dir_all(std::env::temp_dir().join("jcode-wd-dotdot-base")).unwrap();
+    }
+
+    #[test]
+    fn tilde_expands_to_home() {
+        let home = std::env::temp_dir().join("jcode-wd-home-test");
+        let sub = home.join("subdir");
+        std::fs::create_dir_all(&sub).unwrap();
+        let prev_home = std::env::var_os("HOME");
+        crate::env::set_var("HOME", &home);
+
+        let result = resolve_working_dir(std::path::Path::new("/tmp"), "~/subdir").unwrap();
+        assert_eq!(
+            std::path::Path::new(&result),
+            sub.canonicalize().unwrap().as_path(),
+            "~/... must expand to the user's home directory"
+        );
+        // Bare `~` resolves to home itself.
+        let bare = resolve_working_dir(std::path::Path::new("/tmp"), "~").unwrap();
+        assert_eq!(
+            std::path::Path::new(&bare),
+            home.canonicalize().unwrap().as_path(),
+            "bare ~ must resolve to the home directory"
+        );
+
+        if let Some(prev) = prev_home {
+            crate::env::set_var("HOME", prev);
+        } else {
+            crate::env::remove_var("HOME");
+        }
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn symlink_is_resolved_to_canonical_target() {
+        let root = std::env::temp_dir().join("jcode-wd-symlink-test");
+        let real = root.join("real");
+        let link = root.join("link");
+        std::fs::create_dir_all(&real).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // If symlinks are unavailable (non-unix), the test is a no-op.
+        #[cfg(not(unix))]
+        if true {
+            return;
+        }
+
+        let result = resolve_working_dir(&root, "link").unwrap();
+        assert_eq!(
+            std::path::Path::new(&result),
+            real.canonicalize().unwrap().as_path(),
+            "a symlink arg must resolve to its canonical target"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
