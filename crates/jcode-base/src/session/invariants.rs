@@ -276,6 +276,46 @@ impl LogInvariant for ReplayDeterminism {
     }
 }
 
+/// Compaction brackets must be well-formed (takeaway #5's orphan-detection
+/// consumer of takeaway #3). Every `CompactionStart` must be closed by a later
+/// `CompactionEnd`, and a `CompactionEnd` must never appear without a preceding
+/// open start. An orphaned bracket is the replay-visible signal of a compaction
+/// that crashed mid-summarize.
+pub struct CompactionBracket;
+
+impl LogInvariant for CompactionBracket {
+    fn name(&self) -> &'static str {
+        "session.compaction_bracket_balanced"
+    }
+
+    fn check(&self, map: &SessionEventMap) -> Result<(), InvariantViolation> {
+        let mut depth = 0usize;
+        for (i, event) in map.events.iter().enumerate() {
+            match &event.op {
+                SessionEventOp::CompactionStart { .. } => depth += 1,
+                SessionEventOp::CompactionEnd { .. } => {
+                    if depth == 0 {
+                        return Err(InvariantViolation::at(
+                            "session.compaction_bracket_balanced",
+                            i,
+                            "CompactionEnd appears without a matching open CompactionStart",
+                        ));
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        if depth != 0 {
+            return Err(InvariantViolation::new(
+                "session.compaction_bracket_balanced",
+                format!("orphaned CompactionStart bracket remains open (depth {depth}); compaction likely crashed mid-summarize"),
+            ));
+        }
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The registry
 // ---------------------------------------------------------------------------
@@ -296,6 +336,7 @@ impl InvariantRegistry {
         r.add(ParentEdgesResolve);
         r.add(ToolPairingBalanced);
         r.add(ReplayDeterminism);
+        r.add(CompactionBracket);
         r
     }
 

@@ -144,6 +144,129 @@ fn test_event_map_compaction_operations() {
     }));
 }
 
+/// Compaction is a log-bracketed operation (takeaway #5): a `CompactionStart`
+/// marker precedes the reconstitution, and a `CompactionEnd` persists the
+/// result. A balanced bracket yields no orphan and leaves `current_compaction`
+/// equal to the persisted state.
+#[test]
+fn test_compaction_bracket_balanced_round_trip() {
+    let mut map = SessionEventMap::default();
+    map.start_compaction("comp_1", 6);
+
+    // Mid-bracket, the surface is *not* yet considered compacted and the open
+    // bracket is detectable as an orphan.
+    assert!(
+        map.orphaned_compaction().is_some(),
+        "an open bracket before CompactionEnd must be flagged as orphaned"
+    );
+    assert_eq!(map.current_compaction(), None);
+
+    let state = StoredCompactionState {
+        summary_text: "summary".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 6,
+        original_turn_count: 40,
+        compacted_count: 6,
+    };
+    map.end_compaction(state.clone());
+
+    // Closing clears the orphan and persists the state.
+    assert!(map.orphaned_compaction().is_none());
+    assert_eq!(map.current_compaction(), Some(state));
+
+    // Balanced bracket survives serialization.
+    let json = serde_json::to_string(&map).expect("serialize map");
+    let back: SessionEventMap = serde_json::from_str(&json).expect("deserialize map");
+    assert!(back.orphaned_compaction().is_none());
+    match &back.events[0].op {
+        SessionEventOp::CompactionStart { compaction_id, covers_up_to_turn } => {
+            assert_eq!(compaction_id, "comp_1");
+            assert_eq!(*covers_up_to_turn, 6);
+        }
+        _ => panic!("expected CompactionStart as first event"),
+    }
+    assert!(matches!(&back.events[1].op, SessionEventOp::CompactionEnd { .. }));
+}
+
+/// A crash mid-summarize leaves an open `CompactionStart` with no `CompactionEnd`
+/// — the line between "compacted" and "incomplete compaction". `orphaned_compaction`
+/// must surface it so replay can stop and report rather than trust a partial result.
+#[test]
+fn test_compaction_bracket_orphan_detection_on_crash() {
+    let mut map = SessionEventMap::default();
+    map.start_compaction("comp_crash", 12);
+
+    // Simulate a crash: no CompactionEnd appended.
+    let orphan = map
+        .orphaned_compaction()
+        .expect("an open bracket after a simulated crash must be orphaned");
+    match &orphan.op {
+        SessionEventOp::CompactionStart { compaction_id, covers_up_to_turn } => {
+            assert_eq!(compaction_id, "comp_crash");
+            assert_eq!(*covers_up_to_turn, 12);
+        }
+        _ => panic!("orphan must be the CompactionStart marker"),
+    }
+
+    // The invariant registry flags the orphaned bracket.
+    let reg = crate::session::InvariantRegistry::builtin();
+    let log = reg.check(&map);
+    assert!(
+        log.violations
+            .iter()
+            .any(|v| v.invariant == "session.compaction_bracket_balanced"),
+        "expected an orphaned-bracket violation, got {:#?}",
+        log.violations
+    );
+
+    // A balanced pair must not be flagged.
+    map.end_compaction(StoredCompactionState {
+        summary_text: "s".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 12,
+        original_turn_count: 50,
+        compacted_count: 12,
+    });
+    let log = reg.check(&map);
+    assert!(
+        log.is_green(),
+        "balanced bracket should be green, got {:#?}",
+        log.violations
+    );
+}
+
+/// A `CompactionEnd` without a preceding `CompactionStart` is itself an orphan
+/// (an "unpaired close") and must be flagged by the bracket invariant.
+#[test]
+fn test_compaction_end_without_start_is_flagged() {
+    let mut map = SessionEventMap::default();
+    map.append_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "bare_end".to_string(),
+        op: SessionEventOp::CompactionEnd {
+            compaction: StoredCompactionState {
+                summary_text: "s".to_string(),
+                openai_encrypted_content: None,
+                covers_up_to_turn: 1,
+                original_turn_count: 10,
+                compacted_count: 1,
+            },
+        },
+        parent_id: None,
+        version: 1,
+    });
+
+    let reg = crate::session::InvariantRegistry::builtin();
+    let log = reg.check(&map);
+    assert!(
+        log.violations
+            .iter()
+            .any(|v| v.invariant == "session.compaction_bracket_balanced"),
+        "expected an unpaired-close violation, got {:#?}",
+        log.violations
+    );
+}
+
 #[test]
 fn test_event_map_memory_injection_operations() {
     let mut session = Session::create_with_id(
