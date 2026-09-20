@@ -552,6 +552,12 @@ pub use jcode_tui_mermaid::DiagramInfo;
 #[derive(Debug, Clone)]
 pub struct GitInfo {
     pub branch: String,
+    /// The linked-git-worktree name when the working directory is a linked
+    /// worktree (e.g. `git-widget-worktree`), `None` when it is the main
+    /// checkout (or not inside a repository, which is handled by the absent
+    /// `GitInfo` itself). Set on linked worktrees regardless of detached HEAD,
+    /// so the widget can tell the user which worktree they are editing in.
+    pub worktree: Option<String>,
     pub modified: usize,
     pub staged: usize,
     pub untracked: usize,
