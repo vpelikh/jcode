@@ -327,4 +327,55 @@ impl SwarmServiceHandle {
         )
         .await;
     }
+
+    /// Remove a session from a swarm: salvage its assignments, update
+    /// `swarms_by_id`, re-elect/clean up the coordinator if it left, reparent
+    /// its spawned children, persist the new membership, and broadcast status.
+    /// Routes through the swarm service so teardown code does not hold the raw
+    /// swarm maps. Deferred to `swarm::remove_session_from_swarm`.
+    pub(crate) async fn remove_session_from_swarm(&self, session_id: &str, swarm_id: &str) {
+        super::super::swarm::remove_session_from_swarm(
+            session_id,
+            swarm_id,
+            &self.swarm_state.members,
+            &self.swarm_state.swarms_by_id,
+            &self.swarm_state.coordinators,
+            &self.swarm_state.plans,
+        )
+        .await;
+    }
+
+    /// Record a swarm event into the ring buffer and broadcast it. Routes event
+    /// emission through the swarm service so callers do not touch the event
+    /// sinks directly. Deferred to `swarm::record_swarm_event`.
+    pub(crate) async fn record_swarm_event(
+        &self,
+        session_id: String,
+        session_name: Option<String>,
+        swarm_id: Option<String>,
+        event: SwarmEventType,
+    ) {
+        super::super::swarm::record_swarm_event(
+            &self.event_history,
+            &self.event_counter,
+            &self.swarm_event_tx,
+            session_id,
+            session_name,
+            swarm_id,
+            event,
+        )
+        .await;
+    }
+
+    /// Remove a session's channel subscriptions from both indexes. Routes
+    /// through the swarm service so teardown code does not touch the raw channel
+    /// index. Deferred to `swarm_channels::remove_session_channel_subscriptions`.
+    pub(crate) async fn remove_session_channel_subscriptions(&self, session_id: &str) {
+        super::super::swarm_channels::remove_session_channel_subscriptions(
+            session_id,
+            &self.channel_subscriptions,
+            &self.channel_subscriptions_by_session,
+        )
+        .await;
+    }
 }

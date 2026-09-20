@@ -1,5 +1,6 @@
 use super::ClientConnectionInfo;
 use super::client_lifecycle::process_message_streaming_mpsc;
+use super::services::SwarmServiceHandle;
 use super::swarm_mutation_state::{
     PersistedSwarmMutationResponse, SwarmMutationRuntime, begin_or_replay, finish_request,
     request_key,
@@ -7,9 +8,8 @@ use super::swarm_mutation_state::{
 use super::{
     SessionInterruptQueues, SwarmEvent, SwarmEventType, SwarmMember, SwarmState, VersionedPlan,
     append_swarm_completion_report_instructions, broadcast_swarm_plan, broadcast_swarm_status,
-    create_headless_session, fanout_session_event, persist_swarm_state_for, record_swarm_event,
+    create_headless_session, fanout_session_event, persist_swarm_state_for,
     record_swarm_event_for_session, remove_background_tool_signal,
-    remove_session_channel_subscriptions, remove_session_from_swarm,
     remove_session_interrupt_queue, set_member_task_label, truncate_detail, update_member_status,
     update_member_status_with_report,
 };
@@ -1008,18 +1008,14 @@ pub(super) async fn handle_comm_stop(
     force: bool,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
     sessions: &SessionAgents,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    channel_subscriptions: &ChannelSubscriptions,
-    channel_subscriptions_by_session: &ChannelSubscriptions,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
+    swarm: &SwarmServiceHandle,
     soft_interrupt_queues: &SessionInterruptQueues,
     swarm_mutation_runtime: &SwarmMutationRuntime,
 ) {
+    // Swarm-domain state is reached through the swarm service handle. These
+    // locals keep the body single-homed on the handle's fields (server service
+    // split, Slice 4).
+    let swarm_members = &swarm.swarm_state.members;
     // Stopping is authorized per-target by ownership (the requester is the
     // target's spawner or a transitive ancestor) rather than by the swarm-level
     // coordinator slot, so that any parent can stop agents in its own subtree.
@@ -1137,34 +1133,21 @@ pub(super) async fn handle_comm_stop(
         }
     };
     if let Some(ref swarm_id) = removed_swarm_id {
-        record_swarm_event(
-            event_history,
-            event_counter,
-            swarm_event_tx,
-            target_session.clone(),
-            removed_name.clone(),
-            Some(swarm_id.clone()),
-            SwarmEventType::MemberChange {
-                action: "left".to_string(),
-            },
-        )
-        .await;
-        remove_session_from_swarm(
-            &target_session,
-            swarm_id,
-            swarm_members,
-            swarms_by_id,
-            swarm_coordinators,
-            swarm_plans,
-        )
-        .await;
+        swarm
+            .record_swarm_event(
+                target_session.clone(),
+                removed_name.clone(),
+                Some(swarm_id.clone()),
+                SwarmEventType::MemberChange {
+                    action: "left".to_string(),
+                },
+            )
+            .await;
+        swarm.remove_session_from_swarm(&target_session, swarm_id).await;
     }
-    remove_session_channel_subscriptions(
-        &target_session,
-        channel_subscriptions,
-        channel_subscriptions_by_session,
-    )
-    .await;
+    swarm
+        .remove_session_channel_subscriptions(&target_session)
+        .await;
 
     let response = if removed_live_agent || removed_swarm_id.is_some() {
         PersistedSwarmMutationResponse::Done
