@@ -2037,10 +2037,10 @@ fn todos_widget_height_equals_rendered_line_count() {
 /// Every rendered row of the widgets must fit within the widget's inner width:
 /// the header row(s) (now wrapped, and optional confidence/loop suffixes clipped
 /// when a suffix alone is wider than the box), todo rows, wrapped continuation
-/// rows, and wrapped group-header rows. This is the guarantee this feature adds
-/// - everything displays fully, wrapped to its box, never clipped. We sum the
-///   display width of each row's spans (wide CJK glyphs count 2) and require it
-///   <= inner.width.
+/// rows, and wrapped group-header rows. This is the guarantee this feature adds:
+/// everything displays fully, wrapped to its box, never clipped. We sum the
+/// display width of each row's spans (wide CJK glyphs count 2) and require it
+/// <= inner.width.
 #[test]
 fn todo_widget_lines_never_exceed_inner_width() {
     use unicode_width::UnicodeWidthStr;
@@ -2148,9 +2148,10 @@ fn compact_todos_rows_fit_and_height_matches() {
 ///   * the continuation rows printed the content wrapped to the narrower
 ///     first-line prefix, so wrapped chunks overflowed the wider continuation
 ///     prefix.
-///     The fix wraps content to the continuation prefix and appends the confidence
-///     and blocked trailers only when they fit in the leftover columns, so no row
-///     can exceed `inner.width`.
+///
+/// The fix wraps content to the continuation prefix and appends the confidence
+/// and blocked trailers only when they fit in the leftover columns, so no row
+/// can exceed `inner.width`.
 #[test]
 fn todo_widget_rows_never_overflow_narrow_widths() {
     use unicode_width::UnicodeWidthStr;
