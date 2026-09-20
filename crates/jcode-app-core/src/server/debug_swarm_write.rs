@@ -781,5 +781,25 @@ mod tests {
             output.contains("\"approved\":true"),
             "coordinator approve should merge the proposal, got: {output}"
         );
+        // The merged item must actually be in the swarm's plan, along with both
+        // the coordinator and proposer as participants.
+        let plan = swarm
+            .swarm_state()
+            .plans
+            .read()
+            .await
+            .get("swarm-A")
+            .expect("approve must create a plan for swarm-A")
+            .clone();
+        assert_eq!(plan.items.len(), 1, "plan should hold the merged item");
+        assert_eq!(plan.items[0].id, "task-1");
+        assert!(
+            plan.participants.contains("agent-1"),
+            "coordinator is a participant"
+        );
+        assert!(
+            plan.participants.contains("agent-2"),
+            "proposer is a participant"
+        );
     }
 }
