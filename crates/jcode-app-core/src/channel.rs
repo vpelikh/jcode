@@ -192,6 +192,12 @@ pub struct TelegramChannel {
     /// triggers a discovery sweep so a blocked default DC is worked around at
     /// first use rather than only after a failed call.
     discovered_once: tokio::sync::Mutex<bool>,
+    /// Serializes discovery (in `client_or_default` and `invalidate_cache`) so
+    /// concurrent callers — the poll loop, a send, a `/status`, or a recovery
+    /// burst — never run overlapping or redundant discovery sweeps. Callers
+    /// acquire it, re-check state, and call `run_discovery_body` while holding
+    /// it; the network round-trips are serialized rather than duplicated.
+    discovery_lock: tokio::sync::Mutex<()>,
     /// Serializes inbound message handling for this chat. Because each message
     /// is handled in its own task (so the poll loop stays responsive), this
     /// lock ensures the replies to messages from one chat arrive in arrival
@@ -250,6 +256,7 @@ impl TelegramChannel {
             api_ip,
             last_discovery: tokio::sync::Mutex::new(std::time::Instant::now()),
             discovered_once: tokio::sync::Mutex::new(false),
+            discovery_lock: tokio::sync::Mutex::new(()),
             process_lock: tokio::sync::Mutex::new(()),
             consecutive_discovery_failures: tokio::sync::Mutex::new(0),
             auth_warning_tracker: tokio::sync::Mutex::new(AuthWarningTracker::default()),
@@ -260,11 +267,12 @@ impl TelegramChannel {
     /// Run (or re-run) the discovery sweep, replacing the cached client with the
     /// first reachable DC (or the default client if all candidates fail). Marks
     /// discovery as done and records the attempt time for backoff.
-    async fn run_discovery(&self) {
+    async fn run_discovery_body(&self) {
         let replacement = match crate::telegram::discover_client(
             &self.token,
             self.proxy.as_deref(),
             self.api_ip.as_deref(),
+            self.api_base.as_deref(),
         )
         .await
         {
@@ -275,7 +283,14 @@ impl TelegramChannel {
             Err(_) => {
                 let mut failures = self.consecutive_discovery_failures.lock().await;
                 *failures = failures.saturating_add(1);
-                crate::provider::shared_http_client()
+                // Discovery failed. Still hand back a usable client so the caller
+                // can keep trying. Prefer a proxy/IP-aware client (built from the
+                // same configured overrides) over the bare shared client, so a
+                // configured `telegram_proxy` is not silently dropped on the
+                // recovery path. Fall back to the shared client only if even that
+                // build fails.
+                crate::telegram::build_client(self.proxy.as_deref(), self.api_ip.as_deref())
+                    .unwrap_or_else(|_| crate::provider::shared_http_client())
             }
         };
         *self.client.lock().await = replacement;
@@ -289,7 +304,14 @@ impl TelegramChannel {
     /// returned so the calling operation still attempts to run.
     async fn client_or_default(&self) -> reqwest::Client {
         if !*self.discovered_once.lock().await {
-            self.run_discovery().await;
+            // Take the discovery lock so the check-set of discovered_once is
+            // atomic: a concurrent caller that sees the flag still false after we
+            // start will block here, then observe it true (set by the first
+            // discovery) and skip its own redundant sweep.
+            let _guard = self.discovery_lock.lock().await;
+            if !*self.discovered_once.lock().await {
+                self.run_discovery_body().await;
+            }
         }
         self.client.lock().await.clone()
     }
@@ -298,13 +320,19 @@ impl TelegramChannel {
     /// throttled by `DISCOVERY_BACKOFF_SECS` (unless `force`) so a persistently
     /// blocked network does not trigger a slow candidate sweep on every poll.
     async fn invalidate_cache(&self, force: bool) {
+        // Hold the discovery lock across the backoff check AND the sweep so a
+        // burst of concurrent invalidations right at the backoff boundary don't
+        // each run a full sweep: the first runs discovery (refreshing
+        // last_discovery), and the rest, once they acquire the lock, observe the
+        // fresh timestamp and return early.
+        let _guard = self.discovery_lock.lock().await;
         if !force {
             let last = *self.last_discovery.lock().await;
             if last.elapsed().as_secs() < crate::telegram::DISCOVERY_BACKOFF_SECS {
                 return;
             }
         }
-        self.run_discovery().await;
+        self.run_discovery_body().await;
     }
 
     /// Handle a slash command received over Telegram, returning the reply text.
@@ -2711,6 +2739,45 @@ mod tests {
         assert!(
             answer_body.get("text").is_none() || !answer_body["text"].as_str().unwrap_or("").is_empty(),
             "answerCallbackQuery must not send an empty `text` (would leave the button stuck)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_client_or_default_runs_single_discovery() {
+        // Regression for the discovery-dedup fix: concurrent callers of
+        // client_or_default must not each fire their own discovery sweep. A
+        // single mock mirror records exactly one getMe probe (the first
+        // discovery); the losing caller observes discovered_once under the lock
+        // and reuses the already-set client instead of probing again.
+        let mock = MockTelegram::start().await;
+        let ch = std::sync::Arc::new(TelegramChannel::with_connectivity(
+            "tok".into(),
+            "77".into(),
+            true,
+            Some(mock.base()),
+            None,
+            None,
+            None,
+        ));
+        let ch1 = std::sync::Arc::clone(&ch);
+        let ch2 = std::sync::Arc::clone(&ch);
+        let (r1, r2) = tokio::join!(
+            async move { ch1.client_or_default().await },
+            async move { ch2.client_or_default().await },
+        );
+        // Both got a usable client.
+        assert!(r1.get("http://example.com").build().is_ok());
+        assert!(r2.get("http://example.com").build().is_ok());
+        // Exactly ONE discovery probe (getMe) must have reached the mirror.
+        let getme_count = mock
+            .methods()
+            .await
+            .iter()
+            .filter(|m| m.as_str() == "getMe")
+            .count();
+        assert_eq!(
+            getme_count, 1,
+            "two concurrent client_or_default calls must run a single discovery, found {getme_count}"
         );
     }
 

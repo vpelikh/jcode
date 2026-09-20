@@ -88,18 +88,28 @@ fn non_empty(value: &str) -> Option<&str> {
 
 /// Curated list of known Telegram data-center IPs, tried in order when the
 /// DNS-resolved default is blocked. These come from Telegram's published DC
-/// ranges (149.154.167.x / 149.154.175.x and their IPv6 counterparts). The
-/// hostname is always kept for TLS/SNI, so this only redirects the TCP
-/// connection; it does not bypass certificate verification. TLS verification
-/// still uses the hostname, so the server certificate is validated as usual.
-/// We deliberately do not scan arbitrary ranges: discovery is bounded to this list.
+/// IPv4 ranges (149.154.160.0/20) and IPv6 range (2001:67c:4e8::/48). The
+/// 91.108.0.0/16 MTProto DC range is deliberately excluded: those addresses
+/// serve the MTProto client protocol, not the HTTP Bot API, so they cannot be
+/// used as a Bot API endpoint. The hostname is always kept for TLS/SNI, so this
+/// only redirects the TCP connection; it does not bypass certificate
+/// verification. TLS verification still uses the hostname, so the server
+/// certificate is validated as usual.
+///
+/// The list deliberately leads with the current HTTP API edge (`api.telegram.org`
+/// resolves to `149.154.166.110` / `2001:67c:4e8:f004::9`), which is the one a
+/// censor's SNI/DNS filter usually blocks first; if that specific edge is
+/// unreachable the other well-known DC IPs follow. We deliberately do not scan
+/// arbitrary ranges: discovery is bounded to this list.
 pub const TELEGRAM_DC_CANDIDATES: &[&str] = &[
+    "149.154.166.110", // api.telegram.org (current edge, DNS-verified)
     "149.154.167.220",
     "149.154.167.40",
     "149.154.167.50",
     "149.154.175.50",
     "149.154.175.100",
     "149.154.175.53",
+    "2001:67c:4e8:f004::9", // api.telegram.org IPv6 (current edge, DNS-verified)
     "2001:67c:4e8::1",
     "2001:67c:4e8::2",
     "2001:67c:4e8::3",
@@ -117,9 +127,10 @@ pub const TELEGRAM_DC_CANDIDATES: &[&str] = &[
 pub const DISCOVERY_BACKOFF_SECS: u64 = 60;
 
 /// Per-candidate connect timeout during discovery. Kept short so an offline
-/// network does not make the full sweep block for minutes (18 candidates × the
-/// normal 15s is far too long for a single poll). A working candidate is well
-/// within this; the long-poll path reuses the same resolved client afterward.
+/// network does not make the full sweep block for minutes (the whole candidate
+/// list × the normal 15s would be far too long for a single poll). A working
+/// candidate is well within this; the long-poll path reuses the same resolved
+/// client afterward.
 const DISCOVERY_PROBE_TIMEOUT_SECS: u64 = 8;
 
 /// True if the error is a network-level failure (DNS poisoned, IP blocked,
@@ -202,6 +213,27 @@ pub fn is_transient_api_error(e: &anyhow::Error) -> bool {
         || s.contains("retry after")
 }
 
+/// Build the discovery-bail error for a configured `api_base` mirror that
+/// failed to probe. A mirror is the ONLY host the real flows target, so any
+/// failure is terminal for this discovery pass (the caller's re-discovery
+/// retries it). The message distinguishes a transient failure (connectivity
+/// / 429 / timeout — retryable) from a permanent one (bad token), so users get
+/// an accurate diagnosis instead of a misleading "bad token?" on a temporary
+/// outage.
+fn mirror_probe_error(api_base: &str, e: &anyhow::Error) -> anyhow::Error {
+    if is_transient_api_error(e) {
+        anyhow::anyhow!(
+            "Telegram unreachable via configured API base mirror `{api_base}` \
+             ({e}). Will retry on the next discovery pass."
+        )
+    } else {
+        anyhow::anyhow!(
+            "Telegram auth failed via API base mirror `{api_base}` \
+             (bad token?): {e}. Stopping discovery."
+        )
+    }
+}
+
 /// Build a short-timeout client used only for the discovery probe (`getMe`).
 /// A fast *connect* timeout keeps an unreachable candidate from stalling the
 /// sweep. Crucially this client has NO overall request timeout: `discover_client`
@@ -232,19 +264,81 @@ fn build_probe_client(proxy: Option<&str>, api_ip: Option<&str>) -> anyhow::Resu
 /// Build a working client for the Telegram Bot API, auto-discovering a
 /// reachable data-center IP when the DNS-resolved default is blocked.
 ///
-/// Precedence: if `override_ip` (from `[safety] telegram_api_ip`) is set, it is
-/// tried first as an explicit escape hatch. Then the default DNS resolution is
-/// tried, followed by the curated list of known DC IPs (`TELEGRAM_DC_CANDIDATES`).
-/// Each candidate is probed with a short-timeout client; the first whose
-/// `verify_bot_auth` probe succeeds is returned (and reused for the real path).
-/// A permanent error (e.g. a bad bot token) stops discovery immediately, since
-/// no IP will help; transient failures (network, TLS, or a 429 rate-limit) move
-/// on to the next candidate.
+/// There are two mutually exclusive routing modes:
+///
+/// **With a mirror (`api_base`, from `[safety] telegram_api_base`) configured**
+/// — e.g. a reverse-proxy Bot API mirror that itself bypasses censorship. Real
+/// flows target this host exclusively. Discovery probes it with a short-timeout
+/// client; on success that client is reused for the real path. On failure it
+/// bails immediately, distinguishing a transient failure (network, TLS,
+/// timeout — the error says it will retry on the next discovery pass, matching
+/// the caller's `invalidate_cache` re-discovery) from a permanent one (bad
+/// token). No `api.telegram.org` sweep runs here, because the real path never
+/// contacts that host when a mirror is set.
+///
+/// **Without a mirror** — the target is the default `api.telegram.org`. An
+/// explicit `override_ip` (from `[safety] telegram_api_ip`) is tried first as
+/// an escape hatch, then the default DNS resolution, then the curated DC IP
+/// list (`TELEGRAM_DC_CANDIDATES`). Each candidate is probed with a
+/// short-timeout client; the first whose `verify_bot_auth` probe succeeds is
+/// returned (and reused for the real path). A permanent error (e.g. a bad bot
+/// token) stops discovery immediately, since no endpoint will help; transient
+/// failures (network, TLS, or a 429 rate-limit) move on to the next candidate.
 pub async fn discover_client(
     bot_token: &str,
     proxy: Option<&str>,
     override_ip: Option<&str>,
+    api_base: Option<&str>,
 ) -> anyhow::Result<reqwest::Client> {
+    let api_base = api_base
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    // When an explicit API base mirror is configured it takes first precedence:
+    // it is the user's stated anti-censorship path, and the real flows target it
+    // exclusively. Probe it with a plain (default-DNS, optionally proxy-routed)
+    // client; `verify_bot_auth` normalizes the base (appending `/bot` if the
+    // mirror lacks it), and the returned client is reused for the real path if
+    // the probe succeeds.
+    if let Some(api_base) = &api_base {
+        let client = match build_probe_client(proxy, None) {
+            Ok(c) => c,
+            Err(e) => {
+                // A client-build failure is a configuration error (e.g. an
+                // unparseable proxy URL), not a transient connectivity or auth
+                // problem. Surface it as-is rather than mislabeling it "bad token".
+                return Err(e.context(format!(
+                    "failed to build probe client for configured API base mirror `{api_base}`"
+                )));
+            }
+        };
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(DISCOVERY_PROBE_TIMEOUT_SECS + 5),
+            verify_bot_auth(&client, bot_token, Some(api_base)),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {
+                logging::info(&format!(
+                    "telegram reachable via configured API base mirror {api_base}"
+                ));
+                return Ok(client);
+            }
+            Ok(Err(e)) => return Err(mirror_probe_error(api_base, &e)),
+            Err(elapsed) => {
+                return Err(mirror_probe_error(
+                    api_base,
+                    &anyhow::anyhow!("probe timed out: {elapsed}"),
+                ));
+            }
+        }
+    }
+
+    // No mirror configured: the target is the DEFAULT Bot API endpoint
+    // (`api.telegram.org`). Try an explicit pinned `override_ip` first, then
+    // default DNS, then the curated DC IP list. Each candidate is probed with
+    // the default base (None) — IP pinning redirects `api.telegram.org`.
     let mut candidates: Vec<Option<String>> = Vec::new();
     if let Some(ip) = override_ip.filter(|ip| !ip.trim().is_empty()) {
         candidates.push(Some(ip.trim().to_string()));
@@ -1497,8 +1591,9 @@ mod tests {
 
     #[test]
     fn test_discovery_candidate_ordering() {
-        // Simulate the ordering used in discover_client: override first, then
-        // default DNS, then the curated list.
+        // Simulate the ordering used in discover_client: override_ip first, then
+        // default DNS, then the curated list. (api_base is probed even earlier,
+        // before any IP pinning — see test_telegram_api_base_preference.)
         let override_ip = Some("10.0.0.1");
         let mut candidates: Vec<Option<String>> = Vec::new();
         if let Some(ip) = override_ip.filter(|ip| !ip.trim().is_empty()) {
@@ -1511,10 +1606,210 @@ mod tests {
         // candidates.first() returns Option<&Option<String>>, need Some(&Option...)
         assert_eq!(candidates.first(), Some(&Some("10.0.0.1".to_string())));
         assert_eq!(candidates.get(1), Some(&None));
-        assert_eq!(candidates.get(2), Some(&Some("149.154.167.220".to_string())));
+        // The curated list is led by the current api.telegram.org edge IP.
+        assert_eq!(candidates.get(2), Some(&Some("149.154.166.110".to_string())));
         // The curated list must be tried before any arbitrary scan: total is
         // override + default-DNS + every candidate, and never a wider sweep.
         assert_eq!(candidates.len(), 2 + TELEGRAM_DC_CANDIDATES.len());
+    }
+
+    #[test]
+    fn test_telegram_api_base_preference_and_normalization() {
+        // The api_base mirror override is trimmed and dropped when blank.
+        let is_empty = |b: Option<&str>| {
+            b.map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .is_none()
+        };
+        assert!(is_empty(None));
+        assert!(is_empty(Some("")));
+        assert!(is_empty(Some("   ")));
+        assert!(!is_empty(Some("https://mirror.example.com/bot")));
+
+        // api_base() normalizes a mirror WITHOUT a /bot path by appending it,
+        // so a bare host name configured by the user still points at a real
+        // Bot API endpoint.
+        let bare = api_base(Some("https://mirror.example.com"));
+        assert_eq!(bare, "https://mirror.example.com/bot/");
+        let with_bot = api_base(Some("https://mirror.example.com/bot"));
+        assert_eq!(with_bot, "https://mirror.example.com/bot/");
+        // A trailing-slash mirror is normalized too.
+        let trailing = api_base(Some("https://mirror.example.com/bot/"));
+        assert_eq!(trailing, "https://mirror.example.com/bot/");
+    }
+
+    /// Spin up a minimal local Bot API server. With `success=true` it answers
+    /// `getMe` with a Telegram-shaped ok=true body; with `success=false` it
+    /// answers 401 (a permanent auth error). Used to exercise `discover_client`'s
+    /// public behavior against a real HTTP endpoint (no Telegram egress required):
+    /// a successful mirror is probed first and honored, while a mirror that
+    /// returns a permanent error bails with the mirror-specific message.
+    async fn start_mock_bot_api(
+        success: bool,
+    ) -> (u16, std::sync::Arc<tokio::sync::Mutex<Option<String>>>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Captures the first request line so tests can assert the exact path the
+        // client requested (e.g. `/bot/<token>/getMe`), validating URL construction
+        // rather than only "some reachable endpoint answered".
+        let captured: std::sync::Arc<tokio::sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let captured_for_task = std::sync::Arc::clone(&captured);
+        let handle = tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+            // Serve a bounded number of requests so the test task can finish.
+            for _ in 0..8 {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let captured = std::sync::Arc::clone(&captured_for_task);
+                tokio::spawn(async move {
+                    // Read the request line, then drain headers/body, then answer.
+                    let (reader, mut writer) = stream.into_split();
+                    let mut reader = BufReader::new(reader);
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).await.is_ok() {
+                        if let Ok(mut c) = captured.try_lock() {
+                            if c.is_none() {
+                                *c = Some(request_line.trim().to_string());
+                            }
+                        }
+                    }
+                    // Drain remaining request headers + body so the client sees the
+                    // response cleanly.
+                    let mut buf = [0u8; 4096];
+                    let _ = reader.read(&mut buf).await;
+                    if success {
+                        let body = serde_json::json!({
+                            "ok": true,
+                            "result": { "id": 1, "first_name": "test", "username": "testbot" }
+                        })
+                        .to_string();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = writer.write_all(response.as_bytes()).await;
+                    } else {
+                        let body = r#"{"ok":false,"error_code":401,"description":"Unauthorized"}"#;
+                        let response = format!(
+                            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = writer.write_all(response.as_bytes()).await;
+                    }
+                });
+            }
+        });
+        (port, captured, handle)
+    }
+
+    /// The configured `api_base` mirror is probed FIRST: a reachable mirror
+    /// yields a working client even though nothing else is configured.
+    #[tokio::test]
+    async fn test_discover_client_prefers_configured_mirror() {
+        let (port, captured, _handle) = start_mock_bot_api(true).await;
+        let mirror = format!("http://127.0.0.1:{port}");
+        let client = discover_client("test-token", None, None, Some(&mirror))
+            .await
+            .expect("mirror-first discovery should succeed against the mock");
+        // The returned client is a real, usable reqwest client.
+        assert!(client.get("http://example.com").build().is_ok());
+        // Prove the probe actually round-tripped to the MIRROR with the correct
+        // path: normalization appends `/bot`, and the token is spliced before the
+        // method. This validates URL construction, not just "some endpoint answered".
+        let req_line = captured
+            .lock()
+            .await
+            .clone()
+            .expect("mock must have received a request");
+        assert_eq!(req_line, "POST /bot/test-token/getMe HTTP/1.1");
+    }
+
+    /// A configured mirror that returns a PERMANENT error (401 bad token) must
+    /// abort discovery immediately with the mirror-specific message, rather than
+    /// falling through to the DC sweep or the generic message. This is
+    /// deterministic (no network): the permanent error is detected before any
+    /// sweep candidate is tried.
+    #[tokio::test]
+    async fn test_discover_client_mirror_permanent_error_bails() {
+        let (port, _captured, _handle) = start_mock_bot_api(false).await;
+        let mirror = format!("http://127.0.0.1:{port}");
+        let err = discover_client("bad-token", None, None, Some(&mirror))
+            .await
+            .expect_err("a permanently-failing mirror must not be retried into the sweep");
+        let text = err.to_string();
+        // The error names the failing mirror and the auth failure.
+        assert!(
+            text.contains("auth failed via API base mirror") && text.contains(&mirror),
+            "permanent mirror failure must surface the mirror in the error: {text}"
+        );
+        // It must NOT be the generic sweep-exhaustion message.
+        assert!(
+            !text.contains("tried default DNS and"),
+            "permanent mirror failure must not confuse the user with the DC-sweep message: {text}"
+        );
+    }
+
+    /// A configured mirror that fails TRANSIENTLY (connection refused to a
+    /// non-listening port) must also bail immediately with the retryable message,
+    /// and must NOT fall through to an `api.telegram.org` DC sweep: the real
+    /// calls target the mirror host, so sweeping the default endpoint would be a
+    /// useless (and misleading) false-positive. Retry is the caller's job.
+    /// Deterministic: refuses a local connection, never touches Telegram.
+    #[tokio::test]
+    async fn test_discover_client_mirror_transient_failure_bails() {
+        // Use port 1 (IANA "tcpmux"). It is reliably refused: on unprivileged
+        // systems (the test's usual environment) any bind to a port < 1024 is
+        // denied, so nothing else can be listening there and connect is refused;
+        // even running as root, no normal service occupies it. That refusal is
+        // classified as a connectivity (transient) error by is_connectivity_error.
+        let mirror = "http://127.0.0.1:1";
+        let err = discover_client("test-token", None, None, Some(mirror))
+            .await
+            .expect_err("a transiently-failing mirror should bail, not sweep the wrong host");
+        let text = err.to_string();
+        assert!(
+            text.contains("unreachable via configured API base mirror")
+                && text.contains("Will retry on the next discovery pass"),
+            "transient mirror failure must surface a retryable mirror message: {text}"
+        );
+        // It must NOT appear to be a bad token, nor sweep the default endpoint.
+        assert!(
+            !text.contains("bad token")
+                && !text.contains("auth failed via API base mirror")
+                && !text.contains("tried default DNS and"),
+            "transient mirror failure must not be misreported: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_discover_client_mirror_build_client_failure_is_config_error_not_bad_token() {
+        // A client-build failure (e.g. an unparseable proxy URL) must be surfaced as
+        // a configuration error, never mislabeled as a "bad token". An invalid proxy
+        // URL makes build_probe_client fail before any request is attempted.
+        let mirror = "https://mirror.example.com/bot";
+        let err = discover_client(
+            "test-token",
+            Some("not a valid proxy url ://"),
+            None,
+            Some(mirror),
+        )
+        .await
+        .expect_err("an unparseable proxy should fail to build the probe client");
+        let text = err.to_string();
+        assert!(
+            text.contains("failed to build probe client")
+                && text.contains("configured API base mirror"),
+            "client-build failure must be reported as a config error, not bad token: {text}"
+        );
+        assert!(
+            !text.contains("bad token"),
+            "client-build failure must not be mislabeled as a bad token: {text}"
+        );
     }
 
     #[test]
