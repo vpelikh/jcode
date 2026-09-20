@@ -12,7 +12,7 @@ pub use jcode_config_types::{
     NamedProviderModelConfig, NamedProviderType, NativeScrollbarConfig, NotificationsConfig,
     OverscrollStatusMode, PowerConfig, ProviderConfig, ReasoningDisplayMode, SafetyConfig,
     SessionPickerResumeAction, SponsorsConfig, SwarmSpawnMode, SwarmStripLayout, TerminalConfig,
-    UpdateChannel, WebSearchConfig, WebSearchEngine, 0fc260497 (feat(agent): add gated route-fallback rung to the mitigation ladder)
+    UpdateChannel, WebSearchConfig, WebSearchEngine,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -566,7 +566,7 @@ pub struct Config {
     pub loop_guard: LoopGuardConfig,
 
     /// Route-degradation auto-mitigation configuration (opt-in route fallback).
-    pub degradation: DegradationSettings, 0fc260497 (feat(agent): add gated route-fallback rung to the mitigation ladder)
+    pub degradation: DegradationSettings,
 
     /// Power-management configuration (prevent sleep while streaming)
     pub power: PowerConfig,
