@@ -301,16 +301,18 @@ mod tests {
 
         let mut tracker = CacheTracker::new();
 
-        // Baseline turn.
-        let turn1 = M::with_timestamps(&[mktimed("build the thing", t0)]);
+        // Baseline turn. Production feeds the CacheTracker the RAW provider
+        // snapshot (record_client_cache_request(&messages) runs before
+        // with_timestamps), so drive it with raw messages here too.
+        let turn1 = vec![mktimed("build the thing", t0)];
         assert!(tracker.record_request(&turn1).is_none());
 
         // Next turn: same payload, earlier message re-serialized with a later
         // timestamp, plus a legitimate appended assistant turn.
-        let turn2 = M::with_timestamps(&[
+        let turn2 = vec![
             mktimed("build the thing", t0 + chrono::Duration::seconds(5)),
             make_message(Role::Assistant, "ok"),
-        ]);
+        ];
         assert!(
             tracker.record_request(&turn2).is_none(),
             "metadata-only re-timestamp must not be reported as a cache violation"
@@ -332,19 +334,19 @@ mod tests {
             timestamp: Some(t0),
             tool_duration_ms: tool_dur,
         };
-        let base_tool = M::with_timestamps(&[tool_msg(None)]);
+        let base_tool = vec![tool_msg(None)];
         assert!(tracker2.record_request(&base_tool).is_none());
-        let backfilled_tool = M::with_timestamps(&[tool_msg(Some(1234))]);
+        let backfilled_tool = vec![tool_msg(Some(1234))];
         assert!(
             tracker2.record_request(&backfilled_tool).is_none(),
             "tool-result timing backfill must not be reported as a cache violation"
         );
 
         // A real content edit of the earlier message must still be detected.
-        let turn3 = M::with_timestamps(&[
+        let turn3 = vec![
             mktimed("build the thing DIFFERENTLY", t0 + chrono::Duration::seconds(5)),
             make_message(Role::Assistant, "ok"),
-        ]);
+        ];
         let violation = tracker.record_request(&turn3);
         assert!(
             violation.is_some(),
