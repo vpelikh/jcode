@@ -1608,6 +1608,37 @@ pub(super) struct WorktreeSpec {
     pub branch: Option<String>,
 }
 
+/// Whether `branch` is a valid git branch name (a single ref component).
+///
+/// The worktree name is used to derive `feat/<name>` by default and the `-b`
+/// value is used directly, so both must be acceptable to `git check-ref-format`.
+/// We reject the common invalid forms here to give a clear error instead of a
+/// bare git failure. Since names cannot contain `/`, a single valid component is
+/// enough; this also rules out git-invalid sequences like `..`, `@{`, `~`, `^`,
+/// `:`, and trailing `.` / `.lock`.
+fn is_valid_branch_component(branch: &str) -> bool {
+    if branch.is_empty()
+        || branch.starts_with('-')
+        || branch.starts_with('.')
+        || branch.contains("..")
+        || branch.contains("@{")
+        || branch == "@"
+        || branch
+            .chars()
+            .any(|c| matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\' | ' ' | '\t'))
+    {
+        return false;
+    }
+    // Every `/`-separated component must be non-empty and must not end in `.`
+    // or `.git` / `.lock` (git's check-ref-format rules).
+    branch.split('/').all(|component| {
+        !component.is_empty()
+            && !component.ends_with('.')
+            && !component.to_lowercase().ends_with(".git")
+            && !component.to_lowercase().ends_with(".lock")
+    })
+}
+
 /// Parse the arguments of a `/worktree` command.
 pub(super) fn parse_worktree_spec(rest: &str) -> Result<WorktreeSpec, String> {
     let tokens: Vec<&str> = rest.split_whitespace().collect();
@@ -1635,6 +1666,13 @@ pub(super) fn parse_worktree_spec(rest: &str) -> Result<WorktreeSpec, String> {
             "Invalid worktree name '{name}': a name cannot start with '-'."
         ));
     }
+    // The name becomes `feat/<name>` by default, so it must be a valid git
+    // branch component; otherwise `git worktree add` fails with a ref error.
+    if !is_valid_branch_component(&name) {
+        return Err(format!(
+            "Invalid worktree name '{name}': it would form an invalid git branch (feat/{name})."
+        ));
+    }
 
     let mut branch = None;
     let mut i = 1;
@@ -1644,8 +1682,10 @@ pub(super) fn parse_worktree_spec(rest: &str) -> Result<WorktreeSpec, String> {
                 let value = tokens.get(i + 1).ok_or_else(|| {
                     "Usage: /worktree <name> -b <branch>  (branch missing after -b)".to_string()
                 })?;
-                if value.starts_with('-') {
-                    return Err(format!("Invalid branch '{value}': expected a branch name."));
+                if !is_valid_branch_component(value) {
+                    return Err(format!(
+                        "Invalid branch '{value}': not a valid git branch name."
+                    ));
                 }
                 branch = Some(value.to_string());
                 i += 2;
@@ -1684,6 +1724,60 @@ fn main_repo_root_for_work_dir(work_dir: &std::path::Path) -> Result<PathBuf, St
     Ok(root.to_path_buf())
 }
 
+/// Whether a fully-qualified git ref exists.
+///
+/// Runs `git rev-parse --verify --quiet <ref>` and reports success (the ref
+/// exists) without printing anything, so a missing ref is silently `false` and
+/// the shell does not leak errors to stderr.
+fn git_ref_exists(repo_root: &std::path::Path, full_ref: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", full_ref])
+        .current_dir(repo_root)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Whether `branch` is currently checked out in a linked worktree (i.e. not the
+/// main checkout).
+///
+/// In `git worktree list --porcelain` the first entry is the main checkout and
+/// every entry after a blank line is a linked worktree. A linked worktree whose
+/// `branch refs/heads/<branch>` matches means attaching `branch` to a new
+/// worktree would be refused by git because it is checked out elsewhere.
+fn branch_checked_out_elsewhere(repo_root: &std::path::Path, branch: &str) -> Result<bool, String> {
+    let porcelain = run_git_command(repo_root, &["worktree", "list", "--porcelain"])?;
+    let wanted = format!("branch refs/heads/{branch}");
+
+    let mut blocks = porcelain.split("\n\n");
+    // Skip the main-checkout block (the first one); only linked worktrees are
+    // "elsewhere".
+    let _main = blocks.next();
+    for block in blocks {
+        if block.lines().any(|line| line.trim() == wanted) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The branch the main checkout is currently on, if any.
+///
+/// Reads the first (main) block of `git worktree list --porcelain`. Used to give
+/// a precise error when the user asks to create a worktree on the branch the
+/// main checkout already has attached.
+fn main_checkout_branch(repo_root: &std::path::Path) -> Result<Option<String>, String> {
+    let porcelain = run_git_command(repo_root, &["worktree", "list", "--porcelain"])?;
+    let main_block = porcelain
+        .split("\n\n")
+        .next()
+        .unwrap_or_default();
+    Ok(main_block
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("branch refs/heads/"))
+        .map(str::to_string))
+}
+
 /// Create a new git worktree and return its absolute path.
 ///
 /// Pure computation (no `App` borrow): resolves the repo root from `work_dir`,
@@ -1710,21 +1804,59 @@ pub(super) fn create_git_worktree_at(
         ));
     }
 
+    // The repository root comes from git and can in principle contain non-UTF-8
+    // bytes. `git` takes the target path as a byte string; rather than silently
+    // passing an empty string on a lossy conversion, surface a clear error so
+    // the user knows the worktree was not created.
+    let worktree_dir_str = worktree_dir.to_str().ok_or_else(|| {
+        format!("Cannot create worktree at a non-UTF-8 path: {}", worktree_dir.display())
+    })?;
+
+    // Try to create a new branch for the worktree, or attach an existing one.
+    //
+    // Three cases:
+    //  - The branch does not exist yet -> create it with `-b`.
+    //  - The branch exists but is not checked out in a linked worktree -> attach
+    //    it (`git worktree add <dir> <branch>`), which is what a user means by
+    //    re-running or reusing a branch.
+    //  - The branch exists and is checked out in another (linked) worktree ->
+    //    git cannot check the same branch into two worktrees; give a clear error.
+    let branch_ref = format!("refs/heads/{branch}");
+    if git_ref_exists(&repo_root, &branch_ref) {
+        if branch_checked_out_elsewhere(&repo_root, &branch)? {
+            return Err(format!(
+                "Branch '{branch}' is already checked out in another worktree; \
+                 pick a different branch or worktree name."
+            ));
+        }
+        // A branch that is the main checkout's current branch cannot be attached
+        // to a second worktree; give a precise error instead of a bare git one.
+        if main_checkout_branch(&repo_root)?.as_deref() == Some(branch.as_str()) {
+            return Err(format!(
+                "Branch '{branch}' is already checked out in the main worktree; \
+                 use a different branch or worktree name."
+            ));
+        }
+        // Attach the existing branch to the new worktree.
+        run_git_command(
+            &repo_root,
+            &["worktree", "add", "-q", worktree_dir_str, &branch],
+        )
+        .map_err(|error| {
+            format!("Branch '{branch}' exists but could not be attached: {error}")
+        })?;
+        return Ok(worktree_dir);
+    }
+
+    // The branch does not exist yet: create it and check it out in the worktree.
     run_git_command(
         &repo_root,
-        &[
-            "worktree",
-            "add",
-            "-b",
-            &branch,
-            "-q",
-            worktree_dir.to_str().unwrap_or_default(),
-        ],
+        &["worktree", "add", "-b", &branch, "-q", worktree_dir_str],
     )
     .inspect_err(|_error| {
         // `git worktree add` creates the target dir while preparing; if it
-        // fails partway (e.g. branch name collision) it may leave an empty dir
-        // behind. Clean it up so a retry with a corrected name is clean.
+        // fails partway it may leave an empty dir behind. Clean it up so a retry
+        // with a corrected name is clean.
         if worktree_dir.read_dir().map(|mut it| it.next().is_none()).unwrap_or(false) {
             let _ = std::fs::remove_dir(&worktree_dir);
         }

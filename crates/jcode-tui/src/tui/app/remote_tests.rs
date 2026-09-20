@@ -12,6 +12,57 @@ use crate::tui::info_widget::{MemoryState, StepStatus};
 use anyhow::Result;
 use std::sync::Arc;
 
+/// Create a throwaway git repo with a single commit and return its path.
+///
+/// The returned `TempDir` keeps the repo alive for the duration of the test.
+fn repo_with_single_commit() -> (tempfile::TempDir, std::path::PathBuf) {
+    use std::process::Command;
+
+    let home = tempfile::tempdir().expect("temp home");
+    let repo = home.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+    for args in [vec!["init", "-b", "main"], vec!["add", "."]] {
+        let mut cmd = Command::new("git");
+        cmd.args(&args).current_dir(&repo);
+        if args[0] == "add" {
+            std::fs::write(repo.join("file.txt"), "hi\n").expect("write file");
+        }
+        assert!(cmd.output().expect("git run").status.success(), "git {args:?}");
+    }
+    let commit = Command::new("git")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .args(["commit", "-m", "init"])
+        .current_dir(&repo)
+        .output()
+        .expect("git commit run");
+    assert!(commit.status.success(), "git commit failed");
+    (home, repo)
+}
+
+/// Remove a linked worktree at `repo/.worktrees/<name>` and its branch. Test
+/// cleanup only; ignores failures so a partially-created worktree still tears
+/// down.
+fn remove_worktree(repo: &std::path::Path, name: &str) {
+    use std::process::Command;
+    let dir = repo.join(".worktrees").join(name);
+    let _ = Command::new("git")
+        .args([
+            "worktree",
+            "remove",
+            "--force",
+            &dir.display().to_string(),
+        ])
+        .current_dir(repo)
+        .output();
+    let _ = Command::new("git")
+        .args(["branch", "-D", &format!("feat/{name}")])
+        .current_dir(repo)
+        .output();
+}
+
 struct MockProvider;
 
 #[async_trait::async_trait]
@@ -1275,27 +1326,7 @@ fn worktree_creates_and_submits_set_working_dir_request() {
     let _guard = rt.enter();
 
     // A throwaway repo the helper can derive a worktree from.
-    let home = tempfile::tempdir().expect("temp home");
-    let repo = home.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    for args in [vec!["init", "-b", "main"], vec!["add", "."]] {
-        let mut cmd = Command::new("git");
-        cmd.args(&args).current_dir(&repo);
-        if args[0] == "add" {
-            std::fs::write(repo.join("file.txt"), "hi\n").unwrap();
-        }
-        assert!(cmd.output().unwrap().status.success(), "git {args:?}");
-    }
-    let commit = Command::new("git")
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@t")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@t")
-        .args(["commit", "-m", "init"])
-        .current_dir(&repo)
-        .output()
-        .unwrap();
-    assert!(commit.status.success(), "git commit failed");
+    let (_home, repo) = repo_with_single_commit();
 
     let mut app = create_test_app();
     app.is_remote = true;
@@ -1330,16 +1361,15 @@ fn worktree_creates_and_submits_set_working_dir_request() {
         app.input.is_empty(),
         "the /worktree command should be consumed from the input box"
     );
+    // The slash command shows an explicit success confirmation on create+move.
+    assert!(
+        app.display_messages()
+            .iter()
+            .any(|m| m.role == "system" && m.content.contains("Created worktree")),
+        "a successful /worktree should show a confirmation notice"
+    );
 
-    // Cleanup.
-    let _ = Command::new("git")
-        .args(["worktree", "remove", "--force", &worktree_dir.display().to_string()])
-        .current_dir(&repo)
-        .output();
-    let _ = Command::new("git")
-        .args(["branch", "-D", "feat/feat-panel"])
-        .current_dir(&repo)
-        .output();
+    remove_worktree(&repo, "feat-panel");
 }
 
 #[test]
@@ -1351,27 +1381,7 @@ fn auto_trigger_new_worktree_intent_creates_and_moves_the_session() {
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     let _guard = rt.enter();
 
-    let home = tempfile::tempdir().expect("temp home");
-    let repo = home.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    for args in [vec!["init", "-b", "main"], vec!["add", "."]] {
-        let mut cmd = Command::new("git");
-        cmd.args(&args).current_dir(&repo);
-        if args[0] == "add" {
-            std::fs::write(repo.join("file.txt"), "hi\n").unwrap();
-        }
-        assert!(cmd.output().unwrap().status.success(), "git {args:?}");
-    }
-    let commit = Command::new("git")
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@t")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@t")
-        .args(["commit", "-m", "init"])
-        .current_dir(&repo)
-        .output()
-        .unwrap();
-    assert!(commit.status.success(), "git commit failed");
+    let (_home, repo) = repo_with_single_commit();
 
     let mut app = create_test_app();
     app.is_remote = true;
@@ -1408,19 +1418,7 @@ fn auto_trigger_new_worktree_intent_creates_and_moves_the_session() {
         "auto-trigger must send a SetWorkingDir request"
     );
 
-    let _ = Command::new("git")
-        .args([
-            "worktree",
-            "remove",
-            "--force",
-            &worktree_dir.display().to_string(),
-        ])
-        .current_dir(&repo)
-        .output();
-    let _ = Command::new("git")
-        .args(["branch", "-D", "feat/panel-settings"])
-        .current_dir(&repo)
-        .output();
+    remove_worktree(&repo, "panel-settings");
 }
 
 /// End-to-end through the public submit funnel (`submit_prepared_remote_input`),
@@ -1437,27 +1435,7 @@ fn auto_trigger_through_submit_prepared_remote_input_forwards_prompt_and_moves()
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     let _guard = rt.enter();
 
-    let home = tempfile::tempdir().expect("temp home");
-    let repo = home.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    for args in [vec!["init", "-b", "main"], vec!["add", "."]] {
-        let mut cmd = Command::new("git");
-        cmd.args(&args).current_dir(&repo);
-        if args[0] == "add" {
-            std::fs::write(repo.join("file.txt"), "hi\n").unwrap();
-        }
-        assert!(cmd.output().unwrap().status.success(), "git {args:?}");
-    }
-    let commit = Command::new("git")
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@t")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@t")
-        .args(["commit", "-m", "init"])
-        .current_dir(&repo)
-        .output()
-        .unwrap();
-    assert!(commit.status.success(), "git commit failed");
+    let (_home, repo) = repo_with_single_commit();
 
     let mut app = create_test_app();
     app.is_remote = true;
@@ -1499,7 +1477,7 @@ fn auto_trigger_through_submit_prepared_remote_input_forwards_prompt_and_moves()
     assert!(
         app.display_messages()
             .iter()
-            .any(|m| m.role == "system" && m.content.contains("Automatically started new worktree")),
+            .any(|m| m.role == "system" && m.content.contains("moved this session into it")),
         "expected an auto-trigger notice"
     );
 
@@ -1512,19 +1490,7 @@ fn auto_trigger_through_submit_prepared_remote_input_forwards_prompt_and_moves()
         "the original prompt must be forwarded"
     );
 
-    let _ = Command::new("git")
-        .args([
-            "worktree",
-            "remove",
-            "--force",
-            &worktree_dir.display().to_string(),
-        ])
-        .current_dir(&repo)
-        .output();
-    let _ = Command::new("git")
-        .args(["branch", "-D", "feat/feature-x"])
-        .current_dir(&repo)
-        .output();
+    remove_worktree(&repo, "feature-x");
 }
 
 /// Failure mode: while the agent is busy, the auto-trigger must NOT create a
@@ -1533,32 +1499,11 @@ fn auto_trigger_through_submit_prepared_remote_input_forwards_prompt_and_moves()
 fn auto_trigger_is_suppressed_while_agent_is_working() {
     use super::submit_prepared_remote_input;
     use crate::tui::app::input::PreparedInput;
-    use std::process::Command;
 
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     let _guard = rt.enter();
 
-    let home = tempfile::tempdir().expect("temp home");
-    let repo = home.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    for args in [vec!["init", "-b", "main"], vec!["add", "."]] {
-        let mut cmd = Command::new("git");
-        cmd.args(&args).current_dir(&repo);
-        if args[0] == "add" {
-            std::fs::write(repo.join("file.txt"), "hi\n").unwrap();
-        }
-        assert!(cmd.output().unwrap().status.success(), "git {args:?}");
-    }
-    let commit = Command::new("git")
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@t")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@t")
-        .args(["commit", "-m", "init"])
-        .current_dir(&repo)
-        .output()
-        .unwrap();
-    assert!(commit.status.success(), "git commit failed");
+    let (_home, repo) = repo_with_single_commit();
 
     let mut app = create_test_app();
     app.is_remote = true;
@@ -1590,7 +1535,7 @@ fn auto_trigger_is_suppressed_while_agent_is_working() {
         !app
             .display_messages()
             .iter()
-            .any(|m| m.content.contains("Automatically started")),
+            .any(|m| m.content.contains("moved this session into it")),
         "busy agent must not show a success notice"
     );
 }
@@ -1607,27 +1552,7 @@ fn plain_typed_prompt_auto_triggers_new_worktree_via_enter_key() {
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     let _guard = rt.enter();
 
-    let home = tempfile::tempdir().expect("temp home");
-    let repo = home.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    for args in [vec!["init", "-b", "main"], vec!["add", "."]] {
-        let mut cmd = Command::new("git");
-        cmd.args(&args).current_dir(&repo);
-        if args[0] == "add" {
-            std::fs::write(repo.join("file.txt"), "hi\n").unwrap();
-        }
-        assert!(cmd.output().unwrap().status.success(), "git {args:?}");
-    }
-    let commit = Command::new("git")
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@t")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@t")
-        .args(["commit", "-m", "init"])
-        .current_dir(&repo)
-        .output()
-        .unwrap();
-    assert!(commit.status.success(), "git commit failed");
+    let (_home, repo) = repo_with_single_commit();
 
     let mut app = create_test_app();
     app.is_remote = true;
@@ -1660,23 +1585,119 @@ fn plain_typed_prompt_auto_triggers_new_worktree_via_enter_key() {
     assert!(
         app.display_messages()
             .iter()
-            .any(|m| m.content.contains("Automatically started new worktree")),
+            .any(|m| m.content.contains("moved this session into it")),
         "typed intent should show the auto-trigger notice"
     );
 
-    let _ = Command::new("git")
-        .args([
-            "worktree",
-            "remove",
-            "--force",
-            &worktree_dir.display().to_string(),
-        ])
-        .current_dir(&repo)
-        .output();
-    let _ = Command::new("git")
-        .args(["branch", "-D", "feat/wide-gadget"])
-        .current_dir(&repo)
-        .output();
+    remove_worktree(&repo, "wide-gadget");
+}
+
+/// Negative end-to-end: a plain prompt that merely *mentions* worktrees (not an
+/// explicit worktree-creating directive) must NOT auto-trigger. It is forwarded
+/// to the agent normally, and no worktree is created and no SetWorkingDir sent.
+#[test]
+fn plain_mention_of_worktree_does_not_auto_trigger_via_enter_key() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+
+    let (_home, repo) = repo_with_single_commit();
+
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.remote_session_id = Some("active_sess".to_string());
+    app.session.working_dir = Some(repo.display().to_string());
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    remote.mark_history_loaded();
+    let request_id_before = remote.next_request_id_for_test();
+
+    // A question about worktrees, not a directive to create one.
+    app.set_input_for_test("explain what a git worktree is used for".to_string());
+    rt.block_on(app.handle_remote_key(KeyCode::Enter, KeyModifiers::empty(), &mut remote))
+        .expect("a plain mention should be handled");
+
+    // No worktree was created.
+    assert!(
+        !repo.join(".worktrees").join("explain").exists(),
+        "a mention must not create a worktree"
+    );
+
+    // No SetWorkingDir was sent (the prompt itself is an ordinary send, so the
+    // request id advances by exactly one for the forwarded message).
+    assert_eq!(
+        remote.next_request_id_for_test(),
+        request_id_before + 1,
+        "a mention must only forward the prompt, not move the session"
+    );
+
+    // No auto-trigger notice.
+    assert!(
+        !app
+            .display_messages()
+            .iter()
+            .any(|m| m.content.contains("moved this session into it")),
+        "a mention must not show an auto-trigger notice"
+    );
+}
+
+/// The auto-trigger must be disabled in SSH mode: it runs git against the local
+/// filesystem (like `/worktree`/`/cd`), which is wrong when the session belongs
+/// to a remote host. Under SSH, a worktree-intent prompt is forwarded normally
+/// and no local worktree is created.
+///
+/// Run in a child process (via `ssh_test_runs_in_child`) so `JCODE_SSH_REMOTE`
+/// is set in an isolated process and cannot race sibling tests.
+#[test]
+fn auto_trigger_is_disabled_in_ssh_remote_sessions() {
+    use super::submit_prepared_remote_input;
+    use crate::tui::app::commands_dispatch::ssh_test_runs_in_child;
+    use crate::tui::app::input::PreparedInput;
+
+    // Parent spawns an isolated child with SSH mode enabled and returns.
+    if ssh_test_runs_in_child("auto_trigger_is_disabled_in_ssh_remote_sessions") {
+        return;
+    }
+
+    // In the child, SSH mode is active.
+    assert!(crate::tui::is_ssh_remote(), "SSH mode should be active");
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+
+    let (_home, repo) = repo_with_single_commit();
+
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.remote_session_id = Some("active_sess".to_string());
+    app.session.working_dir = Some(repo.display().to_string());
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    remote.mark_history_loaded();
+
+    let prompt = "make a new worktree for \"feature-z\" and do the work there".to_string();
+    rt.block_on(submit_prepared_remote_input(
+        &mut app,
+        &mut remote,
+        PreparedInput {
+            raw_input: prompt.clone(),
+            expanded: prompt.clone(),
+            images: vec![],
+        },
+    ))
+    .expect("submit should succeed");
+
+    // No local worktree was created (SSH disables the auto-trigger).
+    assert!(
+        !repo.join(".worktrees").join("feature-z").exists(),
+        "SSH mode must not create a local worktree"
+    );
+    assert!(
+        !app
+            .display_messages()
+            .iter()
+            .any(|m| m.content.contains("moved this session into it")),
+        "SSH mode must not show an auto-trigger notice"
+    );
 }
 
 /// Reproduces the "stuck on loading session…" bug and verifies the watchdog
