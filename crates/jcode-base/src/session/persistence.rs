@@ -6,7 +6,10 @@ use std::time::Instant;
 
 use super::journal::{PersistVectorMode, SessionJournalEntry, metadata_requires_snapshot};
 use super::storage_paths::{file_len_or_zero, session_journal_path_from_snapshot, session_path};
-use super::{MAX_SESSION_JOURNAL_BYTES, RemoteStartupSessionSnapshot, Session, SessionStartupStub};
+use super::{
+    MAX_SESSION_JOURNAL_BYTES, RemoteStartupSessionSnapshot, Session, SessionEventOp,
+    SessionStartupStub,
+};
 use crate::storage;
 
 /// Outcome of replaying one session journal file.
@@ -182,13 +185,47 @@ impl Session {
         self.memory_injections
             .extend(entry.append_memory_injections);
         self.replay_events.extend(entry.append_replay_events);
+        // Replay journaled event-log entries into `SessionEventMap` so log-only
+        // events (compaction brackets, plugin `Unknown`) survive a crash that is
+        // recovered from the journal, and the replayed log agrees with the
+        // replayed legacy vectors when `reconcile_event_map_after_load` runs.
+        //
+        // Use `push_event` (trusting), not `append_event` (validating): these
+        // events were already validated when originally appended before the
+        // journal write. Re-validating on reload could silently drop a
+        // legitimate long-lived event (e.g. the `MAX_EVENT_AGE_SECS` timestamp
+        // window on an aged session) and desync the event log from the journal,
+        // exactly why the fork path also uses `push_event`.
+        for event in entry.append_events {
+            self.event_map.push_event(event);
+        }
         self.mark_memory_profile_dirty();
     }
 
     fn checkpoint_snapshot(&mut self, snapshot_path: &Path, journal_path: &Path) -> Result<()> {
+        // A checkpoint with an empty transcript is *destructive* only if it would
+        // throw away messages the event log still implies exist. An intentional
+        // `clear_messages()` empties the legacy vectors AND durably records a
+        // ClearAll event in the log, so the two sources of truth agree the
+        // transcript is empty and the empty checkpoint is authoritative.
+        //
+        // A ClearAll OR an empty full-replacement (replace_messages(vec![])) is the
+        // required signal that the empty transcript is an intentional clear —
+        // an ALL-EMPTY event log is not proof of a clear: that is the
+        // accidental-wipe case this guard protects against (messages emptied by
+        // a bug while events were never appended, or a session with no event
+        // support at all — e.g. the guard's own synthetic fixture with
+        // messages_len > 0 and no events).
+        // Only full-derive the event log in the empty-messages case (a clear), so
+        // checkpointing a normal session does not pay an O(n) derivation it never
+        // needed.
+        let clear_intended = self.messages.is_empty()
+            && !self.event_map.events.is_empty()
+            && self.event_map.derive_messages().is_empty();
         let destructive_empty_checkpoint = self.messages.is_empty()
             && self.persist_state.messages_len > 0
-            && snapshot_path.exists();
+            && snapshot_path.exists()
+            && !clear_intended;
         if destructive_empty_checkpoint {
             self.guard_snapshot_shrink(snapshot_path, journal_path);
             bail!(
@@ -247,20 +284,44 @@ impl Session {
         session.reset_persist_state(path.exists());
         session.reset_provider_messages_cache();
         session.mark_memory_profile_dirty();
-        // Hydrate the event-sourced log from the legacy vectors so that
-        // `event_map` is the single source of truth for resumed sessions.
-        session.rebuild_event_map();
-        // Development-only invariant check: the rehydrated event log must
-        // agree with the legacy transcript vector. This catches any code path
-        // that mutates `messages` without emitting a corresponding event.
-        // Gated to debug builds so production stays quiet on a benign mismatch.
-        if cfg!(debug_assertions)
-            && let Err(e) = session.rederive_all_checked()
-        {
-            eprintln!(
-                "session_event: event-log/legacy-vector desync after load: {}",
-                e
-            );
+        // Reconcile the event-sourced log with the legacy vectors. When the
+        // snapshot already carries a persisted `event_map`, keep it as the
+        // authoritative record (it may hold compaction brackets and plugin
+        // `Unknown` events a rebuild-from-vectors cannot reproduce) as long as
+        // it agrees with the legacy vectors; otherwise rebuild/self-heal. This
+        // also serves as the migration path for sessions written before
+        // `event_map` was persisted (those load with an empty log).
+        let preserved_log = session.reconcile_event_map_after_load();
+        if !preserved_log {
+            // The persisted log was rebuilt (either it was empty/migrated, or
+            // it diverged from the legacy vectors and was self-healed). Surface
+            // this so a divergence caused by a prior save bug or corruption is
+            // observable rather than silently overwritten.
+            crate::logging::warn(&format!(
+                "session {}: event log was not preserved on load (empty or divergent); rebuilt from legacy vectors",
+                session.id
+            ));
+        }
+        // Structural invariant registry (takeaway #3): run the built-in checks
+        // (tool-pairing balance, non-empty ids, parent-edge resolution, replay
+        // determinism) over the freshly rehydrated log. Unlike a deliberate
+        // hard opt-in call site (see `InvariantLog::enforce`), the load path is
+        // a *diagnostic* seam: a session can legitimately carry an open tool
+        // call after an interrupt/crash, so we report violations rather than
+        // abort loading. This lets tests and operators observe the invariant
+        // without turning a benign mid-turn state into a hard failure.
+        if cfg!(debug_assertions) && !session.event_map.events.is_empty() {
+            let inv = super::invariants::InvariantRegistry::builtin();
+            let log = inv.check(&session.event_map);
+            if !log.is_green() {
+                eprintln!(
+                    "session_event: invariant report after load ({} violation(s)):",
+                    log.violations.len()
+                );
+                for v in &log.violations {
+                    eprintln!("  - {}: {}", v.invariant, v.message);
+                }
+            }
         }
         if replay_stats.is_corrupt() {
             session.schedule_checkpoint_after_corrupt_journal(&journal_path);
@@ -347,15 +408,34 @@ impl Session {
             session.apply_journal_meta(entry.meta);
             session.messages.extend(entry.append_messages);
             session.replay_events.extend(entry.append_replay_events);
+            // Replay journal-carried log-only events and memory injections so
+            // the remote-startup stub carries the same event-log contents as
+            // the authoritative `load_from_path`. Previously only the structural
+            // vectors (meta, messages, replay events) were replayed, which
+            // silently dropped log-only events (compaction brackets, plugin
+            // `Unknown`) and memory injections if the journal held them before
+            // the next snapshot. Pushing into `event_map` preserves them, and
+            // `reconcile_event_map_after_load` below validates consistency.
+            session.memory_injections.extend(entry.append_memory_injections);
+            for event in entry.append_events {
+                session.event_map.push_event(event);
+            }
         })?;
         let journal_ms = journal_start.elapsed().as_millis();
         let finalize_start = Instant::now();
         session.reset_persist_state(path.exists());
         session.reset_provider_messages_cache();
         session.mark_memory_profile_dirty();
-        // Hydrate the event-sourced log from the legacy vectors so that
-        // `event_map` is the single source of truth for resumed sessions.
-        session.rebuild_event_map();
+        // Reconcile the event-sourced log with the legacy vectors (keep the
+        // persisted authoritative log when it agrees, rebuild/self-heal
+        // otherwise; also migrates pre-persistence snapshots).
+        let preserved_log = session.reconcile_event_map_after_load();
+        if !preserved_log {
+            crate::logging::warn(&format!(
+                "session {}: event log was not preserved on remote-startup load (empty or divergent); rebuilt from legacy vectors",
+                session.id
+            ));
+        }
         let finalize_ms = finalize_start.elapsed().as_millis();
         crate::logging::info(&format!(
             "[TIMING] remote_startup_load: session={}, snapshot={}ms, journal={}ms, finalize={}ms, snapshot_bytes={}, journal_bytes={}, journal_entries={}, messages={}, total={}ms",
@@ -398,22 +478,74 @@ impl Session {
         // Do not turn that implementation detail into a transcript on disk. Once
         // the user (or a programmatic caller) adds a real conversation message,
         // the normal first snapshot includes all of the accumulated context.
+        // Persist even without a visible conversation message when the session
+        // carries configured state that an explicit save() intends to preserve:
+        // a caller-chosen `title` (explicit state just like `custom_title`,
+        // e.g. review/judge and relay sessions), a provider route
+        // (model/provider_key/effort), a bound parent, a self-dev/canary build,
+        // or a save label. The `pre_spawn_session` swarm path, restart-recovery
+        // fixtures, and persisted soft-interrupt/restore flows all rely on such
+        // sessions being written to disk immediately.
         //
-        // A caller-chosen `title` (review/judge sessions, menubar sessions) is
-        // explicit state just like `custom_title`, so it must persist even
-        // before the first visible message (#1144). Otherwise later lookups by
-        // id find no file and silently treat the session as missing.
-        // Parent linkage is also explicit state: an empty fork carries only a
-        // hidden fork notice but must be loadable when its new client attaches.
+        // Note: `event_map` is deliberately NOT part of `has_configured_state`.
+        // A fresh session's `ensure_initial_session_context_message()` produces an
+        // AppendMessage event, so counting `!event_map.is_empty()` would force a
+        // first save for every untouched panel and defeat the lazy-save gate.
+        // Log-only events (compaction brackets, plugin `Unknown`) ARE persisted
+        // via the dedicated last gate clause below: when they exist without any
+        // message/configured-state, the skip condition is false and the session
+        // is written. Only a fresh session whose sole event is the auto-added
+        // session-context placeholder is still skipped, preserving lazy-save.
+        let has_configured_state = self.title.is_some()
+            || self.model.is_some()
+            || self.provider_key.is_some()
+            || self.route_api_method.is_some()
+            || self.reasoning_effort.is_some()
+            || self.subagent_model.is_some()
+            || self.parent_id.is_some()
+            || self.is_canary
+            || self.save_label.is_some()
+            || self.compaction.is_some()
+            // Structured transcript state (swarm status/plan events, memory
+            // injections, compaction markers) is meaningful and must not be
+            // dropped, so persist it even without a visible conversation line.
+            || !self.replay_events.is_empty()
+            || !self.memory_injections.is_empty()
+            // An actively-run session (a PID marker was registered via
+            // `mark_active`/`mark_active_with_pid`) must persist even before a
+            // conversation message exists so restart/crash recovery can find it.
+            || crate::storage::active_session_ids().iter().any(|id| id == &self.id);
+        // A session pointing at real transcript content beyond the auto-added
+        // session-context placeholder (e.g. system-reminder lines, display-role
+        // notices) must be persisted so tools like session_search can read it.
+        let has_non_placeholder_message = self.has_message_beyond_session_context();
+        //
+        // Log-only event-log signals (plugin `Unknown` escape-hatch events, bare
+        // compaction-bracket markers) carry durable meaning even when they are
+        // not accompanied by a message/compaction/configured state, and must be
+        // persisted rather than dropped by the lazy-save gate. This is checked
+        // as the LAST clause of the skip condition (not OR'd into
+        // `has_configured_state`) so the full event-log scan only runs when every
+        // cheap earlier clause says "this fresh session might be skipped": a real
+        // session (already saved, has a snapshot, or has a non-placeholder
+        // message) short-circuits the `&&` chain before reaching this scan, so a
+        // hot save path does not pay an O(n) walk over a large event log. Because
+        // it sits *after* `has_configured_state`, it never defeats lazy-save for a
+        // fresh session whose only event is the auto-added session-context
+        // placeholder.
         if !self.persist_state.snapshot_exists
-            && !self
-                .messages
-                .iter()
-                .any(super::is_visible_conversation_message)
+            && !has_non_placeholder_message
             && !self.saved
             && self.custom_title.is_none()
-            && self.title.is_none()
-            && self.parent_id.is_none()
+            && !has_configured_state
+            && !self.event_map.events.iter().any(|e| {
+                matches!(
+                    e.op,
+                    SessionEventOp::Unknown { .. }
+                        | SessionEventOp::CompactionStart { .. }
+                        | SessionEventOp::CompactionEnd { .. }
+                )
+            })
         {
             return Ok(());
         }
@@ -432,10 +564,12 @@ impl Session {
             || self.persist_state.env_snapshots_mode == PersistVectorMode::Full
             || self.persist_state.memory_injections_mode == PersistVectorMode::Full
             || self.persist_state.replay_events_mode == PersistVectorMode::Full
+            || self.persist_state.events_mode == PersistVectorMode::Full
             || self.messages.len() < self.persist_state.messages_len
             || self.env_snapshots.len() < self.persist_state.env_snapshots_len
             || self.memory_injections.len() < self.persist_state.memory_injections_len
-            || self.replay_events.len() < self.persist_state.replay_events_len;
+            || self.replay_events.len() < self.persist_state.replay_events_len
+            || self.event_map.events.len() < self.persist_state.events_len;
 
         let delta_messages = self
             .messages
@@ -453,6 +587,11 @@ impl Session {
             .replay_events
             .len()
             .saturating_sub(self.persist_state.replay_events_len);
+        let delta_events = self
+            .event_map
+            .events
+            .len()
+            .saturating_sub(self.persist_state.events_len);
         let (
             result,
             save_mode,
@@ -487,6 +626,7 @@ impl Session {
                     .to_vec(),
                 append_replay_events: self.replay_events[self.persist_state.replay_events_len..]
                     .to_vec(),
+                append_events: self.event_map.events[self.persist_state.events_len..].to_vec(),
             };
             let entry_build_ms = entry_build_start.elapsed().as_millis();
             let append_start = Instant::now();
@@ -550,7 +690,7 @@ impl Session {
         let result_ok = result.is_ok();
         if elapsed.as_millis() > 50 {
             crate::logging::info(&format!(
-                "Session save slow: total={:.0}ms mode={} metadata_snapshot={} vectors_snapshot={} entry_build={}ms append={}ms journal_stat={}ms checkpoint={}ms messages={} delta_messages={} delta_env_snapshots={} delta_memory_injections={} delta_replay_events={} snapshot_bytes_before={} journal_bytes_before={} journal_bytes_after={}",
+                "Session save slow: total={:.0}ms mode={} metadata_snapshot={} vectors_snapshot={} entry_build={}ms append={}ms journal_stat={}ms checkpoint={}ms messages={} delta_messages={} delta_env_snapshots={} delta_memory_injections={} delta_replay_events={} delta_events={} snapshot_bytes_before={} journal_bytes_before={} journal_bytes_after={}",
                 elapsed.as_secs_f64() * 1000.0,
                 save_mode,
                 metadata_needs_snapshot,
@@ -564,6 +704,7 @@ impl Session {
                 delta_env_snapshots,
                 delta_memory_injections,
                 delta_replay_events,
+                delta_events,
                 snapshot_bytes_before,
                 journal_bytes_before,
                 journal_bytes_after,
@@ -586,6 +727,7 @@ impl Session {
                 delta_memory_injections.to_string(),
             ),
             ("delta_replay_events", delta_replay_events.to_string()),
+            ("delta_events", delta_events.to_string()),
             ("snapshot_bytes_before", snapshot_bytes_before.to_string()),
             ("snapshot_bytes_after", snapshot_bytes_after.to_string()),
             ("journal_bytes_before", journal_bytes_before.to_string()),

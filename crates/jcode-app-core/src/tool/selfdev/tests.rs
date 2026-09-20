@@ -928,10 +928,12 @@ async fn build_dedupes_identical_reason_and_version_with_attached_watcher() {
 
     let mut session_one = session::Session::create(None, Some("Build A".to_string()));
     session_one.short_name = Some("alpha".to_string());
+    session_one.saved = true;
     session_one.save().expect("save session one");
 
     let mut session_two = session::Session::create(None, Some("Build B".to_string()));
     session_two.short_name = Some("beta".to_string());
+    session_two.saved = true;
     session_two.save().expect("save session two");
 
     let tool = SelfDevTool::new();
