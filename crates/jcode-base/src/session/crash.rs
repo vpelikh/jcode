@@ -349,19 +349,36 @@ fn find_crashed_via_pid_files() -> Option<Vec<(String, String)>> {
 
         match Session::load(&session_id) {
             Ok(mut session) => {
-                session.mark_crashed(Some(format!(
-                    "Process {} exited unexpectedly (no shutdown signal captured)",
-                    pid
-                )));
-                let _ = session.save();
-                let ts = session.last_active_at.unwrap_or(session.updated_at);
-                if ts <= cutoff {
-                    continue;
+                // Only a session still marked `Active` can legitimately
+                // transition to `Crashed`. A gracefully-closed session must not
+                // be relabelled "exited unexpectedly" just because its owning
+                // process is gone: the daemon's cleanup already marked it
+                // `Closed` and removed its pid marker, so a leftover pid file
+                // here is stale (e.g. a server that exited without clearing it).
+                // Leave closed/error/crashed sessions alone and just reap the
+                // stale pid file, mirroring the `detect_crash` guard.
+                match session.status {
+                    SessionStatus::Active => {
+                        session.mark_crashed(Some(format!(
+                            "Process {} exited unexpectedly (no shutdown signal captured)",
+                            pid
+                        )));
+                        let _ = session.save();
+                        let ts = session.last_active_at.unwrap_or(session.updated_at);
+                        if ts <= cutoff {
+                            continue;
+                        }
+                        let name = extract_session_name(&session_id)
+                            .unwrap_or(&session_id)
+                            .to_string();
+                        crashed.push((session_id, name, ts));
+                    }
+                    _ => {
+                        // Not actively running per its own on-disk status: the
+                        // pid marker is stale. Remove it without touching status.
+                        let _ = std::fs::remove_file(entry.path());
+                    }
                 }
-                let name = extract_session_name(&session_id)
-                    .unwrap_or(&session_id)
-                    .to_string();
-                crashed.push((session_id, name, ts));
             }
             Err(_) => {
                 let _ = std::fs::remove_file(entry.path());
@@ -762,6 +779,114 @@ mod batch_crash_tests {
 
         let err = find_session_by_name_or_id("ses_does_not_exist_anywhere");
         assert!(err.is_err(), "expected unknown bare id to error");
+
+        crate::env::remove_var("JCODE_HOME");
+        Ok(())
+    }
+
+    /// Regression: a session the user quit gracefully (`Closed`) must not be
+    /// relabelled "Process ... exited unexpectedly" just because a stale pid
+    /// marker is left behind (e.g. by a server/daemon that exited without
+    /// clearing `active_pids`). Only sessions still marked `Active` may
+    /// transition to `Crashed`; for everything else the stale marker must be
+    /// reaped without touching the session status.
+    #[test]
+    fn stale_pid_marker_does_not_mark_closed_session_crashed() -> anyhow::Result<()> {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir()?;
+        crate::env::set_var("JCODE_HOME", temp.path());
+        std::fs::create_dir_all(temp.path().join("sessions"))?;
+
+        let session_id = "session_gracefulquit_1788888000000";
+        let mut session = Session::create_with_id(
+            session_id.to_string(),
+            None,
+            Some("Gracefully quit session".to_string()),
+        );
+        // Add a message so save() does not early-return (persist guard).
+        session.add_message(
+            crate::message::Role::User,
+            vec![crate::message::ContentBlock::Text {
+                text: "hello".to_string(),
+                cache_control: None,
+            }],
+        );
+        session.mark_closed();
+        session.save()?;
+
+        // Simulate a stale active-pid marker pointing at a dead process (the
+        // daemon exited without clearing it, as on idle/SIGTERM shutdown).
+        let dead_pid = 2_000_000_000u32;
+        let dir = active_pids_dir().expect("active_pids dir");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join(session_id), dead_pid.to_string())?;
+
+        let crashed = find_recent_crashed_sessions();
+        assert!(
+            crashed.is_empty(),
+            "gracefully-closed session must not be reported crashed: {crashed:?}"
+        );
+
+        // The session on disk must still be Closed, not Crashed.
+        let reloaded = Session::load(session_id)?;
+        assert_eq!(
+            reloaded.status,
+            SessionStatus::Closed,
+            "a gracefully-closed session must keep its Closed status"
+        );
+
+        // The stale marker must have been reaped.
+        assert!(
+            !dir.join(session_id).exists(),
+            "stale pid marker should be removed for a non-active session"
+        );
+
+        crate::env::remove_var("JCODE_HOME");
+        Ok(())
+    }
+
+    /// Guard: the crash scan must still catch a genuinely `Active` session
+    /// whose owning process has died (a real crash). This is the mirror case
+    /// to `stale_pid_marker_does_not_mark_closed_session_crashed` and locks in
+    /// that the status guard does not suppress real crash detection.
+    #[test]
+    fn active_session_with_dead_pid_is_still_marked_crashed() -> anyhow::Result<()> {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir()?;
+        crate::env::set_var("JCODE_HOME", temp.path());
+        std::fs::create_dir_all(temp.path().join("sessions"))?;
+
+        let session_id = "session_genuinecrash_1788888111111";
+        let mut session = Session::create_with_id(
+            session_id.to_string(),
+            None,
+            Some("Genuinely crashed session".to_string()),
+        );
+        session.add_message(
+            crate::message::Role::User,
+            vec![crate::message::ContentBlock::Text {
+                text: "hello".to_string(),
+                cache_control: None,
+            }],
+        );
+        // Leave it Active with a pid owner, exactly as an interrupted turn does.
+        let dead_pid = 2_000_000_001u32;
+        session.mark_active_with_pid(dead_pid);
+        session.save()?;
+
+        let crashed = find_recent_crashed_sessions();
+        assert_eq!(
+            crashed.len(),
+            1,
+            "an Active session with a dead pid must be reported as crashed"
+        );
+        assert_eq!(crashed[0].0, session_id);
+
+        let reloaded = Session::load(session_id)?;
+        assert!(
+            matches!(reloaded.status, SessionStatus::Crashed { .. }),
+            "genuinely crashed Active session must transition to Crashed"
+        );
 
         crate::env::remove_var("JCODE_HOME");
         Ok(())
