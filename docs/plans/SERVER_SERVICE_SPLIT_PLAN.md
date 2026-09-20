@@ -1044,6 +1044,15 @@ is no longer `pub(crate)`.
 Zero behavior change; the `jcode-app-core` lib suite stays green (server module
 473 passing, swarm-services 6 passing) and clippy adds no new warnings.
 
+> Note on the "decide before starting" question (Tier 3 item 3): this slice
+> keeps `file_touch` nested on `SwarmServiceHandle` and only hides its field
+> behind an accessor, mirroring the established `channel_subscriptions_map()` /
+> `read_event_sources()` precedent. It does **not** yet decide whether
+> `file_touch` (or `shared_context` / the channel-subscription indexes) belongs
+> on the swarm handle or warrants its own service handle; that ownership
+> boundary remains open and should be settled before methods are baked directly
+> onto the handle for those indexes.
+
 ## Tier 1 convergence status (landed 2026-09)
 
 The flat swarm-map argument convergence on the swarm/client router boundary is
