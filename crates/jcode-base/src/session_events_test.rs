@@ -1010,3 +1010,74 @@ fn test_replace_messages_then_direct_compaction_clear_stays_consistent() {
     assert_eq!(session.derive_messages()[0].id, "replaced");
     assert!(session.derive_compaction().is_none());
 }
+
+#[test]
+fn test_load_path_hydrates_compaction_mem_inj_and_replay_events() {
+    // Round-2 integration boundary: Session::load_from_path hydrates the event
+    // log from ALL four legacy vectors (messages, compaction, memory
+    // injections, replay events), not just messages. Any of these set directly
+    // before persist must survive the load and be derivable from the log.
+    use std::io::Write;
+
+    let dir = std::env::temp_dir().join(format!("jcode_evt_hydrate_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("session.json");
+
+    let mut session = Session::create_with_id(
+        "test_hydrate_all".to_string(),
+        None,
+        Some("Hydrate all".to_string()),
+    );
+    session.append_stored_message(StoredMessage {
+        id: "m1".to_string(),
+        role: Role::User,
+        content: vec![text_block("msg")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    session.compaction = Some(StoredCompactionState {
+        summary_text: "hydrated-summary".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 2,
+        compacted_count: 1,
+    });
+    session.memory_injections.push(StoredMemoryInjection {
+        summary: "recalled".to_string(),
+        content: "note".to_string(),
+        count: 1,
+        memory_ids: vec![],
+        age_ms: None,
+        before_message: Some(1),
+        timestamp: Utc::now(),
+    });
+    session.replay_events.push(crate::session::StoredReplayEvent {
+        timestamp: Utc::now(),
+        kind: crate::session::StoredReplayEventKind::DisplayMessage {
+            role: "system".to_string(),
+            title: None,
+            content: "notice".to_string(),
+        },
+    });
+    // Reconcile before persisting (as fork/clone paths do).
+    session.rebuild_event_map();
+
+    let json = serde_json::to_string(&session).expect("serialize");
+    let mut f = std::fs::File::create(&path).unwrap();
+    f.write_all(json.as_bytes()).unwrap();
+    drop(f);
+
+    let loaded = Session::load_from_path(&path).expect("load_from_path");
+    loaded.rederive_all_checked().expect("load hydration consistent");
+    assert_eq!(loaded.derive_messages().len(), 1);
+    assert_eq!(
+        loaded.derive_compaction().map(|c| c.summary_text),
+        Some("hydrated-summary".to_string())
+    );
+    assert_eq!(loaded.derive_memory_injections().len(), 1);
+    assert_eq!(loaded.derive_replay_events().len(), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
