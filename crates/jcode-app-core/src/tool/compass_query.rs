@@ -82,10 +82,10 @@ const SHA_RETENTION_TTL: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 /// Maximum number of per-SHA index dirs kept under one project, regardless of
 /// reachability. Beyond this, only the newest `SHA_INDEX_MAX_KEPT` dirs plus the
 /// current HEAD's are retained. Without a cap, per-commit graphs that remain
-/// *reachable* from any ref (e.g. a backup branch) accumulate forever — each is
-/// ~0.9 GB for a large repo — so a repo with many long-lived branches can grow
-/// `~/.jcode/compass/<project>/` unbounded. Each large per-SHA dir is ~0.9 GB,
-/// so the default keeps the per-project Compass cache to a few GB.
+/// *reachable* from any ref (e.g. a backup branch) accumulate forever — each can
+/// be very large on a big repo — so a repo with many long-lived branches can grow
+/// `~/.jcode/compass/<project>/` unbounded. Keeping only a few per-SHA dirs (plus
+/// the current HEAD) bounds the per-project Compass cache irrespective of size.
 const SHA_INDEX_MAX_KEPT: usize = 3;
 
 /// Resolved Compass cache paths for a working directory.
@@ -429,7 +429,10 @@ fn looks_like_sha(name: &str) -> bool {
 ///
 /// `current_sha` (the HEAD this build is for) is always kept, even if it is a
 /// detached checkout that no ref points to — pruning it would delete the index
-/// the very worktree currently uses.
+/// the very worktree currently uses. It may be empty when the current SHA cannot
+/// be resolved (git unavailable); in that case no dir is *name*-protected, but
+/// the just-built dir has the newest mtime and survives the cap's newest-kept
+/// rule, so nothing an active worktree reads is lost.
 fn prune_stale_sha_outputs(project_root: &Path, working_dir: &Path, current_sha: &str) {
     // Never prune the shared AST cache, the non-git workspace, or any lock file.
     let now = std::time::SystemTime::now();
@@ -448,8 +451,8 @@ fn prune_stale_sha_outputs(project_root: &Path, working_dir: &Path, current_sha:
     //   2. If the number of surviving per-SHA dirs still exceeds SHA_INDEX_MAX_KEPT,
     //      keep only the newest SHA_INDEX_MAX_KEPT (plus current_sha) and remove the
     //      rest — even if they are reachable from some (e.g. backup) ref. Otherwise
-    //      reachable per-commit graphs accumulate forever (~0.9 GB each on a large
-    //      repo) and `~/.jcode/compass/<project>/` grows unbounded. Rule 2 runs
+    //      reachable per-commit graphs accumulate forever (each can be very large)
+    //      and `~/.jcode/compass/<project>/` grows unbounded. Rule 2 runs
     //      regardless of reachability, so the count cap always bounds growth.
     let mut candidates: Vec<(SystemTime, PathBuf, String)> = Vec::new();
     // Scan all per-SHA dirs (no truncation): the hard cap below prunes the
@@ -475,14 +478,18 @@ fn prune_stale_sha_outputs(project_root: &Path, working_dir: &Path, current_sha:
             Some(set) => set.contains(name),
             None => true,
         };
-        let Some(age) = entry
+        // Age in seconds. A dir whose mtime is in the future (clock skew, a
+        // `touch`-backdated file) must still be *counted* toward the hard cap so
+        // it cannot silently bypass `SHA_INDEX_MAX_KEPT`; clamp it to age 0
+        // (newest) rather than skipping it entirely. If the mtime cannot be read
+        // at all, conservatively treat it as just-created too so it stays subject
+        // to the cap instead of accumulating unbounded.
+        let age = entry
             .metadata()
             .ok()
             .and_then(|m| m.modified().ok())
             .and_then(|mtime| now.duration_since(mtime).ok())
-        else {
-            continue;
-        };
+            .unwrap_or_default();
         // Reachable commits (any branch/tag) are kept regardless of age, but their dir
         // still counts toward the max-kept cap below.
         if reachable {
@@ -964,9 +971,16 @@ fn ensure_fresh_engine(
             // Prune unreachable, aged-out per-SHA graphs so the shared cache
             // does not grow unbounded as the user visits many commits. Always
             // keep the current HEAD's dir, even a detached HEAD with no ref.
-            if let Some(project_root) = output_dir.parent()
-                && let Some(current_sha) = current_git_sha_cached(working_dir)
-            {
+            //
+            // Run the prune even when the current SHA cannot be resolved (git
+            // unavailable, transient git failure): the hard cap must still bound
+            // the cache in that case, which is why `prune_stale_sha_outputs`
+            // treats an unknown reachability as "everything reachable" and caps
+            // by count. An empty `current_sha` (never equal to a real 40/64-hex
+            // SHA) means no dir is name-protected, but the just-built dir has the
+            // newest mtime and survives the cap's newest-kept rule.
+            if let Some(project_root) = output_dir.parent() {
+                let current_sha = current_git_sha_cached(working_dir).unwrap_or_default();
                 prune_stale_sha_outputs(project_root, working_dir, &current_sha);
             }
         }
@@ -2366,8 +2380,8 @@ mod tests {
     }
 
     // Per-commit graph dirs can remain *reachable* from any ref (e.g. a backup
-    // branch) and would otherwise accumulate forever (~0.9 GB each on a large
-    // repo). The hard cap must still prune the oldest beyond `SHA_INDEX_MAX_KEPT`
+    // branch) and would otherwise accumulate forever (each can be very large).
+    // The hard cap must still prune the oldest beyond `SHA_INDEX_MAX_KEPT`
     // survivors, while always keeping the current HEAD — even when the HEAD is
     // itself unreachable. This is what actually bounds `~/.jcode/compass/` when
     // the 14-day TTL cannot (reachable SHAs never age out of that rule).
@@ -2555,6 +2569,89 @@ mod tests {
         assert!(
             surviving.len() <= SHA_INDEX_MAX_KEPT,
             "cap must still apply when git is unavailable: {} survivors > {}",
+            surviving.len(),
+            SHA_INDEX_MAX_KEPT
+        );
+    }
+
+    // A per-SHA dir whose mtime is in the FUTURE (clock skew, `touch -d future`)
+    // used to make `now.duration_since(mtime)` fail and be `continue`d — skipping
+    // it entirely so it never counted toward `SHA_INDEX_MAX_KEPT`. That let a
+    // future-mtime dir bypass the hard cap and accumulate unbounded. Now such a
+    // dir is clamped to age 0 (newest) and still counts toward the cap.
+    #[test]
+    fn prune_caps_future_mtime_dirs_instead_of_bypassing_cap() {
+        let _ = HomeGuard::set();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        // Non-git working dir so reachability is unknown and every per-SHA dir is
+        // treated as "reachable" (counting toward the cap, never TTL-pruned).
+        std::fs::create_dir_all(&root).unwrap();
+
+        let project_root = root.join("compass/proj");
+        let current_sha = "a".repeat(40);
+        // Create more dirs than the cap; make ALL of them future-mtime so the old
+        // bug would have skipped every one of them and the cap would be bypassed.
+        for i in 0..(SHA_INDEX_MAX_KEPT + 3) {
+            let name = format!("{i:040x}");
+            std::fs::create_dir_all(project_root.join(&name)).unwrap();
+            let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+            filetime::set_file_mtime(
+                project_root.join(&name),
+                filetime::FileTime::from_system_time(future),
+            )
+            .unwrap();
+        }
+
+        prune_stale_sha_outputs(&project_root, &root, &current_sha);
+
+        let surviving: Vec<_> = std::fs::read_dir(&project_root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| looks_like_sha(n) && n != &current_sha)
+            .collect();
+        assert!(
+            surviving.len() <= SHA_INDEX_MAX_KEPT,
+            "future-mtime dirs must still count toward the cap: {} survivors > {}",
+            surviving.len(),
+            SHA_INDEX_MAX_KEPT
+        );
+    }
+
+    // The production caller now invokes the prune even when the current SHA
+    // cannot be resolved (git unavailable, transient git failure), passing an
+    // empty `current_sha`. An empty string never matches a real SHA, so no dir
+    // is name-protected, but the hard cap must still be enforced. Without this
+    // the cap's "applies regardless of git availability" guarantee was unreachable
+    // in production (the old caller skipped the prune whenever git was missing).
+    #[test]
+    fn prune_caps_when_current_sha_is_empty() {
+        let _ = HomeGuard::set();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        // Non-git working dir: reachability unknown, all dirs treated reachable.
+        std::fs::create_dir_all(&root).unwrap();
+
+        let project_root = root.join("compass/proj");
+        // Empty current_sha, as the caller passes when git is unavailable.
+        let current_sha = "";
+        for i in 0..(SHA_INDEX_MAX_KEPT + 3) {
+            let name = format!("{i:040x}");
+            std::fs::create_dir_all(project_root.join(&name)).unwrap();
+        }
+
+        prune_stale_sha_outputs(&project_root, &root, current_sha);
+
+        let surviving: Vec<_> = std::fs::read_dir(&project_root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| looks_like_sha(n) && n != current_sha)
+            .collect();
+        assert!(
+            surviving.len() <= SHA_INDEX_MAX_KEPT,
+            "cap must still apply with empty current_sha: {} survivors > {}",
             surviving.len(),
             SHA_INDEX_MAX_KEPT
         );

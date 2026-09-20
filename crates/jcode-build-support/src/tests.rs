@@ -8,18 +8,37 @@ fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn with_temp_jcode_home<T>(f: impl FnOnce() -> T) -> T {
-    let _guard = test_env_lock();
-    let temp_home = tempfile::tempdir().expect("tempdir");
-    let prev_home = std::env::var_os("JCODE_HOME");
-    jcode_core::env::set_var("JCODE_HOME", temp_home.path());
-    let result = f();
-    if let Some(prev_home) = prev_home {
-        jcode_core::env::set_var("JCODE_HOME", prev_home);
-    } else {
-        jcode_core::env::remove_var("JCODE_HOME");
+/// RAII guard that restores `JCODE_HOME` on drop, including on panic. Without
+/// this, a failing test that changed `JCODE_HOME` would leak the value into the
+/// shared process env and poison every later test running under the same env
+/// lock.
+struct JcodeHomeGuard(std::option::Option<std::ffi::OsString>);
+
+impl JcodeHomeGuard {
+    /// Set `JCODE_HOME` to `home`, remembering the previous value so it can be
+    /// restored when the guard drops.
+    fn set(home: &std::path::Path) -> Self {
+        let prev = std::env::var_os("JCODE_HOME");
+        jcode_core::env::set_var("JCODE_HOME", home);
+        Self(prev)
     }
-    result
+}
+
+impl Drop for JcodeHomeGuard {
+    fn drop(&mut self) {
+        if let Some(prev) = self.0.take() {
+            jcode_core::env::set_var("JCODE_HOME", prev);
+        } else {
+            jcode_core::env::remove_var("JCODE_HOME");
+        }
+    }
+}
+
+fn with_temp_jcode_home<T>(f: impl FnOnce() -> T) -> T {
+    let _lock = test_env_lock();
+    let temp_home = tempfile::tempdir().expect("tempdir");
+    let _home = JcodeHomeGuard::set(temp_home.path());
+    f()
 }
 
 fn create_git_repo_fixture() -> tempfile::TempDir {
@@ -192,8 +211,7 @@ fn test_find_repo_in_ancestors_walks_upward() {
 fn test_client_update_candidate_prefers_dev_binary_for_selfdev() {
     let _guard = test_env_lock();
     let temp_home = tempfile::tempdir().expect("tempdir");
-    let prev_home = std::env::var_os("JCODE_HOME");
-    jcode_core::env::set_var("JCODE_HOME", temp_home.path());
+    let _home = JcodeHomeGuard::set(temp_home.path());
 
     let version = "test-current";
     let version_binary =
@@ -207,12 +225,6 @@ fn test_client_update_candidate_prefers_dev_binary_for_selfdev() {
         std::fs::canonicalize(candidate.0).expect("canonical candidate"),
         std::fs::canonicalize(version_binary).expect("canonical version binary")
     );
-
-    if let Some(prev_home) = prev_home {
-        jcode_core::env::set_var("JCODE_HOME", prev_home);
-    } else {
-        jcode_core::env::remove_var("JCODE_HOME");
-    }
 }
 
 #[test]
@@ -653,6 +665,73 @@ fn prune_old_versions_protects_manifest_referenced_versions() {
     });
 }
 
+// A `pending_activation` records the new version plus the *previous* current and
+// *previous* shared-server versions as rollback targets. `prune_old_versions`
+// must preserve all three even when none of them are (yet) channel-promoted,
+// manifest-canary, or channel-symlinked — otherwise a queued rollback or an
+// in-flight activation would fail after prune because the version dir is gone.
+// This pins the protection paths in `prune_old_versions_protecting` that the
+// canary-only manifest test does not exercise.
+#[test]
+fn prune_old_versions_protects_pending_activation_rollback_targets() {
+    with_temp_jcode_home(|| {
+        let exe = std::env::current_exe().unwrap();
+        let new_version = "pending-new";
+        let prev_current = "pending-prev-current";
+        let prev_shared = "pending-prev-shared";
+        install_binary_at_version(&exe, new_version).unwrap();
+        install_binary_at_version(&exe, prev_current).unwrap();
+        install_binary_at_version(&exe, prev_shared).unwrap();
+        // Plenty of plain installs so pruning would otherwise remove these.
+        for i in 0..(VERSIONS_KEEP_NEWEST + 3) {
+            install_binary_at_version(&exe, &format!("plain-pending-{i}")).unwrap();
+        }
+
+        // Record an activation whose rollback targets are NOT promoted channels,
+        // NOT canary, and NOT channel-symlinked.
+        let mut manifest = BuildManifest::load().unwrap();
+        manifest
+            .set_pending_activation(PendingActivation {
+                session_id: "sess-prune".to_string(),
+                new_version: new_version.to_string(),
+                previous_current_version: Some(prev_current.to_string()),
+                previous_shared_server_version: Some(prev_shared.to_string()),
+                source_fingerprint: Some("fingerprint".to_string()),
+                requested_at: Utc::now(),
+            })
+            .unwrap();
+        manifest.save().unwrap();
+
+        prune_old_versions().unwrap();
+
+        let names: std::collections::HashSet<String> =
+            std::fs::read_dir(builds_dir().unwrap().join("versions"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+        assert!(
+            names.contains(new_version),
+            "pending_activation.new_version must survive pruning"
+        );
+        assert!(
+            names.contains(prev_current),
+            "pending_activation.previous_current_version must survive pruning"
+        );
+        assert!(
+            names.contains(prev_shared),
+            "pending_activation.previous_shared_server_version must survive pruning"
+        );
+        // Plain unprotected installs are still capped.
+        let plain = (0..(VERSIONS_KEEP_NEWEST + 3))
+            .filter(|i| names.contains(&format!("plain-pending-{i}")))
+            .count();
+        assert_eq!(
+            plain, VERSIONS_KEEP_NEWEST,
+            "plain unprotected installs must still be capped"
+        );
+    });
+}
+
 // `prune_old_versions_protecting` must preserve an explicitly-listed version
 // that is neither a promoted channel, manifest-referenced, nor channel-symlinked.
 // This mirrors the self-dev publisher preserving the previous current version,
@@ -705,8 +784,9 @@ fn prune_old_versions_protects_promoted_channels_when_home_is_symlinked() {
     let link = link_parent.path().join("home-link");
     std::os::unix::fs::symlink(real.path(), &link).expect("symlink");
 
-    let prev_home = std::env::var_os("JCODE_HOME");
-    jcode_core::env::set_var("JCODE_HOME", &link);
+    // Use the RAII guard so `JCODE_HOME` is restored even if an assertion below
+    // panics, keeping the process env clean for later tests.
+    let _home = JcodeHomeGuard::set(&link);
 
     let exe = std::env::current_exe().unwrap();
     install_binary_at_version(&exe, "promoted-a").unwrap();
@@ -737,12 +817,6 @@ fn prune_old_versions_protects_promoted_channels_when_home_is_symlinked() {
         survivors <= 2,
         "at most VERSIONS_KEEP_NEWEST unprotected may survive, got {survivors}"
     );
-
-    if let Some(prev_home) = prev_home {
-        jcode_core::env::set_var("JCODE_HOME", prev_home);
-    } else {
-        jcode_core::env::remove_var("JCODE_HOME");
-    }
 }
 
 // Failure/edge modes of `prune_old_versions`. The common production paths run
@@ -804,6 +878,106 @@ fn prune_old_versions_is_safe_noop_on_edge_cases() {
             "must retain exactly VERSIONS_KEEP_NEWEST above-cap installs"
         );
     });
+}
+
+// Reinstalling the same immutable version label must refresh the version dir's
+// mtime. `prune_old_versions` decides which unprotected installs to keep by
+// mtime ("newest VERSIONS_KEEP_NEWEST"), so a reinstalled version that kept an
+// old dir mtime would look stale and be pruned despite having just been
+// refreshed. This pins the mtime refresh in `install_binary_at_version`.
+//
+// `#[cfg(unix)]`: on Windows, Rust's std cannot `File::open` a directory (it
+// fails with ERROR_ACCESS_DENIED), so the test's backdating step would panic.
+// The production mtime refresh already no-ops via `if let Ok` on Windows.
+#[cfg(unix)]
+#[test]
+fn reinstall_refreshes_version_dir_mtime() {
+    with_temp_jcode_home(|| {
+        let exe = std::env::current_exe().unwrap();
+        let version = "reinstalled-sha";
+        install_binary_at_version(&exe, version).unwrap();
+
+        let dest_dir = builds_dir().unwrap().join("versions").join(version);
+        let first = dest_dir.metadata().unwrap().modified().unwrap();
+
+        // Backdate the dir's mtime, simulating an old install.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let file = std::fs::File::open(&dest_dir).unwrap();
+        let _ = file.set_modified(old);
+        drop(file);
+        let backdated = dest_dir.metadata().unwrap().modified().unwrap();
+        assert!(
+            backdated <= first,
+            "precondition: dir mtime should be backdated"
+        );
+
+        // Reinstall the same label: the dir mtime must move forward again.
+        install_binary_at_version(&exe, version).unwrap();
+        let refreshed = dest_dir.metadata().unwrap().modified().unwrap();
+        assert!(
+            refreshed > backdated,
+            "reinstall must refresh the version dir mtime"
+        );
+    });
+}
+
+// `install_version` must reclaim space like every other installer: each call
+// adds an immutable `versions/<v>/` install, then prunes so the unprotected
+// installs stay capped to `VERSIONS_KEEP_NEWEST`. This pins the AA1 fix that
+// made `install_version` self-consistent with `publish_*`/`install_local_release`
+// (previously an unbounded path for callers that install many versions).
+#[test]
+fn install_version_prunes_old_installs() {
+    with_temp_jcode_home(|| {
+        // A fake repo whose `target/release` holds a binary for `install_version`
+        // to link into `versions/<v>/`.
+        let repo = tempfile::tempdir().expect("tempdir");
+        let release_dir = repo.path().join("target/release");
+        std::fs::create_dir_all(&release_dir).expect("create target/release");
+        std::fs::copy(
+            std::env::current_exe().unwrap(),
+            release_dir.join(binary_name()),
+        )
+        .expect("stage release binary");
+
+        // Install several distinct versions; each call inlines a prune.
+        for i in 0..(VERSIONS_KEEP_NEWEST + 3) {
+            let version = format!("v0.{i}");
+            install_version(repo.path(), &version).expect("install");
+        }
+        // The first install is old; after many installs it must have been pruned
+        // to keep the unprotected set bounded at VERSIONS_KEEP_NEWEST.
+        let names: std::collections::HashSet<String> =
+            std::fs::read_dir(builds_dir().unwrap().join("versions"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+        // Total unprotected installs may be many, but unprotected ones stay capped.
+        let unprotected = (0..(VERSIONS_KEEP_NEWEST + 3))
+            .filter(|i| names.contains(&format!("v0.{i}")))
+            .count();
+        assert!(
+            unprotected <= VERSIONS_KEEP_NEWEST,
+            "install_version must prune to at most VERSIONS_KEEP_NEWEST unprotected installs, got {unprotected}"
+        );
+    });
+}
+
+// `install_binary_at_version` must reject path-traversal / unsafe version
+// labels before joining them into `builds/versions/<label>/`, so a public
+// caller cannot write outside the versions dir. This is the same hardening
+// already applied to `promote_version_to_shared_server`, now enforced at the
+// single install choke point that all installers share.
+#[test]
+fn install_binary_rejects_unsafe_version_labels() {
+    let exe = std::env::current_exe().unwrap();
+    for label in ["..", ".", "", "/etc/evil", "a/b", "..\\x", "c:\\x", "  x", "x "] {
+        let err = install_binary_at_version(&exe, label).expect_err("must reject label");
+        assert!(
+            err.to_string().contains("Invalid installed version label"),
+            "unexpected error for {label:?}: {err}"
+        );
+    }
 }
 
 #[test]

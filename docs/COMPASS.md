@@ -70,9 +70,12 @@ To bound the cache even when many commits remain *reachable* from refs (e.g. a
 long-lived backup branch keeps `git rev-list --all` growing), a hard cap
 `SHA_INDEX_MAX_KEPT` (default 3) keeps only the newest per-SHA dirs plus the
 current HEAD, and prunes the oldest regardless of reachability — and regardless
-of whether git is available, so a git-less environment stays bounded too. Since
-the shared `.ast-cache` keeps branch-to-branch re-extract incremental, pruning a
-stale per-SHA graph is cheap to recreate on the next visit.
+of whether git is available, so a git-less environment stays bounded too. When
+the current HEAD's SHA cannot be resolved (git unavailable), no dir is
+name-protected as "current"; the just-built dir still survives because it is the
+newest. Since the shared `.ast-cache` keeps branch-to-branch re-extract
+incremental, pruning a stale per-SHA graph is cheap to recreate on the next
+visit.
 
 ## Pre-warm on session bind
 
