@@ -64,6 +64,7 @@ dsh's own priority.
 - 16. [Session fork/resume/title as derived operations](#16-session-forkresumetitle-as-derived-operations)
 - 17. [Composable profiles + live patch reload](#17-composable-profiles--live-patch-reload)
 - 18. [A postmortem culture for bug-class escapes](#18-a-postmortem-culture-for-bug-class-escapes)
+- [Follow-ups (open work, prioritized)](#follow-ups-open-work-prioritized)
 - [What NOT to take](#what-not-to-take)
 - [Sources](#sources)
 
@@ -412,6 +413,21 @@ The session layer implements this as a **uniform envelope** on the wire: every e
 | P2 | #9 subagent provider seam, #10 jobs seam, #11 durable inbox | Composition hygiene for swarm/telegram/review-rounds |
 | P2 | #6 prune/summarize split, #14 waterfall hooks, #16 fork/title providers | Quality-of-design, incremental |
 | P3 | #15 goals domain, #17 layered config patches, #18 postmortem culture | Lower urgency / process |
+
+## Follow-ups (open work, prioritized)
+
+Tracked items that surfaced from delivering takeaway #4 (the projection seam) and its
+trade-off review. These are intentionally still open.
+
+| ID | Follow-up | Why / notes | Priority |
+|----|-----------|-------------|----------|
+| f1 | **Incremental O(1) cache at the append seam.** Keep a `ProjectionRegistry` incrementally current in `Session` (the single chokepoint is `event_map.append_event`; the seam is `ProjectionRegistry::apply`), so `projected_messages()` reads cached derived state instead of refolding the log per read. | Highest-value remaining item: this is what makes the seam actually *cheaper* than the on-demand `derive_messages` it replaces. Must preserve `ProjectionMatchesDerived` byte-identity with `derive_messages`. Own dedicated change; the differential invariant is the safety backstop. | high |
+| f3 | **Benchmark `projected_messages()` vs `derive_messages()`** on a long session. | Justifies/prioritizes f1 with data instead of assumption. | medium |
+| f2 | **Make `derive_messages` delegate to the projection** to purge the duplicated fold. | Higher risk: inverts the `event_types` → `invariants` module dependency (`event_types` currently never depends on `invariants`). Only pursue if the drift-guard (`ProjectionMatchesDerived`) proves insufficient. | low |
+
+Deliberately **not** open items (design constraints, not debt):
+- The `'static + Send + Sync` bound on projection states — inherent to erasing heterogeneous states behind `dyn Any` in the "one fold, many readers" design.
+- The byte-compare cost of `ProjectionMatchesDerived` — it is a load-path diagnostic, not a hot path; the serialize-and-compare is what gives the invariant its meaning.
 
 ## What NOT to take
 
