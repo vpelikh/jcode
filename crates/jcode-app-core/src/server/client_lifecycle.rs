@@ -1,9 +1,11 @@
 use super::available_models_dedup::available_models_dedup_key;
 use super::client_actions::{
-    AgentTaskContext, NotifySessionContext, handle_agent_task, handle_compact, handle_input_shell,
+    AgentTaskContext, NotifySessionContext, handle_agent_task, handle_compact, handle_input_shell, handle_prune,
     handle_notify_session, handle_rename_session, handle_run_subagent, handle_set_feature,
-    handle_set_subagent_model, handle_set_working_dir, handle_split, handle_stdin_response,
-    handle_transfer, handle_trigger_memory_extraction,
+    handle_set_handoff_resume, handle_set_subagent_model, handle_set_working_dir, handle_split,
+    handle_stdin_response, handle_transfer, handle_trigger_memory_extraction,
+    handle_handoff_list, handle_handoff_import, handle_handoff_apply,
+    handle_handoff_resume_by_id,
 };
 use super::client_comm::{
     handle_comm_channel_members, handle_comm_list, handle_comm_list_channels, handle_comm_message,
@@ -45,24 +47,24 @@ use super::provider_control::{
     handle_switch_anthropic_account, handle_switch_openai_account,
     try_available_models_updated_event,
 };
+use super::services::{
+    ClientServiceHandle, DebugServiceHandle, SessionServiceHandle, SwarmServiceHandle,
+};
 use super::{
-    AwaitMembersRuntime, ClientConnectionInfo, ClientDebugState, FileTouchService,
-    SessionControlHandle, SessionInterruptQueues, SharedContext, SwarmEvent, SwarmMember,
-    SwarmMutationRuntime, VersionedPlan, format_structured_completion_report,
-    register_session_interrupt_queue, send_swarm_plan_to_session, truncate_detail,
-    update_member_status, update_member_status_with_report, update_member_status_with_report_tldr,
+    ClientConnectionInfo, SessionControlHandle, SessionInterruptQueues, SwarmMember,
+    format_structured_completion_report, register_session_interrupt_queue,
+    send_swarm_plan_to_session, truncate_detail,
 };
 use crate::agent::Agent;
 use crate::bus::{Bus, BusEvent};
 use crate::id;
 use crate::protocol::{Request, ServerEvent, decode_request, encode_event};
-use crate::provider::Provider;
 use crate::tool::Registry;
 use crate::transport::Stream;
 use anyhow::Result;
 use futures::FutureExt;
 use jcode_agent_runtime::{InterruptSignal, SoftInterruptSource, StreamError};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{
     Arc,
@@ -70,10 +72,9 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 
 type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
-type ChannelSubscriptions = Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
 const RELOAD_STARTING_GUARD_MAX_AGE: Duration = Duration::from_secs(30);
 const REQUEST_HANDLER_STALL_THRESHOLDS_MS: [u64; 3] = [2_000, 10_000, 60_000];
 
@@ -186,11 +187,7 @@ struct ProcessingState<'a> {
 }
 
 struct SwarmStatusRefs<'a> {
-    members: &'a Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &'a Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    event_history: &'a Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &'a Arc<std::sync::atomic::AtomicU64>,
-    event_tx: &'a broadcast::Sender<SwarmEvent>,
+    swarm: &'a SwarmServiceHandle,
 }
 
 fn should_start_idle_soft_interrupt(
@@ -434,34 +431,46 @@ async fn refresh_session_control_handle(
 )]
 pub(super) async fn handle_client(
     stream: Stream,
-    sessions: SessionAgents,
-    _global_event_tx: broadcast::Sender<ServerEvent>,
-    provider_template: Arc<dyn Provider>,
-    _global_is_processing: Arc<RwLock<bool>>,
-    global_session_id: Arc<RwLock<String>>,
-    client_count: Arc<RwLock<usize>>,
-    client_connections: Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
-    swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    shared_context: Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
-    swarm_plans: Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    swarm_coordinators: Arc<RwLock<HashMap<String, String>>>,
-    file_touch: FileTouchService,
-    channel_subscriptions: ChannelSubscriptions,
-    channel_subscriptions_by_session: ChannelSubscriptions,
-    client_debug_state: Arc<RwLock<ClientDebugState>>,
-    client_debug_response_tx: broadcast::Sender<(u64, String)>,
-    event_history: Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: broadcast::Sender<SwarmEvent>,
+    session_service: SessionServiceHandle,
+    client_service: ClientServiceHandle,
+    swarm_service: SwarmServiceHandle,
+    debug_service: DebugServiceHandle,
     server_name: String,
     server_icon: String,
     mcp_pool: Arc<crate::mcp::SharedMcpPool>,
-    shutdown_signals: Arc<RwLock<HashMap<String, InterruptSignal>>>,
-    soft_interrupt_queues: SessionInterruptQueues,
-    await_members_runtime: AwaitMembersRuntime,
-    swarm_mutation_runtime: SwarmMutationRuntime,
 ) -> Result<()> {
+    // Destructure the service handles back into the flat locals the body uses,
+    // preserving every downstream reference. This is Slice 3 of the server
+    // service split: callers pass typed handles instead of a 28-arg positional
+    // list, while the handler body is unchanged.
+    // Swarm-domain operations in the session lifecycle functions take the
+    // handle by reference (server service split, Slice 4). Clone it up front so
+    // the body routes io close/dispatch through `swarm_service_handle` while
+    // the swarm locals (cloned via the accessors below) stay independent.
+    let swarm_service_handle = swarm_service.clone();
+    // The session service handle is also kept alive by reference for
+    // NotifySessionContext routing below; clone it up front so the flat-local
+    // destructuring can move the session fields out of the original.
+    let session_service_handle = session_service.clone();
+    let sessions = session_service.sessions;
+    let provider_template = client_service.provider;
+    let global_session_id = session_service.session_id;
+    let client_count = client_service.client_count;
+    let client_connections = client_service.client_connections;
+    // Clone `file_touch`/`await_members_runtime`/`swarm_state` sub-maps before
+    // the `session_service`/`client_service`/`debug_service` fields are moved
+    // out below. The swarm values are borrowed from `swarm_service` through the
+    // accessors and cloned here (the Arc/RwLock handles are cheap to clone), so
+    // `swarm_service` itself is not partially moved and stays available for the
+    // handle methods used by the dispatch and cleanup paths (Tier 3).
+    let file_touch = swarm_service.file_touch().clone();
+    let await_members_runtime = swarm_service.await_members_runtime().clone();
+    let swarm_members = swarm_service.swarm_state().members.clone();
+    let swarm_plans = swarm_service.swarm_state().plans.clone();
+    let client_debug_state = debug_service.client_debug_state;
+    let client_debug_response_tx = debug_service.client_debug_response_tx;
+    let shutdown_signals = session_service.shutdown_signals;
+    let soft_interrupt_queues = session_service.soft_interrupt_queues;
     let (reader, writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let writer = Arc::new(Mutex::new(writer));
@@ -494,25 +503,14 @@ pub(super) async fn handle_client(
                         request,
                         Arc::clone(&writer),
                         LightweightControlContext {
+                            session: &session_service_handle,
+                            swarm: &swarm_service_handle,
                             sessions: &sessions,
                             global_session_id: &global_session_id,
                             provider_template: &provider_template,
-                            swarm_members: &swarm_members,
-                            swarms_by_id: &swarms_by_id,
-                            shared_context: &shared_context,
-                            swarm_plans: &swarm_plans,
-                            swarm_coordinators: &swarm_coordinators,
-                            file_touch: &file_touch,
-                            channel_subscriptions: &channel_subscriptions,
-                            channel_subscriptions_by_session: &channel_subscriptions_by_session,
                             client_connections: &client_connections,
-                            event_history: &event_history,
-                            event_counter: &event_counter,
-                            swarm_event_tx: &swarm_event_tx,
                             mcp_pool: &mcp_pool,
                             soft_interrupt_queues: &soft_interrupt_queues,
-                            await_members_runtime: &await_members_runtime,
-                            swarm_mutation_runtime: &swarm_mutation_runtime,
                         },
                     )
                     .await?;
@@ -843,12 +841,8 @@ pub(super) async fn handle_client(
                     record_processing_completion(
                         done_session.as_deref(), result, completion_report,
                         &SwarmStatusRefs {
-                            members: &swarm_members,
-                            swarms_by_id: &swarms_by_id,
-                            event_history: &event_history,
-                            event_counter: &event_counter,
-                            event_tx: &swarm_event_tx,
-                        },
+                            swarm: &swarm_service_handle,
+                            },
                     ).await;
                 } else {
                     break;
@@ -1058,12 +1052,8 @@ pub(super) async fn handle_client(
                 &session_control,
                 &client_event_tx,
                 &SwarmStatusRefs {
-                    members: &swarm_members,
-                    swarms_by_id: &swarms_by_id,
-                    event_history: &event_history,
-                    event_counter: &event_counter,
-                    event_tx: &swarm_event_tx,
-                },
+                    swarm: &swarm_service_handle,
+                    },
                 Some(id),
                 Some(request_decoded_at),
             )
@@ -1234,12 +1224,8 @@ pub(super) async fn handle_client(
                     &processing_done_tx,
                     active_terminal_env.clone(),
                     &SwarmStatusRefs {
-                        members: &swarm_members,
-                        swarms_by_id: &swarms_by_id,
-                        event_history: &event_history,
-                        event_counter: &event_counter,
-                        event_tx: &swarm_event_tx,
-                    },
+                        swarm: &swarm_service_handle,
+                        },
                 )
                 .await;
             }
@@ -1255,12 +1241,8 @@ pub(super) async fn handle_client(
                     &session_control,
                     &client_event_tx,
                     &SwarmStatusRefs {
-                        members: &swarm_members,
-                        swarms_by_id: &swarms_by_id,
-                        event_history: &event_history,
-                        event_counter: &event_counter,
-                        event_tx: &swarm_event_tx,
-                    },
+                        swarm: &swarm_service_handle,
+                        },
                     Some(id),
                     Some(request_decoded_at),
                 )
@@ -1300,10 +1282,10 @@ pub(super) async fn handle_client(
                         active_turn_registered,
                         session_connection_busy,
                     );
-                    if start {
-                        if let Some(info) = connections.get_mut(&client_connection_id) {
-                            info.is_processing = true;
-                        }
+                    if start
+                        && let Some(info) = connections.get_mut(&client_connection_id)
+                    {
+                        info.is_processing = true;
                     }
                     start
                 };
@@ -1328,12 +1310,8 @@ pub(super) async fn handle_client(
                         &processing_done_tx,
                         active_terminal_env.clone(),
                         &SwarmStatusRefs {
-                            members: &swarm_members,
-                            swarms_by_id: &swarms_by_id,
-                            event_history: &event_history,
-                            event_counter: &event_counter,
-                            event_tx: &swarm_event_tx,
-                        },
+                            swarm: &swarm_service_handle,
+                            },
                     )
                     .await;
                     if !client_is_processing {
@@ -1388,15 +1366,7 @@ pub(super) async fn handle_client(
                         &shutdown_signals,
                         &soft_interrupt_queues,
                         &client_connections,
-                        &swarm_members,
-                        &swarms_by_id,
-                        &file_touch,
-                        &channel_subscriptions,
-                        &channel_subscriptions_by_session,
-                        &swarm_plans,
-                        &event_history,
-                        &event_counter,
-                        &swarm_event_tx,
+                        &swarm_service_handle,
                         &client_event_tx,
                     ),
                 )
@@ -1633,23 +1603,13 @@ pub(super) async fn handle_client(
                                 &soft_interrupt_queues,
                                 &client_connections,
                                 &client_debug_state,
-                                &swarm_members,
-                                &swarms_by_id,
-                                &file_touch,
-                                &channel_subscriptions,
-                                &channel_subscriptions_by_session,
-                                &swarm_plans,
-                                &swarm_coordinators,
+                                &swarm_service_handle,
                                 &client_count,
                                 &writer,
                                 &server_name,
                                 &server_icon,
                                 &client_event_tx,
                                 &mcp_pool,
-                                &event_history,
-                                &event_counter,
-                                &swarm_event_tx,
-                                supports_pdf_panels,
                             ),
                         )
                         .await?;
@@ -1674,17 +1634,9 @@ pub(super) async fn handle_client(
                                 &agent,
                                 &registry,
                                 swarm_enabled,
-                                &swarm_members,
-                                &swarms_by_id,
-                                &channel_subscriptions,
-                                &channel_subscriptions_by_session,
-                                &swarm_plans,
-                                &swarm_coordinators,
+                                &swarm_service_handle,
                                 &client_event_tx,
                                 &mcp_pool,
-                                &event_history,
-                                &event_counter,
-                                &swarm_event_tx,
                             )
                             .await;
                             if let Some(snapshot) = try_available_models_snapshot(&agent) {
@@ -1714,17 +1666,9 @@ pub(super) async fn handle_client(
                             &agent,
                             &registry,
                             swarm_enabled,
-                            &swarm_members,
-                            &swarms_by_id,
-                            &channel_subscriptions,
-                            &channel_subscriptions_by_session,
-                            &swarm_plans,
-                            &swarm_coordinators,
+                            &swarm_service_handle,
                             &client_event_tx,
                             &mcp_pool,
-                            &event_history,
-                            &event_counter,
-                            &swarm_event_tx,
                         )
                         .await;
                     }
@@ -1745,17 +1689,9 @@ pub(super) async fn handle_client(
                         &agent,
                         &registry,
                         swarm_enabled,
-                        &swarm_members,
-                        &swarms_by_id,
-                        &channel_subscriptions,
-                        &channel_subscriptions_by_session,
-                        &swarm_plans,
-                        &swarm_coordinators,
+                        &swarm_service_handle,
                         &client_event_tx,
                         &mcp_pool,
-                        &event_history,
-                        &event_counter,
-                        &swarm_event_tx,
                     )
                     .await;
                     if let Some(snapshot) = try_available_models_snapshot(&agent) {
@@ -1843,7 +1779,7 @@ pub(super) async fn handle_client(
                     force,
                     &client_session_id,
                     &agent,
-                    &swarm_members,
+                    &swarm_service_handle,
                     &client_event_tx,
                 )
                 .await;
@@ -1888,23 +1824,13 @@ pub(super) async fn handle_client(
                         &soft_interrupt_queues,
                         &client_connections,
                         &client_debug_state,
-                        &swarm_members,
-                        &swarms_by_id,
-                        &file_touch,
-                        &channel_subscriptions,
-                        &channel_subscriptions_by_session,
-                        &swarm_plans,
-                        &swarm_coordinators,
+                        &swarm_service_handle,
                         &client_count,
                         &writer,
                         &server_name,
                         &server_icon,
                         &client_event_tx,
                         &mcp_pool,
-                        &event_history,
-                        &event_counter,
-                        &swarm_event_tx,
-                        supports_pdf_panels,
                     ),
                 )
                 .await?;
@@ -1927,11 +1853,7 @@ pub(super) async fn handle_client(
                 super::client_actions::handle_resume_all_sessions(
                     id,
                     &sessions,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
+                    &swarm_service_handle,
                     &client_event_tx,
                 )
                 .await;
@@ -2039,7 +1961,7 @@ pub(super) async fn handle_client(
                     title,
                     &agent,
                     &client_session_id,
-                    &swarm_members,
+                    &swarm_service_handle,
                     &client_event_tx,
                 )
                 .await;
@@ -2061,10 +1983,68 @@ pub(super) async fn handle_client(
                     working_dir,
                     &agent,
                     &client_session_id,
-                    &swarm_members,
+                    &swarm_service_handle,
                     &client_event_tx,
                 )
                 .await;
+            }
+
+            Request::SetHandoffResume { id, session_id } => {
+                if reject_if_agent_busy_for_request(
+                    id,
+                    "set_handoff_resume",
+                    &client_session_id,
+                    client_is_processing,
+                    &agent,
+                    &client_event_tx,
+                ) {
+                    continue;
+                }
+                handle_set_handoff_resume(id, session_id, &agent, &client_event_tx).await;
+            }
+
+            Request::HandoffList { id } => {
+                handle_handoff_list(id, &client_event_tx).await;
+            }
+
+            Request::HandoffImport {
+                id,
+                payload,
+                disposition,
+            } => {
+                handle_handoff_import(id, payload, disposition, &agent, &client_event_tx).await;
+            }
+
+            Request::HandoffApply {
+                id,
+                payload,
+                disposition,
+            } => {
+                if reject_if_agent_busy_for_request(
+                    id,
+                    "handoff_apply",
+                    &client_session_id,
+                    client_is_processing,
+                    &agent,
+                    &client_event_tx,
+                ) {
+                    continue;
+                }
+                handle_handoff_apply(id, payload, disposition, &agent, &client_event_tx).await;
+            }
+
+            Request::HandoffResumeById { id, session_id } => {
+                if reject_if_agent_busy_for_request(
+                    id,
+                    "handoff_resume_by_id",
+                    &client_session_id,
+                    client_is_processing,
+                    &agent,
+                    &client_event_tx,
+                ) {
+                    continue;
+                }
+                handle_handoff_resume_by_id(id, session_id, &agent, &client_event_tx).await;
             }
 
             Request::NotifyAuthChanged {
@@ -2119,12 +2099,7 @@ pub(super) async fn handle_client(
                     &client_session_id,
                     &friendly_name,
                     &mut swarm_enabled,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &swarm_coordinators,
-                    &channel_subscriptions,
-                    &channel_subscriptions_by_session,
-                    &swarm_plans,
+                    &swarm_service_handle,
                     &client_event_tx,
                 )
                 .await;
@@ -2150,6 +2125,10 @@ pub(super) async fn handle_client(
 
             Request::Compact { id } => {
                 handle_compact(id, &agent, &client_event_tx);
+            }
+
+            Request::Prune { id } => {
+                handle_prune(id, &agent, &client_event_tx);
             }
 
             Request::TriggerMemoryExtraction { id } => {
@@ -2188,11 +2167,7 @@ pub(super) async fn handle_client(
                     &agent,
                     &AgentTaskContext {
                         client_event_tx: &client_event_tx,
-                        swarm_members: &swarm_members,
-                        swarms_by_id: &swarms_by_id,
-                        event_history: &event_history,
-                        event_counter: &event_counter,
-                        swarm_event_tx: &swarm_event_tx,
+                        swarm: &swarm_service_handle,
                     },
                 )
                 .await;
@@ -2216,14 +2191,9 @@ pub(super) async fn handle_client(
                     session_id,
                     message,
                     NotifySessionContext {
-                        sessions: &sessions,
-                        soft_interrupt_queues: &soft_interrupt_queues,
+                        session: &session_service_handle,
                         client_connections: &client_connections,
-                        swarm_members: &swarm_members,
-                        swarms_by_id: &swarms_by_id,
-                        event_history: &event_history,
-                        event_counter: &event_counter,
-                        swarm_event_tx: &swarm_event_tx,
+                        swarm: &swarm_service_handle,
                         client_event_tx: &client_event_tx,
                     },
                 )
@@ -2279,12 +2249,7 @@ pub(super) async fn handle_client(
                     value,
                     append,
                     &client_event_tx,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &shared_context,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
+                    &swarm_service_handle,
                 )
                 .await;
             }
@@ -2299,8 +2264,7 @@ pub(super) async fn handle_client(
                     req_session_id,
                     key,
                     &client_event_tx,
-                    &swarm_members,
-                    &shared_context,
+                    &swarm_service_handle,
                 )
                 .await;
             }
@@ -2325,14 +2289,8 @@ pub(super) async fn handle_client(
                     wake,
                     tldr,
                     &client_event_tx,
-                    &sessions,
-                    &soft_interrupt_queues,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &channel_subscriptions,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
+                    &session_service_handle,
+                    &swarm_service_handle,
                     &client_connections,
                 )
                 .await;
@@ -2346,9 +2304,7 @@ pub(super) async fn handle_client(
                     id,
                     req_session_id,
                     &client_event_tx,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &file_touch,
+                    &swarm_service_handle,
                     &sessions,
                     &client_connections,
                 )
@@ -2363,8 +2319,7 @@ pub(super) async fn handle_client(
                     id,
                     req_session_id,
                     &client_event_tx,
-                    &swarm_members,
-                    &channel_subscriptions,
+                    &swarm_service_handle,
                 )
                 .await;
             }
@@ -2379,8 +2334,7 @@ pub(super) async fn handle_client(
                     req_session_id,
                     channel,
                     &client_event_tx,
-                    &swarm_members,
-                    &channel_subscriptions,
+                    &swarm_service_handle,
                 )
                 .await;
             }
@@ -2395,17 +2349,8 @@ pub(super) async fn handle_client(
                     req_session_id,
                     items,
                     &client_event_tx,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &shared_context,
-                    &swarm_plans,
-                    &swarm_coordinators,
-                    &sessions,
-                    &soft_interrupt_queues,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
-                    &swarm_mutation_runtime,
+                    &session_service_handle,
+                    &swarm_service_handle,
                 )
                 .await;
             }
@@ -2420,17 +2365,8 @@ pub(super) async fn handle_client(
                     req_session_id,
                     proposer_session,
                     &client_event_tx,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &shared_context,
-                    &swarm_plans,
-                    &swarm_coordinators,
-                    &sessions,
-                    &soft_interrupt_queues,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
-                    &swarm_mutation_runtime,
+                    &session_service_handle,
+                    &swarm_service_handle,
                 )
                 .await;
             }
@@ -2447,15 +2383,8 @@ pub(super) async fn handle_client(
                     proposer_session,
                     reason,
                     &client_event_tx,
-                    &swarm_members,
-                    &shared_context,
-                    &swarm_coordinators,
-                    &sessions,
-                    &soft_interrupt_queues,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
-                    &swarm_mutation_runtime,
+                    &session_service_handle,
+                    &swarm_service_handle,
                 )
                 .await;
             }
@@ -2472,13 +2401,7 @@ pub(super) async fn handle_client(
                     mode,
                     nodes,
                     &client_event_tx,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &swarm_plans,
-                    &swarm_coordinators,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
+                    &swarm_service_handle,
                 )
                 .await;
             }
@@ -2495,13 +2418,7 @@ pub(super) async fn handle_client(
                     node_id,
                     children,
                     &client_event_tx,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &swarm_plans,
-                    &swarm_coordinators,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
+                    &swarm_service_handle,
                 )
                 .await;
             }
@@ -2518,13 +2435,7 @@ pub(super) async fn handle_client(
                     node_id,
                     artifact_json,
                     &client_event_tx,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &swarm_plans,
-                    &swarm_coordinators,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
+                    &swarm_service_handle,
                 )
                 .await;
             }
@@ -2541,13 +2452,7 @@ pub(super) async fn handle_client(
                     gate_id,
                     nodes,
                     &client_event_tx,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &swarm_plans,
-                    &swarm_coordinators,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
+                    &swarm_service_handle,
                 )
                 .await;
             }
@@ -2581,18 +2486,9 @@ pub(super) async fn handle_client(
                     &sessions,
                     &global_session_id,
                     &provider_template,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &swarm_coordinators,
-                    &swarm_plans,
-                    &channel_subscriptions,
-                    &channel_subscriptions_by_session,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
+                    &swarm_service_handle,
                     &mcp_pool,
                     &soft_interrupt_queues,
-                    &swarm_mutation_runtime,
                     &client_connections,
                 )
                 .await;
@@ -2627,17 +2523,8 @@ pub(super) async fn handle_client(
                     force.unwrap_or(false),
                     &client_event_tx,
                     &sessions,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &swarm_coordinators,
-                    &swarm_plans,
-                    &channel_subscriptions,
-                    &channel_subscriptions_by_session,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
+                    &swarm_service_handle,
                     &soft_interrupt_queues,
-                    &swarm_mutation_runtime,
                 )
                 .await;
             }
@@ -2655,14 +2542,7 @@ pub(super) async fn handle_client(
                     role,
                     &client_event_tx,
                     &sessions,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &swarm_coordinators,
-                    &swarm_plans,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
-                    &swarm_mutation_runtime,
+                    &swarm_service_handle,
                 )
                 .await;
             }
@@ -2679,7 +2559,7 @@ pub(super) async fn handle_client(
                     target_session,
                     limit,
                     &sessions,
-                    &swarm_members,
+                    &swarm_service_handle,
                     &client_event_tx,
                 )
                 .await;
@@ -2695,9 +2575,8 @@ pub(super) async fn handle_client(
                     req_session_id,
                     target_session,
                     &sessions,
-                    &swarm_members,
+                    &swarm_service_handle,
                     &client_connections,
-                    &file_touch,
                     &client_event_tx,
                 )
                 .await;
@@ -2719,19 +2598,15 @@ pub(super) async fn handle_client(
                     follow_up.as_deref(),
                 );
                 let detail = Some(truncate_detail(&message, 160));
-                update_member_status_with_report_tldr(
-                    &req_session_id,
-                    &status,
-                    detail,
-                    Some(report),
-                    tldr,
-                    &swarm_members,
-                    &swarms_by_id,
-                    Some(&event_history),
-                    Some(&event_counter),
-                    Some(&swarm_event_tx),
-                )
-                .await;
+                swarm_service_handle
+                    .set_member_status_with_report_tldr(
+                        &req_session_id,
+                        &status,
+                        detail,
+                        Some(report),
+                        tldr,
+                    )
+                    .await;
                 let _ = client_event_tx.send(ServerEvent::CommReportResponse {
                     id,
                     status,
@@ -2747,8 +2622,7 @@ pub(super) async fn handle_client(
                 handle_comm_plan_status(
                     id,
                     req_session_id,
-                    &swarm_members,
-                    &swarm_plans,
+                    &swarm_service_handle,
                     &client_event_tx,
                 )
                 .await;
@@ -2764,7 +2638,7 @@ pub(super) async fn handle_client(
                     req_session_id,
                     target_session,
                     &sessions,
-                    &swarm_members,
+                    &swarm_service_handle,
                     &client_event_tx,
                 )
                 .await;
@@ -2779,13 +2653,7 @@ pub(super) async fn handle_client(
                     req_session_id,
                     &CommResyncPlanContext {
                         client_event_tx: &client_event_tx,
-                        swarm_members: &swarm_members,
-                        swarms_by_id: &swarms_by_id,
-                        swarm_plans: &swarm_plans,
-                        swarm_coordinators: &swarm_coordinators,
-                        event_history: &event_history,
-                        event_counter: &event_counter,
-                        swarm_event_tx: &swarm_event_tx,
+                        swarm: &swarm_service_handle,
                     },
                 )
                 .await;
@@ -2805,17 +2673,9 @@ pub(super) async fn handle_client(
                     task_id,
                     message,
                     &client_event_tx,
-                    &sessions,
-                    &soft_interrupt_queues,
+                    &session_service_handle,
                     &client_connections,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &swarm_plans,
-                    &swarm_coordinators,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
-                    &swarm_mutation_runtime,
+                    &swarm_service_handle,
                 )
                 .await;
             }
@@ -2842,20 +2702,12 @@ pub(super) async fn handle_client(
                     model,
                     effort,
                     &client_event_tx,
-                    &sessions,
+                    &session_service_handle,
                     &global_session_id,
                     &provider_template,
-                    &soft_interrupt_queues,
                     &client_connections,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &swarm_plans,
-                    &swarm_coordinators,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
+                    &swarm_service_handle,
                     &mcp_pool,
-                    &swarm_mutation_runtime,
                 )
                 .await;
             }
@@ -2876,17 +2728,9 @@ pub(super) async fn handle_client(
                     target_session,
                     message,
                     &client_event_tx,
-                    &sessions,
-                    &soft_interrupt_queues,
+                    &session_service_handle,
                     &client_connections,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &swarm_plans,
-                    &swarm_coordinators,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
-                    &swarm_mutation_runtime,
+                    &swarm_service_handle,
                 )
                 .await;
             }
@@ -2901,12 +2745,7 @@ pub(super) async fn handle_client(
                     req_session_id,
                     channel,
                     &client_event_tx,
-                    &swarm_members,
-                    &channel_subscriptions,
-                    &channel_subscriptions_by_session,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
+                    &swarm_service_handle,
                 )
                 .await;
             }
@@ -2921,12 +2760,7 @@ pub(super) async fn handle_client(
                     req_session_id,
                     channel,
                     &client_event_tx,
-                    &swarm_members,
-                    &channel_subscriptions,
-                    &channel_subscriptions_by_session,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
+                    &swarm_service_handle,
                 )
                 .await;
             }
@@ -2954,9 +2788,7 @@ pub(super) async fn handle_client(
                     wake,
                     CommAwaitMembersContext {
                         client_event_tx: &client_event_tx,
-                        swarm_members: &swarm_members,
-                        swarms_by_id: &swarms_by_id,
-                        swarm_event_tx: &swarm_event_tx,
+                        swarm: &swarm_service_handle,
                         await_members_runtime: &await_members_runtime,
                     },
                 )
@@ -3092,11 +2924,7 @@ pub(super) async fn handle_client(
                         result,
                         report,
                         &SwarmStatusRefs {
-                            members: &swarm_members,
-                            swarms_by_id: &swarms_by_id,
-                            event_history: &event_history,
-                            event_counter: &event_counter,
-                            event_tx: &swarm_event_tx,
+                            swarm: &swarm_service_handle,
                         },
                     )
                     .await;
@@ -3124,22 +2952,14 @@ pub(super) async fn handle_client(
             client_is_processing,
             &mut processing_task,
             event_handle,
-            &swarm_members,
-            &swarms_by_id,
-            &swarm_coordinators,
-            &swarm_plans,
+            &swarm_service_handle,
             &file_touch,
-            &channel_subscriptions,
-            &channel_subscriptions_by_session,
             &client_debug_state,
             &client_debug_id,
             &client_connections,
             &client_connection_id,
             &shutdown_signals,
             &soft_interrupt_queues,
-            &event_history,
-            &event_counter,
-            &swarm_event_tx,
             &client_event_tx,
             super::client_disconnect_cleanup::IDLE_RECONNECT_GRACE,
         ),
@@ -3157,33 +2977,22 @@ async fn record_processing_completion(
     match result {
         Ok(()) => {
             if let Some(session_id) = done_session {
-                update_member_status_with_report(
-                    session_id,
-                    "ready",
-                    None,
-                    completion_report,
-                    swarm.members,
-                    swarm.swarms_by_id,
-                    Some(swarm.event_history),
-                    Some(swarm.event_counter),
-                    Some(swarm.event_tx),
-                )
-                .await;
+                swarm
+                    .swarm
+                    .set_member_status_with_report(session_id, "ready", None, completion_report)
+                    .await;
             }
         }
         Err(e) => {
             if let Some(session_id) = done_session {
-                update_member_status(
-                    session_id,
-                    "failed",
-                    Some(truncate_detail(&e.to_string(), 120)),
-                    swarm.members,
-                    swarm.swarms_by_id,
-                    Some(swarm.event_history),
-                    Some(swarm.event_counter),
-                    Some(swarm.event_tx),
-                )
-                .await;
+                swarm
+                    .swarm
+                    .set_member_status(
+                        session_id,
+                        "failed",
+                        Some(truncate_detail(&e.to_string(), 120)),
+                    )
+                    .await;
             }
             let retry_after_secs = e
                 .downcast_ref::<StreamError>()
@@ -3310,17 +3119,14 @@ async fn start_processing_message(
         ));
     }
 
-    update_member_status(
-        client_session_id,
-        "running",
-        Some(truncate_detail(&content, 120)),
-        swarm.members,
-        swarm.swarms_by_id,
-        Some(swarm.event_history),
-        Some(swarm.event_counter),
-        Some(swarm.event_tx),
-    )
-    .await;
+    swarm
+        .swarm
+        .set_member_status(
+            client_session_id,
+            "running",
+            Some(truncate_detail(&content, 120)),
+        )
+        .await;
 
     let start_message_index = {
         let agent_guard = agent.lock().await;
@@ -3330,7 +3136,7 @@ async fn start_processing_message(
     let report_agent = Arc::clone(&agent);
     let tx = super::state::session_event_fanout_sender_with_fallback(
         client_session_id.to_string(),
-        Arc::clone(swarm.members),
+        swarm.swarm.swarm_state().members.clone(),
         client_event_tx.clone(),
     );
     let done_tx = processing_done_tx.clone();
@@ -3477,17 +3283,10 @@ async fn cancel_processing_message(
         *state.task = None;
         *state.client_is_processing = false;
         if let Some(session_id) = state.session_id.take() {
-            update_member_status(
-                &session_id,
-                "stopped",
-                Some("cancelled".to_string()),
-                swarm.members,
-                swarm.swarms_by_id,
-                Some(swarm.event_history),
-                Some(swarm.event_counter),
-                Some(swarm.event_tx),
-            )
-            .await;
+            swarm
+                .swarm
+                .set_member_status(&session_id, "stopped", Some("cancelled".to_string()))
+                .await;
         }
         if let Some(message_id) = state.message_id.take() {
             let _ = client_event_tx.send(ServerEvent::Interrupted);
@@ -3545,17 +3344,10 @@ async fn cancel_processing_message(
             .session_id
             .take()
             .unwrap_or_else(|| session_control.session_id.clone());
-        update_member_status(
-            &status_session_id,
-            "stopped",
-            Some("cancelled".to_string()),
-            swarm.members,
-            swarm.swarms_by_id,
-            Some(swarm.event_history),
-            Some(swarm.event_counter),
-            Some(swarm.event_tx),
-        )
-        .await;
+        swarm
+            .swarm
+            .set_member_status(&status_session_id, "stopped", Some("cancelled".to_string()))
+            .await;
         let _ = client_event_tx.send(ServerEvent::Interrupted);
         if let Some(message_id) = state.message_id.take() {
             let _ = client_event_tx.send(ServerEvent::Done { id: message_id });

@@ -906,6 +906,81 @@ impl RemoteConnection {
         self.send_request(request).await
     }
 
+    /// Set which saved handoff this session boots from on its first message.
+    /// `Some(id)` selects a specific handoff via `/handoffres`; `None` restores
+    /// the default automatic latest-for-project injection.
+    pub async fn set_handoff_resume(&mut self, session_id: Option<String>) -> Result<()> {
+        let request = Request::SetHandoffResume {
+            id: self.next_request_id,
+            session_id,
+        };
+        self.next_request_id += 1;
+        self.send_request(request).await
+    }
+
+    /// Ask the server for its handoff store (newest first, including archived
+    /// snapshots). The result arrives asynchronously via
+    /// [`ServerEvent::HandoffListed`], correlated by the request id.
+    ///
+    /// Over SSH the client host's local store is the wrong host to inspect, so
+    /// this is the correct way to discover handoffs for a remote session.
+    pub async fn handoff_list(&mut self) -> Result<u64> {
+        let id = self.next_request_id;
+        let request = Request::HandoffList { id };
+        self.next_request_id += 1;
+        self.send_request(request).await?;
+        Ok(id)
+    }
+
+    /// Ask the server to adopt a portable handoff payload as the live handoff
+    /// for the current session's project. The outcome arrives asynchronously
+    /// via [`ServerEvent::HandoffImported`] (or `Error` on rejection).
+    pub async fn handoff_import(&mut self, payload: String, disposition: Option<String>) -> Result<u64> {
+        let id = self.next_request_id;
+        let request = Request::HandoffImport {
+            id,
+            payload,
+            disposition,
+        };
+        self.next_request_id += 1;
+        self.send_request(request).await?;
+        Ok(id)
+    }
+
+    /// Ask the server to atomically adopt a portable handoff payload *and* boot
+    /// the current session from it in a single hop: the payload is imported, the
+    /// live conversation is cleared, and the handoff-resume override is armed so
+    /// the next first user message boots from the adopted snapshot. The outcome
+    /// arrives asynchronously via [`ServerEvent::HandoffImported`] (or `Error`
+    /// on rejection, which leaves the live conversation untouched).
+    pub async fn handoff_apply(&mut self, payload: String, disposition: Option<String>) -> Result<u64> {
+        let id = self.next_request_id;
+        let request = Request::HandoffApply {
+            id,
+            payload,
+            disposition,
+        };
+        self.next_request_id += 1;
+        self.send_request(request).await?;
+        Ok(id)
+    }
+
+    /// Ask the server to atomically boot the current session from an
+    /// *already-present* server-side handoff in one hop: the conversation is
+    /// cleared and the handoff-resume override armed to the named snapshot,
+    /// both server-side under a single lock. Unlike a client `clear` followed
+    /// by `set_handoff_resume`, a transport drop in between cannot leave the
+    /// session cleared but the resume override unarmed. The outcome arrives
+    /// asynchronously via [`ServerEvent::HandoffResumed`] (or `Error` if the
+    /// named snapshot does not exist, which leaves the conversation untouched).
+    pub async fn handoff_resume_by_id(&mut self, session_id: String) -> Result<u64> {
+        let id = self.next_request_id;
+        let request = Request::HandoffResumeById { id, session_id };
+        self.next_request_id += 1;
+        self.send_request(request).await?;
+        Ok(id)
+    }
+
     /// Inject externally transcribed text into the active remote TUI session.
     pub async fn send_transcript(
         &mut self,
@@ -1019,6 +1094,16 @@ impl RemoteConnection {
     pub async fn compact(&mut self) -> Result<u64> {
         let id = self.next_request_id;
         let request = Request::Compact { id };
+        self.next_request_id += 1;
+        self.send_request(request).await?;
+        Ok(id)
+    }
+
+    /// Trigger manual deterministic prune on the server (takeaway #6): the
+    /// model-free counterpart to compaction that never summarizes.
+    pub async fn prune(&mut self) -> Result<u64> {
+        let id = self.next_request_id;
+        let request = Request::Prune { id };
         self.next_request_id += 1;
         self.send_request(request).await?;
         Ok(id)
@@ -1553,6 +1638,75 @@ mod tests {
             elapsed
         );
         assert_eq!(remote.next_request_id, 2);
+    }
+
+    #[tokio::test]
+    async fn handoff_list_and_import_send_the_right_wire_requests() {
+        use tokio::io::AsyncBufReadExt;
+
+        let mut remote = RemoteConnection::dummy();
+        let peer = remote.take_dummy_peer().unwrap();
+        let (reader, _writer) = peer.into_split();
+        let mut reader = BufReader::new(reader);
+
+        // handoff_list
+        let list_id = remote.handoff_list().await.unwrap();
+        let mut request = String::new();
+        reader.read_line(&mut request).await.unwrap();
+        let parsed = serde_json::from_str::<Request>(&request).unwrap();
+        assert!(matches!(&parsed, Request::HandoffList { id } if *id == list_id));
+        assert_eq!(parsed.id(), list_id);
+
+        // handoff_import with a payload and disposition
+        let import_id = remote
+            .handoff_import("{\"session_id\":\"src\"}".to_string(), Some("closed".to_string()))
+            .await
+            .unwrap();
+        let mut request = String::new();
+        reader.read_line(&mut request).await.unwrap();
+        let parsed = serde_json::from_str::<Request>(&request).unwrap();
+        assert!(matches!(&parsed, Request::HandoffImport {
+            id, payload, disposition
+        } if *id == import_id
+            && payload == "{\"session_id\":\"src\"}"
+            && disposition.as_deref() == Some("closed")));
+        assert_eq!(parsed.id(), import_id);
+
+        // handoff_apply with a payload and disposition
+        let apply_id = remote
+            .handoff_apply("{\"session_id\":\"src\"}".to_string(), Some("interrupted".to_string()))
+            .await
+            .unwrap();
+        let mut request = String::new();
+        reader.read_line(&mut request).await.unwrap();
+        let parsed = serde_json::from_str::<Request>(&request).unwrap();
+        assert!(matches!(&parsed, Request::HandoffApply {
+            id, payload, disposition
+        } if *id == apply_id
+            && payload == "{\"session_id\":\"src\"}"
+            && disposition.as_deref() == Some("interrupted")));
+        assert_eq!(parsed.id(), apply_id);
+    }
+
+    #[tokio::test]
+    async fn handoff_resume_by_id_sends_the_right_wire_request() {
+        use tokio::io::AsyncBufReadExt;
+
+        let mut remote = RemoteConnection::dummy();
+        let peer = remote.take_dummy_peer().unwrap();
+        let (reader, _writer) = peer.into_split();
+        let mut reader = BufReader::new(reader);
+
+        let resume_id = remote
+            .handoff_resume_by_id("handoff-xyz".to_string())
+            .await
+            .unwrap();
+        let mut request = String::new();
+        reader.read_line(&mut request).await.unwrap();
+        let parsed = serde_json::from_str::<Request>(&request).unwrap();
+        assert!(matches!(&parsed, Request::HandoffResumeById { id, session_id }
+            if *id == resume_id && session_id == "handoff-xyz"));
+        assert_eq!(parsed.id(), resume_id);
     }
 
     #[tokio::test]

@@ -1,8 +1,8 @@
 #![cfg_attr(test, allow(clippy::items_after_test_module))]
 
 use super::{
-    App, DisplayMessage, PendingReloadReconnectStatus, ProcessingStatus, RemoteResumeActivity,
-    SendAction, ctrl_bracket_fallback_to_esc, input, parse_rate_limit_error,
+    App, DisplayMessage, PendingHandoffResume, PendingReloadReconnectStatus, ProcessingStatus,
+    RemoteResumeActivity, SendAction, ctrl_bracket_fallback_to_esc, input, parse_rate_limit_error,
     remote_notifications::present_swarm_notification, spawn_in_new_terminal,
 };
 use crate::bus::BusEvent;
@@ -54,12 +54,13 @@ use workspace::{handle_workspace_command, handle_workspace_navigation_key};
 #[allow(unused_imports)]
 pub(super) use input_dispatch::{
     apply_remote_transcript_event, apply_transcript_event, begin_remote_send,
-    begin_remote_split_launch, finish_remote_split_launch, history_matches_pending_startup_prompt,
-    route_prepared_input_to_new_remote_session, stage_turn_for_remote_tick_loop,
-    submit_prepared_remote_input, submit_remote_slash_input,
+    begin_remote_split_launch, dispatch_intent_command, finish_remote_split_launch,
+    history_matches_pending_startup_prompt, route_prepared_input_to_new_remote_session,
+    stage_turn_for_remote_tick_loop, submit_prepared_remote_input, submit_remote_slash_input,
 };
 pub(super) use key_handling::{
-    handle_remote_char_input, handle_remote_key, handle_remote_key_event, send_interleave_now,
+    handle_remote_char_input, handle_remote_key, handle_remote_key_event, invoke_new_worktree,
+    send_interleave_now,
 };
 pub(super) use server_events::handle_server_event;
 
@@ -85,6 +86,58 @@ pub(super) enum RemoteEventOutcome {
     Continue,
     Reconnect,
     Quit,
+}
+
+/// Apply a user-selected handoff from the `/handoff` overlay. Mirrors the
+/// manual `/handoffres` flow: clear the conversation in place (so the next
+/// message is the first visible one) then set the one-shot handoff resume
+/// override. The clear + arm happen atomically server-side via a single
+/// `handoff_resume_by_id` request (so a transport drop cannot leave the
+/// session cleared but the override unarmed). Returns `Ok(())` (the request was
+/// sent and is now awaited via `HandoffResumed`/`Error`) or `Err(())` (after
+/// pushing an error) so the caller can decide whether the tick consumed input /
+/// needs a redraw.
+pub(super) async fn apply_handoff_resume(
+    app: &mut App,
+    remote: &mut RemoteConnection,
+    request: &PendingHandoffResume,
+) -> Result<(), ()> {
+    match async {
+        // Mirror the manual `/handoffres` flow: reset the local client display
+        // state (queued messages, pasted content, inline images, streaming
+        // panes, swarm plan items, side-panel pages) so the overlay/transcript
+        // does not show the old conversation once the handoff override takes
+        // effect. This is destructive, so it only runs after the request is
+        // successfully sent: a failed send must not discard local state for a
+        // clear+arm that never happened.
+        let request_id = remote
+            .handoff_resume_by_id(request.session_id.clone())
+            .await?;
+        key_handling::clear_session_state_after_discard(app);
+        // The clear+arm is atomic server-side, but the client must not claim
+        // "Handoff ready" until the server acknowledges. Record the in-flight
+        // request so `HandoffResumed` (or a matching `Error`) resolves it; the
+        // status stays honest until the server confirms.
+        app.set_pending_handoff_ack(request_id, request.preview_line.clone());
+        Ok::<(), anyhow::Error>(())
+    }
+    .await
+    {
+        Ok(()) => {
+            app.set_status_notice("Applying handoff…");
+            Ok(())
+        }
+        Err(err) => {
+            app.push_display_message(DisplayMessage::error(format!(
+                "Failed to apply handoff resume: {}",
+                err
+            )));
+            // The selection arm set "Handoff selected"; correct it so the status
+            // does not claim success after a failure.
+            app.set_status_notice("Handoff not applied");
+            Err(())
+        }
+    }
 }
 
 pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) -> bool {
@@ -190,6 +243,13 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
                     )));
                     needs_redraw = true;
                 }
+            }
+        }
+
+        if let Some(request) = app.take_pending_handoff_resume() {
+            match apply_handoff_resume(app, remote, &request).await {
+                Ok(()) => return true,
+                Err(()) => needs_redraw = true,
             }
         }
 
@@ -1004,6 +1064,7 @@ pub(super) fn handle_disconnect(
         }
     }
     app.clear_streaming_render_state();
+    app.clear_pending_handoff_ack();
     app.streaming_tool_calls.clear();
     app.batch_progress = None;
     app.thought_line_inserted = false;

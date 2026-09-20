@@ -1,4 +1,5 @@
 use super::*;
+use crate::handoff::HandoffSnapshot;
 use crate::tui::session_picker::{self, OverlayAction, PickerResult, ResumeTarget, SessionPicker};
 use crate::tui::{
     AccountPickerAction, InlineInteractiveState, PickerAction, PickerEntry, PickerKind,
@@ -2456,6 +2457,104 @@ impl App {
         self.start_session_picker_load();
     }
 
+    /// Open the interactive `/handoff` overlay: the session picker re-fed from
+    /// the saved handoff store so the user can arrow-key through snapshots and
+    /// pick one to resume. Unlike the plain text listing, each snapshot's open
+    /// todos are shown in the preview pane, and Enter queues a handoff resume.
+    pub(super) fn open_handoff_picker(&mut self) {
+        if super::commands_dispatch::ssh_local_action_blocked(self, "Local handoff picker") {
+            return;
+        }
+        let snapshots = crate::handoff::list_all_handoffs();
+        self.open_handoff_picker_with(snapshots);
+    }
+
+    /// Open the `/handoff` overlay with an explicit snapshot set. Used by the
+    /// remote/SSH path where the snapshots come from the connected *server*'s
+    /// store rather than the client host's local store. Empty input shows the
+    /// standard "no saved handoffs" message.
+    pub(super) fn open_handoff_picker_with(&mut self, snapshots: Vec<HandoffSnapshot>) {
+        if snapshots.is_empty() {
+            self.push_display_message(DisplayMessage::system(
+                "No saved handoffs on the server. A handoff is captured when a session ends with unfinished work; once one exists, run /handoff to pick it.".to_string(),
+            ));
+            return;
+        }
+        let picker = session_picker::SessionPicker::for_handoffs(snapshots);
+        self.session_picker_overlay = Some(RefCell::new(picker));
+        self.session_picker_mode = SessionPickerMode::Handoff;
+        self.set_status_notice("Select a handoff to resume (Esc to cancel)");
+    }
+
+    /// Queue a handoff resume so the async pump can apply it (clear the current
+    /// conversation, then set the handoff resume override on the remote).
+    pub(super) fn queue_handoff_resume(&mut self, session_id: String, preview_line: String) {
+        self.pending_handoff_resume = Some(PendingHandoffResume {
+            session_id,
+            preview_line,
+        });
+    }
+
+    pub(super) fn take_pending_handoff_resume(&mut self) -> Option<PendingHandoffResume> {
+        self.pending_handoff_resume.take()
+    }
+
+    /// Record an in-flight `handoff_list` request whose `HandoffListed` reply
+    /// should open the `/handoff` overlay from the server's store.
+    pub(super) fn set_pending_remote_handoff_list(&mut self, request_id: u64) {
+        self.pending_remote_handoff_list = Some(PendingRemoteHandoffList { request_id });
+    }
+
+    /// Consume the pending remote handoff list request if its id matches the
+    /// reply that just arrived, returning whether the picker should open now.
+    pub(super) fn take_pending_remote_handoff_list(
+        &mut self,
+        request_id: u64,
+    ) -> Option<PendingRemoteHandoffList> {
+        // Only consume when this is the request we are waiting on; a stale or
+        // unrelated `HandoffListed` for another request is not ours to open.
+        if self
+            .pending_remote_handoff_list
+            .as_ref()
+            .is_some_and(|pending| pending.request_id == request_id)
+        {
+            self.pending_remote_handoff_list.take()
+        } else {
+            None
+        }
+    }
+
+    /// Record an in-flight `handoff_resume_by_id` whose `HandoffResumed` reply
+    /// should surface "Handoff ready".
+    pub(super) fn set_pending_handoff_ack(&mut self, request_id: u64, preview_line: String) {
+        self.pending_handoff_ack = Some(PendingHandoffAck {
+            request_id,
+            preview_line,
+        });
+    }
+
+    /// Consume the pending handoff resume acknowledgement if its request id
+    /// matches the reply that just arrived, returning whether the client is
+    /// still awaiting that specific handoff.
+    pub(super) fn take_pending_handoff_ack(&mut self, request_id: u64) -> Option<PendingHandoffAck> {
+        if self
+            .pending_handoff_ack
+            .as_ref()
+            .is_some_and(|pending| pending.request_id == request_id)
+        {
+            self.pending_handoff_ack.take()
+        } else {
+            None
+        }
+    }
+
+    /// Clear any outstanding handoff ack (e.g. on disconnect) without showing a
+    /// success or failure, so the client does not claim "Handoff ready" for a
+    /// request whose outcome was lost.
+    pub(super) fn clear_pending_handoff_ack(&mut self) {
+        self.pending_handoff_ack = None;
+    }
+
     /// Open the active sessions manager: the session picker scoped to live
     /// (open) sessions, showing which are still working on a response and
     /// which are ready for input. Reached via Left arrow on an empty input
@@ -2564,6 +2663,9 @@ impl App {
                     "Active sessions loaded"
                 }
                 SessionPickerMode::Onboarding => return false,
+                // The handoff overlay is populated synchronously from the saved
+                // handoff store and never flows through this async load path.
+                SessionPickerMode::Handoff => return false,
             };
             self.set_status_notice(notice);
             return true;
@@ -2598,6 +2700,9 @@ impl App {
             // Onboarding constructs its action-only picker synchronously, so it
             // never flows through this async path.
             SessionPickerMode::Onboarding => false,
+            // Likewise the handoff overlay is populated synchronously from the
+            // saved handoff store, so it never flows through this async path.
+            SessionPickerMode::Handoff => false,
         }
     }
 
@@ -3116,6 +3221,15 @@ impl App {
                         self.onboarding_start_recent_project_review();
                         return Ok(());
                     }
+                    // Handoff selection is impossible in onboarding mode (the
+                    // handoff overlay runs in `SessionPickerMode::Handoff`), so
+                    // treat it as a defensive no-op close.
+                    PickerResult::HandoffSelected(_) => {
+                        self.session_picker_overlay = None;
+                        self.session_picker_mode = SessionPickerMode::Resume;
+                        self.onboarding_show_suggestions();
+                        return Ok(());
+                    }
                 };
                 self.session_picker_overlay = None;
                 self.session_picker_mode = SessionPickerMode::Resume;
@@ -3162,6 +3276,16 @@ impl App {
                 // close defensively without launching a proactive turn.
                 self.session_picker_overlay = None;
                 self.session_picker_mode = SessionPickerMode::Resume;
+            }
+            OverlayAction::Selected(PickerResult::HandoffSelected(session_id)) => {
+                self.session_picker_overlay = None;
+                self.session_picker_mode = SessionPickerMode::Resume;
+                self.set_status_notice("Handoff selected");
+                // Compute the headline (intent) the same way `/handoffres` does,
+                // and queue it so the async pump can apply the override once the
+                // remote is available.
+                let preview_line = super::commands::handoff_headline(&session_id);
+                self.queue_handoff_resume(session_id, preview_line);
             }
         }
         Ok(())

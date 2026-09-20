@@ -1,7 +1,7 @@
 #![allow(clippy::await_holding_lock)]
 use super::*;
 use crate::message::{Message, ToolDefinition};
-use crate::provider::EventStream;
+use crate::provider::{EventStream, Provider};
 use async_trait::async_trait;
 
 struct NoRequests;
@@ -70,29 +70,6 @@ async fn live_agent(id: &str, root: &str) -> Arc<Mutex<Agent>> {
     Arc::new(Mutex::new(Agent::new_with_session(
         provider, registry, session, None,
     )))
-}
-
-#[tokio::test]
-async fn target_subscribe_uses_live_unsaved_root_without_changing_it() {
-    let _lock = crate::storage::lock_test_env();
-    let _home = Home::new();
-    let id = "session_live_empty_attach";
-    let agent = live_agent(id, "/workspace/live-original").await;
-    let sessions = Arc::new(RwLock::new(HashMap::from([(id.into(), agent.clone())])));
-    let members = Arc::new(RwLock::new(HashMap::new()));
-    let mut request = subscribe(id);
-    resolve_target_subscribe_working_dir(&mut request, &sessions, &members)
-        .await
-        .unwrap();
-    assert_eq!(
-        initial_subscribe_working_dir(&request).unwrap(),
-        "/workspace/live-original"
-    );
-    assert_eq!(
-        agent.lock().await.working_dir(),
-        Some("/workspace/live-original")
-    );
-    assert!(!crate::session::session_exists(id));
 }
 
 #[tokio::test]

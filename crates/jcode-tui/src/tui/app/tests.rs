@@ -60,6 +60,7 @@ include!("tests/skill_invocation_multi_word.rs");
 include!("tests/prompt_history_cross_session.rs");
 include!("tests/ssh_remote.rs");
 include!("tests/skill_startup.rs");
+include!("tests/background_running_projection.rs");
 #[test]
 fn kv_cache_signature_prefix_match_allows_appended_messages() {
     let baseline_messages = vec![
@@ -158,6 +159,62 @@ fn kv_cache_signature_ignores_non_transmitted_message_metadata() {
         App::kv_cache_common_prefix_messages(&current, &baseline),
         baseline_messages.len(),
         "the whole prior request should still count as a common prefix"
+    );
+}
+
+/// Defense-in-depth: even if the cache-relevant signature is computed from
+/// `Message::with_timestamps`-decorated messages (as some callers do, and as
+/// the projection tolerates), a re-timestamped `[<rfc3339>]` user text tag must
+/// not break the prefix. This targets the recurring `harness:_prefix_changed`
+/// false-positive class: an already-sent *user* message whose `timestamp` is
+/// re-backfilled / re-serialized with a slightly later value on the next turn.
+/// `with_timestamps` bakes the timestamp into the text as `[<rfc3339>] `, so the
+/// cache-relevant projection must strip that derived tag exactly as it already
+/// strips the struct-level `timestamp` field, otherwise the same byte-identical
+/// payload hashes differently across turns. (The production TUI path
+/// `turn.rs` hashes the raw provider messages before with_timestamps; this test
+/// drives the signature directly with decorated input to lock the strip
+/// backstop in.)
+#[test]
+fn kv_cache_signature_ignores_re_derived_user_timestamp_text_tag() {
+    use crate::message::{Message, Role};
+
+    // Baseline turn: a user message committed with timestamp T1.
+    let base_ts = chrono::Utc::now();
+    let mut baseline = vec![Message {
+        role: Role::User,
+        content: vec![crate::message::ContentBlock::Text {
+            text: "build the thing".to_string(),
+            cache_control: None,
+        }],
+        timestamp: Some(base_ts),
+        tool_duration_ms: None,
+    }];
+    baseline.push(Message::assistant_text("ok"));
+    let baseline = crate::message::Message::with_timestamps(&baseline);
+
+    // Next turn: same message, but re-backfilled with a slightly later
+    // timestamp (mirrors the confirmed memory-injection instance and any
+    // reconstruct-on-load path), then a legitimate appended user turn.
+    let mut current_messages = vec![Message {
+        role: Role::User,
+        content: vec![crate::message::ContentBlock::Text {
+            text: "build the thing".to_string(),
+            cache_control: None,
+        }],
+        timestamp: Some(base_ts + chrono::Duration::seconds(5)),
+        tool_duration_ms: None,
+    }];
+    current_messages.push(Message::assistant_text("ok"));
+    current_messages.push(Message::user("follow up"));
+    let current = crate::message::Message::with_timestamps(&current_messages);
+
+    let baseline_sig = App::kv_cache_request_signature(&baseline, &[], "system", "");
+    let current_sig = App::kv_cache_request_signature(&current, &[], "system", "");
+
+    assert!(
+        App::kv_cache_signatures_prefix_match(&current_sig, &baseline_sig),
+        "re-derived user-message timestamp must not break the cache prefix under with_timestamps"
     );
 }
 
@@ -360,6 +417,200 @@ fn harness_caused_kv_cache_miss_pushes_in_chat_alarm() {
         "{alarm:?}"
     );
     assert!(alarm.content.contains("50K"), "{alarm:?}");
+}
+
+/// End-to-end acceptance through the real alarm pipeline
+/// (`begin_kv_cache_request` -> `record_completed_stream_cache_usage` ->
+/// `classify_kv_cache_miss_reason` -> `maybe_push_kv_cache_miss_notice`).
+///
+/// 1. A *metadata-only* re-timestamp of an already-sent user message must NOT
+///    raise the `harness: prefix changed` alarm: after the fix the cache-relevant
+///    projection strips the derived `[<timestamp>]` text tag, so the prefix hash
+///    is unchanged even with `Message::with_timestamps` in the loop.
+/// 2. A *real* content edit of an earlier message must STILL raise the alarm, so
+///    the fix does not hide genuine harness bugs.
+#[test]
+fn re_timestamped_user_message_does_not_alarm_but_real_edit_does() {
+    use crate::message::{ContentBlock, Message, Role};
+    let _invalidation_guard = crate::storage::lock_test_env();
+    crate::provider::anthropic::set_cache_ttl_1h(true);
+    crate::cache_invalidation::clear_for_tests();
+
+    let t0 = chrono::Utc::now() - chrono::Duration::seconds(60);
+
+    let user_msg_at = |text: &str, ts: chrono::DateTime<chrono::Utc>| Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: text.to_string(),
+            cache_control: None,
+        }],
+        timestamp: Some(ts),
+        tool_duration_ms: None,
+    };
+
+    // --- Scenario A: metadata-only re-timestamp must NOT alarm.
+    let baseline_msgs = vec![user_msg_at("build the thing", t0), Message::assistant_text("ok")];
+    // Next turn: same payload, but the earlier message is re-serialized with a
+    // later timestamp, plus a legitimate appended user turn.
+    let current_msgs = vec![
+        user_msg_at("build the thing", t0 + chrono::Duration::seconds(5)),
+        Message::assistant_text("ok"),
+        Message::user("follow up"),
+    ];
+    let baseline_sig =
+        App::kv_cache_request_signature(&baseline_msgs, &[], "system", "");
+    let current_sig = App::kv_cache_request_signature(&current_msgs, &[], "system", "");
+    // Guard: the prefix must still match (this is what the fix guarantees).
+    assert!(App::kv_cache_signatures_prefix_match(&current_sig, &baseline_sig));
+
+    let mut app = create_test_app();
+    crate::provider::anthropic::set_cache_ttl_1h(true);
+    let session_id = app.kv_cache_session_id();
+    app.kv_cache.kv_cache_baseline = Some(KvCacheBaseline {
+        session_id,
+        cache_generation: app.kv_cache.cache_generation,
+        input_tokens: 50_000,
+        completed_at: Instant::now(),
+        provider: app.kv_cache_provider_name(),
+        model: app.kv_cache_provider_model(),
+        upstream_provider: None,
+        signature: Some(baseline_sig.clone()),
+    });
+    // Drive the real pipeline with the RAW provider messages, exactly as
+    // `turn.rs` does (it calls begin_kv_cache_request on `provider_messages`
+    // before with_timestamps). The cache-relevant projection strips the
+    // volatile metadata, so the signature matches the raw baseline.
+    app.begin_kv_cache_request(&current_msgs, &[], "system", "");
+    app.streaming.streaming_input_tokens = 50_000;
+    app.streaming.streaming_cache_read_tokens = Some(0);
+    app.streaming.streaming_cache_creation_tokens = Some(50_000);
+    app.kv_cache.current_api_usage_recorded = false;
+    app.record_completed_stream_cache_usage();
+
+    assert!(
+        !app
+            .display_messages()
+            .iter()
+            .any(|m| m.role == "system" && m.content.contains("KV cache miss")),
+        "metadata-only re-timestamp must not raise the prefix-changed alarm"
+    );
+
+    // --- Scenario B: a real content edit of an earlier message must STILL alarm.
+    let mut app = create_test_app();
+    crate::provider::anthropic::set_cache_ttl_1h(true);
+    let edited_current = vec![
+        user_msg_at("build the thing DIFFERENTLY", t0 + chrono::Duration::seconds(5)),
+        Message::assistant_text("ok"),
+        Message::user("follow up"),
+    ];
+    let edited_sig = App::kv_cache_request_signature(&edited_current, &[], "system", "");
+    assert!(!App::kv_cache_signatures_prefix_match(&edited_sig, &baseline_sig));
+
+    let session_id = app.kv_cache_session_id();
+    app.kv_cache.kv_cache_baseline = Some(KvCacheBaseline {
+        session_id,
+        cache_generation: app.kv_cache.cache_generation,
+        input_tokens: 50_000,
+        completed_at: Instant::now(),
+        provider: app.kv_cache_provider_name(),
+        model: app.kv_cache_provider_model(),
+        upstream_provider: None,
+        signature: Some(baseline_sig),
+    });
+    // Scenario B path: real edit, fed as raw provider messages (matching turn.rs).
+    app.begin_kv_cache_request(&edited_current, &[], "system", "");
+    app.streaming.streaming_input_tokens = 50_000;
+    app.streaming.streaming_cache_read_tokens = Some(0);
+    app.streaming.streaming_cache_creation_tokens = Some(50_000);
+    app.kv_cache.current_api_usage_recorded = false;
+    app.record_completed_stream_cache_usage();
+
+    let alarm = app
+        .display_messages()
+        .iter()
+        .find(|m| m.role == "system" && m.content.contains("KV cache miss"))
+        .expect("a real content edit must still raise the prefix-changed alarm");
+    assert!(alarm.content.contains("prefix changed"), "{alarm:?}");
+}
+
+/// Cross-path consistency: the TUI local request path hashes via `stable_hash_json`
+/// over `cache_relevant_message_value`, while the server/headless path uses
+/// `jcode_message_types::cache_relevant_message_hashes`. The two must agree on
+/// the per-message hash for the SAME message, or remote sessions could report
+/// false `harness: prefix changed` misses (the doc comment on the projection warns
+/// about exactly this drift). Regression only needs to hold for a re-timestamped
+/// message (the metadata class this fix targets) as well as plain messages.
+#[test]
+fn local_and_server_message_hashing_agree_on_cache_projection() {
+    use crate::message::{ContentBlock, Message, Role};
+    let t0 = chrono::Utc::now();
+
+    let msg = |text: &str, ts: chrono::DateTime<chrono::Utc>| Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: text.to_string(),
+            cache_control: None,
+        }],
+        timestamp: Some(ts),
+        tool_duration_ms: None,
+    };
+
+    let cases: Vec<Vec<Message>> = vec![
+        // Plain message list.
+        vec![msg("hello", t0), Message::assistant_text("hi")],
+        // Re-timestamped earlier user message (the fix's target class).
+        vec![
+            msg("build the thing", t0 + chrono::Duration::seconds(5)),
+            Message::assistant_text("ok"),
+            Message::user("follow up"),
+        ],
+        // Contains a tool-result user message with a timing tag.
+        Message::with_timestamps(&[Message::tool_result_with_duration(
+            "tc-1",
+            "ls output",
+            false,
+            Some(1234),
+        )]),
+        // A user message whose GENUINE content begins with an RFC3339-shaped
+        // bracketed tag. The local TUI path hashes the raw message (the
+        // projection strips the leading timestamp-shaped tag), and the server
+        // now also hashes raw `cache_signature_messages` rather than the
+        // with_timestamps-decorated copy, so the two must still agree here.
+        // Previously the server fed decorated input that preserved the genuine
+        // tag while the local stripped it, causing a per-message hash split.
+        vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "[2026-01-01T00:00:00.000Z] start the build".to_string(),
+                cache_control: None,
+            }],
+            timestamp: Some(t0),
+            tool_duration_ms: None,
+        }],
+        // A text block carrying an ephemeral cache_control breakpoint marker.
+        // The projection removes cache_control from text blocks, so both paths
+        // must still hash identically even when this volatile marker is present.
+        vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "with breakpoint marker".to_string(),
+                cache_control: Some(crate::message::CacheControl::ephemeral(Some(
+                    "5m".to_string(),
+                ))),
+            }],
+            timestamp: Some(t0),
+            tool_duration_ms: None,
+        }],
+    ];
+
+    for messages in cases {
+        let local = message_hashes(&messages);
+        let server = crate::message::cache_relevant_message_hashes(&messages);
+        assert_eq!(
+            local, server,
+            "TUI local and server path must produce identical cache-relevant message hashes"
+        );
+    }
 }
 
 #[test]

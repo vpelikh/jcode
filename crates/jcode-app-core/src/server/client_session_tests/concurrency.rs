@@ -80,23 +80,15 @@ async fn restore_for_concurrency_test(
         &Arc::new(RwLock::new(HashMap::new())),
         &connections,
         &Arc::new(RwLock::new(ClientDebugState::default())),
-        &Arc::new(RwLock::new(HashMap::new())),
-        &Arc::new(RwLock::new(HashMap::new())),
-        &FileTouchService::new(),
-        &Arc::new(RwLock::new(HashMap::new())),
-        &Arc::new(RwLock::new(HashMap::new())),
-        &Arc::new(RwLock::new(HashMap::new())),
-        &Arc::new(RwLock::new(HashMap::new())),
+        &crate::server::test_util::TestSwarmBuilder::default()
+            .swarm_event_tx(swarm_event_tx.clone())
+            .build(),
         &Arc::new(RwLock::new(1)),
         &writer,
         "test-server",
         "test",
         &client_event_tx,
         &Arc::new(crate::mcp::SharedMcpPool::from_default_config()),
-        &Arc::new(RwLock::new(VecDeque::new())),
-        &Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        &swarm_event_tx,
-        false,
     )
     .await
 }

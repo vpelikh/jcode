@@ -24,6 +24,29 @@ struct DelayedProvider {
 
 struct NativeAutoCompactionProvider;
 
+struct HandoffFailureProvider;
+
+#[async_trait]
+impl Provider for HandoffFailureProvider {
+    async fn complete(
+        &self,
+        _: &[Message],
+        _: &[ToolDefinition],
+        _: &str,
+        _: Option<&str>,
+    ) -> Result<EventStream> {
+        anyhow::bail!("stop after persisting input")
+    }
+
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(Self)
+    }
+}
+
 struct NativeCompactionStreamProvider;
 
 #[derive(Clone, Default)]
@@ -458,7 +481,7 @@ fn tool_output_to_content_blocks_preserves_labeled_images() {
             content,
             is_error,
         } => {
-            assert_eq!(tool_use_id, "call_1");
+            assert_eq!(tool_use_id.as_str(), "call_1");
             assert_eq!(content, "Image ready");
             assert_eq!(*is_error, None);
         }
@@ -881,6 +904,539 @@ async fn messages_for_provider_applies_manual_compaction_in_native_auto_mode() {
 
 // ── InterruptSignal tests ────────────────────────────────────────────────
 
+/// With `[compaction] physically_consolidate = true`, a completed manual (soft)
+/// compaction must PHYSICALLY consolidate the transcript through the
+/// log-bracketed seam (deepseek-harness takeaway #5): `session.messages`
+/// becomes `[summary_message, recent_tail...]`, the persisted compaction state
+/// is flagged `physically_consolidated`, and the compaction manager is marked
+/// physically consolidated so the next provider view is NOT double-summarized.
+#[tokio::test]
+async fn manual_compaction_physically_consolidates_transcript_when_enabled() {
+    let _guard = crate::storage::lock_test_env();
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-phys-compact-")
+        .tempdir()
+        .expect("temp home");
+    std::fs::write(
+        temp_home.path().join("config.toml"),
+        "[compaction]\nphysically_consolidate = true\n",
+    )
+    .expect("write config");
+    crate::env::set_var("JCODE_HOME", temp_home.path());
+    crate::config::Config::invalidate_cache();
+
+    let provider: Arc<dyn Provider> = Arc::new(PruneAccountingStreamProvider { context: 20_000 });
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // Drive the transcript well past the compaction threshold so the manager
+    // will actually compact on request.
+    for i in 0..40 {
+        agent.add_message(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: format!("turn {i} {}", "x".repeat(400)),
+                cache_control: None,
+            }],
+        );
+    }
+
+    let (started, ok) = agent.request_manual_compaction();
+    assert!(ok, "manual compaction should start: {started}");
+
+    // Poll for the compaction completion event.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut seen = false;
+    while std::time::Instant::now() < deadline {
+        let (_, maybe_event) = agent.messages_for_provider();
+        if maybe_event.is_some() {
+            seen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(seen, "manual compaction event should have been applied");
+
+    let comp = agent
+        .session
+        .compaction
+        .as_ref()
+        .expect("compaction state must be set");
+    assert!(
+        comp.physically_consolidated,
+        "compaction state must be physically consolidated"
+    );
+
+    // The session transcript must now physically hold [summary, recent_tail...],
+    // NOT the full 40-message transcript.
+    assert!(
+        agent.session.messages.len() < 40,
+        "transcript must be physically consolidated (summary + tail), got {} messages",
+        agent.session.messages.len()
+    );
+    let first = &agent.session.messages[0];
+    let is_summary = first.content.iter().any(|b| match b {
+        ContentBlock::Text { text, .. } => text.contains("Previous Conversation Summary"),
+        _ => false,
+    });
+    assert!(
+        is_summary,
+        "transcript[0] must be the physically-carried summary message"
+    );
+
+    // The log must hold a balanced bracket (each CompactionStart matched by a
+    // CompactionEnd), which is what replay uses.
+    let log = agent.session.event_log();
+    let starts = log
+        .iter()
+        .filter(|e| matches!(&e.op, crate::session::SessionEventOp::CompactionStart { .. }))
+        .count();
+    let ends = log
+        .iter()
+        .filter(|e| matches!(&e.op, crate::session::SessionEventOp::CompactionEnd { .. }))
+        .count();
+    assert_eq!(
+        starts, ends,
+        "bracket must be balanced (starts={starts}, ends={ends})"
+    );
+    assert!(
+        starts >= 1,
+        "physical consolidation must have recorded a CompactionStart bracket"
+    );
+    agent
+        .session
+        .rederive_all_checked()
+        .expect("physically consolidated session must be internally consistent");
+
+    // The compaction manager must be marked physically consolidated so a
+    // subsequent provider rebuild does not double-prepend the summary.
+    let compaction_registry = agent.registry.compaction();
+    let manager = compaction_registry.read().await;
+    assert!(
+        manager.is_physically_consolidated(),
+        "compaction manager must be marked physically consolidated"
+    );
+    assert_eq!(
+        manager.compacted_count(),
+        0,
+        "physical manager must have zero live skip offset"
+    );
+    drop(manager);
+
+    // A provider view derived after consolidation must NOT carry a duplicate
+    // synthetic "Previous Conversation Summary" prefix beyond the physical one.
+    let view = agent.provider_messages();
+    let summary_blocks = view
+        .iter()
+        .filter(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text, .. } if text.contains("Previous Conversation Summary")))
+        })
+        .count();
+    assert_eq!(
+        summary_blocks, 1,
+        "exactly one summary message must be present in the provider view"
+    );
+
+    // Restore the previous JCODE_HOME and config cache.
+    if let Some(previous) = prev_home {
+        crate::env::set_var("JCODE_HOME", previous);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    crate::config::Config::invalidate_cache();
+}
+
+#[tokio::test]
+async fn degradation_mitigation_triggers_compaction_once_on_compact_rung() {
+    // Confirm the degradation tracker's Compact rung drives a single
+    // compaction through the agent mitigation checkpoint (Slice 3), and that
+    // the action is one-shot per escalation cycle.
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // Give the compaction manager transcript material so a compaction request
+    // actually succeeds (mirrors the manual-compaction test setup).
+    for i in 0..30 {
+        agent.add_message(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: format!("turn {i} {}", "x".repeat(120)),
+                cache_control: None,
+            }],
+        );
+    }
+
+    // Fresh tracker is healthy: no mitigation fires.
+    assert!(
+        agent.maybe_mitigate_degradation().is_none(),
+        "healthy tracker must not mitigate"
+    );
+
+    // Push past the Compact rung (default config promotes at 2 stalls).
+    agent
+        .degradation
+        .record_stall(crate::agent::degradation::StallKind::StalledPromise);
+    agent
+        .degradation
+        .record_stall(crate::agent::degradation::StallKind::StalledPromise);
+    assert_eq!(agent.degradation.rung(), crate::agent::degradation::Rung::Compact);
+
+    // First mitigation call triggers compaction and returns a notice.
+    let notice = agent.maybe_mitigate_degradation();
+    assert!(notice.is_some(), "compact rung should trigger a mitigation notice");
+
+    // Second call is a no-op (compact already acknowledged, one-shot). Even
+    // though the first compaction may still be applying in the background, the
+    // pending flag is consumed, so we must not re-fire on the same cycle.
+    assert!(
+        agent.maybe_mitigate_degradation().is_none(),
+        "compact mitigation must fire only once per cycle"
+    );
+}
+
+#[tokio::test]
+async fn degradation_route_fallback_gating_escalates_or_switches() {
+    // Consolidated gating test. The disabled and enabled paths both depend on
+    // crate::config::config(). We control them via the DEDICATED degradation
+    // env vars (JCODE_DEGRADATION_ROUTE_FALLBACK / JCODE_DEGRADATION_FALLBACK_MODEL),
+    // which apply_env_overrides applies on every config load and which no other
+    // test sets. Unlike writing config.toml + JCODE_HOME (shared across parallel
+    // config tests), env-var control is deterministic even when another test
+    // concurrently rewrites JCODE_HOME, because the env override wins over the
+    // config file. The scenarios run sequentially so the env is re-set before
+    // each.
+    let prev_enabled = std::env::var_os("JCODE_DEGRADATION_ROUTE_FALLBACK");
+    let prev_model = std::env::var_os("JCODE_DEGRADATION_FALLBACK_MODEL");
+
+    let set_fallback = |enabled: bool, model: Option<&str>| {
+        crate::env::set_var("JCODE_DEGRADATION_ROUTE_FALLBACK", if enabled { "1" } else { "0" });
+        match model {
+            Some(model) => crate::env::set_var("JCODE_DEGRADATION_FALLBACK_MODEL", model),
+            None => crate::env::remove_var("JCODE_DEGRADATION_FALLBACK_MODEL"),
+        }
+        crate::config::Config::invalidate_cache();
+    };
+
+    // Scenario A: disabled (explicit). Reaching RouteFallback must escalate and
+    // NOT switch the model.
+    set_fallback(false, None);
+    let disabled_provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let mut disabled_agent = Agent::new(
+        Arc::clone(&disabled_provider),
+        Registry::new(disabled_provider.clone()).await,
+    );
+    for _ in 0..2 {
+        disabled_agent
+            .degradation
+            .record_stall(crate::agent::degradation::StallKind::StalledPromise);
+    }
+    disabled_agent.degradation.acknowledge_compact();
+    disabled_agent
+        .degradation
+        .record_stall(crate::agent::degradation::StallKind::StalledPromise);
+    assert_eq!(
+        disabled_agent.degradation.rung(),
+        crate::agent::degradation::Rung::RouteFallback
+    );
+    let notice = disabled_agent.maybe_mitigate_degradation();
+    assert!(notice.is_some(), "disabled fallback should surface a notice");
+    assert!(
+        notice.as_deref().unwrap().contains("disabled"),
+        "disabled notice should say fallback is disabled: {:?}",
+        notice
+    );
+    assert_eq!(
+        disabled_agent.degradation.rung(),
+        crate::agent::degradation::Rung::Escalated,
+        "disabled fallback must escalate, not switch the model"
+    );
+
+    // Scenario B: enabled with a fallback model. Reaching RouteFallback
+    // switches the provider onto the fallback and resets the cycle.
+    set_fallback(true, Some("deepseek/deepseek-v3@deepseek"));
+    let enabled_provider = Arc::new(ExplicitPinProvider::new("deepseek/deepseek-v4-flash@deepseek"));
+    let enabled_provider_dyn: Arc<dyn Provider> = enabled_provider.clone();
+    let mut enabled_agent = Agent::new(
+        Arc::clone(&enabled_provider_dyn),
+        Registry::new(enabled_provider_dyn).await,
+    );
+    for _ in 0..2 {
+        enabled_agent
+            .degradation
+            .record_stall(crate::agent::degradation::StallKind::StalledPromise);
+    }
+    enabled_agent.degradation.acknowledge_compact();
+    enabled_agent
+        .degradation
+        .record_stall(crate::agent::degradation::StallKind::StalledPromise);
+    assert_eq!(
+        enabled_agent.degradation.rung(),
+        crate::agent::degradation::Rung::RouteFallback
+    );
+    let gen_before = enabled_agent.provider_model_selection_generation();
+    let notice = enabled_agent.maybe_mitigate_degradation();
+    assert!(notice.is_some(), "configured fallback should produce a notice");
+    assert!(
+        notice.as_deref().unwrap().contains("switched route"),
+        "notice should confirm the route switch: {:?}",
+        notice
+    );
+    assert_eq!(
+        enabled_provider.model(),
+        "deepseek/deepseek-v3",
+        "provider model should switch to the configured fallback"
+    );
+    assert!(
+        !enabled_agent.user_selected_provider_model_after(gen_before),
+        "an automatic route fallback must NOT be recorded as a user model choice"
+    );
+    assert_eq!(
+        enabled_agent.degradation.rung(),
+        crate::agent::degradation::Rung::Healthy,
+        "a successful fallback resets the escalation cycle"
+    );
+
+    // Scenario C: compaction unsupported (ExplicitPinProvider) + fallback
+    // disabled. Reaching the Compact rung must NOT silently spin; it escalates
+    // promptly to the decision point, which with fallback disabled surfaces to
+    // the user (Escalated) rather than stalling at Compact forever.
+    set_fallback(false, None);
+    let no_compact_provider: Arc<dyn Provider> =
+        Arc::new(ExplicitPinProvider::new("some-model"));
+    let mut no_compact_agent = Agent::new(
+        Arc::clone(&no_compact_provider),
+        Registry::new(no_compact_provider).await,
+    );
+    for _ in 0..2 {
+        no_compact_agent
+            .degradation
+            .record_stall(crate::agent::degradation::StallKind::StalledPromise);
+    }
+    assert_eq!(
+        no_compact_agent.degradation.rung(),
+        crate::agent::degradation::Rung::Compact
+    );
+    let notice = no_compact_agent.maybe_mitigate_degradation();
+    assert!(
+        notice.is_some(),
+        "unsupported compaction should surface a notice"
+    );
+    assert_eq!(
+        no_compact_agent.degradation.rung(),
+        crate::agent::degradation::Rung::Escalated,
+        "unsupported compaction + disabled fallback must escalate to the user"
+    );
+
+    // Restore the process env so we do not leak these overrides into other tests.
+    match prev_enabled {
+        Some(v) => crate::env::set_var("JCODE_DEGRADATION_ROUTE_FALLBACK", v),
+        None => crate::env::remove_var("JCODE_DEGRADATION_ROUTE_FALLBACK"),
+    }
+    match prev_model {
+        Some(v) => crate::env::set_var("JCODE_DEGRADATION_FALLBACK_MODEL", v),
+        None => crate::env::remove_var("JCODE_DEGRADATION_FALLBACK_MODEL"),
+    }
+    crate::config::Config::invalidate_cache();
+}
+
+#[tokio::test]
+async fn degradation_tracker_resets_on_model_switch() {
+    // The tracker is keyed by route, set once at construction. A mid-session
+    // model switch must reset the escalation cycle so the new route starts
+    // healthy instead of inheriting the previous model's stall history.
+    let provider = Arc::new(ExplicitPinProvider::new("model-a"));
+    let provider_dyn: Arc<dyn Provider> = provider.clone();
+    let mut agent = Agent::new(
+        Arc::clone(&provider_dyn),
+        Registry::new(provider_dyn).await,
+    );
+
+    // Escalate the tracker on the original route.
+    for _ in 0..3 {
+        agent
+            .degradation
+            .record_stall(crate::agent::degradation::StallKind::StalledPromise);
+    }
+    assert_eq!(
+        agent.degradation.rung(),
+        crate::agent::degradation::Rung::Compact
+    );
+
+    // Switch to a new model: the escalation cycle must reset.
+    agent.set_model("model-b").expect("model switch should succeed");
+    assert_eq!(
+        agent.degradation.rung(),
+        crate::agent::degradation::Rung::Healthy,
+        "a model switch must reset the degradation cycle"
+    );
+    assert_eq!(
+        agent.degradation.stall_count(),
+        0,
+        "a model switch must clear stale stall history"
+    );
+}
+
+#[tokio::test]
+async fn successful_compaction_resets_degradation_rung() {
+    // A compaction that is actually APPLIED (not merely requested) is the
+    // Compact-rung mitigation. Per the plan's ladder (L2 recovered -> Idle), a
+    // successful compaction must reset the route-scoped tracker so the session
+    // does not stay primed to escalate to RouteFallback (a model switch) on the
+    // very next minor stall. Since stalls now accumulate per turn, the missing
+    // reset would otherwise surface far more often.
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // Push past Compact and consume the one-shot pending flag, as the turn loop
+    // mitigation checkpoint would.
+    agent
+        .degradation
+        .record_stall(crate::agent::degradation::StallKind::StalledPromise);
+    agent
+        .degradation
+        .record_stall(crate::agent::degradation::StallKind::StalledPromise);
+    assert_eq!(agent.degradation.rung(), crate::agent::degradation::Rung::Compact);
+    agent.degradation.acknowledge_compact();
+
+    // Applying a compaction resets the cycle back to Healthy.
+    agent.note_compaction_applied();
+    assert_eq!(
+        agent.degradation.rung(),
+        crate::agent::degradation::Rung::Healthy,
+        "a successful compaction must reset the degradation rung to Healthy"
+    );
+    assert_eq!(
+        agent.degradation.stall_count(),
+        0,
+        "a successful compaction must clear stale stall history"
+    );
+    assert!(
+        !agent.degradation.compact_pending(),
+        "a successful compaction leaves nothing pending"
+    );
+
+    // The reset must RE-ARM detection, not disable it: if the model keeps
+    // degrading after a (compacted) recovery, fresh stalls must accumulate from
+    // Healthy again until Compact — otherwise the reset would silently turn off
+    // the mitigation ladder.
+    agent
+        .degradation
+        .record_stall(crate::agent::degradation::StallKind::StalledPromise);
+    agent
+        .degradation
+        .record_stall(crate::agent::degradation::StallKind::StalledPromise);
+    assert_eq!(
+        agent.degradation.rung(),
+        crate::agent::degradation::Rung::Compact,
+        "degradation detection must re-arm and re-reach Compact after a successful compaction reset"
+    );
+    assert_eq!(
+        agent.degradation.stall_count(),
+        2,
+        "two fresh stalls must be counted after the reset"
+    );
+}
+
+#[tokio::test]
+async fn compaction_apply_does_not_clear_terminal_escalated() {
+    // A terminal `Escalated` rung means auto-mitigation was exhausted/disabled
+    // and the user was told to switch models themselves. An unrelated compaction
+    // applying afterward (routine size-based auto-compaction, or a manual
+    // /compact) must NOT silently dismiss that surfaced escalation: only an
+    // explicit reset() or a route/model switch should clear it.
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // Escalate to the terminal rung.
+    agent.degradation.escalate();
+    assert_eq!(agent.degradation.rung(), crate::agent::degradation::Rung::Escalated);
+
+    // A compaction applying must preserve the terminal Escalated state.
+    agent.note_compaction_applied();
+    assert_eq!(
+        agent.degradation.rung(),
+        crate::agent::degradation::Rung::Escalated,
+        "a compaction apply must not clear the terminal Escalated rung"
+    );
+}
+
+#[tokio::test]
+async fn compaction_apply_preserves_watch_level_accumulation() {
+    // A `Watch` rung (a single stall, below the mitigation threshold) must NOT
+    // be reset by an unrelated compaction applying. Erasing it on every routine
+    // auto-compaction would delay detection of a genuinely-degrading session
+    // that is slowly accumulating stalls toward Compact. Reset only happens
+    // from the `Compact` rung, which is the rung that compaction mitigates.
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // Reach Watch (one stall).
+    agent
+        .degradation
+        .record_stall(crate::agent::degradation::StallKind::StalledPromise);
+    assert_eq!(agent.degradation.rung(), crate::agent::degradation::Rung::Watch);
+    assert_eq!(agent.degradation.stall_count(), 1);
+
+    // A compaction applying must preserve the Watch accumulation.
+    agent.note_compaction_applied();
+    assert_eq!(
+        agent.degradation.rung(),
+        crate::agent::degradation::Rung::Watch,
+        "a compaction apply must preserve Watch-level stall accumulation"
+    );
+    assert_eq!(
+        agent.degradation.stall_count(),
+        1,
+        "a compaction apply must not erase a Watch-level stall"
+    );
+}
+
+#[tokio::test]
+async fn compaction_apply_resets_pre_switch_route_fallback() {
+    // A `RouteFallback` rung that has fired the mitigation decision but not yet
+    // switched the model (> `set_model_from_auth`) is still one whose mitigation
+    // is compaction. Per the plan (L3 -- recovered --> Idle), an applied
+    // compaction that restores progress must reset it to Healthy instead of
+    // continuing toward a stale model switch. (Once the switch actually happens,
+    // reset_for_route already undoes the escalation, so this only covers the
+    // pre-switch window.)
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // Reach RouteFallback (compact-acknowledged gate opens the fallback).
+    agent
+        .degradation
+        .record_stall(crate::agent::degradation::StallKind::StalledPromise);
+    agent
+        .degradation
+        .record_stall(crate::agent::degradation::StallKind::StalledPromise);
+    agent.degradation.acknowledge_compact();
+    agent
+        .degradation
+        .record_stall(crate::agent::degradation::StallKind::StalledPromise);
+    assert_eq!(
+        agent.degradation.rung(),
+        crate::agent::degradation::Rung::RouteFallback,
+        "setup must reach RouteFallback"
+    );
+
+    // A compaction applying resets the pre-switch RouteFallback back to Healthy.
+    agent.note_compaction_applied();
+    assert_eq!(
+        agent.degradation.rung(),
+        crate::agent::degradation::Rung::Healthy,
+        "an applied compaction must reset a pre-switch RouteFallback to Healthy"
+    );
+}
+
 #[tokio::test]
 async fn interrupt_signal_fire_before_notified_does_not_hang() {
     // Regression test: fire() called BEFORE notified().await must not hang.
@@ -1145,8 +1701,8 @@ fn seed_transient_session_state(agent: &mut Agent) {
     );
     agent.background_tool_signal.fire();
     agent.request_graceful_shutdown();
-    agent.tool_call_ids.insert("tool_call_old".to_string());
-    agent.tool_result_ids.insert("tool_result_old".to_string());
+    agent.tool_call_ids.insert("tool_call_old".to_string().into());
+    agent.tool_result_ids.insert("tool_result_old".to_string().into());
     agent.tool_output_scan_index = 7;
     agent.last_upstream_provider = Some("upstream_old".to_string());
     agent.last_connection_type = Some("websocket".to_string());
@@ -1339,7 +1895,7 @@ async fn build_memory_prompt_nonblocking_defers_pending_memory_during_tool_loop(
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
-                id: "call_1".to_string(),
+                id: "call_1".to_string().into(),
                 name: "bash".to_string(),
                 input: serde_json::json!({}),
                 thought_signature: None,
@@ -1907,12 +2463,9 @@ fn empty_post_tool_response_gets_more_than_one_retry() {
     // transient hiccup, not a finished task. With only one retry allowed, a
     // single empty response (observed once in 43 turns) ended a 20-hour agent
     // run with the work half-done and the submission unoptimized.
-    assert!(
-        Agent::MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS > 1,
-        "a single retry lets one transient empty response end a long run"
-    );
+    const _: () = assert!(Agent::MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS > 1);
     // Bounded, so a genuinely finished agent still exits instead of looping.
-    assert!(Agent::MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS <= 10);
+    const _: () = assert!(Agent::MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS <= 10);
 }
 
 #[test]
@@ -2243,6 +2796,72 @@ async fn stalled_promise_turn_gets_bounded_continuation() {
 }
 
 #[tokio::test]
+async fn stalled_promise_first_detection_records_route_stall() {
+    // The core degradation-wiring fix: a stalled-promise detection must record
+    // a route-scoped stall on the FIRST stalled-promise detection of a turn,
+    // not only after exhausting the per-turn continuation budget. Otherwise a
+    // session that emits action-promise filler *across turns* (each recovered
+    // by one nudge, never reaching `MAX_STALLED_PROMISE_CONTINUATION_ATTEMPTS`)
+    // would keep the route tracker at `Healthy` forever and no mitigation would
+    // ever fire.
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    let spam = "Let me read the method. Let me run the shell read. Let me look. \
+                Let me view it. Let me grep. Let me run the command. Let me check. \
+                Let me execute. Let me do it. Let me read the body. Let me find it.";
+
+    // First turn: a single stalled-promise detection immediately promotes the
+    // tracker out of Healthy (Watch threshold is 1 in the default config).
+    let mut attempts = 0u32;
+    let retried = agent
+        .maybe_continue_stalled_promise(Some("stop"), spam, &mut attempts)
+        .expect("helper must not error");
+    assert!(retried, "first detection must request a continuation");
+    assert_eq!(agent.degradation.stall_count(), 1, "first detection records one stall");
+    assert_eq!(
+        agent.degradation.rung(),
+        crate::agent::degradation::Rung::Watch,
+        "one stalled-promise turn reaches Watch"
+    );
+
+    // The continuation is nudged two more times within the same turn; these
+    // must NOT double-count stalls (one record per turn).
+    attempts = 1;
+    let retried = agent
+        .maybe_continue_stalled_promise(Some("stop"), spam, &mut attempts)
+        .unwrap();
+    assert!(retried);
+    let retried = agent
+        .maybe_continue_stalled_promise(Some("stop"), spam, &mut attempts)
+        .unwrap();
+    assert!(retried);
+    assert_eq!(
+        agent.degradation.stall_count(),
+        1,
+        "subsequent continuation nudges within one turn must not re-record"
+    );
+
+    // A fresh turn (attempts reset to 0) is a second stall record -> Compact.
+    let mut next_attempts = 0u32;
+    agent
+        .maybe_continue_stalled_promise(Some("stop"), spam, &mut next_attempts)
+        .unwrap();
+    assert_eq!(
+        agent.degradation.stall_count(),
+        2,
+        "a second turn accumulates to two stalls"
+    );
+    assert_eq!(
+        agent.degradation.rung(),
+        crate::agent::degradation::Rung::Compact,
+        "two stalled-promise turns reach Compact"
+    );
+}
+
+#[tokio::test]
 async fn compact_unfulfilled_tool_request_triggers_recovery() {
     let _guard = crate::storage::lock_test_env();
     let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
@@ -2262,6 +2881,19 @@ async fn compact_unfulfilled_tool_request_triggers_recovery() {
         .expect("helper must not error");
     assert!(retried, "compact unfulfilled tool-request must trigger recovery");
     assert_eq!(attempts, 1);
+    // The exact real-world offender's compact form must ALSO feed the route
+    // degradation tracker at first detection (same funnel as dense filler): it
+    // reaches Watch so the cross-turn accumulation toward Compact/fallback works
+    // for this observed degradation shape too, not just the dense "Let me..." one.
+    assert_eq!(
+        agent.degradation.stall_count(), 1,
+        "compact unfulfilled tool-request must record one stall at first detection"
+    );
+    assert_eq!(
+        agent.degradation.rung(),
+        crate::agent::degradation::Rung::Watch,
+        "compact unfulfilled tool-request must reach Watch"
+    );
     let recovery = agent
         .session
         .messages
@@ -2714,6 +3346,28 @@ async fn stalled_promise_turn_requests_continuation_via_streaming_loop() {
         text.contains("append_stored_message self-heal path is verified"),
         "the recovered turn must deliver the real completion, got {text:?}"
     );
+
+    // The single stall was recorded at first detection (Watch = 1), and the
+    // clean continuation that followed recorded a clean turn (so the tracker did
+    // NOT spuriously escalate past Watch on a one-off filler blip that recovered
+    // within the same turn).
+    assert_eq!(
+        agent.degradation.stall_count(),
+        1,
+        "one stalled-promise stall must be recorded"
+    );
+    assert_eq!(
+        agent.degradation.rung(),
+        crate::agent::degradation::Rung::Watch,
+        "a single recovered stall must sit at Watch, never escalated"
+    );
+    // Safety: at Watch (a single, recovered stall) no mitigation may fire — no
+    // premature compaction and no route switch on a one-off filler blip. This is
+    // the guard against the broadened first-detection recording over-reacting.
+    assert!(
+        agent.maybe_mitigate_degradation().is_none(),
+        "a single recovered stall at Watch must not trigger any mitigation"
+    );
 }
 
 /// End-to-end bv watchdog: if the model keeps stalling on every continuation,
@@ -2826,6 +3480,205 @@ impl Provider for AlwaysStalledProvider {
     }
 }
 
+/// Like [`AlwaysStalledProvider`] (dense "Let me..." filler with no tool call on
+/// every turn) but reports `supports_compaction() == true`. Used only by the
+/// cross-turn accumulation tests, whose goal is to prove the route tracker
+/// reaches the `Compact` rung (not to exercise an unsupported-compaction
+/// escalation). Keeping this a SEPARATE double leaves [`AlwaysStalledProvider`]
+/// semantically honest ("always stalled, no compaction capability"), so the
+/// call-count bound tests that use it are not silently given compaction support
+/// they don't need.
+#[derive(Clone, Default)]
+struct AlwaysStalledCompactionProvider {
+    calls: Arc<std::sync::Mutex<usize>>,
+}
+
+#[async_trait]
+impl Provider for AlwaysStalledCompactionProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        let _ = {
+            let mut guard = self.calls.lock().unwrap();
+            *guard += 1;
+            *guard
+        };
+        let (tx, rx) = tokio_mpsc::channel::<Result<StreamEvent>>(8);
+        tokio::spawn(async move {
+            let _ = tx
+                .send(Ok(StreamEvent::TextDelta(
+                    "Let me read it. Let me run it. Let me view it. Let me check. \
+                     Let me grep it. Let me find it. Let me look at it. Let me do it. \
+                     Let me examine it. Let me parse it. Let me print it. Let me search it."
+                        .to_string(),
+                )))
+                .await;
+            let _ = tx
+                .send(Ok(StreamEvent::MessageEnd {
+                    stop_reason: Some("stop".to_string()),
+                }))
+                .await;
+        });
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    fn name(&self) -> &str {
+        "always-stalled-compaction"
+    }
+
+    fn supports_compaction(&self) -> bool {
+        true
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+}
+
+/// Two degraded turns through the real streaming turn loop must accumulate into
+/// the route degradation tracker and reach the Compact rung, proving the
+/// end-to-end public interface (run_once_streaming_mpsc -> stalled-promise
+/// recovery -> tracker promotion) drives the mitigation decision — not just the
+/// tracker's unit logic.
+#[tokio::test]
+async fn stalled_turns_through_public_loop_reach_compact_rung() {
+    let _guard = crate::storage::lock_test_env();
+    let provider = Arc::new(AlwaysStalledCompactionProvider::default());
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // First degraded turn: one stall recorded.
+    {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        agent
+            .run_once_streaming_mpsc("do the task", Vec::new(), None, tx)
+            .await
+            .expect("turn should complete");
+    }
+    assert_eq!(
+        agent.degradation.stall_count(),
+        1,
+        "first degraded turn must record one stall"
+    );
+    assert_eq!(
+        agent.degradation.rung(),
+        crate::agent::degradation::Rung::Watch,
+        "one degraded turn reaches Watch"
+    );
+
+    // Second degraded turn: the tracker accumulates to Compact.
+    {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        agent
+            .run_once_streaming_mpsc("do the task", Vec::new(), None, tx)
+            .await
+            .expect("turn should complete");
+    }
+    assert_eq!(
+        agent.degradation.stall_count(),
+        2,
+        "two degraded turns must record two stalls"
+    );
+    assert_eq!(
+        agent.degradation.rung(),
+        crate::agent::degradation::Rung::Compact,
+        "two degraded turns reach Compact"
+    );
+}
+
+/// End-to-end: the first-detection stall-recording fix must let a compaction-
+/// capable always-stalled session accumulate to Compact THROUGH the public
+/// streaming loop, and the loop's own mitigation checkpoint must then consume
+/// the Compact one-shot (the action the original gap made unreachable).
+#[tokio::test]
+async fn degraded_streaming_session_reaches_compact_and_mitigation_fires() {
+    // End-to-end proof that the first-detection stall-recording fix unblocks the
+    // previously-dead mitigation chain THROUGH the public streaming loop:
+    // 1) a compaction-capable always-stalled session records one stall per turn
+    //    and accumulates to Compact, and
+    // 2) the streaming loop's own `maybe_mitigate_degradation` consumes the
+    //    one-shot Compact mitigation (the pending flag drops to false) — i.e.
+    //    the mitigation that used to never fire now actually runs.
+    let _guard = crate::storage::lock_test_env();
+    let provider = Arc::new(AlwaysStalledCompactionProvider::default());
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // Seed transcript so a compaction would have material to summarize (mirrors
+    // the discrete mitigation test), so any difference is not from a trivially
+    // empty transcript.
+    for i in 0..30 {
+        agent.add_message(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: format!("turn {i} {}", "x".repeat(120)),
+                cache_control: None,
+            }],
+        );
+    }
+
+    // Two degraded turns through the public streaming loop.
+    for _ in 0..2 {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        agent
+            .run_once_streaming_mpsc("do the task", Vec::new(), None, tx)
+            .await
+            .expect("turn should complete");
+    }
+
+    // The tracker accumulated two stalls and sits at Compact...
+    assert_eq!(agent.degradation.stall_count(), 2, "two turns recorded");
+    assert_eq!(
+        agent.degradation.rung(),
+        crate::agent::degradation::Rung::Compact,
+        "two degraded turns reach Compact"
+    );
+    // ...AND the Compact one-shot mitigation was consumed BY THE LOOP: with the
+    // fix the loop's own mitigation checkpoint ran (acknowledging the pending
+    // compaction), so a manual call now finds nothing pending. This is exactly
+    // the action that never fired before the fix.
+    assert!(
+        !agent.degradation.compact_pending(),
+        "the loop must have consumed the Compact mitigation one-shot"
+    );
+    assert!(
+        agent.maybe_mitigate_degradation().is_none(),
+        "after the loop consumed the one-shot, a manual call must be a no-op"
+    );
+}
+
+/// Cross-loop parity: the NON-streaming turn loop (`run_once` -> `run_turn`)
+/// shares the modified `maybe_continue_stalled_promise` and the `record_clean_turn`
+/// wiring, so a degraded always-stalled session must accumulate to Compact here
+/// too — not only on the streaming path. This proves the first-detection fix is
+/// effective regardless of which turn loop serves the session.
+#[tokio::test]
+async fn degraded_session_accumulates_to_compact_in_non_streaming_loop() {
+    let _guard = crate::storage::lock_test_env();
+    let provider = Arc::new(AlwaysStalledCompactionProvider::default());
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // Two degraded turns through the synchronous turn loop.
+    for _ in 0..2 {
+        agent
+            .run_once("do the task")
+            .await
+            .expect("non-streaming turn should complete");
+    }
+
+    assert_eq!(agent.degradation.stall_count(), 2, "two turns recorded");
+    assert_eq!(
+        agent.degradation.rung(),
+        crate::agent::degradation::Rung::Compact,
+        "two degraded turns reach Compact in the non-streaming loop too"
+    );
+}
+
 /// The non-streaming turn loop (run_once -> run_turn) must recover identically:
 /// an always-stalled provider is bounded to 1 original call + exactly
 /// MAX_STALLED_PROMISE_CONTINUATION_ATTEMPTS retries, and each retry persists
@@ -2911,7 +3764,7 @@ impl Provider for FillerWithToolProvider {
                     .await;
                 let _ = tx
                     .send(Ok(StreamEvent::ToolUseStart {
-                        id: "call_stalled_with_tool".to_string(),
+                        id: "call_stalled_with_tool".to_string().into(),
                         name: "bash".to_string(),
                     }))
                     .await;
@@ -3008,6 +3861,148 @@ async fn stalled_promise_skips_turns_that_emit_a_tool_call() {
     assert_eq!(
         reminders, 0,
         "no stalled-promise reminder may be injected for a tool_use turn"
+    );
+}
+
+/// A provider that repeats the EXACT same tool call (same name + same input)
+/// for the configured repeat-tool threshold turns, then completes — reproducing the
+/// runaway-loop failure mode the repeat-tool guard (takeaway #7) exists to
+/// catch. On the completion turn it returns plain text so the turn ends.
+#[derive(Clone, Default)]
+struct RepeatingToolProvider {
+    calls: Arc<std::sync::Mutex<usize>>,
+}
+
+#[async_trait]
+impl Provider for RepeatingToolProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        let call = {
+            let mut guard = self.calls.lock().unwrap();
+            *guard += 1;
+            *guard
+        };
+        let (tx, rx) = tokio_mpsc::channel::<Result<StreamEvent>>(8);
+        tokio::spawn(async move {
+            if call <= crate::config::config().loop_guard.repeat_tool_threshold {
+                // Repeat the identical bash call (calls 1..=threshold).
+                let _ = tx
+                    .send(Ok(StreamEvent::ToolUseStart {
+                        id: "repeat_tool".to_string().into(),
+                        name: "bash".to_string(),
+                    }))
+                    .await;
+                let _ = tx
+                    .send(Ok(StreamEvent::ToolInputDelta(
+                        r#"{"command":"git status"}"#.to_string(),
+                    )))
+                    .await;
+                let _ = tx.send(Ok(StreamEvent::ToolUseEnd)).await;
+                let _ = tx
+                    .send(Ok(StreamEvent::MessageEnd {
+                        stop_reason: Some("tool_calls".to_string()),
+                    }))
+                    .await;
+            } else {
+                // The 4th (threshold) identical call was committed and the guard
+                // should have injected its reminder; provide a real completion so
+                // the turn can end.
+                let _ = tx.send(Ok(StreamEvent::TextDelta("done".to_string()))).await;
+                let _ = tx
+                    .send(Ok(StreamEvent::MessageEnd {
+                        stop_reason: Some("end_turn".to_string()),
+                    }))
+                    .await;
+            }
+        });
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    fn name(&self) -> &str {
+        "repeating-tool"
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+}
+
+/// The repeat-tool guard must fire through the REAL streaming loop: a model that
+/// emits the exact same tool call the configured repeat-tool threshold times in a row gets a
+/// short model-visible "[Guard]" reminder injected into the transcript, without
+/// ending the turn. This is the wiring-level counterpart to the detector unit
+/// tests in `guard.rs`.
+#[tokio::test]
+async fn streaming_turn_injects_repeat_tool_reminder_when_model_loops() {
+    let _guard = crate::storage::lock_test_env();
+    let repeating = RepeatingToolProvider::default();
+    let calls = repeating.calls.clone();
+    let provider: Arc<dyn Provider> = Arc::new(repeating);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent
+        .run_once_streaming_mpsc("do the task", Vec::new(), None, tx)
+        .await
+        .expect("turn should complete");
+
+    let mut text = String::new();
+    while let Ok(event) = rx.try_recv() {
+        if let ServerEvent::TextDelta { text: delta } = event {
+            text.push_str(&delta);
+        }
+    }
+    assert!(text.contains("done"), "turn must complete, got {text:?}");
+
+    // Exactly one [Guard] reminder must have been injected for the repeated run.
+    let reminders = agent
+        .session
+        .messages
+        .iter()
+        .filter(|m| {
+            m.role == Role::User
+                && m.content.iter().any(|block| match block {
+                    ContentBlock::Text { text, .. } => {
+                        text.contains("[Guard]") && text.contains("repeated identically")
+                    }
+                    _ => false,
+                })
+        })
+        .count();
+    assert_eq!(
+        reminders,
+        1,
+        "exactly one [Guard] reminder must be injected; transcript has {} messages",
+        agent.session.messages.len()
+    );
+
+    // The reminder must mention the repeated tool and the exact count.
+    let reminder_text = agent
+        .session
+        .messages
+        .iter()
+        .find_map(|m| {
+            m.content.iter().find_map(|block| match block {
+                ContentBlock::Text { text, .. } if text.contains("[Guard]") => Some(text.clone()),
+                _ => None,
+            })
+        })
+        .expect("reminder text present");
+    assert!(
+        reminder_text.contains("`bash`") && reminder_text.contains("4 times"),
+        "reminder must name the repeated tool and count, got: {reminder_text}"
+    );
+
+    // The turn must have issued the repeated calls then completed.
+    assert!(
+        *calls.lock().unwrap() >= crate::config::config().loop_guard.repeat_tool_threshold,
+        "model must have repeated the call at least the threshold times"
     );
 }
 
@@ -3264,7 +4259,7 @@ impl Provider for CompactWithToolProvider {
                     .await;
                 let _ = tx
                     .send(Ok(StreamEvent::ToolUseStart {
-                        id: "call_compact_with_tool".to_string(),
+                        id: "call_compact_with_tool".to_string().into(),
                         name: "bash".to_string(),
                     }))
                     .await;
@@ -3443,7 +4438,7 @@ fn compaction_retry_limit_error_distinguishes_413_from_context_limit() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _guard = crate::storage::lock_test_env();
     let registry = rt.block_on(Registry::new(provider.clone()));
-    let mut agent = Agent::new(provider, registry);
+    let agent = Agent::new(provider, registry);
 
     let payload_err = "OpenAI-compatible chat request failed\n  status: 413 Payload Too Large";
     let msg = agent.compaction_retry_limit_error(payload_err);
@@ -3565,7 +4560,7 @@ async fn streaming_turn_recovers_from_413_payload_too_large_and_retries() {
         );
     }
 
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     agent
         .run_turn_streaming_mpsc(tx)
         .await
@@ -3584,5 +4579,1112 @@ async fn streaming_turn_recovers_from_413_payload_too_large_and_retries() {
             .as_ref()
             .is_some_and(|c| c.compacted_count > 0),
         "recovery must have hard-compacted older messages to shrink the payload"
+    );
+}
+
+/// The handoff integration: a fresh agent with a working dir that has a prior
+/// handoff prepends the compact block to its very first user message, and does
+/// not re-inject it on subsequent messages within the same conversation. The
+/// auto-injected handoff is consumed on injection, so a *later* fresh session
+/// in the same project no longer sees the stale one (the cross-session
+/// re-injection bug); each scenario below seeds its own distinct working dir.
+#[tokio::test]
+async fn first_user_message_injects_handoff_once() {
+    let _guard = crate::storage::lock_test_env();
+    let home = tempfile::TempDir::new().expect("temp home");
+    struct RestoreHome(Option<std::ffi::OsString>);
+    impl Drop for RestoreHome {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => crate::env::set_var("JCODE_HOME", value),
+                None => crate::env::remove_var("JCODE_HOME"),
+            }
+        }
+    }
+    let _restore = RestoreHome(std::env::var_os("JCODE_HOME"));
+    crate::env::set_var("JCODE_HOME", home.path());
+
+    // Seed a fresh handoff for a dedicated working dir.
+    fn seed_handoff(wd: &std::path::Path) {
+        crate::todo::save_todos(
+            "prev-session",
+            &[crate::todo::TodoItem {
+                id: "p".into(),
+                content: "resume the split".into(),
+                status: "in_progress".into(),
+                priority: "high".into(),
+                group: None,
+                confidence: None,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        crate::todo::save_plan(
+            "prev-session",
+            &crate::todo::TodoPlan {
+                user_intention: Some("continue server split".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::handoff::capture("prev-session", Some(wd), "closed", None).expect("capture");
+    }
+
+    // Scenario 1: text-first conversation injects exactly once.
+    let wd = home.path().join("project-text");
+    std::fs::create_dir_all(&wd).unwrap();
+    seed_handoff(&wd);
+
+    // Build a fresh agent in that working dir.
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent =
+        Agent::new_with_initial_working_dir(provider, registry, Some(wd.to_str().unwrap()));
+
+    // First message gets the handoff prepended by the injection path.
+    agent
+        .append_user_context_message("continue now", Vec::new())
+        .expect("first message");
+    let first_text = agent
+        .session
+        .messages
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, Role::User))
+        .expect("a user message");
+    let first_str = first_text
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        first_str.contains("[Handoff from previous session]"),
+        "first user message should carry the handoff, got: {first_str}"
+    );
+    assert!(
+        first_str.contains("continue now"),
+        "original text preserved"
+    );
+
+    // Second message must not re-inject (conversation is no longer fresh).
+    agent
+        .append_user_context_message("next step", Vec::new())
+        .expect("second message");
+    let second_text = agent
+        .session
+        .messages
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, Role::User))
+        .expect("a second user message");
+    let second_str = second_text
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        !second_str.contains("[Handoff from previous session]"),
+        "second user message must not re-inject the handoff, got: {second_str}"
+    );
+
+    // The auto-inject consumed the handoff: a brand-new session in the *same*
+    // project no longer inherits the stale snapshot (the bug fixed). Only the
+    // archived snapshot remains, reachable via explicit manual resume.
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent2 =
+        Agent::new_with_initial_working_dir(provider, registry, Some(wd.to_str().unwrap()));
+    agent2
+        .append_user_context_message("continue again", Vec::new())
+        .expect("fresh session first message");
+    let agent2_first = agent2
+        .session
+        .messages
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, Role::User))
+        .map(|m| {
+            m.content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    assert!(
+        !agent2_first.contains("[Handoff from previous session]"),
+        "consumed handoff must not re-inject into a fresh later session, got: {agent2_first}"
+    );
+
+    // Scenario 2: an image-first conversation in its own dir injects once.
+    let wd = home.path().join("project-image");
+    std::fs::create_dir_all(&wd).unwrap();
+    seed_handoff(&wd);
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut image_agent =
+        Agent::new_with_initial_working_dir(provider, registry, Some(wd.to_str().unwrap()));
+    image_agent
+        .append_user_context_message("", vec![("image/png".into(), "AA==".into())])
+        .unwrap();
+    let message = image_agent.session.messages.last().unwrap();
+    assert!(
+        message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Image { .. }))
+    );
+    assert!(message.content.iter().any(|block| matches!(block,
+        ContentBlock::Text { text, .. } if text.contains("[Handoff from previous session]")
+    )));
+
+    // Scenario 3: turn-entry points (run_once / run_once_capture) inject once
+    // into a fresh conversation via the autoregressive paths, each with its own
+    // seeded project.
+    for capture in [false, true] {
+        let wd = home.path().join(format!("project-cli-{capture}"));
+        std::fs::create_dir_all(&wd).unwrap();
+        seed_handoff(&wd);
+        let provider: Arc<dyn Provider> = Arc::new(HandoffFailureProvider);
+        let registry = Registry::new(provider.clone()).await;
+        let mut agent =
+            Agent::new_with_initial_working_dir(provider, registry, Some(wd.to_str().unwrap()));
+        agent.set_memory_enabled(false);
+        for text in ["first CLI message", "second CLI message"] {
+            let result = if capture {
+                agent.run_once_capture(text).await.map(|_| ())
+            } else {
+                agent.run_once(text).await
+            };
+            assert!(result.is_err(), "test provider stops after input persistence");
+            let messages = serde_json::to_string(&agent.session.messages).unwrap();
+            assert_eq!(messages.matches("[Handoff from previous session]").count(), 1,
+                "capture={capture}: all turn entry points must inject exactly once");
+            assert!(messages.contains(text), "original user text retained");
+        }
+    }
+
+}
+
+/// Manual selection overrides the automatic latest-for-project handoff, is
+/// consumed after one injection, and does not regress the default.
+#[tokio::test]
+async fn manual_handoff_override_injects_selected_snapshot_once() {
+    let _guard = crate::storage::lock_test_env();
+    let home = tempfile::TempDir::new().expect("temp home");
+    struct RestoreHome(Option<std::ffi::OsString>);
+    impl Drop for RestoreHome {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => crate::env::set_var("JCODE_HOME", value),
+                None => crate::env::remove_var("JCODE_HOME"),
+            }
+        }
+    }
+    let _restore = RestoreHome(std::env::var_os("JCODE_HOME"));
+    crate::env::set_var("JCODE_HOME", home.path());
+    let wd = home.path().join("project");
+    std::fs::create_dir_all(&wd).unwrap();
+
+    fn seed(session_id: &str, wd: &std::path::Path, intent: &str) {
+        crate::todo::save_todos(
+            session_id,
+            &[crate::todo::TodoItem {
+                id: "t".into(),
+                content: format!("work for {intent}"),
+                status: "in_progress".into(),
+                priority: "high".into(),
+                group: None,
+                confidence: None,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        crate::todo::save_plan(
+            session_id,
+            &crate::todo::TodoPlan {
+                user_intention: Some(intent.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::handoff::capture(session_id, Some(wd), "closed", None).expect("capture");
+    }
+
+    // Newer handoff would be auto-injected by default; an older one is the
+    // manual target so we can tell which was actually used.
+    seed("older-handoff", &wd, "older intent");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    seed("newer-handoff", &wd, "newer intent");
+    assert_eq!(
+        crate::handoff::latest_handoff_for_project(Some(&wd)).as_deref(),
+        Some("newer-handoff"),
+        "default auto-inject target is the newest"
+    );
+
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent =
+        Agent::new_with_initial_working_dir(provider, registry, Some(wd.to_str().unwrap()));
+    agent.set_handoff_resume(Some("older-handoff".to_string()));
+
+    agent
+        .append_user_context_message("resume older", Vec::new())
+        .expect("first message");
+    let first_str = agent
+        .session
+        .messages
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, Role::User))
+        .map(|m| {
+            m.content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    assert!(
+        first_str.contains("older intent") && !first_str.contains("newer intent"),
+        "manual selection must win over auto-inject, got: {first_str}"
+    );
+
+    // The override is consumed after the first injection, so a later first
+    // message in a fresh conversation would fall back to the default again.
+    agent
+        .append_user_context_message("next", Vec::new())
+        .expect("second message");
+    let second_str = agent
+        .session
+        .messages
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, Role::User))
+        .map(|m| {
+            m.content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    assert!(
+        !second_str.contains("[Handoff from previous session]"),
+        "override must be consumed after one injection, got: {second_str}"
+    );
+}
+
+/// A stale manual override (a snapshot that no longer exists) must not fall
+/// through to a context-less boot: the first message should instead fall back
+/// to the automatic latest-for-project handoff, and the stale id must be
+/// consumed so it never re-triggers.
+#[tokio::test]
+async fn stale_manual_handoff_override_falls_back_to_auto_inject() {
+    let _guard = crate::storage::lock_test_env();
+    let home = tempfile::TempDir::new().expect("temp home");
+    struct RestoreHome(Option<std::ffi::OsString>);
+    impl Drop for RestoreHome {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => crate::env::set_var("JCODE_HOME", value),
+                None => crate::env::remove_var("JCODE_HOME"),
+            }
+        }
+    }
+    let _restore = RestoreHome(std::env::var_os("JCODE_HOME"));
+    crate::env::set_var("JCODE_HOME", home.path());
+    let wd = home.path().join("project");
+    std::fs::create_dir_all(&wd).unwrap();
+
+    // Seed the project's current handoff so auto-injection has a target.
+    crate::todo::save_todos(
+        "current-handoff",
+        &[crate::todo::TodoItem {
+            id: "t".into(),
+            content: "auto work".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: None,
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    crate::todo::save_plan(
+        "current-handoff",
+        &crate::todo::TodoPlan {
+            user_intention: Some("auto intent".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    crate::handoff::capture("current-handoff", Some(&wd), "closed", None).expect("capture");
+
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent =
+        Agent::new_with_initial_working_dir(provider, registry, Some(wd.to_str().unwrap()));
+    // Point the override at a snapshot that does not exist.
+    agent.set_handoff_resume(Some("retired-handoff".to_string()));
+
+    agent
+        .append_user_context_message("continue", Vec::new())
+        .expect("first message");
+    let first_str = agent
+        .session
+        .messages
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, Role::User))
+        .map(|m| {
+            m.content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    assert!(
+        first_str.contains("auto intent"),
+        "stale override should fall back to auto-inject, got: {first_str}"
+    );
+
+    // The stale override was consumed; a later first message still uses the
+    // default and does not inject the missing snapshot.
+    agent
+        .append_user_context_message("next", Vec::new())
+        .expect("second message");
+    let second_str = agent
+        .session
+        .messages
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, Role::User))
+        .map(|m| {
+            m.content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    assert!(
+        !second_str.contains("[Handoff from previous session]"),
+        "stale override must be consumed after one injection, got: {second_str}"
+    );
+}
+
+#[tokio::test]
+async fn manual_prune_updates_provider_view_and_is_idempotent() {
+    let home = PruneTestHome::new();
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+    agent.add_message(
+        Role::User,
+        vec![ContentBlock::ToolResult {
+            tool_use_id: "manual-prune-tool".into(),
+            content: "x".repeat(20_000),
+            is_error: None,
+        }],
+    );
+    let _cached = agent.provider_messages();
+    agent.provider_session_id = Some("stale-native-session".into());
+    agent.session.provider_session_id = agent.provider_session_id.clone();
+    agent.session.save().expect("baseline save");
+    let (report, message) = agent.request_manual_prune().expect("manual prune persists");
+    assert_eq!(report.tool_results_truncated, 1, "{message}");
+    assert_eq!(report.images_stripped, 0);
+    let messages = agent.provider_messages();
+    let result = messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .find_map(|block| {
+            if let ContentBlock::ToolResult { content, .. } = block {
+                Some(content)
+            } else {
+                None
+            }
+        })
+        .expect("tool result preserved");
+    assert!(result.len() <= 16384);
+    agent
+        .session
+        .rederive_all_checked()
+        .expect("pruned event log replays");
+    assert!(agent.request_manual_prune().unwrap().0.is_empty());
+    assert!(agent.provider_session_id.is_none());
+    let loaded = Session::load(&agent.session.id).expect("manual prune survives reload");
+    assert!(loaded.provider_session_id.is_none());
+    assert_eq!(
+        serde_json::to_value(&loaded.messages).unwrap(),
+        serde_json::to_value(&agent.session.messages).unwrap()
+    );
+
+    // Block the sessions directory, then verify errors reach the caller and a
+    // subsequent no-op retries the failed save instead of claiming success.
+    let sessions = home.home.path().join("sessions");
+    let backup = home.home.path().join("sessions-backup");
+    std::fs::rename(&sessions, &backup).unwrap();
+    std::fs::write(&sessions, "blocked").unwrap();
+    agent.add_message(
+        Role::User,
+        vec![ContentBlock::ToolResult {
+            tool_use_id: "retry".into(),
+            content: "z".repeat(20_000),
+            is_error: None,
+        }],
+    );
+    assert!(
+        agent
+            .request_manual_prune()
+            .unwrap_err()
+            .to_string()
+            .contains("failed to save")
+    );
+    std::fs::remove_file(&sessions).unwrap();
+    std::fs::rename(&backup, &sessions).unwrap();
+    assert!(agent.request_manual_prune().unwrap().0.is_empty());
+    let loaded = Session::load(&agent.session.id).unwrap();
+    assert_eq!(
+        serde_json::to_value(&loaded.messages).unwrap(),
+        serde_json::to_value(&agent.session.messages).unwrap()
+    );
+}
+
+struct PruneTestHome {
+    previous: Option<std::ffi::OsString>,
+    home: tempfile::TempDir,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+impl PruneTestHome {
+    fn new() -> Self {
+        let lock = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("JCODE_HOME");
+        crate::env::set_var("JCODE_HOME", home.path());
+        Self {
+            previous,
+            home,
+            _lock: lock,
+        }
+    }
+}
+impl Drop for PruneTestHome {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => crate::env::set_var("JCODE_HOME", value),
+            None => crate::env::remove_var("JCODE_HOME"),
+        }
+    }
+}
+
+
+/// Provider that on EVERY call emits only text (an assistant continuation with NO
+/// tool call). Drives the streaming loop on a pure-text path so the scheduled
+/// prune's image pass is exercised without tool results.
+#[derive(Clone, Default)]
+struct TextOnlyStreamProvider;
+
+#[async_trait]
+impl Provider for TextOnlyStreamProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        let (tx, rx) = tokio_mpsc::channel::<Result<StreamEvent>>(4);
+        tokio::spawn(async move {
+            let _ = tx.send(Ok(StreamEvent::TextDelta("ok".to_string()))).await;
+            let _ = tx
+                .send(Ok(StreamEvent::MessageEnd {
+                    stop_reason: Some("end_turn".to_string()),
+                }))
+                .await;
+        });
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    fn name(&self) -> &str {
+        "text-only"
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(TextOnlyStreamProvider)
+    }
+}
+
+/// Provider that on call 1 invokes `bash` producing an oversized tool result, and on
+/// call 2 ends the turn. Drives the REAL streaming loop so the scheduled per-step
+/// prune runs after the tool result is appended.
+#[derive(Clone, Default)]
+struct OversizedToolStreamProvider {
+    calls: Arc<std::sync::Mutex<usize>>,
+}
+
+#[async_trait]
+impl Provider for OversizedToolStreamProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        let call = {
+            let mut g = self.calls.lock().unwrap();
+            *g += 1;
+            *g
+        };
+        let (tx, rx) = tokio_mpsc::channel::<Result<StreamEvent>>(8);
+        tokio::spawn(async move {
+            if call == 1 {
+                let _ = tx
+                    .send(Ok(StreamEvent::ToolUseStart {
+                        id: "call_big".to_string().into(),
+                        name: "bash".to_string(),
+                    }))
+                    .await;
+                // echoes ~20,000 chars so the tool result exceeds the 16 KiB default cap
+                let _ = tx
+                    .send(Ok(StreamEvent::ToolInputDelta(
+                        r#"{"command":"printf 'x%.0s' {1..20000}"}"#.to_string(),
+                    )))
+                    .await;
+                let _ = tx.send(Ok(StreamEvent::ToolUseEnd)).await;
+                let _ = tx
+                    .send(Ok(StreamEvent::MessageEnd {
+                        stop_reason: Some("tool_calls".to_string()),
+                    }))
+                    .await;
+            } else {
+                let _ = tx
+                    .send(Ok(StreamEvent::TextDelta("done".to_string())))
+                    .await;
+                let _ = tx
+                    .send(Ok(StreamEvent::MessageEnd {
+                        stop_reason: Some("end_turn".to_string()),
+                    }))
+                    .await;
+            }
+        });
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    fn name(&self) -> &str {
+        "oversized-stream"
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+}
+
+/// Runtime evidence the scheduled per-step prune (a) does NOT strip a freshly added
+/// oversized tool result from this batch (it is in the unconsumed suffix after the
+/// latest assistant), and (b) DOES strip an oversized image already consumed before
+/// the current turn.
+#[tokio::test]
+async fn scheduled_prune_preserves_fresh_oversized_results_at_runtime() {
+    let _guard = crate::storage::lock_test_env();
+    let sp = OversizedToolStreamProvider::default();
+    let provider: Arc<dyn Provider> = Arc::new(sp);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // A consumed-prefix oversized image (append, then an assistant response marks
+    // it consumed when a later user turn exists). Simulate via a user image block
+    // then an assistant ack.
+    agent
+        .session
+        .append_stored_message(crate::session::StoredMessage {
+            id: "consumed-img".into(),
+            role: crate::message::Role::User,
+            content: vec![ContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "a".repeat(5000),
+            }],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    agent.session.add_message(
+        crate::message::Role::Assistant,
+        vec![ContentBlock::Text {
+            text: "ack".into(),
+            cache_control: None,
+        }],
+    );
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent
+        .run_once_streaming_mpsc("big output", Vec::new(), None, tx)
+        .await
+        .expect("turn should complete");
+
+    let mut text = String::new();
+    while let Ok(event) = rx.try_recv() {
+        if let ServerEvent::TextDelta { text: d } = event {
+            text.push_str(&d);
+        }
+    }
+    assert!(text.contains("done"), "turn must finish, got {text:?}");
+
+    // The fresh oversized bash tool-result from THIS batch must survive pruning.
+    let tool_result_count = agent
+        .session
+        .messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter(|b| matches!(b, ContentBlock::ToolResult { content, .. } if content.len() > 16384))
+        .count();
+    assert_eq!(
+        tool_result_count, 1,
+        "fresh oversized tool result must not be pruned before the model reads it"
+    );
+
+    // The consumed oversized image from BEFORE this turn must have been replaced.
+    let consumed_image = agent.session.messages.iter().flat_map(|m| &m.content)
+        .find(|b| matches!(b, ContentBlock::Text { text, .. } if text.contains("Image omitted during context pruning")));
+    assert!(
+        consumed_image.is_some(),
+        "consumed oversized image must be pruned by scheduled prune"
+    );
+}
+/// A pure-text continuation turn (no tool results) must STILL prune a previously
+/// consumed oversized image; gating the image pass on tool_results_dirty would
+/// leak it for the whole session.
+#[tokio::test]
+async fn text_only_turn_prunes_consumed_oversized_image() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(TextOnlyStreamProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // A consumed oversized image: the image (User), then an assistant ack.
+    agent.session.append_stored_message(crate::session::StoredMessage {
+        id: "txt-img".into(),
+        role: crate::message::Role::User,
+        content: vec![ContentBlock::Image {
+            media_type: "image/png".into(),
+            data: "a".repeat(5000),
+        }],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    agent.session.add_message(
+        crate::message::Role::Assistant,
+        vec![ContentBlock::Text {
+            text: "ack".into(),
+            cache_control: None,
+        }],
+    );
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    agent
+        .run_once_streaming_mpsc("continue", Vec::new(), None, tx)
+        .await
+        .unwrap();
+
+    // The consumed oversized image must have been pruned even though this turn
+    // added no tool results (regression for the text-only image leak).
+    let marker = agent.session.messages.iter().flat_map(|m| &m.content).find(|b| {
+        matches!(b, ContentBlock::Text { text, .. } if text.contains("Image omitted during context pruning"))
+    });
+    assert!(
+        marker.is_some(),
+        "consumed oversized image must be pruned on a text-only turn"
+    );
+}
+/// A pure-text continuation turn over a PREVIOUS turn's consumed oversized tool
+/// result must STILL truncate it (the tool cap should not be limited to turns
+/// that themselves ran tools). This proves the consumed-prefix prune runs every
+/// step for already-consumed oversized nodes, not only on tool-result steps.
+#[tokio::test]
+async fn text_only_turn_truncates_consumed_oversized_tool_result() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(TextOnlyStreamProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // A consumed oversized tool result: a prior turn committed a 6000-byte
+    // result, then an assistant ack made it consumed (prefix before last assistant).
+    agent.session.append_stored_message(crate::session::StoredMessage {
+        id: "txt-tool".into(),
+        role: crate::message::Role::User,
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: "t1".into(),
+            content: "x".repeat(20_000),
+            is_error: None,
+        }],
+        display_role: None, timestamp: None, tool_duration_ms: None, token_usage: None,
+    });
+    agent.session.add_message(
+        crate::message::Role::Assistant,
+        vec![ContentBlock::Text { text: "ack".into(), cache_control: None }],
+    );
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.run_once_streaming_mpsc("continue", Vec::new(), None, tx).await.unwrap();
+
+    // After a text-only turn, the consumed oversized tool result must be truncated
+    // to <= the default 16 KiB cap. If it is still 20000, the tool-result pass was
+    // wrongly gated off (it should run on the loop head, every step).
+    let big = agent.session.messages.iter().flat_map(|m| &m.content).filter(|b| {
+        matches!(b, ContentBlock::ToolResult { content, .. } if content.len() > 16384)
+    }).count();
+    assert_eq!(big, 0, "consumed oversized tool result must be truncated on a text-only turn");
+}
+
+/// Streaming provider that enables jcode summary compaction (`uses_jcode_compaction`)
+/// with a small context window so the compaction manager's token estimate drives
+/// real decisions. It ends the turn with a plain text reply (no tool calls), which
+/// keeps the assertion focused on the *accounting* effect of the scheduled prune.
+#[derive(Clone, Default)]
+struct PruneAccountingStreamProvider {
+    context: usize,
+}
+
+#[async_trait]
+impl Provider for PruneAccountingStreamProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        let (tx, rx) = tokio_mpsc::channel::<Result<StreamEvent>>(4);
+        tokio::spawn(async move {
+            let _ = tx
+                .send(Ok(StreamEvent::TextDelta("done".to_string())))
+                .await;
+            let _ = tx
+                .send(Ok(StreamEvent::MessageEnd {
+                    stop_reason: Some("end_turn".to_string()),
+                }))
+                .await;
+        });
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    fn name(&self) -> &str {
+        "prune-accounting"
+    }
+
+    fn supports_compaction(&self) -> bool {
+        true
+    }
+
+    fn uses_jcode_compaction(&self) -> bool {
+        true
+    }
+
+    fn context_window(&self) -> usize {
+        self.context
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+}
+
+/// Drives a LARGE transcript through the REAL streaming loop with BOTH a consumed
+/// oversized tool result AND a consumed oversized image in the preview prefix, then
+/// asserts the scheduled per-step prune (a) actually shrinks both nodes and (b) — the
+/// token-accounting focus — leaves the compaction manager's estimate reseeded from the
+/// already-pruned transcript rather than trusting a stale (over-counted) pre-prune
+/// figure. This is what makes a subsequent auto-compaction decide using the pruned
+/// sizes: its context-usage gate reads exactly this estimate.
+#[tokio::test]
+async fn scheduled_prune_keeps_compaction_token_accounting_consistent_with_both_oversized_nodes() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(PruneAccountingStreamProvider { context: 20_000 });
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // Seed a CONSUMED prefix (everything before the last assistant gets pruned)
+    // containing BOTH an oversized tool result and an oversized inline image.
+    // Adding via `agent.add_message` keeps the manager's message bookkeeping in
+    // lockstep with the session, so `total_turns` matches the message count and
+    // the only thing that can mark `active_chars` stale is the prune itself.
+    agent.add_message(
+        Role::User,
+        vec![ContentBlock::ToolResult {
+            tool_use_id: "big_tool".into(),
+            content: "y".repeat(50_000),
+            is_error: None,
+        }],
+    );
+    agent.add_message(
+        Role::User,
+        vec![ContentBlock::Image {
+            media_type: "image/png".into(),
+            data: "a".repeat(10_000),
+        }],
+    );
+    // An assistant ack makes the tool result + image CONSUMED (they sit before
+    // the last assistant message) so the scheduled prune is allowed to shrink them.
+    agent.add_message(
+        Role::Assistant,
+        vec![ContentBlock::Text {
+            text: "ack".into(),
+            cache_control: None,
+        }],
+    );
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent
+        .run_once_streaming_mpsc("continue", Vec::new(), None, tx)
+        .await
+        .expect("streaming turn should complete");
+
+    let mut text = String::new();
+    while let Ok(event) = rx.try_recv() {
+        if let ServerEvent::TextDelta { text: d } = event {
+            text.push_str(&d);
+        }
+    }
+    assert!(text.contains("done"), "turn must finish, got {text:?}");
+
+    // (1) Both consumed oversized nodes must have been pruned in place.
+    let oversized_tool_results = agent
+        .session
+        .messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter(|b| matches!(b, ContentBlock::ToolResult { content, .. } if content.len() > 16384))
+        .count();
+    assert_eq!(
+        oversized_tool_results, 0,
+        "consumed oversized tool result must be truncated to <= the 16 KiB cap"
+    );
+    let image_marker = agent
+        .session
+        .messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .any(|b| matches!(b, ContentBlock::Text { text, .. } if text.contains("Image omitted during context pruning")));
+    assert!(
+        image_marker,
+        "consumed oversized image must be replaced with the prune marker"
+    );
+
+    // (2) The compaction manager's token accounting must now reflect the pruned
+    // (small) content, NOT a stale pre-prune over-count. The scheduled prune shrinks
+    // content in place without changing the message count, so the count-guard in
+    // `active_message_chars_with` would NOT recompute on its own — the manager must
+    // have been told (via `note_prune_applied`) to invalidate its rolling estimate.
+    let budget = agent.registry.compaction().read().await.token_budget();
+    let provider_messages = agent.provider_messages();
+    let pruned_chars: usize = provider_messages
+        .iter()
+        .map(crate::compaction::message_char_count)
+        .sum();
+    let expected = crate::compaction::estimate_compaction_tokens(None, pruned_chars, budget);
+    let estimate = agent
+        .registry
+        .compaction()
+        .read()
+        .await
+        .token_estimate_with(&provider_messages);
+
+    assert!(
+        pruned_chars < 20_000,
+        "expected the pruned transcript to be small, got {pruned_chars} chars"
+    );
+    assert_eq!(
+        estimate, expected,
+        "manager token estimate must be reseeded from the pruned transcript (expected {expected} from {pruned_chars} chars), got {estimate}"
+    );
+    assert!(
+        estimate < 5_000,
+        "auto-compaction must see the small pruned size, got {estimate} tokens"
+    );
+}
+
+/// The manual `/prune` command (server route) must reseed the compaction
+/// manager's rolling token estimate from the already-pruned transcript, exactly
+/// like the scheduled per-step prune. Regression for a stale-over-count: before
+/// this fix `request_manual_prune` called only `note_compaction_applied()`, which
+/// resets provider/cache/tool state but not the manager's `active_chars`, so a
+/// subsequent auto-compaction gate could read a pre-prune over-count. The TUI
+/// `/prune` handler already reseeds via `reseed_compaction_from_provider_messages`;
+/// this assertion keeps the server route consistent with it.
+#[tokio::test]
+async fn manual_prune_reseeds_compaction_token_accounting_from_pruned_transcript() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(PruneAccountingStreamProvider { context: 20_000 });
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    agent.add_message(
+        Role::User,
+        vec![ContentBlock::ToolResult {
+            tool_use_id: "manual_big".into(),
+            content: "z".repeat(50_000),
+            is_error: None,
+        }],
+    );
+
+    // Prime the manager over-count: it consumed the oversized result and now
+    // trusts a large rolling char estimate.
+    agent.provider_messages();
+    let budget = agent.registry.compaction().read().await.token_budget();
+    let pre_estimate = agent
+        .registry
+        .compaction()
+        .read()
+        .await
+        .token_estimate_with(&agent.provider_messages());
+    assert!(
+        pre_estimate > 10_000,
+        "without the prune the manager should be over-counting, got {pre_estimate}"
+    );
+
+    let (report, _message) = agent.request_manual_prune().expect("manual prune persists");
+    assert_eq!(report.tool_results_truncated, 1);
+
+    // After pruning, the manager's estimate must reflect the small (pruned)
+    // content, NOT the stale pre-prune over-count.
+    let provider_messages = agent.provider_messages();
+    let pruned_chars: usize = provider_messages
+        .iter()
+        .map(crate::compaction::message_char_count)
+        .sum();
+    let expected = crate::compaction::estimate_compaction_tokens(None, pruned_chars, budget);
+    let estimate = agent
+        .registry
+        .compaction()
+        .read()
+        .await
+        .token_estimate_with(&provider_messages);
+    assert_eq!(
+        estimate, expected,
+        "manual prune must reseed the estimate from pruned content (expected {expected}), got {estimate}"
+    );
+    assert!(
+        estimate < 2_000,
+        "auto-compaction must see the small pruned size after manual prune, got {estimate}"
+    );
+}
+
+/// The manual `/prune` full-reseed must also handle a pre-existing compaction
+/// summary correctly (the `restore_persisted_state_with` branch of
+/// `reseed_compaction_from_pruned_transcript`). It should reseed to
+/// `summary_chars + active (pruned) chars` — NOT double-count the summary and
+/// NOT keep a stale pre-prune over-count on the active suffix.
+#[tokio::test]
+async fn manual_prune_reseeds_with_existing_compaction_summary() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(PruneAccountingStreamProvider { context: 20_000 });
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // A short consumed prefix that will be summarized.
+    agent.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "old 1".into(),
+            cache_control: None,
+        }],
+    );
+    agent.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "old 2".into(),
+            cache_control: None,
+        }],
+    );
+    // An oversized tool result in the ACTIVE (uncompacted) suffix.
+    agent.add_message(
+        Role::User,
+        vec![ContentBlock::ToolResult {
+            tool_use_id: "summary_big".into(),
+            content: "z".repeat(50_000),
+            is_error: None,
+        }],
+    );
+
+    // Apply a native compaction over the first 2 messages so `session.compaction`
+    // is populated; the oversized tool result remains active (uncompacted).
+    agent
+        .apply_openai_native_compaction("enc_summary".to_string(), 2)
+        .unwrap();
+
+    let (_report, _msg) = agent.request_manual_prune().expect("manual prune persists");
+
+    // The summary must survive the manual-prune full-reseed.
+    let comp = agent.registry.compaction();
+    let manager = comp.read().await;
+    let summary_chars = manager.summary_chars();
+    assert!(
+        summary_chars > 0,
+        "existing compression summary must be preserved after manual prune (summary_chars={summary_chars})"
+    );
+
+    // The estimate must be summary + active (pruned) chars. Use the manager's own
+    // token_estimate_with (which folds the summary in), and separately confirm the
+    // active suffix is small after the prune by comparing against an estimate built
+    // from the live provider messages' pruned char count.
+    let provider_messages = agent.provider_messages();
+    let estimate = manager.token_estimate_with(&provider_messages);
+
+    // Build the expected figure the same way the manager would if it recomputed:
+    // (budget-adjusted) summary + active chars, where active = messages beyond the
+    // compacted prefix (index 2), all already pruned. Budget (20k) < DEFAULT_TOKEN_BUDGET/2
+    // so SYSTEM_OVERHEAD_TOKENS is 0 and the estimate is just chars / CHARS_PER_TOKEN.
+    let active_chars: usize = provider_messages
+        .iter()
+        .skip(2)
+        .map(crate::compaction::message_char_count)
+        .sum();
+    let expected_active_tokens =
+        (summary_chars + active_chars) / crate::compaction::CHARS_PER_TOKEN;
+    // token_estimate_with returns estimate_compaction_tokens(summary, active_chars),
+    // which equals budget-adjusted(summary_chars + active_chars) — the same as above.
+    assert_eq!(
+        estimate, expected_active_tokens,
+        "manual prune with existing summary must yield summary+active-pruned (got {estimate}, expected {expected_active_tokens})"
+    );
+    // Active suffix must be small (pruned): the 50k tool result was truncated to <=16k.
+    assert!(
+        active_chars <= 16_384,
+        "active tool result must be pruned to <= the 16 KiB cap, got {active_chars} chars"
+    );
+    // Sanity: overall estimate is small (summary is tiny + active is pruned), far
+    // below a stale over-count of ~50k chars (~12.5k tokens).
+    assert!(
+        estimate < 3_000,
+        "manual-prune-with-summary estimate must be small, got {estimate}"
     );
 }
