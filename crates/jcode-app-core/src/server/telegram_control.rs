@@ -176,20 +176,43 @@ pub async fn request_graceful_shutdown_for_control(session_id: &str) -> bool {
     let Some(agent) = agent else {
         return false;
     };
-    // No active turn is registered; flag the agent directly without blocking.
-    // A `try_lock` succeeds whenever no turn currently holds the agent mutex,
-    // which is exactly the non-streaming case where flagging is meaningful.
-    if let Ok(guard) = agent.try_lock() {
-        guard.request_graceful_shutdown();
-        crate::logging::info(&format!(
-            "telegram graceful shutdown flagged for idle session session={session_id}"
-        ));
-        return true;
+    // No streaming turn is registered. If the agent is idle (lock free) there
+    // is nothing running to stop, so we must NOT set `graceful_shutdown`: that
+    // flag is only ever reset by the registry guard that exists while a turn
+    // actually runs. Setting it on an idle agent leaks into the next turn and
+    // instantly cancels it at the turn-loop head, silently eating the user's
+    // next message. (The original implementation always set the flag here, so
+    // an /abort on an idle session had this latent bug.)
+    match agent.try_lock() {
+        Ok(_guard) => {
+            crate::logging::info(&format!(
+                "telegram graceful shutdown requested for idle session session={session_id}; nothing to stop"
+            ));
+            false
+        }
+        Err(_) => {
+            // The agent is busy but had no turn registered moments ago — a
+            // narrow window at turn start. Re-check the registry (the abort may
+            // have raced with the turn registering its signal). If none, there
+            // is no signal we can safely fire, so report "no running turn".
+            let registered = crate::turn_cancel_registry::active_turn_signals(session_id);
+            if registered.is_empty() {
+                crate::logging::info(&format!(
+                    "telegram graceful shutdown requested for busy-unregistered session session={session_id}; nothing to stop"
+                ));
+                false
+            } else {
+                for signal in &registered {
+                    signal.fire();
+                }
+                crate::logging::info(&format!(
+                    "telegram graceful shutdown signaled via registry (retry) session={session_id} signals={}",
+                    registered.len()
+                ));
+                true
+            }
+        }
     }
-    crate::logging::info(&format!(
-        "telegram graceful shutdown requested but agent busy session={session_id}"
-    ));
-    true
 }
 
 /// Live agent count (size of the in-memory registry) for status reporting.
