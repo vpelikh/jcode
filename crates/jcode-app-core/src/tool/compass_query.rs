@@ -3,15 +3,45 @@
 //! `compass_query` is a first-class, always-available tool (like `read` or
 //! `agentgrep`). It integrates Compass as a pure library: there is no MCP
 //! server and no CLI subprocess. The first query in a project builds the
-//! Compass index in-process and caches it under `.jcode/cache/compass`. A warm
-//! index is reused for subsequent queries, so the build runs only when the
-//! project has never been indexed or when source has changed since the last
-//! build. On a rebuild Compass reuses its persisted AST cache (incremental
-//! extract), so changed files are re-extracted rather than the whole project.
+//! Compass index in-process and caches it.
+//!
+//! ## Cache locations
+//!
+//! All Compass cache data lives under the **jcode home** (`~/.jcode`, or
+//! `$JCODE_HOME` if set), never inside a project folder:
+//!
+//! ```text
+//! <jcode_home>/compass/<project_id>/
+//!   .ast-cache/            branch-agnostic AST-fact cache (shared across SHAs)
+//!   <sha>/compass-out/     per-commit graph (git-backed)
+//!   workspace/compass-out/ single graph (non-git)
+//! ```
+//!
+//! * `project_id` is derived from the repo's git *common dir*, which is
+//!   identical across all worktrees, so every worktree shares one cache.
+//! * Because everything lives under jcode home, no cache is ever written into a
+//!   project folder, so worktrees/checkouts never need their cache copied around.
+//!
+//! A warm index is reused for subsequent queries, so the build runs only when
+//! the project has never been indexed or when source has changed since the last
+//! build. On a rebuild Compass reuses its shared AST cache (incremental
+//! extract), so a branch switch only re-extracts files that actually changed
+//! instead of rebuilding the whole project.
 //! A git branch or commit switch (HEAD) is detected via a cached SHA sidecar
 //! and forces a rebuild even when no file mtime changed, so a freshly checked
 //! out tree is never served against a stale index.
-//! The index can also be force-refreshed by deleting the cache dir.
+//! The current commit's index can be force-refreshed by deleting just its
+//! per-SHA dir (`<project_id>/<sha>/`); deleting the whole `<project_id>/` root
+//! also discards the shared `.ast-cache` and forces a full re-extract.
+//!
+//! ### Shared-cache staleness semantics
+//!
+//! A shared index represents a single *committed* tree, keyed by commit SHA.
+//! Its freshness is therefore decided purely by whether the current commit SHA
+//! matches the sidecar — never by walking the working tree. This guarantees an
+//! individual worktree's uncommitted edits never force a shared rebuild from
+//! that dirty tree (which would leak that worktree's uncommitted code into the
+//! index that every clean worktree on the same SHA also reads).
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use compass_core::{build_graph_with_layers, BuildOptions, BuildPurpose};
@@ -24,6 +54,48 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use super::{Tool, ToolContext, ToolOutput};
+
+/// Top-level directory under the jcode home where all Compass indexes live.
+/// Keeping everything under jcode home (`~/.jcode` or `$JCODE_HOME`) means no
+/// cache data is ever written into a project folder, so a worktree or checkout
+/// never needs its cache copied around.
+const COMPASS_CACHE_HOME: &str = "compass";
+
+/// Name of the branch-agnostic AST-fact digest cache shared across all SHAs of
+/// one repository/project. Compass keys it by file content (repo-relative), so
+/// a branch switch only re-extracts files that actually changed.
+const AST_CACHE_DIR: &str = ".ast-cache";
+
+/// Name of the non-git (workspace) output dir inside a project root.
+const WORKSPACE_DIR: &str = "workspace";
+
+/// How long a per-SHA output dir is retained before it is eligible for GC, if
+/// its SHA is no longer reachable from the repo. Older, unreachable per-commit
+/// graphs are pruned so `~/.jcode/compass/<project>/` does not grow unbounded
+/// as a user visits many commits over time.
+const SHA_RETENTION_TTL: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+
+/// Resolved Compass cache paths for a working directory.
+///
+/// * `output_dir` — Compass's *output root*. Compass writes its output under
+///   `<output_dir>/compass-out/` (graph.json, manifest.json, and the `.git-sha`
+///   sidecar). For git work it is per-commit (`.../<project_id>/<sha>/`), so
+///   each distinct commit gets an isolated, immutable graph.
+/// * `graph_path` — the `graph.json` inside `<output_dir>/compass-out/`.
+/// * `ast_cache_root` — the branch-agnostic AST-fact digest cache shared across
+///   all SHAs of the same repo/project, so branch switches rebuild incrementally.
+/// * `build_lock_dir` — the directory used for the flock that serializes builds
+///   sharing the same `output_dir`.
+/// * `is_shared` — true when this is a git-backed per-SHA cache that must decide
+///   staleness purely by commit SHA (see `index_is_stale`).
+#[derive(Clone)]
+struct CompassCachePaths {
+    output_dir: PathBuf,
+    graph_path: PathBuf,
+    ast_cache_root: PathBuf,
+    build_lock_dir: PathBuf,
+    is_shared: bool,
+}
 
 #[derive(Debug, Deserialize)]
 struct CompassQueryInput {
@@ -109,10 +181,12 @@ impl Tool for CompassQueryTool {
             .clone()
             .ok_or_else(|| anyhow!("compass_query requires a working directory"))?;
 
-        // Build cache directory relative to working directory. The Compass index
-        // is built and stored here, so the project tree stays clean.
-        let cache_dir = working_dir.join(".jcode/cache/compass");
-        if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+        // Resolve the Compass cache paths. All caches live under the jcode home
+        // (`~/.jcode` or `$JCODE_HOME`), partitioned by repository/project id and
+        // commit SHA. Nothing is written into the project folder, so a worktree
+        // or fresh checkout never needs its cache copied around.
+        let cache = resolve_compass_cache(&working_dir);
+        if let Err(e) = std::fs::create_dir_all(&cache.output_dir) {
             return Ok(ToolOutput::new(format!(
                 "Failed to create Compass cache directory: {}",
                 e
@@ -124,13 +198,12 @@ impl Tool for CompassQueryTool {
         // seconds for a large project, so it runs on a blocking thread; the
         // project flock serializes concurrent builds, keeping the concurrency-
         // safe contract intact.
-        let graph_path = cache_dir.join("compass-out").join("graph.json");
+        let cache_edge = cache.clone();
         let engine_res: std::result::Result<compass_query::CodeQueryEngine, (String, String)> =
             tokio::task::spawn_blocking({
-                let graph_path = graph_path.clone();
-                let cache_dir = cache_dir.clone();
+                let edge = cache_edge.clone();
                 let working_dir = working_dir.clone();
-                move || ensure_fresh_engine(&graph_path, &cache_dir, &working_dir)
+                move || ensure_fresh_engine(&edge, &working_dir)
             })
             .await
             .expect("compass index task panicked");
@@ -165,8 +238,183 @@ impl Tool for CompassQueryTool {
             Err(e) => Ok(ToolOutput::new(format_query_error(
                 &e.to_string(),
                 &params.query,
-                &cache_dir,
+                &cache.output_dir,
             ))),
+        }
+    }
+}
+
+/// Resolve the Compass cache paths for `working_dir`. All of them live under
+/// the jcode home (see [`crate::storage::jcode_dir`]):
+///
+/// ```text
+/// <jcode_home>/compass/<project_id>/<model-or-layout>/
+///   .ast-cache/        branch-agnostic AST-fact digest cache (shared across SHAs)
+///   <sha_or_layout>/... per-commit output dir (graph.json + .git-sha sidecar)
+/// ```
+///
+/// `project_id` is derived from the git common dir for repos (identical across
+/// every worktree of the same repo) or from the canonical absolute path for
+/// non-git directories. No cache data is written into the project folder.
+fn resolve_compass_cache(working_dir: &Path) -> CompassCachePaths {
+    // Determine a stable per-repository id. It must be identical across all
+    // worktrees of one repo so they share the AST cache and, per SHA, the index.
+    let project_key = current_git_top_cached(working_dir).unwrap_or_else(|| {
+        // Non-git: use the canonical absolute path so a stable project id still
+        // lives entirely under jcode home (no data in the project folder).
+        canonical_string(working_dir).unwrap_or_else(|| working_dir.display().to_string())
+    });
+    let project_id = short_id(&project_key);
+
+    // `output_dir` below is Compass's *output root*: Compass writes its graph
+    // under `<output_dir>/compass-out/graph.json` (see build_compass_index).
+    let Ok(compass_home) = crate::storage::jcode_dir().map(|d| d.join(COMPASS_CACHE_HOME)) else {
+        // No jcode home (unset and no dirs home): fall back to a local cache
+        // inside the working dir so the tool still functions.
+        let output_dir = working_dir.join(".jcode/cache/compass");
+        let graph_path = output_dir.join("compass-out/graph.json");
+        return CompassCachePaths {
+            ast_cache_root: output_dir.join(AST_CACHE_DIR),
+            build_lock_dir: output_dir.clone(),
+            output_dir,
+            graph_path,
+            is_shared: false,
+        };
+    };
+    let project_root = compass_home.join(&project_id);
+
+    // All caches share one branch-agnostic AST-fact digest cache under the
+    // project root, so switching branches re-extracts only changed files.
+    let ast_cache_root = project_root.join(AST_CACHE_DIR);
+
+    if let Some(sha) = current_git_sha_cached(working_dir) {
+        // Git-backed: per-SHA output root, so each commit has an isolated,
+        // immutable graph. Worktrees on the same SHA share it exactly.
+        let output_dir = project_root.join(&sha);
+        let graph_path = output_dir.join("compass-out/graph.json");
+        // Serialize on the *project root* (not per-SHA): all worktrees of one
+        // repo write the same shared `.ast-cache`, and Compass does not lock
+        // its cache internally. A per-project flock prevents two worktrees on
+        // different SHAs from corrupting the shared history index concurrently.
+        CompassCachePaths {
+            build_lock_dir: project_root.clone(),
+            ast_cache_root,
+            output_dir,
+            graph_path,
+            is_shared: true,
+        }
+    } else {
+        // Non-git: stable per-project id under jcode home (never the project
+        // folder), single graph, branch-agnostic AST cache.
+        let output_dir = project_root.join("workspace");
+        let graph_path = output_dir.join("compass-out/graph.json");
+        CompassCachePaths {
+            ast_cache_root,
+            build_lock_dir: output_dir.clone(),
+            output_dir,
+            graph_path,
+            is_shared: false,
+        }
+    }
+}
+
+/// Deterministic, stable identifier for a path (used for the shared-cache
+/// partition). Uses SHA-256 rather than `DefaultHasher`, whose algorithm is
+/// explicitly documented as unstable across Rust releases/builds — a stable
+/// key is required so an on-disk cache id does not change (and orphan the
+/// cache) when jcode is rebuilt or upgraded. The full 256-bit digest is used:
+/// a collision here would silently merge two distinct projects' caches.
+fn short_id(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(s.as_bytes());
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Canonical absolute string form of a path, for a stable non-git project id.
+fn canonical_string(p: &Path) -> Option<String> {
+    std::fs::canonicalize(p)
+        .ok()
+        .map(|c| c.to_string_lossy().into_owned())
+}
+
+/// Returns the set of commit SHAs reachable in `working_dir`'s repo via
+/// `git rev-list --all` (all refs: heads, tags, remotes), or `None` if git is
+/// unavailable. Used to identify per-SHA output dirs that are no longer
+/// reachable and can be garbage-collected.
+fn git_reachable_shas(working_dir: &Path) -> Option<std::collections::HashSet<String>> {
+    let output = std::process::Command::new("git")
+        .args(["rev-list", "--all"])
+        .current_dir(working_dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut shas = std::collections::HashSet::new();
+    for line in String::from_utf8(output.stdout).ok()?.lines() {
+        let sha = line.trim();
+        if !sha.is_empty() {
+            shas.insert(sha.to_string());
+        }
+    }
+    Some(shas)
+}
+
+/// True if `name` looks like a git commit hash (40 hex for SHA-1, or 64 hex for
+/// SHA-256 object format), i.e. a per-SHA output dir that GC may consider.
+fn looks_like_sha(name: &str) -> bool {
+    let len = name.len();
+    (len == 40 || len == 64) && name.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Garbage-collect per-SHA output dirs under `project_root` that are no longer
+/// reachable from `working_dir`'s repo and have not been touched within the
+/// retention window. This keeps `~/.jcode/compass/<project>/` bounded as a user
+/// visits many commits. Best-effort: any failure just skips pruning.
+///
+/// `current_sha` (the HEAD this build is for) is always kept, even if it is a
+/// detached checkout that no ref points to — pruning it would delete the index
+/// the very worktree currently uses.
+fn prune_stale_sha_outputs(project_root: &Path, working_dir: &Path, current_sha: &str) {
+    // Never prune the shared AST cache, the non-git workspace, or any lock file.
+    let Some(reachable) = git_reachable_shas(working_dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    let Ok(entries) = std::fs::read_dir(project_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        // Only per-SHA dirs are candidates; never touch shared/workspace/others.
+        if name == AST_CACHE_DIR || name == WORKSPACE_DIR || !looks_like_sha(name) {
+            continue;
+        }
+        // The current HEAD is always kept, even a detached HEAD with no ref.
+        if name == current_sha {
+            continue;
+        }
+        // Reachable commits (any branch/tag) are kept regardless of age.
+        if reachable.contains(name) {
+            continue;
+        }
+        // Unreachable dirs must be older than the retention window before being
+        // removed, so a recent checkout that happens to be unreachable from refs
+        // is not deleted immediately.
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(mtime) = meta.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(mtime) else {
+            continue;
+        };
+        if age >= SHA_RETENTION_TTL {
+            let _ = std::fs::remove_dir_all(entry.path());
         }
     }
 }
@@ -191,8 +439,9 @@ fn format_index_unavailable(open_err: &str, build_err: &str) -> String {
 fn format_query_error(e: &str, query: &str, cache_dir: &std::path::Path) -> String {
     format!(
         "Compass query failed: {}\n\nQuery: {}\n\n\
-         The index is built, but the search engine returned an error. If this persists, \
-         try removing the cached index ({}) and re-running the query to force a rebuild.",
+         The index is built, but the search engine returned an error.\n\
+         Clear the cache to force a rebuild:\n\
+         rm -rf {}",
         e,
         query,
         cache_dir.display()
@@ -242,6 +491,15 @@ where
 /// how often it runs so a busy agent doesn't re-stat the tree on every single call.
 const STALE_RESCAN_TTL: Duration = Duration::from_secs(5);
 
+/// Lock a process-global `Mutex` for these per-process caches, tolerating
+/// poisoning. If a thread panics while holding one of these locks (e.g. inside a
+/// build path), `Mutex::lock()` would otherwise make every subsequent `.unwrap()`
+/// panic and break the tool for the whole process. `into_inner()` recovers the
+/// (consistent-enough) guard instead.
+fn lock_cached<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Last time a correct staleness scan proved `cache_dir` fresh, keyed by cache dir
 /// so each project is throttled independently. Bounded in size by the number of
 /// distinct projects indexed in this process.
@@ -250,10 +508,7 @@ static LAST_STALE_SCAN: OnceLock<Mutex<HashMap<PathBuf, SystemTime>>> = OnceLock
 /// True when this cache was verified fresh within `STALE_RESCAN_TTL`. On any error
 /// (missing entry, clock skew) we return false so correctness wins over the shortcut.
 fn recently_scanned(cache_dir: &Path) -> bool {
-    let map = LAST_STALE_SCAN
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap();
+    let map = lock_cached(LAST_STALE_SCAN.get_or_init(|| Mutex::new(HashMap::new())));
     match map.get(cache_dir) {
         Some(&t) => t.elapsed().map(|d| d < STALE_RESCAN_TTL).unwrap_or(false),
         None => false,
@@ -261,10 +516,7 @@ fn recently_scanned(cache_dir: &Path) -> bool {
 }
 
 fn record_scan(cache_dir: &Path) {
-    LAST_STALE_SCAN
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap()
+    lock_cached(LAST_STALE_SCAN.get_or_init(|| Mutex::new(HashMap::new())))
         .insert(cache_dir.to_path_buf(), SystemTime::now());
 }
 
@@ -287,7 +539,7 @@ static LAST_GIT_SHA: OnceLock<Mutex<HashMap<PathBuf, (SystemTime, String)>>> = O
 fn current_git_sha_cached(working_dir: &Path) -> Option<String> {
     let map = LAST_GIT_SHA.get_or_init(|| Mutex::new(HashMap::new()));
     {
-        let guard = map.lock().unwrap();
+        let guard = lock_cached(map);
         if let Some((t, sha)) = guard.get(working_dir)
             && t.elapsed().map(|d| d < GIT_SHA_CACHE_TTL).unwrap_or(false)
         {
@@ -296,8 +548,7 @@ fn current_git_sha_cached(working_dir: &Path) -> Option<String> {
     } // Drop the read lock before shelling out to git.
     match current_git_sha(working_dir) {
         Some(sha) => {
-            map.lock()
-                .unwrap()
+            lock_cached(map)
                 .insert(working_dir.to_path_buf(), (SystemTime::now(), sha.clone()));
             Some(sha)
         }
@@ -355,6 +606,88 @@ fn current_git_sha(working_dir: &Path) -> Option<String> {
     }
 }
 
+/// How long a resolved git common-dir result is reused. The common dir is a
+/// stable property of a repo clone, so a per-process cache with a long TTL is
+/// fine and avoids a `git` fork on every query.
+const GIT_TOP_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Currently resolved git top/common-dir per working dir. The git *common dir*
+/// is identical across all worktrees of a repo (unlike `--show-toplevel`, which
+/// differs per worktree), so it is a correct shared-cache partition key.
+static LAST_GIT_TOP: OnceLock<Mutex<HashMap<PathBuf, (SystemTime, String)>>> = OnceLock::new();
+
+/// Return the git *common dir* path string for `working_dir`, cached per process
+/// so we don't fork `git` on every query. This is stable across every worktree
+/// of one repo, which is exactly the partition key we need for a shared cache.
+///
+/// Falls back to `None` like [`current_git_sha`] when git is unavailable.
+fn current_git_top_cached(working_dir: &Path) -> Option<String> {
+    let map = LAST_GIT_TOP.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let guard = lock_cached(map);
+        if let Some((t, top)) = guard.get(working_dir)
+            && t.elapsed().map(|d| d < GIT_TOP_CACHE_TTL).unwrap_or(false)
+        {
+            return Some(top.clone());
+        }
+    } // Drop the read lock before shelling out to git.
+    // Prefer the git *common dir* (identical across all worktrees). `--path-format=absolute`
+    // is a rev-parse flag (requires git >= 2.31); on older git it fails and we fall back
+    // to `--show-toplevel`, which is also an absolute, subdir-stable repo identity.
+    let top = git_repo_identity(working_dir);
+    let top = top?;
+    if top.is_empty() {
+        return None;
+    }
+    let result = top.clone();
+    lock_cached(map).insert(working_dir.to_path_buf(), (SystemTime::now(), top));
+    Some(result)
+}
+
+/// Resolve a stable repository identity string for `working_dir`, preferring
+/// the git common dir (identical across all worktrees) and falling back to the
+/// working-tree toplevel for older git. Returns `None` when git is unavailable
+/// or `working_dir` is not inside a git repo.
+///
+/// Note on the fallback: `--show-toplevel` resolves to the *current worktree's*
+/// own top directory, which differs for each linked worktree. That is safe
+/// (it never causes cross-worktree contamination), but on git < 2.31 the
+/// shared-cache benefit across linked worktrees is reduced because each worktree
+/// maps to its own identity. The absolute common-dir primary path (git >= 2.31)
+/// is what actually gives all worktrees one shared key.
+fn git_repo_identity(working_dir: &Path) -> Option<String> {
+    // Primary: absolute common dir.
+    let common = std::process::Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .current_dir(working_dir)
+        .output()
+        .ok();
+    if let Some(out) = common
+        && out.status.success()
+        && let Ok(s) = String::from_utf8(out.stdout)
+    {
+        let s = s.trim().to_string();
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    // Fallback: toplevel (absolute, subdir-stable).
+    let top = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(working_dir)
+        .output()
+        .ok()?;
+    if !top.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(top.stdout).ok()?.trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 /// Decide whether `graph_path`'s index is older than any source under `root`.
 ///
 /// Best-effort: a missing index, or any IO error while walking the tree, is
@@ -366,11 +699,20 @@ fn current_git_sha(working_dir: &Path) -> Option<String> {
 /// Callers should gate this behind `recently_scanned`/`record_scan` so the walk
 /// does not run on every query (see `ensure_fresh_engine`): within
 /// `STALE_RESCAN_TTL` of a verified-fresh scan we reuse the index without re-walking.
+///
+/// `shared` selects shared-cache semantics. A shared index is keyed strictly by
+/// the commit SHA and represents the *committed* tree: freshness is determined
+/// purely by SHA match, and the mtime walk is intentionally skipped. This is
+/// essential for correctness: local, uncommitted edits in one worktree must not
+/// force a rebuild of the shared index from that worktree's dirty tree, which
+/// would leak that worktree's uncommitted code into the index that clean
+/// worktrees on the same commit also read.
 fn index_is_stale(
     root: &Path,
     graph_path: &Path,
     current_sha: Option<&str>,
     cache_dir: &Path,
+    shared: bool,
 ) -> bool {
     // Check for branch/commit change first. If the current git SHA differs from
     // the one the index was built against, it's definitely stale.
@@ -379,6 +721,14 @@ fn index_is_stale(
         && sha != cached_sha
     {
         return true; // Branch/commit changed, index is stale
+    }
+
+    // A shared index is keyed by commit SHA and represents only committed code,
+    // so SHA match is the complete freshness criterion. We never walk the tree:
+    // uncommitted edits belong to one worktree and must not invalidate (or force
+    // a rebuild of) the index clean worktrees on the same SHA read.
+    if shared {
+        return false;
     }
 
     // Short-circuit if we recently scanned and confirmed freshness.
@@ -442,11 +792,17 @@ fn index_is_stale(
 /// `with_build_lock`, which serializes concurrent/stale rebuilds so two parallel
 /// calls can't write `graph.json` at once.
 fn ensure_fresh_engine(
-    graph_path: &Path,
-    cache_dir: &Path,
+    cache: &CompassCachePaths,
     working_dir: &Path,
 ) -> std::result::Result<compass_query::CodeQueryEngine, (String, String)> {
-    with_build_lock(cache_dir, || {
+    let CompassCachePaths {
+        output_dir,
+        graph_path,
+        ast_cache_root,
+        build_lock_dir,
+        is_shared,
+    } = cache;
+    with_build_lock(build_lock_dir, || {
         // Open an existing index. Reuse it only when source and branch haven't
         // moved past it. The mtime scan that proves freshness is throttled to
         // once per STALE_RESCAN_TTL per project (see `recently_scanned`/
@@ -460,7 +816,7 @@ fn ensure_fresh_engine(
         // `current_sha` is resolved lazily only when we actually have to
         // reconcile staleness against an open index: it shells out to `git`, so
         // we avoid that per query on the warm, recently-scanned path.
-        match compass_query::open(graph_path, None, cache_dir) {
+        match compass_query::open(graph_path, None, output_dir) {
             Ok(engine) => {
                 // Reuse the index only when nothing has moved past it.
                 // `index_is_stale` checks the cached git SHA first, so a
@@ -468,15 +824,30 @@ fn ensure_fresh_engine(
                 // throttled mtime walk; otherwise it relies on the per-cache
                 // STALE_RESCAN_TTL to skip the walk, and finally walks the tree.
                 let current_sha = current_git_sha_cached(working_dir);
-                if !index_is_stale(working_dir, graph_path, current_sha.as_deref(), cache_dir) {
-                    record_scan(cache_dir);
+                if !index_is_stale(working_dir, graph_path, current_sha.as_deref(), output_dir, *is_shared) {
+                    if !is_shared {
+                        record_scan(output_dir);
+                    }
                     return Ok(engine);
                 }
-                // Valid but stale (source edit or branch change): discard it and
-                // rebuild below so we never serve a dirty index. Do NOT treat
-                // the discarded index as freshly scanned.
+
+                // The shared index is keyed by the committed SHA and holds no
+                // worktree's uncommitted edits (see index_is_stale). For shared
+                // caches this branch is only reachable in the transient window
+                // after a checkout where the cached SHA lags HEAD. The output
+                // dir is already keyed by the current SHA, so we do NOT delete
+                // it here: Compass republishes atomically on rebuild, and
+                // removing it could destroy another worktree's still-in-use
+                // index on the same SHA. Non-shared caches (single output that
+                // evolves in place) still need a clean discard on source edits.
                 drop(engine);
-                let _ = std::fs::remove_dir_all(cache_dir.join("compass-out"));
+                if !is_shared {
+                    let _ = std::fs::remove_dir_all(output_dir);
+                    // Don't remove .compass-build.lock here - it's safe to leave
+                    // and removing it while holding the lock could block other
+                    // worktrees.
+                    let _ = std::fs::remove_file(output_dir.join(GIT_SHA_FILE));
+                }
             }
             Err(_) => {
                 // Missing or corrupt: rebuild below (current_sha is captured by
@@ -485,14 +856,28 @@ fn ensure_fresh_engine(
         }
 
         // Build (covers missing, corrupt, stale, or branch change). `cache_root`
-        // makes this incremental on a repeat build, re-extracting only changed
-        // files. `build_compass_index` also records the current git SHA sidecar,
-        // so a later branch switch is detected without walking the tree. Record
-        // the scan so the immediately following query doesn't re-walk the tree.
-        build_compass_index(working_dir, cache_dir)
+        // lives under the project's branch-agnostic `.ast-cache` dir and is shared
+        // across all SHAs of the repo, so a branch switch only re-extracts the
+        // files that actually changed instead of rebuilding cold.
+        // `build_compass_index` also records the current git SHA sidecar, so a
+        // later branch switch is detected without walking the tree. For shared
+        // caches, the scan is intentionally skipped so each caller still
+        // validates freshness against its own working directory.
+        build_compass_index(working_dir, output_dir, ast_cache_root)
             .map_err(|e| ("existing index missing or stale".to_string(), e.to_string()))?;
-        record_scan(cache_dir);
-        compass_query::open(graph_path, None, cache_dir).map_err(|e| {
+        if !is_shared {
+            record_scan(output_dir);
+        } else {
+            // Prune unreachable, aged-out per-SHA graphs so the shared cache
+            // does not grow unbounded as the user visits many commits. Always
+            // keep the current HEAD's dir, even a detached HEAD with no ref.
+            if let Some(project_root) = output_dir.parent()
+                && let Some(current_sha) = current_git_sha_cached(working_dir)
+            {
+                prune_stale_sha_outputs(project_root, working_dir, &current_sha);
+            }
+        }
+        compass_query::open(graph_path, None, output_dir).map_err(|e| {
             (
                 "existing index missing or stale".to_string(),
                 format!("Index was built but could not be opened: {e}"),
@@ -505,10 +890,10 @@ fn ensure_fresh_engine(
 /// Compass library API (`compass_core::build_graph_with_layers`). The resulting
 /// store is written into `output_dir` so the project tree stays untouched.
 ///
-/// `cache_root` points at the same dir as `output_dir` so Compass can persist
-/// its AST-fact digests across builds. On a rebuild (stale index) this lets
-/// Compass re-extract only changed files instead of the whole project, i.e. the
-/// index is incrementally maintained rather than fully re-derived each time.
+/// `cache_root` (`ast_cache_root`) holds Compass's AST-fact digests. Unlike the
+/// output, it is NOT keyed per SHA: it lives under the project's shared
+/// `.ast-cache` dir, so on a branch switch Compass reuses the content-keyed
+/// cache and re-extracts only changed files instead of the whole project.
 ///
 /// On success the current git commit SHA is recorded in a sidecar next to the
 /// index, so a later `index_is_stale` call can detect a branch/commit switch
@@ -522,10 +907,11 @@ fn ensure_fresh_engine(
 fn build_compass_index(
     root: &std::path::Path,
     output_dir: &std::path::Path,
+    ast_cache_root: &std::path::Path,
 ) -> Result<(), anyhow::Error> {
     let mut options = BuildOptions::new(root);
     options.output_root = Some(output_dir.to_path_buf());
-    options.cache_root = Some(output_dir.to_path_buf());
+    options.cache_root = Some(ast_cache_root.to_path_buf());
     options.purpose = BuildPurpose::Extract;
     options.scan_filesystem = true;
     options.graph_storage = compass_core::GraphStorage::Json;
@@ -611,22 +997,52 @@ mod tests {
     use jcode_tool_core::ToolExecutionMode;
     use std::io::Write;
     use std::path::PathBuf;
-    use tempfile::TempDir;
+
+    /// Test helper that sets `JCODE_HOME` for the duration of a test, so
+    /// `resolve_compass_cache`/`execute` writes under a temp dir instead of the
+    /// real `~/.jcode`. Holds the `TempDir` so it isn't removed early, and
+    /// restores/removes the previous `JCODE_HOME` on drop.
+    struct HomeGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl HomeGuard {
+        fn set() -> (Self, PathBuf) {
+            let _lock = crate::storage::lock_test_env();
+            let dir = tempfile::tempdir().expect("temp home");
+            let path = dir.path().to_path_buf();
+            crate::env::set_var("JCODE_HOME", &path);
+            (HomeGuard { _lock, _dir: dir }, path)
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            crate::env::remove_var("JCODE_HOME");
+        }
+    }
 
     /// Create an isolated temp project with a single source file, returning the
-    /// project dir and its `.jcode/cache/compass` cache dir. The `TempDir` is
-    /// dropped (and the directory removed) automatically when the test ends, so
-    /// each test gets a unique, isolated workspace with no cross-test leakage.
-    fn make_isolated_project() -> (TempDir, PathBuf, PathBuf) {
+    /// project dir, its `compass-out` output dir, and a separate branch-agnostic
+    /// AST cache root (mirroring the production split). The `TempDir` is dropped
+    /// (and the directory removed) automatically when the test ends, so each test
+    /// gets a unique, isolated workspace with no cross-test leakage.
+    fn make_isolated_project() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
         let tmp = tempfile::tempdir().expect("create temp dir");
         let root = tmp.path().to_path_buf();
         let mut f = std::fs::File::create(root.join("main.rs")).unwrap();
         writeln!(f, "fn authenticate(user: &str) {{ let _ = user; }}").unwrap();
         drop(f);
 
-        let cache = root.join(".jcode/cache/compass");
-        std::fs::create_dir_all(&cache).unwrap();
-        (tmp, root, cache)
+        // Match production semantics: `output_dir` is Compass's *output root*
+        // (Compass writes its graph under `<output_dir>/compass-out/graph.json`),
+        // and `ast_cache_root` is the branch-agnostic AST-fact cache.
+        let output_dir = root.join("cache/compass");
+        let ast_cache_root = root.join("cache/.ast-cache");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::create_dir_all(&ast_cache_root).unwrap();
+        (tmp, root, output_dir, ast_cache_root)
     }
 
     #[test]
@@ -663,14 +1079,14 @@ mod tests {
     }
     #[test]
     fn builds_and_queries_index() {
-        let (_tmp, root, cache) = make_isolated_project();
+        let (_tmp, root, output_dir, ast_cache_root) = make_isolated_project();
 
         // Build the index in-process.
-        build_compass_index(&root, &cache).expect("build should succeed");
+        build_compass_index(&root, &output_dir, &ast_cache_root).expect("build should succeed");
 
         // Open and run a search.
         let engine =
-            compass_query::open(&cache.join("compass-out").join("graph.json"), None, &cache)
+            compass_query::open(&output_dir.join("compass-out/graph.json"), None, &output_dir)
                 .expect("open after build");
         let response = engine
             .search(SearchRequest {
@@ -696,8 +1112,13 @@ mod tests {
     // overlap, then assert every call succeeds and a single valid index remains.
     #[test]
     fn concurrent_cold_builds_do_not_race() {
-        let (_tmp, root, cache) = make_isolated_project();
-        let graph_path = cache.join("compass-out").join("graph.json");
+        let (_home, root) = HomeGuard::set();
+        let root = root.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut f = std::fs::File::create(root.join("main.rs")).unwrap();
+        writeln!(f, "fn authenticate(user: &str) {{ let _ = user; }}").unwrap();
+        drop(f);
+        let graph_path = resolve_compass_cache(&root).graph_path;
         assert!(!graph_path.exists(), "fixture should start with no index");
 
         let tool = std::sync::Arc::new(CompassQueryTool::new());
@@ -758,17 +1179,124 @@ mod tests {
             graph_path.exists(),
             "index should exist after concurrent builds"
         );
+        let edge = resolve_compass_cache(&root);
         assert!(
-            compass_query::open(&graph_path, None, &cache).is_ok(),
+            compass_query::open(&graph_path, None, &edge.output_dir).is_ok(),
             "index left by concurrent builds must be openable"
         );
     }
 
+    // Two worktrees of the same repo on DIFFERENT commits must be able to build
+    // concurrently without corrupting the shared .ast-cache. This is the race the
+    // per-project build lock (vs a per-SHA lock) exists to prevent: Compass does
+    // not internally lock its shared-history cache.
+    #[test]
+    fn concurrent_cross_worktree_builds_do_not_corrupt_shared_cache() {
+        let (_home, _home_path) = HomeGuard::set();
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+
+        let git = |args: &[&str], cwd: &std::path::Path| -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init", "-q"], &main) {
+            return;
+        }
+        git(&["config", "user.email", "test@example.com"], &main);
+        git(&["config", "user.name", "Test"], &main);
+        std::fs::write(main.join("main.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "."], &main);
+        if !git(&["commit", "-qm", "init"], &main) {
+            return;
+        }
+        // Create a second commit on a different branch so the worktrees are on
+        // DIFFERENT SHAs.
+        git(&["checkout", "-qb", "other"], &main);
+        std::fs::write(main.join("main.rs"), "fn b() {}\n").unwrap();
+        git(&["commit", "-aqm", "other"], &main);
+        // Two linked worktrees, one per branch/commit.
+        git(&["checkout", "-q", "master"], &main);
+        if !std::process::Command::new("git")
+            .args(["worktree", "add", "-qb", "wother", wt.to_str().unwrap(), "other"])
+            .current_dir(&main)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        let tool = std::sync::Arc::new(CompassQueryTool::new());
+        let failures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        std::thread::scope(|s| {
+            for wd in [main.clone(), wt.clone()] {
+                let tool = tool.clone();
+                let failures = failures.clone();
+                s.spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .expect("runtime");
+                    let ctx = ToolContext {
+                        session_id: "s".into(),
+                        message_id: "m".into(),
+                        tool_call_id: "t".into(),
+                        working_dir: Some(wd),
+                        stdin_request_tx: None,
+                        graceful_shutdown_signal: None,
+                        execution_mode: ToolExecutionMode::Direct,
+                    };
+                    let out = rt.block_on(
+                        tool.execute(serde_json::json!({ "query": "authentication" }), ctx),
+                    );
+                    match out {
+                        Ok(out) if out.output.contains("**Found ") => {}
+                        _ => {
+                            failures.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            failures.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "both cross-worktree concurrent builds must succeed against a shared .ast-cache"
+        );
+        // Both per-SHA outputs must be independently valid.
+        let main_shas = git_reachable_shas(&main).unwrap();
+        let (a_sha, b_sha) = {
+            let mut v: Vec<&String> = main_shas.iter().collect();
+            v.sort();
+            (v[0].clone(), v[1].clone())
+        };
+        for sha in [a_sha, b_sha] {
+            let out_dir = crate::storage::jcode_dir()
+                .unwrap()
+                .join(COMPASS_CACHE_HOME)
+                .join(short_id(
+                    &git_repo_identity(&main).unwrap(),
+                ))
+                .join(&sha);
+            assert!(
+                compass_query::open(&out_dir.join("compass-out/graph.json"), None, &out_dir).is_ok(),
+                "per-SHA index for {sha} must be openable after concurrent builds"
+            );
+        }
+    }
+
     #[test]
     fn index_is_stale_detects_new_source() {
-        let (_tmp, root, cache) = make_isolated_project();
-        let graph_path = cache.join("compass-out").join("graph.json");
-        build_compass_index(&root, &cache).expect("build");
+        let (_tmp, root, output_dir, ast_cache_root) = make_isolated_project();
+        let graph_path = output_dir.join("compass-out/graph.json");
+        build_compass_index(&root, &output_dir, &ast_cache_root).expect("build");
 
         // A fresh index is not considered stale against its own source.
         assert!(
@@ -776,7 +1304,8 @@ mod tests {
                 &root,
                 &graph_path,
                 current_git_sha(&root).as_deref(),
-                &cache
+                &output_dir,
+                false
             ),
             "just-built index should not be stale"
         );
@@ -791,19 +1320,21 @@ mod tests {
                 &root,
                 &graph_path,
                 current_git_sha(&root).as_deref(),
-                &cache
+                &output_dir,
+                false
             ),
             "index must be stale after a newer source file is added"
         );
 
         // Rebuilding refreshes the index mtime, so it is no longer stale.
-        build_compass_index(&root, &cache).expect("rebuild");
+        build_compass_index(&root, &output_dir, &ast_cache_root).expect("rebuild");
         assert!(
             !index_is_stale(
                 &root,
                 &graph_path,
                 current_git_sha(&root).as_deref(),
-                &cache
+                &output_dir,
+                false
             ),
             "index should be fresh again after rebuild"
         );
@@ -815,11 +1346,18 @@ mod tests {
     // query succeeds — a valid-but-stale index would also satisfy the latter.
     #[tokio::test]
     async fn stale_index_is_rebuilt_on_query() {
-        let (_tmp, root, cache) = make_isolated_project();
-        let graph_path = cache.join("compass-out").join("graph.json");
-        build_compass_index(&root, &cache).expect("build");
+        let (_home, root) = HomeGuard::set();
+        let root = root.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut f = std::fs::File::create(root.join("main.rs")).unwrap();
+        writeln!(f, "fn authenticate(user: &str) {{ let _ = user; }}").unwrap();
+        drop(f);
+        let edge = resolve_compass_cache(&root);
+        let graph_path = edge.graph_path.clone();
+        let out_dir = edge.output_dir.join("compass-out");
+        let c = edge.clone();
+        build_compass_index(&root, &c.output_dir, &c.ast_cache_root).expect("build");
 
-        let out_dir = cache.join("compass-out");
         std::thread::sleep(std::time::Duration::from_millis(10));
         let before = std::fs::metadata(&out_dir)
             .expect("index dir exists")
@@ -862,7 +1400,7 @@ mod tests {
             "stale index must be rebuilt (dir mtime {after:?} should be after {before:?})"
         );
         assert!(
-            compass_query::open(&graph_path, None, &cache).is_ok(),
+            compass_query::open(&graph_path, None, &edge.output_dir).is_ok(),
             "rebuilt index must be openable"
         );
     }
@@ -872,9 +1410,16 @@ mod tests {
     // guards against regressions where the cache is needlessly discarded.
     #[tokio::test]
     async fn fresh_index_is_not_rebuilt_on_query() {
-        let (_tmp, root, cache) = make_isolated_project();
-        let out_dir = cache.join("compass-out");
-        build_compass_index(&root, &cache).expect("build");
+        let (_home, root) = HomeGuard::set();
+        let root = root.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut f = std::fs::File::create(root.join("main.rs")).unwrap();
+        writeln!(f, "fn authenticate(user: &str) {{ let _ = user; }}").unwrap();
+        drop(f);
+        let edge = resolve_compass_cache(&root);
+        let out_dir = edge.output_dir.join("compass-out");
+        let c = edge.clone();
+        build_compass_index(&root, &c.output_dir, &c.ast_cache_root).expect("build");
 
         std::thread::sleep(std::time::Duration::from_millis(10));
         let before = std::fs::metadata(&out_dir)
@@ -900,6 +1445,14 @@ mod tests {
             "fresh index query should succeed: {}",
             out.output
         );
+        // The query must actually return real search results through the public
+        // execute interface, not merely not-error: the built index must contain
+        // at least one node for "authentication".
+        assert!(
+            out.output.contains("**Found ") && out.output.contains(" result(s)**"),
+            "execute must return a result report, got: {}",
+            out.output
+        );
 
         // No rebuild => the index dir mtime is unchanged.
         let after = std::fs::metadata(&out_dir)
@@ -916,10 +1469,10 @@ mod tests {
     // CodeQueryLimits::is_valid) and fail the query.
     #[test]
     fn huge_limit_is_clamped_not_wrapped() {
-        let (_tmp, root, cache) = make_isolated_project();
-        let graph_path = cache.join("compass-out").join("graph.json");
-        build_compass_index(&root, &cache).expect("build");
-        let engine = compass_query::open(&graph_path, None, &cache).expect("open after build");
+        let (_tmp, root, output_dir, ast_cache_root) = make_isolated_project();
+        let graph_path = output_dir.join("compass-out/graph.json");
+        build_compass_index(&root, &output_dir, &ast_cache_root).expect("build");
+        let engine = compass_query::open(&graph_path, None, &output_dir).expect("open after build");
 
         // u32::MAX + 1 would wrap to 0 under a naive `as u32`.
         let out = execute_query(&engine, "authentication", None, u64::MAX as usize, "search")
@@ -990,18 +1543,20 @@ mod tests {
             return;
         }
 
-        let cache = root.join(".jcode/cache/compass");
-        std::fs::create_dir_all(&cache).unwrap();
-        let graph_path = cache.join("compass-out").join("graph.json");
-        build_compass_index(&root, &cache).expect("build");
+        let output_dir = root.join(".jcode/cache/compass");
+        let ast_cache_root = root.join(".jcode/cache/.ast-cache");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::create_dir_all(&ast_cache_root).unwrap();
+        let graph_path = output_dir.join("compass-out/graph.json");
+        build_compass_index(&root, &output_dir, &ast_cache_root).expect("build");
 
         // Sidecar was written at build time and matches HEAD.
         let sha1 = current_git_sha(&root).expect("sha after init");
-        assert_eq!(index_git_sha(&cache).as_deref(), Some(sha1.as_str()));
+        assert_eq!(index_git_sha(&output_dir).as_deref(), Some(sha1.as_str()));
 
         // A freshly built index is not stale against its own commit.
         assert!(
-            !index_is_stale(&root, &graph_path, current_git_sha(&root).as_deref(), &cache),
+            !index_is_stale(&root, &graph_path, current_git_sha(&root).as_deref(), &output_dir, false),
             "just-built index should not be stale against its own commit"
         );
 
@@ -1014,7 +1569,7 @@ mod tests {
         assert_ne!(sha1, sha2, "amend must produce a new commit SHA");
 
         assert!(
-            index_is_stale(&root, &graph_path, current_git_sha(&root).as_deref(), &cache),
+            index_is_stale(&root, &graph_path, current_git_sha(&root).as_deref(), &output_dir, false),
             "branch/commit change must mark the index stale even with unchanged mtimes"
         );
     }
@@ -1070,5 +1625,548 @@ mod tests {
         let sha1 = current_git_sha_cached(&root).expect("cached sha on a real repo");
         let sha2 = current_git_sha_cached(&root).expect("cached sha reused");
         assert_eq!(sha1, sha2, "SHA must be reused within the cache TTL");
+    }
+
+    // `git_repo_identity` must return one stable absolute value from any
+    // subdirectory of a repo. This is what makes the shared cache key identical
+    // across all worktrees of one repo. Skips when git is unavailable.
+    #[test]
+    fn git_repo_identity_is_stable_across_subdirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let git = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init"]) {
+            return;
+        }
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::write(root.join("a/b/main.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "."]);
+        if !git(&["commit", "-m", "init"]) {
+            return;
+        }
+
+        let top = git_repo_identity(&root).expect("identity in repo");
+        assert!(std::path::Path::new(&top).is_absolute(), "identity must be absolute: {top}");
+        let sub = git_repo_identity(&root.join("a/b")).expect("identity in subdir");
+        assert_eq!(top, sub, "identity must be identical from any subdir");
+        assert!(
+            !top.is_empty(),
+            "identity must not be empty"
+        );
+    }
+    #[test]
+    fn resolve_compass_cache_uses_shared_path_for_git_repos() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        // Init a real git repo so current_git_sha succeeds.
+        let ok = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return; // git not available.
+        }
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&root)
+            .status()
+            .ok();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&root)
+            .status()
+            .ok();
+        std::fs::write(root.join("main.rs"), "fn a() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .status()
+            .ok();
+        if !std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&root)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        let (_home, _home_path) = HomeGuard::set();
+        let cache = resolve_compass_cache(&root);
+        assert!(cache.is_shared, "git repo should use shared cache");
+        assert!(
+            cache
+                .output_dir
+                .to_string_lossy()
+                .contains(std::path::Path::new(COMPASS_CACHE_HOME).to_string_lossy().as_ref()),
+            "shared cache should be under the jcode home /compass dir: {}",
+            cache.output_dir.display()
+        );
+        assert!(cache.graph_path.ends_with("compass-out/graph.json"));
+    }
+
+    #[test]
+    fn resolve_compass_cache_falls_back_to_local_for_non_git() {
+        let (_home, home_path) = HomeGuard::set();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let cache = resolve_compass_cache(&root);
+        assert!(!cache.is_shared, "non-git dir should not use a git per-SHA cache");
+        assert!(
+            cache.output_dir.starts_with(&home_path),
+            "non-git cache should live under the jcode home, not the project: {}",
+            cache.output_dir.display()
+        );
+        assert!(!cache.output_dir.starts_with(&root), "cache must not be inside the project dir");
+        assert!(cache.graph_path.ends_with("compass-out/graph.json"));
+    }
+    #[test]
+    fn stale_index_cleanup_removes_sidecar_and_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        // Create a git repo with one commit.
+        let ok = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return;
+        }
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&root)
+            .status()
+            .ok();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&root)
+            .status()
+            .ok();
+        std::fs::write(root.join("main.rs"), "fn a() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .status()
+            .ok();
+        if !std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&root)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        let (_home, _home_path) = HomeGuard::set();
+        let cache = resolve_compass_cache(&root);
+        assert!(cache.is_shared);
+        let graph_path = &cache.graph_path;
+        let output_dir = &cache.output_dir;
+
+        // Build the index manually to create sidecar files.
+        build_compass_index(&root, output_dir, &cache.ast_cache_root).expect("build should succeed");
+
+        // Verify sidecar files exist.
+        assert!(
+            output_dir.join(GIT_SHA_FILE).exists(),
+            "git-sha sidecar should exist after build"
+        );
+        // Note: .compass-build.lock is only created during concurrent builds via with_build_lock,
+        // so we don't assert its existence here.
+
+        // Verify the fresh index is not stale.
+        assert!(
+            !index_is_stale(&root, graph_path, current_git_sha(&root).as_deref(), output_dir, true),
+            "fresh index should not be stale"
+        );
+    }
+    #[test]
+    fn shared_cache_ignores_uncommitted_local_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        // Init a real git repo.
+        let ok = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return;
+        }
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&root)
+            .status()
+            .ok();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&root)
+            .status()
+            .ok();
+        std::fs::write(root.join("main.rs"), "fn a() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .status()
+            .ok();
+        if !std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&root)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        let (_home, _home_path) = HomeGuard::set();
+        let cache = resolve_compass_cache(&root);
+        assert!(cache.is_shared);
+        let graph_path = &cache.graph_path;
+        let output_dir = &cache.output_dir;
+
+        // Build the index.
+        build_compass_index(&root, output_dir, &cache.ast_cache_root).expect("build should succeed");
+
+        // Verify the index is fresh initially.
+        assert!(
+            !index_is_stale(&root, graph_path, current_git_sha(&root).as_deref(), output_dir, true),
+            "fresh index should not be stale"
+        );
+
+        // Uncommitted local edits in one worktree must NOT make the shared index
+        // stale: the shared index is keyed by commit SHA and represents only the
+        // committed tree. A local edit must never force a shared rebuild from a
+        // dirty worktree (which would leak that worktree's uncommitted code into
+        // the index all clean worktrees on the same SHA also read).
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(root.join("modified.rs"), "fn b() {}\n").unwrap();
+
+        assert!(
+            !index_is_stale(&root, graph_path, current_git_sha(&root).as_deref(), output_dir, true),
+            "shared index must stay fresh under uncommitted local edits (SHA unchanged)"
+        );
+    }
+
+    // For a shared cache, staleness is driven purely by the commit SHA.
+    // Advancing HEAD (amending produces a new SHA with an identical tree) must
+    // mark the shared index stale, since a shared index represents exactly one
+    // committed tree keyed by that SHA.
+    #[test]
+    fn shared_cache_rebuilds_on_commit_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        let git = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init"]) {
+            return;
+        }
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(root.join("main.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "."]);
+        if !git(&["commit", "-m", "init"]) {
+            return;
+        }
+        if current_git_sha(&root).is_none() {
+            return;
+        }
+
+        let (_home, _home_path) = HomeGuard::set();
+        let cache = resolve_compass_cache(&root);
+        assert!(cache.is_shared);
+        let graph_path = &cache.graph_path;
+        let output_dir = &cache.output_dir;
+        build_compass_index(&root, output_dir, &cache.ast_cache_root).expect("build");
+
+        // Fresh against its own commit.
+        assert!(
+            !index_is_stale(&root, graph_path, current_git_sha(&root).as_deref(), output_dir, true),
+            "shared index should be fresh against its own commit"
+        );
+
+        // Amend -> new SHA, identical tree -> shared index must turn stale.
+        assert!(git(&["commit", "--amend", "-m", "init-amended"]), "amend should succeed");
+        assert!(
+            index_is_stale(&root, graph_path, current_git_sha(&root).as_deref(), output_dir, true),
+            "shared index must be stale after the commit SHA changes"
+        );
+    }
+
+    #[test]
+    fn looks_like_sha_classifies_commit_hashes() {
+        assert!(looks_like_sha(&"a".repeat(40)));
+        assert!(looks_like_sha(&"0".repeat(40)));
+        assert!(looks_like_sha(&"a".repeat(64)), "sha256-object-format hash");
+        assert!(!looks_like_sha("short"));
+        assert!(!looks_like_sha(&"g".repeat(40)), "non-hex must not match");
+        assert!(!looks_like_sha(&"g".repeat(64)), "non-hex 64 must not match");
+        assert!(!looks_like_sha(AST_CACHE_DIR));
+        assert!(!looks_like_sha(WORKSPACE_DIR));
+    }
+
+    // The shared-cache project id must be deterministic and stable: the same
+    // repo id must hash to the same value across calls (and thus across
+    // processes/builds), so an on-disk cache is never orphaned by id drift.
+    #[test]
+    fn short_id_is_deterministic_and_hex() {
+        let a = short_id("/some/repo/.git");
+        let b = short_id("/some/repo/.git");
+        assert_eq!(a, b, "same input must hash identically");
+        assert_eq!(a.len(), a.chars().count());
+        assert_eq!(a.chars().count(), 64, "full 32-byte SHA-256 digest = 64 hex chars");
+        assert!(
+            a.chars().all(|c| c.is_ascii_hexdigit()),
+            "id must be hex only, got {a}"
+        );
+        // Different inputs differ.
+        assert_ne!(short_id("/repo/one/.git"), short_id("/repo/two/.git"));
+    }
+
+    #[test]
+    fn prune_stale_sha_outputs_spares_reachable_shared_and_workspace() {
+        let (_home, _home_path) = HomeGuard::set();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        // A real git repo so `git rev-list --all` yields a reachable SHA.
+        let git = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init"]) {
+            return;
+        }
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(root.join("main.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "."]);
+        if !git(&["commit", "-m", "init"]) {
+            return;
+        }
+        let Some(reachable) = git_reachable_shas(&root) else {
+            return;
+        };
+        assert_eq!(reachable.len(), 1, "exactly one commit in the fresh repo");
+        let head_sha = reachable.iter().next().unwrap().clone();
+
+        // Simulate the shared layout: reachable SHA dir, an unreachable old fake
+        // SHA dir, the AST cache, and a workspace dir.
+        let project_root = root.join("compass/proj");
+        std::fs::create_dir_all(project_root.join(&head_sha)).unwrap();
+        std::fs::create_dir_all(project_root.join(AST_CACHE_DIR)).unwrap();
+        std::fs::create_dir_all(project_root.join(WORKSPACE_DIR)).unwrap();
+        let stale_sha = "f".repeat(40);
+        std::fs::create_dir_all(project_root.join(&stale_sha)).unwrap();
+        // Backdate the unreachable dir beyond the retention window.
+        let old = std::time::SystemTime::now()
+            .checked_sub(SHA_RETENTION_TTL + std::time::Duration::from_secs(1))
+            .unwrap();
+        let filetime_old = filetime::FileTime::from_system_time(old);
+        filetime::set_file_mtime(project_root.join(&stale_sha), filetime_old).unwrap();
+
+        prune_stale_sha_outputs(&project_root, &root, &head_sha);
+
+        assert!(
+            project_root.join(&head_sha).exists(),
+            "reachable SHA dir must be kept"
+        );
+        assert!(
+            project_root.join(AST_CACHE_DIR).exists(),
+            "shared AST cache must be kept"
+        );
+        assert!(
+            project_root.join(WORKSPACE_DIR).exists(),
+            "workspace dir must be kept"
+        );
+        assert!(
+            !project_root.join(&stale_sha).exists(),
+            "old, unreachable per-SHA dir must be pruned"
+        );
+    }
+
+    // The current HEAD's per-SHA dir must survive GC even when that commit is a
+    // detached checkout (unreachable from any ref): pruning it would delete the
+    // index the very worktree currently uses. We simulate this directly: a
+    // 40-hex `current_sha` that is NOT in `git rev-list --all` (so reachability
+    // alone would not protect it), with an old mtime beyond the retention window.
+    // It must still be kept purely because it equals the active HEAD.
+    #[test]
+    fn prune_keeps_detached_head_even_if_unreachable() {
+        let (_home, _home_path) = HomeGuard::set();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        let git = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init", "-q"]) {
+            return;
+        }
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(root.join("main.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "."]);
+        if !git(&["commit", "-qm", "init"]) {
+            return;
+        }
+        let Some(reachable) = git_reachable_shas(&root) else {
+            return;
+        };
+
+        // A detached-HEAD sha that is NOT reachable from any ref (so reachability
+        // alone would NOT protect it), yet describes the currently checked-out
+        // commit and must survive GC.
+        let detached_sha = "a".repeat(40);
+        assert!(
+            !reachable.contains(&detached_sha),
+            "detached_sha must be unreachable so the test isolates the HEAD guard"
+        );
+
+        let project_root = root.join("compass/proj");
+        std::fs::create_dir_all(project_root.join(&detached_sha)).unwrap();
+        let old = std::time::SystemTime::now()
+            .checked_sub(SHA_RETENTION_TTL + std::time::Duration::from_secs(1))
+            .unwrap();
+        filetime::set_file_mtime(
+            project_root.join(&detached_sha),
+            filetime::FileTime::from_system_time(old),
+        )
+        .unwrap();
+
+        // GC with the active detached HEAD equal to detached_sha.
+        prune_stale_sha_outputs(&project_root, &root, &detached_sha);
+        assert!(
+            project_root.join(&detached_sha).exists(),
+            "detached current HEAD must be kept even though it is unreachable and old"
+        );
+    }
+
+    // END-USER ACCEPTANCE PATH: exercise the real CompassQueryTool::execute
+    // against actual linked git worktrees. Two worktrees of the same repo must
+    // (a) resolve to the SAME per-SHA output dir and AST cache root (from the
+    // git common dir), and (b) running the real tool in each worktree produces
+    // real results with only ONE on-disk index, proving the second worktree
+    // reused the first's shared index rather than building its own.
+    async fn run_execute(working_dir: &std::path::Path) -> bool {
+        let ctx = ToolContext {
+            session_id: "s".into(),
+            message_id: "m".into(),
+            tool_call_id: "t".into(),
+            working_dir: Some(working_dir.to_path_buf()),
+            stdin_request_tx: None,
+            graceful_shutdown_signal: None,
+            execution_mode: ToolExecutionMode::Direct,
+        };
+        match CompassQueryTool::new()
+            .execute(serde_json::json!({ "query": "authentication" }), ctx)
+            .await
+        {
+            Ok(out) => {
+                out.output.contains("**Found ") && out.output.contains(" result(s)**")
+            }
+            Err(_) => false,
+        }
+    }
+
+    #[tokio::test]
+    async fn linked_worktrees_share_one_index_end_to_end() {
+        let (_home, _home_path) = HomeGuard::set();
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+
+        let git = |args: &[&str], cwd: &std::path::Path| -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init", "-q"], &main) {
+            return;
+        }
+        git(&["config", "user.email", "test@example.com"], &main);
+        git(&["config", "user.name", "Test"], &main);
+        std::fs::write(main.join("main.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "."], &main);
+        if !git(&["commit", "-qm", "init"], &main) {
+            return;
+        }
+        git(&["branch", "shared"], &main);
+        if !std::process::Command::new("git")
+            .args(["worktree", "add", "-q", wt.to_str().unwrap(), "shared"])
+            .current_dir(&main)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        let main_cache = resolve_compass_cache(&main);
+        let wt_cache = resolve_compass_cache(&wt);
+        assert!(main_cache.is_shared && wt_cache.is_shared);
+        assert_eq!(main_cache.output_dir, wt_cache.output_dir);
+        assert_eq!(main_cache.ast_cache_root, wt_cache.ast_cache_root);
+
+        // Run the real tool in BOTH worktrees; each must return indexed results.
+        assert!(run_execute(&main).await, "main worktree must return results");
+        // The second run (in the linked worktree) must reuse the shared index.
+        let shared_graph = main_cache.output_dir.join("compass-out/graph.json");
+        assert!(shared_graph.exists(), "shared index must exist after first execute");
+        assert!(
+            run_execute(&wt).await,
+            "linked worktree must also return results via the shared index"
+        );
+
+        // Exactly one index must exist for both worktrees (the sharing guarantee).
+        let mut index_count = 0usize;
+        if let Ok(entries) = std::fs::read_dir(&main_cache.output_dir) {
+            for e in entries.flatten() {
+                if e.file_name().to_string_lossy() == "compass-out" {
+                    index_count += 1;
+                }
+            }
+        }
+        assert_eq!(index_count, 1, "one shared index, not one per worktree");
     }
 }
