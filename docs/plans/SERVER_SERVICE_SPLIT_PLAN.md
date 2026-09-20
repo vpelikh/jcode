@@ -1289,3 +1289,36 @@ accessor and routed all three sites through it.
 Zero behavior change; the server suite stays green (482 passing) and clippy adds
 no new warnings. One unit test covers coordinator vs plain-member vs unknown /
 post-clear coordinator identity.
+
+## Trade-off resolutions (2026-09)
+
+Follow-up pass weighing the branch's known trade-offs.
+
+- **Lock ordering (resolved).** `coordinator_identity` now resolves the member's
+  swarm id first (dropping the `members` guard) before reading `coordinators`,
+  so it holds one swarm map lock at a time instead of nesting `members` +
+  `coordinators` reads. Behavior-identical (same reads, same order), less lock
+  hold time; the `require_coordinator_swarm` and the debug approve/reject
+  branches inherit it. Covered by the services suite (15) and the full server
+  suite (482).
+- **Thin accessors (`member_swarm_id` / `member_swarm_ids`): kept.** Both are
+  consumed (`coordinator_identity` / `require_plan_driver_swarm` use
+  `member_swarm_id`, `ensure_same_swarm_access` uses `member_swarm_ids`), so
+  they are not dead and provide consistent swarm-id resolution behind the
+  handle. Verified no unused-accessor warnings.
+- **Live-wire swarm-comm e2e (deliberately not added).** A socket-level test that
+  drives propose -> approve -> assign over a running server requires realistic
+  swarm-membership setup (two sessions deriving the same swarm id plus a
+  coordinator outcome), which is brittle and flaky-prone. The swarm logic is
+  already covered at the router layer by `client_comm` (6), `comm_plan` (9,
+  approve/reject/coordinator-direct), `comm_control` (70, assign/deep/e2e), and
+  `comm_session` (36), and the real debug *command string* path is
+  covered by the debug swarm-write test. Forcing a membership-dependent socket
+  e2e would add maintenance cost disproportionate to its coverage, so it was
+  deliberately scoped out.
+
+- The remaining Tier-3 follow-up (the intertwined `comm_graph` / `comm_session`
+  / `comm_await` / `comm_sync` resync / session-lifecycle `.swarm_state()`
+  sites, and true ownership isolation) is deferred to dedicated slices with
+  their own ownership decisions (file_touch / shared_context / channel-subscript),
+  per the plan's dependency-direction section.

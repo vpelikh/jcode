@@ -838,10 +838,14 @@ impl SwarmServiceHandle {
     /// own `require_coordinator_swarm` and by callers (e.g. the debug plan
     /// commands) that need the raw identity without emitting an error event.
     pub(crate) async fn coordinator_identity(&self, session_id: &str) -> (Option<String>, bool) {
-        let members = self.swarm_state.members.read().await;
-        let swarm_id = members
-            .get(session_id)
-            .and_then(|member| member.swarm_id.clone());
+        // Resolve the member's swarm id without retaining the members lock while
+        // reading coordinators (independent locks, never a path back to members).
+        let swarm_id = {
+            let members = self.swarm_state.members.read().await;
+            members
+                .get(session_id)
+                .and_then(|member| member.swarm_id.clone())
+        };
         let is_coordinator = if let Some(ref swarm_id) = swarm_id {
             let coordinators = self.swarm_state.coordinators.read().await;
             coordinators
