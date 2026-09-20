@@ -1,17 +1,17 @@
+use super::services::SwarmServiceHandle;
 use super::{
-    ClientConnectionInfo, ClientDebugState, DebugJob, FileAccess, FileTouchService, ServerIdentity,
-    SessionInterruptQueues, SharedContext, SwarmEvent, SwarmMember, VersionedPlan,
+    ClientConnectionInfo, ClientDebugState, DebugJob, FileAccess, ServerIdentity,
+    SessionInterruptQueues, SharedContext, SwarmEvent, SwarmMember,
 };
 use crate::agent::Agent;
 use anyhow::Result;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
 
 type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
-type ChannelSubscriptions = Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
 
 const MEMORY_INCIDENT_WINDOW_MS: u128 = 15 * 60 * 1_000;
 const MEMORY_WARNING_PSS_BYTES: u64 = 1024 * 1024 * 1024;
@@ -92,22 +92,18 @@ pub(super) async fn maybe_handle_server_state_command(
     cmd: &str,
     sessions: &SessionAgents,
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    swarm: &SwarmServiceHandle,
     client_debug_state: &Arc<RwLock<ClientDebugState>>,
     server_identity: &ServerIdentity,
     server_start_time: Instant,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    shared_context: &Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-    file_touch: &FileTouchService,
-    channel_subscriptions: &ChannelSubscriptions,
-    channel_subscriptions_by_session: &ChannelSubscriptions,
     debug_jobs: &Arc<RwLock<HashMap<String, DebugJob>>>,
-    event_history: &Arc<RwLock<VecDeque<SwarmEvent>>>,
     shutdown_signals: &Arc<RwLock<HashMap<String, jcode_agent_runtime::InterruptSignal>>>,
     soft_interrupt_queues: &SessionInterruptQueues,
 ) -> Result<Option<String>> {
+    // Swarm-domain state is reached through the swarm service handle. This
+    // local keeps the body single-homed on the handle's field instead of a
+    // flat pass-through argument bag (server service split, Slice 4).
+    let swarm_members = &swarm.swarm_state.members;
     if cmd == "sessions" {
         let (connected_agents, members) =
             connected_session_snapshot(sessions, client_connections, swarm_members).await;
@@ -180,7 +176,7 @@ pub(super) async fn maybe_handle_server_state_command(
         let payload = build_server_memory_incident_payload(
             sessions,
             client_connections,
-            swarm_members,
+            swarm,
             server_identity,
             server_start_time,
         )
@@ -194,19 +190,11 @@ pub(super) async fn maybe_handle_server_state_command(
         let payload = build_server_memory_payload(
             sessions,
             client_connections,
-            swarm_members,
+            swarm,
             client_debug_state,
             server_identity,
             server_start_time,
-            swarms_by_id,
-            shared_context,
-            swarm_plans,
-            swarm_coordinators,
-            file_touch,
-            channel_subscriptions,
-            channel_subscriptions_by_session,
             debug_jobs,
-            event_history,
             shutdown_signals,
             soft_interrupt_queues,
         )
@@ -392,10 +380,12 @@ fn classify_memory_incident(metrics: MemoryIncidentMetrics) -> MemoryIncidentDec
 async fn build_server_memory_incident_payload(
     sessions: &SessionAgents,
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    swarm: &SwarmServiceHandle,
     server_identity: &ServerIdentity,
     server_start_time: Instant,
 ) -> serde_json::Value {
+    // Swarm-domain state is reached through the swarm service handle (Slice 4).
+    let swarm_members = &swarm.swarm_state.members;
     // This command intentionally avoids locking any Agent. It must remain usable
     // when thousands of sessions are resident and the full server:memory walk is
     // slow or contended.
@@ -758,22 +748,24 @@ mod tests {
 async fn build_server_memory_payload(
     sessions: &SessionAgents,
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    swarm: &SwarmServiceHandle,
     client_debug_state: &Arc<RwLock<ClientDebugState>>,
     server_identity: &ServerIdentity,
     server_start_time: Instant,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    shared_context: &Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-    file_touch: &FileTouchService,
-    channel_subscriptions: &ChannelSubscriptions,
-    channel_subscriptions_by_session: &ChannelSubscriptions,
     debug_jobs: &Arc<RwLock<HashMap<String, DebugJob>>>,
-    event_history: &Arc<RwLock<VecDeque<SwarmEvent>>>,
     shutdown_signals: &Arc<RwLock<HashMap<String, jcode_agent_runtime::InterruptSignal>>>,
     soft_interrupt_queues: &SessionInterruptQueues,
 ) -> serde_json::Value {
+    // Swarm-domain state is reached through the swarm service handle (Slice 4).
+    let swarm_members = &swarm.swarm_state.members;
+    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let shared_context = &swarm.shared_context;
+    let swarm_plans = &swarm.swarm_state.plans;
+    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let file_touch = &swarm.file_touch;
+    let channel_subscriptions = &swarm.channel_subscriptions;
+    let channel_subscriptions_by_session = &swarm.channel_subscriptions_by_session;
+    let event_history = &swarm.event_history;
     let process = crate::process_memory::snapshot_with_source("server:memory");
     let background_tasks = crate::background::global().list().await;
     let embedder_stats = crate::embedding::stats();
