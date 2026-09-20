@@ -60,6 +60,125 @@ async fn stdio_stream_handshake_ping_and_eof_release_daemon_connection() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn interactive_desktop_hello_sets_crash_on_disconnect_on_subscribe() {
+    let root = std::env::temp_dir().join(format!(
+        "jcode-desktop2-crash-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let socket = root.join("daemon.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let (client, bridge) = tokio::io::duplex(8192);
+    let (bridge_read, bridge_write) = tokio::io::split(bridge);
+    let task = tokio::spawn(run_bridge_stream(bridge_read, bridge_write, socket));
+    let (read, mut write) = tokio::io::split(client);
+    let mut read = BufReader::new(read);
+
+    // Interactive desktop client hello.
+    write_json_line(
+        &mut write,
+        &ClientFrame::new(
+            1,
+            ApiRequest::Hello {
+                min_version: API_VERSION_MAJOR,
+                max_version: API_VERSION_MAJOR,
+                client: "jcode-desktop2/0.83.0".into(),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    let mut line = String::new();
+    read_frame(&mut read, &mut line).await.unwrap();
+    let (daemon, _) = listener.accept().await.unwrap();
+
+    // Create a session; this maps to a legacy `subscribe`.
+    write_json_line(
+        &mut write,
+        &ClientFrame::new(2, ApiRequest::CreateSession { working_dir: None }),
+    )
+    .await
+    .unwrap();
+
+    // The daemon receives the subscribe labelled with crash_on_disconnect.
+    let mut daemon = BufReader::new(daemon);
+    let mut out = Vec::new();
+    daemon.read_until(b'\n', &mut out).await.unwrap();
+    let request: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(request["type"], "subscribe");
+    assert_eq!(request["crash_on_disconnect"], true);
+
+    drop(listener);
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = task.abort();
+    let _ = line;
+    let _ = read;
+    let _ = write;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn background_helper_hello_does_not_set_crash_on_disconnect() {
+    let root = std::env::temp_dir().join(format!(
+        "jcode-helper-crash-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let socket = root.join("daemon.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let (client, bridge) = tokio::io::duplex(8192);
+    let (bridge_read, bridge_write) = tokio::io::split(bridge);
+    let task = tokio::spawn(run_bridge_stream(bridge_read, bridge_write, socket));
+    let (read, mut write) = tokio::io::split(client);
+    let mut read = BufReader::new(read);
+
+    write_json_line(
+        &mut write,
+        &ClientFrame::new(
+            1,
+            ApiRequest::Hello {
+                min_version: API_VERSION_MAJOR,
+                max_version: API_VERSION_MAJOR,
+                client: "jcode-desktop2-sessions/0.83.0".into(),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    let mut line = String::new();
+    read_frame(&mut read, &mut line).await.unwrap();
+    let (daemon, _) = listener.accept().await.unwrap();
+
+    write_json_line(
+        &mut write,
+        &ClientFrame::new(2, ApiRequest::CreateSession { working_dir: None }),
+    )
+    .await
+    .unwrap();
+
+    let mut daemon = BufReader::new(daemon);
+    let mut out = Vec::new();
+    daemon.read_until(b'\n', &mut out).await.unwrap();
+    let request: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(request["type"], "subscribe");
+    assert!(request.get("crash_on_disconnect").is_none());
+
+    drop(listener);
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = task.abort();
+    let _ = line;
+    let _ = read;
+    let _ = write;
+}
+
 #[tokio::test]
 async fn stdio_stream_rejects_bad_hello_without_dialing_daemon() {
     let (mut client, bridge) = tokio::io::duplex(8192);

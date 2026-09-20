@@ -18,10 +18,10 @@
 //!   line untouched.
 //!
 //! Regular `cmd+;` and `cmd+'` bindings forward Desktop's pinned/home session
-//! aliases when `jcode-desktop` is focused. This runtime route uses `niri`, `jq`,
-//! and `wtype`. Other apps (or unavailable focus information) retain the terminal
-//! launcher, as do all self-dev and modified bindings. A forwarding failure does
-//! not also launch a terminal.
+//! aliases when the `jcode-desktop2` window is focused. This runtime route uses
+//! `niri`, `jq`, and `wtype`. Other apps (or unavailable focus information)
+//! retain the terminal launcher, as do all self-dev and modified bindings. A
+//! forwarding failure does not also launch a terminal.
 //!
 //! The managed region is delimited by sentinel comments so re-installs are
 //! idempotent and a user can hand-remove it cleanly:
@@ -169,7 +169,7 @@ fn launch_shell_command(
     let desktop_route = desktop_keys
         .map(|keys| {
             format!(
-                "if [ \"$(niri msg -j focused-window 2>/dev/null | jq -r '.app_id // empty' 2>/dev/null)\" = 'jcode-desktop' ]; then exec wtype {keys}; fi; "
+                "if [ \"$(niri msg -j focused-window 2>/dev/null | jq -r '.app_id // empty' 2>/dev/null)\" = 'jcode-desktop2' ]; then exec wtype {keys}; fi; "
             )
         })
         .unwrap_or_default();

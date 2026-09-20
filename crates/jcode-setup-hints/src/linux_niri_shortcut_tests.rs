@@ -90,7 +90,7 @@ fn regular_desktop_shortcuts_forward_exact_aliases() {
         ("cmd+'", "wtype\n<-M>\n<ctrl>\n<-k>\n<t>\n<-m>\n<ctrl>\n"),
     ] {
         let fixture = RouterFixture::new();
-        let output = fixture.run(chord, false, "jcode-desktop", &[]);
+        let output = fixture.run(chord, false, "jcode-desktop2", &[]);
         assert!(output.status.success(), "{output:?}");
         assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
         assert!(fixture.queried());
@@ -106,6 +106,8 @@ fn other_apps_and_missing_focus_preserve_launcher_arguments_and_directory() {
             "",
             "org.jcode-desktop",
             "jcode-desktop-extra",
+            // The old binary name no longer identifies the desktop window.
+            "jcode-desktop",
         ] {
             let fixture = RouterFixture::new();
             let output = fixture.run(chord, false, app, &[]);
@@ -166,7 +168,7 @@ fn self_dev_and_other_chords_do_not_even_query_focus() {
 #[test]
 fn failed_forwarding_does_not_launch_a_terminal() {
     let fixture = RouterFixture::new();
-    let output = fixture.run("cmd+'", false, "jcode-desktop", &[("WTYPE_STATUS", "7")]);
+    let output = fixture.run("cmd+'", false, "jcode-desktop2", &[("WTYPE_STATUS", "7")]);
     assert_eq!(output.status.code(), Some(7));
     assert!(String::from_utf8_lossy(&output.stdout).starts_with("wtype\n"));
     assert!(!String::from_utf8_lossy(&output.stdout).contains("kitty"));
