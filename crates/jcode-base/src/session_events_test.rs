@@ -1,7 +1,7 @@
 #![allow(unused_variables, unused_imports)]
 
 use crate::session::event_types::SessionEventOp;
-use crate::session::Session;
+use crate::session::{CompactionId, EventId, MessageId, Session};
 use crate::session::event_types::{SessionEvent, SessionEventMap};
 use crate::message::ContentBlock;
 use jcode_session_types::{StoredCompactionState, StoredMemoryInjection, StoredMessage};
@@ -219,7 +219,7 @@ fn test_compaction_bracket_balanced_round_trip() {
     assert!(back.orphaned_compaction().is_none());
     match &back.events[0].op {
         SessionEventOp::CompactionStart { compaction_id, covers_up_to_turn } => {
-            assert_eq!(compaction_id, "comp_1");
+            assert_eq!(compaction_id.as_str(), "comp_1");
             assert_eq!(*covers_up_to_turn, 6);
         }
         _ => panic!("expected CompactionStart as first event"),
@@ -270,7 +270,7 @@ fn test_all_session_event_ops_round_trip_losslessly() {
 
     let ops = vec![
         SessionEventOp::AppendMessage {
-            message_id: "m1".to_string(),
+            message_id: "m1".to_string().into(),
             message: msg("m1"),
         },
         SessionEventOp::ReplaceMessages {
@@ -286,7 +286,7 @@ fn test_all_session_event_ops_round_trip_losslessly() {
         SessionEventOp::ReplayEvent { replay_event: replay.clone() },
         SessionEventOp::SetCompaction { compaction: compaction.clone() },
         SessionEventOp::CompactionStart {
-            compaction_id: "c1".to_string(),
+            compaction_id: "c1".to_string().into(),
             covers_up_to_turn: 3,
         },
         SessionEventOp::CompactionEnd { compaction: compaction.clone() },
@@ -322,7 +322,7 @@ fn test_compaction_bracket_orphan_detection_on_crash() {
         .expect("an open bracket after a simulated crash must be orphaned");
     match &orphan.op {
         SessionEventOp::CompactionStart { compaction_id, covers_up_to_turn } => {
-            assert_eq!(compaction_id, "comp_crash");
+            assert_eq!(compaction_id.as_str(), "comp_crash");
             assert_eq!(*covers_up_to_turn, 12);
         }
         _ => panic!("orphan must be the CompactionStart marker"),
@@ -364,9 +364,9 @@ fn test_orphaned_compaction_reports_innermost_unmatched_start() {
     let mut map = SessionEventMap::default();
     map.append_event(SessionEvent {
         timestamp: chrono::Utc::now(),
-        event_id: "a".to_string(),
+        event_id: "a".to_string().into(),
         op: SessionEventOp::CompactionStart {
-            compaction_id: "outer".to_string(),
+            compaction_id: "outer".to_string().into(),
             covers_up_to_turn: 5,
         },
         parent_id: None,
@@ -374,9 +374,9 @@ fn test_orphaned_compaction_reports_innermost_unmatched_start() {
     });
     map.append_event(SessionEvent {
         timestamp: chrono::Utc::now(),
-        event_id: "b".to_string(),
+        event_id: "b".to_string().into(),
         op: SessionEventOp::CompactionStart {
-            compaction_id: "inner".to_string(),
+            compaction_id: "inner".to_string().into(),
             covers_up_to_turn: 5,
         },
         parent_id: None,
@@ -385,7 +385,7 @@ fn test_orphaned_compaction_reports_innermost_unmatched_start() {
     // Close the inner bracket; the OUTER one is the real orphan.
     map.append_event(SessionEvent {
         timestamp: chrono::Utc::now(),
-        event_id: "end_b".to_string(),
+        event_id: "end_b".to_string().into(),
         op: SessionEventOp::CompactionEnd {
             compaction: StoredCompactionState {
                 summary_text: "inner".to_string(),
@@ -405,7 +405,7 @@ fn test_orphaned_compaction_reports_innermost_unmatched_start() {
     match &orphan.op {
         SessionEventOp::CompactionStart { compaction_id, .. } => {
             assert_eq!(
-                compaction_id, "outer",
+                compaction_id.as_str(), "outer",
                 "orphaned_compaction must report the innermost *unmatched* start"
             );
         }
@@ -422,9 +422,9 @@ fn test_orphaned_compactions_reports_all_unmatched_starts() {
     // Two distinct interrupted runs: [Start A] ... [Start B] with no closes.
     let start_a = SessionEvent {
         timestamp: chrono::Utc::now(),
-        event_id: "a".to_string(),
+        event_id: "a".to_string().into(),
         op: SessionEventOp::CompactionStart {
-            compaction_id: "run_a".to_string(),
+            compaction_id: "run_a".to_string().into(),
             covers_up_to_turn: 5,
         },
         parent_id: None,
@@ -432,9 +432,9 @@ fn test_orphaned_compactions_reports_all_unmatched_starts() {
     };
     let start_b = SessionEvent {
         timestamp: chrono::Utc::now(),
-        event_id: "b".to_string(),
+        event_id: "b".to_string().into(),
         op: SessionEventOp::CompactionStart {
-            compaction_id: "run_b".to_string(),
+            compaction_id: "run_b".to_string().into(),
             covers_up_to_turn: 5,
         },
         parent_id: None,
@@ -466,7 +466,7 @@ fn test_compaction_end_without_start_is_flagged() {
     let mut map = SessionEventMap::default();
     map.append_event(SessionEvent {
         timestamp: chrono::Utc::now(),
-        event_id: "bare_end".to_string(),
+        event_id: "bare_end".to_string().into(),
         op: SessionEventOp::CompactionEnd {
             compaction: StoredCompactionState {
                 summary_text: "s".to_string(),
@@ -618,7 +618,7 @@ fn test_event_op_serialization() {
     use serde_json;
 
     let append_op = SessionEventOp::AppendMessage {
-        message_id: "test_123".to_string(),
+        message_id: "test_123".to_string().into(),
         message: StoredMessage {
             id: "msg_123".to_string(),
             role: Role::User,
@@ -684,7 +684,7 @@ fn test_unknown_op_flows_through_event_log() {
     };
     map.append_event(SessionEvent {
         timestamp: chrono::Utc::now(),
-        event_id: "unknown_1".to_string(),
+        event_id: "unknown_1".to_string().into(),
         op: unknown.clone(),
         parent_id: None,
         version: 1,
@@ -731,7 +731,7 @@ fn test_rebuild_event_map_preserves_plugin_unknown_events() {
     session.append_stored_message(message);
     session.append_session_event(SessionEvent {
         timestamp: chrono::Utc::now(),
-        event_id: "plugin_kept".to_string(),
+        event_id: "plugin_kept".to_string().into(),
         op: SessionEventOp::Unknown {
             event_type: "plugin/keep".to_string(),
             data: serde_json::json!({ "k": "v" }),
@@ -873,7 +873,7 @@ fn test_unknown_op_validation() {
     let mut map = SessionEventMap::default();
     map.append_event(SessionEvent {
         timestamp: chrono::Utc::now(),
-        event_id: String::new(),
+        event_id: EventId::from(String::new()),
         op: SessionEventOp::Unknown {
             event_type: "plugin/x".to_string(),
             data: serde_json::json!({}),
@@ -886,7 +886,7 @@ fn test_unknown_op_validation() {
     // A well-formed unknown op with a valid id is accepted.
     map.append_event(SessionEvent {
         timestamp: chrono::Utc::now(),
-        event_id: "unknown_ok".to_string(),
+        event_id: "unknown_ok".to_string().into(),
         op: SessionEventOp::Unknown {
             event_type: "plugin/x".to_string(),
             data: serde_json::json!({ "k": "v" }),
@@ -901,7 +901,7 @@ fn test_unknown_op_validation() {
     // so the append-only log must not be polluted with an unroutable event.
     map.append_event(SessionEvent {
         timestamp: chrono::Utc::now(),
-        event_id: "unknown_empty_type".to_string(),
+        event_id: "unknown_empty_type".to_string().into(),
         op: SessionEventOp::Unknown {
             event_type: String::new(),
             data: serde_json::json!({ "k": "v" }),
@@ -965,9 +965,9 @@ fn test_session_event_validation_accepts_valid_events() {
     let mut map = SessionEventMap::default();
     let valid_event = SessionEvent {
         timestamp: chrono::Utc::now(),
-        event_id: "msg_valid".to_string(),
+        event_id: "msg_valid".to_string().into(),
         op: SessionEventOp::AppendMessage {
-            message_id: "0".to_string(),
+            message_id: "0".to_string().into(),
             message: StoredMessage {
                 id: "0".to_string(),
                 role: Role::User,
@@ -990,7 +990,7 @@ fn test_session_event_validation_skips_invalid_event_id() {
     let mut map = SessionEventMap::default();
     let invalid_event = SessionEvent {
         timestamp: chrono::Utc::now(),
-        event_id: String::new(), // invalid: empty
+        event_id: EventId::from(String::new()), // invalid: empty
         op: SessionEventOp::ClearAll,
         parent_id: None,
         version: 1,
@@ -1004,7 +1004,7 @@ fn test_session_event_validation_skips_invalid_compaction() {
     let mut map = SessionEventMap::default();
     let invalid_event = SessionEvent {
         timestamp: chrono::Utc::now(),
-        event_id: "compact_bad".to_string(),
+        event_id: "compact_bad".to_string().into(),
         op: SessionEventOp::SetCompaction {
             compaction: StoredCompactionState {
                 summary_text: "x".to_string(),
@@ -1116,8 +1116,8 @@ fn test_replace_after_truncate_replays_deterministically() {
     for id in ["a", "b", "c"] {
         map.append_event(SessionEvent {
             timestamp: chrono::Utc::now(),
-            event_id: format!("rehydrate_{}", id),
-            op: SessionEventOp::AppendMessage { message_id: id.to_string(), message: mk(id) },
+            event_id: format!("rehydrate_{}", id).into(),
+            op: SessionEventOp::AppendMessage { message_id: MessageId::from(id.to_string()), message: mk(id) },
             parent_id: None,
             version: 1,
         });
@@ -1125,7 +1125,7 @@ fn test_replace_after_truncate_replays_deterministically() {
     // 2) truncate to first two (splice out the tail from index 2)
     map.append_event(SessionEvent {
         timestamp: chrono::Utc::now(),
-        event_id: "truncate".to_string(),
+        event_id: "truncate".to_string().into(),
         op: SessionEventOp::ReplaceMessages {
             start_index: 2,
             end_index: usize::MAX,
@@ -1145,7 +1145,7 @@ fn test_replace_after_truncate_replays_deterministically() {
     // 3) full replacement (end_index::MAX semantics)
     map.append_event(SessionEvent {
         timestamp: chrono::Utc::now(),
-        event_id: "replace_all".to_string(),
+        event_id: "replace_all".to_string().into(),
         op: SessionEventOp::ReplaceMessages {
             start_index: 0,
             end_index: usize::MAX,
@@ -1342,8 +1342,8 @@ fn test_replace_after_clear_replays_deterministically() {
     for id in ["a", "b"] {
         map.append_event(SessionEvent {
             timestamp: chrono::Utc::now(),
-            event_id: format!("rehydrate_{}", id),
-            op: SessionEventOp::AppendMessage { message_id: id.to_string(), message: mk(id) },
+            event_id: format!("rehydrate_{}", id).into(),
+            op: SessionEventOp::AppendMessage { message_id: MessageId::from(id.to_string()), message: mk(id) },
             parent_id: None,
             version: 1,
         });
@@ -1351,7 +1351,7 @@ fn test_replace_after_clear_replays_deterministically() {
     // 2) clear all
     map.append_event(SessionEvent {
         timestamp: chrono::Utc::now(),
-        event_id: "clear_all".to_string(),
+        event_id: "clear_all".to_string().into(),
         op: SessionEventOp::ClearAll,
         parent_id: None,
         version: 1,
@@ -1360,7 +1360,7 @@ fn test_replace_after_clear_replays_deterministically() {
     //    transcript, not be silently dropped because the derived length is 0).
     map.append_event(SessionEvent {
         timestamp: chrono::Utc::now(),
-        event_id: "replace_all".to_string(),
+        event_id: "replace_all".to_string().into(),
         op: SessionEventOp::ReplaceMessages {
             start_index: 0,
             end_index: usize::MAX,
@@ -1845,9 +1845,9 @@ fn test_append_session_event_appends_checks_desync_in_debug() {
     // This violates the documented contract and must be caught by the check.
     session.append_session_event(SessionEvent {
         timestamp: chrono::Utc::now(),
-        event_id: "m_desync".to_string(),
+        event_id: "m_desync".to_string().into(),
         op: SessionEventOp::AppendMessage {
-            message_id: "m_desync".to_string(),
+            message_id: "m_desync".to_string().into(),
             message: StoredMessage {
                 id: "m_desync".to_string(),
                 role: Role::User,
@@ -1872,7 +1872,7 @@ fn test_append_session_event_log_only_op_does_not_check_desync() {
     let mut session = Session::create_with_id("append_logonly_debug".to_string(), None, None);
     let recorded = session.append_session_event(SessionEvent {
         timestamp: chrono::Utc::now(),
-        event_id: "plugin_debug".to_string(),
+        event_id: "plugin_debug".to_string().into(),
         op: SessionEventOp::Unknown {
             event_type: "plugin/x".to_string(),
             data: serde_json::json!({}),
@@ -2077,7 +2077,7 @@ fn test_replace_messages_clamps_out_of_range_bounds() {
     let mut map = SessionEventMap::default();
     map.append_event(SessionEvent {
         timestamp: chrono::Utc::now(),
-        event_id: "r1".to_string(),
+        event_id: "r1".to_string().into(),
         op: SessionEventOp::ReplaceMessages {
             start_index: 5, // exceeds the (empty) current transcript
             end_index: 8,
@@ -2094,8 +2094,8 @@ fn test_replace_messages_clamps_out_of_range_bounds() {
     for id in ["a", "b", "c"] {
         map2.append_event(SessionEvent {
             timestamp: chrono::Utc::now(),
-            event_id: format!("append_{}", id),
-            op: SessionEventOp::AppendMessage { message_id: id.to_string(), message: mk(id) },
+            event_id: format!("append_{}", id).into(),
+            op: SessionEventOp::AppendMessage { message_id: MessageId::from(id.to_string()), message: mk(id) },
             parent_id: None,
             version: 1,
         });
@@ -2137,9 +2137,9 @@ fn test_replace_messages_reversed_bounds_do_not_panic() {
     for id in ["a", "b", "c"] {
         map.append_event(SessionEvent {
             timestamp: chrono::Utc::now(),
-            event_id: format!("append_{}", id),
+            event_id: format!("append_{}", id).into(),
             op: SessionEventOp::AppendMessage {
-                message_id: id.to_string(),
+                message_id: MessageId::from(id.to_string()),
                 message: mk(id),
             },
             parent_id: None,
@@ -2319,7 +2319,7 @@ fn test_old_timestamp_replay_event_is_accepted() {
     };
     map.append_event(SessionEvent {
         timestamp: old,
-        event_id: "old_replay".to_string(),
+        event_id: "old_replay".to_string().into(),
         op,
         parent_id: None,
         version: 1,
@@ -2334,9 +2334,9 @@ fn test_old_timestamp_replay_event_is_accepted() {
     let mut map2 = SessionEventMap::default();
     map2.append_event(SessionEvent {
         timestamp: old,
-        event_id: "old_msg".to_string(),
+        event_id: "old_msg".to_string().into(),
         op: SessionEventOp::AppendMessage {
-            message_id: "m1".to_string(),
+            message_id: "m1".to_string().into(),
             message: StoredMessage {
                 id: "m1".to_string(),
                 role: Role::User,
@@ -2640,9 +2640,9 @@ fn test_fork_preserves_aged_events() {
     let mut map = SessionEventMap::default();
     map.push_event(SessionEvent {
         timestamp: old,
-        event_id: "rehydrate_0".to_string(),
+        event_id: "rehydrate_0".to_string().into(),
         op: SessionEventOp::AppendMessage {
-            message_id: "m0".to_string(),
+            message_id: "m0".to_string().into(),
             message: StoredMessage {
                 id: "m0".to_string(),
                 role: Role::User,
@@ -2713,7 +2713,7 @@ fn test_persisted_event_log_survives_snapshot_round_trip_with_bracket_and_unknow
 
     let unknown_event = SessionEvent {
         timestamp: chrono::Utc::now(),
-        event_id: "plugin_1".to_string(),
+        event_id: "plugin_1".to_string().into(),
         op: SessionEventOp::Unknown {
             event_type: "review_round".to_string(),
             data: serde_json::json!({ "rounds": 3 }),
@@ -3008,7 +3008,7 @@ fn test_compaction_bracket_enforcement_catches_broken_bracket() {
     // A CompactionEnd with no preceding CompactionStart -> dangling close.
     map.push_event(SessionEvent {
         timestamp: chrono::Utc::now(),
-        event_id: "dangling_end".to_string(),
+        event_id: "dangling_end".to_string().into(),
         op: SessionEventOp::CompactionEnd {
             compaction: StoredCompactionState {
                 summary_text: "s".to_string(),
@@ -3453,7 +3453,7 @@ fn test_current_compaction_ignores_open_bracket_and_keeps_last_completed() {
     let mut map = SessionEventMap::default();
     map.append_event(SessionEvent {
         timestamp: chrono::Utc::now(),
-        event_id: "set1".to_string(),
+        event_id: "set1".to_string().into(),
         op: SessionEventOp::SetCompaction {
             compaction: StoredCompactionState {
                 summary_text: "completed_at_set".to_string(),
@@ -3513,7 +3513,7 @@ fn test_current_compaction_cache_matches_reverse_scan_after_reload() {
         // 1: plain SetCompaction.
         vec![SessionEvent {
             timestamp: Utc::now(),
-            event_id: "set".to_string(),
+            event_id: "set".to_string().into(),
             op: SessionEventOp::SetCompaction { compaction: comp(1) },
             parent_id: None,
             version: 1,
@@ -3522,14 +3522,14 @@ fn test_current_compaction_cache_matches_reverse_scan_after_reload() {
         vec![
             SessionEvent {
                 timestamp: Utc::now(),
-                event_id: "set".to_string(),
+                event_id: "set".to_string().into(),
                 op: SessionEventOp::SetCompaction { compaction: comp(1) },
                 parent_id: None,
                 version: 1,
             },
             SessionEvent {
                 timestamp: Utc::now(),
-                event_id: "clear".to_string(),
+                event_id: "clear".to_string().into(),
                 op: SessionEventOp::ClearAll,
                 parent_id: None,
                 version: 1,
@@ -3539,9 +3539,9 @@ fn test_current_compaction_cache_matches_reverse_scan_after_reload() {
         vec![
             SessionEvent {
                 timestamp: Utc::now(),
-                event_id: "start".to_string(),
+                event_id: "start".to_string().into(),
                 op: SessionEventOp::CompactionStart {
-                    compaction_id: "c".to_string(),
+                    compaction_id: "c".to_string().into(),
                     covers_up_to_turn: 1,
                 },
                 parent_id: None,
@@ -3549,7 +3549,7 @@ fn test_current_compaction_cache_matches_reverse_scan_after_reload() {
             },
             SessionEvent {
                 timestamp: Utc::now(),
-                event_id: "end".to_string(),
+                event_id: "end".to_string().into(),
                 op: SessionEventOp::CompactionEnd { compaction: comp(1) },
                 parent_id: None,
                 version: 1,
@@ -3558,9 +3558,9 @@ fn test_current_compaction_cache_matches_reverse_scan_after_reload() {
         // 4: orphaned bracket (no End) -> no completed compaction.
         vec![SessionEvent {
             timestamp: Utc::now(),
-            event_id: "start".to_string(),
+            event_id: "start".to_string().into(),
             op: SessionEventOp::CompactionStart {
-                compaction_id: "c".to_string(),
+                compaction_id: "c".to_string().into(),
                 covers_up_to_turn: 1,
             },
             parent_id: None,
@@ -3570,16 +3570,16 @@ fn test_current_compaction_cache_matches_reverse_scan_after_reload() {
         vec![
             SessionEvent {
                 timestamp: Utc::now(),
-                event_id: "set".to_string(),
+                event_id: "set".to_string().into(),
                 op: SessionEventOp::SetCompaction { compaction: comp(1) },
                 parent_id: None,
                 version: 1,
             },
             SessionEvent {
                 timestamp: Utc::now(),
-                event_id: "start".to_string(),
+                event_id: "start".to_string().into(),
                 op: SessionEventOp::CompactionStart {
-                    compaction_id: "c".to_string(),
+                    compaction_id: "c".to_string().into(),
                     covers_up_to_turn: 1,
                 },
                 parent_id: None,
@@ -3653,9 +3653,9 @@ fn test_event_validation_rejects_extreme_timestamps_but_accepts_duplicate_ids() 
     // Far-future timestamp (400 days > the ~1yr window) -> rejected.
     map.append_event(SessionEvent {
         timestamp: Utc::now() + chrono::Duration::days(400),
-        event_id: "future".to_string(),
+        event_id: "future".to_string().into(),
         op: SessionEventOp::AppendMessage {
-            message_id: "m_future".to_string(),
+            message_id: "m_future".to_string().into(),
             message: msg("m_future"),
         },
         parent_id: None,
@@ -3670,9 +3670,9 @@ fn test_event_validation_rejects_extreme_timestamps_but_accepts_duplicate_ids() 
     // Far-past timestamp (400 days ago) -> rejected.
     map.append_event(SessionEvent {
         timestamp: Utc::now() - chrono::Duration::days(400),
-        event_id: "past".to_string(),
+        event_id: "past".to_string().into(),
         op: SessionEventOp::AppendMessage {
-            message_id: "m_past".to_string(),
+            message_id: "m_past".to_string().into(),
             message: msg("m_past"),
         },
         parent_id: None,
@@ -3684,9 +3684,9 @@ fn test_event_validation_rejects_extreme_timestamps_but_accepts_duplicate_ids() 
     let shared_id = "same_event_id".to_string();
     map.append_event(SessionEvent {
         timestamp: Utc::now(),
-        event_id: shared_id.clone(),
+        event_id: shared_id.clone().into(),
         op: SessionEventOp::AppendMessage {
-            message_id: "m_a".to_string(),
+            message_id: "m_a".to_string().into(),
             message: msg("m_a"),
         },
         parent_id: None,
@@ -3694,9 +3694,9 @@ fn test_event_validation_rejects_extreme_timestamps_but_accepts_duplicate_ids() 
     });
     map.append_event(SessionEvent {
         timestamp: Utc::now(),
-        event_id: shared_id.clone(),
+        event_id: shared_id.clone().into(),
         op: SessionEventOp::AppendMessage {
-            message_id: "m_b".to_string(),
+            message_id: "m_b".to_string().into(),
             message: msg("m_b"),
         },
         parent_id: None,
@@ -3786,7 +3786,7 @@ fn test_memory_profile_snapshot_total_matches_debug_total() {
     });
     session.append_session_event(SessionEvent {
         timestamp: Utc::now(),
-        event_id: "plugin".to_string(),
+        event_id: "plugin".to_string().into(),
         op: SessionEventOp::Unknown {
             event_type: "plugin/probe".to_string(),
             data: serde_json::json!({ "n": 1 }),
@@ -3867,7 +3867,7 @@ fn test_memory_profile_event_log_refresh_after_injection_and_replay() {
     // Public append_session_event must also refresh the cached event-log count.
     let appended = session.append_session_event(SessionEvent {
         timestamp: Utc::now(),
-        event_id: "plugin_evt".to_string(),
+        event_id: "plugin_evt".to_string().into(),
         op: SessionEventOp::Unknown {
             event_type: "plugin/probe".to_string(),
             data: serde_json::json!({ "n": 1 }),
@@ -3887,7 +3887,7 @@ fn test_memory_profile_event_log_refresh_after_injection_and_replay() {
     // (no event was added), and the profile must still agree with the map.
     let rejected = session.append_session_event(SessionEvent {
         timestamp: Utc::now(),
-        event_id: "".to_string(), // empty id -> rejected by validation
+        event_id: "".to_string().into(), // empty id -> rejected by validation
         op: SessionEventOp::Unknown {
             event_type: "plugin/bad".to_string(),
             data: serde_json::json!({}),
@@ -3944,7 +3944,7 @@ fn test_known_tag_with_extra_field_stays_known_but_missing_field_degrades() {
     let extra: SessionEventOp = serde_json::from_str(raw_extra).expect("must not error");
     match &extra {
         SessionEventOp::AppendMessage { message_id, message } => {
-            assert_eq!(message_id, "m1");
+            assert_eq!(message_id.as_str(), "m1");
             assert_eq!(message.id, "m1", "known variant must be preserved, extra field dropped");
         }
         other => panic!("expected AppendMessage (extra field dropped), got {other:?}"),
@@ -3968,13 +3968,13 @@ fn test_known_tag_with_extra_field_stays_known_but_missing_field_degrades() {
 fn test_session_event_parent_id_and_version_round_trip() {
     let event = SessionEvent {
         timestamp: Utc::now(),
-        event_id: "e1".to_string(),
+        event_id: "e1".to_string().into(),
         op: SessionEventOp::ReplaceMessages {
             start_index: 0,
             end_index: 1,
             messages: Vec::new(),
         },
-        parent_id: Some("parent_event".to_string()),
+        parent_id: Some(EventId::from("parent_event".to_string())),
         version: 7,
     };
 
@@ -3990,12 +3990,12 @@ fn test_session_event_parent_id_and_version_round_trip() {
         "parent_id must round-trip"
     );
     assert_eq!(back.version, 7, "version must round-trip");
-    assert_eq!(back.event_id, "e1");
+    assert_eq!(back.event_id.as_str(), "e1");
 
     // When parent_id is None it must be omitted from the wire form.
     let none_event = SessionEvent {
         timestamp: Utc::now(),
-        event_id: "e2".to_string(),
+        event_id: "e2".to_string().into(),
         op: SessionEventOp::ClearAll,
         parent_id: None,
         version: 1,
@@ -4028,7 +4028,7 @@ fn test_public_event_log_accessor_exposes_committed_events() {
     });
     session.append_session_event(SessionEvent {
         timestamp: Utc::now(),
-        event_id: "plugin_evt".to_string(),
+        event_id: "plugin_evt".to_string().into(),
         op: SessionEventOp::Unknown {
             event_type: "plugin/marker".to_string(),
             data: serde_json::json!({ "k": "v" }),
@@ -4090,9 +4090,9 @@ fn test_derive_messages_fuzz_matches_reference() {
                 let id = m.id.clone();
                 map.events.push(SessionEvent {
                     timestamp: Utc::now(),
-                    event_id: id.clone(),
+                    event_id: id.clone().into(),
                     op: SessionEventOp::AppendMessage {
-                        message_id: id,
+                        message_id: id.into(),
                         message: m.clone(),
                     },
                     parent_id: None,
@@ -4107,7 +4107,7 @@ fn test_derive_messages_fuzz_matches_reference() {
                 // Mirror derive_messages clamping.
                 map.events.push(SessionEvent {
                     timestamp: Utc::now(),
-                    event_id: format!("ins_{step}"),
+                    event_id: format!("ins_{step}").into(),
                     op: SessionEventOp::InsertMessage {
                         index: n,
                         message: m.clone(),
@@ -4126,7 +4126,7 @@ fn test_derive_messages_fuzz_matches_reference() {
                 let (a, b) = (start.min(end), start.max(end).min(reference.len()));
                 map.events.push(SessionEvent {
                     timestamp: Utc::now(),
-                    event_id: format!("repl_{step}"),
+                    event_id: format!("repl_{step}").into(),
                     op: SessionEventOp::ReplaceMessages {
                         start_index: a,
                         end_index: b,
@@ -4142,7 +4142,7 @@ fn test_derive_messages_fuzz_matches_reference() {
                 let m = message(&mut next_id);
                 map.events.push(SessionEvent {
                     timestamp: Utc::now(),
-                    event_id: format!("end_{step}"),
+                    event_id: format!("end_{step}").into(),
                     op: SessionEventOp::InsertMessage {
                         index: reference.len(),
                         message: m.clone(),
@@ -4156,7 +4156,7 @@ fn test_derive_messages_fuzz_matches_reference() {
             4 => {
                 map.events.push(SessionEvent {
                     timestamp: Utc::now(),
-                    event_id: format!("clr_{step}"),
+                    event_id: format!("clr_{step}").into(),
                     op: SessionEventOp::ClearAll,
                     parent_id: None,
                     version: 1,

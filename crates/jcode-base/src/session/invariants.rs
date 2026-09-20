@@ -465,9 +465,9 @@ mod tests {
     fn append(map: &mut SessionEventMap, id: &str, message: StoredMessage) {
         map.append_event(SessionEvent {
             timestamp: chrono::Utc::now(),
-            event_id: id.to_string(),
+            event_id: id.to_string().into(),
             op: SessionEventOp::AppendMessage {
-                message_id: message.id.clone(),
+                message_id: message.id.clone().into(),
                 message,
             },
             parent_id: None,
@@ -513,9 +513,9 @@ mod tests {
         append(&mut map, "e1", text_msg("m1"));
         map.events.push(SessionEvent {
             timestamp: chrono::Utc::now(),
-            event_id: "e2".to_string(),
+            event_id: "e2".to_string().into(),
             op: SessionEventOp::ClearAll,
-            parent_id: Some("ghost".to_string()),
+            parent_id: Some("ghost".to_string().into()),
             version: 1,
         });
         let reg = InvariantRegistry::builtin();
@@ -541,7 +541,7 @@ mod tests {
         // ClearAll resets the projection to zero.
         map.append_event(SessionEvent {
             timestamp: chrono::Utc::now(),
-            event_id: "e4".to_string(),
+            event_id: "e4".to_string().into(),
             op: SessionEventOp::ClearAll,
             parent_id: None,
             version: 1,
@@ -563,7 +563,7 @@ mod tests {
         // message. Real derived transcript is 4 + 1 - (3-1) = 3.
         map.events.push(SessionEvent {
             timestamp: chrono::Utc::now(),
-            event_id: "e_replace".to_string(),
+            event_id: "e_replace".to_string().into(),
             op: SessionEventOp::ReplaceMessages {
                 start_index: 1,
                 end_index: 3,
@@ -582,7 +582,7 @@ mod tests {
         // Full replacement (start=0, end=usize::MAX) collapses to the replacement size.
         map.events.push(SessionEvent {
             timestamp: chrono::Utc::now(),
-            event_id: "e_full".to_string(),
+            event_id: "e_full".to_string().into(),
             op: SessionEventOp::ReplaceMessages {
                 start_index: 0,
                 end_index: usize::MAX,
@@ -615,7 +615,7 @@ mod tests {
         // A replace with a reversed span (start > end) must not crash or diverge.
         map.events.push(SessionEvent {
             timestamp: chrono::Utc::now(),
-            event_id: "rev".to_string(),
+            event_id: "rev".to_string().into(),
             op: SessionEventOp::ReplaceMessages {
                 start_index: 3,
                 end_index: 1,
@@ -627,7 +627,7 @@ mod tests {
         // An out-of-range insert (index beyond the live length) must clamp.
         map.events.push(SessionEvent {
             timestamp: chrono::Utc::now(),
-            event_id: "oob".to_string(),
+            event_id: "oob".to_string().into(),
             op: SessionEventOp::InsertMessage {
                 index: 99,
                 message: text_msg("oob"),
@@ -638,7 +638,7 @@ mod tests {
         // A full replacement collapse.
         map.events.push(SessionEvent {
             timestamp: chrono::Utc::now(),
-            event_id: "full".to_string(),
+            event_id: "full".to_string().into(),
             op: SessionEventOp::ReplaceMessages {
                 start_index: 0,
                 end_index: usize::MAX,
@@ -650,7 +650,7 @@ mod tests {
         // A partial splice near the live length boundary.
         map.events.push(SessionEvent {
             timestamp: chrono::Utc::now(),
-            event_id: "partial".to_string(),
+            event_id: "partial".to_string().into(),
             op: SessionEventOp::ReplaceMessages {
                 start_index: 0,
                 end_index: 1,
@@ -665,7 +665,7 @@ mod tests {
         // per-prefix consistency check must not diverge on.
         map.events.push(SessionEvent {
             timestamp: chrono::Utc::now(),
-            event_id: "clear_mid".to_string(),
+            event_id: "clear_mid".to_string().into(),
             op: SessionEventOp::ClearAll,
             parent_id: None,
             version: 1,
@@ -675,7 +675,7 @@ mod tests {
         // Post-clear replace (start == end when empty must append, not no-op).
         map.events.push(SessionEvent {
             timestamp: chrono::Utc::now(),
-            event_id: "post_repl".to_string(),
+            event_id: "post_repl".to_string().into(),
             op: SessionEventOp::ReplaceMessages {
                 start_index: 0,
                 end_index: usize::MAX,
