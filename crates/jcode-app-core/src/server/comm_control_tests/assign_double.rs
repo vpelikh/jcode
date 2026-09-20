@@ -217,6 +217,16 @@ async fn assign_task_rejects_double_assignment_of_actively_worked_task() {
     let mutation_runtime = SwarmMutationRuntime::default();
 
     let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
+    let swarm = swarm_handle(
+        &swarm_members,
+        &swarms_by_id,
+        &swarm_plans,
+        &swarm_coordinators,
+        &event_history,
+        &event_counter,
+        &swarm_event_tx,
+        &mutation_runtime,
+    );
     handle_comm_assign_task(
         91,
         requester.to_string(),
@@ -226,14 +236,7 @@ async fn assign_task_rejects_double_assignment_of_actively_worked_task() {
         &client_tx,
         &session_h,
         &client_connections,
-        &swarm_members,
-        &swarms_by_id,
-        &swarm_plans,
-        &swarm_coordinators,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
-        &mutation_runtime,
+        &swarm,
     )
     .await;
 
@@ -301,6 +304,16 @@ async fn assign_task_allows_taking_over_stale_assignment() {
     let mutation_runtime = SwarmMutationRuntime::default();
 
     let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
+    let swarm = swarm_handle(
+        &swarm_members,
+        &swarms_by_id,
+        &swarm_plans,
+        &swarm_coordinators,
+        &event_history,
+        &event_counter,
+        &swarm_event_tx,
+        &mutation_runtime,
+    );
     handle_comm_assign_task(
         92,
         requester.to_string(),
@@ -310,14 +323,7 @@ async fn assign_task_allows_taking_over_stale_assignment() {
         &client_tx,
         &session_h,
         &client_connections,
-        &swarm_members,
-        &swarms_by_id,
-        &swarm_plans,
-        &swarm_coordinators,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
-        &mutation_runtime,
+        &swarm,
     )
     .await;
 
@@ -390,6 +396,16 @@ async fn task_control_reassign_tells_displaced_worker_to_stand_down() {
     let mutation_runtime = SwarmMutationRuntime::default();
 
     let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
+    let swarm = swarm_handle(
+        &swarm_members,
+        &swarms_by_id,
+        &swarm_plans,
+        &swarm_coordinators,
+        &event_history,
+        &event_counter,
+        &swarm_event_tx,
+        &mutation_runtime,
+    );
     handle_comm_task_control(
         93,
         requester.to_string(),
@@ -400,14 +416,7 @@ async fn task_control_reassign_tells_displaced_worker_to_stand_down() {
         &client_tx,
         &session_h,
         &client_connections,
-        &swarm_members,
-        &swarms_by_id,
-        &swarm_plans,
-        &swarm_coordinators,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
-        &mutation_runtime,
+        &swarm,
     )
     .await;
 

@@ -1,9 +1,10 @@
+use super::services::SwarmServiceHandle;
 use crate::agent::Agent;
 use crate::protocol::ServerEvent;
 use crate::provider::Provider;
 use crate::server::{
-    SessionInterruptQueues, SwarmMember, VersionedPlan, broadcast_swarm_status,
-    register_background_tool_signal, register_session_interrupt_queue, swarm_id_for_session,
+    SessionInterruptQueues, SwarmMember, register_background_tool_signal,
+    register_session_interrupt_queue, swarm_id_for_session,
 };
 use crate::tool::Registry;
 use anyhow::Result;
@@ -39,10 +40,7 @@ pub(super) async fn create_headless_session(
     global_session_id: &Arc<RwLock<String>>,
     provider_template: &Arc<dyn Provider>,
     command: &str,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-    _swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
+    swarm: &SwarmServiceHandle,
     soft_interrupt_queues: &SessionInterruptQueues,
     selfdev_requested: bool,
     model_override: Option<String>,
@@ -53,6 +51,10 @@ pub(super) async fn create_headless_session(
     report_back_to_session_id: Option<String>,
     memory_scope: HeadlessMemoryScope,
 ) -> Result<String> {
+    let swarm_members = &swarm.swarm_state.members;
+    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let _swarm_plans = &swarm.swarm_state.plans;
     let memory_enabled = crate::config::config().features.memory;
     let swarm_enabled = crate::config::config().features.swarm;
 
@@ -290,7 +292,7 @@ pub(super) async fn create_headless_session(
     }
 
     if let Some(ref id) = swarm_id {
-        broadcast_swarm_status(id, swarm_members, swarms_by_id).await;
+        swarm.broadcast_swarm_status(id).await;
     }
 
     crate::runtime_memory_log::emit_event(

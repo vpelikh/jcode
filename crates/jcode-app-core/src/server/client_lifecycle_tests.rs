@@ -467,7 +467,7 @@ async fn deferred_cancel_reset_does_not_erase_newer_cancel() {
             },
             &control,
             &client_event_tx,
-                        &SwarmStatusRefs {
+            &SwarmStatusRefs {
                 swarm: &test_swarm_status_handle(
                     &swarm_members,
                     &swarms_by_id,
@@ -642,7 +642,7 @@ fn cancel_aborts_detached_streaming_turn_with_stale_stop_signal() -> anyhow::Res
             },
             &control,
             &client_event_tx,
-                        &SwarmStatusRefs {
+            &SwarmStatusRefs {
                 swarm: &test_swarm_status_handle(
                     &swarm_members,
                     &swarms_by_id,
@@ -731,7 +731,7 @@ fn idle_cancel_does_not_arm_the_signal_for_the_next_turn() -> anyhow::Result<()>
             },
             &control,
             &client_event_tx,
-                        &SwarmStatusRefs {
+            &SwarmStatusRefs {
                 swarm: &test_swarm_status_handle(
                     &swarm_members,
                     &swarms_by_id,
@@ -1048,7 +1048,7 @@ fn reload_starting_rejects_new_turn_without_spawning_processing_task() {
             &client_event_tx,
             &processing_done_tx,
             Vec::new(),
-                        &SwarmStatusRefs {
+            &SwarmStatusRefs {
                 swarm: &test_swarm_status_handle(
                     &swarm_members,
                     &swarms_by_id,
@@ -1151,7 +1151,7 @@ async fn client_initiated_turn_fans_out_stream_and_terminal_events_to_live_attac
         &origin_tx,
         &processing_done_tx,
         Vec::new(),
-                &SwarmStatusRefs {
+        &SwarmStatusRefs {
             swarm: &test_swarm_status_handle(
                 &swarm_members,
                 &swarms_by_id,
@@ -1278,7 +1278,7 @@ fn accepted_reload_recovery_continuation_marks_intent_delivered() -> anyhow::Res
             &client_event_tx,
             &processing_done_tx,
             Vec::new(),
-                        &SwarmStatusRefs {
+            &SwarmStatusRefs {
                 swarm: &test_swarm_status_handle(
                     &swarm_members,
                     &swarms_by_id,
@@ -1380,7 +1380,7 @@ fn reload_starting_rejects_new_turns_for_multiple_sessions() {
                 &client_event_tx,
                 &processing_done_tx,
                 Vec::new(),
-                                &SwarmStatusRefs {
+                &SwarmStatusRefs {
                     swarm: &test_swarm_status_handle(
                         &swarm_members,
                         &swarms_by_id,

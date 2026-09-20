@@ -11,11 +11,9 @@ use super::swarm_mutation_state::{
     finish_request as finish_swarm_mutation_request, request_key as swarm_mutation_request_key,
 };
 use super::{
-    ClientConnectionInfo, SwarmEvent, SwarmEventType, SwarmMember, SwarmMutationRuntime,
-    SwarmState, SwarmTaskProgress, VersionedPlan, broadcast_swarm_plan,
-    broadcast_swarm_plan_with_previous, fanout_session_event,
-    persist_swarm_state_for, record_swarm_event,
-    set_member_task_label, truncate_detail, update_member_status, update_member_status_with_report,
+    ClientConnectionInfo, SwarmEventType, SwarmMember, SwarmState, SwarmTaskProgress,
+    VersionedPlan, broadcast_swarm_plan, broadcast_swarm_plan_with_previous, fanout_session_event,
+    persist_swarm_state_for, set_member_task_label, truncate_detail,
 };
 use crate::agent::Agent;
 use crate::plan::{
@@ -754,25 +752,19 @@ async fn resolve_assignment_target_for_task(
     select_and_claim_auto_target(swarm_id, &candidates, &affinities.loads)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "task execution restart needs session state, plan state, and event sinks together"
-)]
 fn spawn_assigned_task_run(
     agent_arc: Arc<Mutex<Agent>>,
     target_session: String,
     swarm_id: String,
     task_id: String,
     assignment_text: String,
-    swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    swarm_plans: Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    swarm_coordinators: Arc<RwLock<HashMap<String, String>>>,
-    event_history: Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: broadcast::Sender<SwarmEvent>,
+    swarm: SwarmServiceHandle,
 ) {
     let assignment_text = append_swarm_completion_report_instructions(&assignment_text);
+    let swarm_members = Arc::clone(&swarm.swarm_state.members);
+    let swarms_by_id = Arc::clone(&swarm.swarm_state.swarms_by_id);
+    let swarm_plans = Arc::clone(&swarm.swarm_state.plans);
+    let swarm_coordinators = Arc::clone(&swarm.swarm_state.coordinators);
     tokio::spawn(async move {
         {
             let now_ms = now_unix_ms();
@@ -812,17 +804,13 @@ fn spawn_assigned_task_run(
         )
         .await;
         set_member_task_label(&target_session, &assignment_text, &swarm_members).await;
-        update_member_status(
-            &target_session,
-            "running",
-            Some(truncate_detail(&assignment_text, 120)),
-            &swarm_members,
-            &swarms_by_id,
-            Some(&event_history),
-            Some(&event_counter),
-            Some(&swarm_event_tx),
-        )
-        .await;
+        swarm
+            .set_member_status(
+                &target_session,
+                "running",
+                Some(truncate_detail(&assignment_text, 120)),
+            )
+            .await;
 
         let (heartbeat_stop_tx, mut heartbeat_stop_rx) = watch::channel(false);
         let heartbeat_task = {
@@ -874,16 +862,10 @@ fn spawn_assigned_task_run(
         };
 
         let event_tx = task_progress_event_sender(
+            swarm.clone(),
             target_session.clone(),
             swarm_id.clone(),
             task_id.clone(),
-            Arc::clone(&swarm_members),
-            Arc::clone(&swarms_by_id),
-            Arc::clone(&swarm_plans),
-            Arc::clone(&swarm_coordinators),
-            Arc::clone(&event_history),
-            Arc::clone(&event_counter),
-            swarm_event_tx.clone(),
         );
         let start_message_index = {
             let agent = agent_arc.lock().await;
@@ -1029,18 +1011,14 @@ fn spawn_assigned_task_run(
                 // completion) even when its node was requeued/failed for missing
                 // an artifact: lifecycle and node state are separate axes, and a
                 // "completed" worker is reusable for the requeued node.
-                update_member_status_with_report(
-                    &target_session,
-                    "completed",
-                    None,
-                    completion_report,
-                    &swarm_members,
-                    &swarms_by_id,
-                    Some(&event_history),
-                    Some(&event_counter),
-                    Some(&swarm_event_tx),
-                )
-                .await;
+                swarm
+                    .set_member_status_with_report(
+                        &target_session,
+                        "completed",
+                        None,
+                        completion_report,
+                    )
+                    .await;
             }
             Err(error) => {
                 {
@@ -1077,17 +1055,13 @@ fn spawn_assigned_task_run(
                     &swarms_by_id,
                 )
                 .await;
-                update_member_status(
-                    &target_session,
-                    "failed",
-                    Some(truncate_detail(&error.to_string(), 120)),
-                    &swarm_members,
-                    &swarms_by_id,
-                    Some(&event_history),
-                    Some(&event_counter),
-                    Some(&swarm_event_tx),
-                )
-                .await;
+                swarm
+                    .set_member_status(
+                        &target_session,
+                        "failed",
+                        Some(truncate_detail(&error.to_string(), 120)),
+                    )
+                    .await;
             }
         }
     });
@@ -1128,22 +1102,16 @@ fn format_salvage_message(
     output
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "task progress fanout needs plan state, swarm membership, and event sinks together"
-)]
 fn task_progress_event_sender(
+    swarm: SwarmServiceHandle,
     session_id: String,
     swarm_id: String,
     task_id: String,
-    swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    swarm_plans: Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    swarm_coordinators: Arc<RwLock<HashMap<String, String>>>,
-    event_history: Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: broadcast::Sender<SwarmEvent>,
 ) -> mpsc::UnboundedSender<ServerEvent> {
+    let swarm_members = Arc::clone(&swarm.swarm_state.members);
+    let swarms_by_id = Arc::clone(&swarm.swarm_state.swarms_by_id);
+    let swarm_plans = Arc::clone(&swarm.swarm_state.plans);
+    let swarm_coordinators = Arc::clone(&swarm.swarm_state.coordinators);
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerEvent>();
     tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
@@ -1178,17 +1146,13 @@ fn task_progress_event_sender(
                 )
                 .await;
                 if let Some(detail) = detail {
-                    update_member_status(
-                        &session_id,
-                        "running",
-                        Some(truncate_detail(&detail, 120)),
-                        &swarm_members,
-                        &swarms_by_id,
-                        Some(&event_history),
-                        Some(&event_counter),
-                        Some(&swarm_event_tx),
-                    )
-                    .await;
+                    swarm
+                        .set_member_status(
+                            &session_id,
+                            "running",
+                            Some(truncate_detail(&detail, 120)),
+                        )
+                        .await;
                 }
                 if revived {
                     broadcast_swarm_plan(
@@ -1335,16 +1299,17 @@ pub(super) async fn handle_comm_assign_role(
     persist_swarm_state_for(&swarm_id, &swarm.swarm_state).await;
 
     swarm.broadcast_swarm_status(&swarm_id).await;
-    swarm.record_swarm_event(
-        req_session_id,
-        None,
-        Some(swarm_id),
-        SwarmEventType::Notification {
-            notification_type: "role_assignment".to_string(),
-            message: format!("{} -> {}", target_session, role),
-        },
-    )
-    .await;
+    swarm
+        .record_swarm_event(
+            req_session_id,
+            None,
+            Some(swarm_id),
+            SwarmEventType::Notification {
+                notification_type: "role_assignment".to_string(),
+                message: format!("{} -> {}", target_session, role),
+            },
+        )
+        .await;
     finish_swarm_mutation_request(
         swarm_mutation_runtime,
         &mutation_state,
@@ -1381,14 +1346,7 @@ pub(super) async fn handle_comm_assign_task(
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
     session: &SessionServiceHandle,
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
-    swarm_mutation_runtime: &SwarmMutationRuntime,
+    swarm: &SwarmServiceHandle,
 ) {
     handle_comm_assign_task_with_mode(
         id,
@@ -1400,14 +1358,7 @@ pub(super) async fn handle_comm_assign_task(
         client_event_tx,
         session,
         client_connections,
-        swarm_members,
-        swarms_by_id,
-        swarm_plans,
-        swarm_coordinators,
-        event_history,
-        event_counter,
-        swarm_event_tx,
-        swarm_mutation_runtime,
+        swarm,
     )
     .await;
 }
@@ -1426,15 +1377,13 @@ async fn handle_comm_assign_task_with_mode(
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
     session: &SessionServiceHandle,
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
-    swarm_mutation_runtime: &SwarmMutationRuntime,
+    swarm: &SwarmServiceHandle,
 ) {
+    let swarm_members = &swarm.swarm_state.members;
+    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let swarm_plans = &swarm.swarm_state.plans;
+    let swarm_coordinators = &swarm.swarm_state.coordinators;
+    let swarm_mutation_runtime = &swarm.swarm_mutation_runtime;
     let sessions = &session.sessions;
     let requested_target_session = target_session.and_then(|target| {
         let trimmed = target.trim();
@@ -1688,19 +1637,17 @@ async fn handle_comm_assign_task_with_mode(
         swarms_by_id,
     )
     .await;
-    record_swarm_event(
-        event_history,
-        event_counter,
-        swarm_event_tx,
-        req_session_id.clone(),
-        None,
-        Some(swarm_id.clone()),
-        SwarmEventType::PlanUpdate {
-            swarm_id: swarm_id.clone(),
-            item_count: plan_item_count,
-        },
-    )
-    .await;
+    swarm
+        .record_swarm_event(
+            req_session_id.clone(),
+            None,
+            Some(swarm_id.clone()),
+            SwarmEventType::PlanUpdate {
+                swarm_id: swarm_id.clone(),
+                item_count: plan_item_count,
+            },
+        )
+        .await;
 
     let coordinator_name = {
         let members = swarm_members.read().await;
@@ -1719,17 +1666,13 @@ async fn handle_comm_assign_task_with_mode(
     let queued_task_prompt = append_swarm_completion_report_instructions(&notification);
     let assignment_text = combine_assignment_text(&content, message.as_deref());
     set_member_task_label(&target_session, &assignment_text, swarm_members).await;
-    update_member_status(
-        &target_session,
-        "queued",
-        Some(truncate_detail(&assignment_text, 120)),
-        swarm_members,
-        swarms_by_id,
-        Some(event_history),
-        Some(event_counter),
-        Some(swarm_event_tx),
-    )
-    .await;
+    swarm
+        .set_member_status(
+            &target_session,
+            "queued",
+            Some(truncate_detail(&assignment_text, 120)),
+        )
+        .await;
 
     let target_agent = {
         let agent_sessions = sessions.read().await;
@@ -1764,28 +1707,16 @@ async fn handle_comm_assign_task_with_mode(
     };
     if !target_has_client && let Some(agent_arc) = target_agent {
         let target_session_for_run = target_session.clone();
-        let swarm_members_for_run = Arc::clone(swarm_members);
-        let swarms_for_run = Arc::clone(swarms_by_id);
-        let swarm_plans_for_run = Arc::clone(swarm_plans);
-        let swarm_coordinators_for_run = Arc::clone(swarm_coordinators);
+        let swarm_for_run = swarm.clone();
         let swarm_id_for_run = swarm_id.clone();
         let task_id_for_run = selected_task_id.clone();
-        let event_history_for_run = Arc::clone(event_history);
-        let event_counter_for_run = Arc::clone(event_counter);
-        let swarm_event_tx_for_run = swarm_event_tx.clone();
         spawn_assigned_task_run(
             agent_arc,
             target_session_for_run,
             swarm_id_for_run,
             task_id_for_run,
             assignment_text,
-            swarm_members_for_run,
-            swarms_for_run,
-            swarm_plans_for_run,
-            swarm_coordinators_for_run,
-            event_history_for_run,
-            event_counter_for_run,
-            swarm_event_tx_for_run,
+            swarm_for_run,
         );
     }
 
@@ -1842,16 +1773,12 @@ pub(super) async fn handle_comm_assign_next(
     global_session_id: &Arc<RwLock<String>>,
     provider_template: &Arc<dyn crate::provider::Provider>,
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
+    swarm: &SwarmServiceHandle,
     mcp_pool: &Arc<crate::mcp::SharedMcpPool>,
-    swarm_mutation_runtime: &SwarmMutationRuntime,
 ) {
+    let swarm_members = &swarm.swarm_state.members;
+    let swarm_plans = &swarm.swarm_state.plans;
+    let swarm_coordinators = &swarm.swarm_state.coordinators;
     let sessions = &session.sessions;
     let soft_interrupt_queues = &session.soft_interrupt_queues;
     if target_session.is_none() {
@@ -1912,13 +1839,7 @@ pub(super) async fn handle_comm_assign_next(
                 sessions,
                 global_session_id,
                 provider_template,
-                swarm_members,
-                swarms_by_id,
-                swarm_coordinators,
-                swarm_plans,
-                event_history,
-                event_counter,
-                swarm_event_tx,
+                swarm,
                 mcp_pool,
                 soft_interrupt_queues,
                 client_connections,
@@ -1935,14 +1856,7 @@ pub(super) async fn handle_comm_assign_next(
                         client_event_tx,
                         session,
                         client_connections,
-                        swarm_members,
-                        swarms_by_id,
-                        swarm_plans,
-                        swarm_coordinators,
-                        event_history,
-                        event_counter,
-                        swarm_event_tx,
-                        swarm_mutation_runtime,
+                        swarm,
                     )
                     .await;
                     return;
@@ -1969,14 +1883,7 @@ pub(super) async fn handle_comm_assign_next(
                     client_event_tx,
                     session,
                     client_connections,
-                    swarm_members,
-                    swarms_by_id,
-                    swarm_plans,
-                    swarm_coordinators,
-                    event_history,
-                    event_counter,
-                    swarm_event_tx,
-                    swarm_mutation_runtime,
+                    swarm,
                 )
                 .await;
                 // The pick was claimed at resolve time; by now the assignment
@@ -2004,14 +1911,7 @@ pub(super) async fn handle_comm_assign_next(
         client_event_tx,
         session,
         client_connections,
-        swarm_members,
-        swarms_by_id,
-        swarm_plans,
-        swarm_coordinators,
-        event_history,
-        event_counter,
-        swarm_event_tx,
-        swarm_mutation_runtime,
+        swarm,
     )
     .await;
 }
@@ -2030,15 +1930,12 @@ pub(super) async fn handle_comm_task_control(
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
     session: &SessionServiceHandle,
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: &Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
-    swarm_mutation_runtime: &SwarmMutationRuntime,
+    swarm: &SwarmServiceHandle,
 ) {
+    let swarm_members = &swarm.swarm_state.members;
+    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let swarm_plans = &swarm.swarm_state.plans;
+    let swarm_coordinators = &swarm.swarm_state.coordinators;
     let sessions = &session.sessions;
     let Some(action) = TaskControlAction::parse(&action) else {
         let _ = client_event_tx.send(ServerEvent::Error {
@@ -2234,13 +2131,7 @@ pub(super) async fn handle_comm_task_control(
                     swarm_id.clone(),
                     task_id.clone(),
                     assignment_text,
-                    Arc::clone(swarm_members),
-                    Arc::clone(swarms_by_id),
-                    Arc::clone(swarm_plans),
-                    Arc::clone(swarm_coordinators),
-                    Arc::clone(event_history),
-                    Arc::clone(event_counter),
-                    swarm_event_tx.clone(),
+                    swarm.clone(),
                 );
                 let summary = plan_graph_status_for(&swarm_id, swarm_plans).await;
                 let _ = client_event_tx.send(ServerEvent::CommTaskControlResponse {
@@ -2319,14 +2210,7 @@ pub(super) async fn handle_comm_task_control(
                 client_event_tx,
                 session,
                 client_connections,
-                swarm_members,
-                swarms_by_id,
-                swarm_plans,
-                swarm_coordinators,
-                event_history,
-                event_counter,
-                swarm_event_tx,
-                swarm_mutation_runtime,
+                swarm,
             )
             .await;
         }
@@ -2445,14 +2329,7 @@ pub(super) async fn handle_comm_task_control(
                 client_event_tx,
                 session,
                 client_connections,
-                swarm_members,
-                swarms_by_id,
-                swarm_plans,
-                swarm_coordinators,
-                event_history,
-                event_counter,
-                swarm_event_tx,
-                swarm_mutation_runtime,
+                swarm,
             )
             .await;
 
