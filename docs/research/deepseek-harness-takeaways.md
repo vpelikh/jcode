@@ -151,7 +151,8 @@ dsh's own priority.
   is undefined. The event-sourced scaffolding points the right way — `SessionEventOp::ReplaceMessages`
   + `SetCompaction` are exactly the dsh "replace the span with a summary, keep the raw events"
   shape, and `SessionEventMap` caches `compaction_event_index` for O(1) current compaction — but
-  this is not yet wired end-to-end. So the *bracket* must be designed into the log, not assumed.
+  this was not wired end-to-end when this report was written. So the *bracket* must be designed
+  into the log, not assumed.
 - **Recommendation (designs the event-sourced log — includes the bracket):** Build compaction
   as a log-bracketed operation from the start. The scaffold's `ReplaceMessages`/`SetCompaction`
   give the right surface shape; the missing design is **crash-safety of the bracket** and
@@ -167,6 +168,13 @@ dsh's own priority.
   These are the natural first consumers of takeaway #3 (invariants).
 
 **What this gives us.** Without the bracket, a compaction that crashes leaves the session in an invisible bad state: the session appears compacted (title updated, token count drops) but future log-derived messages include raw tool calls from *before* the crash, which the model sees as if they were called *after*. With the bracket, replay stops at the orphan marker and the user sees an obvious "incomplete compaction" state instead of a silent corruption.
+
+**Current status (2026-09-04).** The bracket is now **designed, durable, and replayable** in the session layer:
+- `SessionEventOp::CompactionStart` / `CompactionEnd` are wired through the (de)serializer and the persistence stack; `SessionEventMap::orphaned_compaction()` detects a crashed (open) bracket, and the `CompactionBracket` invariant flags it.
+- The event log is persisted **end-to-end**: `event_map` is kept in the snapshot, and the journal carries `append_events` so log-only events (brackets, plugin `Unknown`) survive a crash recovered purely from the journal instead of being collapsed into a rebuild-from-legacy-vectors. Tests cover snapshot round-trip, journal-append reload, and orphan detection after reload.
+- Producers now have a seam: `Session::compact_transcript_with_bracket()` emits a balanced `Start` → `replace` → `End` bracket atomically and keeps the legacy `compaction` vector in sync.
+
+**Still open (deliberately not forced).** The *live* compaction producer (`jcode-tui`/`jcode-app-core`) currently runs a prefix-summary model — it does **not** physically consolidate `session.messages` into a summary + recent tail, so `compact_transcript_with_bracket()` is the *integration point* to adopt, not something the live path calls yet. Migrating the live producer onto the seam is a behavior-changing, cross-crate change and is tracked separately from this report's design deliverable. This is an explicit, documented follow-up rather than an unimplemented recommendation.
 
 ## 6. Separate "prune" from "summarize"
 
