@@ -3220,6 +3220,7 @@ fn token_limit_422_is_retried_and_recovers() {
                 label: "test".to_string(),
             },
             false,
+            new_conversation_id(),
             request,
             tx,
             Arc::new(Mutex::new(None)),
