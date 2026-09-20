@@ -940,7 +940,9 @@ fn test_event_map_hydrated_on_disk_round_trip() {
     drop(f);
 
     let loaded = Session::load_from_path(&path).expect("load_from_path");
-    // event_map is #[serde(skip)], so without hydration it would be empty.
+    // event_map is now persisted in the snapshot, so a serialize + reload round
+    // trip carries it through. The load path keeps the persisted log when it
+    // agrees with the legacy vectors, so the events must equal the messages.
     assert_eq!(
         loaded.event_map.events.len(),
         loaded.messages.len(),
@@ -2346,13 +2348,9 @@ fn test_persisted_event_log_survives_snapshot_round_trip_with_bracket_and_unknow
     drop(f);
 
     let loaded = Session::load_from_path(&path).expect("load_from_path");
-    let kept = {
-        // reconcile already ran inside load; assert the authoritative log kept.
-        loaded.event_map.events.iter().any(|e| {
-            matches!(e.op, SessionEventOp::CompactionStart { .. })
-                && matches!(&e.op, SessionEventOp::CompactionStart { .. })
-        })
-    };
+    let kept = loaded.event_map.events.iter().any(|e| {
+        matches!(e.op, SessionEventOp::CompactionStart { .. })
+    });
     assert!(
         kept,
         "persisted bracket (CompactionStart) must survive the snapshot round-trip"
@@ -2484,10 +2482,14 @@ fn test_unknown_op_in_memory_non_object_serializes_single_op() {
         1,
         "in-memory non-object Unknown must serialize exactly one op key; got: {json}"
     );
-    // The round-trip must be stable: after the first deserialize the value settles
-    // into the object-wrapped wire form and stays unchanged on further round-trips.
+    // The round-trip must be lossless AND stable: the scalar/bare payload is
+    // preserved (not object-wrapped) and stays unchanged on further round-trips.
     let back: SessionEventOp = serde_json::from_str(&json).expect("deserialize");
     let json2 = serde_json::to_string(&back).expect("re-serialize");
+    assert_eq!(
+        json2, json,
+        "in-memory non-object Unknown must round-trip to the identical wire form (lossless)"
+    );
     let again: SessionEventOp = serde_json::from_str(&json2).expect("re-deserialize");
     let json3 = serde_json::to_string(&again).expect("re-serialize 2");
     assert_eq!(json2, json3, "shape must stabilize after first round-trip");
@@ -2495,36 +2497,47 @@ fn test_unknown_op_in_memory_non_object_serializes_single_op() {
 }
 
 /// The `Unknown` escape hatch must round-trip **stably** even when the remaining
-/// payload is not a flat JSON object (e.g. `{"op":"x","data":123}`). Such a
-/// value is preserved as an object wrapper (`data: { "data": 123 }`) so it
-/// carries an `op` alongside the payload; a second serialize→deserialize must
-/// reproduce the exact same in-memory value (no unbounded nesting growth). This
-/// pins the documented behavior of the non-object branch of `Serialize`.
+/// payload is not a flat JSON object (e.g. `{"op":"x","data":123}`). The
+/// serializer emission-encodes a non-object payload as a lone `data` field, and
+/// the deserializer unwraps it back to the bare value, so a scalar/array payload
+/// round-trips losslessly (no unbounded nesting growth, no spurious object
+/// wrapper). This pins the documented behavior of the non-object branch.
 #[test]
 fn test_unknown_op_non_object_payload_round_trips_losslessly() {
-    // Serialize a non-object data directly (matches the on-disk `{"op","data"}`)
-    // and confirm Deserialize recovers the same value WITHOUT re-nesting.
-    let raw = r#"{"op":"plugin_scalar","data":123}"#;
-    let op: SessionEventOp = serde_json::from_str(raw).expect("deserialize scalar unknown");
-    match &op {
-        SessionEventOp::Unknown { event_type, data } => {
-            assert_eq!(event_type, "plugin_scalar");
-            // Round-trip once. A non-object payload must stay a scalar, not
-            // collapse into `{"data":123}`.
-            let json = serde_json::to_string(&op).expect("serialize");
-            let again: SessionEventOp = serde_json::from_str(&json).expect("round-trip");
-            match &again {
-                SessionEventOp::Unknown { data: d2, .. } => {
-                    assert_eq!(
-                        d2,
-                        data,
-                        "non-object Unknown payload must round-trip without shape change"
-                    );
+    // A non-object payload (scalar or array) must deserialize to the bare value,
+    // NOT collapse into `{"data":123}` (the serializer's emission shape), and
+    // round-trip losslessly.
+    for (raw_tag, payload) in [
+        (r#"{"op":"plugin_scalar","data":123}"#, serde_json::json!(123)),
+        (
+            r#"{"op":"plugin_array","data":[1,"two",null]}"#,
+            serde_json::json!([1, "two", null]),
+        ),
+    ] {
+        let op: SessionEventOp =
+            serde_json::from_str(raw_tag).expect("deserialize non-object unknown");
+        match &op {
+            SessionEventOp::Unknown { event_type, data } => {
+                assert_eq!(
+                    data, &payload,
+                    "raw non-object payload must not be wrapped under `data`"
+                );
+                // Round-trip: the bare value must serialize back to the same
+                // wire form and deserialize to the identical value.
+                let json = serde_json::to_string(&op).expect("serialize");
+                let again: SessionEventOp = serde_json::from_str(&json).expect("round-trip");
+                match &again {
+                    SessionEventOp::Unknown { data: d2, .. } => {
+                        assert_eq!(
+                            d2, data,
+                            "non-object Unknown payload must round-trip without shape change"
+                        );
+                    }
+                    other => panic!("changed kind: {other:?}"),
                 }
-                other => panic!("changed kind: {other:?}"),
             }
+            other => panic!("expected Unknown, got {other:?}"),
         }
-        other => panic!("expected Unknown, got {other:?}"),
     }
 }
 

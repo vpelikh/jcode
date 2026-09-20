@@ -59,8 +59,12 @@ pub use jcode_session_types::{
     StoredCompactionState, StoredDisplayRole, StoredMemoryInjection, StoredMessage,
     StoredTokenUsage,
 };
-use event_types::{SessionEvent, SessionEventMap};
-pub use event_types::SessionEventOp;
+// The public event-log seam (`append_session_event`, `event_log`,
+// `fork_event_log`) exposes `SessionEvent`/`SessionEventMap`/`SessionEventError`
+// types directly, so re-export them at the session-module level uniformly with
+// `SessionEventOp` instead of forcing external callers to reach into
+// `event_types::`.
+pub use event_types::{SessionEvent, SessionEventError, SessionEventMap, SessionEventOp};
 use jcode_message_types::Role;
 use journal::{PersistVectorMode, SessionJournalMeta, SessionPersistState};
 pub use maintenance::prune_old_session_backups;

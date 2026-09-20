@@ -164,8 +164,14 @@ impl Serialize for SessionEventOp {
         use serde::ser::SerializeMap;
 
         // Unknown round-trips by re-emitting `op` plus the preserved payload.
+        // Size hint = emitted entries: fields+op for an object payload, or
+        // `data`+op for a non-object (scalar/array) payload.
         if let SessionEventOp::Unknown { event_type, data } = self {
-            let mut map = serializer.serialize_map(Some(data.as_object().map_or(1, |m| m.len() + 1)))?;
+            let entry_hint = match data {
+                serde_json::Value::Object(fields) => fields.len() + 1,
+                _ => 2,
+            };
+            let mut map = serializer.serialize_map(Some(entry_hint))?;
             match data {
                 serde_json::Value::Object(fields) => {
                     for (k, v) in fields {
@@ -280,12 +286,38 @@ impl<'de> Deserialize<'de> for SessionEventOp {
         // shape differs from what this build expects. If the per-variant parse
         // fails, degrade to `Unknown` (preserving the full payload) rather than
         // erroring — otherwise a single shape mismatch on one event would fail to
-        // load the whole journal. `remaining` is a copy of the fields WITHOUT the
-        // `op` tag, used as the Unknown payload.
-        let remaining = serde_json::Value::Object(clone.clone());
-        let make_unknown = |event_type: &str| SessionEventOp::Unknown {
-            event_type: event_type.to_string(),
-            data: remaining.clone(),
+        // load the whole journal.
+        //
+        // Non-object payloads (a scalar/array) are emission-encoded by the
+        // serializer as a lone `data` field (they cannot carry an `op` alongside
+        // sibling fields). Unwrap that shape back to the bare value so a
+        // scalar/array `Unknown` round-trips losslessly instead of collapsing
+        // into `{"data": <value>}`. An object payload is emitted flattened, so a
+        // lone `data` field whose value is NOT an object is unambiguous — EXCEPT
+        // for the narrow case of an object payload whose single field is named
+        // `data` and is itself not an object (e.g. `{"data": 5}`), which on the
+        // wire is indistinguishable from a wrapped non-object. We prefer the
+        // bundled-non-object interpretation since flattened objects that carry a
+        // lone non-`data` field are common while a lone `data`-keyed non-object
+        // field is rare; such a plugin payload should store the value on a
+        // differently-named key. Resolve from `obj` (never moved by the
+        // per-variant parse) so this stays usable after `clone` is moved into a
+        // known-variant parser.
+        let make_unknown = |event_type: &str| -> SessionEventOp {
+            let mut fields = obj.clone();
+            fields.remove(OP_KEY);
+            let data = if fields.len() == 1
+                && let Some(v) = fields.get("data")
+                && !v.is_object()
+            {
+                v.clone()
+            } else {
+                serde_json::Value::Object(fields)
+            };
+            SessionEventOp::Unknown {
+                event_type: event_type.to_string(),
+                data,
+            }
         };
 
         match op {
@@ -366,11 +398,10 @@ impl<'de> Deserialize<'de> for SessionEventOp {
             // Unknown `op`: this is the escape hatch. Preserve the type tag and
             // every remaining field so a plugin event round-trips through the
             // log losslessly and future core releases can promote it to a
-            // first-class variant without losing already-logged data.
-            other => Ok(SessionEventOp::Unknown {
-                event_type: other.to_string(),
-                data: serde_json::Value::Object(clone),
-            }),
+            // first-class variant without losing already-logged data. Non-object
+            // payloads are unwrapped from their serialization-encoded `data` form
+            // (see `make_unknown`).
+            other => Ok(make_unknown(other)),
         }
     }
 }
