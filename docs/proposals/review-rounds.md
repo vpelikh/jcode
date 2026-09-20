@@ -263,6 +263,10 @@ review loop, so there is no gates↔review ping-pong.
 - `model` (existing)
 - `loop_mode` (new, default true, autoreview-only)
 - `max_stalled_turns` (new, default 3, 0 = unlimited)
+- `stale_reviewer_timeout_secs` (new, default 1800 = 30 min, 0 = disabled): how
+  long a no-verdict reviewer may be silent before its process is assumed dead and
+  the lens is respawned (recovers from a reviewer whose process died but whose
+  session file persists; a generous window avoids misclassifying a slow reviewer)
 
 ## Cost
 
