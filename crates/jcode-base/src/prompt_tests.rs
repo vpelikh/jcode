@@ -221,6 +221,11 @@ fn agents_md_distinct_project_and_global_files_are_both_loaded() {
 
 #[test]
 fn captured_agents_md_keeps_split_prompt_stable_after_file_write() {
+    let _guard = crate::storage::lock_test_env();
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let temp = tempfile::TempDir::new().unwrap();
+    crate::env::set_var("JCODE_HOME", temp.path());
+
     let project_dir = tempfile::TempDir::new().unwrap();
     let agents_md = project_dir.path().join("AGENTS.md");
     std::fs::write(&agents_md, "original session instructions").unwrap();
@@ -269,6 +274,12 @@ fn captured_agents_md_keeps_split_prompt_stable_after_file_write() {
             .contains("instructions written during the session")
     );
     assert_ne!(before.static_part, next_session.static_part);
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
 }
 
 #[test]
@@ -559,6 +570,15 @@ fn test_split_selfdev_prompt_defaults_to_tui_focus_for_repo_root() {
 }
 
 #[test]
+fn test_selfdev_prompt_uses_desktop2_focus_for_desktop2_working_dir() {
+    let desktop2_dir = std::path::Path::new("/tmp/jcode/crates/jcode-desktop2/src");
+    let (prompt, _info) = build_system_prompt_full(None, &[], true, None, Some(desktop2_dir));
+    assert!(prompt.contains("launched from the jcode-desktop2"));
+    assert!(prompt.contains("selfdev build target=desktop2"));
+    assert!(!prompt.contains("launched from the TUI/root jcode context"));
+}
+
+#[test]
 fn test_selfdev_prompt_prefers_publish_flow_for_active_builds() {
     let prompt = build_system_prompt_with_selfdev(None, &[], true);
     assert!(prompt.contains("selfdev build"));
@@ -759,6 +779,26 @@ fn desktop_prompt_leaves_normal_and_cli_sessions_unchanged() {
 }
 
 #[test]
+fn default_system_prompt_contains_code_search_guidance() {
+    assert!(
+        DEFAULT_SYSTEM_PROMPT.contains("## Code search"),
+        "system prompt should contain a Code search section"
+    );
+    assert!(
+        DEFAULT_SYSTEM_PROMPT.contains("compass_query"),
+        "system prompt should mention compass_query"
+    );
+    assert!(
+        DEFAULT_SYSTEM_PROMPT.contains("agentgrep"),
+        "system prompt should mention agentgrep fallback"
+    );
+    assert!(
+        DEFAULT_SYSTEM_PROMPT.contains("Code search is\nnever optional between grep and a search skill"),
+        "system prompt should enforce the precedence rule"
+    );
+}
+
+#[test]
 fn desktop_prompt_documents_safe_product_specific_workflow() {
     for action in [
         "status",
@@ -917,4 +957,193 @@ fn prompt_guidance_missing_or_unreadable_project_keeps_global_content() {
             }
         }
     });
+}
+
+fn default_preferred_tools_guidance_matches_system_prompt_code_search_section() {
+    // The built-in preferred-tools fallback must stay in sync with the base
+    // system prompt's code-search section so the rule never drifts between the
+    // two injection points. Compare the body (after each file's heading).
+    let md_section = DEFAULT_SYSTEM_PROMPT
+        .split("## Code search\n\n")
+        .nth(1)
+        .expect("system prompt should contain the code search section")
+        .split("\n## ")
+        .next()
+        .unwrap_or("")
+        .trim();
+
+    // DEFAULT_PREFERRED_TOOLS starts with a "# Default Preferred Tools" heading
+    // then the guidance paragraphs.
+    let const_body = DEFAULT_PREFERRED_TOOLS.split_once("\n\n").map(|x| x.1)
+        .expect("default preferred tools should have a body")
+        .trim();
+
+    assert_eq!(
+        const_body, md_section,
+        "DEFAULT_PREFERRED_TOOLS body must match the system prompt code-search section"
+    );
+}
+
+#[test]
+fn preferred_tools_fallback_is_used_when_no_config_exists() {
+    use crate::prompt::{
+        build_system_prompt_full, build_system_prompt_split_with_agents_md,
+        load_preferred_tools_files_from_dir,
+    };
+
+    let _guard = crate::storage::lock_test_env();
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let temp = tempfile::TempDir::new().unwrap();
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    // Project dir has NO .jcode/preferred-tools.md
+    let project_dir = tempfile::TempDir::new().unwrap();
+
+    // Home has NO preferred-tools.md
+    std::fs::remove_file(temp.path().join("preferred-tools.md")).ok();
+
+    let (content, chars) = load_preferred_tools_files_from_dir(Some(project_dir.path()));
+    assert!(
+        content.is_some(),
+        "expected default preferred-tools content even when no config exists"
+    );
+    let content = content.unwrap();
+    assert!(content.contains("compass_query"), "default should mention compass_query");
+    assert!(content.contains("agentgrep"), "default should mention agentgrep");
+    assert!(chars > 0, "default should have non-zero character count");
+
+    let (prompt, info) = build_system_prompt_full(None, &[], false, None, Some(project_dir.path()));
+    assert!(
+        prompt.contains("compass_query"),
+        "system prompt should include code-search guidance from default preferred-tools"
+    );
+    assert!(info.preferred_tools_chars > 0);
+
+    // The split builder (used by live agents for cache-friendly prompts) must
+    // also inject the fallback into its cacheable static part.
+    let (split, split_info) = build_system_prompt_split_with_agents_md(
+        None,
+        &[],
+        false,
+        None,
+        Some(project_dir.path()),
+        (None, crate::prompt::ContextInfo::default()),
+    );
+    assert!(
+        split.static_part.contains("compass_query"),
+        "split static part should include the fallback guidance"
+    );
+    assert!(split_info.preferred_tools_chars > 0);
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}
+
+#[test]
+fn custom_preferred_tools_override_default_fallback() {
+    use crate::prompt::load_preferred_tools_files_from_dir;
+
+    let _guard = crate::storage::lock_test_env();
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let temp = tempfile::TempDir::new().unwrap();
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    let project_dir = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(project_dir.path().join(".jcode")).unwrap();
+    std::fs::write(
+        project_dir.path().join(".jcode/preferred-tools.md"),
+        "# Custom\nUse my custom tool.",
+    )
+    .unwrap();
+
+    let (content, _) = load_preferred_tools_files_from_dir(Some(project_dir.path()));
+    let content = content.expect("should load project preferred tools");
+    assert!(
+        content.contains("Custom"),
+        "project preferred-tools should appear"
+    );
+    // The custom content should not be mixed with the default heading
+    assert!(
+        !content.contains("# Default Preferred Tools"),
+        "project preferred-tools should not include the default heading"
+    );
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}
+
+#[test]
+fn preferred_tools_global_only_uses_global_without_default_duplication() {
+    use crate::prompt::load_preferred_tools_files_from_dir;
+
+    let _guard = crate::storage::lock_test_env();
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let temp = tempfile::TempDir::new().unwrap();
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    // Global present, no project file.
+    std::fs::write(
+        temp.path().join("preferred-tools.md"),
+        "global custom guidance",
+    )
+    .unwrap();
+    let project_dir = tempfile::TempDir::new().unwrap();
+
+    let (content, _) = load_preferred_tools_files_from_dir(Some(project_dir.path()));
+    let content = content.expect("global preferred-tools should be loaded");
+    assert!(content.contains("global custom guidance"));
+    assert!(
+        content.contains("Global Preferred Tools (~/.jcode/preferred-tools.md)"),
+        "expected global heading"
+    );
+    // The default must not be appended when a real file is present.
+    assert!(
+        !content.contains("# Default Preferred Tools"),
+        "default fallback should not be mixed with real config"
+    );
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}
+
+#[test]
+fn preferred_tools_blank_file_falls_through_to_default() {
+    use crate::prompt::load_preferred_tools_files_from_dir;
+
+    let _guard = crate::storage::lock_test_env();
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let temp = tempfile::TempDir::new().unwrap();
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    let project_dir = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(project_dir.path().join(".jcode")).unwrap();
+    // A whitespace-only project file must not disable the default guidance.
+    std::fs::write(project_dir.path().join(".jcode/preferred-tools.md"), "   \n").unwrap();
+
+    let (content, chars) = load_preferred_tools_files_from_dir(Some(project_dir.path()));
+    let content = content.expect("blank project file should still yield guidance");
+    assert!(
+        content.contains("compass_query"),
+        "blank file should not suppress the default code-search guidance"
+    );
+    assert!(
+        content.contains("agentgrep"),
+        "blank file should not suppress the default fallback guidance"
+    );
+    assert!(chars > 0, "blank file should yield non-zero character count");
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
 }
