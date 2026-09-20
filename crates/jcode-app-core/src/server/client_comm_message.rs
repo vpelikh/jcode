@@ -1,17 +1,16 @@
 use super::live_turn::{LiveTurnSwarmContext, run_live_turn_if_idle};
+use super::services::SessionServiceHandle;
 use super::{
-    ClientConnectionInfo, SessionInterruptQueues, SwarmEvent, SwarmEventType, SwarmMember,
-    fanout_session_event, queue_soft_interrupt_for_session, record_swarm_event, truncate_detail,
+    ClientConnectionInfo, SwarmEvent, SwarmEventType, SwarmMember,
+    fanout_session_event, record_swarm_event, truncate_detail,
 };
-use crate::agent::Agent;
 use crate::protocol::{CommDeliveryMode, NotificationType, ServerEvent};
 use jcode_agent_runtime::SoftInterruptSource;
 use jcode_swarm_core::ChannelIndex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+use tokio::sync::{RwLock, broadcast, mpsc};
 
-type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
 type ChannelSubscriptions = Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
 
 async fn swarm_id_for_session(
@@ -110,8 +109,7 @@ pub(super) async fn handle_comm_message(
     wake: Option<bool>,
     tldr: Option<String>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
-    sessions: &SessionAgents,
-    soft_interrupt_queues: &SessionInterruptQueues,
+    session: &SessionServiceHandle,
     swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
     swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
     channel_subscriptions: &ChannelSubscriptions,
@@ -120,6 +118,7 @@ pub(super) async fn handle_comm_message(
     swarm_event_tx: &broadcast::Sender<SwarmEvent>,
     _client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
 ) {
+    let sessions = &session.sessions;
     let started = std::time::Instant::now();
     crate::logging::event_info(
         "COMM_LIFECYCLE",
@@ -325,15 +324,14 @@ pub(super) async fn handle_comm_message(
                 match delivery_mode {
                     CommDeliveryMode::Notify => {}
                     CommDeliveryMode::Interrupt => {
-                        let _ = queue_soft_interrupt_for_session(
-                            session_id,
-                            notification_msg.clone(),
-                            false,
-                            SoftInterruptSource::System,
-                            soft_interrupt_queues,
-                            sessions,
-                        )
-                        .await;
+                        let _ = session
+                                .queue_soft_interrupt(
+                                    session_id,
+                                    notification_msg.clone(),
+                                    false,
+                                    SoftInterruptSource::System,
+                                )
+                                .await;
                     }
                     CommDeliveryMode::Wake => {
                         if crate::config::config().server.wake_mode
@@ -368,15 +366,14 @@ pub(super) async fn handle_comm_message(
                         .await;
 
                         if !woke_immediately {
-                            let _ = queue_soft_interrupt_for_session(
-                                session_id,
-                                notification_msg.clone(),
-                                false,
-                                SoftInterruptSource::System,
-                                soft_interrupt_queues,
-                                sessions,
-                            )
-                            .await;
+                            let _ = session
+                                    .queue_soft_interrupt(
+                                        session_id,
+                                        notification_msg.clone(),
+                                        false,
+                                        SoftInterruptSource::System,
+                                    )
+                                    .await;
                         }
                     }
                 }

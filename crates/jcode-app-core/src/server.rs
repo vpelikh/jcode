@@ -2010,8 +2010,6 @@ impl Server {
         let event_history = swarm.event_history.clone();
         let event_counter = Arc::clone(&swarm.event_counter);
         let swarm_event_tx = swarm.swarm_event_tx.clone();
-        let sessions = Arc::clone(&session.sessions);
-        let soft_interrupt_queues = Arc::clone(&session.soft_interrupt_queues);
         let mut receiver = Bus::global().subscribe();
         let mut last_cleanup = Instant::now();
         const TOUCH_EXPIRY: Duration = Duration::from_secs(30 * 60); // 30 min
@@ -2235,8 +2233,7 @@ impl Server {
                 Ok(BusEvent::BackgroundTaskCompleted(task)) => {
                     dispatch_background_task_completion(
                         &task,
-                        &sessions,
-                        &soft_interrupt_queues,
+                        session,
                         &swarm_members,
                         &swarms_by_id,
                         &event_history,
@@ -2251,8 +2248,7 @@ impl Server {
                 Ok(BusEvent::BackgroundTaskStalled(task)) => {
                     dispatch_background_task_stalled(
                         &task,
-                        &sessions,
-                        &soft_interrupt_queues,
+                        session,
                         &swarm_members,
                         &swarms_by_id,
                         &event_history,
@@ -2264,8 +2260,7 @@ impl Server {
                 Ok(BusEvent::SwarmAwaitCompleted(event)) => {
                     dispatch_swarm_await_completion(
                         &event,
-                        &sessions,
-                        &soft_interrupt_queues,
+                        session,
                         &swarm_members,
                         &swarms_by_id,
                         &event_history,

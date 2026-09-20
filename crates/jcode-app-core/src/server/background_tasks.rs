@@ -1,9 +1,7 @@
 use super::live_turn::{LiveTurnSwarmContext, run_live_turn_if_idle};
+use super::services::SessionServiceHandle;
 use super::state::SwarmEvent;
-use super::{
-    SessionAgents, SessionInterruptQueues, SwarmMember, fanout_session_event,
-    queue_soft_interrupt_for_session,
-};
+use super::{SwarmMember, fanout_session_event};
 use crate::message::{
     format_background_task_notification_markdown, format_background_task_progress_markdown,
 };
@@ -42,14 +40,14 @@ async fn emit_external_wake(
 )]
 pub(super) async fn dispatch_background_task_completion(
     task: &crate::bus::BackgroundTaskCompleted,
-    sessions: &SessionAgents,
-    soft_interrupt_queues: &SessionInterruptQueues,
+    session: &SessionServiceHandle,
     swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
     swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
     event_history: &Arc<RwLock<VecDeque<SwarmEvent>>>,
     event_counter: &Arc<AtomicU64>,
     swarm_event_tx: &broadcast::Sender<SwarmEvent>,
 ) {
+    let sessions = &session.sessions;
     let notification = format_background_task_notification_markdown(task);
 
     if task.notify
@@ -101,15 +99,14 @@ pub(super) async fn dispatch_background_task_completion(
             ),
         )
         .await
-        && !queue_soft_interrupt_for_session(
-            &task.session_id,
-            notification.clone(),
-            false,
-            SoftInterruptSource::BackgroundTask,
-            soft_interrupt_queues,
-            sessions,
-        )
-        .await
+        && !session
+            .queue_soft_interrupt(
+                &task.session_id,
+                notification.clone(),
+                false,
+                SoftInterruptSource::BackgroundTask,
+            )
+            .await
     {
         crate::logging::warn(&format!(
             "Failed to deliver background task completion to session {}",
@@ -129,14 +126,14 @@ pub(super) async fn dispatch_background_task_completion(
 )]
 pub(super) async fn dispatch_background_task_stalled(
     task: &crate::bus::BackgroundTaskStalled,
-    sessions: &SessionAgents,
-    soft_interrupt_queues: &SessionInterruptQueues,
+    session: &SessionServiceHandle,
     swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
     swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
     event_history: &Arc<RwLock<VecDeque<SwarmEvent>>>,
     event_counter: &Arc<AtomicU64>,
     swarm_event_tx: &broadcast::Sender<SwarmEvent>,
 ) {
+    let sessions = &session.sessions;
     let notification = crate::message::format_background_task_stalled_markdown(task);
 
     if task.notify
@@ -188,15 +185,14 @@ pub(super) async fn dispatch_background_task_stalled(
             ),
         )
         .await
-        && !queue_soft_interrupt_for_session(
-            &task.session_id,
-            notification.clone(),
-            false,
-            SoftInterruptSource::BackgroundTask,
-            soft_interrupt_queues,
-            sessions,
-        )
-        .await
+        && !session
+            .queue_soft_interrupt(
+                &task.session_id,
+                notification.clone(),
+                false,
+                SoftInterruptSource::BackgroundTask,
+            )
+            .await
     {
         crate::logging::warn(&format!(
             "Failed to deliver background task stall to session {}",
@@ -215,14 +211,14 @@ pub(super) async fn dispatch_background_task_stalled(
 )]
 pub(super) async fn dispatch_swarm_await_completion(
     event: &crate::bus::SwarmAwaitCompleted,
-    sessions: &SessionAgents,
-    soft_interrupt_queues: &SessionInterruptQueues,
+    session: &SessionServiceHandle,
     swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
     swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
     event_history: &Arc<RwLock<VecDeque<SwarmEvent>>>,
     event_counter: &Arc<AtomicU64>,
     swarm_event_tx: &broadcast::Sender<SwarmEvent>,
 ) {
+    let sessions = &session.sessions;
     if event.notify
         && fanout_session_event(
             swarm_members,
@@ -279,15 +275,14 @@ pub(super) async fn dispatch_swarm_await_completion(
         ),
     )
     .await
-        && !queue_soft_interrupt_for_session(
-            &event.session_id,
-            event.notification.clone(),
-            false,
-            SoftInterruptSource::BackgroundTask,
-            soft_interrupt_queues,
-            sessions,
-        )
-        .await
+        && !session
+            .queue_soft_interrupt(
+                &event.session_id,
+                event.notification.clone(),
+                false,
+                SoftInterruptSource::BackgroundTask,
+            )
+            .await
     {
         crate::logging::warn(&format!(
             "Failed to deliver swarm await completion to session {}",

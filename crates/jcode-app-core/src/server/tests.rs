@@ -1,5 +1,6 @@
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
 
+use super::services::SessionServiceHandle;
 use super::{
     FileAccess, Server, SessionInterruptQueues, SwarmMember, dispatch_background_task_completion,
     file_activity_scope_label, persist_swarm_state_snapshot, remove_session_entry,
@@ -395,6 +396,21 @@ fn attached_swarm_member(
     }
 }
 
+/// A minimal session service handle for tests that only exercise the soft-interrupt
+/// delivery path. The other handle fields are inert defaults.
+fn test_session_service_handle(
+    sessions: super::SessionAgents,
+    soft_interrupt_queues: SessionInterruptQueues,
+) -> SessionServiceHandle {
+    SessionServiceHandle {
+        sessions,
+        session_id: Arc::new(RwLock::new(String::new())),
+        is_processing: Arc::new(RwLock::new(false)),
+        shutdown_signals: Arc::new(RwLock::new(HashMap::new())),
+        soft_interrupt_queues,
+    }
+}
+
 fn persisted_headless_member(
     session_id: &str,
     swarm_id: &str,
@@ -461,10 +477,13 @@ async fn background_task_wake_runs_live_session_immediately_when_idle() {
     };
 
     let (swarms_by_id, event_history, event_counter, swarm_event_tx) = empty_swarm_status_state();
+    let session_handle = test_session_service_handle(
+            Arc::clone(&sessions),
+            Arc::clone(&soft_interrupt_queues),
+        );
     dispatch_background_task_completion(
         &task,
-        &sessions,
-        &soft_interrupt_queues,
+        &session_handle,
         &swarm_members,
         &swarms_by_id,
         &event_history,
@@ -562,10 +581,13 @@ async fn external_background_task_wake_emits_request_without_starting_turn() {
     };
     let (swarms_by_id, event_history, event_counter, swarm_event_tx) = empty_swarm_status_state();
 
+    let session_handle = test_session_service_handle(
+            Arc::clone(&sessions),
+            Arc::clone(&soft_interrupt_queues),
+        );
     dispatch_background_task_completion(
         &task,
-        &sessions,
-        &soft_interrupt_queues,
+        &session_handle,
         &swarm_members,
         &swarms_by_id,
         &event_history,
@@ -846,10 +868,13 @@ async fn background_task_notify_without_wake_does_not_queue_soft_interrupt() {
     };
 
     let (swarms_by_id, event_history, event_counter, swarm_event_tx) = empty_swarm_status_state();
+    let session_handle = test_session_service_handle(
+            Arc::clone(&sessions),
+            Arc::clone(&soft_interrupt_queues),
+        );
     dispatch_background_task_completion(
         &task,
-        &sessions,
-        &soft_interrupt_queues,
+        &session_handle,
         &swarm_members,
         &swarms_by_id,
         &event_history,

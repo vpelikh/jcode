@@ -1,10 +1,11 @@
 #![cfg_attr(test, allow(clippy::items_after_test_module))]
 
 use super::client_lifecycle::process_message_streaming_mpsc;
+use super::services::SessionServiceHandle;
 use super::{
-    ClientConnectionInfo, SessionInterruptQueues, SwarmEvent, SwarmMember, SwarmState,
+    ClientConnectionInfo, SwarmEvent, SwarmMember, SwarmState,
     VersionedPlan, broadcast_swarm_status, fanout_session_event, persist_swarm_state_for,
-    queue_soft_interrupt_for_session, remove_session_channel_subscriptions,
+    remove_session_channel_subscriptions,
     remove_session_from_swarm, swarm_id_for_session, truncate_detail, update_member_status,
 };
 use crate::agent::Agent;
@@ -80,8 +81,7 @@ fn combine_input_shell_output(stdout: &[u8], stderr: &[u8]) -> (String, bool) {
 }
 
 pub(super) struct NotifySessionContext<'a> {
-    pub sessions: &'a SessionAgents,
-    pub soft_interrupt_queues: &'a SessionInterruptQueues,
+    pub session: &'a SessionServiceHandle,
     pub client_connections: &'a Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
     pub swarm_members: &'a Arc<RwLock<HashMap<String, SwarmMember>>>,
     pub swarms_by_id: &'a Arc<RwLock<HashMap<String, HashSet<String>>>>,
@@ -97,6 +97,7 @@ pub(super) async fn handle_notify_session(
     message: String,
     ctx: NotifySessionContext<'_>,
 ) {
+    let sessions = &ctx.session.sessions;
     let target_has_client = {
         let connections = ctx.client_connections.read().await;
         connections
@@ -108,7 +109,7 @@ pub(super) async fn handle_notify_session(
         super::live_turn::run_live_system_turn_if_idle(
             &session_id,
             &message,
-            ctx.sessions,
+            sessions,
             super::live_turn::LiveTurnSwarmContext::new(
                 ctx.swarm_members,
                 ctx.swarms_by_id,
@@ -152,15 +153,14 @@ pub(super) async fn handle_notify_session(
     let queued_interrupt = if ran_immediately {
         false
     } else {
-        queue_soft_interrupt_for_session(
-            &session_id,
-            message.clone(),
-            false,
-            SoftInterruptSource::System,
-            ctx.soft_interrupt_queues,
-            ctx.sessions,
-        )
-        .await
+        ctx.session
+            .queue_soft_interrupt(
+                &session_id,
+                message.clone(),
+                false,
+                SoftInterruptSource::System,
+            )
+            .await
     };
 
     if ran_immediately || notified || queued_interrupt {

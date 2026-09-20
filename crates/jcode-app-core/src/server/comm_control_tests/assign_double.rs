@@ -216,6 +216,7 @@ async fn assign_task_rejects_double_assignment_of_actively_worked_task() {
     let (swarm_event_tx, _swarm_event_rx) = broadcast::channel(32);
     let mutation_runtime = SwarmMutationRuntime::default();
 
+    let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
     handle_comm_assign_task(
         91,
         requester.to_string(),
@@ -223,8 +224,7 @@ async fn assign_task_rejects_double_assignment_of_actively_worked_task() {
         Some("contested".to_string()),
         None,
         &client_tx,
-        &sessions,
-        &soft_interrupt_queues,
+        &session_h,
         &client_connections,
         &swarm_members,
         &swarms_by_id,
@@ -300,6 +300,7 @@ async fn assign_task_allows_taking_over_stale_assignment() {
     let (swarm_event_tx, _swarm_event_rx) = broadcast::channel(32);
     let mutation_runtime = SwarmMutationRuntime::default();
 
+    let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
     handle_comm_assign_task(
         92,
         requester.to_string(),
@@ -307,8 +308,7 @@ async fn assign_task_allows_taking_over_stale_assignment() {
         Some("stalled".to_string()),
         None,
         &client_tx,
-        &sessions,
-        &soft_interrupt_queues,
+        &session_h,
         &client_connections,
         &swarm_members,
         &swarms_by_id,
@@ -389,6 +389,7 @@ async fn task_control_reassign_tells_displaced_worker_to_stand_down() {
     let (swarm_event_tx, _swarm_event_rx) = broadcast::channel(32);
     let mutation_runtime = SwarmMutationRuntime::default();
 
+    let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
     handle_comm_task_control(
         93,
         requester.to_string(),
@@ -397,8 +398,7 @@ async fn task_control_reassign_tells_displaced_worker_to_stand_down() {
         Some(intruder.to_string()),
         None,
         &client_tx,
-        &sessions,
-        &soft_interrupt_queues,
+        &session_h,
         &client_connections,
         &swarm_members,
         &swarms_by_id,

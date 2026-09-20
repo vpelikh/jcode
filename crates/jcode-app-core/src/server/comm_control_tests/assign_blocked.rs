@@ -47,6 +47,7 @@ async fn assign_task_rejects_explicit_blocked_task() {
     let (swarm_event_tx, _swarm_event_rx) = broadcast::channel(32);
     let mutation_runtime = SwarmMutationRuntime::default();
 
+    let session_h = session_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
     handle_comm_assign_task(
         88,
         requester.to_string(),
@@ -54,8 +55,7 @@ async fn assign_task_rejects_explicit_blocked_task() {
         Some("blocked".to_string()),
         None,
         &client_tx,
-        &sessions,
-        &soft_interrupt_queues,
+        &session_h,
         &client_connections,
         &swarm_members,
         &swarms_by_id,
