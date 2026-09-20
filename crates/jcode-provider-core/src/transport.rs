@@ -363,4 +363,169 @@ mod tests {
             beacons[0]
         );
     }
+
+    #[test]
+    fn upload_progress_label_switches_to_uploaded_at_total() {
+        use super::upload_progress_label;
+        // Mid-upload: shows the running byte counter against the total.
+        let mid = upload_progress_label(193 * 1024, 503 * 1024);
+        assert_eq!(mid, "uploading 193 KB / 503 KB", "got: {mid}");
+
+        // Once every byte is handed to the transport, the label stops
+        // suggesting an in-flight drain and names the server-side wait.
+        let done = upload_progress_label(503 * 1024, 503 * 1024);
+        assert_eq!(done, "uploaded 503 KB, waiting for server", "got: {done}");
+
+        // A zero-length body has no meaningful progress to report.
+        assert_eq!(upload_progress_label(0, 0), "");
+    }
+
+    #[tokio::test]
+    async fn counting_body_reports_upload_progress_and_fixed_framing() {
+        use super::CountingBody;
+        use http_body::Body as _;
+        use std::sync::{Arc, Mutex};
+
+        let payload = vec![7_u8; 200 * 1024]; // > 64KB chunk => multiple callbacks
+        let sent = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let sent_cb = sent.clone();
+        let body = CountingBody::new(
+            bytes::Bytes::from(payload),
+            move |n| {
+                sent_cb.lock().unwrap().push(n);
+            },
+        );
+
+        // Exact size hint guarantees fixed Content-Length framing when wrapped.
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), Some(200 * 1024), "exact size hint expected");
+        assert!(
+            hint.exact().is_some(),
+            "CountingBody must report an exact size hint"
+        );
+
+        // Draining the whole body yields every byte and fires upload progress.
+        // Poll manually (no `collect`) to avoid needing http-body-util here.
+        use std::task::Waker;
+        let mut body = Box::pin(body);
+        let mut cx = std::task::Context::from_waker(Waker::noop());
+        let mut total_bytes = 0usize;
+        loop {
+            match http_body::Body::poll_frame(body.as_mut(), &mut cx) {
+                std::task::Poll::Ready(Some(Ok(frame))) => {
+                    total_bytes += frame.data_ref().map(|d| d.len()).unwrap_or(0);
+                }
+                std::task::Poll::Ready(None) => break,
+                std::task::Poll::Pending => panic!("CountingBody must not pend"),
+            }
+        }
+        assert_eq!(total_bytes, 200 * 1024, "all bytes delivered");
+        let sent = sent.lock().unwrap();
+        assert!(
+            sent.len() >= 2,
+            "expected multiple progress callbacks, got {:?}",
+            *sent
+        );
+        assert_eq!(*sent.last().unwrap(), 200 * 1024, "final byte count");
+        // Monotonically increasing byte counts.
+        for window in sent.windows(2) {
+            assert!(window[1] > window[0], "progress must increase: {window:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn send_body_with_upload_progress_keeps_content_length_and_fires_callbacks() {
+        use super::send_body_with_upload_progress;
+        use std::sync::{Arc, Mutex};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind server");
+        let address = listener.local_addr().expect("read address");
+
+        let (headers_tx, headers_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set timeout");
+
+            // Read bytes until we have the header-terminator and the whole body.
+            let mut buf = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            let mut header_end: Option<usize> = None;
+            let mut content_length = 0usize;
+            loop {
+                let n = stream.read(&mut chunk).expect("read chunk");
+                assert!(n > 0, "client closed mid-request");
+                buf.extend_from_slice(&chunk[..n]);
+                if header_end.is_none() {
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        header_end = Some(pos + 4);
+                        content_length = String::from_utf8_lossy(&buf[..pos])
+                            .to_lowercase()
+                            .split("content-length:")
+                            .nth(1)
+                            .and_then(|s| s.split_whitespace().next())
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0);
+                    }
+                }
+                if let Some(he) = header_end {
+                    if buf.len() >= he + content_length {
+                        break;
+                    }
+                }
+            }
+            let head_str = String::from_utf8_lossy(&buf[..header_end.unwrap()]).to_string();
+            headers_tx.send(head_str).expect("send headers");
+
+            // Respond so the client resolves.
+            let body = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
+            let _ = stream.write_all(body.as_bytes()).expect("write response");
+        });
+
+        let payload: Vec<u8> = vec![9_u8; 3 * 1024 * 1024]; // 3 MB, > 64KB chunk
+        let uploads = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let uploads_cb = uploads.clone();
+
+        let request = reqwest::Client::new()
+            .post(format!("http://{address}/chat/completions"))
+            .header("Content-Type", "application/json");
+        let _response = send_body_with_upload_progress(
+            request,
+            payload,
+            Duration::from_secs(10),
+            move |sent| {
+                uploads_cb.lock().unwrap().push(sent);
+            },
+            |_: &str| async {}, // no heartbeat expected for fast local request
+        )
+        .await
+        .expect("request should succeed");
+
+        server.join().expect("server should exit");
+
+        // The request must arrive with a fixed Content-Length (not chunked).
+        let headers = headers_rx.recv_timeout(Duration::from_secs(2)).expect("headers");
+        assert!(
+            !headers.to_lowercase().contains("transfer-encoding: chunked"),
+            "must not fall back to chunked transfer-encoding:\n{headers}"
+        );
+        let cl = headers
+            .to_lowercase()
+            .find("content-length:")
+            .map(|i| {
+                let rest = &headers[i + "content-length:".len()..];
+                rest.split_whitespace().next().unwrap_or("").to_string()
+            })
+            .unwrap_or_default();
+        assert_eq!(cl, (3 * 1024 * 1024).to_string(), "content-length mismatch");
+
+        // At least two progress callbacks, final one equals the full size.
+        let uploads = uploads.lock().unwrap();
+        assert!(uploads.len() >= 2, "expected multiple upload callbacks: {uploads:?}");
+        assert_eq!(*uploads.last().unwrap(), 3 * 1024 * 1024, "full payload reported");
+        for w in uploads.windows(2) {
+            assert!(w[1] > w[0], "progress must increase: {w:?}");
+        }
+    }
 }
