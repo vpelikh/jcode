@@ -1076,17 +1076,12 @@ pub(super) fn get_tool_summary_with_budget(
                         .get("query")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    if query.is_empty() {
+                    let quoted =
+                        quoted_query_display(query, bounded(36).saturating_sub(mode.len() + 3));
+                    if quoted.is_empty() {
                         mode.to_string()
                     } else {
-                        format!(
-                            "{} '{}'",
-                            mode,
-                            truncate_query_display(
-                                query,
-                                bounded(36).saturating_sub(mode.len() + 3)
-                            )
-                        )
+                        format!("{} {}", mode, quoted)
                     }
                 }
                 "smart" => {
@@ -1370,10 +1365,12 @@ pub(super) fn get_tool_summary_with_budget(
                 "recall" => {
                     let query = tool.input.get("query").and_then(|v| v.as_str());
                     if let Some(q) = query {
-                        format!(
-                            "recall '{}'",
-                            truncate_query_display(q, bounded(35).saturating_sub(2))
-                        )
+                        let s = quoted_query_display(q, bounded(35).saturating_sub(2));
+                        if s.is_empty() {
+                            "recall (recent)".to_string()
+                        } else {
+                            format!("recall {}", s)
+                        }
                     } else {
                         "recall (recent)".to_string()
                     }
@@ -1384,10 +1381,12 @@ pub(super) fn get_tool_summary_with_budget(
                         .get("query")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    format!(
-                        "search '{}'",
-                        truncate_query_display(query, bounded(35).saturating_sub(2))
-                    )
+                    let s = quoted_query_display(query, bounded(35).saturating_sub(2));
+                    if s.is_empty() {
+                        "search".to_string()
+                    } else {
+                        format!("search {}", s)
+                    }
                 }
                 "forget" => match tool.input.get("id").and_then(|v| v.as_str()) {
                     Some(id) => format!("forget {}", truncate_identifier_display(id, bounded(30))),
