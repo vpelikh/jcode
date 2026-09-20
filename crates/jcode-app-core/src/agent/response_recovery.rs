@@ -338,9 +338,8 @@ impl Agent {
             return std::borrow::Cow::Borrowed(text);
         }
         let mut out = String::with_capacity(text.len());
-        let mut lines = text.split('\n').peekable();
         let mut in_fence = false;
-        while let Some(line) = lines.next() {
+        for line in text.split('\n') {
             let trimmed = line.trim_start();
             if trimmed.starts_with("```") {
                 in_fence = !in_fence;
