@@ -2139,7 +2139,7 @@ mod tests {
             ..before.clone()
         };
 
-        let changes = goal_changes(&[before.clone()], &[after.clone()]);
+        let changes = goal_changes(std::slice::from_ref(&before), std::slice::from_ref(&after));
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].before.as_ref(), Some(&before));
@@ -2170,26 +2170,29 @@ mod tests {
         // State change fires TradeOff.
         let mut state_changed = base.clone();
         state_changed.trade_off = Some(crate::todo::TradeOffState::Diligent);
-        let changes = goal_changes(&[base.clone()], &[state_changed]);
+        let changes = goal_changes(std::slice::from_ref(&base), &[state_changed]);
         assert_eq!(changes.len(), 1);
         assert!(changes[0].fields.contains(&TodoGoalField::TradeOff));
 
         // Rationale-only change fires TradeOff.
         let mut rationale_changed = base.clone();
         rationale_changed.trade_offs = Some("weighed X vs Z".to_string());
-        let changes = goal_changes(&[base.clone()], &[rationale_changed]);
+        let changes = goal_changes(std::slice::from_ref(&base), &[rationale_changed]);
         assert_eq!(changes.len(), 1);
         assert!(changes[0].fields.contains(&TodoGoalField::TradeOff));
 
         // Explored-alternative-flag-only change fires TradeOff.
         let mut flag_changed = base.clone();
         flag_changed.explored_alternative = Some(false);
-        let changes = goal_changes(&[base.clone()], &[flag_changed]);
+        let changes = goal_changes(std::slice::from_ref(&base), &[flag_changed]);
         assert_eq!(changes.len(), 1);
         assert!(changes[0].fields.contains(&TodoGoalField::TradeOff));
 
         // No trade-off change at all produces no goal change.
-        let changes = goal_changes(&[base.clone()], &[base.clone()]);
+        let changes = goal_changes(
+            std::slice::from_ref(&base),
+            std::slice::from_ref(&base),
+        );
         assert!(changes.is_empty());
     }
 
