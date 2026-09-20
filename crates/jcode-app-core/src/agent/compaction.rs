@@ -9,12 +9,11 @@ impl Agent {
         self.session.provider_session_id = None;
         // A compaction was actually applied (not just requested): resolve the
         // degradation it mitigates (L2 recovered -> Idle, L3 recovered -> Idle
-        // per the plan). Reset only from `Compact` or a pre-switch
-        // `RouteFallback`, so a successful compaction does not continue toward
-        // a stale model switch; a `Watch` rung keeps its accumulation (a fresh
-        // stalled-promise stall that recovers on its own decays via
-        // `record_clean_turn`) and a `Watch`/`Escalated` rung is preserved —
-        // an unrelated compaction must not dismiss a user-surfaced escalation.
+        // per the plan). Reset only from `Compact`/pre-switch `RouteFallback`
+        // so a successful compaction does not continue toward a stale model
+        // switch. Preserve `Watch` (accumulation below the mitigation threshold
+        // recovers on its own via `record_clean_turn`) and terminal `Escalated`
+        // (an unrelated compaction must not dismiss a user-surfaced escalation).
         if matches!(
             self.degradation.rung(),
             crate::agent::degradation::Rung::Compact
