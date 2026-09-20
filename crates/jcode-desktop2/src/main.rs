@@ -813,7 +813,18 @@ impl App {
             text,
             transcript: cache,
         } = painter;
-        let probe = layout::Frame::new(size, scale);
+        // The project explorer owns the window's leading edge and is painted
+        // above the page, so when it is present the page has to live to its
+        // right (the top-left chrome is the sessions button). The sidebar
+        // width feeds the probe and the final frame alike, so the measured
+        // column, the composer, and the chrome all agree on where the page
+        // begins.
+        let sidebar = if model.file_tree.root().is_some() {
+            crate::file_tree::WIDTH
+        } else {
+            0.0
+        };
+        let probe = layout::Frame::with_content_sidebar(size, scale, 1, false, 0.0, sidebar);
         // The empty editor still draws its hint inside the well. Measure that
         // same visible string here, otherwise a hint that wraps at a narrow
         // window is laid out as two rows inside a one-row composer.
@@ -856,7 +867,7 @@ impl App {
             probe.scale,
         );
         let content = crate::viewport::Viewport::new(laid, 0.0, 0.0).content_height;
-        layout::Frame::with_content(size, scale, lines, strip, content)
+        layout::Frame::with_content_sidebar(size, scale, lines, strip, content, sidebar)
     }
 
     /// Byte offset in the composer text under a logical x position, or `None`
