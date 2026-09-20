@@ -1165,4 +1165,262 @@ fn max_context_tokens_applies_at_construction_and_reloads_before_requests() {
     cfg.save().unwrap();
     manager.ensure_context_fits(&[], Arc::new(MockSummaryProvider));
     assert_eq!(manager.token_budget(), 128_000);
+
+/// The scheduled per-step prune shrinks existing content without changing the
+/// message count, and the manager then appends an assistant turn through the
+/// trusted `append_exact` fast path. This test locks the subtle ordering that
+/// the app-core integration test surfaced: `note_prune_applied` must *recompute*
+/// the active-char estimate from the already-pruned transcript (`set_exact`),
+/// not merely `invalidate` it. If it only invalidated, the next
+/// `notify_message_added_blocks` would trust the stale pre-prune base and carry
+/// the over-count forward, keeping auto-compaction gated on the wrong size.
+#[test]
+fn note_prune_applied_reseeds_from_pruned_transcript_before_append() {
+    let tool_result_len = 50_000;
+    let image_payload_len = 10_000;
+
+    let mut messages = vec![
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "big".into(),
+                content: "y".repeat(tool_result_len),
+                is_error: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "a".repeat(image_payload_len),
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+    ];
+
+    let mut manager = CompactionManager::new().with_budget(20_000);
+    for message in &messages {
+        manager.notify_message_added_blocks(&message.content);
+    }
+
+    // Prune in place (simulating the scheduled per-step prune): the tool result
+    // drops to the 4000-char cap and the image becomes a short text marker.
+    let policy = crate::compaction::prune::PrunePolicy::node_caps();
+    let mut contents: Vec<&mut Vec<ContentBlock>> =
+        messages.iter_mut().map(|m| &mut m.content).collect();
+    crate::compaction::prune::prune_contents(&mut contents, &policy);
+    drop(contents);
+
+    // The manager must reseed from the pruned content.
+    manager.note_prune_applied(&messages);
+    let after_prune = manager.token_estimate_with(&messages);
+    assert!(
+        after_prune < 2_000,
+        "estimate must reflect the pruned (small) content, got {after_prune}"
+    );
+
+    // Now append an assistant turn through the trusted fast path. With a
+    // recompute-based `set_exact` base, this appends onto the small pruned size
+    // and stays small; a buggy invalidate-only base would carry the ~12.5k-token
+    // stale figure forward here.
+    let assistant = make_text_message(Role::Assistant, "ack");
+    let pre_append = manager.token_estimate_with(&messages);
+    manager.notify_message_added_blocks(&assistant.content);
+    messages.push(assistant);
+    let post_append = manager.token_estimate_with(&messages);
+    assert!(
+        post_append < 2_000,
+        "append must carry the small pruned base forward, got {post_append}"
+    );
+    assert!(
+        post_append >= pre_append,
+        "append must only add the small assistant turn, pre={pre_append} post={post_append}"
+    );
+}
+
+/// Edge case: `note_prune_applied` must NOT double-count a pre-existing
+/// compaction summary. It seeds only the ACTIVE (uncompacted) suffix; the
+/// summary's own characters are added separately by `token_estimate_with`
+/// through `estimate_compaction_tokens`. This mirrors how the routine recompute
+/// guard in `active_message_chars_with` treats a summary, and keeps the
+/// per-step prune consistent with the TUI `/prune` reseed
+/// (which folds the summary in via `restore_persisted_state_with`).
+#[test]
+fn note_prune_applied_respects_existing_compaction_summary() {
+    // 3 active messages, 2 of them compacted into a summary, 1 kept active.
+    let mut messages = vec![
+        make_text_message(Role::User, "old 1"),
+        make_text_message(Role::User, "old 2"),
+        // An oversized TOOL RESULT in the active suffix — the node type the
+        // prune actually shrinks (it only rewrites ToolResult / Image blocks).
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "active_big".into(),
+                content: "z".repeat(50_000),
+                is_error: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+    ];
+    let mut manager = CompactionManager::new().with_budget(20_000);
+    for m in &messages {
+        manager.notify_message_added_blocks(&m.content);
+    }
+    manager.compacted_count = 2;
+    manager.active_summary = Some(Summary {
+        text: "a summary of old turns".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 2,
+        original_turn_count: 2,
+    });
+
+    // Prune the active oversized tool-result-ish content in place.
+    let policy = crate::compaction::prune::PrunePolicy::node_caps();
+    let mut contents: Vec<&mut Vec<ContentBlock>> =
+        messages.iter_mut().map(|m| &mut m.content).collect();
+    crate::compaction::prune::prune_contents(&mut contents, &policy);
+    drop(contents);
+
+    manager.note_prune_applied(&messages);
+
+    // The estimate must be summary_chars + active_pruned_chars, NOT double the
+    // pruned content or the stale pre-prune over-count.
+    let summary_chars: usize =
+        crate::compaction::summary_payload_char_count(manager.active_summary.as_ref().unwrap());
+    let active_chars: usize = manager
+        .active_messages(&messages)
+        .iter()
+        .map(message_char_count)
+        .sum();
+    let expected = crate::compaction::estimate_compaction_tokens(
+        manager.active_summary.as_ref(),
+        active_chars,
+        manager.token_budget(),
+    );
+    let actual = manager.token_estimate_with(&messages);
+    assert_eq!(
+        actual, expected,
+        "estimate must be summary+active-pruned (summary {summary_chars} chars), got {actual}"
+    );
+    assert!(
+        actual < 2_500,
+        "active suffix must be small after prune, got {actual}"
+    );
+    assert!(
+        actual > summary_chars / crate::compaction::CHARS_PER_TOKEN,
+        "estimate must still include the existing summary, got {actual}"
+    );
+}
+
+// ── physical consolidation reconciliation (takeaway #5) ─────────────
+
+/// Restoring a physically-consolidated state must zero the live skip offset
+/// (`compacted_count`) and `messages_for_api_with` must return the consolidated
+/// transcript AS-IS (the summary is already message 0), NOT prepend a second
+/// synthetic summary or skip the tail.
+#[test]
+fn test_restore_physical_consolidation_returns_transcript_as_is() {
+    let mut manager = CompactionManager::new().with_budget(1_000);
+
+    // A physically consolidated transcript: [summary, recent tail...].
+    let consolidated = vec![
+        make_text_message(Role::User, "Previous Conversation Summary ...[sum]"),
+        make_text_message(Role::User, "tail 1"),
+        make_text_message(Role::User, "tail 2"),
+    ];
+
+    let state = crate::session::StoredCompactionState {
+        summary_text: "summarized".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 10,
+        original_turn_count: 10,
+        compacted_count: 10, // original count, but must NOT be used as a live skip
+        physically_consolidated: true,
+    };
+
+    manager.restore_persisted_state_with(&state, &consolidated);
+
+    assert!(
+        manager.is_physically_consolidated(),
+        "restore must adopt the physical flag"
+    );
+    assert_eq!(
+        manager.compacted_count,
+        0,
+        "physical restore must zero the live skip offset"
+    );
+
+    let view = manager.messages_for_api_with(&consolidated);
+    assert_eq!(
+        view.len(),
+        3,
+        "physically consolidated transcript must be returned as-is (no summary prepend, no skipped tail)"
+    );
+    // No synthetic "Previous Conversation Summary" block is prepended; the
+    // existing summary message is index 0.
+    match &view[0].content[0] {
+        ContentBlock::Text { text, .. } => assert!(
+            text.contains("Previous Conversation Summary"),
+            "index 0 must be the physically-carried summary, got unquoted from view: {text}"
+        ),
+        _ => panic!("expected text summary at transcript[0]"),
+    }
+    assert!(
+        view.iter().any(|m| matches!(&m.content[0], ContentBlock::Text { text, .. } if text.contains("tail 2"))),
+        "recent tail must survive"
+    );
+
+    // The token estimate must NOT double-count the summary: it is already
+    // message 0 of the transcript, so `token_estimate_with` must match an
+    // estimate over the whole transcript WITHOUT adding the separate
+    // `active_summary` characters again.
+    let active_all_chars: usize = manager
+        .active_messages(&consolidated)
+        .iter()
+        .map(message_char_count)
+        .sum();
+    let expected = crate::compaction::estimate_compaction_tokens(
+        None,
+        active_all_chars,
+        manager.token_budget(),
+    );
+    let actual = manager.token_estimate_with(&consolidated);
+    assert_eq!(
+        actual, expected,
+        "physical-mode token estimate must not add the already-present summary separately"
+    );
+}
+
+/// `mark_physically_consolidated` zeroes the live skip offset and `recent_tail`
+/// returns the kept (virtual) tail slice. A manager can use this to transition
+/// from a virtual apply to a physical view after calling
+/// `Session::physically_consolidate_compaction`.
+#[test]
+fn test_mark_physically_consolidated_resets_offset_and_tail() {
+    let mut manager = CompactionManager::new().with_budget(1_000);
+    let messages = vec![
+        make_text_message(Role::User, "m0"),
+        make_text_message(Role::User, "m1"),
+        make_text_message(Role::User, "m2"),
+        make_text_message(Role::User, "m3"),
+    ];
+    // Simulate the manager having virtually compacted the first 2.
+    manager.compacted_count = 2;
+
+    let tail = manager.recent_tail(&messages);
+    assert_eq!(
+        tail.len(),
+        2,
+        "recent_tail must be the kept (compacted_count..) slice"
+    );
+
+    manager.mark_physically_consolidated();
+    assert!(manager.is_physically_consolidated());
+    assert_eq!(manager.compacted_count, 0, "physical mark must zero the offset");
+}
 }
