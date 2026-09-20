@@ -144,9 +144,10 @@ These are explicitly open and are tracked as follow-ups, not delivered work:
   parked pending steering.
 - **F2 — remaining plan items (large refactors).** P1 #2+#8 execution-world seam +
   fail-closed sandbox (confinement, not just classification); P2 #10 jobs
-  seam, #11 durable inbox, #14 waterfall hooks; P3 #15 goals domain, #17
-  layered config, #18 postmortem culture. These are large, cross-cutting, and
-  benefit from a steer before work begins.
+  seam, #11 durable inbox, #14 waterfall hooks; P3 #17 layered config. These are
+  large, cross-cutting, and benefit from a steer before work begins. **#18
+  postmortem culture and #15 goals domain are no longer open here** — see F5
+  and F6 below.
 - **F3 — extend `branded_id!` beyond the event log.** ✅ **Delivered.** The
   `branded_id!` macro moved out of `jcode-base` into a new minimal leaf crate
   `crates/jcode-id-types`, so the identity-bearing `-types` crates can depend on
@@ -179,3 +180,28 @@ These are explicitly open and are tracked as follow-ups, not delivered work:
   `jcode-base` (1554 lib tests, incl. wire-format legacy-load), `jcode-app-core`
   (1446 lib tests; the only failures are the documented pre-existing timing
   flakes), and the provider/compaction suites all pass.
+- **F5 — postmortem culture (P3 #18).** ✅ **Delivered.** Added a
+  `docs/postmortem/` archive following dsh's structure (executive summary, exact
+  root-cause chain, safety nets that failed in order, guardrails added with a
+  stable guardrail home). It records the real, shipped `#604` class:
+  - `destructive-command-gate-bypasses.md` — `rm -rf ~` reached a home; the
+    reflection gate then had three more escape-route classes (wrapper commands,
+    piped deletes, conditional recursive flags) closed under review.
+  - `reflection-gate-background-dispatch-604.md` — `run_in_background` early
+    return bypassed the gate until it moved before the escape path.
+  - `protected-path-deletion-second-route-604.md` — `apply_patch` deleted by
+    absolute path; exact-match credential protection missed files *inside* a
+    store until made recursive.
+  Each documents the guardrail's stable home (`jcode-command-risk`,
+  `bash_destructive_gate.rs`, `apply_patch.rs`) so the next instance of the
+  class is cheaper to prevent.
+- **F6 — goals domain (P3 #15).** ✅ **Delivered** (pre-existing on master via a
+  different spelling than the doc's `goals`). jcode ships a same-session
+  objective domain distinct from the durable todo list: the `initiative` tool
+  (`crates/jcode-app-core/src/tool/goal.rs`, `crate::goal`) manages durable,
+  steerable initiatives with a progress percentage, milestones, next steps,
+  blockers, and checkpoints — separate from the `todo` tool / pinned todos. It
+  is registered on the tool registry and has a side-panel Goals view. This
+  satisfies the doc's separation of a steered objective from the user's task
+  list; the spelling differs ("initiative" vs "goal") but the domain intended by
+  #15 is present.
