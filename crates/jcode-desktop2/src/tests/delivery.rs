@@ -192,25 +192,20 @@ fn an_acknowledged_card_visibly_moves() {
 
     // Start from the attached node, so the page is a live conversation rather
     // than the boot reveal (which fades the whole transcript in and would
-    // dominate the measurement).
-    let mut model = crate::states::by_name("attached_empty").expect("attached_empty node");
-    model.transcript = crate::transcript::Transcript::default();
-    model
-        .transcript
-        .push(crate::transcript::Message::sent("acknowledge me"));
-    model.donut = None;
+    // dominate the measurement). Built fresh per render so the single message
+    // is always in the Sent (pending) state when acknowledged.
+    let make_model = || {
+        let mut model = crate::states::by_name("attached_empty").expect("attached_empty node");
+        model.transcript = crate::transcript::Transcript::default();
+        model
+            .transcript
+            .push(crate::transcript::Message::sent("acknowledge me"));
+        model.donut = None;
+        model
+    };
 
-    let pending = Rendered::new(&model).expect("render the pending card");
-    // A quarter through the wiggle is near its first peak, so the card is at
-    // its most displaced and the comparison is not measuring a zero crossing.
-    let at = Instant::now() - WIGGLE.mul_f64(0.25);
-    assert!(model.transcript.acknowledge_oldest_pending(at));
-    let acked = Rendered::new(&model).expect("render the acknowledged card");
+    let pending = Rendered::new(&make_model()).expect("render the pending card");
 
-    // The card is a wash on paper, so its left edge is the first column near
-    // the measure that is darker than the page. Sampling a band around
-    // `frame.left` keeps the window's own furniture (borders, scrollbar) out of
-    // the measurement.
     // The card is a wash on paper, so its left edge is the first column that
     // is darker than the page. Scan the whole transcript region and take the
     // topmost row that inks near the measure, so this does not depend on where
@@ -232,14 +227,45 @@ fn an_acknowledged_card_visibly_moves() {
         }
         None
     };
-    let (before, after) = (left_edge(&pending), left_edge(&acked));
+    let before = left_edge(&pending);
     assert!(
-        before.is_some() && after.is_some(),
-        "the user card did not ink at all: {before:?} {after:?}"
+        before.is_some(),
+        "the user card did not ink at all: {before:?}"
     );
-    assert_ne!(
-        before, after,
-        "the acknowledgement wiggle drew nothing: card edge stayed at {before:?}"
+
+    // The wiggle is drawn at the renderer's own `Instant::now()`, so the phase
+    // that lands on screen is the render's real elapsed time and drifts with
+    // how long the GPU spends on the frame (heavier across the parallel suite).
+    // A single fixed-phase sample is therefore unreliable here. Instead sample
+    // the acknowledged card at the four peak phases of the double oscillation
+    // (one-eighth, three-eighths, five-eighths, seven-eighths of the way
+    // through): under any real render delay the same offset shifts all four,
+    // but at least two land on different peaks, giving visibly different card
+    // edges. Only a coincidence that pinned every sample to a zero crossing
+    // could hide the wiggle, and that cannot happen for a spread of peaks.
+    let peaks = [1, 3, 5, 7];
+    let mut edges = Vec::new();
+    for eighth in peaks {
+        let mut model = make_model();
+        let at = Instant::now() - WIGGLE.mul_f64(f64::from(eighth) / 8.0);
+        assert!(
+            model.transcript.acknowledge_oldest_pending(at),
+            "the message should still be pending at sample {eighth}/8"
+        );
+        let acked = Rendered::new(&model).expect("render the acknowledged card");
+        edges.push(left_edge(&acked));
+    }
+    // Assert the card edge really moved: across the four peak phases at least
+    // two distinct edges must appear, otherwise the acknowledgement wiggle was
+    // never drawn.
+    let distinct = edges
+        .iter()
+        .filter(|e| e.is_some())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    assert!(
+        distinct >= 2,
+        "the acknowledgement wiggle drew nothing: the card edge was the same at every peak phase ({before:?}, {edges:?})"
     );
 }
 

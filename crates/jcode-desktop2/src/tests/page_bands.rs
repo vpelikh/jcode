@@ -8,22 +8,49 @@
 use super::visual::{Rendered, nodes};
 use crate::Model;
 
-/// Nodes without the session overview up. The overview is the one sanctioned
-/// full-page layer: it veils the page and spreads blobs across every band and
-/// margin by design, so the page-band invariants below it do not apply.
+/// Nodes in the settled window, i.e. those whose page-band invariants hold.
+///
+/// The capture set includes states that are not the settled page, and the
+/// page-band invariants do not apply to them:
+///   * full-window modes that paint over the page by design — the space the
+///     bands are supposed to keep bare is not theirs to keep:
+///       - the session overview veils the page and spreads blobs across every
+///         band and margin;
+///       - the resume picker dims the whole window behind its card;
+///       - the settings panel hangs a dropdown over the top-right chrome;
+///       - the help overlay puts a dimmed full-window card over everything;
+///       - the boot reveal paints the entire window with the opening black
+///         paper, the full-page hero donut, and a fading-in chrome group, so
+///         "nothing in the left margin" is false before the chrome is solid;
+///   * pre-session screens with no attached session, which draw their own
+///     connecting/starting status lines instead of a settled transcript.
+/// A settled (default) `Boot` reports a `Solid` chrome layer, so only the
+/// pinned mid-reveal captures are filtered out.
 fn page_nodes() -> Vec<(&'static str, Model)> {
     nodes()
         .into_iter()
-        .filter(|(_, model)| !model.overview.is_visible())
+        .filter(|(_, model)| {
+            model.session_id.is_some()
+                && !model.overview.is_visible()
+                && !model.resume.is_open()
+                && !model.panel.is_open()
+                && !model.help_open
+                && model.boot.chrome_layer() == crate::boot::ChromeReveal::Solid
+        })
         .collect()
 }
 
 /// The input box must be *drawn* on the middle of the window, not merely laid
 /// out there: this catches a renderer that ignores the centred geometry.
+///
+/// Sweeps the settled page nodes, i.e. those reaching `page_nodes()` that are
+/// not busy. A busy page draws its activity spinner beside the composer well,
+/// which `wash_band` could mistake for the well, so the "is the well centred
+/// where it is drawn" invariant is tested on the settled page.
 #[test]
 #[ignore = "requires a GPU"]
 fn the_composer_well_is_drawn_on_the_middle_of_the_window() {
-    for (name, model) in nodes() {
+    for (name, model) in page_nodes().into_iter().filter(|(_, model)| !model.busy) {
         let Some(r) = Rendered::new(&model) else {
             return;
         };

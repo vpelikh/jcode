@@ -21,5 +21,6 @@ mod scheduling;
 mod selection_visual;
 mod settings;
 mod strip_visual;
+mod theme_resolution;
 mod transcript_selection;
 mod visual;

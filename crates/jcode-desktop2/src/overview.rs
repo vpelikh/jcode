@@ -45,16 +45,42 @@ pub const ROW_LABEL_BAND: f64 = 20.0;
 /// same reason [`crate::layout::Frame`] is: if the two ever disagreed, clicks
 /// would land on a different card than the one under the cursor.
 pub fn area(frame: &crate::layout::Frame) -> (f64, f64, f64, f64) {
+    // Centre the picker on the page column's measure rather than the raw
+    // window. When a left sidebar (the project explorer) owns the leading edge,
+    // the conversation and its chrome start at `frame.left`, so centring on
+    // `frame.width` would float the field to the right of the content it
+    // overlays and read as a lopsided gap on the left. Centring the field by
+    // its *midpoint* against the column's midpoint keeps it optically lined up
+    // with the page the user is comparing it against, while the field still
+    // sizes itself from the full window so a large monitor keeps the generous
+    // panel. Without a sidebar the column is already centred on the window, so
+    // the two definitions coincide.
+    //
     // Deliberately leave a substantial ring of the current page visible. The
     // session picker is a temporary object over the conversation, not a route
     // away from it. Caps keep the panel readable on a large monitor, while the
     // fractions make it gracefully fill a small window without touching its
     // edges.
+    //
+    // The field must stay inside the window: centring on the column shifts the
+    // midpoint right of the window's own centre when a sidebar is present, so a
+    // full-window-sized width would spill past the right edge and hide the
+    // cards it is supposed to compare. Clamp the field to the room the column's
+    // midpoint leaves on either side of it, keeping the centred relationship
+    // without ever running off-paper.
     let width = (frame.width * 0.84).min(960.0).max(1.0);
     let height = (frame.height * 0.68).min(620.0).max(1.0);
-    let left = (frame.width - width) / 2.0;
+    let column_mid = (frame.left + frame.right) / 2.0;
+    // Half-width that keeps the field symmetric about the column's midpoint
+    // while never crossing either window edge. The narrower flank wins, so a
+    // column hugging an edge at a degenerate window (e.g. a sidebar wider than
+    // the window) yields a field that ends exactly at that edge rather than
+    // leaking past it. `frame` clamps `left >= 0` and `right <= width`, so
+    // `column_mid` is always within the window and `half` stays non-negative.
+    let half = (width / 2.0).min(column_mid).min(frame.width - column_mid);
+    let left = column_mid - half;
     let top = (frame.height - height) / 2.0;
-    (left, top, left + width, top + height)
+    (left, top, left + half * 2.0, top + height)
 }
 
 /// A direction for keyboard navigation across the field.
@@ -650,6 +676,42 @@ mod tests {
         }
     }
 
+    /// A row is centred in the field: the run of cards in one workspace sits
+    /// symmetrically about the field's midline, never shoved to one edge.
+    #[test]
+    fn each_row_is_centred_in_the_field() {
+        let field = field();
+        let mid = AREA.0 + (AREA.2 - AREA.0) / 2.0;
+        // Group cards by row, then assert each row's horizontal extent is
+        // centred about the field's midline.
+        let mut rows: Vec<Vec<&Card>> = Vec::new();
+        for card in &field.cards {
+            match rows.iter_mut().find(|r| r[0].label == card.label) {
+                Some(r) => r.push(card),
+                None => rows.push(vec![card]),
+            }
+        }
+        assert!(!rows.is_empty());
+        for row in rows {
+            let x0 = row.iter().map(|c| c.rect.0).fold(f64::INFINITY, f64::min);
+            let x1 = row
+                .iter()
+                .map(|c| c.rect.2)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let rcx = (x0 + x1) / 2.0;
+            assert!(
+                (rcx - mid).abs() < 1.0,
+                "row {} centre {rcx:.1} is not near the field midline {mid:.1} (x0={x0:.1}, x1={x1:.1})",
+                row[0].label
+            );
+        }
+        // A single-row field is centred too: one workspace fills the middle.
+        let solo = layout(&[entry("solo", "/tmp", 100.0)], Some("solo"), None, AREA);
+        let c = &solo.cards[0];
+        let cl = c.rect.0 + (c.rect.2 - c.rect.0) / 2.0;
+        assert!((cl - mid).abs() < 1.0, "single row centred, got {cl:.1}");
+    }
+
     /// The field has to fit the window: a card drawn off-page is a session the
     /// user cannot reach.
     #[test]
@@ -887,6 +949,47 @@ mod tests {
         assert_eq!(overview.focus(), Some("a3"));
     }
 
+    /// The picker centres itself on the page column, not the raw window. When
+    /// the left sidebar (project explorer) pushes the page right, centring on
+    /// `frame.width` would float the field off to the right of the content it
+    /// overlays and read as a lopsided gap on the left.
+    #[test]
+    fn the_field_centres_on_the_page_column_not_the_window() {
+        const SIDEBAR: f64 = 252.0;
+        for (width, scale) in [(1100usize, 1.0), (1920, 1.0), (1400, 1.75), (900, 1.0)] {
+            let frame = crate::layout::Frame::with_content_sidebar(
+                (width as u32, 720),
+                scale,
+                1,
+                false,
+                0.0,
+                SIDEBAR,
+            );
+            let (left, _, right, _) = area(&frame);
+            let field_mid = (left + right) / 2.0;
+            let column_mid = (frame.left + frame.right) / 2.0;
+            assert!(
+                (field_mid - column_mid).abs() < 1.0,
+                "at ({width},{scale}) the field mid {field_mid:.1} strayed from the column mid {column_mid:.1}"
+            );
+            // Centring on the column shifts the midpoint right when a sidebar
+            // is present; the field must shrink rather than run off the right
+            // edge, or the rightmost cards would be cut off.
+            assert!(
+                left >= 0.0 && right <= frame.width + 1.0,
+                "at ({width},{scale}) the field [{left:.1},{right:.1}] left the window [{},{}]",
+                0.0,
+                frame.width
+            );
+        }
+        // Without a sidebar the column is the window, so the field must land on
+        // the window centre exactly as the old code did.
+        let frame = crate::layout::Frame::new((1920, 720), 1.0);
+        let (left, _, right, _) = area(&frame);
+        let field_mid = (left + right) / 2.0;
+        assert!((field_mid - frame.width / 2.0).abs() < 1.0);
+    }
+
     #[test]
     fn session_field_is_a_bounded_overlay_with_page_visible_around_it() {
         for size in [(420, 540), (1280, 800), (1920, 1080)] {
@@ -901,6 +1004,61 @@ mod tests {
                 "overlay filled the page at {size:?}"
             );
             assert!(right - left <= 960.0 && bottom - top <= 620.0);
+        }
+    }
+
+    /// Exhaustive sweep: the overview field must stay inside the window and
+    /// symmetric about the page column's midpoint for *every* plausible
+    /// window width, height, scale, and sidebar width.
+    ///
+    /// The discrete point checks above catch the sizes a human thinks to try.
+    /// This step scan catches the ones in between — the width where a narrow
+    /// window with a wide sidebar first crosses into overflow, or a HiDPI
+    /// half-pixel or a sidebar wider than the window. It is the guarantee the
+    /// field can never read as "larger than the window".
+    #[test]
+    fn the_field_stays_on_paper_across_the_whole_sweep() {
+        for height in [540usize, 720, 900, 1080] {
+            for scale in [1.0f64, 1.25, 1.5, 1.75, 2.0] {
+                for sidebar in [0.0f64, 120.0, 252.0, 380.0] {
+                    for width in (280usize..=2200).step_by(60) {
+                        let frame = crate::layout::Frame::with_content_sidebar(
+                            (width as u32, height as u32),
+                            scale,
+                            1,
+                            false,
+                            0.0,
+                            sidebar,
+                        );
+                        let (left, top, right, bottom) = area(&frame);
+                        let ctx = format!("w{width} h{height} s{scale} bar{sidebar}");
+                        // On-paper on every side.
+                        assert!(
+                            left >= -1e-6 && right <= frame.width + 1e-6,
+                            "{ctx}: field [{left:.2},{right:.2}] left the window [0,{:.2}]",
+                            frame.width
+                        );
+                        assert!(
+                            top >= -1e-6 && bottom <= frame.height + 1e-6,
+                            "{ctx}: field y [{top:.2},{bottom:.2}] left the window [0,{:.2}]",
+                            frame.height
+                        );
+                        // Symmetric about the column midpoint.
+                        let field_mid = (left + right) / 2.0;
+                        let column_mid = (frame.left + frame.right) / 2.0;
+                        assert!(
+                            (field_mid - column_mid).abs() < 1.0,
+                            "{ctx}: field mid {field_mid:.2} strayed from column mid {column_mid:.2}"
+                        );
+                        // Non-degenerate.
+                        assert!(
+                            right - left >= 1.0,
+                            "{ctx}: field collapsed to width {:.2}",
+                            right - left
+                        );
+                    }
+                }
+            }
         }
     }
 }
