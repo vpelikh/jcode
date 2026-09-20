@@ -133,7 +133,12 @@ const DISCOVERY_PROBE_TIMEOUT_SECS: u64 = 8;
 /// and rely on `resolve`/`dns`/`name resolution`/`no address` for the common
 /// poisoned-DNS case.
 pub fn is_connectivity_error(e: &anyhow::Error) -> bool {
-    let s = e.to_string().to_lowercase();
+    // Concatenate the whole error chain, not just the outermost Display. A
+    // reqwest failure surfaces as a top-level `"error sending request for
+    // url (...)"` with the real cause (`Connection refused`, DNS, timeout)
+    // deeper in the chain; inspecting only the top level would miss it and
+    // misclassify a transient network failure as permanent.
+    let s = error_chain_text(e);
     s.contains("dns")
         || s.contains("resolve")
         || s.contains("lookup")
@@ -156,6 +161,45 @@ pub fn is_connectivity_error(e: &anyhow::Error) -> bool {
         || s.contains("handshake")
         || s.contains("http2")
         || s.contains("connect: ")
+}
+
+/// Lowercased concatenation of every error in the chain. Inspecting only the
+/// outermost `Display` misses the real cause (e.g. a reqwest failure whose top
+/// level is `"error sending request for url (...)"` while `Connection refused`
+/// sits deeper in the chain), so classifiers walk the full chain.
+fn error_chain_text(e: &anyhow::Error) -> String {
+    e.chain()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase()
+}
+
+/// Whether an error indicates a transient API-level failure that warrants
+/// retry. This includes both connectivity errors (DNS failures, timeouts, TLS
+/// issues) and Telegram's 429 flood-control responses. Permanent errors
+/// (invalid token, malformed request, unauthorized) should not be retried.
+pub fn is_transient_api_error(e: &anyhow::Error) -> bool {
+    // Network-layer failures are transient by nature.
+    if is_connectivity_error(e) {
+        return true;
+    }
+    // Telegram returns 429 with "flood control" or "Too Many Requests: retry
+    // after X" in the description. We detect retryable rate-limits from these
+    // standard fragments rather than a bare "429" number, which could appear
+    // incidentally in a permanent error's description and cause a false
+    // positive (retrying an error that will never succeed). The description
+    // text is reliable across both an HTTP-429 response and a body-only
+    // error_code=429 (HTTP 200) path. Lowercase keeps the check
+    // case-insensitive, matching `is_connectivity_error`.
+    let s = error_chain_text(e);
+    // `; code 429` is a precise marker from post_telegram when the body's
+    // error_code is 429 even if the HTTP status differs; it cannot appear
+    // incidentally in a description, so it is safe to match.
+    s.contains("; code 429")
+        || s.contains("too many requests")
+        || s.contains("flood control")
+        || s.contains("retry after")
 }
 
 /// Build a short-timeout client used only for the discovery probe (`getMe`).
@@ -193,8 +237,9 @@ fn build_probe_client(proxy: Option<&str>, api_ip: Option<&str>) -> anyhow::Resu
 /// tried, followed by the curated list of known DC IPs (`TELEGRAM_DC_CANDIDATES`).
 /// Each candidate is probed with a short-timeout client; the first whose
 /// `verify_bot_auth` probe succeeds is returned (and reused for the real path).
-/// A non-connectivity error (e.g. a bad bot token) stops discovery immediately,
-/// since no IP will help.
+/// A permanent error (e.g. a bad bot token) stops discovery immediately, since
+/// no IP will help; transient failures (network, TLS, or a 429 rate-limit) move
+/// on to the next candidate.
 pub async fn discover_client(
     bot_token: &str,
     proxy: Option<&str>,
@@ -235,8 +280,12 @@ pub async fn discover_client(
                 return Ok(client);
             }
             Ok(Err(e)) => {
-                // Probe returned an application-level error (e.g. 401 Unauthorized).
-                if !is_connectivity_error(&e) {
+                // Probe returned an application-level error. Only a genuinely
+                // permanent error (e.g. 401 bad token) should stop discovery;
+                // transient failures (network, TLS, or a 429 rate-limit) mean
+                // try the next candidate. Classifying a 429 as permanent would
+                // abort all discovery with a misleading "bad token?" message.
+                if !is_transient_api_error(&e) {
                     anyhow::bail!(
                         "Telegram auth failed (bad token?): {e}. Stopping IP discovery."
                     );
@@ -545,7 +594,7 @@ pub async fn send_message_raw(
     if !parsed.ok {
         anyhow::bail!(
             "Telegram API error ({}): {}",
-            status,
+            telegram_api_error_scope(status, parsed.error_code),
             parsed.description.unwrap_or_default()
         );
     }
@@ -614,7 +663,7 @@ async fn send_message_once(
         }
         anyhow::bail!(
             "Telegram API error ({}): {}",
-            status,
+            telegram_api_error_scope(status, parsed.error_code),
             description
         );
     }
@@ -679,33 +728,98 @@ pub async fn send_chat_action(
     }
 }
 
+/// How many total attempts to make for `setMyCommands` before giving up. The
+/// Telegram Bot API returns 429 during temporary flooding; a couple of attempts
+/// with backoff lets the command list settle even if the bot is briefly
+/// rate-limited at startup. Kept deliberately small because this runs inline
+/// before the reply-poll loop begins, so the attempt budget bounds how long a
+/// start-up retry churn can block the bot from answering messages.
+const SET_MY_COMMANDS_MAX_ATTEMPTS: u32 = 3;
+/// Base delay between retry attempts (doubles each attempt). Kept short so a
+/// transient rate-limit at startup does not block the reply loop for long.
+const SET_MY_COMMANDS_RETRY_BASE_SECS: u64 = 1;
+/// Hard per-attempt budget for a single `setMyCommands` request. The shared
+/// client only sets a connect timeout (no overall request timeout), so without
+/// this a hung connection could stall a retry leg indefinitely. A timeout here
+/// is treated as a transient failure and retried like a network error.
+const SET_MY_COMMANDS_ATTEMPT_TIMEOUT_SECS: u64 = 10;
+
 /// Register the bot's slash command list in the Telegram client so users can
-/// discover commands via the `/` menu. Non-fatal: failures are swallowed.
+/// discover commands via the `/` menu. Retries on transient failures so the
+/// menu is actually populated — a single one-shot call at startup would leave
+/// it empty if the first attempt hit a 429 or transient network blip.
 pub async fn set_my_commands(
     client: &reqwest::Client,
     bot_token: &str,
     base_override: Option<&str>,
 ) {
-    let body = serde_json::json!({
-        "commands": [
-            { "command": "start", "description": "Show help and available commands" },
-            { "command": "list", "description": "List recent sessions" },
-            { "command": "find", "description": "Search sessions by title or id" },
-            { "command": "new", "description": "Start a new session (optionally with a prompt)" },
-            { "command": "use", "description": "Select a session to talk to (id or #)" },
-            { "command": "history", "description": "Show recent messages of the active session" },
-            { "command": "resume", "description": "Ask a session (id + prompt)" },
-            { "command": "live", "description": "List live sessions (free with a tap)" },
-            { "command": "free", "description": "Drop a live headless session" },
-            { "command": "abort", "description": "Stop the active session's running turn" },
-            { "command": "whoami", "description": "Show this chat's id for config" },
-            { "command": "clear", "description": "Stop talking to the active session" },
-            { "command": "status", "description": "Show control & ambient status" },
-            { "command": "help", "description": "Show help" },
-        ]
-    });
-    if let Err(e) = post_telegram(client, bot_token, "setMyCommands", body, base_override).await {
-        logging::warn(&format!("failed to register telegram commands: {e}"));
+    // Build the command list once outside the retry loop so we don't clone it
+    // on every failed attempt.
+    let commands = serde_json::json!([
+        { "command": "start", "description": "Show help and available commands" },
+        { "command": "list", "description": "List recent sessions" },
+        { "command": "sessions", "description": "Alias for /list" },
+        { "command": "find", "description": "Search sessions by title or id" },
+        { "command": "new", "description": "Start a new session (optionally with a prompt)" },
+        { "command": "use", "description": "Select a session to talk to (id or #)" },
+        { "command": "history", "description": "Show recent messages of the active session" },
+        { "command": "resume", "description": "Ask a session (id + prompt)" },
+        { "command": "live", "description": "List live sessions (tap to free)" },
+        { "command": "ls", "description": "Alias for /live" },
+        { "command": "free", "description": "Drop a live headless session" },
+        { "command": "abort", "description": "Stop the active session's running turn" },
+        { "command": "cancel", "description": "Alias for /abort" },
+        { "command": "whoami", "description": "Show this chat's id for config" },
+        { "command": "clear", "description": "Stop talking to the active session" },
+        { "command": "stop", "description": "Alias for /clear" },
+        { "command": "status", "description": "Show control & ambient status" },
+        { "command": "help", "description": "Show help" },
+    ]);
+    let body = serde_json::json!({ "commands": commands });
+
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        // Bound each request with a hard timeout so a hung connection cannot
+        // stall the whole registration (the shared client only has a connect
+        // timeout). A timeout is a transient failure and is retried below.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(SET_MY_COMMANDS_ATTEMPT_TIMEOUT_SECS),
+            post_telegram(client, bot_token, "setMyCommands", body.clone(), base_override),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("setMyCommands request timed out"));
+
+        match outcome {
+            Ok(Ok(())) => break,
+            Ok(Err(e)) | Err(e) => {
+                // Only retry transient errors (connectivity issues, rate
+                // limits, timeouts). Permanent failures like invalid token or
+                // bad request should surface immediately instead of being
+                // hidden behind retries.
+                if !is_transient_api_error(&e) {
+                    logging::warn(&format!(
+                        "setMyCommands failed with non-transient error ({e}); not retrying"
+                    ));
+                    break;
+                }
+                // Exhausted the retry budget.
+                if attempt >= SET_MY_COMMANDS_MAX_ATTEMPTS {
+                    logging::warn(&format!(
+                        "failed to register telegram commands after {attempt} attempts: {e}"
+                    ));
+                    break;
+                }
+                // Compute the delay once to avoid duplicating the formula. The
+                // attempt budget already bounds total sleep, so no separate
+                // upper cap is needed here.
+                let delay_secs = SET_MY_COMMANDS_RETRY_BASE_SECS * 2u64.pow(attempt - 1);
+                logging::debug(&format!(
+                    "setMyCommands attempt {attempt} failed (transient), retrying in {delay_secs}s"
+                ));
+                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+            }
+        }
     }
 }
 
@@ -832,6 +946,18 @@ pub async fn answer_callback_query(
     post_telegram(client, bot_token, "answerCallbackQuery", body, base_override).await
 }
 
+/// Format the status/code scope shared by all Bot API error messages. When the
+/// response body carries an `error_code` it is appended so transient failures
+/// (429 rate-limit) are recognizable even when the HTTP layer reports a
+/// success status. Kept identical across call sites so error strings are
+/// consistent for anything that parses or classifies them.
+fn telegram_api_error_scope(status: reqwest::StatusCode, error_code: Option<i64>) -> String {
+    match error_code {
+        Some(c) => format!("{status}; code {c}"),
+        None => status.to_string(),
+    }
+}
+
 /// POST a JSON body to a Bot API method and return whether it succeeded,
 /// logging on failure but not erroring (agnostic callers decide).
 async fn post_telegram(
@@ -846,9 +972,9 @@ async fn post_telegram(
     let status = resp.status();
     let parsed: TelegramResponse<serde_json::Value> = resp.json().await?;
     if !parsed.ok {
+        let scope = telegram_api_error_scope(status, parsed.error_code);
         anyhow::bail!(
-            "Telegram API error ({}): {}",
-            status,
+            "Telegram API error ({scope}): {}",
             parsed.description.unwrap_or_default()
         );
     }
@@ -1214,6 +1340,34 @@ mod tests {
     }
 
     #[test]
+    fn connection_refused_reqwest_error_is_connectivity() {
+        // Regression: a real reqwest connect failure surfaces as a top-level
+        // "error sending request for url (...)" with the actual cause
+        // ("Connection refused") only in its error chain. The classifier must
+        // inspect the chain to catch it; otherwise set_my_commands would treat
+        // a transient network failure as permanent and never retry.
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port = listener.local_addr().unwrap().port();
+                drop(listener);
+                let url = format!("http://127.0.0.1:{port}/x");
+                let client = reqwest::Client::new();
+                let err = client.post(&url).body("hi").send().await.unwrap_err();
+                let e: anyhow::Error = anyhow::Error::new(err);
+                assert!(
+                    is_connectivity_error(&e),
+                    "top-level was: {e} (real cause is in the chain)"
+                );
+                assert!(
+                    is_transient_api_error(&e),
+                    "a connection-refused error must be classified transient"
+                );
+            });
+    }
+
+    #[test]
     fn test_is_connectivity_error_classifies() {
         // Network-level failures should keep discovery going.
         for msg in [
@@ -1258,6 +1412,85 @@ mod tests {
                 "false positive for connectivity: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn test_is_transient_api_error_classifies() {
+        // Connectivity errors should be transient.
+        assert!(is_transient_api_error(&anyhow::anyhow!(
+            "error trying to connect: tcp connect error: Connection refused"
+        )));
+        assert!(is_transient_api_error(&anyhow::anyhow!(
+            "failed to lookup host: dns resolution failed"
+        )));
+        // A request timeout (from the per-attempt bound in set_my_commands)
+        // should also be transient.
+        assert!(is_transient_api_error(&anyhow::anyhow!(
+            "setMyCommands request timed out"
+        )));
+
+        // Telegram 429 flood control should be transient (retryable).
+        // `reqwest::StatusCode` Display renders TOO_MANY_REQUESTS as
+        // "429 Too Many Requests", so the wrapped error reads as below.
+        assert!(is_transient_api_error(&anyhow::anyhow!(
+            "Telegram API error (429 Too Many Requests): Bad Request: flood control"
+        )));
+        assert!(is_transient_api_error(&anyhow::anyhow!(
+            "Telegram API error (429 Too Many Requests): Too Many Requests: retry after 8"
+        )));
+        // Root-cause based description of flood control.
+        assert!(is_transient_api_error(&anyhow::anyhow!(
+            "telegram flood control, please wait"
+        )));
+        // Matching is case-insensitive, covering varied casing from the wire.
+        assert!(is_transient_api_error(&anyhow::anyhow!(
+            "Telegram API error (429 Too Many Requests): Bad Request: Flood Control"
+        )));
+        // Rate-limit surfacing only via the body's error_code (HTTP 200) is
+        // still classified as transient thanks to the "; code 429" marker,
+        // even with an unusual description that lacks the standard wording.
+        assert!(is_transient_api_error(&anyhow::anyhow!(
+            "Telegram API error (200 OK; code 429): Too Many Requests: retry after 11"
+        )));
+        assert!(is_transient_api_error(&anyhow::anyhow!(
+            "Telegram API error (200 OK; code 429): throttled"
+        )));
+
+        // Permanent errors should NOT be transient.
+        assert!(!is_transient_api_error(&anyhow::anyhow!(
+            "Telegram auth failed: Unauthorized"
+        )));
+        // Real post_telegram format now renders the code with a '; code N'
+        // suffix when the body carries an error_code.
+        assert!(!is_transient_api_error(&anyhow::anyhow!(
+            "Telegram API error (400 Bad Request; code 400): Bad Request: chat not found"
+        )));
+        assert!(!is_transient_api_error(&anyhow::anyhow!(
+            "Telegram API error (403 Forbidden; code 403): Forbidden"
+        )));
+        // A description mentioning an unrelated number must not trip the
+        // bare "429" matcher (only rate-limit context is transient).
+        assert!(!is_transient_api_error(&anyhow::anyhow!(
+            "Telegram API error (400 Bad Request): message 429 is not found"
+        )));
+    }
+
+    #[test]
+    fn test_telegram_api_error_scope_renders_status_and_code() {
+        // No error_code in the body: render just the HTTP status.
+        assert_eq!(
+            telegram_api_error_scope(StatusCode::BAD_REQUEST, None),
+            "400 Bad Request"
+        );
+        // error_code present: append it so a body-only 429 is recognizable.
+        assert_eq!(
+            telegram_api_error_scope(StatusCode::OK, Some(429)),
+            "200 OK; code 429"
+        );
+        assert_eq!(
+            telegram_api_error_scope(StatusCode::TOO_MANY_REQUESTS, Some(429)),
+            "429 Too Many Requests; code 429"
+        );
     }
 
     #[test]
