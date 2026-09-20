@@ -206,7 +206,7 @@ async fn ensure_member_refresh_existing_member_adds_connection_without_reinserti
     let member = swarm_members.read().await;
     let member = member.get("session-b").expect("member remains present");
     assert!(member.event_txs.contains_key("conn-b"));
-    assert_eq!(member.swarm_enabled, false);
+    assert!(!member.swarm_enabled);
     assert!(swarms_by_id.read().await.is_empty());
 }
 

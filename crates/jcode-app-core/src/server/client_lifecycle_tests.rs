@@ -1,10 +1,8 @@
+#![expect(clippy::await_holding_lock, reason = "tests intentionally hold locks across awaits")]
 use super::*;
 use crate::message::{ContentBlock, Message, StreamEvent, ToolDefinition};
 use crate::provider::{EventStream, Provider};
-use crate::server::{
-    AwaitMembersRuntime, ClientDebugState, FileTouchService, SessionInterruptQueues,
-    SwarmMutationRuntime, SwarmState,
-};
+use crate::server::{ClientDebugState, SessionInterruptQueues};
 use async_trait::async_trait;
 use futures::stream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1410,31 +1408,11 @@ async fn lightweight_comm_request_skips_full_session_initialization() {
     let global_session_id = Arc::new(RwLock::new(String::new()));
     let client_count = Arc::new(RwLock::new(0usize));
     let client_connections = Arc::new(RwLock::new(HashMap::new()));
-    let swarm_members = Arc::new(RwLock::new(HashMap::new()));
-    let swarms_by_id = Arc::new(RwLock::new(HashMap::new()));
-    let shared_context = Arc::new(RwLock::new(HashMap::new()));
-    let swarm_plans = Arc::new(RwLock::new(HashMap::new()));
-    let swarm_coordinators = Arc::new(RwLock::new(HashMap::new()));
-    let file_touch = FileTouchService::new();
-    let channel_subscriptions = Arc::new(RwLock::new(HashMap::new()));
-    let channel_subscriptions_by_session = Arc::new(RwLock::new(HashMap::new()));
-    let client_debug_state = Arc::new(RwLock::new(ClientDebugState::default()));
-    let (_debug_response_tx, _) = broadcast::channel(8);
-    let event_history = Arc::new(RwLock::new(std::collections::VecDeque::new()));
-    let event_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let (swarm_event_tx, _) = broadcast::channel(8);
     let global_is_processing = Arc::new(RwLock::new(false));
     let shutdown_signals = Arc::new(RwLock::new(HashMap::new()));
     let soft_interrupt_queues: SessionInterruptQueues = Arc::new(RwLock::new(HashMap::new()));
     let mcp_pool = Arc::new(crate::mcp::SharedMcpPool::from_default_config());
     let debug_jobs = Arc::new(RwLock::new(HashMap::new()));
-
-    let swarm_state = SwarmState {
-        members: Arc::clone(&swarm_members),
-        swarms_by_id: Arc::clone(&swarms_by_id),
-        plans: Arc::clone(&swarm_plans),
-        coordinators: Arc::clone(&swarm_coordinators),
-    };
 
     let server_task = tokio::spawn(handle_client(
         server_stream,
@@ -1450,21 +1428,10 @@ async fn lightweight_comm_request_skips_full_session_initialization() {
             client_connections: Arc::clone(&client_connections),
             provider: Arc::clone(&provider_template),
         },
-        SwarmServiceHandle {
-            swarm_state,
-            shared_context: Arc::clone(&shared_context),
-            file_touch: file_touch.clone(),
-            channel_subscriptions: Arc::clone(&channel_subscriptions),
-            channel_subscriptions_by_session: Arc::clone(&channel_subscriptions_by_session),
-            event_history: Arc::clone(&event_history),
-            event_counter: Arc::clone(&event_counter),
-            swarm_event_tx: swarm_event_tx.clone(),
-            await_members_runtime: AwaitMembersRuntime::default(),
-            swarm_mutation_runtime: SwarmMutationRuntime::default(),
-        },
+        crate::server::test_util::TestSwarmBuilder::default().build(),
         DebugServiceHandle {
-            client_debug_state: Arc::clone(&client_debug_state),
-            client_debug_response_tx: _debug_response_tx,
+            client_debug_state: Arc::new(RwLock::new(ClientDebugState::default())),
+            client_debug_response_tx: broadcast::channel(8).0,
             debug_jobs: Arc::clone(&debug_jobs),
         },
         "jcode-test".to_string(),

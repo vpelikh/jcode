@@ -539,6 +539,7 @@ fn cap_chars(s: &str, cap: usize) -> String {
 }
 
 #[cfg(test)]
+#[expect(clippy::items_after_test_module, reason = "test module sits before shared test helpers")]
 mod tests {
     use super::*;
     use crate::bus::{BatchProgress, ToolEvent, ToolStatus};

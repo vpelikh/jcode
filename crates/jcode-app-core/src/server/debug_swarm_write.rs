@@ -742,32 +742,16 @@ mod tests {
         let _env = isolated_runtime(&dir);
         let session_id = Arc::new(RwLock::new("session-1".to_string()));
         let swarm_members = Arc::new(RwLock::new(HashMap::new()));
-        let swarms_by_id = Arc::new(RwLock::new(HashMap::new()));
-        let shared_context = Arc::new(RwLock::new(HashMap::new()));
-        let swarm_plans = Arc::new(RwLock::new(HashMap::new()));
         let swarm_coordinators = Arc::new(RwLock::new(HashMap::from([(
             "swarm-lock-order".to_string(),
             "session-1".to_string(),
         )])));
         let ctx = DebugSwarmWriteContext {
             session_id: &session_id,
-            swarm: &SwarmServiceHandle {
-                swarm_state: SwarmState {
-                    members: Arc::clone(&swarm_members),
-                    swarms_by_id: Arc::clone(&swarms_by_id),
-                    plans: Arc::clone(&swarm_plans),
-                    coordinators: Arc::clone(&swarm_coordinators),
-                },
-                shared_context: Arc::clone(&shared_context),
-                file_touch: crate::server::FileTouchService::new(),
-                channel_subscriptions: Arc::new(RwLock::new(HashMap::new())),
-                channel_subscriptions_by_session: Arc::new(RwLock::new(HashMap::new())),
-                event_history: Arc::new(RwLock::new(std::collections::VecDeque::new())),
-                event_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                swarm_event_tx: tokio::sync::broadcast::channel(8).0,
-                await_members_runtime: crate::server::AwaitMembersRuntime::default(),
-                swarm_mutation_runtime: crate::server::SwarmMutationRuntime::default(),
-            },
+            swarm: &crate::server::test_util::TestSwarmBuilder::default()
+                .members(Arc::clone(&swarm_members))
+                .coordinators(Arc::clone(&swarm_coordinators))
+                .build(),
         };
 
         // Force the command to wait at members.write(). A safe path must not

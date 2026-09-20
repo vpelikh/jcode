@@ -1,3 +1,4 @@
+#![expect(clippy::await_holding_lock, reason = "tests intentionally hold locks across awaits")]
 use super::*;
 
 /// Point the process at a temp jcode home and return it with a restore guard.

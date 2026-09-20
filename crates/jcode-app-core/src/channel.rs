@@ -474,7 +474,7 @@ impl TelegramChannel {
                 ""
             };
             rows.push(vec![InlineKeyboardButton {
-                text: picker_button_label(&prefix, &title, &short),
+                text: picker_button_label(prefix, &title, &short),
                 callback_data: s.session_id.clone(),
             }]);
         }
@@ -875,7 +875,7 @@ impl TelegramChannel {
                 ""
             };
             rows.push(vec![InlineKeyboardButton {
-                text: picker_button_label(&prefix, &title, &short),
+                text: picker_button_label(prefix, &title, &short),
                 callback_data: s.session_id.clone(),
             }]);
         }
@@ -2641,6 +2641,8 @@ impl MessageChannel for JadeRelayChannel {
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::await_holding_lock, reason = "tests intentionally hold locks across awaits")]
+
     use super::*;
 
     #[test]

@@ -1,3 +1,4 @@
+#![expect(clippy::await_holding_lock, reason = "tests intentionally hold locks across awaits")]
 use super::*;
 use crate::tool::{ToolContext, ToolExecutionMode};
 use serde_json::json;

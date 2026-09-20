@@ -639,6 +639,7 @@ async fn build_server_memory_incident_payload(
 }
 
 #[cfg(test)]
+#[expect(clippy::items_after_test_module, reason = "test module sits before shared test helpers")]
 mod tests {
     use super::*;
     use std::time::Duration;

@@ -11,10 +11,6 @@ use tokio::sync::{Mutex, RwLock};
 
 type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "swarm read debug commands inspect sessions, swarm state, shared context, plans, channels, and file touches together"
-)]
 pub(super) async fn maybe_handle_swarm_read_command(
     cmd: &str,
     sessions: &SessionAgents,
