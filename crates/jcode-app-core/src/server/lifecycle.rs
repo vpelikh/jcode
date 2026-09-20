@@ -159,7 +159,13 @@ pub(crate) fn spawn_temporary_lifecycle_monitor(
                     "Temporary server owner pid {} is gone. Shutting down.",
                     owner_pid
                 ));
-                shutdown_temporary_server(&server_name, &socket_path, &debug_socket_path).await;
+                shutdown_temporary_server(
+                    &server_name,
+                    &socket_path,
+                    &debug_socket_path,
+                    Arc::clone(&sessions),
+                )
+                .await;
             }
 
             let count = *client_count.read().await;
@@ -181,7 +187,13 @@ pub(crate) fn spawn_temporary_lifecycle_monitor(
                         "Temporary server idle for {} seconds. Shutting down.",
                         since.elapsed().as_secs()
                     ));
-                    shutdown_temporary_server(&server_name, &socket_path, &debug_socket_path).await;
+                    shutdown_temporary_server(
+                        &server_name,
+                        &socket_path,
+                        &debug_socket_path,
+                        Arc::clone(&sessions),
+                    )
+                    .await;
                 }
             } else {
                 if idle_since.is_some() {
@@ -199,7 +211,11 @@ async fn shutdown_temporary_server(
     server_name: &str,
     socket_path: &Path,
     debug_socket_path: &Path,
+    sessions: super::SessionAgents,
 ) -> ! {
+    // Graceful idle shutdown: close any lingering owned sessions so they persist
+    // as Closed rather than being left Active and later relabelled crashed.
+    super::close_owned_sessions(&sessions).await;
     let _ = crate::registry::unregister_server(server_name).await;
     crate::transport::remove_socket(socket_path);
     crate::transport::remove_socket(debug_socket_path);
