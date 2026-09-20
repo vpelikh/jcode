@@ -290,6 +290,42 @@ the prior environment.
   rows. Behavior is byte-identical (the picker, review, and handoff suites
   still pass unchanged).
 
+  Two deliberate bounds keep this refactor contained, recorded here so they are
+  explicit decisions rather than unstated gaps:
+  - **`ServerGroup.sessions` stays `Vec<SessionInfo>`.** Handoff rows never
+    route through server groups — only the flat (`all_sessions` /
+    `all_orphan_sessions`) store can hold a `Row::Handoff`. Re-typing the
+    group's session list to `Vec<Row>` would be a public API change in the
+    `jcode-tui-session-picker` crate that forces every group access through a
+    `row.session()` projection for no correctness gain. `row_by_ref` therefore
+    returns `None` for `SessionRef::Group` (a group can never be a handoff row).
+  - **Public constructors (`new`/`new_grouped`/`reseed_grouped`) still take
+    sessions, not rows.** They wrap `Row::Session` internally; only
+    `for_handoffs` produces `Row::Handoff`. This keeps the session-facing API
+    and wire/CLI behavior byte-identical. A caller cannot hand a prebuilt
+    handoff row through the public constructors today, which is fine because
+    the handoff overlay is the only producer of handoff rows.
+
+  `is_handoff()` derives from a representative flat/orphan backing row (the
+  data source is homogeneous by construction — constructors/reseed never mix
+  or partially append), so it is O(1) on the per-frame render path yet robust
+  to an emptied visible list.
+
+- **Row-model unification (follow-up, deferred).** A fully-uniform `Vec<Row>`
+  pipeline (groups included) is feasible but requires decoupling the
+  serializable `HandoffSnapshot` / `HandoffTodo` shapes out of `jcode-base`
+  into `jcode-session-types`, since `ServerGroup` lives in the leaf
+  `jcode-tui-session-picker` crate that cannot depend on `jcode-base`
+  (that would create a cycle with `jcode-app-core`). Doing so would let
+  `ServerGroup.sessions` become `Vec<Row>` and would let `Row`/`HandoffModel`
+  move into the picker crate. Payoff is architectural only — one accessor
+  path, no `Group`-arm special case, a self-contained picker crate, and the
+  ability to group handoffs by project — with **zero user-visible behavior
+  change**. It touches the serialization/wire surface and re-types a public
+  struct across `loading.rs`, `memory.rs`, `filter.rs`, and test literals, so
+  it is deliberately out of scope here. Optional; pursue only if grouped
+  handoffs or a non-app-core picker consumer becomes a real need.
+
 - **Atomic handoff apply (non-atomic clear+set is a known gap).** The overlay
   applies a selection as `remote.clear()` then `set_handoff_resume` — two
   requests that can split if the transport drops between them, leaving a cleared

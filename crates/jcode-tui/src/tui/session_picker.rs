@@ -585,10 +585,15 @@ impl SessionPicker {
 
     /// Whether this picker's rows are handoff snapshots rather than sessions.
     /// Derived from the backing [`Row`] type, so there is no separate mode flag
-    /// that can drift from the data source. A handoff picker always has handoff
-    /// rows in its flat backing (the handoff overlay never mixes sources), so
-    /// checking the first backing row is authoritative even when the current
-    /// filter/search has emptied the visible list.
+    /// that can drift from the data source.
+    ///
+    /// The data source is homogeneous by construction: every public constructor
+    /// and reseed builds a fully-session or fully-handoff backing and never
+    /// partially appends to it, so checking a single representative backing row
+    /// is correct. We consult the first flat/orphan row only (never the visible
+    /// list, which filter/search can empty). This stays O(1) because the method
+    /// runs on the per-frame render path; an O(n) all-rows scan would cost a
+    /// full iteration for large flat session lists every frame.
     pub fn is_handoff(&self) -> bool {
         self.all_sessions
             .iter()
