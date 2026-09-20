@@ -6,10 +6,10 @@
 //! and silently wedges dependent work, so these handlers must validate
 //! acyclicity too.
 
-use crate::server::services::SessionServiceHandle;
 use super::{handle_comm_approve_plan, handle_comm_propose_plan, plan_cycle_error};
 use crate::plan::PlanItem;
 use crate::protocol::ServerEvent;
+use crate::server::services::SessionServiceHandle;
 use crate::server::{SharedContext, SwarmMember, SwarmMutationRuntime, VersionedPlan};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;

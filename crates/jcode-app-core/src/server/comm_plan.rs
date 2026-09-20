@@ -2,14 +2,10 @@ use super::services::{SessionServiceHandle, SwarmServiceHandle};
 use super::swarm_mutation_state::{
     PersistedSwarmMutationResponse, begin_or_replay, finish_request, request_key,
 };
-use super::{
-    SwarmEventType, SwarmState, VersionedPlan, broadcast_swarm_plan,
-    persist_swarm_state_for, record_swarm_event, summarize_plan_items,
-};
+use super::{SwarmEventType, summarize_plan_items};
 use crate::plan::PlanItem;
 use crate::protocol::{NotificationType, ServerEvent};
 use jcode_agent_runtime::SoftInterruptSource;
-use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Reject plans whose dependency graph contains a cycle. Cyclic items can never
@@ -39,10 +35,7 @@ pub(super) async fn handle_comm_propose_plan(
     swarm: &SwarmServiceHandle,
 ) {
     let swarm_members = &swarm.swarm_state().members;
-    let swarms_by_id = &swarm.swarm_state().swarms_by_id;
-    let swarm_plans = &swarm.swarm_state().plans;
     let swarm_coordinators = &swarm.swarm_state().coordinators;
-    let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
     let swarm_id = swarm.member_swarm_id(&req_session_id).await;
 
     let swarm_id = match swarm_id.as_ref() {
@@ -94,21 +87,14 @@ pub(super) async fn handle_comm_propose_plan(
             });
             return;
         }
-        let (version, participant_ids) = {
-            let mut plans = swarm_plans.write().await;
-            let plan = plans
-                .entry(swarm_id.clone())
-                .or_insert_with(VersionedPlan::new);
-            plan.participants.insert(req_session_id.clone());
-            for item in &items {
-                if let Some(owner) = &item.assigned_to {
-                    plan.participants.insert(owner.clone());
-                }
-            }
-            plan.replace_items(items.clone());
-            plan.version += 1;
-            (plan.version, plan.participants.clone())
-        };
+        let (version, participant_ids, _item_count) = swarm
+            .propose_coordinator_plan_update(
+                &swarm_id,
+                &req_session_id,
+                items.clone(),
+                from_name.clone(),
+            )
+            .await;
 
         let members = swarm_members.read().await;
         let notification_msg = format!(
@@ -134,44 +120,14 @@ pub(super) async fn handle_comm_propose_plan(
                 });
             }
             let _ = session
- .queue_soft_interrupt(
- &sid,
- notification_msg.clone(),
- false,
- SoftInterruptSource::System,
- )
- .await;
+                .queue_soft_interrupt(
+                    &sid,
+                    notification_msg.clone(),
+                    false,
+                    SoftInterruptSource::System,
+                )
+                .await;
         }
-
-        let swarm_state = SwarmState {
-            members: Arc::clone(swarm_members),
-            swarms_by_id: Arc::clone(swarms_by_id),
-            plans: Arc::clone(swarm_plans),
-            coordinators: Arc::clone(swarm_coordinators),
-        };
-        persist_swarm_state_for(&swarm_id, &swarm_state).await;
-
-        broadcast_swarm_plan(
-            &swarm_id,
-            Some("coordinator_direct_update".to_string()),
-            swarm_plans,
-            swarm_members,
-            swarms_by_id,
-        )
-        .await;
-        record_swarm_event(
-            event_history,
-            event_counter,
-            swarm_event_tx,
-            req_session_id.clone(),
-            from_name.clone(),
-            Some(swarm_id.clone()),
-            SwarmEventType::PlanUpdate {
-                swarm_id: swarm_id.clone(),
-                item_count: items.len(),
-            },
-        )
-        .await;
 
         let _ = client_event_tx.send(ServerEvent::Done { id });
         return;
@@ -203,20 +159,18 @@ pub(super) async fn handle_comm_propose_plan(
             false,
         )
         .await;
-    record_swarm_event(
-        event_history,
-        event_counter,
-        swarm_event_tx,
-        req_session_id.clone(),
-        from_name.clone(),
-        Some(swarm_id.clone()),
-        SwarmEventType::PlanProposal {
-            swarm_id: swarm_id.clone(),
-            proposer_session: req_session_id.clone(),
-            item_count: items.len(),
-        },
-    )
-    .await;
+    swarm
+        .record_swarm_event(
+            req_session_id.clone(),
+            from_name.clone(),
+            Some(swarm_id.clone()),
+            SwarmEventType::PlanProposal {
+                swarm_id: swarm_id.clone(),
+                proposer_session: req_session_id.clone(),
+                item_count: items.len(),
+            },
+        )
+        .await;
 
     let summary = summarize_plan_items(&items, 3);
     let notification_msg = format!(
@@ -249,13 +203,13 @@ pub(super) async fn handle_comm_propose_plan(
         });
     }
     let _ = session
- .queue_soft_interrupt(
- &coordinator_id,
- notification_msg.clone(),
- false,
- SoftInterruptSource::System,
- )
- .await;
+        .queue_soft_interrupt(
+            &coordinator_id,
+            notification_msg.clone(),
+            false,
+            SoftInterruptSource::System,
+        )
+        .await;
 
     let proposer_confirmation = "Plan proposal sent to coordinator (not yet applied).".to_string();
     if let Some(member) = members.get(&req_session_id) {
@@ -271,13 +225,13 @@ pub(super) async fn handle_comm_propose_plan(
         });
     }
     let _ = session
- .queue_soft_interrupt(
- &req_session_id,
- proposer_confirmation,
- false,
- SoftInterruptSource::System,
- )
- .await;
+        .queue_soft_interrupt(
+            &req_session_id,
+            proposer_confirmation,
+            false,
+            SoftInterruptSource::System,
+        )
+        .await;
 
     let _ = client_event_tx.send(ServerEvent::Done { id });
 }
@@ -291,10 +245,7 @@ pub(super) async fn handle_comm_approve_plan(
     swarm: &SwarmServiceHandle,
 ) {
     let swarm_members = &swarm.swarm_state().members;
-    let swarms_by_id = &swarm.swarm_state().swarms_by_id;
     let swarm_plans = &swarm.swarm_state().plans;
-    let swarm_coordinators = &swarm.swarm_state().coordinators;
-    let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
     let swarm_mutation_runtime = swarm.swarm_mutation_runtime();
     let swarm_id = match swarm
         .require_coordinator_swarm(
@@ -398,48 +349,15 @@ pub(super) async fn handle_comm_approve_plan(
             return;
         }
 
-        let participant_ids = {
-            let mut plans = swarm_plans.write().await;
-            let plan = plans
-                .entry(swarm_id.clone())
-                .or_insert_with(VersionedPlan::new);
-            plan.items.extend(items.clone());
-            plan.version += 1;
-            plan.participants.insert(req_session_id.clone());
-            plan.participants.insert(proposer_session.clone());
-            for item in &items {
-                if let Some(owner) = &item.assigned_to {
-                    plan.participants.insert(owner.clone());
-                }
-            }
-            plan.participants.clone()
-        };
-
-        swarm
-            .remove_shared_context(&swarm_id, &proposal_key)
+let (participant_ids, _item_count) = swarm
+            .approve_plan_merge(
+                &swarm_id,
+                &req_session_id,
+                &proposer_session,
+                items.clone(),
+                &proposal_key,
+            )
             .await;
-
-        broadcast_swarm_plan(
-            &swarm_id,
-            Some("proposal_approved".to_string()),
-            swarm_plans,
-            swarm_members,
-            swarms_by_id,
-        )
-        .await;
-        record_swarm_event(
-            event_history,
-            event_counter,
-            swarm_event_tx,
-            req_session_id.clone(),
-            None,
-            Some(swarm_id.clone()),
-            SwarmEventType::PlanUpdate {
-                swarm_id: swarm_id.clone(),
-                item_count: items.len(),
-            },
-        )
-        .await;
 
         let coordinator_name = {
             let members = swarm_members.read().await;
@@ -468,23 +386,11 @@ pub(super) async fn handle_comm_approve_plan(
                 });
 
                 let _ = session
- .queue_soft_interrupt(
- &sid,
- message.clone(),
- false,
- SoftInterruptSource::System,
- )
- .await;
+                    .queue_soft_interrupt(&sid, message.clone(), false, SoftInterruptSource::System)
+                    .await;
             }
         }
 
-        let swarm_state = SwarmState {
-            members: Arc::clone(swarm_members),
-            swarms_by_id: Arc::clone(swarms_by_id),
-            plans: Arc::clone(swarm_plans),
-            coordinators: Arc::clone(swarm_coordinators),
-        };
-        persist_swarm_state_for(&swarm_id, &swarm_state).await;
     }
 
     finish_request(
@@ -505,7 +411,6 @@ pub(super) async fn handle_comm_reject_plan(
     swarm: &SwarmServiceHandle,
 ) {
     let swarm_members = &swarm.swarm_state().members;
-    let (event_history, event_counter, swarm_event_tx) = swarm.read_event_sources();
     let swarm_mutation_runtime = swarm.swarm_mutation_runtime();
     let swarm_id = match swarm
         .require_coordinator_swarm(
@@ -561,9 +466,7 @@ pub(super) async fn handle_comm_reject_plan(
         return;
     }
 
-    swarm
-        .remove_shared_context(&swarm_id, &proposal_key)
-        .await;
+    swarm.remove_shared_context(&swarm_id, &proposal_key).await;
 
     let coordinator_name = {
         let members = swarm_members.read().await;
@@ -591,27 +494,25 @@ pub(super) async fn handle_comm_reject_plan(
         });
 
         let _ = session
- .queue_soft_interrupt(
- &proposer_session,
- message,
- false,
- SoftInterruptSource::System,
- )
- .await;
+            .queue_soft_interrupt(
+                &proposer_session,
+                message,
+                false,
+                SoftInterruptSource::System,
+            )
+            .await;
     }
-    record_swarm_event(
-        event_history,
-        event_counter,
-        swarm_event_tx,
-        req_session_id.clone(),
-        coordinator_name,
-        Some(swarm_id.clone()),
-        SwarmEventType::Notification {
-            notification_type: "plan_rejected".to_string(),
-            message: proposer_session.clone(),
-        },
-    )
-    .await;
+    swarm
+        .record_swarm_event(
+            req_session_id.clone(),
+            coordinator_name,
+            Some(swarm_id.clone()),
+            SwarmEventType::Notification {
+                notification_type: "plan_rejected".to_string(),
+                message: proposer_session.clone(),
+            },
+        )
+        .await;
 
     finish_request(
         swarm_mutation_runtime,
