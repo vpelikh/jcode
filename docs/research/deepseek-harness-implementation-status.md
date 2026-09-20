@@ -26,6 +26,16 @@ Fully implemented, tested, and committed.
 | `515eb1471` | **repeat-tool reminder guard.** New pure `crates/jcode-app-core/src/agent/guard.rs`: canonical (order-insensitive recursive JSON-key) tool-call signature, consecutive-identical-tail detector, `repeat_reminder_from_transcript`. Wired into the streaming loop's Injection Point D and the headless `run_turn`. 9 unit tests. Model-free, no API cost. |
 | `d4e0698da` | **opt-in per-call tool timeout.** `jcode-tool-core::Tool::execution_timeout()` (default `None`), `execute_with_deadline()` mapping a hung call to a readable `"timed out after Ns"` error. Wired at the single `Registry::execute` choke point in `jcode-app-core/src/tool/mod.rs` (no per-construction-site bloat). tokio `time` feature. 4 unit tests incl. model-visible timeout. |
 
+  **Review note (2026-09-06):** the per-call timeout *capability* is delivered,
+  tested, and wired, but it is currently **dormant in production** — no tool
+  overrides `execution_timeout()`, so every live call passes `None` and no
+  deadline is ever applied. This was a deliberate call: the tools most likely to
+  hang (`bash`, `bg`) already manage their own timeout/background-resume flows,
+  and a registry-level deadline would conflict with them. To realize the benefit,
+  a specific tool whose execution is externally cancellable must opt in with a
+  declared `execution_timeout()`. Until then, the capability is a tested
+  extension point, not an active guard.
+
 ## Branch `jc/live-compaction-bracket-migrate` — takeaway #5 (live bracket)
 
 The live producer (`jcode-app-core`) uses a **virtual** summary model: it
