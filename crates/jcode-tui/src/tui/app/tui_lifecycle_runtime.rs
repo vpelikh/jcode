@@ -67,10 +67,12 @@ impl App {
                 .as_deref()
                 .or(self.resume_session_id.as_deref())
                 .unwrap_or("connecting");
-            let _ = crossterm::execute!(
-                std::io::stdout(),
+            let mut buf = Vec::new();
+            let _ = crossterm::queue!(
+                &mut buf,
                 crossterm::terminal::SetTitle(format!("jcode SSH {host} {session}"))
             );
+            crate::tui::terminal_writer::write_serialized(&buf);
             return;
         }
         let session_id = if self.is_remote {
@@ -126,10 +128,9 @@ impl App {
             Some(&fallback_label),
             is_canary,
         );
-        let _ = crossterm::execute!(
-            std::io::stdout(),
-            crossterm::terminal::SetTitle(window_title)
-        );
+        let mut buf = Vec::new();
+        let _ = crossterm::queue!(&mut buf, crossterm::terminal::SetTitle(window_title));
+        crate::tui::terminal_writer::write_serialized(&buf);
     }
 
     pub(super) fn reconnect_target_session_id(&self) -> Option<String> {
