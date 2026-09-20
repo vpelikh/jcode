@@ -1398,18 +1398,12 @@ impl Server {
             });
         }
 
-        // Spawn the bus monitor for swarm coordination. Swarm state flows in via the
-        // swarm service handle (Slice 4); only session-scoped state is cloned.
+        // Spawn the bus monitor for swarm coordination. Swarm and session state flow
+        // in via the service handles (Slice 4).
         let monitor_swarm = services::SwarmServiceHandle::from_server(self);
-        let monitor_sessions = Arc::clone(&self.sessions);
-        let monitor_soft_interrupt_queues = Arc::clone(&self.soft_interrupt_queues);
+        let monitor_session = services::SessionServiceHandle::from_server(self);
         tokio::spawn(async move {
-            Self::monitor_bus(
-                &monitor_swarm,
-                monitor_sessions,
-                monitor_soft_interrupt_queues,
-            )
-            .await;
+            Self::monitor_bus(&monitor_swarm, &monitor_session).await;
         });
 
         // Resume any background `swarm await_members` watchers that were active
@@ -2006,18 +2000,20 @@ impl Server {
     /// Monitor the global Bus for FileTouch events and detect conflicts
     async fn monitor_bus(
         swarm: &services::SwarmServiceHandle,
-        sessions: Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>,
-        soft_interrupt_queues: SessionInterruptQueues,
+        session: &services::SessionServiceHandle,
     ) {
-        // Swarm-domain state is reached through the swarm service handle. These
-        // locals keep the body single-homed on the handle's fields instead of a
-        // flat pass-through argument bag (server service split, Slice 4).
+        // Swarm-domain state is reached through the swarm service handle, and
+        // session-domain state through the session service handle. These locals
+        // keep the body single-homed on the handles' fields instead of a flat
+        // pass-through argument bag (server service split, Slice 4).
         let file_touch = swarm.file_touch.clone();
         let swarm_members = Arc::clone(&swarm.swarm_state.members);
         let swarms_by_id = Arc::clone(&swarm.swarm_state.swarms_by_id);
         let event_history = swarm.event_history.clone();
         let event_counter = Arc::clone(&swarm.event_counter);
         let swarm_event_tx = swarm.swarm_event_tx.clone();
+        let sessions = Arc::clone(&session.sessions);
+        let soft_interrupt_queues = Arc::clone(&session.soft_interrupt_queues);
         let mut receiver = Bus::global().subscribe();
         let mut last_cleanup = Instant::now();
         const TOUCH_EXPIRY: Duration = Duration::from_secs(30 * 60); // 30 min
@@ -2179,15 +2175,7 @@ impl Server {
                                 };
                                 let _ = member.event_tx.send(notification);
 
-                                if !queue_soft_interrupt_for_session(
-                                    &session_id,
-                                    alert_msg.clone(),
-                                    false,
-                                    SoftInterruptSource::System,
-                                    &soft_interrupt_queues,
-                                    &sessions,
-                                )
-                                .await
+                                if !session.queue_soft_interrupt(&session_id, alert_msg.clone(), false, SoftInterruptSource::System).await
                                 {
                                     crate::logging::warn(&format!(
                                         "Failed to queue file-activity soft interrupt for session {}",
@@ -2235,15 +2223,7 @@ impl Server {
                                 };
                                 let _ = prev_member.event_tx.send(notification);
 
-                                if !queue_soft_interrupt_for_session(
-                                    &prev.session_id,
-                                    alert_msg.clone(),
-                                    false,
-                                    SoftInterruptSource::System,
-                                    &soft_interrupt_queues,
-                                    &sessions,
-                                )
-                                .await
+                                if !session.queue_soft_interrupt(&prev.session_id, alert_msg.clone(), false, SoftInterruptSource::System).await
                                 {
                                     crate::logging::warn(&format!(
                                         "Failed to queue file-activity soft interrupt for session {}",

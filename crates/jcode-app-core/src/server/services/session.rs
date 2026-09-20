@@ -1,8 +1,9 @@
 //! Session service handle.
 
 use crate::agent::Agent;
+use crate::server::state::queue_soft_interrupt_for_session;
 use crate::server::{Server, SessionInterruptQueues};
-use jcode_agent_runtime::InterruptSignal;
+use jcode_agent_runtime::{InterruptSignal, SoftInterruptSource};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -35,5 +36,26 @@ impl SessionServiceHandle {
             shutdown_signals: Arc::clone(&server.shutdown_signals),
             soft_interrupt_queues: Arc::clone(&server.soft_interrupt_queues),
         }
+    }
+
+    /// Queue a soft-interrupt (system notice) for a session, routing through the
+    /// session service's registered queues and sessions so callers do not reach
+    /// into the raw session maps. Deferred to [`queue_soft_interrupt_for_session`].
+    pub(crate) async fn queue_soft_interrupt(
+        &self,
+        session_id: &str,
+        content: String,
+        urgent: bool,
+        source: SoftInterruptSource,
+    ) -> bool {
+        queue_soft_interrupt_for_session(
+            session_id,
+            content,
+            urgent,
+            source,
+            &self.soft_interrupt_queues,
+            &self.sessions,
+        )
+        .await
     }
 }
