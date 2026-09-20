@@ -57,6 +57,29 @@ pub(super) fn clear_session_state_after_discard(app: &mut App) {
     app.status = ProcessingStatus::Idle;
 }
 
+/// Open the `/handoff` overlay from the connected *server*'s handoff store.
+///
+/// Over SSH the client host's local store is the wrong host to inspect, so
+/// instead of reading local snapshots we issue `handoff_list` to the server.
+/// When `ServerEvent::HandoffListed` returns (matched by request id), the
+/// picker opens from that data. Until then a status notice explains the load.
+async fn handle_remote_handoff_command(
+    app: &mut App,
+    remote: &mut RemoteConnection,
+) -> Result<()> {
+    if app.is_processing {
+        app.push_display_message(DisplayMessage::error(
+            "The agent is currently working. Wait for it to finish, then run /handoff again."
+                .to_string(),
+        ));
+        return Ok(());
+    }
+    let request_id = remote.handoff_list().await?;
+    app.set_pending_remote_handoff_list(request_id);
+    app.set_status_notice("Loading server handoffs…");
+    Ok(())
+}
+
 /// Set which saved handoff this session boots from on its first message.
 ///
 /// `/handoffres <session_id>` clears the current conversation in place (like
@@ -2014,6 +2037,15 @@ async fn handle_remote_key_internal(
                 }
 
                 if trimmed == "/handoff" || trimmed.starts_with("/handoff ") {
+                    if app_mod::commands_dispatch::ssh_local_action_blocked(
+                        app,
+                        "Local handoff picker",
+                    ) {
+                        // Over SSH the client host's local store is the wrong
+                        // host: fetch the *server's* handoff store and feed the
+                        // `/handoff` overlay from it.
+                        return handle_remote_handoff_command(app, remote).await;
+                    }
                     app.open_handoff_picker();
                     return Ok(());
                 }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::protocol::HandoffWireModel;
 use crate::tool::selfdev::ReloadContext;
 use crate::tui::TuiState;
 use crate::tui::app as app_mod;
@@ -3027,8 +3028,62 @@ pub(in crate::tui::app) fn handle_server_event(
             app.set_status_notice("⌨ Interactive terminal detected (command will timeout)");
             false
         }
+        ServerEvent::HandoffListed { id, handoffs } => {
+            if app.take_pending_remote_handoff_list(id).is_some() {
+                open_picker_from_remote_handoffs(app, handoffs);
+            }
+            false
+        }
+        ServerEvent::HandoffImported { id, session_id } => {
+            let _ = id;
+            if session_id.is_empty() {
+                app.set_status_notice("Could not adopt handoff (payload rejected by server)");
+            } else {
+                app.push_display_message(DisplayMessage::system(format!(
+                    "Handoff adopted on this server: {session_id}"
+                )));
+                app.set_status_notice("Handoff imported");
+            }
+            false
+        }
         _ => false,
     }
+}
+
+/// Build `/handoff` picker rows from `HandoffListed` wire models.
+///
+/// The wire model carries every field the preview/resume flow needs as typed
+/// values, so the client reconstructs the snapshot directly and never parses
+/// the opaque `payload`. A malformed payload can therefore no longer silently
+/// drop a row from the picker. The `payload` itself is still available for
+/// re-adoption (`handoff_import`) when a row is selected.
+fn open_picker_from_remote_handoffs(app: &mut App, handoffs: Vec<HandoffWireModel>) {
+    use crate::handoff::{HandoffSnapshot, HandoffTodo};
+    let mut snapshots: Vec<HandoffSnapshot> = Vec::with_capacity(handoffs.len());
+    for model in handoffs {
+        snapshots.push(HandoffSnapshot {
+            session_id: model.session_id,
+            project_key: model.project_key,
+            ended_at: model.ended_at,
+            disposition: model.disposition,
+            working_dir: model.working_dir,
+            intent: model.intent,
+            open_todos: model
+                .open_todos
+                .into_iter()
+                .map(|t| HandoffTodo {
+                    id: t.id,
+                    content: t.content,
+                    status: t.status,
+                    group: t.group,
+                    confidence: t.confidence,
+                })
+                .collect(),
+            last_assistant_text: model.last_assistant_text,
+            initiative_id: model.initiative_id,
+        });
+    }
+    app.open_handoff_picker_with(snapshots);
 }
 
 fn runtime_activity_status_notice(message: &str) -> String {

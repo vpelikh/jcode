@@ -175,7 +175,7 @@ pub type ReloadRecoverySnapshot = jcode_selfdev_types::ReloadRecoveryDirective;
 
 mod wire;
 pub use wire::TaskGraphNodeSpec;
-pub use wire::{Request, ServerEvent};
+pub use wire::{HandoffTodoWire, HandoffWireModel, Request, ServerEvent};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallSummary {
@@ -604,6 +604,9 @@ impl Request {
             Request::RenameSession { id, .. } => *id,
             Request::SetWorkingDir { id, .. } => *id,
             Request::SetHandoffResume { id, .. } => *id,
+            Request::HandoffList { id } => *id,
+            Request::HandoffImport { id, .. } => *id,
+            Request::HandoffApply { id, .. } => *id,
             Request::Split { id } => *id,
             Request::Transfer { id } => *id,
             Request::Compact { id } => *id,
