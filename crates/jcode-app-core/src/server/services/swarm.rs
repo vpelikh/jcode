@@ -635,3 +635,183 @@ impl SwarmServiceHandle {
         .await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_handle() -> SwarmServiceHandle {
+        SwarmServiceHandle::test_with_state(
+            SwarmState {
+                members: Arc::new(RwLock::new(HashMap::new())),
+                swarms_by_id: Arc::new(RwLock::new(HashMap::new())),
+                plans: Arc::new(RwLock::new(HashMap::new())),
+                coordinators: Arc::new(RwLock::new(HashMap::new())),
+            },
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(HashMap::new())),
+            SwarmMutationRuntime::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn shared_context_upsert_and_preserve_created_at() {
+        let handle = base_handle();
+        handle
+            .set_shared_context("swarm-1", "k", "v1".to_string(), "sess", None, false)
+            .await;
+
+        let first = handle.get_shared_context("swarm-1", "k").await;
+        let created = first.as_ref().expect("entry").created_at;
+        assert_eq!(first.as_ref().expect("entry").value, "v1");
+
+        // Re-insert preserves the original created_at (Tier 3 unification).
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        handle
+            .set_shared_context("swarm-1", "k", "v2".to_string(), "sess", None, false)
+            .await;
+        let second = handle.get_shared_context("swarm-1", "k").await;
+        assert_eq!(second.as_ref().expect("entry").value, "v2");
+        assert_eq!(
+            second.as_ref().expect("entry").created_at, created,
+            "created_at should survive a plain re-insert"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_context_append_semantics() {
+        let handle = base_handle();
+        handle
+            .set_shared_context("swarm-1", "k", "head".to_string(), "sess", None, false)
+            .await;
+
+        // Append joins with a newline.
+        handle
+            .set_shared_context("swarm-1", "k", "tail".to_string(), "sess", None, true)
+            .await;
+        let entry = handle.get_shared_context("swarm-1", "k").await;
+        assert_eq!(entry.as_ref().expect("entry").value, "head\ntail");
+
+        // Append onto an empty existing value uses the new value directly.
+        handle
+            .set_shared_context("swarm-1", "empty", "".to_string(), "sess", None, false)
+            .await;
+        handle
+            .set_shared_context("swarm-1", "empty", "solo".to_string(), "sess", None, true)
+            .await;
+        assert_eq!(
+            handle.get_shared_context("swarm-1", "empty").await.unwrap().value,
+            "solo"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_context_remove_and_entries() {
+        let handle = base_handle();
+        handle
+            .set_shared_context("swarm-1", "a", "1".to_string(), "sess", None, false)
+            .await;
+        handle
+            .set_shared_context("swarm-1", "b", "2".to_string(), "sess", None, false)
+            .await;
+
+        let mut entries = handle.shared_context_entries("swarm-1").await;
+        let mut keys: Vec<String> = entries.drain(..).map(|e| e.key).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["a".to_string(), "b".to_string()]);
+
+        handle.remove_shared_context("swarm-1", "a").await;
+        assert!(handle.get_shared_context("swarm-1", "a").await.is_none());
+        assert!(handle.get_shared_context("swarm-1", "b").await.is_some());
+
+        // Removing from a swarm with no context map is a no-op.
+        handle.remove_shared_context("swarm-nope", "a").await;
+    }
+
+    #[tokio::test]
+    async fn subscribe_unsubscribe_channel_updates_both_indexes() {
+        let handle = base_handle();
+        handle
+            .subscribe_session_to_channel("sess-1", "swarm-1", "chan-a")
+            .await;
+
+        // Forward index: swarm-1 -> chan-a -> {sess-1}
+        let fwd = handle.channel_subscriptions_map().read().await;
+        assert!(
+            fwd.get("swarm-1")
+                .and_then(|ch| ch.get("chan-a"))
+                .is_some_and(|s| s.contains("sess-1"))
+        );
+        // Reverse index: sess-1 -> swarm-1 -> {chan-a}
+        let rev = handle
+            .channel_subscriptions_by_session_map()
+            .read()
+            .await;
+        assert!(
+            rev.get("sess-1")
+                .and_then(|sw| sw.get("swarm-1"))
+                .is_some_and(|ch| ch.contains("chan-a"))
+        );
+        drop(fwd);
+        drop(rev);
+
+        handle
+            .unsubscribe_session_from_channel("sess-1", "swarm-1", "chan-a")
+            .await;
+        let fwd = handle.channel_subscriptions_map().read().await;
+        assert!(
+            fwd.get("swarm-1")
+                .and_then(|ch| ch.get("chan-a"))
+                .is_none_or(|s| !s.contains("sess-1"))
+        );
+    }
+
+    #[tokio::test]
+    async fn event_sources_expose_the_seeded_sinks() {
+        let history = Arc::new(RwLock::new(VecDeque::from([SwarmEvent {
+            id: 1,
+            session_id: "s".to_string(),
+            session_name: None,
+            swarm_id: Some("sw".to_string()),
+            event: SwarmEventType::MemberChange {
+                action: "joined".to_string(),
+            },
+            timestamp: std::time::Instant::now(),
+            absolute_time: std::time::SystemTime::now(),
+        }])));
+        let counter = Arc::new(AtomicU64::new(7));
+        let (tx, _rx) = broadcast::channel(16);
+        let handle = base_handle().with_event_sources(history, counter, tx.clone());
+
+        let (h, c, t) = handle.read_event_sources();
+        assert_eq!(h.read().await.len(), 1);
+        assert_eq!(c.load(std::sync::atomic::Ordering::SeqCst), 7);
+        assert!(
+            t.same_channel(&tx),
+            "read_event_sources should expose the seeded broadcast sender"
+        );
+    }
+
+    // Smoke: a default handle builds and mutations on it are inert, not panics.
+    #[tokio::test]
+    async fn default_handle_accepts_method_calls() {
+        let handle = SwarmServiceHandle::test_with_state(
+            SwarmState {
+                members: Arc::new(RwLock::new(HashMap::new())),
+                swarms_by_id: Arc::new(RwLock::new(HashMap::new())),
+                plans: Arc::new(RwLock::new(HashMap::new())),
+                coordinators: Arc::new(RwLock::new(HashMap::new())),
+            },
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(HashMap::new())),
+            SwarmMutationRuntime::default(),
+        );
+        handle.remove_shared_context("swarm-1", "k").await;
+        handle
+            .unsubscribe_session_from_channel("s", "sw", "c")
+            .await;
+        let _ = handle.read_event_sources();
+    }
+}

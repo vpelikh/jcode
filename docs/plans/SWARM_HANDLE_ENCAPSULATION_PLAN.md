@@ -141,3 +141,14 @@ through handle methods; suite green + clippy clean.
   for reads. They are documented read-only; all writes route through handle
   methods. A future stricter boundary could snapshot-ify these, but that is out
   of scope for the encapsulation slices.
+
+- **Direct unit tests for the Tier-3 handle methods (added 2026-09).** The
+  earlier review pass noted the new handle methods were only covered
+  transitively via callers. `services/swarm.rs` now carries a dedicated
+  `#[cfg(test)] mod tests` with six tests locking the behavior of
+  `set_shared_context` (plain upsert, created_at preservation, append
+  semantics), `get_shared_context` / `remove_shared_context` /
+  `shared_context_entries`, `subscribe_session_to_channel` /
+  `unsubscribe_session_from_channel` (both forward and reverse indexes), and
+  `read_event_sources` (seeded sinks round-trip). Added 6 tests; suite 1494
+  green, clippy clean.
