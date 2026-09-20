@@ -5,14 +5,14 @@
 
 pub use jcode_config_types::{
     AgentsConfig, AmbientConfig, AuthConfig, AutoJudgeConfig, AutoReviewConfig, CompactionConfig,
-    CompactionMode, CrossProviderFailoverMode, DiagramDisplayMode, DiagramPanePosition,
-    DiffDisplayMode, DisplayConfig, FeatureConfig, GatewayConfig, HookCommands, HooksConfig,
-    KeybindingsConfig, LatexRenderingMode, LaunchHotkeyEntry, LaunchHotkeysConfig,
+    CompactionMode, CrossProviderFailoverMode, DegradationSettings, DiagramDisplayMode,
+    DiagramPanePosition, DiffDisplayMode, DisplayConfig, FeatureConfig, GatewayConfig, HookCommands,
+    HooksConfig, KeybindingsConfig, LatexRenderingMode, LaunchHotkeyEntry, LaunchHotkeysConfig,
     LoopGuardConfig, MarkdownSpacingMode, NamedProviderAuth, NamedProviderConfig,
     NamedProviderModelConfig, NamedProviderType, NativeScrollbarConfig, NotificationsConfig,
     OverscrollStatusMode, PowerConfig, ProviderConfig, ReasoningDisplayMode, SafetyConfig,
     SessionPickerResumeAction, SponsorsConfig, SwarmSpawnMode, SwarmStripLayout, TerminalConfig,
-    UpdateChannel, WebSearchConfig, WebSearchEngine,
+    UpdateChannel, WebSearchConfig, WebSearchEngine, 0fc260497 (feat(agent): add gated route-fallback rung to the mitigation ladder)
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -65,6 +65,8 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_CROSS_PROVIDER_FAILOVER",
     "JCODE_DEBUG_SOCKET",
     "JCODE_DEFAULT_REASONING_DISPLAY",
+    "JCODE_DEGRADATION_FALLBACK_MODEL",
+    "JCODE_DEGRADATION_ROUTE_FALLBACK",
     "JCODE_DICTATION_COMMAND",
     "JCODE_DICTATION_KEY",
     "JCODE_DICTATION_MODE",
@@ -562,6 +564,9 @@ pub struct Config {
 
     /// Loop-hygiene / runaway-loop guard configuration (repeat-tool reminder).
     pub loop_guard: LoopGuardConfig,
+
+    /// Route-degradation auto-mitigation configuration (opt-in route fallback).
+    pub degradation: DegradationSettings, 0fc260497 (feat(agent): add gated route-fallback rung to the mitigation ladder)
 
     /// Power-management configuration (prevent sleep while streaming)
     pub power: PowerConfig,

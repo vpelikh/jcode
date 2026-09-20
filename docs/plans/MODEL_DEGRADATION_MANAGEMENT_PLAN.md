@@ -2,11 +2,23 @@
 
 ## Status
 
-**In progress.** Slices 1-3 landed on `feat/model-degradation-management`. Slice 1
-(watchdog subscription surface) and Slice 2 (degradation tracker) are complete;
-Slice 3 wires the tracker's `Compact` rung into the turn-loop head to trigger a
-compaction before the next API call. The plan proposes turning an existing but
-passive set of detection signals into an active degradation-management system.
+**In progress.** Slices 1-4 landed on `feat/model-degradation-management`. Slice 1
+(watchdog subscription surface), Slice 2 (degradation tracker), and Slice 3
+(auto-compaction at the `Compact` rung) are complete. Slice 4 adds the gated
+route-fallback rung: a `[degradation]` config section (off by default) that, when
+enabled with a `fallback_model`, switches a persistently-degrading session onto
+the fallback; otherwise the session escalates to `Escalated` and surfaces the
+situation instead of changing the user's model. The plan proposes turning an
+existing but passive set of detection signals into an active
+degradation-management system.
+
+**Known limitations of the landed Slices 1-4 (not yet closed):**
+- The tracker is not persisted; state resets on disconnect/reload.
+- `watchdog::subscribe()` (Slice 1) has no production consumer yet; the system
+  "load" axis is documented as a future extension rather than wired state.
+- The non-streaming loop records a clean turn for rung decay; the streaming
+  loop does not yet (its many exit paths were left untouched). Decay still
+  happens there via window expiry.
 
 > **Trigger for this plan (2026-09):** a long-running session with a live
 > language model degraded into a classic stalled-promise loop. The session

@@ -11,16 +11,12 @@
 //! effects are layered on by the caller, which keeps this logic deterministic
 //! and unit-testable in isolation (see `tests` below).
 //!
-//! The two signals it consumes are:
-//! - **Turn-content stalls** (`record_stall`): stalled-promise filler turns,
-//!   empty turns, unfulfilled tool requests. These indicate *model* degradation
-//!   on a long context and can be mitigated by re-prompting, compacting, or
-//!   switching the route.
-//! - **System-level stalls** (`record_system_stall`): `watchdog.stall` events,
-//!   which indicate CPU/memory oversubscription, NOT model degradation. A system
-//!   stall is recorded but does not by itself promote the route rung; it is the
-//!   separate "load" axis named in the plan. (Escalation for the load axis is a
-//!   future slice; here we only track it for observability.)
+//! The signal it consumes is **turn-content stalls** (`record_stall`):
+//! stalled-promise filler turns, empty turns, unfulfilled tool requests. These
+//! indicate *model* degradation on a long context and can be mitigated by
+//! re-prompting, compacting, or switching the route. (A separate system-level
+//! "load" axis from `watchdog.stall` is a documented future extension; it is
+//! not represented here yet to avoid carrying dead state.)
 
 use super::*;
 use std::collections::VecDeque;
@@ -53,14 +49,12 @@ pub enum Rung {
     RouteFallback,
     /// Escalated to the user / stopped; the tracker will not auto-mitigate
     /// further. Reached only after the higher rungs were tried and failed.
-    #[allow(dead_code, reason = "reached in the route-fallback slice (Slice 4)")]
     Escalated,
 }
 
 impl Rung {
     /// Whether this rung still recommends autonomous mitigation (as opposed to
     /// surfacing to the user).
-    #[allow(dead_code, reason = "used by the route-fallback slice (Slice 4)")]
     pub fn is_autonomous(self) -> bool {
         matches!(self, Self::Watch | Self::Compact | Self::RouteFallback)
     }
@@ -72,15 +66,15 @@ pub enum StallKind {
     /// Dense "let me …" filler with no tool call (`is_stalled_promise_text`).
     StalledPromise,
     /// A turn ended with no tool call and no useful content.
-    #[allow(dead_code, reason = "wired from the empty-turn path in Slice 3")]
+    #[allow(dead_code, reason = "constructed by future empty-turn wiring; test-only for now")]
     EmptyTurn,
     /// The model said it would invoke a tool but did not.
-    #[allow(dead_code, reason = "wired from the unfulfilled-tool path in Slice 3")]
+    #[allow(dead_code, reason = "constructed by future unfulfilled-tool wiring; test-only for now")]
     UnfulfilledToolRequest,
 }
 
 impl StallKind {
-    #[allow(dead_code, reason = "used by describe() logging; kept for later slices")]
+    #[allow(dead_code, reason = "used only by describe() for diagnostics")]
     fn as_str(self) -> &'static str {
         match self {
             Self::StalledPromise => "stalled_promise",
@@ -93,7 +87,7 @@ impl StallKind {
 /// Observational record for a single stall event.
 #[derive(Debug, Clone)]
 struct StallRecord {
-    #[allow(dead_code, reason = "reporting only; more kinds land in Slice 3")]
+    #[allow(dead_code, reason = "reporting only; later kinds will populate it")]
     kind: StallKind,
     at: Instant,
 }
@@ -110,10 +104,6 @@ pub struct DegradationConfig {
     pub compact_threshold: u32,
     /// Number of stall events within [`Self::window`] to reach `RouteFallback`.
     pub fallback_threshold: u32,
-    /// Load concern surfaced by watchdog.stall events. Does not promote the
-    /// route rung but is tracked for observability and the load axis.
-    #[allow(dead_code, reason = "load-axis alarm lands with Slice 5 observability")]
-    pub system_stall_load_concern_threshold: u32,
 }
 
 impl Default for DegradationConfig {
@@ -123,7 +113,6 @@ impl Default for DegradationConfig {
             watch_threshold: 1,
             compact_threshold: 2,
             fallback_threshold: 3,
-            system_stall_load_concern_threshold: 2,
         }
     }
 }
@@ -135,19 +124,18 @@ pub struct DegradationTracker {
     cfg: DegradationConfig,
     /// Most recent stall events within the window, oldest first.
     stalls: VecDeque<StallRecord>,
-    /// Rung reached in the current escalation cycle. Rises monotonically until
-    /// [`Self::reset`] (e.g. after a successful mitigation) or expiry.
+    /// Currently recommended mitigation rung. Recomputes from the live stall
+    /// count; decays on recovery and is terminal at `Escalated` (only
+    /// [`Self::reset`] clears that).
     rung: Rung,
     /// Recommended compact is one-shot: record the fact we already recommended
     /// it so we do not re-fire on every turn while the session is mid-compact.
     compact_recommended: bool,
-    /// Load-axis count (watchdog.stall) within the window.
-    system_stalls: VecDeque<Instant>,
 }
 
 #[allow(
     dead_code,
-    reason = "read-side mitigation/observability API consumed by the compaction, route-fallback, and observability slices; already covered by unit tests"
+    reason = "diagnostic/read API (route, stall_count, describe) exercised by unit tests and used by callers for logging; kept as the stable tracker surface"
 )]
 impl DegradationTracker {
     /// Start a tracker for the given route with the default configuration.
@@ -164,7 +152,6 @@ impl DegradationTracker {
             stalls: VecDeque::new(),
             rung: Rung::Healthy,
             compact_recommended: false,
-            system_stalls: VecDeque::new(),
         }
     }
 
@@ -199,11 +186,6 @@ impl DegradationTracker {
         self.stalls.len() as u32
     }
 
-    /// The loaded count of system-level (watchdog) stalls in the window.
-    pub fn system_stall_count(&self) -> u32 {
-        self.system_stalls.len() as u32
-    }
-
     /// Record a turn-content stall of the given kind.
     pub fn record_stall(&mut self, kind: StallKind) {
         self.prune_expired();
@@ -214,17 +196,15 @@ impl DegradationTracker {
         self.recompute_rung();
     }
 
-    /// Record a system-level (watchdog) stall. Does not move the route rung up,
-    /// but is tracked for load observability.
-    pub fn record_system_stall(&mut self) {
-        self.prune_expired();
-        self.system_stalls.push_back(Instant::now());
-    }
-
-    /// Record a clean, healthy turn. Pushes back the stall window so a flurry of
-    /// stalls long ago stops counting; does not reset an already-escalated rung.
+    /// Record a clean, healthy turn. Prunes stale stall-window entries and
+    /// recomputes the rung from the live count, so a genuine recovery decays the
+    /// rung back toward Healthy instead of pinning it at a stale escalated level.
+    /// `Escalated` remains terminal (only [`Self::reset`] clears it).
     pub fn record_healthy_turn(&mut self) {
         self.prune_expired();
+        // Recompute from the live (pruned) count so a clean turn after a
+        // recovery can decay the rung instead of pinning it at an old level.
+        self.recompute_rung();
     }
 
     /// Reset the escalation cycle: clear stall records and drop back to Healthy.
@@ -232,9 +212,25 @@ impl DegradationTracker {
     /// progress) or an explicit user reset.
     pub fn reset(&mut self) {
         self.stalls.clear();
-        self.system_stalls.clear();
         self.rung = Rung::Healthy;
         self.compact_recommended = false;
+    }
+
+    /// Escalate to the terminal `Escalated` rung: auto-mitigation is exhausted
+    /// or disabled, so the caller should surface the situation to the user
+    /// rather than keep acting. Idempotent.
+    pub fn escalate(&mut self) {
+        self.rung = Rung::Escalated;
+    }
+
+    /// Promptly promote to `RouteFallback`, skipping the intermediate rungs.
+    /// Used when an earlier rung is genuinely unavailable (e.g. the provider
+    /// does not support compaction), so the session still reaches the
+    /// fallback/escalation decision instead of silently spinning.
+    pub fn promote_to_route_fallback(&mut self) {
+        // Treat a compaction as "attempted" so the RouteFallback gate opens.
+        self.compact_recommended = true;
+        self.rung = Rung::RouteFallback;
     }
 
     fn prune_expired(&mut self) {
@@ -246,20 +242,22 @@ impl DegradationTracker {
         {
             self.stalls.pop_front();
         }
-        while self
-            .system_stalls
-            .front()
-            .is_some_and(|at| *at < cutoff)
-        {
-            self.system_stalls.pop_front();
-        }
     }
 
     fn recompute_rung(&mut self) {
+        // `Escalated` is terminal: once we surface to the user, only an
+        // explicit reset() clears it. Do not let a healthy stretch silently
+        // un-escalate.
+        if self.rung == Rung::Escalated {
+            return;
+        }
         let count = self.stalls.len() as u32;
-        // Recompute from the raw count so a rung can only rise, never drop,
-        // mid-cycle (matches the monotonically-escalating model).
-        let next = if count >= self.cfg.fallback_threshold {
+        // RouteFallback is deliberately gated on a compaction having been
+        // attempted and acknowledged. A count alone reaching the fallback
+        // threshold is NOT enough to justify switching the user's model: we
+        // first compact (which mostly resolves long-context degradation) and
+        // only escalate past it if the window STILL has enough stalls.
+        let next = if count >= self.cfg.fallback_threshold && self.compact_recommended {
             Rung::RouteFallback
         } else if count >= self.cfg.compact_threshold {
             Rung::Compact
@@ -268,7 +266,10 @@ impl DegradationTracker {
         } else {
             Rung::Healthy
         };
-        self.rung = next.max(self.rung);
+        // Rederive from the live count so a genuinely clean stretch (e.g. after
+        // a successful compaction prunes the stall window) decays the rung back
+        // toward Healthy instead of pinning it at a previously-escalated level.
+        self.rung = next;
         if self.rung < Rung::Compact {
             self.compact_recommended = false;
         }
@@ -278,11 +279,10 @@ impl DegradationTracker {
     pub fn describe(&self) -> String {
         let stall_types = self.stalls.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>();
         format!(
-            "route={} rung={:?} stall_count={} system_stalls={} kinds=[{}]",
+            "route={} rung={:?} stall_count={} kinds=[{}]",
             self.route,
             self.rung,
             self.stalls.len(),
-            self.system_stalls.len(),
             stall_types.join(",")
         )
     }
@@ -294,22 +294,39 @@ impl Agent {
     ///
     /// Called at the turn-loop head (before the next provider request). Returns
     /// a user-visible message when we acted on a mitigation (e.g. triggered a
-    /// compaction); `None` when nothing needed doing.
+    /// compaction or a gated route fallback); `None` when nothing needed doing.
     ///
-    /// Currently handles the `Compact` rung: when the tracker reports a pending
-    /// compaction, request a manual compaction through the existing
-    /// `request_manual_compaction` mechanism, acknowledge it (one-shot), and
-    /// report success/failure via the returned message. Route-fallback
-    /// (`Rung::RouteFallback`) and the observability rungs land in later slices.
+    /// Rungs handled:
+    /// - `Compact` (pending): request a manual compaction through the existing
+    ///   `request_manual_compaction` mechanism and acknowledge it (one-shot).
+    /// - `RouteFallback`: switch to the configured fallback model when
+    ///   `degradation.route_fallback_enabled` is true and a `fallback_model` is
+    ///   set; otherwise `escalate()` (surface to the user) and report that
+    ///   auto-mitigation is exhausted.
     pub(crate) fn maybe_mitigate_degradation(&mut self) -> Option<String> {
         let rung = self.degradation.rung();
         match rung {
             Rung::Compact if self.degradation.compact_pending() => {
+                // If the provider cannot compact, this rung cannot help: promptly
+                // skip to the fallback/escalation decision rather than spinning
+                // on a compaction that will always fail.
+                if !self.provider.supports_compaction() {
+                    crate::logging::warn(&format!(
+                        "Model degradation: {} reached Compact rung but provider does not support compaction; escalating to route fallback",
+                        self.degradation.describe()
+                    ));
+                    self.degradation.promote_to_route_fallback();
+                    return self.maybe_fallback_route();
+                }
                 crate::logging::warn(&format!(
                     "Model degradation: {} reached Compact rung; triggering compaction",
                     self.degradation.describe()
                 ));
                 let (message, success) = self.request_manual_compaction();
+                // Mark compaction as attempted regardless of outcome: this is
+                // what un-gates the RouteFallback escalation, whose whole point
+                // is "compaction did not (or could not) restore progress". One
+                // attempt per escalation cycle so we do not re-fire every turn.
                 self.degradation.acknowledge_compact();
                 if success {
                     Some(format!(
@@ -317,20 +334,88 @@ impl Agent {
                         message.lines().last().unwrap_or("context compaction started")
                     ))
                 } else {
-                    // Compaction unavailable right now; log and carry on rather
-                    // than blocking the turn. The rung stays Compact so a later
-                    // checkpoint can retry once progress resumes.
+                    // Compaction could not run now (busy / nothing to compact).
+                    // We still recorded the attempt so the fallback rung can
+                    // escalate; log and carry on this turn.
                     crate::logging::warn(&format!(
                         "Deferred degradation compaction (unsupported or busy): {message}"
                     ));
                     None
                 }
             }
+            Rung::RouteFallback => self.maybe_fallback_route(),
             Rung::Compact
             | Rung::Watch
             | Rung::Healthy
-            | Rung::RouteFallback
             | Rung::Escalated => None,
+        }
+    }
+
+    /// Handle the `RouteFallback` rung: switch to the gated fallback model or,
+    /// when fallback is disabled/unconfigured, escalate to surface to the user.
+    fn maybe_fallback_route(&mut self) -> Option<String> {
+        let settings = crate::config::config().degradation.clone();
+        let current = self.provider_model();
+        if !settings.route_fallback_enabled {
+            crate::logging::warn(&format!(
+                "Model degradation: {} reached RouteFallback rung but route fallback is disabled; escalating",
+                self.degradation.describe()
+            ));
+            self.degradation.escalate();
+            return Some(format!(
+                "Model {} is degrading after compaction; route auto-fallback is disabled. Switch models manually to continue.",
+                current
+            ));
+        }
+        let Some(fallback) = settings.fallback_model.clone() else {
+            crate::logging::warn(
+                "Model degradation: route fallback enabled but no fallback_model set; escalating",
+            );
+            self.degradation.escalate();
+            return Some(format!(
+                "Model {} is degrading; route fallback enabled but no fallback_model configured.",
+                current
+            ));
+        };
+        if fallback.trim().is_empty() || fallback == current {
+            crate::logging::warn(
+                "Model degradation: fallback_model empty or equals the current model; escalating",
+            );
+            self.degradation.escalate();
+            return Some(format!(
+                "Model {} is degrading; configured fallback_model is invalid.",
+                current
+            ));
+        }
+        crate::logging::warn(&format!(
+            "Model degradation: {} reached RouteFallback; switching {} -> {}",
+            self.degradation.describe(),
+            current,
+            fallback
+        ));
+        // Use the auth (automatic) selection source, NOT the user source: this
+        // is an automated mitigation, not a deliberate user choice. Marking it
+        // User would bump selection_generation and make provider-control auth
+        // reconciliation treat the auto-switch as a sticky user preference.
+        match self.set_model_from_auth(&fallback) {
+            Ok(()) => {
+                // set_model_from_auth already resets the degradation cycle since
+                // the route changed to the fallback; nothing else to do here.
+                Some(format!(
+                    "Model degradation detected; switched route from {} to {}",
+                    current, fallback
+                ))
+            }
+            Err(e) => {
+                crate::logging::warn(&format!(
+                    "Model degradation: failed to switch to fallback model {fallback}: {e}; escalating"
+                ));
+                self.degradation.escalate();
+                Some(format!(
+                    "Model {} is degrading and the fallback switch to {} failed: {e}",
+                    current, fallback
+                ))
+            }
         }
     }
 
@@ -362,30 +447,50 @@ mod tests {
         t.record_stall(StallKind::StalledPromise);
         assert_eq!(t.rung(), Rung::Compact);
         assert!(t.compact_pending());
+        // RouteFallback is gated on a compaction having been attempted: a 3rd
+        // stall alone must not escalate to a model switch.
+        t.record_stall(StallKind::StalledPromise);
+        assert_eq!(
+            t.rung(),
+            Rung::Compact,
+            "fallback must not fire without an acknowledged compaction"
+        );
+        // After acknowledging the compaction, a persistent stall escalates.
+        t.acknowledge_compact();
         t.record_stall(StallKind::StalledPromise);
         assert_eq!(t.rung(), Rung::RouteFallback);
     }
 
     #[test]
-    fn rung_is_monotonic_until_reset() {
-        let mut t = DegradationTracker::with_config(
-            RouteKey("p/m".into()),
-            DegradationConfig {
-                window: Duration::from_secs(60),
-                watch_threshold: 2,
-                compact_threshold: 3,
-                fallback_threshold: 4,
-                system_stall_load_concern_threshold: 2,
-            },
-        );
-        for _ in 0..4 {
-            t.record_stall(StallKind::EmptyTurn);
-        }
-        assert_eq!(t.rung(), Rung::RouteFallback);
-        // Health events do not drop a reached rung.
+    fn rung_decays_after_a_clean_stretch_and_reset_clears() {
+        let cfg = DegradationConfig {
+            window: Duration::from_secs(60),
+            watch_threshold: 1,
+            compact_threshold: 2,
+            fallback_threshold: 3,
+        };
+        let mut t = DegradationTracker::with_config(RouteKey("p/m".into()), cfg);
+        // Escalate to Compact and acknowledge the compaction.
+        t.record_stall(StallKind::StalledPromise);
+        t.record_stall(StallKind::StalledPromise);
+        assert_eq!(t.rung(), Rung::Compact);
+        t.acknowledge_compact();
+        // A clean stretch after the stall window has expired (simulate pruning
+        // by clearing the records, which is what would follow a recovery) lets
+        // the rung decay back to Healthy instead of pinning at a stale level.
+        t.stalls.clear();
         t.record_healthy_turn();
-        assert_eq!(t.rung(), Rung::RouteFallback);
-        // Reset clears it.
+        assert_eq!(t.stalls.len(), 0);
+        assert_eq!(t.rung(), Rung::Healthy, "a clean stretch should decay the rung");
+        assert_eq!(t.stall_count(), 0);
+        // Escalated is terminal: only reset() clears it.
+        t.record_stall(StallKind::StalledPromise);
+        t.record_stall(StallKind::StalledPromise);
+        t.record_stall(StallKind::StalledPromise);
+        t.escalate();
+        assert_eq!(t.rung(), Rung::Escalated);
+        t.record_healthy_turn();
+        assert_eq!(t.rung(), Rung::Escalated, "Escalated is terminal");
         t.reset();
         assert_eq!(t.rung(), Rung::Healthy);
         assert_eq!(t.stall_count(), 0);
@@ -404,24 +509,6 @@ mod tests {
         // The pending flag is consumed once, even if healthy turns follow.
         t.record_healthy_turn();
         assert!(!t.compact_pending());
-    }
-
-    #[test]
-    fn system_stall_does_not_promote_route_rung() {
-        let cfg = DegradationConfig {
-            window: Duration::from_secs(60),
-            watch_threshold: 2,
-            compact_threshold: 3,
-            fallback_threshold: 4,
-            system_stall_load_concern_threshold: 2,
-        };
-        let mut t = DegradationTracker::with_config(RouteKey("p/m".into()), cfg);
-        t.record_system_stall();
-        t.record_system_stall();
-        assert_eq!(t.system_stall_count(), 2);
-        // Route rung stays Healthy: a watchdog stall is load, not degradation.
-        assert_eq!(t.rung(), Rung::Healthy);
-        assert!(!t.recommends_mitigation());
     }
 
     #[test]
