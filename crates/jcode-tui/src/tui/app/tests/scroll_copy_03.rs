@@ -1843,15 +1843,94 @@ fn command_palette_open_does_not_move_existing_rows() {
 
 /// The scroll fix hides the terminal cursor for the full-frame diff flush so the
 /// visible caret does not sweep across the re-emitted cells. This drives the real
-/// production path (`StatusSpinnerRenderer::draw_full_core`, the shared body the
-/// scroll-triggered SoftRepaint runs) against a crossterm backend that captures the
-/// raw escape stream, and asserts:
+/// production path (`StatusSpinnerRenderer::draw_full_core`, the shared body every
+/// scroll-triggered full frame runs) against a crossterm backend that captures the
+/// raw escape stream, and asserts for each invalidation mode:
 ///   - the repaint actually re-emits cells (`MoveTo`, `ESC[<row>;<col>H`);
 ///   - the cursor `Hide` (`ESC[?25l`) precedes the first `MoveTo`;
 ///   - the caret is shown again (`ESC[?25h`) with a set cursor position.
 #[test]
 fn scroll_repaint_hides_cursor_before_cell_moves_via_draw_core() {
     use regex::Regex;
+    // draw_full_core renders through the shared unscoped ui::draw, which mutates
+    // process-global render state (layout snapshots, mermaid, etc.). Serialize with
+    // the other scroll/repaint tests exactly as they do, so this test does not race
+    // a parallel sibling that holds the same state.
+    let _render_lock = scroll_render_test_lock();
+    let move_re = Regex::new(r"\x1b\[[0-9]+;[0-9]+H").expect("static move-regex");
+    let hide = "\u{1b}[?25l";
+    let show = "\u{1b}[?25h";
+
+    // Frame the same capture and ordering check for the two real full-frame
+    // invalidation branches. SoftRepaint is the scroll path (`scroll_up` /
+    // `scroll_down` set `force_full_repaint`); HardClear is the full redraw path
+    // (`force_full_redraw`, e.g. native terminal scroll or external commands),
+    // which clears then re-emits an even larger diff. Both must hide the caret
+    // before any `MoveTo`.
+    for arm in ["soft_repaint", "hard_clear"] {
+        let mut app = create_test_app();
+        match arm {
+            "soft_repaint" => app.force_full_repaint = true,
+            "hard_clear" => app.force_full_redraw = true,
+            _ => unreachable!(),
+        }
+
+        let stream = {
+            let mut output: Vec<u8> = Vec::new();
+            let mut renderer = crate::tui::app::run_shell::StatusSpinnerRenderer::default();
+            let backend = ratatui::backend::CrosstermBackend::new(&mut output);
+            let mut terminal = ratatui::Terminal::new(backend).expect("capture terminal");
+            renderer
+                .draw_full_core(&mut app, &mut terminal)
+                .expect("draw_full_core");
+            drop(terminal); // release the backend borrow on `output`
+            String::from_utf8_lossy(&output).into_owned()
+        };
+
+        // A cell `MoveTo` is `ESC[<row>;<col>H`. Match that exact pattern rather
+        // than the first bare `H` (which could also hit an unrelated CSI command),
+        // so the ordering assertion is precise: the cursor `Hide` must come before
+        // any move for this arm.
+        let first_moveto = move_re
+            .find(&stream)
+            .unwrap_or_else(|| panic!("{arm} must emit a cell MoveTo; got: {stream:?}"));
+        let hide_at = stream
+            .find(hide)
+            .unwrap_or_else(|| panic!("{arm} must hide the cursor; got: {stream:?}"));
+        // The re-show must come strictly after the hide, so the caret is frozen for
+        // the whole sweep interval (all MoveTo of the diff flush). A `?25h` emitted
+        // before the hide would mean the cursor was visible during part of the sweep.
+        let show_at = stream
+            .find(show)
+            .unwrap_or_else(|| panic!("composer frame must re-show the caret; got: {stream:?}"));
+        assert!(
+            hide_at <= first_moveto.start(),
+            "{arm}: Hide must precede the first MoveTo; hide@{hide_at} move@{}",
+            first_moveto.start()
+        );
+        assert!(
+            hide_at < show_at,
+            "{arm}: Hide must precede the re-show so the caret stays frozen through the diff; hide@{hide_at} show@{show_at}"
+        );
+    }
+}
+
+/// The production entry point to a full-frame repaint is [`StatusSpinnerRenderer::draw_full`],
+/// which delegates to the backend-generic [`StatusSpinnerRenderer::draw_full_with`] wrapper. That
+/// wrapper owns two things the `draw_full_core` body does not: the synchronized-update window
+/// (`ESC[?2026h` / `ESC[?2026l`) and the error-path cursor re-show. This test drives the exact
+/// wrapper against a captured `CrosstermBackend<Vec<u8>>` and asserts:
+///   - the sync window opens (`?2026h`) and closes (`?2026l`);
+///   - the cursor `Hide` (`?25l`) precedes the first cell `MoveTo` (the sweep guard);
+///   - the composer re-shows the caret (`?25h`) inside the frame.
+#[test]
+fn full_frame_wrapper_opens_and_closes_sync_window_around_cursor_hidden_draw() {
+    use regex::Regex;
+    // draw_full_with/ draw_full_core render through the shared unscoped ui::draw, which
+    // mutates process-global render state (layout snapshots, mermaid, etc.). Serialize
+    // with the sibling scroll/repaint tests exactly as they do.
+    let _render_lock = scroll_render_test_lock();
+
     let mut app = create_test_app();
     app.force_full_repaint = true; // the exact flag scroll_up/scroll_down set
 
@@ -1861,32 +1940,43 @@ fn scroll_repaint_hides_cursor_before_cell_moves_via_draw_core() {
         let backend = ratatui::backend::CrosstermBackend::new(&mut output);
         let mut terminal = ratatui::Terminal::new(backend).expect("capture terminal");
         renderer
-            .draw_full_core(&mut app, &mut terminal)
-            .expect("draw_full_core");
+            .draw_full_with(&mut app, &mut terminal)
+            .expect("draw_full_with");
         drop(terminal); // release the backend borrow on `output`
         String::from_utf8_lossy(&output).into_owned()
     };
 
-    // A cell `MoveTo` is `ESC[<row>;<col>H`. Match that exact pattern rather than
-    // the first bare `H` (which could also hit an unrelated CSI command), so the
-    // ordering assertion is precise: the cursor `Hide` must come before any move.
+    let begin_sync = "\u{1b}[?2026h";
+    let end_sync = "\u{1b}[?2026l";
     let hide = "\u{1b}[?25l";
+    let show = "\u{1b}[?25h";
     let move_re = Regex::new(r"\x1b\[[0-9]+;[0-9]+H").expect("static move-regex");
-    let first_moveto = move_re
-        .find(&stream)
-        .expect("SoftRepaint must emit a cell MoveTo");
+
+    let first_moveto = move_re.find(&stream).expect("full frame must emit a cell MoveTo");
+    let hide_at = stream
+        .find(hide)
+        .unwrap_or_else(|| panic!("full wrapper must hide the cursor; got: {stream:?}"));
+    let show_at = stream
+        .find(show)
+        .unwrap_or_else(|| panic!("composer frame must re-show the caret; got: {stream:?}"));
+    let begin_at = stream
+        .find(begin_sync)
+        .unwrap_or_else(|| panic!("wrapper must open the sync window; got: {stream:?}"));
+    let end_at = stream
+        .find(end_sync)
+        .unwrap_or_else(|| panic!("wrapper must close the sync window; got: {stream:?}"));
+
     assert!(
-        stream.contains(hide),
-        "scroll-triggered repaint must hide the cursor for the diff flush; got: {stream:?}"
+        begin_at < end_at,
+        "sync window must open before it closes; begin@{begin_at} end@{end_at}"
     );
-    let hide_at = stream.find(hide).expect("hide present");
+    assert!(
+        begin_at <= hide_at && end_at >= show_at,
+        "the whole hide/log/re-show must sit inside the sync window; begin@{begin_at} hide@{hide_at} show@{show_at} end@{end_at}"
+    );
     assert!(
         hide_at <= first_moveto.start(),
         "Hide must precede the first MoveTo; hide@{hide_at} move@{}",
         first_moveto.start()
-    );
-    assert!(
-        stream.contains("\u{1b}[?25h"),
-        "composer frame must re-show the caret; got: {stream:?}"
     );
 }

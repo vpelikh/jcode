@@ -19,7 +19,7 @@ fn report_reload_interaction_gap() {
     ));
 }
 use crate::tui::TuiState;
-use crossterm::cursor::{RestorePosition, SavePosition};
+use crossterm::cursor::{RestorePosition, SavePosition, Show};
 use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use ratatui::{buffer::Buffer, layout::Rect, style::Style};
 use std::io::Write;
@@ -460,28 +460,68 @@ impl StatusSpinnerRenderer {
         Ok(true)
     }
 
+    /// Render a full frame into the live terminal.
+    ///
+    /// This is the only production entry point into a full repaint. It dispatches to
+    /// the backend-generic [`Self::draw_full_with`], which owns the synchronized-
+    /// update window and the cursor error-recovery. Every call site routes through
+    /// here; [`Self::draw_full_core`] is the backend-generic body kept separate so
+    /// tests can drive the real production path against a captured backend.
     pub(super) fn draw_full(
         &mut self,
         app: &mut App,
         terminal: &mut DefaultTerminal,
     ) -> Result<()> {
+        self.draw_full_with(app, terminal)
+    }
+
+    /// The synchronized-update wrapper shared by every full-frame repaint.
+    ///
+    /// Splitting this out generically (rather than inlining it in
+    /// [`Self::draw_full`], which is pinned to `DefaultTerminal = CrosstermBackend<Stdout>`)
+    /// lets a test drive the exact wrapper — the `BeginSynchronizedUpdate` /
+    /// `EndSynchronizedUpdate` window and the error-path cursor re-show — against a
+    /// captured `CrosstermBackend<Vec<u8>>`, instead of leaving it untestable on
+    /// real stdout.
+    ///
+    /// On a failed draw `draw_full_core` has already hidden the cursor but the
+    /// composer never reached its re-show (the errored `terminal.draw` aborts before
+    /// `apply_buffer_with_cursor` restores the caret). Re-show it so a fatal frame
+    /// error cannot leave the terminal with the cursor hidden after teardown.
+    pub(super) fn draw_full_with<B>(
+        &mut self,
+        app: &mut App,
+        terminal: &mut ratatui::Terminal<B>,
+    ) -> Result<()>
+    where
+        B: ratatui::backend::Backend + Write,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
         // Wrap the whole frame in a synchronized update so the terminal applies
         // every cell change atomically. Without this, ratatui's crossterm backend
         // streams cells one-by-one and eagerly-repainting terminals (and slow/remote
         // or multiplexed sessions) show visible flicker. See issue #282.
         let sync = crossterm::execute!(terminal.backend_mut(), BeginSynchronizedUpdate).is_ok();
-        self.draw_full_core(app, terminal)?;
+        // Always close the sync window, even if the draw fails; otherwise the
+        // terminal is left in synchronized-update mode and later output glitches.
+        let result = self.draw_full_core(app, terminal);
         if sync {
             let _ = crossterm::execute!(terminal.backend_mut(), EndSynchronizedUpdate);
         }
-        Ok(())
+        // On a failed draw the cursor was hidden but the composer's re-show never ran
+        // (see the note above); re-show it so a fatal frame error cannot leave the
+        // terminal with the caret hidden after teardown.
+        if result.is_err() {
+            let _ = crossterm::execute!(terminal.backend_mut(), Show);
+        }
+        result
     }
 
     /// The backend-generic body of a full-frame repaint. Split out from
-    /// [`Self::draw_full`] so the actual production path (including the
-    /// cursor-hide for the diff flush) can be exercised directly against any
-    /// `ratatui::backend::Backend` in tests, instead of being approximated by a
-    /// stand-in harness.
+    /// [`Self::draw_full_with`] (which in turn is dispatched from [`Self::draw_full`])
+    /// so the actual production path (including the cursor-hide for the diff flush)
+    /// can be exercised directly against any `ratatui::backend::Backend` in tests,
+    /// instead of being approximated by a stand-in harness.
     ///
     /// This is the exact code path the scroll-triggered `SoftRepaint` runs
     /// (request_full_repaint → invalidate_previous_terminal_buffer → here), and the
@@ -499,6 +539,26 @@ impl StatusSpinnerRenderer {
     {
         // Painting a frame is progress, including during long streaming turns.
         crate::logging::watchdog::beat("tui.draw");
+
+        // A full frame (and any SoftRepaint the scroll path triggers) clears/invalidates and
+        // then writes the diff through the backend's `MoveTo(x, y)` for every changed cell.
+        // While the cursor is visible, eager terminals (especially ones without synchronized-
+        // update support) let the visible block cursor sweep across the re-emitted cells, which
+        // reads as "cursor jumps to random places" during scroll. Hide it for EVERY full frame,
+        // not only the sentinel-invalidated repaints: streaming and plain-keystroke frames also
+        // come through here with `FullFrameInvalidation::None` (turn.rs and the input loop don't
+        // set the repaint flags), yet still `MoveTo` the cells that shift as content grows —
+        // including the composer row the caret sits in — so gating the hide on
+        // `invalidation != None` would let the caret sweep on those paths again. `terminal.draw`
+        // then either restores the caret (the normal composer path, where `draw_input` sets a
+        // cursor position) or leaves it hidden (overlay branches such as the changelog/help/
+        // pickers, where ratatui also hides when no position is set), so the cursor ends exactly
+        // where it belongs in every case. The hide/show is atomic within the synchronized-update
+        // frame (or a sub-frame burst on non-sync terminals), so it is invisible in steady state.
+        // The hide is best-effort: skipping it must not abort the frame (the soft-repaint buffer
+        // invalidation has already happened), so the error is deliberately ignored.
+        let _ = terminal.backend_mut().hide_cursor();
+
         let invalidation = full_frame_invalidation(app.force_full_redraw, app.force_full_repaint);
         let force_full_redraw = invalidation != FullFrameInvalidation::None;
         match invalidation {
@@ -515,18 +575,6 @@ impl StatusSpinnerRenderer {
         app.force_full_redraw = false;
         app.force_full_repaint = false;
 
-        // A full frame (and any SoftRepaint the scroll path triggers) writes the diff
-        // through the backend's `MoveTo(x, y)` for every changed cell while the cursor
-        // is still visible. On terminals without synchronized-update support this makes
-        // the visible block cursor sweep across the whole screen ("cursor jumps to
-        // random places") during scroll. Hide it for the diff flush; `terminal.draw`
-        // then either restores the caret (the normal composer path, where `draw_input`
-        // sets a cursor position) or leaves the cursor hidden (overlay branches such as
-        // the changelog/help/pickers, where ratatui also hides when no position is set),
-        // so the cursor ends exactly where it belongs in every case. The hide is
-        // best-effort: skipping it must not abort the frame (the soft-repaint buffer
-        // invalidation has already happened), so the error is deliberately ignored.
-        let _ = terminal.backend_mut().hide_cursor();
         let previous_frame = self.last_frame.as_ref();
         let draw_start = Instant::now();
         let mut render_elapsed = Duration::ZERO;
