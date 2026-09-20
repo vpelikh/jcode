@@ -22,6 +22,11 @@ async fn await_members_any_mode_returns_after_first_match() {
         ]),
     )])));
     let (swarm_event_tx, _swarm_event_rx) = broadcast::channel(32);
+    let swarm = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .swarms_by_id(Arc::clone(&swarms_by_id))
+        .swarm_event_tx(swarm_event_tx.clone())
+        .build();
 
     handle_comm_await_members(
         1,
@@ -35,9 +40,7 @@ async fn await_members_any_mode_returns_after_first_match() {
         false,
         CommAwaitMembersContext {
             client_event_tx: &client_tx,
-            swarm_members: &swarm_members,
-            swarms_by_id: &swarms_by_id,
-            swarm_event_tx: &swarm_event_tx,
+            swarm: &swarm,
             await_members_runtime: &await_runtime,
         },
     )

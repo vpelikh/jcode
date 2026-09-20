@@ -43,16 +43,15 @@ async fn resume_background_awaits_finalizes_states_expired_while_down() {
         HashSet::from([requester.to_string(), peer.to_string()]),
     )])));
     let (swarm_event_tx, _swarm_event_rx) = broadcast::channel(32);
+    let swarm = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .swarms_by_id(Arc::clone(&swarms_by_id))
+        .swarm_event_tx(swarm_event_tx.clone())
+        .build();
 
     let mut bus_rx = crate::bus::Bus::global().subscribe();
 
-    crate::server::comm_await::resume_background_awaits(
-        &swarm_members,
-        &swarms_by_id,
-        &swarm_event_tx,
-        &await_runtime,
-    )
-    .await;
+    crate::server::comm_await::resume_background_awaits(&swarm, &await_runtime).await;
 
     // The expired state must be finalized as a timeout so the promised
     // notify/wake fires.

@@ -927,3 +927,95 @@ handlers still reach into `swarm.swarm_state.plans` directly. Deferred follow-up
    their own service handle, so we do not bake methods onto a handle that gets
    reshuffled. This is a behavior/API-boundary change and should land as its own
    reviewed slice, not mixed into mechanical convergence.
+
+### comm_plan convergence slice landed (2026-09)
+
+The three plan-decision handlers collapsed their flat swarm bag onto
+`&SwarmServiceHandle`. `handle_comm_propose_plan` (9 flat fields),
+`handle_comm_approve_plan` (9), and `handle_comm_reject_plan` (7) each bind
+their maps/event history/runtimes as body locals from the handle (design
+decision A); the non-swarm params (`client_event_tx`, `session`) stay. Both
+routers (`client_lifecycle.rs`, `client_lightweight_control.rs`) drop the
+extra arguments and pass `&swarm_service_handle`/`swarm`; the now-unused
+flat locals (`shared_context`, `swarm_plans`, `swarm_coordinators`,
+`event_history`, `event_counter`, `swarm_mutation_runtime`) were trimmed
+from both routers. `TestSwarmBuilder` gained a `shared_context` seeder so
+the `comm_plan_tests::PlanFixture` shares its context map with the handle
+(the propose path writes proposals into `swarm.shared_context`, which the
+tests read through `fx.shared_context`); the fixture drops six now-dead
+flat fields (`swarms_by_id`, `swarm_coordinators`, `event_history`,
+`event_counter`, `swarm_event_tx`, `mutation_runtime`) and feeds its maps to
+the shared builder. The three now-satisfied `too_many_arguments` expects
+were removed; unused imports (`SwarmEvent`, `SwarmMutationRuntime`,
+`HashSet`, `broadcast`) trimmed. Zero behavior change; `comm_plan` (9) and
+`server::` (466) stay green and clippy introduces no new warnings.
+
+### comm_await handlers route through the swarm handle (landed 2026-09)
+
+The `await_members` handlers were the final `comm_await` call sites still
+carrying a flat swarm bag.
+
+- **`CommAwaitMembersContext` slimmed.** The context previously held the flat
+  `swarm_members` / `swarms_by_id` / `swarm_event_tx` triple; it now holds
+  `&SwarmServiceHandle` (plus `client_event_tx` and `await_members_runtime`).
+  `handle_comm_await_members` binds the three maps as body locals from
+  `ctx.swarm` and keeps every in-body reference, byte-identical behavior.
+- **`resume_background_awaits` takes `&SwarmServiceHandle`** (plus
+  `&AwaitMembersRuntime`), binding the maps as body locals.
+- **Callers migrated.** Both production routers pass a swarm handle:
+  `client_lifecycle.rs::handle_client` (`&swarm_service_handle`, dropping the
+  now-unused `swarms_by_id` / `swarm_event_tx` flat locals) and
+  `client_lightweight_control.rs::handle_lightweight_control_request`
+  (`swarm`). The startup recovery path in `server.rs` builds
+  `SwarmServiceHandle::from_server(self)` once for the resume `tokio::spawn`
+  instead of three field clones. All await test fixtures now build a
+  `SwarmServiceHandle` via `TestSwarmBuilder` with `.members` /
+  `.swarms_by_id` / `.swarm_event_tx` instead of the flat context fields.
+- `spawn_or_resume_await_members` intentionally keeps flat owned args: it
+  spawns into a task that needs owned `Arc`/`Sender` clones, and the plan's
+  design-decision A keeps such task-spawn internals unchanged.
+
+Zero behavior change; the full `jcode-app-core` lib suite stays green
+(1480 passing) and clippy introduces no new warnings.
+
+### client-request router handlers route through the swarm handle (landed 2026-09)
+
+Three client-request router handlers still carried a flat `swarm_members`
+`pub(super)` param; they now take `&SwarmServiceHandle` (Seam B narrowing).
+
+- **`handle_rename_session` / `handle_set_working_dir`** (`client_actions.rs`)
+  and **`handle_reload`** (`client_session.rs`) swap the flat
+  `&Arc<RwLock<HashMap<String, SwarmMember>>>` for `&SwarmServiceHandle`,
+  binding `let swarm_members = &swarm.swarm_state.members;` as a body local so
+  every in-body reference (fanout / live-client fanout / member read) is
+  byte-identical.
+- **Routers** in `client_lifecycle.rs::handle_client` pass the existing
+  `&swarm_service_handle`.
+- **Test fixtures** (`client_actions_tests.rs` rename + 7 set_working_dir call
+  sites, `client_session_tests/reload.rs` both reload call sites) build a
+  `SwarmServiceHandle` inline via `TestSwarmBuilder::default().members(...)`.
+- Drops the now-unused `SwarmMember` imports in `client_actions.rs` and
+  `client_session.rs`.
+
+Zero behavior change; the full `jcode-app-core` lib suite stays green
+(1480 passing) and clippy introduces no new warnings.
+
+### live_turn and debug_events handlers route through the swarm handle (landed 2026-09)
+
+Two more `pub(super)` handlers dropped flat swarm-map params for
+`&SwarmServiceHandle` (Seam B / Seam E progress).
+
+- **`live_turn.rs::idle_live_agent`** swaps the flat
+  `&Arc<RwLock<HashMap<String, SwarmMember>>>` for `&SwarmServiceHandle`,
+  reading `swarm.swarm_state.members`. Its two internal callers
+  (`run_live_turn_if_idle` / `run_live_system_turn_if_idle`) pass `swarm`
+  directly instead of `&swarm.swarm_state.members`, and the reservation tests
+  in `tests.rs` build the handle via `TestSwarmBuilder`.
+- **`debug_events.rs::maybe_handle_event_query_command`** swaps the flat
+  `event_history` `Arc` for `&SwarmServiceHandle`, binding
+  `let event_history = &swarm.event_history;`. The debug router passes
+  `&swarm_service_handle`; the now-unused `event_history` local in `debug.rs`
+  and the unused `Arc`/`RwLock` imports in `debug_events.rs` were dropped.
+
+Zero behavior change; the full `jcode-app-core` lib suite stays green
+(1480 passing) and clippy introduces no new warnings.

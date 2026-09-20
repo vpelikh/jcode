@@ -85,14 +85,10 @@ pub(super) async fn handle_lightweight_control_request(
     // split, Slice 3).
     let swarm_members = &swarm.swarm_state.members;
     let swarms_by_id = &swarm.swarm_state.swarms_by_id;
-    let shared_context = &swarm.shared_context;
-    let swarm_plans = &swarm.swarm_state.plans;
-    let swarm_coordinators = &swarm.swarm_state.coordinators;
     let event_history = &swarm.event_history;
     let event_counter = &swarm.event_counter;
     let swarm_event_tx = &swarm.swarm_event_tx;
     let await_members_runtime = &swarm.await_members_runtime;
-    let swarm_mutation_runtime = &swarm.swarm_mutation_runtime;
     if let Request::Ping { id } = request {
         write_direct_event(
             &writer,
@@ -258,16 +254,8 @@ pub(super) async fn handle_lightweight_control_request(
                 req_session_id,
                 items,
                 &client_event_tx,
-                swarm_members,
-                swarms_by_id,
-                shared_context,
-                swarm_plans,
-                swarm_coordinators,
                 session,
-                event_history,
-                event_counter,
-                swarm_event_tx,
-                swarm_mutation_runtime,
+                swarm,
             )
             .await;
         }
@@ -281,16 +269,8 @@ pub(super) async fn handle_lightweight_control_request(
                 req_session_id,
                 proposer_session,
                 &client_event_tx,
-                swarm_members,
-                swarms_by_id,
-                shared_context,
-                swarm_plans,
-                swarm_coordinators,
                 session,
-                event_history,
-                event_counter,
-                swarm_event_tx,
-                swarm_mutation_runtime,
+                swarm,
             )
             .await;
         }
@@ -306,14 +286,8 @@ pub(super) async fn handle_lightweight_control_request(
                 proposer_session,
                 reason,
                 &client_event_tx,
-                swarm_members,
-                shared_context,
-                swarm_coordinators,
                 session,
-                event_history,
-                event_counter,
-                swarm_event_tx,
-                swarm_mutation_runtime,
+                swarm,
             )
             .await;
         }
@@ -695,9 +669,7 @@ pub(super) async fn handle_lightweight_control_request(
                 wake,
                 CommAwaitMembersContext {
                     client_event_tx: &client_event_tx,
-                    swarm_members,
-                    swarms_by_id,
-                    swarm_event_tx,
+                    swarm,
                     await_members_runtime,
                 },
             )

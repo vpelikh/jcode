@@ -1,14 +1,15 @@
+use super::services::SwarmServiceHandle;
 use super::state::MAX_EVENT_HISTORY;
 use super::{SwarmEvent, SwarmEventType};
 use anyhow::Result;
-use std::sync::Arc;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::broadcast;
 
 pub(super) async fn maybe_handle_event_query_command(
     cmd: &str,
-    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
+    swarm: &SwarmServiceHandle,
 ) -> Option<String> {
+    let event_history = &swarm.event_history;
     if cmd == "events:recent" || cmd.starts_with("events:recent:") {
         let count: usize = cmd
             .strip_prefix("events:recent:")

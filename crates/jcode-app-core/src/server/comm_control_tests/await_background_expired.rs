@@ -46,6 +46,11 @@ async fn await_members_background_already_expired_answers_tool_call() {
         HashSet::from([requester.to_string(), peer.to_string()]),
     )])));
     let (swarm_event_tx, _swarm_event_rx) = broadcast::channel(32);
+    let swarm = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .swarms_by_id(Arc::clone(&swarms_by_id))
+        .swarm_event_tx(swarm_event_tx.clone())
+        .build();
 
     handle_comm_await_members(
         7,
@@ -59,9 +64,7 @@ async fn await_members_background_already_expired_answers_tool_call() {
         false,
         CommAwaitMembersContext {
             client_event_tx: &client_tx,
-            swarm_members: &swarm_members,
-            swarms_by_id: &swarms_by_id,
-            swarm_event_tx: &swarm_event_tx,
+            swarm: &swarm,
             await_members_runtime: &await_runtime,
         },
     )

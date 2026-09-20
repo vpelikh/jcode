@@ -270,7 +270,6 @@ pub(super) async fn handle_debug_client(
     let client_debug_state = debug_service.client_debug_state;
     let client_debug_response_tx = debug_service.client_debug_response_tx;
     let debug_jobs = debug_service.debug_jobs;
-    let event_history = swarm_service.event_history;
     let swarm_event_tx = swarm_service.swarm_event_tx;
     let shutdown_signals = session_service.shutdown_signals;
     let soft_interrupt_queues = session_service.soft_interrupt_queues;
@@ -491,7 +490,7 @@ pub(super) async fn handle_debug_client(
                         {
                             return Ok(());
                         } else if let Some(output) =
-                            maybe_handle_event_query_command(cmd, &event_history).await
+                            maybe_handle_event_query_command(cmd, &swarm_service_handle).await
                         {
                             Ok(output)
                         } else if cmd == "swarm:help" {

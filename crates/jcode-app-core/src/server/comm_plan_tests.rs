@@ -10,7 +10,7 @@ use crate::server::services::SessionServiceHandle;
 use super::{handle_comm_approve_plan, handle_comm_propose_plan, plan_cycle_error};
 use crate::plan::PlanItem;
 use crate::protocol::ServerEvent;
-use crate::server::{SharedContext, SwarmEvent, SwarmMember, SwarmMutationRuntime, VersionedPlan};
+use crate::server::{SharedContext, SwarmMember, SwarmMutationRuntime, VersionedPlan};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -98,14 +98,9 @@ struct PlanFixture {
     soft_interrupt_queues: crate::server::SessionInterruptQueues,
     session_handle: SessionServiceHandle,
     swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: Arc<RwLock<HashMap<String, HashSet<String>>>>,
     shared_context: Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
     swarm_plans: Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    swarm_coordinators: Arc<RwLock<HashMap<String, String>>>,
-    event_history: Arc<RwLock<VecDeque<SwarmEvent>>>,
-    event_counter: Arc<AtomicU64>,
-    swarm_event_tx: broadcast::Sender<SwarmEvent>,
-    mutation_runtime: SwarmMutationRuntime,
+    swarm: crate::server::services::SwarmServiceHandle,
 }
 
 fn plan_fixture(swarm_id: &str, coord: &str, worker: &str) -> PlanFixture {
@@ -139,6 +134,22 @@ fn plan_fixture(swarm_id: &str, coord: &str, worker: &str) -> PlanFixture {
         shutdown_signals: Arc::new(RwLock::new(HashMap::new())),
         soft_interrupt_queues: Arc::clone(&soft_interrupt_queues),
     };
+    let shared_context = Arc::new(RwLock::new(HashMap::new()));
+    let event_history = Arc::new(RwLock::new(VecDeque::new()));
+    let event_counter = Arc::new(AtomicU64::new(1));
+    let swarm_event_tx = broadcast::channel(64).0;
+    let mutation_runtime = SwarmMutationRuntime::default();
+    let swarm = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .swarms_by_id(Arc::clone(&swarms_by_id))
+        .plans(Arc::clone(&swarm_plans))
+        .coordinators(Arc::clone(&swarm_coordinators))
+        .shared_context(Arc::clone(&shared_context))
+        .swarm_event_tx(swarm_event_tx.clone())
+        .event_history(Arc::clone(&event_history))
+        .event_counter(Arc::clone(&event_counter))
+        .swarm_mutation_runtime(mutation_runtime.clone())
+        .build();
     PlanFixture {
         swarm_id,
         coord,
@@ -148,14 +159,9 @@ fn plan_fixture(swarm_id: &str, coord: &str, worker: &str) -> PlanFixture {
         soft_interrupt_queues,
         session_handle,
         swarm_members,
-        swarms_by_id,
-        shared_context: Arc::new(RwLock::new(HashMap::new())),
+        shared_context: Arc::clone(&shared_context),
         swarm_plans,
-        swarm_coordinators,
-        event_history: Arc::new(RwLock::new(VecDeque::new())),
-        event_counter: Arc::new(AtomicU64::new(1)),
-        swarm_event_tx: broadcast::channel(64).0,
-        mutation_runtime: SwarmMutationRuntime::default(),
+        swarm,
     }
 }
 
@@ -166,16 +172,8 @@ impl PlanFixture {
             from.to_string(),
             items,
             &self.client_tx,
-            &self.swarm_members,
-            &self.swarms_by_id,
-            &self.shared_context,
-            &self.swarm_plans,
-            &self.swarm_coordinators,
             &self.session_handle,
-            &self.event_history,
-            &self.event_counter,
-            &self.swarm_event_tx,
-            &self.mutation_runtime,
+            &self.swarm,
         )
         .await;
     }
@@ -186,16 +184,8 @@ impl PlanFixture {
             self.coord.clone(),
             proposer.to_string(),
             &self.client_tx,
-            &self.swarm_members,
-            &self.swarms_by_id,
-            &self.shared_context,
-            &self.swarm_plans,
-            &self.swarm_coordinators,
             &self.session_handle,
-            &self.event_history,
-            &self.event_counter,
-            &self.swarm_event_tx,
-            &self.mutation_runtime,
+            &self.swarm,
         )
         .await;
     }

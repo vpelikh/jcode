@@ -8,8 +8,8 @@
 use crate::plan::VersionedPlan;
 use crate::server::services::SwarmServiceHandle;
 use crate::server::{
-    AwaitMembersRuntime, FileTouchService, SwarmEvent, SwarmMember, SwarmMutationRuntime,
-    SwarmState,
+    AwaitMembersRuntime, FileTouchService, SharedContext, SwarmEvent, SwarmMember,
+    SwarmMutationRuntime, SwarmState,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -40,6 +40,7 @@ pub(crate) struct TestSwarmBuilder {
     event_counter: Option<Arc<AtomicU64>>,
     swarm_event_tx: Option<broadcast::Sender<SwarmEvent>>,
     swarm_mutation_runtime: Option<SwarmMutationRuntime>,
+    shared_context: Option<Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>>,
 }
 
 #[allow(clippy::type_complexity)]
@@ -94,6 +95,14 @@ impl TestSwarmBuilder {
         self
     }
 
+    pub(crate) fn shared_context(
+        mut self,
+        v: Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
+    ) -> Self {
+        self.shared_context = Some(v);
+        self
+    }
+
     pub(crate) fn build(self) -> SwarmServiceHandle {
         SwarmServiceHandle {
             swarm_state: SwarmState {
@@ -110,7 +119,9 @@ impl TestSwarmBuilder {
                     .coordinators
                     .unwrap_or_else(|| Arc::new(RwLock::new(HashMap::new()))),
             },
-            shared_context: Arc::new(RwLock::new(HashMap::new())),
+            shared_context: self
+                .shared_context
+                .unwrap_or_else(|| Arc::new(RwLock::new(HashMap::new()))),
             file_touch: FileTouchService::new(),
             channel_subscriptions: self
                 .channel_subscriptions

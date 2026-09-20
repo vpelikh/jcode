@@ -2,6 +2,7 @@ use super::await_members_state::{
     PersistedAwaitMembersState, all_pending_await_members_including_expired, ensure_pending_state,
     load_state, persist_final_response, request_key, save_state,
 };
+use super::services::SwarmServiceHandle;
 use super::{AwaitMembersRuntime, SwarmEvent, SwarmMember};
 use crate::bus::{Bus, BusEvent, SwarmAwaitCompleted, UiActivity};
 use crate::protocol::{AwaitedMemberStatus, ServerEvent, format_comm_awaited_members_with_reports};
@@ -304,9 +305,7 @@ pub(super) async fn spawn_or_resume_await_members(
 
 pub(super) struct CommAwaitMembersContext<'a> {
     pub client_event_tx: &'a mpsc::UnboundedSender<ServerEvent>,
-    pub swarm_members: &'a Arc<RwLock<HashMap<String, SwarmMember>>>,
-    pub swarms_by_id: &'a Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    pub swarm_event_tx: &'a broadcast::Sender<SwarmEvent>,
+    pub swarm: &'a SwarmServiceHandle,
     pub await_members_runtime: &'a AwaitMembersRuntime,
 }
 
@@ -326,8 +325,11 @@ pub(super) async fn handle_comm_await_members(
     wake: bool,
     ctx: CommAwaitMembersContext<'_>,
 ) {
+    let swarm_members = &ctx.swarm.swarm_state.members;
+    let swarms_by_id = &ctx.swarm.swarm_state.swarms_by_id;
+    let swarm_event_tx = &ctx.swarm.swarm_event_tx;
     let swarm_id = {
-        let members = ctx.swarm_members.read().await;
+        let members = swarm_members.read().await;
         members
             .get(&req_session_id)
             .and_then(|member| member.swarm_id.clone())
@@ -348,8 +350,8 @@ pub(super) async fn handle_comm_await_members(
             &swarm_id,
             &requested_ids,
             &target_status,
-            ctx.swarm_members,
-            ctx.swarms_by_id,
+            swarm_members,
+            swarms_by_id,
         )
         .await;
 
@@ -477,9 +479,9 @@ pub(super) async fn handle_comm_await_members(
                 spawn_or_resume_await_members(
                     state,
                     req_session_id,
-                    ctx.swarm_members.clone(),
-                    ctx.swarms_by_id.clone(),
-                    ctx.swarm_event_tx.clone(),
+                    swarm_members.clone(),
+                    swarms_by_id.clone(),
+                    swarm_event_tx.clone(),
                     ctx.await_members_runtime.clone(),
                 )
                 .await;
@@ -522,9 +524,9 @@ pub(super) async fn handle_comm_await_members(
             spawn_or_resume_await_members(
                 state,
                 req_session_id,
-                ctx.swarm_members.clone(),
-                ctx.swarms_by_id.clone(),
-                ctx.swarm_event_tx.clone(),
+                swarm_members.clone(),
+                swarms_by_id.clone(),
+                swarm_event_tx.clone(),
                 ctx.await_members_runtime.clone(),
             )
             .await;
@@ -606,11 +608,12 @@ fn publish_await_started_card(
 /// the agent is told to rerun the wait after reload. Background waits, by
 /// contrast, deliver via notify/wake, so they can resume transparently.
 pub(super) async fn resume_background_awaits(
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
+    swarm: &SwarmServiceHandle,
     await_members_runtime: &AwaitMembersRuntime,
 ) {
+    let swarm_members = &swarm.swarm_state.members;
+    let swarms_by_id = &swarm.swarm_state.swarms_by_id;
+    let swarm_event_tx = &swarm.swarm_event_tx;
     let pending: Vec<PersistedAwaitMembersState> = all_pending_await_members_including_expired()
         .into_iter()
         .filter(|state| state.background)

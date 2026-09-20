@@ -15,6 +15,11 @@ async fn await_members_blocking_to_background_upgrade_survives_waiter_disconnect
         HashSet::from([requester.to_string(), peer.to_string()]),
     )])));
     let (swarm_event_tx, _swarm_event_rx) = broadcast::channel(32);
+    let swarm = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .swarms_by_id(Arc::clone(&swarms_by_id))
+        .swarm_event_tx(swarm_event_tx.clone())
+        .build();
 
     let mut bus_rx = crate::bus::Bus::global().subscribe();
 
@@ -32,9 +37,7 @@ async fn await_members_blocking_to_background_upgrade_survives_waiter_disconnect
         false,
         CommAwaitMembersContext {
             client_event_tx: &blocking_tx,
-            swarm_members: &swarm_members,
-            swarms_by_id: &swarms_by_id,
-            swarm_event_tx: &swarm_event_tx,
+            swarm: &swarm,
             await_members_runtime: &await_runtime,
         },
     )
@@ -56,9 +59,7 @@ async fn await_members_blocking_to_background_upgrade_survives_waiter_disconnect
         true,
         CommAwaitMembersContext {
             client_event_tx: &bg_tx,
-            swarm_members: &swarm_members,
-            swarms_by_id: &swarms_by_id,
-            swarm_event_tx: &swarm_event_tx,
+            swarm: &swarm,
             await_members_runtime: &await_runtime,
         },
     )
