@@ -2242,6 +2242,58 @@ async fn stalled_promise_turn_gets_bounded_continuation() {
     );
 }
 
+#[tokio::test]
+async fn compact_unfulfilled_tool_request_triggers_recovery() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // The exact compact degradation reported on a real long-context session: a
+    // single explicit "I'll invoke bash now" with no tool call. Unlike the
+    // dense-rambling filler, this has only one or two promise phrases, so it
+    // relies on the compact unfulfilled-tool-request detector.
+    let compact = "Let me invoke the bash tool to grep and view rename_session_title.\n\n\
+                   <system-warning>Grep and view rename_session_title.</system-warning>\n\n\
+                   I'll invoke bash now.";
+    let mut attempts = 0u32;
+    let retried = agent
+        .maybe_continue_stalled_promise(Some("stop"), compact, &mut attempts)
+        .expect("helper must not error");
+    assert!(retried, "compact unfulfilled tool-request must trigger recovery");
+    assert_eq!(attempts, 1);
+    let recovery = agent
+        .session
+        .messages
+        .last()
+        .expect("recovery instruction must be persisted");
+    assert_eq!(recovery.role, Role::User);
+    assert!(
+        recovery
+            .content
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .is_some_and(|text| text.starts_with("<system-reminder>")),
+        "compact recovery instruction must be hidden from the transcript"
+    );
+
+    // A short but genuine final answer that invokes an abstract concept (not a
+    // tool/command target) must not trigger recovery.
+    assert!(
+        !agent
+            .maybe_continue_stalled_promise(
+                Some("stop"),
+                "I'll invoke the review and report back when it's ready.",
+                &mut attempts,
+            )
+            .unwrap(),
+        "a short abstract 'invoke' must not be treated as a stalled tool request"
+    );
+}
+
 include!("agent_tests/retention_readiness.rs");
 
 /// Provider that reproduces the DeepSWE Opus 5 incident: the first response
@@ -2957,4 +3009,343 @@ async fn stalled_promise_skips_turns_that_emit_a_tool_call() {
         reminders, 0,
         "no stalled-promise reminder may be injected for a tool_use turn"
     );
+}
+
+/// A provider reproducing the compact degradation: the first response is a
+/// SHORT turn that explicitly says it will invoke a tool ("I'll invoke bash
+/// now.") but contains no tool call. The second response is a real completion.
+#[derive(Clone, Default)]
+struct CompactStallProvider {
+    calls: Arc<std::sync::Mutex<usize>>,
+}
+
+#[async_trait]
+impl Provider for CompactStallProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        let call = {
+            let mut guard = self.calls.lock().unwrap();
+            *guard += 1;
+            *guard
+        };
+        let (tx, rx) = tokio_mpsc::channel::<Result<StreamEvent>>(8);
+        tokio::spawn(async move {
+            if call == 1 {
+                // The exact compact stall from the giraffe session.
+                let _ = tx
+                    .send(Ok(StreamEvent::TextDelta(
+                        "Let me invoke the bash tool to grep and view rename_session_title. \
+                         I'll invoke bash now."
+                            .to_string(),
+                    )))
+                    .await;
+                let _ = tx
+                    .send(Ok(StreamEvent::MessageEnd {
+                        stop_reason: Some("stop".to_string()),
+                    }))
+                    .await;
+            } else {
+                // A real, concise completion that must be surfaced.
+                let _ = tx
+                    .send(Ok(StreamEvent::TextDelta(
+                        "The resolved path is returned by rename_session_title.".to_string(),
+                    )))
+                    .await;
+                let _ = tx
+                    .send(Ok(StreamEvent::MessageEnd {
+                        stop_reason: Some("end_turn".to_string()),
+                    }))
+                    .await;
+            }
+        });
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    fn name(&self) -> &str {
+        "compact-stall"
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+}
+
+/// End-to-end through the streaming turn loop: a compact unfulfilled
+/// tool-request ("I'll invoke bash now." with no tool call) must trigger one
+/// continuation and surface the real completion, exactly like the dense-filler
+/// case. This proves the new compact detector drives recovery through the
+/// actual public turn loop, not just the isolated text classifier.
+#[tokio::test]
+async fn compact_stall_recovered_via_streaming_loop() {
+    let _guard = crate::storage::lock_test_env();
+    let compact = CompactStallProvider::default();
+    let calls = compact.calls.clone();
+    let provider: Arc<dyn Provider> = Arc::new(compact);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent
+        .run_once_streaming_mpsc("investigate", Vec::new(), None, tx)
+        .await
+        .expect("turn should complete");
+
+    let mut text = String::new();
+    while let Ok(event) = rx.try_recv() {
+        if let ServerEvent::TextDelta { text: delta } = event {
+            text.push_str(&delta);
+        }
+    }
+
+    assert_eq!(
+        *calls.lock().unwrap(),
+        2,
+        "compact unfulfilled tool-request must trigger exactly one continuation request"
+    );
+    assert!(
+        text.contains("resolved path is returned by rename_session_title"),
+        "the recovered turn must deliver the real completion, got {text:?}"
+    );
+    // The recovery <system-reminder> is a user-role internal message, so it can
+    // never appear in the assistant delta stream a client sees. (The stalled
+    // first-turn text itself IS streamed as normal live output, exactly as the
+    // dense-filler path does; the correct contract is that the real completion
+    // is surfaced after it, which is asserted above.)
+    assert!(
+        !text.contains("repeatedly said you would perform an action"),
+        "client stream must not leak the recovery reminder, got {text:?}"
+    );
+
+    // The injected reminder must be hidden behind a <system-reminder> marker.
+    let injected = agent
+        .session
+        .messages
+        .iter()
+        .filter(|m| {
+            m.role == Role::User
+                && m.content.iter().any(|block| match block {
+                    ContentBlock::Text { text, .. } => {
+                        text.starts_with("<system-reminder>")
+                            && text.contains("repeatedly said you would perform an action")
+                    }
+                    _ => false,
+                })
+        })
+        .count();
+    assert_eq!(injected, 1, "exactly one compact-stall reminder must be injected");
+}
+
+/// A provider that always returns the compact stall (single "I'll invoke
+/// bash" no-tool turn) so the bounded-recovery path is exercised end-to-end.
+#[derive(Clone, Default)]
+struct AlwaysCompactStallProvider {
+    calls: Arc<std::sync::Mutex<usize>>,
+}
+
+#[async_trait]
+impl Provider for AlwaysCompactStallProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        let _ = {
+            let mut guard = self.calls.lock().unwrap();
+            *guard += 1;
+            *guard
+        };
+        let (tx, rx) = tokio_mpsc::channel::<Result<StreamEvent>>(8);
+        tokio::spawn(async move {
+            let _ = tx
+                .send(Ok(StreamEvent::TextDelta(
+                    "Let me invoke bash now.".to_string(),
+                )))
+                .await;
+            let _ = tx
+                .send(Ok(StreamEvent::MessageEnd {
+                    stop_reason: Some("stop".to_string()),
+                }))
+                .await;
+        });
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    fn name(&self) -> &str {
+        "always-compact-stall"
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+}
+
+/// The non-streaming loop must bound the compact stall identically: one
+/// original call plus exactly MAX_STALLED_PROMISE_CONTINUATION_ATTEMPTS
+/// retries, each persisting one hidden reminder. This closes parity for the
+/// compact detector through the sync path.
+#[tokio::test]
+async fn compact_stall_bounded_in_non_streaming_loop() {
+    let _guard = crate::storage::lock_test_env();
+    let stuck = AlwaysCompactStallProvider::default();
+    let calls = stuck.calls.clone();
+    let provider: Arc<dyn Provider> = Arc::new(stuck);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    agent
+        .run_once("do the task")
+        .await
+        .expect("non-streaming turn should complete");
+
+    assert_eq!(
+        *calls.lock().unwrap(),
+        1 + Agent::MAX_STALLED_PROMISE_CONTINUATION_ATTEMPTS as usize,
+        "non-streaming loop must bound compact-stall retries identically (made {} calls)",
+        *calls.lock().unwrap()
+    );
+    let injected = agent
+        .session
+        .messages
+        .iter()
+        .filter(|m| {
+            m.role == Role::User
+                && m.content.iter().any(|block| match block {
+                    ContentBlock::Text { text, .. } => {
+                        text.starts_with("<system-reminder>")
+                            && text.contains("repeatedly said you would perform an action")
+                    }
+                    _ => false,
+                })
+        })
+        .count();
+    assert_eq!(
+        injected,
+        Agent::MAX_STALLED_PROMISE_CONTINUATION_ATTEMPTS as usize,
+        "non-streaming loop must inject one compact-stall reminder per retry"
+    );
+}
+
+/// A provider that emits the compact "I'll invoke bash now" text but ALSO a
+/// real tool_use. The guard must not fire: a turn that actually calls a tool is
+/// not stalled even though it contains the compact frame.
+#[derive(Clone, Default)]
+struct CompactWithToolProvider {
+    calls: Arc<std::sync::Mutex<usize>>,
+}
+
+#[async_trait]
+impl Provider for CompactWithToolProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        let call = {
+            let mut guard = self.calls.lock().unwrap();
+            *guard += 1;
+            *guard
+        };
+        let (tx, rx) = tokio_mpsc::channel::<Result<StreamEvent>>(8);
+        tokio::spawn(async move {
+            if call == 1 {
+                let _ = tx
+                    .send(Ok(StreamEvent::TextDelta(
+                        "Let me invoke bash now.".to_string(),
+                    )))
+                    .await;
+                let _ = tx
+                    .send(Ok(StreamEvent::ToolUseStart {
+                        id: "call_compact_with_tool".to_string(),
+                        name: "bash".to_string(),
+                    }))
+                    .await;
+                let _ = tx
+                    .send(Ok(StreamEvent::ToolInputDelta(
+                        "{\"cmd\":\"echo hi\"}".to_string(),
+                    )))
+                    .await;
+                let _ = tx
+                    .send(Ok(StreamEvent::ToolUseEnd))
+                    .await;
+                let _ = tx
+                    .send(Ok(StreamEvent::MessageEnd {
+                        stop_reason: Some("tool_calls".to_string()),
+                    }))
+                    .await;
+            } else {
+                let _ = tx
+                    .send(Ok(StreamEvent::TextDelta("done".to_string())))
+                    .await;
+                let _ = tx
+                    .send(Ok(StreamEvent::MessageEnd {
+                        stop_reason: Some("end_turn".to_string()),
+                    }))
+                    .await;
+            }
+        });
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    fn name(&self) -> &str {
+        "compact-with-tool"
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+}
+
+/// A compact-frame turn that ALSO emits a real tool call must not be treated as
+/// a stalled no-tool turn (tool_use -> tool_result adjacency invariant).
+#[tokio::test]
+async fn compact_frame_skips_turns_that_emit_tool_call() {
+    let _guard = crate::storage::lock_test_env();
+    let with_tool = CompactWithToolProvider::default();
+    let calls = with_tool.calls.clone();
+    let provider: Arc<dyn Provider> = Arc::new(with_tool);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent
+        .run_once_streaming_mpsc("do the task", Vec::new(), None, tx)
+        .await
+        .expect("turn should complete");
+
+    let mut text = String::new();
+    while let Ok(event) = rx.try_recv() {
+        if let ServerEvent::TextDelta { text: delta } = event {
+            text.push_str(&delta);
+        }
+    }
+    assert!(
+        *calls.lock().unwrap() <= 2,
+        "a compact-frame turn WITH a tool call must not trigger recovery, made {} calls",
+        *calls.lock().unwrap()
+    );
+    assert!(text.contains("done"), "tool-executing turn must complete, got {text:?}");
+    let reminders = agent
+        .session
+        .messages
+        .iter()
+        .filter(|m| {
+            m.role == Role::User
+                && m.content.iter().any(|block| match block {
+                    ContentBlock::Text { text, .. } => {
+                        text.contains("repeatedly said you would perform an action")
+                    }
+                    _ => false,
+                })
+        })
+        .count();
+    assert_eq!(reminders, 0, "no reminder may be injected for a tool_use turn");
 }
