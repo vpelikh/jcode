@@ -14,7 +14,10 @@ pub trait MessageChannel: Send + Sync {
 
     async fn send(&self, text: &str) -> anyhow::Result<()>;
 
-    async fn reply_loop(&self, runner: AmbientRunnerHandle);
+    /// Poll the channel for inbound messages and react. `runner` is the ambient
+    /// runner when ambient mode is available; pass `None` when the loop runs
+    /// standalone (e.g. Telegram remote control with ambient disabled).
+    async fn reply_loop(&self, runner: Option<AmbientRunnerHandle>);
 }
 
 #[derive(Clone)]
@@ -43,6 +46,7 @@ impl ChannelRegistry {
                 config.telegram_api_base.clone(),
                 config.telegram_proxy.clone(),
                 config.telegram_api_ip.clone(),
+                config.telegram_allowed_user_id.clone(),
             )));
         }
 
@@ -122,10 +126,10 @@ impl ChannelRegistry {
         }
     }
 
-    pub fn spawn_reply_loops(&self, runner: &AmbientRunnerHandle) {
+    pub fn spawn_reply_loops(&self, runner: Option<&AmbientRunnerHandle>) {
         for ch in self.channels.iter().filter(|c| c.is_reply_enabled()) {
             let ch = Arc::clone(ch);
-            let runner = runner.clone();
+            let runner = runner.cloned();
             tokio::spawn(async move {
                 logging::info(&format!("{} reply loop spawned", ch.name()));
                 ch.reply_loop(runner).await;
@@ -163,18 +167,21 @@ pub struct TelegramChannel {
     chat_id: String,
     reply_enabled: bool,
     api_base: Option<String>,
+    allowed_user_id: Option<String>,
     client: reqwest::Client,
 }
 
 impl TelegramChannel {
     pub fn new(token: String, chat_id: String, reply_enabled: bool) -> Self {
-        // Default connectivity: default API base, no proxy, no IP pin.
-        Self::with_connectivity(token, chat_id, reply_enabled, None, None, None)
+        // Default connectivity: default API base, no proxy, no IP pin, no user whitelist.
+        Self::with_connectivity(token, chat_id, reply_enabled, None, None, None, None)
     }
 
-    /// Construct a Telegram channel with optional API-base, proxy, and
-    /// alternate-IP overrides (from `[safety] telegram_api_base` /
-    /// `telegram_proxy` / `telegram_api_ip`, or their env vars).
+    /// Construct a Telegram channel with optional API-base, proxy, alternate-IP,
+    /// and sender-whitelist overrides (from `[safety] telegram_api_base` /
+    /// `telegram_proxy` / `telegram_api_ip` / `telegram_allowed_user_id`, or
+    /// their env vars).
+    #[allow(clippy::too_many_arguments)]
     pub fn with_connectivity(
         token: String,
         chat_id: String,
@@ -182,6 +189,7 @@ impl TelegramChannel {
         api_base: Option<String>,
         proxy: Option<String>,
         api_ip: Option<String>,
+        allowed_user_id: Option<String>,
     ) -> Self {
         let client = match crate::telegram::build_client(proxy.as_deref(), api_ip.as_deref()) {
             Ok(client) => client,
@@ -198,10 +206,332 @@ impl TelegramChannel {
             chat_id,
             reply_enabled,
             api_base,
+            allowed_user_id,
             client,
         }
     }
+
+    /// Handle a slash command received over Telegram, returning the reply text.
+    /// Read-only commands: `/help`, `/status`, `/list`. Write commands
+    /// (create/resume/abort) are reserved for a later phase.
+    async fn handle_command(
+        &self,
+        trimmed: &str,
+        runner: Option<&AmbientRunnerHandle>,
+    ) -> String {
+        let (cmd, rest) = split_command(trimmed);
+        match cmd.as_str() {
+            "/help" | "/start" | "help" | "start" => HELP_TEXT.to_string(),
+            "/list" | "/sessions" => {
+                self.send_session_picker().await;
+                String::new()
+            }
+            "/status" => self.status_reply(runner).await,
+            "/use" => self.use_session_reply(&rest).await,
+            "/history" => self.history_reply(&rest),
+            "/clear" | "/stop" => {
+                let cleared =
+                    crate::server::telegram_control::active_session_for(&self.chat_id).is_some();
+                crate::server::telegram_control::clear_active_session(&self.chat_id);
+                if cleared {
+                    "✓ Cleared the active session. Use `/use <id>` to select another.".to_string()
+                } else {
+                    "No active session to clear.".to_string()
+                }
+            }
+            "/resume" => {
+                let prompt = rest.trim();
+                self.resume_reply(prompt).await
+            }
+            _ => format!(
+                "Unknown command `{}`. Use `/help` for available commands.",
+                cmd
+            ),
+        }
+    }
+
+    /// Send an inline-keyboard session picker to the chat. Each button's
+    /// `callback_data` is the session id, so tapping it selects that session.
+    async fn send_session_picker(&self) {
+        let entries = crate::recent_session_index::recent(12);
+        let sessions = match entries {
+            Ok(list) => list,
+            Err(e) => {
+                logging::warn(&format!("telegram session picker index error: {e}"));
+                return;
+            }
+        };
+        if sessions.is_empty() {
+            let _ = self.send("No sessions found yet.");
+            return;
+        }
+        use crate::telegram::{InlineKeyboardButton, InlineKeyboardRow};
+        let active = crate::server::telegram_control::active_session_for(&self.chat_id);
+        let mut rows: Vec<InlineKeyboardRow> = Vec::new();
+        for s in sessions.iter() {
+            let title = s
+                .display_title()
+                .unwrap_or("<untitled>")
+                .chars()
+                .take(30)
+                .collect::<String>();
+            let short: String = s.session_id.chars().take(8).collect();
+            let prefix = if active.as_deref() == Some(s.session_id.as_str()) {
+                "✅ "
+            } else {
+                ""
+            };
+            rows.push(vec![InlineKeyboardButton {
+                text: format!("{}{} ({})", prefix, title, short),
+                callback_data: s.session_id.clone(),
+            }]);
+        }
+        let _ = crate::telegram::send_message_with_keyboard(
+            &self.client,
+            &self.token,
+            &self.chat_id,
+            "📚 Select a session:",
+            &rows,
+            self.api_base.as_deref(),
+        )
+        .await;
+    }
+
+    /// Handle an inline-keyboard tap (`callback_query`). `callback_data` is a
+    /// session id; selecting it sets the active session for this chat.
+    async fn handle_callback_query(&self, cb: crate::telegram::CallbackQuery) {
+        let Some(chat_id) = cb
+            .message
+            .as_ref()
+            .and_then(|m| m.chat.as_ref())
+            .map(|c| c.id.to_string())
+        else {
+            return;
+        };
+        if chat_id != self.chat_id {
+            return;
+        }
+        if !self.is_allowed_sender(cb.from.as_ref()) {
+            logging::warn("ignoring callback_query from disallowed sender");
+            let _ = crate::telegram::answer_callback_query(
+                &self.client,
+                &self.token,
+                &cb.id,
+                "Not allowed",
+                self.api_base.as_deref(),
+            )
+            .await;
+            return;
+        }
+        let Some(data) = cb.data.as_deref() else {
+            let _ = crate::telegram::answer_callback_query(
+                &self.client,
+                &self.token,
+                &cb.id,
+                "",
+                self.api_base.as_deref(),
+            )
+            .await;
+            return;
+        };
+
+        let session_id = data.trim().to_string();
+        crate::server::telegram_control::set_active_session(&self.chat_id, &session_id);
+        let ack = format!("Selected session `{}`", short_id(&session_id));
+        crate::logging::info(&format!("telegram callback selected session={session_id}"));
+        let _ = crate::telegram::answer_callback_query(
+            &self.client,
+            &self.token,
+            &cb.id,
+            &ack,
+            self.api_base.as_deref(),
+        )
+        .await;
+        let _ = self
+            .send(&format!(
+                "✅ Selected `{}`. Send a message to talk to it, or `/history` to view.",
+                short_id(&session_id)
+            ))
+            .await;
+    }
+
+    /// `/use <n-or-id>`: select the active session for this chat.
+    async fn use_session_reply(&self, arg: &str) -> String {
+        let arg = arg.trim();
+        if arg.is_empty() {
+            return "Usage: `/use <n-or-id>`. Run `/list` to see numbered sessions.".to_string();
+        }
+        let session_id = if let Ok(n) = arg.parse::<usize>() {
+            match crate::recent_session_index::recent(200) {
+                Ok(list) if n >= 1 && n <= list.len() => list[n - 1].session_id.clone(),
+                Ok(_) => return format!("`{n}` is out of range for `/list`.").to_string(),
+                Err(e) => return format!("⚠️ Could not read the session index: {e}").to_string(),
+            }
+        } else {
+            match self.resolve_session_id(arg).await {
+                Ok(id) => id,
+                Err(e) => return e,
+            }
+        };
+        crate::server::telegram_control::set_active_session(&self.chat_id, &session_id);
+        format!(
+            "✅ Selected session `{}`. Use `/history` to view it.",
+            short_id(&session_id)
+        )
+    }
+
+    /// `/history [n]`: show recent messages of the active session.
+    fn history_reply(&self, arg: &str) -> String {
+        let Some(session_id) = crate::server::telegram_control::active_session_for(&self.chat_id)
+        else {
+            return "No active session. Use `/use <n>` after `/list`.".to_string();
+        };
+        let limit = arg
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=50).contains(n))
+            .unwrap_or(10);
+        match crate::server::telegram_control::render_session_history(&session_id, limit) {
+            Ok(text) if text != "(no visible messages)" => format!("📜 [{}]\n{}", short_id(&session_id), text),
+            Ok(text) => format!("[{}] {}", short_id(&session_id), text),
+            Err(e) => format!(
+                "⚠️ Could not read history for `{}`: {}",
+                short_id(&session_id),
+                e
+            ),
+        }
+    }
+
+    /// `/resume <session-id> <prompt>`: send a prompt to a live session
+    /// headlessly and return the assistant's reply (prefix id allowed).
+    async fn resume_reply(&self, args: &str) -> String {
+        let args = args.trim();
+        if args.is_empty() {
+            return "Usage: `/resume <session-id> <prompt>`. Run `/list` first.".to_string();
+        }
+        let (ref_token, prompt) = match args.find(char::is_whitespace) {
+            Some(idx) => (args[..idx].trim(), args[idx..].trim()),
+            None => (args, "Continue"),
+        };
+        let prompt = if prompt.is_empty() { "Continue" } else { prompt };
+        let session_id = match self.resolve_session_id(ref_token).await {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+        crate::server::telegram_control::set_active_session(&self.chat_id, &session_id);
+        crate::logging::info(&format!(
+            "telegram /resume session={} chars={}",
+            session_id,
+            prompt.chars().count()
+        ));
+        match crate::server::telegram_control::resume_session_for_control_or_spawn(
+            &session_id,
+            prompt,
+        )
+        .await
+        {
+            Ok(reply) => format!("💬 [{}] {}", short_id(&session_id), reply),
+            Err(e) => format!("⚠️ Could not resume `{}`: {}", short_id(&session_id), e),
+        }
+    }
+
+    /// Resolve a user-supplied session reference (full id or unique prefix)
+    /// against the live session registry.
+    async fn resolve_session_id(&self, reference: &str) -> Result<String, String> {
+        let Some(sessions) = crate::server::telegram_control::live_session_ids().await else {
+            return Err("Telegram control is not wired to a server runtime.".to_string());
+        };
+        let reference = reference.trim();
+        if let Some(id) = sessions.iter().find(|id| id.as_str() == reference) {
+            return Ok(id.clone());
+        }
+        let matches: Vec<&String> = sessions
+            .iter()
+            .filter(|id| id.starts_with(reference))
+            .collect();
+        match matches.len() {
+            0 => Err(format!(
+                "No live session matches `{}`. Use `/list`, then `/use <n>`, or pick a live session id.",
+                reference
+            )),
+            1 => Ok(matches[0].clone()),
+            _ => Err(format!(
+                "`{}` matches {} live sessions; use a longer prefix.",
+                reference,
+                matches.len()
+            )),
+        }
+    }
+
+    /// `/status`: report ambient mode availability and remote-control readiness.
+    async fn status_reply(&self, runner: Option<&AmbientRunnerHandle>) -> String {
+        let active = crate::server::telegram_control::active_session_for(&self.chat_id);
+        let ambient = if let Some(r) = runner {
+            let running = r.is_running().await;
+            if running { "running" } else { "initialized" }
+        } else {
+            "disabled"
+        };
+        let active_line = match active {
+            Some(id) => format!("*Active session:* `{}` (use `/history`)", short_id(&id)),
+            None => "*Active session:* none (use `/use`)".to_string(),
+        };
+        format!(
+            "🤖 jcode session control\n*Ambient mode:* {}\n{}\n*Commands:* /list /use /history /clear /help",
+            ambient, active_line
+        )
+    }
+
+    /// Enforce the sender whitelist. When no whitelist is configured, any
+    /// sender in the configured chat is accepted for backwards compatibility.
+    fn is_allowed_sender(&self, from: Option<&crate::telegram::TelegramFrom>) -> bool {
+        match &self.allowed_user_id {
+            Some(allow) => {
+                let allow = allow.trim();
+                if allow.is_empty() {
+                    return true;
+                }
+                from.map(|f| f.id.to_string() == allow).unwrap_or(false)
+            }
+            None => true,
+        }
+    }
 }
+
+/// Split a Telegram command line into (command, rest-of-args), matching bot
+/// commands like `/status`, `/list 5`, or a bare `/start`. A trailing
+/// `@botname` on the command word is stripped.
+fn split_command(line: &str) -> (String, String) {
+    let line = line.trim();
+    let (word, rest) = match line.find(char::is_whitespace) {
+        Some(idx) => (&line[..idx], line[idx..].trim()),
+        None => (line, ""),
+    };
+    let cmd = word.split('@').next().unwrap_or(word).to_string();
+    (cmd, rest.to_string())
+}
+
+/// First 8 characters of a session id, for compact display.
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+const HELP_TEXT: &str = "\
+🤖 *jcode Telegram session control*
+
+Commands:
+/list — list sessions
+/use <n or id> — select a session to talk to
+/history [n] — show recent messages of the selected session
+/clear — stop talking to the selected session
+/status — show ambient & control status
+/help — this help
+
+After `/use`, send any plain message to talk to that session.";
+
+// ---------------------------------------------------------------------------
+// Discord channel
 
 #[async_trait]
 impl MessageChannel for TelegramChannel {
@@ -232,7 +562,7 @@ impl MessageChannel for TelegramChannel {
         .await
     }
 
-    async fn reply_loop(&self, runner: AmbientRunnerHandle) {
+    async fn reply_loop(&self, runner: Option<AmbientRunnerHandle>) {
         let mut offset: Option<i64> = None;
 
         loop {
@@ -255,12 +585,25 @@ impl MessageChannel for TelegramChannel {
                     for update in updates {
                         offset = Some(update.update_id + 1);
 
+                        if let Some(cb) = update.callback_query {
+                            let _ = self.handle_callback_query(cb).await;
+                            continue;
+                        }
+
                         let msg = match update.message {
                             Some(m) => m,
                             None => continue,
                         };
 
                         if msg.chat.id.to_string() != self.chat_id {
+                            continue;
+                        }
+
+                        if !self.is_allowed_sender(msg.from.as_ref()) {
+                            logging::warn(&format!(
+                                "ignoring telegram message from disallowed sender from={:?}",
+                                msg.from.as_ref().map(|f| f.id)
+                            ));
                             continue;
                         }
 
@@ -274,7 +617,8 @@ impl MessageChannel for TelegramChannel {
                             continue;
                         }
 
-                        if let Some(req_id) = crate::notifications::extract_permission_id(trimmed) {
+                        if let Some(req_id) = crate::notifications::extract_permission_id(trimmed)
+                        {
                             let (approved, message) =
                                 crate::notifications::parse_permission_reply(trimmed);
                             if let Err(e) = crate::safety::record_permission_via_file(
@@ -301,7 +645,36 @@ impl MessageChannel for TelegramChannel {
                                     ))
                                     .await;
                             }
-                        } else {
+                        } else if trimmed.starts_with('/') {
+                            let reply = self.handle_command(trimmed, runner.as_ref()).await;
+                            if !reply.is_empty() {
+                                let _ = self.send(&reply).await;
+                            }
+                        } else if let Some(active_id) =
+                            crate::server::telegram_control::active_session_for(&self.chat_id)
+                        {
+                            match crate::server::telegram_control::resume_session_for_control_or_spawn(
+                                &active_id,
+                                trimmed,
+                            )
+                            .await
+                            {
+                                Ok(reply) => {
+                                    let _ = self
+                                        .send(&format!("💬 [{}] {}", short_id(&active_id), reply))
+                                        .await;
+                                }
+                                Err(e) => {
+                                    let _ = self
+                                        .send(&format!(
+                                            "⚠️ Could not reach session `{}`: {}",
+                                            short_id(&active_id),
+                                            e
+                                        ))
+                                        .await;
+                                }
+                            }
+                        } else if let Some(ref runner) = runner {
                             let injected = runner.inject_message(trimmed, "telegram").await;
                             logging::info(&format!(
                                 "telegram reply injected into session injected={}",
@@ -313,6 +686,12 @@ impl MessageChannel for TelegramChannel {
                                 format!("📋 Message queued, waking agent: _{}_", trimmed)
                             };
                             let _ = self.send(&ack).await;
+                        } else {
+                            let _ = self
+                                .send(&format!(
+                                    "ℹ️ Select a session first: use `/list` then `/use <n>`, or run `/help`."
+                                ))
+                                .await;
                         }
                     }
                 }
@@ -439,7 +818,7 @@ impl MessageChannel for DiscordChannel {
         Ok(())
     }
 
-    async fn reply_loop(&self, runner: AmbientRunnerHandle) {
+    async fn reply_loop(&self, runner: Option<AmbientRunnerHandle>) {
         let mut last_seen_id: Option<String> = None;
 
         // Get the latest message ID on startup so we don't replay old messages
@@ -510,7 +889,7 @@ impl MessageChannel for DiscordChannel {
                                     ))
                                     .await;
                             }
-                        } else {
+                        } else if let Some(ref runner) = runner {
                             let injected = runner.inject_message(trimmed, "discord").await;
                             logging::info(&format!(
                                 "discord reply injected into session injected={}",
@@ -709,7 +1088,7 @@ impl MessageChannel for JadeRelayChannel {
         self.post_response(text, 0).await
     }
 
-    async fn reply_loop(&self, runner: AmbientRunnerHandle) {
+    async fn reply_loop(&self, runner: Option<AmbientRunnerHandle>) {
         let host = std::env::var("HOSTNAME")
             .or_else(|_| std::env::var("COMPUTERNAME"))
             .unwrap_or_else(|_| "laptop".to_string());
@@ -771,7 +1150,11 @@ impl MessageChannel for JadeRelayChannel {
                             }
                             continue;
                         }
-                        let injected = runner.inject_message(trimmed, "jade_relay").await;
+                        let injected = if let Some(ref runner) = runner {
+                            runner.inject_message(trimmed, "jade_relay").await
+                        } else {
+                            false
+                        };
                         logging::info(&format!(
                             "jade relay prompt injected seq={} injected={}",
                             ev.seq, injected
@@ -798,6 +1181,49 @@ impl MessageChannel for JadeRelayChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_split_command_basic() {
+        let (cmd, rest) = split_command("/list");
+        assert_eq!(cmd, "/list");
+        assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn test_split_command_with_args() {
+        let (cmd, rest) = split_command("/list  10");
+        assert_eq!(cmd, "/list");
+        assert_eq!(rest, "10");
+    }
+
+    #[test]
+    fn test_split_command_strips_bot_mention() {
+        let (cmd, _) = split_command("/status@vasily_pelikh_openclaw_bot");
+        assert_eq!(cmd, "/status");
+    }
+
+    #[test]
+    fn test_is_allowed_sender_unrestricted() {
+        let ch = TelegramChannel::new("t".into(), "c".into(), true);
+        assert!(ch.is_allowed_sender(None));
+        assert!(ch.is_allowed_sender(Some(&crate::telegram::TelegramFrom { id: 999 })));
+    }
+
+    #[test]
+    fn test_is_allowed_sender_whitelist() {
+        let ch = TelegramChannel::with_connectivity(
+            "t".into(),
+            "c".into(),
+            true,
+            None,
+            None,
+            None,
+            Some("42".into()),
+        );
+        assert!(!ch.is_allowed_sender(None));
+        assert!(!ch.is_allowed_sender(Some(&crate::telegram::TelegramFrom { id: 7 })));
+        assert!(ch.is_allowed_sender(Some(&crate::telegram::TelegramFrom { id: 42 })));
+    }
 
     #[test]
     fn test_discord_message_parse() {
