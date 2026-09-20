@@ -474,7 +474,7 @@ impl TelegramChannel {
                 ""
             };
             rows.push(vec![InlineKeyboardButton {
-                text: format!("{}{} ({})", prefix, title, short),
+                text: picker_button_label(&prefix, &title, &short),
                 callback_data: s.session_id.clone(),
             }]);
         }
@@ -875,7 +875,7 @@ impl TelegramChannel {
                 ""
             };
             rows.push(vec![InlineKeyboardButton {
-                text: format!("{}{} ({})", prefix, title, short),
+                text: picker_button_label(&prefix, &title, &short),
                 callback_data: s.session_id.clone(),
             }]);
         }
@@ -1469,6 +1469,23 @@ fn short_id(id: &str) -> String {
         };
     }
     id.chars().take(8).collect()
+}
+
+/// Build an inline-keyboard button label for a session-picker row.
+///
+/// The title can come from an explicit rename, a todo-derived goal, or the
+/// generated/imported title. When none of those exist, `display_title()` falls
+/// back to mining the memorable animal name from the session id (e.g.
+/// `session_giraffe_…` -> `giraffe`), which is exactly the same token
+/// `short_id()` surfaces. Appending the short id in that case yields a
+/// redundant "giraffe (giraffe)". We detect that collision (title == short)
+/// and omit the ` (short)` suffix so the button stays compact and readable.
+fn picker_button_label(prefix: &str, title: &str, short: &str) -> String {
+    if title == short {
+        format!("{prefix}{title}")
+    } else {
+        format!("{prefix}{title} ({short})")
+    }
 }
 
 /// Split a `render_session_history` block into preview lines: one per
@@ -2836,8 +2853,9 @@ mod tests {
         let row = keyboard[0].as_array().expect("button row");
         assert_eq!(row.len(), 1, "one button per row");
         assert_eq!(
-            row[0]["text"], "fox (fox)",
-            "menu button must show the memorable name as its short-id suffix"
+            row[0]["text"], "fox",
+            "with no title the fallback name equals the short id, so the menu \
+             button must render a single 'fox' (not a redundant 'fox (fox)')"
         );
         assert_eq!(
             row[0]["callback_data"], "session_fox_1_aabbccddeeff0011",
@@ -3201,6 +3219,34 @@ mod tests {
         assert_eq!(short_id("session_otter"), "otter");
         // Non-standard ids keep the old first-8-chars behavior.
         assert_eq!(short_id("abc1234567890"), "abc12345");
+    }
+
+    #[test]
+    fn test_picker_button_label_omits_redundant_short_id() {
+        // When a session has no explicit/todo/generated title, display_title()
+        // falls back to the mined animal name and short_id() yields the same
+        // token. We must not render a redundant "giraffe (giraffe)".
+        assert_eq!(
+            picker_button_label("", "giraffe", "giraffe"),
+            "giraffe"
+        );
+        // Active/saved prefixes are still carried through.
+        assert_eq!(
+            picker_button_label("✅ ", "giraffe", "giraffe"),
+            "✅ giraffe"
+        );
+        // A real human title is distinct from the short id, so the short id is
+        // still surfaced to disambiguate sessions with similar titles.
+        assert_eq!(
+            picker_button_label("", "Build the thing", "giraffe"),
+            "Build the thing (giraffe)"
+        );
+        // Case matters: a title that merely resembles the short id (different
+        // case) is treated as distinct and keeps the short id suffix.
+        assert_eq!(
+            picker_button_label("", "Giraffe", "giraffe"),
+            "Giraffe (giraffe)"
+        );
     }
 
     #[test]
