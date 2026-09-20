@@ -948,7 +948,15 @@ async fn background_task_progress_notifies_attached_clients() {
         },
     };
 
-    super::dispatch_background_task_progress(&task, &swarm_members).await;
+    let (swarms_by_id, event_history, event_counter, swarm_event_tx) = empty_swarm_status_state();
+    let swarm_handle = test_swarm_service_handle(
+        Arc::clone(&swarm_members),
+        Arc::clone(&swarms_by_id),
+        Arc::clone(&event_history),
+        Arc::clone(&event_counter),
+        swarm_event_tx.clone(),
+    );
+    super::dispatch_background_task_progress(&task, &swarm_handle).await;
 
     let notification = timeout(Duration::from_secs(2), member_event_rx.recv())
         .await
