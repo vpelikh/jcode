@@ -150,12 +150,28 @@ API the handle wraps). Instead:
 `swarm.channel_subscriptions{,_by_session}` and the two runtime handles are
 private; zero non-`services/swarm.rs` code reaches them; all mutations go
 through handle methods; suite green + clippy clean.
-**Achieved:** every named field is private; cross-module code reaches the maps
-only through documented read accessors; live-path mutations route through handle
-methods (debug write / persistence-test code is a documented privileged
-observer). `Server.swarm_state` (the handle's constructor source) remains a pub
-field, out of scope. Full lib suite green (1539) + clippy clean on changed
-files.
+**Achieved (partial).** Every named handle field is private and cross-module
+code reaches them only through documented read accessors. The single-purpose
+teardown/rename mutations are routed through handle methods
+(`remove_session_member` / `take_session_membership`, `rename_member_session`
+now also rewrites coordinators, resume/detached cleanup), and all four
+member-removal write sites in the session lifecycle funnel through the handle.
+`debug_swarm_write` / persistence-test code is a documented privileged
+observer. `Server.swarm_state` (the handle's constructor source) remains a pub
+field, out of scope.
+
+**Known remaining boundary (honest):** the deeper live orchestration (subscribe
+`working-dir`/swarm-id rebind in `handle_set_feature` or `handle_detach`,
+plus several plan/coordinator writes in `comm_graph`, `comm_session`,
+`comm_control`, `comm_plan`, `comm_sync`, `client_actions`, `headless`, and
+`background_tasks`) still mutate the swarm maps in place *after* borrowing them
+through the accessor. These are the plan's "risk concentration": their
+mutations are interleaved with persistence, event emission, broadcasting, and
+coordinator re-election, so pulling them into the handle requires keeping the
+borrow order identical. Not done in this pass; follow-up slices should route
+each onto a handle method/reconstructed `SwarmState` argument. Field-level
+encapsulation (the tier's core) is complete; mutation routing is the remaining
+part of "all mutations go through handle methods".
 
 ## Review notes (2026-09)
 
