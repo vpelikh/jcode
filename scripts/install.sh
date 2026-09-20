@@ -272,7 +272,7 @@ if [ "$download_mode" = "tar" ]; then
   mv "$src_bin" "$dest_version_dir/$bin_name"
   # Install the native desktop app sibling (jcode-desktop2-*) if the payload
   # shipped it, as "jcode-desktop2" next to the jcode binary.
-  desktop_src="$(find "$tmpdir" -maxdepth 1 -type f -name 'jcode-desktop2-*' | head -1 || true)"
+  desktop_src="$(find "$tmpdir" -maxdepth 1 -type f -name 'jcode-desktop2-*' -print -quit || true)"
   if [ -n "$desktop_src" ] && [ -f "$desktop_src" ]; then
     cp -f "$desktop_src" "$dest_version_dir/jcode-desktop2${EXE}"
     chmod +x "$dest_version_dir/jcode-desktop2${EXE}" 2>/dev/null || true
