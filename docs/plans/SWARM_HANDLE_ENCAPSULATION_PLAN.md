@@ -124,3 +124,20 @@ API the handle wraps). Instead:
 `swarm.channel_subscriptions{,_by_session}` and the two runtime handles are
 private; zero non-`services/swarm.rs` code reaches them; all mutations go
 through handle methods; suite green + clippy clean.
+
+## Review notes (2026-09)
+
+- **`set_shared_context` unifies `created_at` semantics.** The three migrated
+  write sites previously differed: `client_comm_context` and
+  `debug_swarm_write` preserved the original `created_at` on re-insert, while
+  `comm_plan::handle_comm_propose_plan` reset it to `now`. The shared method
+  preserves `created_at` (matching the 2-of-3 majority and the more useful
+  behavior). `created_at` is only consumed by debug snapshot display
+  (`created_secs_ago` / `age_secs`), so this is cosmetic, not functional.
+- **Read accessors return mutable-capable `&Arc<RwLock<...>>`.** The debug
+  snapshot accessors (`shared_context_map`, `channel_subscriptions_map`,
+  `channel_subscriptions_by_session_map`) expose the inner map by reference.
+  This is intentional: debug is the privileged observer and uses these strictly
+  for reads. They are documented read-only; all writes route through handle
+  methods. A future stricter boundary could snapshot-ify these, but that is out
+  of scope for the encapsulation slices.
