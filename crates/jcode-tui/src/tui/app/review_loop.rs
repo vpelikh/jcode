@@ -165,6 +165,7 @@ pub fn apply_verdict(
 /// Mark findings for the current lens as "can't fix" (blocked / out of scope).
 /// These never count as a stall; the loop advances to the next lens with the
 /// finding kept open in the digest.
+#[allow(dead_code)] // Review-loop action currently exercised by tests; wired into interactive flow in a follow-up.
 pub fn mark_cant_fix(state: &mut ReviewLoopState, findings: Vec<Finding>) -> ReviewLoopAction {
     if state.finished {
         return ReviewLoopAction::None;

@@ -497,7 +497,7 @@ fn step_review_loop_converges_with_fix_and_gate_recheck_passes_cleanly() {
 fn step_review_loop_converged_without_fix_never_runs_gate_recheck() {
     with_temp_jcode_home(|| {
         let mut app = create_test_app();
-        let parent_session_id = app.session_id().to_string();
+        let _parent_session_id = app.session_id().to_string();
 
         // No todos persisted at all. The review converges WITHOUT touching any
         // files (empty touched_files), so `review_touched_files` is false and
