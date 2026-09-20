@@ -2800,11 +2800,21 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn test_session_picker_menu_flow() {
+        struct RestoreHome(Option<std::ffi::OsString>);
+        impl Drop for RestoreHome {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => crate::env::set_var("JCODE_HOME", value),
+                    None => crate::env::remove_var("JCODE_HOME"),
+                }
+            }
+        }
         // Isolate the recent-session index (and the per-chat active-session
         // state) under a scratch JCODE_HOME so we can seed a resumable session
         // and have the `/list` menu actually render a real button.
         let _guard = crate::storage::lock_test_env();
         let home = tempfile::TempDir::new().expect("temp home");
+        let _restore = RestoreHome(std::env::var_os("JCODE_HOME"));
         crate::env::set_var("JCODE_HOME", home.path());
 
         crate::recent_session_index::upsert(&crate::recent_session_index::RecentSessionMetadata {
@@ -2849,7 +2859,11 @@ mod tests {
         let keyboard = picker["reply_markup"]["inline_keyboard"]
             .as_array()
             .expect("inline_keyboard array");
-        assert_eq!(keyboard.len(), 1, "one seeded session -> one menu button row");
+        assert_eq!(
+            keyboard.len(),
+            1,
+            "one seeded session -> one menu button row: {keyboard:?}"
+        );
         let row = keyboard[0].as_array().expect("button row");
         assert_eq!(row.len(), 1, "one button per row");
         assert_eq!(

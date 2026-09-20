@@ -26,10 +26,8 @@ use crate::todo::{TodoItem, load_plan, load_todos};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
 
 /// A single session's handoff snapshot, written on session close.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,31 +83,21 @@ const MAX_INDEX_ENTRIES: usize = 64;
 /// the absolute working directory. Returns `None` when neither yields anything
 /// meaningful.
 ///
-/// The git remote lookup runs a `git` subprocess. Because the URL is a constant
-/// for a given directory within a process, the result is cached so the hot
-/// first-message injection path does not spawn git on every session.
+/// Resolve the remote on each call: a long-lived server can observe a checkout
+/// being initialized or its origin changing while it is running.
 pub fn project_key(working_dir: Option<&Path>) -> Option<String> {
     let dir = working_dir?;
-    let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-    let cache = PROJECT_KEY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(cached) = cache.lock().ok().and_then(|m| m.get(&canonical).cloned()) {
-        return cached;
-    }
-    // The git remote URL is the most portable identity across machines.
-    let key = if let Some(url) = git_remote_url(&canonical) {
-        Some(format!("git:{}", url))
+    let absolute = if dir.is_absolute() {
+        dir.to_path_buf()
     } else {
-        // Fall back to the absolute path (only stable if the same path is
-        // reused across sessions).
-        Some(format!("path:{}", canonical.display()))
+        std::env::current_dir().ok()?.join(dir)
     };
-    if let Ok(mut guard) = cache.lock() {
-        guard.insert(canonical, key.clone());
-    }
-    key
+    let canonical = absolute.canonicalize().unwrap_or(absolute);
+    Some(match git_remote_url(&canonical) {
+        Some(url) => format!("git:{}", url),
+        None => format!("path:{}", canonical.display()),
+    })
 }
-
-static PROJECT_KEY_CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<String>>>> = OnceLock::new();
 
 /// Build a handoff snapshot for a closing session, sans writing to disk.
 ///
@@ -144,8 +132,9 @@ pub fn build_snapshot(
         })
         .collect();
 
-    let last_assistant_text =
-        transcript_for_extraction.and_then(extract_last_assistant_text);
+    let last_assistant_text = transcript_for_extraction
+        .and_then(extract_last_assistant_text)
+        .map(|text| truncate(&text, 4096));
 
     Some(HandoffSnapshot {
         session_id: session_id.to_string(),
@@ -170,8 +159,36 @@ pub fn capture(
     disposition: &str,
     transcript_for_extraction: Option<&str>,
 ) -> Option<HandoffSnapshot> {
-    let snapshot = build_snapshot(session_id, working_dir, disposition, transcript_for_extraction)?;
-    match write_snapshot(&snapshot) {
+    // Serialize capture including its read of todo state, not merely the rename.
+    let _lock = match lock_store() {
+        Ok(lock) => lock,
+        Err(error) => {
+            crate::logging::warn(&format!("[handoff] cannot lock store: {error}"));
+            return None;
+        }
+    };
+    let Some(snapshot) = build_snapshot(
+        session_id,
+        working_dir,
+        disposition,
+        transcript_for_extraction,
+    ) else {
+        // A read failure is not evidence of completed work. Only retire a
+        // snapshot when the persisted todo list was successfully read.
+        if let Ok(todos) = load_todos(session_id)
+            && todos
+                .iter()
+                .all(|t| t.status == "completed" || t.status == "cancelled")
+            && let Err(err) = retire_session(session_id)
+        {
+            crate::logging::warn(&format!(
+                "[handoff] failed to retire {}: {}",
+                session_id, err
+            ));
+        }
+        return None;
+    };
+    match write_snapshot_locked(&snapshot) {
         Ok(()) => Some(snapshot),
         Err(err) => {
             crate::logging::warn(&format!(
@@ -184,20 +201,57 @@ pub fn capture(
 }
 
 /// Write the snapshot file and update the per-project index.
+#[cfg(test)]
 fn write_snapshot(snapshot: &HandoffSnapshot) -> Result<()> {
+    let _lock = lock_store()?;
+    write_snapshot_locked(snapshot)
+}
+
+fn lock_store() -> Result<std::fs::File> {
+    let dir = handoffs_dir()?;
+    crate::storage::ensure_dir(&dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.join(".lock"))?;
+    file.lock()?;
+    Ok(file)
+}
+
+fn retire_session(session_id: &str) -> Result<()> {
+    let mut index = load_index();
+    index.latest.retain(|entry| entry.session_id != session_id);
+    crate::storage::write_json_fast(&index_path()?, &index)?;
+    // Keep the archived snapshot available for explicit promotion, but it is
+    // no longer eligible for automatic injection.
+    Ok(())
+}
+
+fn write_snapshot_locked(snapshot: &HandoffSnapshot) -> Result<()> {
+    if load_snapshot(&snapshot.session_id).is_some_and(|old| old.ended_at > snapshot.ended_at) {
+        return Ok(());
+    }
     let dir = handoffs_dir()?;
     crate::storage::write_json_fast(&file_path(&dir, &snapshot.session_id)?, snapshot)?;
     upsert_index(snapshot)
 }
 
 /// Path to a single per-session handoff file.
-fn file_path(_dir: &Path, session_id: &str) -> Result<PathBuf> {
-    // The caller passes `handoffs_dir`; sanitize the session id before use.
-    let safe = session_id
-        .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-        .collect::<String>();
-    Ok(_dir.join(format!("{}.json", safe)))
+fn file_path(dir: &Path, session_id: &str) -> Result<PathBuf> {
+    // Reject rather than replace: lossy sanitization aliases unrelated sessions.
+    // ASCII validation also avoids case-folding/Unicode normalization aliases.
+    anyhow::ensure!(
+        !session_id.is_empty()
+            && !session_id.eq_ignore_ascii_case("index")
+            && session_id.len() <= 200
+            && session_id
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_'),
+        "invalid handoff session id"
+    );
+    Ok(dir.join(format!("{}.json", session_id)))
 }
 
 fn handoffs_dir() -> Result<PathBuf> {
@@ -222,6 +276,19 @@ fn load_index() -> HandoffIndex {
 /// Record `snapshot` as the latest handoff for its project.
 fn upsert_index(snapshot: &HandoffSnapshot) -> Result<()> {
     let mut index = load_index();
+    // A session may move between projects. Its single snapshot file no longer
+    // represents the old project's entry.
+    index
+        .latest
+        .retain(|e| e.session_id != snapshot.session_id || e.project_key == snapshot.project_key);
+    if index
+        .latest
+        .iter()
+        .any(|e| e.project_key == snapshot.project_key && e.ended_at > snapshot.ended_at)
+    {
+        crate::storage::write_json_fast(&index_path()?, &index)?;
+        return Ok(());
+    }
     let entry = IndexEntry {
         project_key: snapshot.project_key.clone(),
         session_id: snapshot.session_id.clone(),
@@ -233,7 +300,9 @@ fn upsert_index(snapshot: &HandoffSnapshot) -> Result<()> {
                 .unwrap_or_else(|| "<no intent>".to_string()),
         ),
     };
-    index.latest.retain(|e| e.project_key != snapshot.project_key);
+    index
+        .latest
+        .retain(|e| e.project_key != snapshot.project_key);
     index.latest.push(entry);
     if index.latest.len() > MAX_INDEX_ENTRIES {
         index.latest.sort_by(|a, b| b.ended_at.cmp(&a.ended_at));
@@ -251,37 +320,65 @@ pub fn load_snapshot(session_id: &str) -> Option<HandoffSnapshot> {
     if !path.exists() {
         return None;
     }
-    crate::storage::read_json::<HandoffSnapshot>(&path).ok()
+    crate::storage::read_json::<HandoffSnapshot>(&path)
+        .ok()
+        .filter(|snapshot| snapshot.session_id == session_id)
 }
 
 /// The most recent handoff session id for a project directory, if one exists.
 pub fn latest_handoff_for_project(working_dir: Option<&Path>) -> Option<String> {
     let key = project_key(working_dir)?;
     let index = load_index();
-    index.latest.into_iter().find(|e| e.project_key == key).map(|e| e.session_id)
+    index
+        .latest
+        .into_iter()
+        .find(|e| e.project_key == key)
+        .map(|e| e.session_id)
 }
 
 /// The most recent handoff for a working dir as a compact markdown block, for
-/// system-prompt injection at session start. Returns `None` when there is
+/// first-message injection at session start. Returns `None` when there is
 /// nothing to show.
 pub fn render_boot_context(working_dir: Option<&Path>) -> Option<String> {
-    let session_id = latest_handoff_for_project(working_dir)?;
+    let key = project_key(working_dir)?;
+    let session_id = load_index()
+        .latest
+        .into_iter()
+        .find(|e| e.project_key == key)?
+        .session_id;
     let snapshot = load_snapshot(&session_id)?;
+    if snapshot.project_key != key {
+        return None;
+    }
     let mut out = String::from("[Handoff from previous session]");
     if let Some(intent) = &snapshot.intent {
-        out.push_str(&format!("\nIntent: {}", intent));
+        out.push_str(&format!("\nIntent: {}", truncate(intent, 2048)));
     }
     if !snapshot.open_todos.is_empty() {
         out.push_str("\nOpen work:");
-        for t in &snapshot.open_todos {
-            out.push_str(&format!("\n- [{}] {}", t.status, t.content));
+        for t in snapshot.open_todos.iter().take(32) {
+            out.push_str(&format!(
+                "\n- [{}] {}",
+                truncate(&t.status, 32),
+                truncate(&t.content, 512)
+            ));
+        }
+        if snapshot.open_todos.len() > 32 {
+            out.push_str("\n[Additional work omitted; see the saved handoff.]");
         }
     }
     if let Some(text) = &snapshot.last_assistant_text {
-        out.push_str(&format!("\nLast assistant message: {}", truncate(text, 200)));
+        out.push_str(&format!(
+            "\nLast assistant message: {}",
+            truncate(text, 200)
+        ));
     }
     if let Some(id) = &snapshot.initiative_id {
-        out.push_str(&format!("\nLinked initiative: {}", id));
+        out.push_str(&format!("\nLinked initiative: {}", truncate(id, 200)));
+    }
+    if out.len() > 8192 {
+        out = truncate(&out, 8100);
+        out.push_str("\n[Handoff truncated; see the saved handoff.]");
     }
     Some(out)
 }
@@ -336,7 +433,7 @@ pub fn promote_to_initiative(
         working_dir,
     )?;
     // Record the handoff itself as the opening checkpoint.
-    let _ = crate::goal::update_goal(
+    crate::goal::update_goal(
         &goal.id,
         Some(crate::goal::GoalScope::Project),
         working_dir,
@@ -348,12 +445,12 @@ pub fn promote_to_initiative(
             )),
             ..Default::default()
         },
-    );
+    )?;
     Ok(Some(goal.id))
 }
 
-/// Get the git remote `origin` URL for a directory, if any. Shells out to git,
-/// which is acceptable here: capture runs once per session close.
+/// Get the git remote `origin` URL for a directory, if any, using local git
+/// configuration. Called during capture and first-message lookup, not later turns.
 fn git_remote_url(dir: &Path) -> Option<String> {
     let output = Command::new("git")
         .arg("-C")
