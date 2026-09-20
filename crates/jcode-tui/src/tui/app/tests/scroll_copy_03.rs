@@ -1952,7 +1952,9 @@ fn full_frame_wrapper_opens_and_closes_sync_window_around_cursor_hidden_draw() {
     let show = "\u{1b}[?25h";
     let move_re = Regex::new(r"\x1b\[[0-9]+;[0-9]+H").expect("static move-regex");
 
-    let first_moveto = move_re.find(&stream).expect("full frame must emit a cell MoveTo");
+    let first_moveto = move_re
+        .find(&stream)
+        .expect("full frame must emit a cell MoveTo");
     let hide_at = stream
         .find(hide)
         .unwrap_or_else(|| panic!("full wrapper must hide the cursor; got: {stream:?}"));
