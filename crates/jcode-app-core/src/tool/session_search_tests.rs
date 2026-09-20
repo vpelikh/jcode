@@ -53,9 +53,9 @@ fn run_report(home: &Path, query: &str, options: &SearchOptions) -> SearchReport
     .expect("search succeeds")
 }
 
-/// A cancellation flag that is never set, so search runs to completion.
+/// A cancellation scope that is never cancelled, so search runs to completion.
 fn never_abort() -> CheckAbort {
-    Arc::new(AtomicBool::new(false))
+    crate::cancel_scope::CancelScope::new()
 }
 
 fn run_search(home: &Path, query: &str, options: &SearchOptions) -> Vec<SearchResult> {
@@ -824,12 +824,12 @@ async fn session_search_deadline_is_model_visible_on_hang() {
 async fn abort_on_drop_guard_arms_the_flag_when_the_future_is_dropped() {
     // deepseek-harness F8 Part A, mechanism check. The pre-set-flag test proves
     // a cancelled scan short-circuits; this one proves the *trigger*: the
-    // `AbortOnDrop` guard held by the executing future must set the shared flag
+    // `CancelScope` guard held by the executing future must set the shared flag
     // when that future is dropped. `execute_with_deadline` drops the inner
     // future on timeout, so this pins the real path — a timed-out call leaves
     // the flag armed for the already-spawned blocking scan.
-    let abort = Arc::new(AtomicBool::new(false));
-    assert!(!abort.load(Ordering::Relaxed), "flag must start clear");
+    let abort = crate::cancel_scope::CancelScope::new();
+    assert!(!abort.cancelled(), "flag must start clear");
     // The guard is created *inside* the future, exactly like `execute` does
     // before its `spawn_blocking(...).await`. The async state machine holds it
     // for the whole future, so the timeout dropping the future drops the guard.
@@ -837,7 +837,7 @@ async fn abort_on_drop_guard_arms_the_flag_when_the_future_is_dropped() {
         Some(std::time::Duration::from_millis(20)),
         SessionSearchTool::new().name(),
         async {
-            let _guard = AbortOnDrop(abort.clone());
+            let _guard = abort.guard();
             // Simulate the running blocking scan: await forever, just as
             // `execute` does while its blocking scan is in flight.
             std::future::pending::<()>().await;
@@ -847,7 +847,7 @@ async fn abort_on_drop_guard_arms_the_flag_when_the_future_is_dropped() {
     .await;
     assert!(dropped.is_err(), "the hung call must be dropped by the deadline");
     assert!(
-        abort.load(Ordering::Relaxed),
+        abort.cancelled(),
         "dropping the timed-out future must drop the guard and arm the flag"
     );
 }
@@ -869,7 +869,8 @@ fn pre_abort_flag_short_circuits_the_scan() {
             );
         }
 
-        let abort = Arc::new(AtomicBool::new(true));
+        let abort = crate::cancel_scope::CancelScope::new();
+        drop(abort.guard()); // pre-cancel the scope so the scan short-circuits
         let mut options = SearchOptions::for_test("current-session");
         options.exhaustive = true; // bypass the index so the scan is required
         let report = search_sessions_blocking(

@@ -547,26 +547,37 @@ shared, reusable type (e.g. a `JournalingCancelScope` / `AbortOnDrop`) in
 `jcode-tool-core` that any hang-prone tool could adopt the same way. Weighed
 against what was built:
 
-- **Reuse / maintenance.** `AtomicBool` + a `Drop`-armed flag already exists
-  ad-hoc in the repo (`server/runtime.rs` has a `DropFlag`, `client_lifecycle.rs`
-  a `done: Arc<AtomicBool>`), so the idiom is proven but currently duplicated at
-  three sites. A shared primitive would remove that duplication and make the next
-  consumer one type-import instead of a reimplementation.
-- **Cost / complexity.** A shared type must sit in a leaf crate both
-  app-core-internal tooling and server runtime can depend on, and requires
-  converting the existing two server sites to it — a small but cross-cutting
-  change outside the F8 Part A scope. It also risks an interface that is *just*
-  `Arc<AtomicBool>` in disguise, earning its abstraction less than it costs
-  unless the semantics (drop-arms, `never()` helper) are the real
-  deliverable.
+- **Reuse / maintenance.** The "`AtomicBool` + a `Drop`-armed flag" shape
+  exists in exactly one production site (`AbortOnDrop` in `session_search`) and
+  one `#[cfg(test)]` helper (`DropFlag` in `server/runtime.rs`). Earlier drafts
+  of this note also cited `server/client_lifecycle.rs`'s `done: Arc<AtomicBool>`
+  and `turn_cancel_registry.rs`'s `ActiveTurnGuard` as siblings, but an audit
+  showed those are *different* patterns — `client_lifecycle.done` is a
+  `tokio::spawn` poll-stop flag written by a separate task (not drop-armed), and
+  `ActiveTurnGuard` is an RAII registry-deregistration guard. So the genuinely
+  shared shape is thin: one production site plus one test helper. A shared
+  primitive would let a third consumer import the type instead of
+  reimplementing it, but it is unifying more test/`cfg` surface than real
+  production duplication.
+- **Cost / complexity.** Because the shared shape is only one production site
+  plus one test helper, a *new leaf-crate* abstraction would be over-engineered:
+  it must sit in a crate both tooling and server can depend on, and would convert
+  production code to a type that today has a single real consumer. It also risks
+  an interface that is just `Arc<AtomicBool>` in disguise, earning the
+  abstraction less than it costs unless the semantics (drop-arms, `never()`
+  helper) are the real deliverable.
 - **Compatibility / behavior.** Either approach leaves the observable contract
   identical (a timed-out call returns the model-visible timeout and reclaims the
   blocking thread); the only difference is where the type lives.
-- **Decision.** Keeping it local was chosen for this follow-up: it stays
-  behavior-identical and zero-risk to the two existing server sites, and the
-  unification is a natural companion to the already-parked F8 promote-on-timeout
-  seam, which is the right place to introduce the shared type across tools.
-  Revisited there.
+- **Decision (corrected after audit, then executed).** The audit corrected the
+  earlier "three-site duplication" claim: only `session_search` (production) and
+  a `#[cfg(test)]` helper shared the drop-arms shape, so a *new leaf crate* was
+  over-engineered. Instead, the reusable primitive was promoted **inside**
+  `jcode-app-core` as `cancel_scope::CancelScope` (same crate, no new leaf), and
+  `session_search` now uses it via the `CheckAbort` alias. It gained a genuine
+  second consumer: the `server/runtime.rs` task-scope test was converted to it,
+  replacing its local `DropFlag`. A future promote-on-timeout seam can adopt the
+  same type with one import.
 
 ### Alternative considered: async `select!` cancellation at a finer grain
 
@@ -627,3 +638,22 @@ boundary. Weighed against the cooperative flag:
   leans on. Timeout-joining a *leaf* worker is a reasonable future enhancement if
   a candidate is ever observed to hang in practice, but there is no evidence of
   that today, so it is not adopted as part of F8 Part A.
+
+### F8 Part A follow-ups (deferred, not gaps)
+
+Three genuine trade-offs are accepted explicitly rather than closed, tracked for
+anyone who wants to pick one up:
+
+- **F8a — mid-candidate cancellation gap.** The cooperative flag preempts only
+  at candidate boundaries; an in-flight synchronous `load_from_path` still runs
+  to completion before the flag is honored. Closing it requires rewriting
+  `Session::load_from_path` (`jcode-base`) as async, chunked deserialization — a
+  large cross-crate change disproportionate to the thread-reclaim gain. Kept open.
+- **F8b — no per-candidate timeout-join escape valve.** If a real stalked
+  deserialize ever appears, there is no way to abandon it mid-load (see the
+  detached-thread alternative above). Only justified if such a hang is observed
+  in practice; not adopted without that evidence.
+- **F8c — `CancelScope` is same-crate, not a leaf crate.** It lives in
+  `jcode-app-core` and has one production consumer. If the promote-on-timeout
+  seam adds abortability to `bash`/`bg`/`webfetch`, the second/third consumer is
+  the signal to promote it (and convert the remaining ad-hoc sites).
