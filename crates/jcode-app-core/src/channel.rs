@@ -314,13 +314,34 @@ impl TelegramChannel {
     /// Handle an inline-keyboard tap (`callback_query`). `callback_data` is a
     /// session id; selecting it sets the active session for this chat.
     async fn handle_callback_query(&self, cb: crate::telegram::CallbackQuery) {
+        // A tap on a picker button must always be acknowledged so Telegram
+        // clears the button's loading spinner. A callback whose message or
+        // chat id is missing is still answered (a no-op toast) so the button
+        // never stays stuck in its loading state.
         let Some(msg) = cb.message.as_ref() else {
+            let _ = crate::telegram::answer_callback_query(
+                &self.client,
+                &self.token,
+                &cb.id,
+                "",
+                self.api_base.as_deref(),
+            )
+            .await;
             return;
         };
         let Some(chat_id) = msg.chat.as_ref().map(|c| c.id.to_string()) else {
+            let _ = crate::telegram::answer_callback_query(
+                &self.client,
+                &self.token,
+                &cb.id,
+                "",
+                self.api_base.as_deref(),
+            )
+            .await;
             return;
         };
         if chat_id != self.chat_id {
+            // Not our chat; do not act on or acknowledge a foreign callback.
             return;
         }
         // The message id of the tapped picker message, used to collapse its
@@ -1402,6 +1423,229 @@ impl MessageChannel for JadeRelayChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tiny in-memory Telegram Bot API endpoint for exercising the picker
+    /// menu flow (`send_session_picker` + `handle_callback_query`) without a
+    /// live network. It records the requests it receives so the test can assert
+    /// on the exact JSON payloads the channel emits (keyboard, answer, and
+    /// keyboard-collapse).
+    struct MockTelegram {
+        addr: std::net::SocketAddr,
+        requests: std::sync::Arc<tokio::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+    }
+
+    impl MockTelegram {
+        async fn start() -> Self {
+            use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock");
+            let addr = listener.local_addr().expect("local addr");
+            let requests = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+            let reqs = requests.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut sock, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let reqs = reqs.clone();
+                    tokio::spawn(async move {
+                        let mut reader = BufReader::new(&mut sock);
+                        let mut line = String::new();
+                        let n = reader.read_line(&mut line).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        // Request line: POST /bot<token>/<method> HTTP/1.1
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        let method_name = parts
+                            .get(1)
+                            .and_then(|p| p.rsplit('/').next())
+                            .map(str::to_string)
+                            .unwrap_or_default();
+                        // Read headers until blank line.
+                        let mut content_length = 0usize;
+                        loop {
+                            let mut h = String::new();
+                            if reader.read_line(&mut h).await.unwrap_or(0) == 0 {
+                                break;
+                            }
+                            if h.trim().is_empty() {
+                                break;
+                            }
+                            if let Some(rest) = h.to_lowercase().strip_prefix("content-length:") {
+                                content_length = rest.trim().parse().unwrap_or(0);
+                            }
+                        }
+                        let mut body = vec![0u8; content_length];
+                        reader.read_exact(&mut body).await.unwrap_or(0);
+                        let json: serde_json::Value =
+                            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                        reqs.lock().await.push((method_name.clone(), json.clone()));
+                        // Answer each Bot API call with ok:true and a minimal
+                        // result so the client considers the call successful.
+                        let response = match method_name.as_str() {
+                            "sendMessage" | "answerCallbackQuery" | "editMessageReplyMarkup" => {
+                                serde_json::json!({
+                                    "ok": true,
+                                    "result": {"message_id": 1}
+                                })
+                            }
+                            _ => serde_json::json!({ "ok": true, "result": true }),
+                        };
+                        let payload = serde_json::to_string(&response).unwrap();
+                        let _ = sock
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    payload.len(),
+                                    payload
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                    });
+                }
+            });
+            MockTelegram { addr, requests }
+        }
+
+        fn base(&self) -> String {
+            format!("http://{}/", self.addr)
+        }
+
+        async fn methods(&self) -> Vec<String> {
+            self.requests.lock().await.iter().map(|(m, _)| m.clone()).collect()
+        }
+
+        async fn bodies(&self) -> Vec<serde_json::Value> {
+            self.requests.lock().await.iter().map(|(_, b)| b.clone()).collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_session_picker_menu_flow() {
+        // Isolate the recent-session index (and the per-chat active-session
+        // state) under a scratch JCODE_HOME so we can seed a resumable session
+        // and have the `/list` menu actually render a real button.
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::TempDir::new().expect("temp home");
+        crate::env::set_var("JCODE_HOME", home.path());
+
+        crate::recent_session_index::upsert(&crate::recent_session_index::RecentSessionMetadata {
+            session_id: "session_fox_1_aabbccddeeff0011".into(),
+            working_dir: None,
+            // No title at all: the menu label must fall back to the memorable
+            // session name ("fox") instead of rendering "<untitled>".
+            generated_title: None,
+            custom_title: None,
+            todo_title: None,
+            saved: false,
+            updated_at_ms: 1,
+            last_active_at_ms: Some(2),
+        })
+        .expect("seed session");
+        // Note: the test env lock is held for the whole test (matching the
+        // established agent_tests pattern) so the global JCODE_HOME / recent
+        // index are isolated from parallel tests.
+
+        let mock = MockTelegram::start().await;
+
+        let ch = TelegramChannel::with_connectivity(
+            "tok".into(),
+            "77".into(),
+            true,
+            Some(mock.base()),
+            None,
+            None,
+            None,
+        );
+
+        // /list drives the picker menu.
+        let reply = ch.handle_command("/list", None).await;
+        // The picker sends the keyboard message itself; there is no text reply.
+        assert_eq!(reply, "");
+
+        let bodies = mock.bodies().await;
+        let picker = bodies
+            .iter()
+            .find(|b| b.get("text").is_some() && b.get("reply_markup").is_some())
+            .expect("a picker message with an inline keyboard");
+        let keyboard = picker["reply_markup"]["inline_keyboard"]
+            .as_array()
+            .expect("inline_keyboard array");
+        assert_eq!(keyboard.len(), 1, "one seeded session -> one menu button row");
+        let row = keyboard[0].as_array().expect("button row");
+        assert_eq!(row.len(), 1, "one button per row");
+        assert_eq!(
+            row[0]["text"], "fox (session_)",
+            "menu button must fall back to the memorable session name, not <untitled>"
+        );
+        assert_eq!(
+            row[0]["callback_data"], "session_fox_1_aabbccddeeff0011",
+            "button data must carry the selectable session id"
+        );
+
+        // Tap the menu button: a callback_query carrying the session id.
+        ch.handle_callback_query(crate::telegram::CallbackQuery {
+            id: "cb1".into(),
+            from: Some(crate::telegram::TelegramFrom { id: 1 }),
+            data: Some("session_fox_1_aabbccddeeff0011".into()),
+            message: Some(crate::telegram::CallbackMessage {
+                chat: Some(crate::telegram::Chat { id: 77 }),
+                message_id: Some(42),
+            }),
+        })
+        .await;
+
+        // The tap must answer the callback (clear the button's loading spinner)
+        // and collapse the picker keyboard so the menu does not linger.
+        let methods = mock.methods().await;
+        assert!(
+            methods.iter().any(|m| m == "answerCallbackQuery"),
+            "callback must be answered to stop the button spinner, got {methods:?}"
+        );
+        assert!(
+            methods.iter().any(|m| m == "editMessageReplyMarkup"),
+            "picker keyboard should be collapsed after selection, got {methods:?}"
+        );
+        // The acknowledged session becomes the active session for this chat.
+        assert_eq!(
+            crate::server::telegram_control::active_session_for("77").as_deref(),
+            Some("session_fox_1_aabbccddeeff0011")
+        );
+
+        // A callback with no `data` (e.g. a stray tap on a disabled button)
+        // must still be acknowledged, and the acknowledgement must NOT carry an
+        // empty `text` field: Telegram rejects empty text and would leave the
+        // button stuck in its loading state.
+        let before = mock.methods().await.len();
+        ch.handle_callback_query(crate::telegram::CallbackQuery {
+            id: "cb_empty".into(),
+            from: Some(crate::telegram::TelegramFrom { id: 1 }),
+            data: None,
+            message: Some(crate::telegram::CallbackMessage {
+                chat: Some(crate::telegram::Chat { id: 77 }),
+                message_id: Some(43),
+            }),
+        })
+        .await;
+        let (new_methods, bodies) = (mock.methods().await, mock.bodies().await);
+        assert!(
+            new_methods.len() > before,
+            "a data-less callback must still be answered"
+        );
+        let answer_body = bodies
+            .iter()
+            .zip(new_methods.iter())
+            .find(|(_, m)| m.as_str() == "answerCallbackQuery")
+            .map(|(b, _)| b)
+            .expect("latest answerCallbackQuery body");
+        assert!(
+            answer_body.get("text").is_none() || !answer_body["text"].as_str().unwrap_or("").is_empty(),
+            "answerCallbackQuery must not send an empty `text` (would leave the button stuck)"
+        );
+    }
 
     #[test]
     fn test_split_command_basic() {

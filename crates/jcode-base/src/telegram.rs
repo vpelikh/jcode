@@ -519,9 +519,11 @@ pub async fn answer_callback_query(
     base_override: Option<&str>,
 ) -> anyhow::Result<()> {
     let mut body = serde_json::json!({ "callback_query_id": callback_query_id });
-    if text.is_empty() {
-        body["text"] = serde_json::json!("");
-    } else {
+    // Telegram's `text` field must be 1-200 characters when present. An empty
+    // string is rejected with "Bad Request" and leaves the tapped button stuck
+    // in its loading state, so only include `text` when the caller supplied a
+    // non-empty notification.
+    if !text.is_empty() {
         body["text"] = serde_json::json!(text);
     }
     post_telegram(client, bot_token, "answerCallbackQuery", body, base_override).await
