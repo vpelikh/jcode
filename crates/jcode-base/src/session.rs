@@ -1675,7 +1675,7 @@ request in this new forked session, using the inherited conversation only as con
     pub fn set_compaction(&mut self, compaction: StoredCompactionState) {
         let event = SessionEvent {
             timestamp: chrono::Utc::now(),
-            event_id: "set_compaction".to_string(),
+            event_id: crate::id::new_id("set_compaction"),
             op: SessionEventOp::SetCompaction {
                 compaction: compaction.clone(),
             },
@@ -1732,6 +1732,28 @@ request in this new forked session, using the inherited conversation only as con
                 self.messages.len()
             ));
         }
+        for (i, (derived, legacy)) in messages.iter().zip(self.messages.iter()).enumerate() {
+            if derived.id != legacy.id {
+                return Err(format!(
+                    "event_map message[{}] id mismatch: derived={}, legacy={}",
+                    i, derived.id, legacy.id
+                ));
+            }
+            if derived.content.len() != legacy.content.len() {
+                return Err(format!(
+                    "event_map message[{}] content block count mismatch: derived={}, legacy={}",
+                    i, derived.content.len(), legacy.content.len()
+                ));
+            }
+        }
+
+        // Compaction must also agree.
+        if compaction != self.compaction {
+            return Err(format!(
+                "event_map compaction mismatch: derived={:?}, legacy={:?}",
+                compaction, self.compaction
+            ));
+        }
 
         if let Some(comp) = &compaction {
             // covers_up_to_turn must not exceed the original turn count.
@@ -1772,7 +1794,7 @@ request in this new forked session, using the inherited conversation only as con
         let now = chrono::Utc::now();
 
         for (i, message) in self.messages.iter().enumerate() {
-            map.append_event(SessionEvent {
+            map.push_event(SessionEvent {
                 timestamp: message.timestamp.unwrap_or(now),
                 event_id: format!("rehydrate_{}", i),
                 op: SessionEventOp::AppendMessage {
@@ -1785,7 +1807,7 @@ request in this new forked session, using the inherited conversation only as con
         }
 
         for (j, injection) in self.memory_injections.iter().enumerate() {
-            map.append_event(SessionEvent {
+            map.push_event(SessionEvent {
                 timestamp: injection.timestamp,
                 event_id: format!("rehydrate_mem_{}", j),
                 op: SessionEventOp::MemoryInjection {
@@ -1797,7 +1819,7 @@ request in this new forked session, using the inherited conversation only as con
         }
 
         for (k, replay) in self.replay_events.iter().enumerate() {
-            map.append_event(SessionEvent {
+            map.push_event(SessionEvent {
                 timestamp: replay.timestamp,
                 event_id: format!("rehydrate_replay_{}", k),
                 op: SessionEventOp::ReplayEvent {
@@ -1809,7 +1831,7 @@ request in this new forked session, using the inherited conversation only as con
         }
 
         if let Some(compaction) = &self.compaction {
-            map.append_event(SessionEvent {
+            map.push_event(SessionEvent {
                 timestamp: now,
                 event_id: "rehydrate_compaction".to_string(),
                 op: SessionEventOp::SetCompaction {
