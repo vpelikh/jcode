@@ -3,8 +3,34 @@ use super::{
     SessionRef,
 };
 
+/// Estimate the on-heap bytes for a [`Row`]. A session row is exactly its
+/// `SessionInfo` projection. A handoff row also retains the real
+/// [`super::HandoffSnapshot`] alongside the projection, so counting only the
+/// projection would under-report the handoff picker's memory.
 fn row_session_bytes(row: &Row) -> usize {
-    estimate_session_info_bytes(row.session())
+    let projection = estimate_session_info_bytes(row.session());
+    match row {
+        Row::Session(_) => projection,
+        Row::Handoff(model) => projection + estimate_handoff_snapshot_bytes(&model.snapshot),
+    }
+}
+
+fn estimate_handoff_snapshot_bytes(snapshot: &super::HandoffSnapshot) -> usize {
+    let mut bytes = snapshot.session_id.capacity()
+        + snapshot.project_key.capacity()
+        + snapshot.disposition.capacity()
+        + estimate_optional_string_bytes(&snapshot.working_dir)
+        + estimate_optional_string_bytes(&snapshot.intent)
+        + estimate_optional_string_bytes(&snapshot.last_assistant_text)
+        + estimate_optional_string_bytes(&snapshot.initiative_id);
+    for todo in &snapshot.open_todos {
+        bytes += todo.id.capacity()
+            + todo.content.capacity()
+            + todo.status.capacity()
+            + estimate_optional_string_bytes(&todo.group)
+            + estimate_optional_string_bytes(&todo.confidence);
+    }
+    bytes
 }
 
 pub(super) fn debug_memory_profile(picker: &SessionPicker) -> serde_json::Value {
