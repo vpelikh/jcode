@@ -255,8 +255,10 @@ behavior-changing, cross-cutting change (touches the tool trait, the registry,
 bash/bg, and the background manager's adoption API) and should get its own
 dedicated session with a steering decision on the default for each tool.
 
-**Related (also parked as a small follow-up):** broaden the opt-in to the
-cancellable I/O tools that don't self-manage a timeout
-(`conversation_search`, `session_search`, `ambient`/schedule, `gmail`), and
-change the TUI info-widget `background_info` `None`-session fallback to show no
-indicator instead of a global aggregate (backward compat is not a goal).
+**Related (the `None`-fallback half is now DONE):** broaden the opt-in to the
+cancellable I/O tools that don't self-manage a timeout (`conversation_search`,
+`session_search`, `ambient`/schedule, `gmail`). The TUI info-widget
+`background_info` `None`-session fallback was changed to show no indicator
+instead of a global aggregate (backward compat is not a goal), with an
+integration-test assertion covering the resolved-and-idle and unresolved-`None`
+cases.

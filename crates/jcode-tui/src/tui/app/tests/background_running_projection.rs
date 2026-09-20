@@ -65,6 +65,18 @@ fn focused_session_background_count_reflects_only_that_sessions_live_tasks() {
             "a session with no live tasks must not show a background indicator"
         );
 
+        // A remote client with no resolved session id (session_id == None) must
+        // also show no background indicator — even though global background
+        // tasks exist — rather than falling back to a misleading global count.
+        app.is_remote = true;
+        app.remote_session_id = None;
+        let data = crate::tui::TuiState::info_widget_data(&app);
+        assert!(
+            data.background_info.is_none(),
+            "a remote client with no session id must not show a global background count"
+        );
+        app.is_remote = false;
+
         // Clean up so the global singleton does not leak tasks across tests.
         rt.block_on(async {
             let _ = manager.cancel(&a.task_id).await;
