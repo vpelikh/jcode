@@ -5,6 +5,12 @@ use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
 
+/// Maximum acceptable skew between an event's timestamp and "now" when
+/// validating an event at insert time. Generous enough for normal sessions,
+/// but rejects wildly improbable clocks. (Forking and rehydration use
+/// unvalidated `push_event`, so this never drops already-trusted history.)
+const MAX_EVENT_AGE_SECS: i64 = 86400 * 365; // ~1 year
+
 /// Errors that can occur when working with session events
 #[derive(Debug, Clone)]
 pub enum SessionEventError {
@@ -244,7 +250,13 @@ impl SessionEventMap {
         
         for (event_index, event) in self.events.iter().enumerate() {
             if event_index <= boundary_index {
-                fork.append_event(event.clone());
+                // Use push_event (no validation): the events being forked were
+                // already validated when originally appended to this log, and
+                // forking must not drop them merely because they carry their
+                // original timestamps (e.g. a session older than the validation
+                // window). Re-validating here would otherwise silently truncate
+                // the fork of long-lived or imported sessions.
+                fork.push_event(event.clone());
             }
         }
         
@@ -276,7 +288,7 @@ impl SessionEventMap {
         // Validate timestamp (not too far in future or past)
         let now = chrono::Utc::now();
         let timestamp_diff = (event.timestamp - now).num_seconds().abs();
-        if timestamp_diff > 86400 * 365 { // Within 1 year
+        if timestamp_diff > MAX_EVENT_AGE_SECS {
             return Err(SessionEventError::InvalidTimestamp {
                 timestamp: event.timestamp
             });

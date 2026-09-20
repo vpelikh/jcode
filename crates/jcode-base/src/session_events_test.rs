@@ -1451,3 +1451,175 @@ fn test_in_place_mutation_reflects_in_derived_and_provider_view() {
     assert_eq!(provider_after[0].content.len(), 1);
     session.rederive_all_checked().expect("in-place mutation must stay consistent");
 }
+
+#[test]
+fn test_duplicate_id_empty_content_append_stays_consistent() {
+    // Round O regression: a later append whose content is empty (rejected by
+    // event validation) but whose id matches an earlier accepted message must
+    // still trigger the rebuild fallback. The previous tail-id heuristic was
+    // fooled by the shared id and left the log and legacy vector desynced.
+    let mut session = Session::create_with_id("test_dup_id_empty".to_string(), None, None);
+    // First: an accepted message with id "X".
+    session.append_stored_message(StoredMessage {
+        id: "X".to_string(),
+        role: Role::User,
+        content: vec![text_block("ok")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+
+    // Second: same id "X" but empty content -> validation rejects the event.
+    session.append_stored_message(StoredMessage {
+        id: "X".to_string(),
+        role: Role::User,
+        content: vec![], // rejected
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+
+    // The log must be reconciled: derived id list equals legacy id list.
+    let legacy_ids: Vec<String> = session.messages.iter().map(|m| m.id.clone()).collect();
+    let derived_ids: Vec<String> = session.derive_messages().iter().map(|m| m.id.clone()).collect();
+    assert_eq!(derived_ids, legacy_ids, "log and legacy must agree even with duplicate empty-content append");
+    assert_eq!(derived_ids, vec!["X", "X"]);
+    session.rederive_all_checked().expect("duplicate-id empty append must stay consistent");
+}
+
+#[test]
+fn test_empty_and_replay_only_session_hydrate_consistently() {
+    // Round T: an empty session and a replay-only session (no messages) must
+    // round-trip through the real load path and stay consistent after rebuild.
+    use std::io::Write;
+
+    let dir = std::env::temp_dir().join(format!("jcode_edge_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // 1) Empty session (no messages/injections/compaction/replay).
+    let empty = Session::create_with_id("edge_empty".to_string(), None, None);
+    let p1 = dir.join("empty.json");
+    std::fs::write(&p1, serde_json::to_string(&empty).unwrap()).unwrap();
+    let loaded_empty = Session::load_from_path(&p1).expect("load empty");
+    loaded_empty.rederive_all_checked().expect("empty session consistent");
+    assert!(loaded_empty.messages.is_empty());
+    assert!(loaded_empty.derive_messages().is_empty());
+
+    // 2) Replay-only session (a replay event but no messages). before_message on
+    //    the replay event is independent; hydration must preserve the event.
+    let mut replay_only = Session::create_with_id("edge_replay".to_string(), None, None);
+    replay_only.record_replay_event(&crate::session::StoredReplayEvent {
+        timestamp: Utc::now(),
+        kind: crate::session::StoredReplayEventKind::DisplayMessage {
+            role: "system".to_string(),
+            title: None,
+            content: "notice".to_string(),
+        },
+    });
+    // Bypass the in-process event append to simulate a persisted-session load
+    // where only the legacy replay vector is present.
+    replay_only.rebuild_event_map();
+    let p2 = dir.join("replay.json");
+    std::fs::write(&p2, serde_json::to_string(&replay_only).unwrap()).unwrap();
+    let loaded_replay = Session::load_from_path(&p2).expect("load replay-only");
+    loaded_replay.rederive_all_checked().expect("replay-only consistent");
+    assert!(loaded_replay.messages.is_empty());
+    assert_eq!(loaded_replay.derive_replay_events().len(), 1);
+    assert_eq!(loaded_replay.replay_events.len(), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_multi_insert_repair_pattern_stays_consistent() {
+    // Round U: mirrors agent.rs repair_missing_tool_outputs - an assistant
+    // message with two missing tool uses is followed by two sequential
+    // insert_message calls using the (index + 1 + inserted + offset) arithmetic.
+    // The event log must stay consistent with the legacy vector throughout.
+    let mut session = Session::create_with_id("test_multi_repair".to_string(), None, None);
+    session.append_stored_message(StoredMessage {
+        id: "user".to_string(),
+        role: Role::User,
+        content: vec![text_block("run tools")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    // Assistant at index 1, with two ToolUse blocks that need results.
+    session.append_stored_message(StoredMessage {
+        id: "asst".to_string(),
+        role: Role::Assistant,
+        content: vec![
+            ContentBlock::ToolUse { id: "t1".to_string(), name: "tool".to_string(), input: json!({"a":1}), thought_signature: None },
+            ContentBlock::ToolUse { id: "t2".to_string(), name: "tool".to_string(), input: json!({"b":2}), thought_signature: None },
+        ],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+
+    // Repair: insert two tool results after the assistant (index 1), using the
+    // offset arithmetic from repair_missing_tool_outputs. `inserted` only
+    // advances per assistant message (by this message's missing count), while
+    // `offset` indexes within the message's missing items.
+    let missing_for_message = vec!["t1", "t2"];
+    let mut inserted = 0usize;
+    for (offset, tid) in missing_for_message.iter().enumerate() {
+        let stored = StoredMessage {
+            id: format!("result_{tid}"),
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult { tool_use_id: tid.to_string(), content: "ok".to_string(), is_error: Some(false) }],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        };
+        session.insert_message(1 + 1 + inserted + offset, stored);
+    }
+    inserted += missing_for_message.len();
+
+    session.rederive_all_checked().expect("multi-insert repair must stay consistent");
+    let ids: Vec<String> = session.messages.iter().map(|m| m.id.clone()).collect();
+    let dids: Vec<String> = session.derive_messages().iter().map(|m| m.id.clone()).collect();
+    assert_eq!(ids, dids);
+    // Expected order: user, asst, result_t1, result_t2
+    assert_eq!(ids, vec!["user", "asst", "result_t1", "result_t2"]);
+}
+
+#[test]
+fn test_fork_preserves_aged_events() {
+    // Round AA: forking a log whose events carry old (beyond the ±1yr insert
+    // validation window) timestamps must NOT drop them. Re-validating on fork
+    // would silently truncate long-lived or imported sessions.
+    use crate::session::event_types::SessionEventMap;
+
+    let old = chrono::Utc::now() - chrono::Duration::days(700); // ~2 years ago
+    let mut map = SessionEventMap::default();
+    map.push_event(SessionEvent {
+        timestamp: old,
+        event_id: "rehydrate_0".to_string(),
+        op: SessionEventOp::AppendMessage {
+            message_id: "m0".to_string(),
+            message: StoredMessage {
+                id: "m0".to_string(),
+                role: Role::User,
+                content: vec![text_block("aged")],
+                display_role: None,
+                timestamp: Some(old),
+                tool_duration_ms: None,
+                token_usage: None,
+            },
+        },
+        parent_id: None,
+        version: 1,
+    });
+
+    // Fork up to boundary 0 must preserve the aged message.
+    let fork = map.fork_up_to_boundary(0);
+    let ids: Vec<String> = fork.derive_messages().iter().map(|m| m.id.clone()).collect();
+    assert_eq!(ids, vec!["m0"], "fork must not drop an aged (validated-at-insert) event");
+}
