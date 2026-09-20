@@ -221,7 +221,12 @@ sys.exit(1 if mode == 'warning' else 0)
     #[test]
     fn timeout_reaps_process_and_unique_ids_isolate_cancellation() {
         let (dir, mut client) = fixture("hang");
-        client.options.timeout = Duration::from_millis(150);
+        // The Begin subprocess is a `#!/usr/bin/env python3` intercept that
+        // takes a few hundred ms to spawn and emit its auth URL; a 150 ms cap
+        // makes `start()` itself time out before the poll phase. Keep the cap
+        // short enough that the 60 s hang poll times out promptly, but generous
+        // enough that the Begin launch reliably completes.
+        client.options.timeout = Duration::from_secs(2);
         let flow = client.begin("copilot", None).unwrap();
         let other = client.begin("copilot", None).unwrap();
         assert_ne!(flow.0.flow_id, other.0.flow_id);

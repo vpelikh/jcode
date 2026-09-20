@@ -1537,7 +1537,7 @@ fn push_todo_plan_details(
         let state_span = Span::styled(state.as_str().to_string(), Style::default().fg(state_color));
         if let Some(intention) = intention {
             if compact_details {
-                let mut spans = vec![
+                let spans = vec![
                     Span::styled("Intent ", Style::default().fg(todo_label_color())),
                     state_span.clone(),
                     Span::styled(": ", Style::default().fg(todo_label_color())),

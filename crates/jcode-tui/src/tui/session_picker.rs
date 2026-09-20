@@ -575,6 +575,11 @@ impl SessionPicker {
     /// `/handoffres` override flow. Rows are built into the flat (ungrouped)
     /// path, matching how [`new_grouped`](Self::new_grouped) treats an empty
     /// server list plus orphan sessions.
+    ///
+    /// Note: an empty input produces a picker with no backing rows, which
+    /// [`is_handoff`](Self::is_handoff) reports as `false` (matching the
+    /// derived-from-rows contract). Callers should avoid passing an empty list;
+    /// the app-level `open_handoff_picker` guard already does so.
     pub fn for_handoffs(snapshots: Vec<HandoffSnapshot>) -> Self {
         let rows = snapshots
             .into_iter()
@@ -1298,13 +1303,18 @@ impl SessionPicker {
                 if self.visible_sessions.is_empty() {
                     self.search_query.clear();
                     self.rebuild_items();
-                } else if let Some(session_id) = self.selected_handoff_snapshot_id() {
+                } else if self.is_handoff() {
                     // Searching the handoff list must still select a handoff,
                     // not a resume target. Emit HandoffSelected exactly like the
                     // non-search Enter path, using the selected handoff's own id.
-                    return Ok(OverlayAction::Selected(
-                        PickerResult::HandoffSelected(session_id),
-                    ));
+                    // Gated on the data-source mode (not just the selected row)
+                    // so a handoff picker never falls through to a resume
+                    // target, matching the pre-row-model behavior.
+                    if let Some(session_id) = self.selected_handoff_snapshot_id() {
+                        return Ok(OverlayAction::Selected(
+                            PickerResult::HandoffSelected(session_id),
+                        ));
+                    }
                 } else {
                     let targets = self.selection_or_current_targets();
                     if !targets.is_empty() {
@@ -1411,7 +1421,7 @@ impl SessionPicker {
             }
             KeyCode::Char('q') => return Ok(OverlayAction::Close),
             KeyCode::Char(' ') => {
-                if self.selected_handoff_snapshot_id().is_none() {
+                if !self.is_handoff() {
                     self.toggle_selected_session();
                 }
             }

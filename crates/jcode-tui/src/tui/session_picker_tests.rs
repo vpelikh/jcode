@@ -2635,6 +2635,49 @@ fn make_handoff_snapshot(session_id: &str, intent: &str, todo: &str) -> super::H
 }
 
 #[test]
+fn session_picker_is_not_handoff_in_flat_or_grouped_mode() {
+    // `is_handoff()` is derived from the backing row type, so a plain session
+    // picker must report false in both the flat and grouped configurations.
+    // This guards the row-derivation against a false positive (e.g. if the
+    // first-row probe were wrong or a session ever got wrapped as a handoff).
+    let flat = SessionPicker::new(vec![make_session("s1", "One", false, SessionStatus::Closed)]);
+    assert!(
+        !flat.is_handoff(),
+        "flat session picker must not be reported as a handoff picker"
+    );
+
+    let grouped = SessionPicker::new_grouped(
+        vec![ServerGroup {
+            name: "server-a".to_string(),
+            icon: "🖥".to_string(),
+            version: "1".to_string(),
+            git_hash: "abc".to_string(),
+            is_running: true,
+            sessions: vec![make_session("s2", "Two", false, SessionStatus::Closed)],
+        }],
+        Vec::new(),
+    );
+    assert!(
+        !grouped.is_handoff(),
+        "grouped session picker must not be reported as a handoff picker"
+    );
+}
+
+#[test]
+fn session_picker_is_not_handoff_when_empty() {
+    // An empty backing (loading picker, or a session picker with no rows) is
+    // not a handoff picker; the derived flag must stay false, not accidentally
+    // report true on a vacuum.
+    let empty = SessionPicker::new(Vec::new());
+    assert!(!empty.is_handoff(), "empty picker must not be a handoff picker");
+    let loading = SessionPicker::loading();
+    assert!(
+        !loading.is_handoff(),
+        "loading picker must not be a handoff picker"
+    );
+}
+
+#[test]
 fn for_handoffs_builds_rows_with_intent_title_and_handoff_flag() {
     let picker = SessionPicker::for_handoffs(vec![
         make_handoff_snapshot("handoff-a", "Fix the login bug", "add tests"),
