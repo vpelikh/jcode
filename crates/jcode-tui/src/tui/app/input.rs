@@ -1727,28 +1727,13 @@ impl App {
         // progress and reset a stuck group's budget. The ungrouped list
         // (`None`) is completed when there is at least one ungrouped todo and
         // all of them are completed.
-        let normalized = |group: Option<&str>| -> Option<String> {
-            group.map(str::trim).filter(|g| !g.is_empty()).map(str::to_string)
-        };
-        let mut group_todo_counts: Vec<(Option<String>, usize, bool)> = Vec::new();
-        for todo in todos {
-            let key = normalized(todo.group.as_deref());
-            if let Some(entry) = group_todo_counts.iter_mut().find(|(k, _, _)| *k == key) {
-                entry.1 += 1;
-                entry.2 = entry.2 && todo.status == "completed";
-            } else {
-                group_todo_counts.push((key, 1, todo.status == "completed"));
-            }
-        }
-        let completed_groups: Vec<Option<String>> = group_todo_counts
-            .into_iter()
-            .filter(|(_, count, all_completed)| *count > 0 && *all_completed)
-            .map(|(key, _, _)| key)
-            .collect();
+        // Same completed-group set the ownership gate evaluates, so the two stay
+        // in lock step (`completed_group_keys` drives both).
+        let completed_groups = crate::todo::completed_group_keys(todos);
 
         let mut entries: Vec<(String, String)> = Vec::new();
         for goal in goals {
-            let key = normalized(goal.group.as_deref());
+            let key = crate::todo::normalized_group(goal.group.as_deref());
             if !completed_groups.contains(&key) {
                 // Not a completed group, not gated.
                 continue;
@@ -1794,7 +1779,7 @@ impl App {
             }
         }
         for todo in todos.iter().filter(|t| t.status == "completed") {
-            let group = normalized(todo.group.as_deref()).unwrap_or_default();
+            let group = crate::todo::normalized_group(todo.group.as_deref()).unwrap_or_default();
             entries.push((
                 format!("todo:{group}:{}:completion_confidence", todo.id),
                 todo.completion_confidence
@@ -1805,6 +1790,13 @@ impl App {
             entries.push((
                 format!("todo:{group}:{}:confidence", todo.id),
                 todo.confidence.map(|s| s.as_str()).unwrap_or("").to_string(),
+            ));
+            // The confidence gate's weighted average uses priority as its
+            // weight (`todo_confidence_weight`), so a priority change alters
+            // the gated signal and must count as progress.
+            entries.push((
+                format!("todo:{group}:{}:priority", todo.id),
+                todo.priority.clone(),
             ));
             // Spike detection reads the last two confidence_history entries (or
             // falls back to confidence/completion_confidence when empty).
