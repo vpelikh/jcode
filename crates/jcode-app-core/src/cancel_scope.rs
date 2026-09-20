@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// [`CancelScope::guard`] arms it once when dropped, so a loop can bail at a
 /// convenient boundary after a timer or an abandoned call drops the surrounding
 /// future.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CancelScope {
     flag: Arc<AtomicBool>,
 }
@@ -65,8 +65,9 @@ impl CancelScope {
 
 /// Sets the scope's flag on drop. Created via [`CancelScope::guard`]; when the
 /// owning future is dropped (e.g. by `execute_with_deadline`'s timeout) this
-/// guard's `Drop` marks the scope cancelled for the in-flight task.
-#[derive(Clone)]
+/// guard's `Drop` marks the scope cancelled for the in-flight task. It is an
+/// RAII guard, not a `Clone`able handle: you make one to own the cancellation
+/// of one future.
 pub struct CancelGuard {
     flag: Arc<AtomicBool>,
 }
