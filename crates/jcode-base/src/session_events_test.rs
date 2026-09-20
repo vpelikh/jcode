@@ -969,6 +969,88 @@ fn test_strip_transcript_for_remote_client_keeps_event_log_consistent() {
 }
 
 #[test]
+fn test_strip_transcript_for_remote_client_drops_compaction_when_messages_empty() {
+    // Edge case: a compacted remote transcript may render locally with an empty
+    // messages vector but retained compaction state. Stripping must still drop
+    // compaction so the surviving (rebuilt) event log does not re-record a stale
+    // SetCompaction event.
+    let mut session = Session::create_with_id("test_strip_remote_empty".to_string(), None, None);
+    // No messages, but a compaction that survived (as in a fully-compacted remote).
+    session.compaction = Some(StoredCompactionState {
+        summary_text: "compacted".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 2,
+        compacted_count: 1,
+    });
+    session.record_memory_injection(
+        "auto-recalled".to_string(),
+        "content".to_string(),
+        1,
+        0,
+        vec![],
+    );
+    session.record_replay_event(&crate::session::StoredReplayEvent {
+        timestamp: Utc::now(),
+        kind: crate::session::StoredReplayEventKind::DisplayMessage {
+            role: "system".to_string(),
+            title: None,
+            content: "notice".to_string(),
+        },
+    });
+
+    session.strip_transcript_for_remote_client();
+
+    assert!(session.messages.is_empty());
+    assert!(session.compaction.is_none());
+    assert!(session.memory_injections.is_empty());
+    assert!(session.replay_events.is_empty());
+    // Rebuilt log must agree with the stripped legacy state.
+    session.rederive_all_checked().expect("strip must stay consistent even with empty messages");
+    assert!(session.derive_compaction().is_none());
+    assert!(session.derive_messages().is_empty());
+    assert!(session.derive_memory_injections().is_empty());
+    assert!(session.derive_replay_events().is_empty());
+}
+
+#[test]
+fn test_append_and_insert_empty_content_message_stay_consistent() {
+    // append_stored_message / insert_message must not silently desync the event
+    // log from the legacy vector when validation rejects the emitted event.
+    // Here an empty-content message is rejected (validate_message) but still
+    // lands in `messages`; the methods must rebuild the log from legacy so the
+    // two sources of truth agree.
+    let mut session = Session::create_with_id("test_empty_content".to_string(), None, None);
+    let empty = StoredMessage {
+        id: "empty".to_string(),
+        role: Role::User,
+        content: vec![], // empty content is rejected by event validation
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    };
+
+    session.append_stored_message(empty.clone());
+    session.append_stored_message(StoredMessage {
+        id: "ok1".to_string(),
+        role: Role::User,
+        content: vec![text_block("fine")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    session.insert_message(1, empty.clone());
+
+    // Event log and legacy vector must agree (no panic/desync), even though the
+    // empty-content events themselves are not recorded with the exact ids.
+    session.rederive_all_checked().expect("empty-content mutated session must stay consistent");
+    assert_eq!(session.messages.len(), 3);
+    assert_eq!(session.derive_messages().len(), session.messages.len());
+}
+
+#[test]
 fn test_replace_messages_then_direct_compaction_clear_stays_consistent() {
     // Mirrors apply_judge_visible_context_if_needed: replace the transcript
     // (emits a ReplaceMessages event) then clear compaction directly and
