@@ -1897,6 +1897,23 @@ fn scroll_repaint_hides_cursor_before_cell_moves_via_draw_core() {
         let hide_at = stream
             .find(hide)
             .unwrap_or_else(|| panic!("{arm} must hide the cursor; got: {stream:?}"));
+        // Prove each arm reproduced its real invalidation, not just any repaint:
+        // HardClear predates the draw with `Terminal::clear()` (an ED2 `ESC[2J`
+        // Clear-All), while SoftRepaint is sentinel-invalidate only and must NOT
+        // emit a clear. This ensures the two arms genuinely differ and the hide
+        // check guards each distinct branch.
+        let has_clear = stream.contains("\u{1b}[2J");
+        match arm {
+            "soft_repaint" => assert!(
+                !has_clear,
+                "soft_repaint arm must not emit an ED2 clear; got: {stream:?}"
+            ),
+            "hard_clear" => assert!(
+                has_clear,
+                "hard_clear arm must emit an ED2 clear; got: {stream:?}"
+            ),
+            _ => unreachable!(),
+        }
         // The re-show must come strictly after the hide, so the caret is frozen for
         // the whole sweep interval (all MoveTo of the diff flush). A `?25h` emitted
         // before the hide would mean the cursor was visible during part of the sweep.
@@ -1917,12 +1934,14 @@ fn scroll_repaint_hides_cursor_before_cell_moves_via_draw_core() {
 
 /// The production entry point to a full-frame repaint is [`StatusSpinnerRenderer::draw_full`],
 /// which delegates to the backend-generic [`StatusSpinnerRenderer::draw_full_with`] wrapper. That
-/// wrapper owns two things the `draw_full_core` body does not: the synchronized-update window
-/// (`ESC[?2026h` / `ESC[?2026l`) and the error-path cursor re-show. This test drives the exact
-/// wrapper against a captured `CrosstermBackend<Vec<u8>>` and asserts:
+/// wrapper owns the synchronized-update window (`ESC[?2026h` / `ESC[?2026l`) around the body it
+/// calls. This test drives the exact wrapper against a captured `CrosstermBackend<Vec<u8>>` on the
+/// success path and asserts:
 ///   - the sync window opens (`?2026h`) and closes (`?2026l`);
 ///   - the cursor `Hide` (`?25l`) precedes the first cell `MoveTo` (the sweep guard);
 ///   - the composer re-shows the caret (`?25h`) inside the frame.
+/// The wrapper's error-path cursor re-show is not exercised here (that requires a backend whose
+/// draw fails); it is verified by inspection of `draw_full_with`.
 #[test]
 fn full_frame_wrapper_opens_and_closes_sync_window_around_cursor_hidden_draw() {
     use regex::Regex;
