@@ -2603,6 +2603,50 @@ fn test_compact_transcript_with_bracket_produces_balanced_durable_bracket() {
         .expect("reloaded bracket producer log must stay consistent");
 }
 
+/// The `CompactionBracket` enforcement wired into `compact_transcript_with_bracket`
+/// must actually catch a genuinely broken bracket — not just be inert. A
+/// `CompactionEnd` without a matching open `CompactionStart` (a double-close or
+/// an unpaired close) is provably a bug at the completion point, so the narrow
+/// registry used there must report it as a violation.
+#[test]
+#[cfg(debug_assertions)]
+fn test_compaction_bracket_enforcement_catches_broken_bracket() {
+    use crate::session::LogInvariant;
+    let mut map = SessionEventMap::default();
+    // A CompactionEnd with no preceding CompactionStart -> dangling close.
+    map.push_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "dangling_end".to_string(),
+        op: SessionEventOp::CompactionEnd {
+            compaction: StoredCompactionState {
+                summary_text: "s".to_string(),
+                openai_encrypted_content: None,
+                covers_up_to_turn: 1,
+                original_turn_count: 10,
+                compacted_count: 1,
+            },
+        },
+        parent_id: None,
+        version: 1,
+    });
+
+    // Mirror the narrow registry used at the compaction-complete enforcement site.
+    let mut reg = crate::session::InvariantRegistry::default();
+    reg.add(crate::session::CompactionBracket);
+    let log = reg.check(&map);
+    assert!(
+        !log.is_green(),
+        "a dangling CompactionEnd must be flagged by the enforced CompactionBracket check"
+    );
+    assert!(
+        log.violations
+            .iter()
+            .any(|v| v.invariant == "session.compaction_bracket_balanced"),
+        "expected the compaction_bracket_balanced violation, got {:#?}",
+        log.violations
+    );
+}
+
 /// An `Unknown` whose payload is a non-object value (e.g. `data: json!(123)`)
 /// serializes to exactly one top-level `op` key, with the bare value under
 /// `data`. The envelope encoding makes a scalar/array payload unambiguous: it

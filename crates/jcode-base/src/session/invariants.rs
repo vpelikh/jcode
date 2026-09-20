@@ -5,10 +5,15 @@
 //! reconstructable from the session log." We take the same shape here: a small
 //! set of *named* checks over the append-only event log. [`InvariantLog::enforce`]
 //! is the seam that turns a violation into a hard `debug_assert!` panic in dev
-//! and a structured log/metric in release, but it is **not yet wired into a
-//! production call site** — callers adopt it explicitly. Today the built-in
-//! checks run as a *diagnostic* pass on the load path (reporting violations to
-//! stderr in debug builds without aborting load) and in tests.
+//! and a structured log/metric in release. `enforce` is wired at the safe,
+//! deliberately narrow call site in
+//! `Session::compact_transcript_with_bracket` (after the bracket closes, where an
+//! open/duplicated bracket is provably a bug). Other callers adopt it explicitly;
+//! notably it is NOT enforced on the plain load/resume path, because a crashed
+//! session legitimately carries an open bracket / unanswered tool call there.
+//! The built-in checks additionally run as a *diagnostic* pass on the load path
+//! (reporting violations to stderr in debug builds without aborting load) and
+//! in tests.
 //!
 //! The registry also provides a minimal **projection seam** (takeaway #4): rather
 //! than re-scanning the raw event stream ad hoc, consumers fold committed
