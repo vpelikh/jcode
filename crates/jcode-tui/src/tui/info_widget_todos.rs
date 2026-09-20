@@ -309,6 +309,55 @@ fn push_aggregate_confidence_suffix(
     ));
 }
 
+/// Append the aggregate-confidence suffix only when it fits within `available`
+/// remaining columns. The suffix is informational and is dropped (never
+/// clipped) when the group header is too narrow, so it cannot overflow the box.
+fn push_aggregate_confidence_suffix_if_fits(
+    spans: &mut Vec<Span<'static>>,
+    score: Option<crate::todo::ConfidenceState>,
+    available: u16,
+) {
+    if aggregate_confidence_suffix_width(score) == 0
+        || aggregate_confidence_suffix_width(score) > available
+    {
+        return;
+    }
+    push_aggregate_confidence_suffix(spans, score);
+}
+
+/// Total display width of a row's spans, used to decide how much room remains
+/// for optional suffixes before the line can overflow `inner.width`.
+fn spans_width(spans: &[Span<'static>]) -> u16 {
+    use unicode_width::UnicodeWidthStr;
+    spans.iter().map(|s| s.content.width() as u16).sum()
+}
+
+/// Push a header, wrapping its spans into however many rows are needed so every
+/// row fits `inner.width` (no line is dropped or clipped). Header spans are
+/// short, indivisible units (label, counter, pips, confidence, loop suffix), so
+/// we greedily pack whole spans and break only between them. This lets the
+/// confidence + feedback-loop suffixes stay visible even on narrow widgets
+/// without overflowing the box.
+fn push_header_wrapped(lines: &mut Vec<Line<'static>>, header: Vec<Span<'static>>, inner: Rect) {
+    if header.is_empty() {
+        return;
+    }
+    let max = inner.width.max(1) as usize;
+    let mut row: Vec<Span<'static>> = Vec::new();
+    let mut row_w = 0usize;
+    use unicode_width::UnicodeWidthStr;
+    for span in header {
+        let w = span.content.width();
+        if row_w > 0 && row_w + w > max {
+            lines.push(Line::from(std::mem::take(&mut row)));
+            row_w = 0;
+        }
+        row_w += w;
+        row.push(span);
+    }
+    lines.push(Line::from(row));
+}
+
 /// Normalize a todo's group label, treating empty/whitespace as ungrouped.
 fn todo_group_key(todo: &crate::todo::TodoItem) -> Option<String> {
     todo.group
@@ -381,20 +430,41 @@ fn push_group_header(
     } else {
         Style::default().fg(rgb(170, 175, 205)).bold()
     };
-    let mut spans = vec![
-        Span::styled(truncate_smart(name, max_name), name_style),
-        Span::styled(counter, Style::default().fg(rgb(120, 120, 140))),
-    ];
-    push_aggregate_confidence_suffix(&mut spans, confidence);
-    if let Some(goal) = goal {
-        push_goal_loop_suffix(&mut spans, goal);
+    // Group names wrap instead of truncating so the full label always shows.
+    let name_lines = wrap_text_width(name, max_name);
+    for (i, name_line) in name_lines.iter().enumerate() {
+        let mut spans = if i == 0 {
+            vec![
+                Span::styled(name_line.clone(), name_style),
+                Span::styled(counter.clone(), Style::default().fg(rgb(120, 120, 140))),
+            ]
+        } else {
+            vec![Span::styled(name_line.clone(), name_style)]
+        };
+        if i == 0 {
+            // The name is already sized to reserve room, but when the widget is
+            // very narrow the reserved confidence/loop suffixes alone can exceed
+            // inner.width (the name clamps to a minimum). Guard each optional
+            // suffix so the group header never overflows its box; the suffix is
+            // informational and is dropped rather than clipped.
+            let avail = inner.width.saturating_sub(spans_width(&spans));
+            push_aggregate_confidence_suffix_if_fits(&mut spans, confidence, avail);
+            if let Some(goal) = goal {
+                let avail = inner.width.saturating_sub(spans_width(&spans));
+                if goal_loop_suffix_width(goal) <= avail {
+                    push_goal_loop_suffix(&mut spans, goal);
+                }
+            }
+        }
+        lines.push(Line::from(spans));
     }
-    lines.push(Line::from(spans));
 }
 
-/// Render one todo as a line. `show_priority_marker` adds the `!` high-priority
-/// marker (used by the expanded widget); `indent` is the leading-space depth
-/// used when items sit under a group header.
+/// Render one todo, wrapping its content across as many lines as needed so the
+/// full text always displays (no ellipsis truncation). Continuation pawns of a
+/// wrapped item repeat its status icon indented so the multi-line item stays
+/// visually attributed. `indent` is the leading-space depth used when items sit
+/// under a group header.
 fn push_todo_item_line(
     lines: &mut Vec<Line<'static>>,
     todo: &crate::todo::TodoItem,
@@ -429,14 +499,6 @@ fn push_todo_item_line(
         ""
     };
 
-    let reserved = indent as u16
-        + 3
-        + priority_marker.0.len() as u16
-        + suffix.len() as u16
-        + todo_confidence_suffix_width(todo);
-    let max_len = inner.width.saturating_sub(reserved) as usize;
-    let content = truncate_smart(&todo.content, max_len);
-
     let text_color = if todo.status == "completed" {
         rgb(100, 100, 110)
     } else if is_blocked {
@@ -447,59 +509,83 @@ fn push_todo_item_line(
         rgb(160, 160, 170)
     };
 
-    let mut spans = Vec::new();
+    // Fixed prefix consumed by the status glyph, optional priority marker, the
+    // per-item confidence suffix, and the blocked suffix.
+    let prefix_width = indent
+        + 2 // glyph + following space
+        + priority_marker.0.len()
+        + todo_confidence_suffix_width(todo) as usize;
+
+    let content_width = inner
+        .width
+        .saturating_sub(prefix_width as u16)
+        .saturating_sub(suffix.len() as u16)
+        .max(1) as usize;
+
+    let wrapped = wrap_text_width(&todo.content, content_width);
+
+    // First line carries the status glyph + priority marker + content + suffix.
+    let mut first_spans = Vec::new();
     if indent > 0 {
-        spans.push(Span::raw(" ".repeat(indent)));
+        first_spans.push(Span::raw(" ".repeat(indent)));
     }
-    spans.push(Span::styled(
+    first_spans.push(Span::styled(
         format!("{} ", icon),
         Style::default().fg(status_color),
     ));
     if !priority_marker.0.is_empty() {
-        spans.push(Span::styled(
+        first_spans.push(Span::styled(
             priority_marker.0,
             Style::default().fg(priority_marker.1),
         ));
     }
-    spans.push(Span::styled(content, Style::default().fg(text_color)));
-    push_todo_confidence_suffix(&mut spans, todo);
+    first_spans.push(Span::styled(
+        wrapped[0].clone(),
+        Style::default().fg(text_color),
+    ));
+    push_todo_confidence_suffix(&mut first_spans, todo);
     if !suffix.is_empty() {
-        spans.push(Span::styled(
+        first_spans.push(Span::styled(
             suffix.to_string(),
             Style::default().fg(rgb(100, 100, 110)),
         ));
     }
-    lines.push(Line::from(spans));
+    lines.push(Line::from(first_spans));
+
+    // Continuation lines: indent to align under the content start and repeat a
+    // dim glyph so the wrapped rows stay visually attributed to the item.
+    let cont_indent = indent + 2 + priority_marker.0.len();
+    for chunk in &wrapped[1..] {
+        let mut spans = Vec::new();
+        spans.push(Span::raw(" ".repeat(cont_indent)));
+        spans.push(Span::styled(
+            format!("{} ", icon),
+            Style::default().fg(status_color).dim(),
+        ));
+        spans.push(Span::styled(chunk.clone(), Style::default().fg(text_color)));
+        lines.push(Line::from(spans));
+    }
 }
 
-/// Render todos partitioned by group, honoring a `max_lines` budget that counts
-/// both group headers and item rows. Returns the rendered lines plus the number
-/// of todo items actually shown (so callers can render a "+N more" footer).
+/// Render every todo partitioned by group (headers + item rows), with no line
+/// budget and no "+N more" footer: the full list always renders. Returns the
+/// rendered lines so height computation can mirror them exactly.
 fn render_grouped_todo_lines(
     groups: &[(Option<String>, Vec<&crate::todo::TodoItem>)],
     goals: &[crate::todo::TodoGoal],
     inner: Rect,
     show_priority_marker: bool,
-    max_lines: usize,
-) -> (Vec<Line<'static>>, usize) {
+) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut shown = 0usize;
     for (group, items) in groups {
-        if lines.len() >= max_lines {
-            break;
-        }
         let header_name = group.as_deref().unwrap_or("Other");
         let goal = goal_for_group(goals, group.as_deref());
         push_group_header(&mut lines, header_name, items, goal, inner);
         for todo in sort_todos_by_status(items) {
-            if lines.len() >= max_lines {
-                break;
-            }
             push_todo_item_line(&mut lines, todo, inner, show_priority_marker, 2);
-            shown += 1;
         }
     }
-    (lines, shown)
+    lines
 }
 
 /// Header label for the todo slot: "Plan" when the items are the shared
@@ -525,11 +611,6 @@ pub(super) fn render_todos_widget(data: &InfoWidgetData, inner: Rect) -> Vec<Lin
         .iter()
         .filter(|t| t.status == "completed")
         .count();
-    let _in_progress: usize = data
-        .todos
-        .iter()
-        .filter(|t| t.status == "in_progress")
-        .count();
 
     // Header with progress + inline pip meter
     let mut header = vec![
@@ -544,53 +625,48 @@ pub(super) fn render_todos_widget(data: &InfoWidgetData, inner: Rect) -> Vec<Lin
     ];
     let pip_budget = (inner.width.saturating_sub(12) / 2).clamp(0, 10) as usize;
     push_todo_pips(&mut header, data, pip_budget);
-    push_aggregate_confidence_suffix(&mut header, aggregate_todo_confidence(&data.todos));
-
-    let available_lines = inner.height.saturating_sub(1) as usize; // Account for header
-    let budget = available_lines.clamp(1, 5);
+    // The header wraps to multiple rows (push_header_wrapped below), so the
+    // aggregate-confidence and feedback-loop suffixes each get their own row
+    // when wide. Clip them only when a suffix alone is wider than the box.
+    push_aggregate_confidence_suffix_if_fits(
+        &mut header,
+        aggregate_todo_confidence(&data.todos),
+        inner.width,
+    );
 
     // Grouped layout when any todo declares a group; otherwise the flat list.
     if let Some(groups) = grouped_todos(&data.todos) {
-        lines.push(Line::from(header));
-        let (group_lines, shown) =
-            render_grouped_todo_lines(&groups, &data.todo_goals, inner, false, budget);
-        lines.extend(group_lines);
-        if total > shown {
-            lines.push(Line::from(vec![Span::styled(
-                format!("  +{} more", total - shown),
-                Style::default().fg(rgb(100, 100, 110)),
-            )]));
-        }
+        push_header_wrapped(&mut lines, header, inner);
+        lines.extend(render_grouped_todo_lines(&groups, &data.todo_goals, inner, false));
         return lines;
     }
 
     // Flat list: the whole list is one implicit goal, so its feedback-loop score
     // (if recorded) lives on the header line.
-    if let Some(goal) = goal_for_group(&data.todo_goals, None) {
+    if let Some(goal) = goal_for_group(&data.todo_goals, None)
+        .filter(|goal| goal_loop_suffix_width(goal) <= inner.width)
+    {
         push_goal_loop_suffix(&mut header, goal);
     }
-    lines.push(Line::from(header));
+    push_header_wrapped(&mut lines, header, inner);
 
     // Sort todos: in_progress first, then pending, then completed
     let mut sorted_todos: Vec<&crate::todo::TodoItem> = data.todos.iter().collect();
     sorted_todos.sort_by(|a, b| status_sort_rank(&a.status).cmp(&status_sort_rank(&b.status)));
 
-    // Render todos (limit based on available height)
-    for todo in sorted_todos.iter().take(budget) {
+    // Render every todo with no height cap and no "+N more" footer.
+    for todo in sorted_todos {
         push_todo_item_line(&mut lines, todo, inner, false, 0);
     }
 
-    // Show count of remaining items
-    let shown = budget.min(sorted_todos.len());
-    if data.todos.len() > shown {
-        let remaining = data.todos.len() - shown;
-        lines.push(Line::from(vec![Span::styled(
-            format!("  +{} more", remaining),
-            Style::default().fg(rgb(100, 100, 110)),
-        )]));
-    }
-
     lines
+}
+
+/// Number of rows the todos widget would render at `width` (wrapping long
+/// items, no cap and no "+N more" footer). Used by page-layout height math so a
+/// widget that shows the full list is sized to match.
+pub(crate) fn todos_widget_line_count(data: &InfoWidgetData, width: u16) -> usize {
+    render_todos_widget(data, Rect::new(0, 0, width, u16::MAX)).len()
 }
 
 pub(super) fn render_todos_expanded(data: &InfoWidgetData, inner: Rect) -> Vec<Line<'static>> {
@@ -606,11 +682,6 @@ pub(super) fn render_todos_expanded(data: &InfoWidgetData, inner: Rect) -> Vec<L
         .iter()
         .filter(|t| t.status == "completed")
         .count();
-    let _in_progress: usize = data
-        .todos
-        .iter()
-        .filter(|t| t.status == "in_progress")
-        .count();
 
     // Header with progress + inline pip meter
     let mut header = vec![
@@ -625,67 +696,41 @@ pub(super) fn render_todos_expanded(data: &InfoWidgetData, inner: Rect) -> Vec<L
     ];
     let pip_budget = (inner.width.saturating_sub(12) / 2).clamp(0, 14) as usize;
     push_todo_pips(&mut header, data, pip_budget);
-    push_aggregate_confidence_suffix(&mut header, aggregate_todo_confidence(&data.todos));
-
-    let available_lines = MAX_TODO_LINES.saturating_sub(1); // Account for header
+    push_aggregate_confidence_suffix_if_fits(
+        &mut header,
+        aggregate_todo_confidence(&data.todos),
+        inner.width,
+    );
 
     // Grouped layout when any todo declares a group; otherwise the flat list.
     if let Some(groups) = grouped_todos(&data.todos) {
-        lines.push(Line::from(header));
-        let (group_lines, shown) =
-            render_grouped_todo_lines(&groups, &data.todo_goals, inner, true, available_lines);
-        lines.extend(group_lines);
-        if total > shown {
-            lines.push(Line::from(vec![Span::styled(
-                format!("  +{} more", total - shown),
-                Style::default().fg(rgb(100, 100, 110)),
-            )]));
-        }
+        push_header_wrapped(&mut lines, header, inner);
+        lines.extend(render_grouped_todo_lines(&groups, &data.todo_goals, inner, true));
         return lines;
     }
 
     // Flat list: the whole list is one implicit goal, so its feedback-loop score
     // (if recorded) lives on the header line.
-    if let Some(goal) = goal_for_group(&data.todo_goals, None) {
+    if let Some(goal) = goal_for_group(&data.todo_goals, None)
+        .filter(|goal| goal_loop_suffix_width(goal) <= inner.width)
+    {
         push_goal_loop_suffix(&mut header, goal);
     }
-    lines.push(Line::from(header));
+    push_header_wrapped(&mut lines, header, inner);
 
     // Sort todos: in_progress first, then pending, then completed
     let mut sorted_todos: Vec<&crate::todo::TodoItem> = data.todos.iter().collect();
     sorted_todos.sort_by(|a, b| status_sort_rank(&a.status).cmp(&status_sort_rank(&b.status)));
 
-    // Render todos with priority colors
-    for todo in sorted_todos.iter().take(available_lines) {
+    // Render every todo with no height cap and no "+N more" footer.
+    for todo in sorted_todos {
         push_todo_item_line(&mut lines, todo, inner, true, 0);
-    }
-
-    // Show count of remaining items
-    let shown = available_lines.min(sorted_todos.len());
-    if data.todos.len() > shown {
-        let remaining = data.todos.len() - shown;
-        let remaining_completed = sorted_todos
-            .iter()
-            .skip(shown)
-            .filter(|t| t.status == "completed")
-            .count();
-        let desc = if remaining_completed == remaining {
-            format!("  +{} done", remaining)
-        } else if remaining_completed > 0 {
-            format!("  +{} more ({} done)", remaining, remaining_completed)
-        } else {
-            format!("  +{} more", remaining)
-        };
-        lines.push(Line::from(vec![Span::styled(
-            desc,
-            Style::default().fg(rgb(100, 100, 110)),
-        )]));
     }
 
     lines
 }
 
-pub(super) fn render_todos_compact(data: &InfoWidgetData, _inner: Rect) -> Vec<Line<'static>> {
+pub(super) fn render_todos_compact(data: &InfoWidgetData, inner: Rect) -> Vec<Line<'static>> {
     if data.todos.is_empty() {
         return Vec::new();
     }
@@ -716,16 +761,28 @@ pub(super) fn render_todos_compact(data: &InfoWidgetData, _inner: Rect) -> Vec<L
             Style::default().fg(rgb(140, 140, 150)),
         ),
     ];
-    push_aggregate_confidence_suffix(&mut summary, aggregate_todo_confidence(&data.todos));
-    if let Some(goal) = goal_for_group(&data.todo_goals, None) {
+    push_aggregate_confidence_suffix_if_fits(
+        &mut summary,
+        aggregate_todo_confidence(&data.todos),
+        inner.width,
+    );
+    if let Some(goal) = goal_for_group(&data.todo_goals, None)
+        .filter(|goal| goal_loop_suffix_width(goal) <= inner.width)
+    {
         push_goal_loop_suffix(&mut summary, goal);
     }
 
-    vec![
-        Line::from(vec![Span::styled(
-            todos_widget_label(data),
-            Style::default().fg(rgb(180, 180, 190)).bold(),
-        )]),
-        Line::from(summary),
-    ]
+    let mut lines = vec![Line::from(vec![Span::styled(
+        todos_widget_label(data),
+        Style::default().fg(rgb(180, 180, 190)).bold(),
+    )])];
+    push_header_wrapped(&mut lines, summary, inner);
+    lines
+}
+
+/// Number of rows the compact todos surface renders at `width` (the label row
+/// plus the wrapped summary rows). Used by the overview page-layout height math
+/// so the compact section's reserved height matches its rendered rows exactly.
+pub(crate) fn todos_compact_line_count(data: &InfoWidgetData, width: u16) -> usize {
+    render_todos_compact(data, Rect::new(0, 0, width, u16::MAX)).len()
 }
