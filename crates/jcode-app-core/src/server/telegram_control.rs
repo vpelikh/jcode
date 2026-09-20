@@ -139,7 +139,33 @@ where
 /// turn (if any). The agent's run loop checks the graceful_shutdown flag at
 /// safe points and stops generating, returning whatever partial response was
 /// produced so far. Returns `false` if the session is not live.
+///
+/// This is lock-free by design: during a streaming turn the stream task holds
+/// the agent's mutex the whole time, so `agent.lock().await` would block until
+/// the turn finishes and a "Stop" request would do nothing while the model keeps
+/// generating. Instead we fire every turn-cancel signal the agent registered in
+/// the process-global [`turn_cancel_registry`] for the running turn (the same
+/// mechanism the TUI's Esc and the Jade relay use). The registry's RAII guard
+/// resets the signal when the turn ends, so one abort never leaks into the next
+/// turn. For turns that are not currently streaming (no active registration),
+/// we fall back to setting the agent's graceful-shutdown flag directly via a
+/// non-blocking `try_lock`, which is safe because a non-streaming agent that
+/// holds no active turn cannot be mid-generation.
 pub async fn request_graceful_shutdown_for_control(session_id: &str) -> bool {
+    // Prefer the turn-cancel registry: it is the authoritative source for
+    // in-flight streams and never blocks on the busy agent mutex.
+    let registered = crate::turn_cancel_registry::active_turn_signals(session_id);
+    if !registered.is_empty() {
+        for signal in &registered {
+            signal.fire();
+        }
+        crate::logging::info(&format!(
+            "telegram graceful shutdown requested for live streaming turn session={session_id} signals={}",
+            registered.len()
+        ));
+        return true;
+    }
+
     let Some(sessions) = LIVE_SESSIONS.get() else {
         return false;
     };
@@ -150,8 +176,19 @@ pub async fn request_graceful_shutdown_for_control(session_id: &str) -> bool {
     let Some(agent) = agent else {
         return false;
     };
-    let guard = agent.lock().await;
-    guard.request_graceful_shutdown();
+    // No active turn is registered; flag the agent directly without blocking.
+    // A `try_lock` succeeds whenever no turn currently holds the agent mutex,
+    // which is exactly the non-streaming case where flagging is meaningful.
+    if let Ok(guard) = agent.try_lock() {
+        guard.request_graceful_shutdown();
+        crate::logging::info(&format!(
+            "telegram graceful shutdown flagged for idle session session={session_id}"
+        ));
+        return true;
+    }
+    crate::logging::info(&format!(
+        "telegram graceful shutdown requested but agent busy session={session_id}"
+    ));
     true
 }
 
