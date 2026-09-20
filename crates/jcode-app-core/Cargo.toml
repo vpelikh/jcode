@@ -106,9 +106,9 @@ jcode-tool-core = { path = "../jcode-tool-core" }
 # NOTE: compass-core pulls in compass-history, which pins time = "=0.3.53"; the
 # workspace root pins time to 0.3.53 so the two co-resolve (aws/azure/ratatui
 # accept ^0.3.4, so this is compatible).
-compass-query = { git = "https://github.com/crabbuild/compass", tag = "compass-v0.3.23" }
-compass-model = { git = "https://github.com/crabbuild/compass", tag = "compass-v0.3.23" }
-compass-core = { git = "https://github.com/crabbuild/compass", tag = "compass-v0.3.23" }
+compass-query = { git = "https://github.com/crabbuild/compass", tag = "compass-v0.3.28" }
+compass-model = { git = "https://github.com/crabbuild/compass", tag = "compass-v0.3.28" }
+compass-core = { git = "https://github.com/crabbuild/compass", tag = "compass-v0.3.28" }
 jcode-tool-types = { path = "../jcode-tool-types" }
 
 # Archive extraction (for auto-update)
@@ -118,7 +118,9 @@ tempfile = "3"
 agentgrep = { git = "https://github.com/1jehuang/agentgrep.git", tag = "v0.1.6" }
 
 [features]
-default = ["pdf", "embeddings", "bedrock"]
+# jemalloc is a default allocator feature (matches the root crate): it forwards
+# down to jcode-base, giving a page-returning allocator that bounds RSS.
+default = ["pdf", "embeddings", "bedrock", "jemalloc"]
 # jemalloc allocator stats live in jcode-base (process_memory); forward there.
 jemalloc = ["jcode-base/jemalloc"]
 jemalloc-prof = ["jcode-base/jemalloc-prof"]
