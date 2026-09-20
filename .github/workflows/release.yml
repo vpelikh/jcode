@@ -154,6 +154,11 @@ jobs:
           else
             cargo build --release --target ${{ matrix.target }}
           fi
+          # Native GPU desktop app, shipped as a sibling of the `jcode` binary
+          # so `setup-launcher --desktop` can bundle it. Best-effort: it is a
+          # non-essential companion on Linux, but required for the Jcode
+          # Desktop.app bundle on macOS.
+          cargo build --release --target ${{ matrix.target }} -p jcode-desktop2 --bin jcode-desktop2 || echo "::warning::jcode-desktop2 build skipped for ${{ matrix.target }}"
         env:
           JCODE_RELEASE_BUILD: "1"
           JCODE_CI_BUILD: "1"
@@ -175,7 +180,13 @@ jobs:
           mkdir -p dist
           cp target/${{ matrix.target }}/release/jcode dist/${{ matrix.artifact }}
           chmod +x dist/${{ matrix.artifact }}
-          cd dist && tar czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
+          # Ship the desktop binary as a sibling so the installed payload can
+          # generate the Jcode Desktop.app bundle.
+          if [ -f target/${{ matrix.target }}/release/jcode-desktop2 ]; then
+            cp target/${{ matrix.target }}/release/jcode-desktop2 dist/jcode-desktop2-${{ matrix.target }}
+            chmod +x dist/jcode-desktop2-${{ matrix.target }}
+          fi
+          cd dist && tar czf ${{ matrix.artifact }}.tar.gz .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
