@@ -21,6 +21,14 @@ The loop entry is gated behind `loop_mode` and local-session scope, matching the
 proposal. The final confirmation pass re-runs all six lenses against the final code
 state; only an all-CLEAN final pass converges.
 
+As of the default-on change (`jc/review-flow`), `AutoReviewConfig.enabled` and
+`loop_mode` both default to `true`, so the review loop runs as part of the normal
+flow without manual opt-in. The one-shot "double-check this turn's weak points"
+digest still fires even while the loop is active (it is cheap and verifies the weak
+points the agent's own assessments surfaced); delivering it first lets that lighter
+verification run before the heavier per-lens loop steps. Auto-seeding is suppressed
+only under the unit-test harness, which keeps todo-completion tests deterministic.
+
 Once a session's todos are complete, jcode has nothing between "work done" and
 "final response". The completion gates check *assessments*, not the *result*. We
 want a second pass that reviews the finished work for bugs, minors, and overlooked
@@ -241,7 +249,7 @@ failing, surface + stop (no ping-pong).
 ## Config (on `AutoReviewConfig`)
 
 - `enabled`, `model` (existing)
-- `loop_mode` (new, default false, autoreview-only)
+- `loop_mode` (new, default true, autoreview-only)
 - `max_stalled_turns` (new, default 3, 0 = unlimited)
 
 ## Cost
