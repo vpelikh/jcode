@@ -17,6 +17,11 @@
 //!    deadlock (threads in futex wait) from a spin (threads running) from a
 //!    blocked syscall (threads in a network/IO wchan).
 //!
+//! In addition to the log, these observations are published as
+//! [`WatchdogEvent`]s on a process-wide broadcast channel (see [`subscribe`]),
+//! so live code such as a degradation tracker can react to a stall in real
+//! time rather than only reading it from a log after the fact.
+//!
 //! The monitor thread is independent of the async runtime and the UI loop, so
 //! it still reports when either is wedged.
 
@@ -32,6 +37,88 @@ const DEFAULT_HEARTBEAT_SECS: u64 = 300;
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// Cap on threads included in a stall dump so one dump cannot flood the log.
 const MAX_THREADS_IN_DUMP: usize = 48;
+/// Capacity of the stall-event broadcast channel. Subscribers that fall more
+/// than this many events behind drop the oldest; that is correct here because
+/// these are state signals with a fresh snapshot every poll, not a gapless log.
+const EVENT_CAPACITY: usize = 64;
+/// The `watchdog.stall` event is emitted no more often than this backoff.
+/// Kept in sync with the log-side backoff policy in [`monitor_loop`].
+const STALL_BACKOFF_MULTIPLIER: u32 = 2;
+
+/// A structured watchdog observation, published to subscribers so live code
+/// (e.g. the model-degradation tracker) can react to a stall or recovery in
+/// real time instead of only seeing it in the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchdogEvent {
+    /// The process stopped making progress while work was in flight.
+    Stall {
+        phase: String,
+        detail: String,
+        stalled_secs: u64,
+        rss_mb: u64,
+        threads: usize,
+    },
+    /// Progress resumed after a stall.
+    Recovered { stalled_secs: u64 },
+    /// Periodic liveness beat (process alive and whatever it is doing).
+    Alive {
+        phase: String,
+        detail: String,
+        busy: bool,
+        uptime_secs: u64,
+        rss_mb: u64,
+        threads: usize,
+    },
+}
+
+impl WatchdogEvent {
+    /// Short stable tag used as the `event=` name for logs and as a match
+    /// discriminator for subscribers.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Stall { .. } => "stall",
+            Self::Recovered { .. } => "recovered",
+            Self::Alive { .. } => "alive",
+        }
+    }
+}
+
+static EVENT_TX: OnceLock<std::sync::Mutex<Option<tokio::sync::broadcast::Sender<WatchdogEvent>>>> =
+    OnceLock::new();
+
+fn event_sender() -> tokio::sync::broadcast::Sender<WatchdogEvent> {
+    let lock = EVENT_TX.get_or_init(|| std::sync::Mutex::new(None));
+    let mut guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(sender) = &*guard {
+        return sender.clone();
+    }
+    let (tx, _rx) = tokio::sync::broadcast::channel(EVENT_CAPACITY);
+    *guard = Some(tx.clone());
+    tx
+}
+
+/// Subscribe to live watchdog events ([`WatchdogEvent::Stall`], `Recovered`,
+/// `Alive`). The receiver starts after the currently-buffered events (broadcast
+/// semantics), so a late subscriber does not see history it missed.
+///
+/// Exactly one shared broadcast channel is used process-wide, matching the
+/// log-only design: subscribers can be added at any time without disturbing
+/// the watchdog thread.
+pub fn subscribe() -> tokio::sync::broadcast::Receiver<WatchdogEvent> {
+    event_sender().subscribe()
+}
+
+fn publish(event: &WatchdogEvent) {
+    let Some(lock) = EVENT_TX.get() else {
+        return;
+    };
+    if let Ok(guard) = lock.lock() {
+        // No subscribers is fine; broadcast::try_send is a no-op then.
+        if let Some(sender) = &*guard {
+            let _ = sender.send(event.clone());
+        }
+    }
+}
 
 static STARTED: AtomicBool = AtomicBool::new(false);
 static LAST_BEAT_MS: AtomicU64 = AtomicU64::new(0);
@@ -285,10 +372,17 @@ fn monitor_loop(stall: Duration, heartbeat: Duration) {
                     ("thread_states", states.join(" | ")),
                 ],
             );
+            publish(&WatchdogEvent::Stall {
+                phase: current_phase().to_string(),
+                detail: current_detail(),
+                stalled_secs: since_beat.as_secs(),
+                rss_mb: resources.rss_mb,
+                threads: resources.threads,
+            });
             stall_reported_at = Some(since_beat);
             // Back off so a long hang produces a few informative dumps rather
             // than a log full of identical ones.
-            next_stall_report = since_beat.saturating_mul(2).max(stall);
+            next_stall_report = since_beat.saturating_mul(STALL_BACKOFF_MULTIPLIER).max(stall);
             continue;
         }
 
@@ -302,6 +396,9 @@ fn monitor_loop(stall: Duration, heartbeat: Duration) {
                     ("stalled_secs", reported.as_secs().to_string()),
                 ],
             );
+            publish(&WatchdogEvent::Recovered {
+                stalled_secs: reported.as_secs(),
+            });
             stall_reported_at = None;
             next_stall_report = stall;
         }
@@ -337,6 +434,14 @@ fn emit_heartbeat_if_due(
             ("open_fds", resources.open_fds.to_string()),
         ],
     );
+    publish(&WatchdogEvent::Alive {
+        phase: current_phase().to_string(),
+        detail: current_detail(),
+        busy: is_busy(),
+        uptime_secs: process_start().elapsed().as_secs(),
+        rss_mb: resources.rss_mb,
+        threads: resources.threads,
+    });
 }
 
 #[cfg(test)]
@@ -386,5 +491,51 @@ mod tests {
                 "expected tid:name:state:wchan, got {first}"
             );
         }
+    }
+
+    #[test]
+    fn subscribe_provides_distinct_receivers_on_one_channel() {
+        let mut rx1 = subscribe();
+        let mut rx2 = subscribe();
+        // Both receivers must be live and reading from the same channel.
+        publish(&WatchdogEvent::Stall {
+            phase: "p".to_string(),
+            detail: "d".to_string(),
+            stalled_secs: 1,
+            rss_mb: 2,
+            threads: 3,
+        });
+        assert!(matches!(rx1.try_recv(), Ok(WatchdogEvent::Stall { .. })));
+        assert!(matches!(rx2.try_recv(), Ok(WatchdogEvent::Stall { .. })));
+    }
+
+    #[test]
+    fn event_name_returns_stable_tags() {
+        let stall = WatchdogEvent::Stall {
+            phase: "p".to_string(),
+            detail: "d".to_string(),
+            stalled_secs: 1,
+            rss_mb: 2,
+            threads: 3,
+        };
+        let recovered = WatchdogEvent::Recovered { stalled_secs: 1 };
+        let alive = WatchdogEvent::Alive {
+            phase: "p".to_string(),
+            detail: "d".to_string(),
+            busy: true,
+            uptime_secs: 1,
+            rss_mb: 2,
+            threads: 3,
+        };
+        assert_eq!(stall.name(), "stall");
+        assert_eq!(recovered.name(), "recovered");
+        assert_eq!(alive.name(), "alive");
+    }
+
+    #[test]
+    fn publish_without_subscribers_is_a_noop() {
+        // Must not panic when the channel has no active receivers (broadcast
+        // send ignores the `Err` from a zero-receiver channel).
+        publish(&WatchdogEvent::Recovered { stalled_secs: 5 });
     }
 }
