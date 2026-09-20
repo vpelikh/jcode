@@ -426,6 +426,57 @@ pub fn list_all_handoffs() -> Vec<HandoffSnapshot> {
     snapshots
 }
 
+/// Serialize a saved handoff snapshot as an opaque portable payload.
+///
+/// This is the transfer half of the remote-adoption flow: a snapshot exported
+/// on one host can be shipped (transcript of the handoff store, SSH, etc.) to
+/// another host and re-adopted there with [`import_handoff`]. Fails with
+/// `None` when the session id is unknown.
+pub fn export_handoff(session_id: &str) -> Option<String> {
+    let snapshot = load_snapshot(session_id)?;
+    serde_json::to_string(&snapshot).ok()
+}
+
+/// Adopt a portable handoff payload into this host's store.
+///
+/// The remote-adoption counterpart to [`export_handoff`]: parses a payload
+/// formerly produced there, rekeys it to the current working directory's
+/// project (so it is found by this host's automatic first-message injection
+/// and the `/handoff` picker), writes it as a snapshot file, and *explicitly
+/// registers it with the project in the index*. Unlike a blanket on-disk scan,
+/// adoption is a deliberate act: the imported snapshot is intentionally live,
+/// so it cannot silently resurrect a retired handoff.
+///
+/// When the target project already has a *newer* local handoff, that one stays
+/// as the project's latest entry (upsert keeps the newer timestamp) and the
+/// import is retained as an archived, still-manually-selectable snapshot. Only
+/// when the imported snapshot is the newest for the project does it become the
+/// automatic latest-for-project pick.
+///
+/// Returns the adopted session id (a fresh UUID that does not collide with an
+/// existing snapshot), or `None` when the payload is malformed or the working
+/// directory has no resolvable project key.
+pub fn import_handoff(
+    payload: &str,
+    working_dir: Option<&Path>,
+    disposition: &str,
+) -> Option<String> {
+    let project = project_key(working_dir)?;
+    let mut snapshot: HandoffSnapshot = serde_json::from_str(payload).ok()?;
+    // Re-key to this host's project identity so lookup and injection find it.
+    snapshot.project_key = project.clone();
+    snapshot.disposition = disposition.to_string();
+
+    let _lock = lock_store().ok()?;
+    let dir = handoffs_dir().ok()?;
+    // A fresh session id avoids overwriting a local snapshot for the same id.
+    let session_id = format!("import-{}", uuid::Uuid::new_v4());
+    snapshot.session_id = session_id.clone();
+    crate::storage::write_json_fast(&file_path(&dir, &session_id).ok()?, &snapshot).ok()?;
+    upsert_index(&snapshot).ok()?;
+    Some(session_id)
+}
+
 /// Prune archived handoff snapshot files so the store does not grow without
 /// bound as sessions accumulate.
 ///
