@@ -152,7 +152,7 @@ mod tests {
 
     fn tool_use(name: &str, input: serde_json::Value) -> ContentBlock {
         ContentBlock::ToolUse {
-            id: format!("t-{name}"),
+            id: format!("t-{name}").into(),
             name: name.to_string(),
             input,
             thought_signature: None,

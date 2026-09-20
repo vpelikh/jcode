@@ -885,7 +885,7 @@ mod tests {
         let tool_use = Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
-                id: "call_1".to_string(),
+                id: "call_1".to_string().into(),
                 name: "read".to_string(),
                 input: serde_json::json!({"file":"src/lib.rs"}),
                 thought_signature: None,
@@ -896,7 +896,7 @@ mod tests {
         let tool_result = Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
-                tool_use_id: "call_1".to_string(),
+                tool_use_id: "call_1".to_string().into(),
                 content: "ok".to_string(),
                 is_error: None,
             }],
@@ -969,7 +969,7 @@ mod tests {
                     cache_control: None,
                 },
                 ContentBlock::ToolResult {
-                    tool_use_id: "call_1".to_string(),
+                    tool_use_id: "call_1".to_string().into(),
                     content: "tool output".to_string(),
                     is_error: None,
                 },
@@ -989,7 +989,7 @@ mod tests {
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
-                    id: "call_1".to_string(),
+                    id: "call_1".to_string().into(),
                     name: "read".to_string(),
                     input: serde_json::json!({"file":"src/lib.rs"}),
                     thought_signature: None,
@@ -1075,7 +1075,7 @@ mod tests {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
-                tool_use_id: "call_x".to_string(),
+                tool_use_id: "call_x".to_string().into(),
                 content: "r".repeat(content_len),
                 is_error: None,
             }],

@@ -508,7 +508,7 @@ fn test_safe_cutoff_preserves_tool_pairs() {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
-                id: "tool_1".to_string(),
+                id: "tool_1".to_string().into(),
                 name: "bash".to_string(),
                 input: serde_json::json!({"command": "ls"}),
                 thought_signature: None,
@@ -519,7 +519,7 @@ fn test_safe_cutoff_preserves_tool_pairs() {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
-                tool_use_id: "tool_1".to_string(),
+                tool_use_id: "tool_1".to_string().into(),
                 content: "file1.txt\nfile2.txt".to_string(),
                 is_error: Some(false),
             }],
@@ -559,7 +559,7 @@ fn test_safe_cutoff_handles_chained_tool_dependencies_without_rescan() {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
-                id: "tool_a".to_string(),
+                id: "tool_a".to_string().into(),
                 name: "read".to_string(),
                 input: serde_json::json!({"file": "a.txt"}),
                 thought_signature: None,
@@ -572,12 +572,12 @@ fn test_safe_cutoff_handles_chained_tool_dependencies_without_rescan() {
             role: Role::Assistant,
             content: vec![
                 ContentBlock::ToolResult {
-                    tool_use_id: "tool_a".to_string(),
+                    tool_use_id: "tool_a".to_string().into(),
                     content: "a contents".to_string(),
                     is_error: Some(false),
                 },
                 ContentBlock::ToolUse {
-                    id: "tool_b".to_string(),
+                    id: "tool_b".to_string().into(),
                     name: "grep".to_string(),
                     input: serde_json::json!({"pattern": "foo"}),
                     thought_signature: None,
@@ -589,7 +589,7 @@ fn test_safe_cutoff_handles_chained_tool_dependencies_without_rescan() {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
-                tool_use_id: "tool_b".to_string(),
+                tool_use_id: "tool_b".to_string().into(),
                 content: "foo".to_string(),
                 is_error: Some(false),
             }],
@@ -617,7 +617,7 @@ fn test_emergency_truncate_large_tool_results() {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
-                id: "tool_1".to_string(),
+                id: "tool_1".to_string().into(),
                 name: "bash".to_string(),
                 input: serde_json::json!({"command": "cat bigfile"}),
                 thought_signature: None,
@@ -628,7 +628,7 @@ fn test_emergency_truncate_large_tool_results() {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
-                tool_use_id: "tool_1".to_string(),
+                tool_use_id: "tool_1".to_string().into(),
                 content: big_result.clone(),
                 is_error: Some(false),
             }],
@@ -665,7 +665,7 @@ fn test_emergency_truncate_skips_small_results() {
     let mut messages = vec![Message {
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
-            tool_use_id: "tool_1".to_string(),
+            tool_use_id: "tool_1".to_string().into(),
             content: "small output".to_string(),
             is_error: Some(false),
         }],
@@ -1044,7 +1044,7 @@ fn test_recover_within_budget_truncates_when_tail_still_too_large() {
         messages.push(Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
-                id: id.clone(),
+                id: id.clone().into(),
                 name: "bash".to_string(),
                 input: serde_json::json!({ "command": "cat big.log" }),
                 thought_signature: None,
@@ -1056,7 +1056,7 @@ fn test_recover_within_budget_truncates_when_tail_still_too_large() {
         messages.push(Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
-                tool_use_id: id,
+                tool_use_id: id.into(),
                 content: format!("huge {} {}", i, "y".repeat(20_000)),
                 is_error: Some(false),
             }],

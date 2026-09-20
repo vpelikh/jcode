@@ -221,7 +221,7 @@ impl LogInvariant for ToolPairingBalanced {
     fn check(&self, map: &SessionEventMap) -> Result<(), InvariantViolation> {
         let messages = map.derive_messages();
         // Stack of open tool_call ids, in the order the assistant emitted them.
-        let mut open: Vec<String> = Vec::new();
+        let mut open: Vec<super::ToolCallId> = Vec::new();
         for (i, m) in messages.iter().enumerate() {
             for block in &m.content {
                 match block {
@@ -434,7 +434,7 @@ mod tests {
             id: id.to_string(),
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
-                id: tool_id.to_string(),
+                id: tool_id.to_string().into(),
                 name: "bash".into(),
                 input: serde_json::json!({}),
                 thought_signature: None,
@@ -451,7 +451,7 @@ mod tests {
             id: id.to_string(),
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
-                tool_use_id: tool_id.to_string(),
+                tool_use_id: tool_id.to_string().into(),
                 content: "ok".into(),
                 is_error: None,
             }],

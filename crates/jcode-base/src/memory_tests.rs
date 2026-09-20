@@ -259,7 +259,7 @@ fn format_context_includes_roles_and_tools() {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
-                id: "tool-1".to_string(),
+                id: "tool-1".to_string().into(),
                 name: "memory".to_string(),
                 input: json!({"action": "list"}),
                 thought_signature: None,
@@ -271,7 +271,7 @@ fn format_context_includes_roles_and_tools() {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
-                tool_use_id: "tool-2".to_string(),
+                tool_use_id: "tool-2".to_string().into(),
                 content: "boom".to_string(),
                 is_error: Some(true),
             }],
@@ -294,7 +294,7 @@ fn extraction_context_keeps_tool_io_details() {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
-                id: "tool-1".to_string(),
+                id: "tool-1".to_string().into(),
                 name: "memory".to_string(),
                 input: json!({"action": "list"}),
                 thought_signature: None,
@@ -917,7 +917,7 @@ fn focused_query_excludes_multiline_tool_errors_but_keeps_later_user_prose() {
         role: Role::User,
         content: vec![
             ContentBlock::ToolResult {
-                tool_use_id: "tool-1".to_string(),
+                tool_use_id: "tool-1".to_string().into(),
                 content: "This command was not run.\nUNIQUE_MULTILINE_ERROR_PAYLOAD\nThe target cannot be confirmed.\nThe operation is irreversible."
                     .to_string(),
                 is_error: Some(true),

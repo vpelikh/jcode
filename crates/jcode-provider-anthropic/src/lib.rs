@@ -38,10 +38,10 @@ pub fn format_messages(messages: &[Message], is_oauth: bool) -> Vec<ApiMessage> 
         for block in &msg.content {
             match block {
                 ContentBlock::ToolUse { id, .. } => {
-                    tool_use_ids.insert(id.clone());
+                    tool_use_ids.insert(id.to_string());
                 }
                 ContentBlock::ToolResult { tool_use_id, .. } => {
-                    tool_result_ids.insert(tool_use_id.clone());
+                    tool_result_ids.insert(tool_use_id.to_string());
                 }
                 _ => {}
             }
@@ -81,10 +81,10 @@ pub fn format_messages(messages: &[Message], is_oauth: bool) -> Vec<ApiMessage> 
             let mut synthetic_results: Vec<ApiContentBlock> = Vec::new();
             for block in &msg.content {
                 if let ContentBlock::ToolUse { id, .. } = block
-                    && dangling.contains(id)
+                    && dangling.contains(id.as_str())
                 {
                     synthetic_results.push(ApiContentBlock::ToolResult {
-                        tool_use_id: sanitize_tool_id(id),
+                        tool_use_id: sanitize_tool_id(id.as_str()),
                         content: ToolResultContent::Text(
                             "[Session interrupted before tool execution completed]".to_string(),
                         ),
@@ -238,13 +238,13 @@ fn dedupe_tool_results(messages: &[Message]) -> Vec<Message> {
             let real = !is_placeholder_tool_result(content, *is_error);
             match winner_is_real.get(tool_use_id.as_str()) {
                 None => {
-                    winner.insert(tool_use_id, (mi, bi));
-                    winner_is_real.insert(tool_use_id, real);
+                    winner.insert(tool_use_id.as_str(), (mi, bi));
+                    winner_is_real.insert(tool_use_id.as_str(), real);
                 }
                 Some(false) if real => {
                     // Upgrade a placeholder winner to the real output.
-                    winner.insert(tool_use_id, (mi, bi));
-                    winner_is_real.insert(tool_use_id, true);
+                    winner.insert(tool_use_id.as_str(), (mi, bi));
+                    winner_is_real.insert(tool_use_id.as_str(), true);
                     duplicate_seen = true;
                 }
                 Some(_) => duplicate_seen = true,
@@ -331,7 +331,7 @@ pub fn format_content_blocks(blocks: &[ContentBlock], is_oauth: bool) -> Vec<Api
                 id, name, input, ..
             } => {
                 result.push(ApiContentBlock::ToolUse {
-                    id: sanitize_tool_id(id),
+                    id: sanitize_tool_id(id.as_str()),
                     name: if is_oauth {
                         map_tool_name_for_oauth(name)
                     } else {
@@ -351,7 +351,7 @@ pub fn format_content_blocks(blocks: &[ContentBlock], is_oauth: bool) -> Vec<Api
                 is_error,
             } => {
                 result.push(ApiContentBlock::ToolResult {
-                    tool_use_id: sanitize_tool_id(tool_use_id),
+                    tool_use_id: sanitize_tool_id(tool_use_id.as_str()),
                     content: ToolResultContent::Text(content.clone()),
                     is_error: is_error.unwrap_or(false),
                 });

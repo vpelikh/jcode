@@ -141,7 +141,7 @@ pub fn export_timeline(session: &Session) -> Vec<TimelineEvent> {
     let session_start = session.created_at;
 
     // Track tool IDs for pairing ToolUse → ToolResult
-    let mut pending_tools: Vec<(String, String, serde_json::Value)> = Vec::new(); // (id, name, input)
+    let mut pending_tools: Vec<(crate::session::ToolCallId, String, serde_json::Value)> = Vec::new(); // (id, name, input)
 
     // Track memory injections by message index
     let mut memory_by_msg: std::collections::HashMap<usize, Vec<_>> =

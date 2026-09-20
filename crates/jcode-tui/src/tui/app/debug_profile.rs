@@ -230,17 +230,17 @@ impl App {
         let catchup_return_stack_bytes: usize = self
             .catchup_return_stack
             .iter()
-            .map(|value| value.capacity())
+            .map(|value| value.as_str().len())
             .sum();
         let tool_tracking_bytes: usize = self
             .tool_call_ids
             .iter()
-            .map(|value| value.capacity())
+            .map(|value| value.as_str().len())
             .sum::<usize>()
             + self
                 .tool_result_ids
                 .iter()
-                .map(|value| value.capacity())
+                .map(|value| value.as_str().len())
                 .sum::<usize>();
         let remote_sessions_bytes: usize = self
             .remote_sessions

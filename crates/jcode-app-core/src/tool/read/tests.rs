@@ -747,7 +747,7 @@ fn read_message(
         id: id.to_string(),
         role: Role::User,
         content: vec![ContentBlock::ToolUse {
-            id: format!("call-{id}"),
+            id: format!("call-{id}").into(),
             name: "read".to_string(),
             input: json!({
                 "file_path": file,
@@ -774,7 +774,7 @@ fn collect_prior_read_candidates_skips_compacted_and_non_read_messages() {
             id: "m1".to_string(),
             role: Role::User,
             content: vec![ContentBlock::ToolUse {
-                id: "call-bash".to_string(),
+                id: "call-bash".to_string().into(),
                 name: "bash".to_string(),
                 input: json!({ "command": "ls" }),
                 thought_signature: None,
@@ -839,7 +839,7 @@ async fn read_tool_dedup_returns_pointer_for_unchanged_reread() {
         id: "m0".to_string(),
         role: crate::message::Role::User,
         content: vec![ContentBlock::ToolUse {
-            id: "call-read".to_string(),
+            id: "call-read".to_string().into(),
             name: "read".to_string(),
             input: json!({
                 "file_path": file.to_str().unwrap(),
@@ -923,7 +923,7 @@ async fn read_tool_dedup_returns_fresh_content_when_file_changed() {
         id: "m0".to_string(),
         role: crate::message::Role::User,
         content: vec![ContentBlock::ToolUse {
-            id: "call-read".to_string(),
+            id: "call-read".to_string().into(),
             name: "read".to_string(),
             input: json!({
                 "file_path": file.to_str().unwrap(),
@@ -1008,7 +1008,7 @@ async fn read_tool_dedup_skips_lookup_for_small_reads() {
         id: "m0".to_string(),
         role: crate::message::Role::User,
         content: vec![ContentBlock::ToolUse {
-            id: "call-read".to_string(),
+            id: "call-read".to_string().into(),
             name: "read".to_string(),
             input: json!({
                 "file_path": file.to_str().unwrap(),

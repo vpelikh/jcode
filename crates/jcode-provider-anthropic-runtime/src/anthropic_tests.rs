@@ -853,13 +853,13 @@ async fn test_dangling_tool_use_repair() {
                     cache_control: None,
                 },
                 ContentBlock::ToolUse {
-                    id: "tool_123".to_string(),
+                    id: "tool_123".to_string().into(),
                     name: "bash".to_string(),
                     input: serde_json::json!({"command": "ls"}),
                     thought_signature: None,
                 },
                 ContentBlock::ToolUse {
-                    id: "tool_456".to_string(),
+                    id: "tool_456".to_string().into(),
                     name: "read".to_string(),
                     input: serde_json::json!({"file_path": "/tmp/test"}),
                     thought_signature: None,
@@ -925,7 +925,7 @@ async fn test_no_repair_when_tool_results_present() {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
-                id: "tool_123".to_string(),
+                id: "tool_123".to_string().into(),
                 name: "bash".to_string(),
                 input: serde_json::json!({"command": "ls"}),
                 thought_signature: None,
@@ -936,7 +936,7 @@ async fn test_no_repair_when_tool_results_present() {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
-                tool_use_id: "tool_123".to_string(),
+                tool_use_id: "tool_123".to_string().into(),
                 content: "file1.txt\nfile2.txt".to_string(),
                 is_error: Some(false),
             }],
@@ -977,7 +977,7 @@ async fn test_parallel_image_tool_results_stay_contiguous() {
         role: Role::User,
         content: vec![
             ContentBlock::ToolResult {
-                tool_use_id: id.to_string(),
+                tool_use_id: id.to_string().into(),
                 content: format!("Image: {label}"),
                 is_error: None,
             },
@@ -1001,19 +1001,19 @@ async fn test_parallel_image_tool_results_stay_contiguous() {
             role: Role::Assistant,
             content: vec![
                 ContentBlock::ToolUse {
-                    id: "tool_a".to_string(),
+                    id: "tool_a".to_string().into(),
                     name: "read".to_string(),
                     input: serde_json::json!({"file_path": "a.png"}),
                     thought_signature: None,
                 },
                 ContentBlock::ToolUse {
-                    id: "tool_b".to_string(),
+                    id: "tool_b".to_string().into(),
                     name: "read".to_string(),
                     input: serde_json::json!({"file_path": "b.png"}),
                     thought_signature: None,
                 },
                 ContentBlock::ToolUse {
-                    id: "tool_c".to_string(),
+                    id: "tool_c".to_string().into(),
                     name: "read".to_string(),
                     input: serde_json::json!({"file_path": "c.png"}),
                     thought_signature: None,
@@ -1548,7 +1548,7 @@ async fn test_sanitize_tool_ids_with_dots() {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
-                id: "chatcmpl-BF2xX.tool_call.0".to_string(),
+                id: "chatcmpl-BF2xX.tool_call.0".to_string().into(),
                 name: "bash".to_string(),
                 input: serde_json::json!({"command": "ls"}),
                 thought_signature: None,
@@ -1559,7 +1559,7 @@ async fn test_sanitize_tool_ids_with_dots() {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
-                tool_use_id: "chatcmpl-BF2xX.tool_call.0".to_string(),
+                tool_use_id: "chatcmpl-BF2xX.tool_call.0".to_string().into(),
                 content: "file1.txt".to_string(),
                 is_error: None,
             }],
@@ -1603,7 +1603,7 @@ async fn test_sanitize_dangling_tool_ids_with_dots() {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
-                id: "call.with.dots".to_string(),
+                id: "call.with.dots".to_string().into(),
                 name: "bash".to_string(),
                 input: serde_json::json!({"command": "crash"}),
                 thought_signature: None,

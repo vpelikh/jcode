@@ -659,7 +659,7 @@ impl App {
         false
     }
 
-    fn collect_missing_tool_outputs_since_last_scan(&mut self) -> Vec<(usize, Vec<String>)> {
+    fn collect_missing_tool_outputs_since_last_scan(&mut self) -> Vec<(usize, Vec<crate::session::ToolCallId>)> {
         let message_len = self.local_transcript_message_count();
         if self.tool_output_scan_index > message_len {
             self.reset_tool_output_tracking();
@@ -667,7 +667,7 @@ impl App {
 
         let scan_start = self.tool_output_scan_index;
         let mut new_result_ids = Vec::new();
-        let mut assistant_tool_uses: Vec<(usize, Vec<String>)> = Vec::new();
+        let mut assistant_tool_uses: Vec<(usize, Vec<crate::session::ToolCallId>)> = Vec::new();
 
         if self.is_remote {
             for (index, msg) in self.messages.iter().enumerate().skip(scan_start) {
@@ -734,7 +734,7 @@ impl App {
                 // Still-executing tools will deliver their own result; a
                 // placeholder here becomes a duplicate tool_result that
                 // Anthropic rejects. See `jcode_app_core::tool::inflight`.
-                if crate::tool::inflight::is_tool_in_flight(&id) {
+                if crate::tool::inflight::is_tool_in_flight(id.as_str()) {
                     crate::logging::info(&format!(
                         "Skipping missing tool-output repair for {id}: tool is still executing"
                     ));
@@ -751,7 +751,7 @@ impl App {
         missing_repairs
     }
 
-    pub(super) fn missing_tool_result_ids(&mut self) -> Vec<String> {
+    pub(super) fn missing_tool_result_ids(&mut self) -> Vec<crate::session::ToolCallId> {
         self.collect_missing_tool_outputs_since_last_scan();
         self.tool_call_ids
             .difference(&self.tool_result_ids)

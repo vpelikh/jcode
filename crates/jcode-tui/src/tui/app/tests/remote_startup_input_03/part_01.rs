@@ -537,7 +537,7 @@ fn test_restore_session_with_selfdev_reload_tool_result_queues_continuation() {
     session.add_message(
         Role::User,
         vec![ContentBlock::ToolResult {
-            tool_use_id: "tool_selfdev_reload".to_string(),
+            tool_use_id: "tool_selfdev_reload".to_string().into(),
             content: "Reload initiated. Process restarting...".to_string(),
             is_error: Some(false),
         }],

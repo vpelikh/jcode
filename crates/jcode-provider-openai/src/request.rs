@@ -112,7 +112,7 @@ pub fn build_responses_input_with_logger(
         if let Role::User = msg.role {
             for block in &msg.content {
                 if let ContentBlock::ToolResult { tool_use_id, .. } = block {
-                    tool_result_last_pos.insert(tool_use_id.clone(), idx);
+                    tool_result_last_pos.insert(tool_use_id.to_string(), idx);
                 }
             }
         }
@@ -200,15 +200,15 @@ pub fn build_responses_input_with_logger(
                             if open_calls.contains(tool_use_id.as_str()) {
                                 items.push(serde_json::json!({
                                     "type": "function_call_output",
-                                    "call_id": sanitize_tool_id(tool_use_id),
+                                    "call_id": sanitize_tool_id(tool_use_id.as_str()),
                                     "output": output
                                 }));
                                 open_calls.remove(tool_use_id.as_str());
-                                used_outputs.insert(tool_use_id.clone());
+                                used_outputs.insert(tool_use_id.to_string());
                             } else if pending_outputs.contains_key(tool_use_id.as_str()) {
                                 skipped_results += 1;
                             } else {
-                                pending_outputs.insert(tool_use_id.clone(), output);
+                                pending_outputs.insert(tool_use_id.to_string(), output);
                                 delayed_results += 1;
                             }
                         }
@@ -267,31 +267,31 @@ pub fn build_responses_input_with_logger(
                                 "type": "function_call",
                                 "name": name,
                                 "arguments": arguments,
-                                "call_id": sanitize_tool_id(id)
+                                "call_id": sanitize_tool_id(id.as_str())
                             }));
 
                             if let Some(output) = pending_outputs.remove(id.as_str()) {
                                 items.push(serde_json::json!({
                                     "type": "function_call_output",
-                                    "call_id": sanitize_tool_id(id),
+                                    "call_id": sanitize_tool_id(id.as_str()),
                                     "output": output
                                 }));
-                                used_outputs.insert(id.clone());
+                                used_outputs.insert(id.to_string());
                             } else {
                                 let has_future_output = tool_result_last_pos
-                                    .get(id)
+                                    .get(id.as_str())
                                     .map(|pos| *pos > idx)
                                     .unwrap_or(false);
                                 if has_future_output {
-                                    open_calls.insert(id.clone());
+                                    open_calls.insert(id.to_string());
                                 } else {
                                     injected_missing += 1;
                                     items.push(serde_json::json!({
                                         "type": "function_call_output",
-                                        "call_id": sanitize_tool_id(id),
+                                        "call_id": sanitize_tool_id(id.as_str()),
                                         "output": missing_output.clone()
                                     }));
-                                    used_outputs.insert(id.clone());
+                                    used_outputs.insert(id.to_string());
                                 }
                             }
                         }

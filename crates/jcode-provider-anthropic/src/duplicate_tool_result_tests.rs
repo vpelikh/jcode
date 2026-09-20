@@ -29,7 +29,7 @@ fn tool_use(id: &str) -> Message {
     Message {
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
-            id: id.to_string(),
+            id: id.to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({"command": "ls"}),
             thought_signature: None,
@@ -43,7 +43,7 @@ fn tool_result(id: &str, content: &str, is_error: Option<bool>) -> Message {
     Message {
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
-            tool_use_id: id.to_string(),
+            tool_use_id: id.to_string().into(),
             content: content.to_string(),
             is_error,
         }],

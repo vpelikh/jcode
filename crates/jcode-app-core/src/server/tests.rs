@@ -978,7 +978,7 @@ async fn startup_recovery_resumes_interrupted_headless_sessions_after_reload() -
     initiator.add_message(
         Role::User,
         vec![crate::message::ContentBlock::ToolResult {
-            tool_use_id: "tool_reload".to_string(),
+            tool_use_id: "tool_reload".to_string().into(),
             content: "Reload initiated. Process restarting...".to_string(),
             is_error: Some(false),
         }],
@@ -998,7 +998,7 @@ async fn startup_recovery_resumes_interrupted_headless_sessions_after_reload() -
     peer.add_message(
         Role::User,
         vec![crate::message::ContentBlock::ToolResult {
-            tool_use_id: "tool_bash".to_string(),
+            tool_use_id: "tool_bash".to_string().into(),
             content: "[Tool 'bash' interrupted by server reload after 0.2s]".to_string(),
             is_error: Some(true),
         }],
@@ -1111,7 +1111,7 @@ async fn startup_recovery_preserves_headed_session_reload_context_for_later_reco
     headless.add_message(
         Role::User,
         vec![crate::message::ContentBlock::ToolResult {
-            tool_use_id: "tool_bash".to_string(),
+            tool_use_id: "tool_bash".to_string().into(),
             content: "[Tool 'bash' interrupted by server reload after 0.2s]".to_string(),
             is_error: Some(true),
         }],

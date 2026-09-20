@@ -578,7 +578,7 @@ impl BedrockProvider {
                             };
                             let result =
                                 match aws_sdk_bedrockruntime::types::ToolResultBlock::builder()
-                                    .tool_use_id(tool_use_id)
+                                    .tool_use_id(tool_use_id.as_str())
                                     .status(status)
                                     .content(
                                         aws_sdk_bedrockruntime::types::ToolResultContentBlock::Text(
@@ -597,7 +597,7 @@ impl BedrockProvider {
                         } => {
                             let tool_use =
                                 match aws_sdk_bedrockruntime::types::ToolUseBlock::builder()
-                                    .tool_use_id(id)
+                                    .tool_use_id(id.as_str())
                                     .name(name)
                                     .input(Self::json_to_document(input))
                                     .build()

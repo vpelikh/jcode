@@ -368,7 +368,7 @@ fn with_timestamps_adds_tool_timing_header_with_duration() -> Result<()> {
     let stamped = Message::with_timestamps(&[Message {
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
-            tool_use_id: "call_1".to_string(),
+            tool_use_id: "call_1".to_string().into(),
             content: "ok".to_string(),
             is_error: None,
         }],
@@ -424,7 +424,7 @@ fn ends_with_fresh_user_turn_rejects_trailing_tool_result() {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
-                id: "call_1".to_string(),
+                id: "call_1".to_string().into(),
                 name: "bash".to_string(),
                 input: serde_json::json!({}),
                 thought_signature: None,
