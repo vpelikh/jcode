@@ -7,7 +7,7 @@
 //! This is a fallback mechanism for providers like Fireworks (via OpenRouter) that
 //! have automatic caching but don't report cache hit/miss metrics.
 
-use jcode_message_types::{Message, stable_message_hash};
+use jcode_message_types::{Message, cache_relevant_message_hashes, extend_stable_hash};
 use std::collections::VecDeque;
 
 /// Maximum number of prefix hashes to remember (for detecting intermittent violations)
@@ -55,11 +55,19 @@ impl CacheTracker {
     fn prefix_hashes_for_messages(messages: &[Message]) -> Vec<u64> {
         let mut prefix_hashes = Vec::with_capacity(messages.len());
         for message in messages {
-            let message_hash = stable_message_hash(message);
+            // Hash the cache-relevant projection, not the raw Message, matching
+            // the TUI alarm path and the projection's documented contract. Raw
+            // hashing keys off non-transmitted metadata (timestamp,
+            // tool_duration_ms, ReasoningTrace blocks, cache_control markers and
+            // the with_timestamps-derived text tags), which triggers spurious
+            // CLIENT_CACHE_VIOLATION reports when the same message is rehashed
+            // with backfilled metadata on a later turn.
+            let message_hash =
+                cache_relevant_message_hashes(std::slice::from_ref(message))[0];
             let prefix_hash = prefix_hashes
                 .last()
                 .copied()
-                .map(|prev| jcode_message_types::extend_stable_hash(prev, message_hash))
+                .map(|prev| extend_stable_hash(prev, message_hash))
                 .unwrap_or(message_hash);
             prefix_hashes.push(prefix_hash);
         }
@@ -269,6 +277,80 @@ mod tests {
         let violation = tracker.record_request(&msgs2);
         assert!(violation.is_some());
         assert!(violation.unwrap().reason.contains("Prefix modified"));
+    }
+
+    /// Regression: a *metadata-only* re-timestamp of an already-sent user message
+    /// must NOT trigger CLIENT_CACHE_VIOLATION, matching the TUI alarm fix. The
+    /// tracker now hashes the cache-relevant projection, which strips the derived
+    /// `[<timestamp>]` text tag from `Message::with_timestamps`, so the raw
+    /// timestamp field changing does not change the prefix hash. A *real* content
+    /// edit must still be detected.
+    #[test]
+    fn test_re_timestamped_message_no_false_violation() {
+        use jcode_message_types::Message as M;
+        let t0 = chrono::Utc::now() - chrono::Duration::seconds(60);
+
+        let mktimed = |text: &str, ts: chrono::DateTime<chrono::Utc>| M {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+                cache_control: None,
+            }],
+            timestamp: Some(ts),
+            tool_duration_ms: None,
+        };
+
+        let mut tracker = CacheTracker::new();
+
+        // Baseline turn.
+        let turn1 = M::with_timestamps(&[mktimed("build the thing", t0)]);
+        assert!(tracker.record_request(&turn1).is_none());
+
+        // Next turn: same payload, earlier message re-serialized with a later
+        // timestamp, plus a legitimate appended assistant turn.
+        let turn2 = M::with_timestamps(&[
+            mktimed("build the thing", t0 + chrono::Duration::seconds(5)),
+            make_message(Role::Assistant, "ok"),
+        ]);
+        assert!(
+            tracker.record_request(&turn2).is_none(),
+            "metadata-only re-timestamp must not be reported as a cache violation"
+        );
+
+        // Tool-result timing-tag backfill: a user message whose ToolResult
+        // timing (start/finish/duration) is backfilled on the next turn. After
+        // `with_timestamps` this only changes the `[tool timing: ...]` text tag,
+        // which the projection strips, so it must not be reported as a
+        // violation either.
+        let mut tracker2 = CacheTracker::new();
+        let tool_msg = |tool_dur: Option<u64>| M {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "tc-1".into(),
+                content: "ls output".to_string(),
+                is_error: None,
+            }],
+            timestamp: Some(t0),
+            tool_duration_ms: tool_dur,
+        };
+        let base_tool = M::with_timestamps(&[tool_msg(None)]);
+        assert!(tracker2.record_request(&base_tool).is_none());
+        let backfilled_tool = M::with_timestamps(&[tool_msg(Some(1234))]);
+        assert!(
+            tracker2.record_request(&backfilled_tool).is_none(),
+            "tool-result timing backfill must not be reported as a cache violation"
+        );
+
+        // A real content edit of the earlier message must still be detected.
+        let turn3 = M::with_timestamps(&[
+            mktimed("build the thing DIFFERENTLY", t0 + chrono::Duration::seconds(5)),
+            make_message(Role::Assistant, "ok"),
+        ]);
+        let violation = tracker.record_request(&turn3);
+        assert!(
+            violation.is_some(),
+            "a real content edit must still be detected as a cache violation"
+        );
     }
 
     #[test]

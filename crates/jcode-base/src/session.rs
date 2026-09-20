@@ -692,7 +692,14 @@ impl Session {
     }
 
     fn push_provider_message_cache_entry(&mut self, message: Message) {
-        let message_hash = crate::message::stable_message_hash(&message);
+        // Hash the cache-relevant projection, not the raw Message, so the
+        // prefix-hash chain (consumed by the app-core fast-snapshot cache
+        // violation detector) stays consistent with `CacheTracker::record_request`
+        // and the TUI alarm. Raw hashing keys off non-transmitted metadata and
+        // the `with_timestamps`-derived text tags, causing spurious
+        // CLIENT_CACHE_VIOLATION reports for metadata-only re-timestamps.
+        let message_hash =
+            crate::message::cache_relevant_message_hashes(std::slice::from_ref(&message))[0];
         let prefix_hash = self
             .provider_message_prefix_hashes_cache
             .last()
