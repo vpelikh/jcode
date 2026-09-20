@@ -535,7 +535,7 @@ fn schema_only_advertises_common_public_fields() {
     assert!(
         props["allow_raw_fallback"]["description"]
             .as_str()
-            .map(|d| d.to_lowercase().contains("refused until a compass_query has actually been attempted"))
+            .map(|d| d.to_lowercase().contains("refused until compass_query attempted"))
             .unwrap_or(false),
         "allow_raw_fallback description must warn that the fallback is refused until
          compass_query was attempted, so the model-visible guidance stays accurate"
