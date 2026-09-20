@@ -194,6 +194,11 @@ prompt_entry_animation = true
 # results directly in the chat.
 # show_agentgrep_output = false
 
+# Show the full compass_query search output inline in the transcript instead of
+# just the one-line summary (default: true). Set false to keep only the compact
+# one-line summary.
+# show_compass_query_output = true
+
 # Render the full, untrimmed bash command output beneath the tool summary
 # (default: true). When false, no bash output is shown at all. This flag is
 # the sole owner of bash command output.

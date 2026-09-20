@@ -299,6 +299,11 @@ impl Config {
                 self.display.show_agentgrep_output = parsed;
             }
         }
+        if let Ok(v) = std::env::var("JCODE_SHOW_COMPASS_QUERY_OUTPUT") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.display.show_compass_query_output = parsed;
+            }
+        }
         if let Ok(v) = std::env::var("JCODE_SHOW_BASH_OUTPUT") {
             if let Some(parsed) = parse_env_bool(&v) {
                 self.display.show_bash_output = parsed;

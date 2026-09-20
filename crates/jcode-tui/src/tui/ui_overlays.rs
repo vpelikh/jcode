@@ -217,6 +217,10 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
         "/show-agentgrep-output [status|on|off]",
         "Render full agentgrep search output inline in chat",
     ));
+    lines.push(help_entry(
+        "/show-compass-query-output [status|on|off]",
+        "Render full compass_query search output inline in chat",
+    ));
     lines.push(help_entry("/config", "Show active configuration"));
     lines.push(help_entry("/config init", "Create default config file"));
     lines.push(help_entry("/config edit", "Open config in $EDITOR"));

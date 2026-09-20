@@ -3789,6 +3789,108 @@ fn render_agentgrep_output_body_caps_huge_output() {
 }
 
 #[test]
+fn render_compass_query_output_body_renders_markdown() {
+    let content = "# Compass query: fn config\n\n\
+        **Intent:** discovery\n\
+        **Limit:** 20\n\n\
+        **Found 1 result(s)**\n\n\
+        ## 1. jcode_app_core::tool::mod\n\n\
+        **File:** crates/jcode-app-core/src/tool/mod.rs\n\
+        **Score:** 116100.000\n";
+    let lines = super::render_compass_query_output_body(content, 120);
+    let rendered = lines
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(rendered.contains("Compass query: fn config"), "rendered={rendered}");
+    assert!(
+        rendered.contains("jcode_app_core::tool::mod"),
+        "rendered={rendered}"
+    );
+    assert!(
+        rendered.contains("crates/jcode-app-core/src/tool/mod.rs"),
+        "rendered={rendered}"
+    );
+}
+
+#[test]
+fn render_compass_query_output_body_caps_huge_output() {
+    // Markdown headings produce one rendered line each; generate enough to
+    // exceed the cap.
+    let content = (0..600)
+        .map(|i| format!("## {i}. result {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let lines = super::render_compass_query_output_body(&content, 120);
+    // 400-line cap plus a single truncation summary line.
+    assert_eq!(lines.len(), 401, "should cap the body and add a summary");
+    let last = extract_line_text(&lines[lines.len() - 1]);
+    // The note reports how many lines were actually hidden (a positive number
+    // strictly less than the cap), not a fixed MAX_BODY_LINES constant.
+    let count = last
+        .find("more lines")
+        .and_then(|idx| last[..idx].rsplit(' ').nth(1))
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    assert!(
+        (1..400).contains(&count),
+        "last={last:?} should report a hidden-line count in (0, 400)"
+    );
+}
+
+/// A realistic multi-result compass response keeps every field on its own
+/// visual row (the hard-break behavior) and still renders legibly at a narrow
+/// transcript width (the wrap behavior). Guards the interplay between
+/// `preserve_hard_line_breaks_for_markdown` and `wrap_lines`.
+#[test]
+fn render_compass_query_output_body_multi_result_and_narrow_width() {
+    let content = "# Compass query: config handler\n\n\
+        **Intent:** discovery\n\
+        **Limit:** 20\n\n\
+        **Found 2 result(s)**\n\n\
+        ## 1. app::config::load\n\n\
+        **File:** crates/app/src/config.rs\n\
+        **Score:** 100.000\n\n\
+        ## 2. app::config::Config\n\n\
+        **File:** crates/app/src/config/structs.rs\n\
+        **Score:** 98.500\n";
+
+    for width in [40u16, 80, 120] {
+        let lines = super::render_compass_query_output_body(content, width as usize);
+        let rendered = lines
+            .iter()
+            .map(extract_line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("app::config::load") && rendered.contains("app::config::Config"),
+            "width {width}: both results must render: {rendered}"
+        );
+        // Each result's "File:" field must survive (single newline after a
+        // bold label is preserved as a hard break, not dropped).
+        assert!(
+            rendered.contains("crates/app/src/config.rs")
+                && rendered.contains("crates/app/src/config/structs.rs"),
+            "width {width}: file paths must render: {rendered}"
+        );
+
+        // No rendered line may exceed the requested width (except the cap note).
+        for line in render_compass_query_output_body(content, width as usize) {
+            let text = extract_line_text(&line);
+            if !text.contains("more lines") {
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(text.as_str()) <= width as usize,
+                    "width {width}: line exceeds width: {text:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn render_assistant_message_plan_card_wraps_instead_of_truncating() {
     let saved = crate::tui::markdown::center_code_blocks();
     crate::tui::markdown::set_center_code_blocks(false);
@@ -4255,6 +4357,70 @@ fn render_tool_message_compass_query_row_shows_query() {
             .any(|line| line.contains("'find the config handler'")),
         "completed card must show the query: {rendered:?}"
     );
+}
+
+fn compass_query_output_msg(content: &str) -> DisplayMessage {
+    DisplayMessage {
+        role: "tool".to_string(),
+        content: content.to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_compass_inline".to_string(),
+            name: "compass_query".to_string(),
+            input: serde_json::json!({ "query": "fn config" }),
+            intent: None,
+            thought_signature: None,
+        }),
+    }
+}
+
+/// With `show_compass_query_output` off, the compass_query card stays compact:
+/// the search-result body must NOT render inline.
+#[test]
+fn render_tool_message_compass_query_output_hidden_when_disabled() {
+    crate::tui::ui::tools_ui::tests_show_compass_query_output_override::set(false);
+    let content = "# Compass query: fn config\n\n**Found 1 result(s)**\n\n## 1. cfg::load\n";
+    let msg = compass_query_output_msg(content);
+    let rendered = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        !rendered.contains("Found 1 result(s)"),
+        "compass body must not render when flag is off: {rendered}"
+    );
+    assert!(
+        !rendered.contains("cfg::load"),
+        "compass result must not render when flag is off: {rendered}"
+    );
+}
+
+/// With `show_compass_query_output` on (the default), the compass_query
+/// search-result body renders inline beneath the one-line summary.
+#[test]
+fn render_tool_message_compass_query_output_shows_when_enabled() {
+    crate::tui::ui::tools_ui::tests_show_compass_query_output_override::set(true);
+    let content = "# Compass query: fn config\n\n**Found 1 result(s)**\n\n## 1. cfg::load\n";
+    let msg = compass_query_output_msg(content);
+    let rendered = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        rendered.contains("Found 1 result(s)"),
+        "compass body must render when flag is on: {rendered}"
+    );
+    assert!(
+        rendered.contains("cfg::load"),
+        "compass result must render when flag is on: {rendered}"
+    );
+    crate::tui::ui::tools_ui::tests_show_compass_query_output_override::set(false);
 }
 
 /// A `batch` that contains a `compass_query` sub-call renders the query on the
