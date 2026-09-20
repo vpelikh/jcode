@@ -86,6 +86,57 @@ fn non_empty(value: &str) -> Option<&str> {
     }
 }
 
+/// Escape text for Telegram's legacy `Markdown` parse mode so it renders
+/// literally and cannot be misinterpreted as formatting.
+///
+/// Legacy Markdown treats `_`, `*`, `` ` ``, `[`, `]`, and `\` as control
+/// characters. When embedding user-provided or otherwise untrusted content into
+/// a message that is sent with `parse_mode=Markdown`, escape these so the text
+/// cannot (a) break parse_mode and trigger a "can't parse entities" resend, or
+/// (b) leak unintended bold/italic/code formatting into the visible output.
+///
+/// A literal `\` is only special when it precedes one of the escapable
+/// characters (it introduces an escape). So a backslash is doubled *only* when
+/// followed by `_`, `*`, `` ` ``, `[`, `]`, or another `\`; a backslash before
+/// any other character is left as-is so content like a Windows path
+/// (`C:\Users\foo`) or a regex (`\d+`) renders without doubling.
+///
+/// The surrounding static markup is *not* escaped here; callers compose the
+/// trusted delimiters (`*bold*`, `` `code` ``) and escape only the interpolated
+/// value: `format!("💬 _{}_", escape_markdown(user_input))`.
+pub fn escape_markdown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        match ch {
+            '_' | '*' | '`' | '[' | ']' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            '\\' => {
+                // A backslash needs escaping only when it precedes an escapable
+                // char (i.e. when Telegram would otherwise treat it as an escape
+                // marker). Otherwise it is a literal backslash already.
+                let next_escapable = chars
+                    .get(i + 1)
+                    .map(|n| matches!(n, '_' | '*' | '`' | '[' | ']' | '\\'))
+                    .unwrap_or(false);
+                if next_escapable {
+                    out.push('\\');
+                    out.push('\\');
+                } else {
+                    out.push('\\');
+                }
+            }
+            _ => out.push(ch),
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Split `text` into chunks no longer than Telegram's per-message limit.
 ///
 /// Used by senders to deliver arbitrarily-long content (e.g. session history)
@@ -123,6 +174,8 @@ struct TelegramResponse<T> {
     ok: bool,
     #[serde(default)]
     description: Option<String>,
+    #[serde(default)]
+    error_code: Option<i64>,
     result: Option<T>,
 }
 
@@ -325,6 +378,10 @@ fn is_markdown_parse_error(description: &str) -> bool {
 /// Broadcast a chat action such as `typing` to show the user a live indicator
 /// while the bot is processing a long request. Errors are swallowed so the
 /// caller's flow is not disrupted by a transient indicator failure.
+///
+/// Returns `Err` when the request fails to send *or* Telegram reports the action
+/// was not accepted (`ok:false`), so callers can decide whether retrying is
+/// worthwhile rather than blindly looping a rejected indicator.
 pub async fn send_chat_action(
     client: &reqwest::Client,
     bot_token: &str,
@@ -337,9 +394,19 @@ pub async fn send_chat_action(
         "chat_id": chat_id,
         "action": action,
     });
-    match client.post(&url).json(&body).send().await {
-        Ok(_) => Ok(()),
-        Err(_) => Err(()),
+    let resp = match client.post(&url).json(&body).send().await {
+        Ok(resp) => resp,
+        Err(_) => return Err(()),
+    };
+    // Parse the response body. A connection that succeeded does not guarantee
+    // the action was accepted; a non-2xx status or an `ok:false` body means the
+    // indicator was not sent.
+    if !resp.status().is_success() {
+        return Err(());
+    }
+    match resp.json::<TelegramResponse<serde_json::Value>>().await {
+        Ok(parsed) if parsed.ok => Ok(()),
+        _ => Err(()),
     }
 }
 
@@ -352,6 +419,7 @@ pub async fn set_my_commands(
 ) {
     let body = serde_json::json!({
         "commands": [
+            { "command": "start", "description": "Show help and available commands" },
             { "command": "list", "description": "List recent sessions" },
             { "command": "new", "description": "Start a new session (optionally with a prompt)" },
             { "command": "use", "description": "Select a session to talk to (id or #)" },
@@ -567,10 +635,22 @@ pub async fn get_updates_with_base(
     let body: TelegramResponse<Vec<Update>> = resp.json().await?;
 
     if !body.ok {
-        anyhow::bail!(
-            "Telegram getUpdates error: {}",
-            body.description.unwrap_or_default()
-        );
+        // Telegram's Bot API returns HTTP 200 with a body of
+        // `{"ok":false,"error_code":409,...}` when *another* bot instance (or a
+        // stale poll from an old process) already holds the `getUpdates` long
+        // poll. Telegram only allows one concurrent long poll per bot token; a
+        // second one is rejected with 409. Surface this distinctly so the poll
+        // loop can log a clear diagnosis instead of a generic error.
+        let description = body.description.unwrap_or_default();
+        if body.error_code == Some(409) {
+            anyhow::bail!(
+                "Telegram 409 Conflict: another bot instance is already polling \
+                 `getUpdates` with this token (a second concurrent long poll is \
+                 rejected). Stop the other process or wait for its stale poll to \
+                 expire. ({description})"
+            );
+        }
+        anyhow::bail!("Telegram getUpdates error: {}", description);
     }
 
     Ok(body.result.unwrap_or_default())
@@ -782,5 +862,36 @@ mod tests {
         assert!(is_markdown_parse_error("cannot parse entities"));
         assert!(is_markdown_parse_error("parse: unexpected ... entity"));
         assert!(!is_markdown_parse_error("message text is empty"));
+    }
+
+    #[test]
+    fn test_escape_markdown_escapes_control_chars() {
+        assert_eq!(escape_markdown("plain text"), "plain text");
+        assert_eq!(escape_markdown("a_b"), "a\\_b");
+        assert_eq!(escape_markdown("a*b"), "a\\*b");
+        assert_eq!(escape_markdown("`code`"), "\\`code\\`");
+        assert_eq!(escape_markdown("[x]"), "\\[x\\]");
+        // A backslash before an escapable char is doubled so it renders literally.
+        assert_eq!(escape_markdown("_a_"), "\\_a\\_");
+        // Two consecutive backslashes: the first precedes a `\` (doubled), the
+        // second precedes `b` (kept single), so the value ends with three `\`.
+        assert_eq!(escape_markdown(r"a\\b"), r"a\\\b");
+    }
+
+    #[test]
+    fn test_escape_markdown_does_not_double_unrelated_backslashes() {
+        // A backslash before a non-escapable char is already literal, so it is
+        // NOT doubled: Windows paths and regexes render without `\\`.
+        assert_eq!(escape_markdown(r"C:\Users\foo"), r"C:\Users\foo");
+        assert_eq!(escape_markdown(r"\d+\.\d+"), r"\d+\.\d+");
+        // Trailing backslash has no following char; stays single.
+        assert_eq!(escape_markdown(r"path\"), r"path\");
+    }
+
+    #[test]
+    fn test_escape_markdown_leaves_normal_plain_text_untouched() {
+        // Ordinary characters and spaces pass through unescaped; only the
+        // legacy-Markdown reserved set gets a backslash.
+        assert_eq!(escape_markdown("hello world 123"), "hello world 123");
     }
 }
