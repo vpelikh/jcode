@@ -76,6 +76,7 @@ mod idle_heap_release;
 mod inline_interactive;
 mod input;
 mod input_help;
+mod intent;
 mod local;
 mod misc_ui;
 mod model_context;
@@ -404,6 +405,9 @@ pub(super) enum SessionPickerMode {
     ActiveSessions,
     /// First-run onboarding action picker.
     Onboarding,
+    /// The `/handoff` interactive overlay: the session picker re-fed from the
+    /// saved handoff store. Selections route to `/handoffres` logic.
+    Handoff,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -412,6 +416,41 @@ pub(super) struct PendingCatchupResume {
     pub source_session_id: Option<String>,
     pub queue_position: Option<(usize, usize)>,
     pub show_brief: bool,
+}
+
+/// A handoff snapshot the user picked from the `/handoff` overlay. Carried
+/// through the async pump (mirroring `PendingCatchupResume`) so the selection
+/// can be applied once the remote connection is available to clear the
+/// conversation and set the handoff resume override.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct PendingHandoffResume {
+    pub session_id: String,
+    /// The headline (first content line) to show once the handoff is applied.
+    pub preview_line: String,
+}
+
+/// An in-flight `handoff_resume_by_id` request to the connected server whose
+/// `HandoffResumed`/`Error` reply the client is still awaiting. The clear+arm
+/// happens atomically server-side; the status line must not claim "Handoff
+/// ready" until the server has actually acknowledged it, so the request id is
+/// recorded here and the pending state is resolved when `HandoffResumed` (or a
+/// matching `Error`) arrives.
+#[derive(Clone, Debug)]
+pub(super) struct PendingHandoffAck {
+    /// The request id echoed back in `HandoffResumed`.
+    pub request_id: u64,
+    /// The headline (first content line) to show on the acknowledgement.
+    pub preview_line: String,
+}
+
+/// An in-flight `handoff_list` request to the connected server. Over SSH the
+/// client host's local store is the wrong host to inspect; the `/handoff`
+/// overlay must be fed from the *server*'s store. When `ServerEvent::HandoffListed`
+/// arrives with a matching request id, the picker is opened from that data.
+#[derive(Clone, Debug)]
+pub(super) struct PendingRemoteHandoffList {
+    /// The request id echoed back in `HandoffListed`.
+    pub request_id: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -957,10 +996,37 @@ pub struct App {
     /// delivered. The digest asks the model to verify weak points, so re-asking
     /// after it has done so would loop; one delivery per turn is the contract.
     todo_gate_digest_delivered: bool,
-    /// How many completion-confidence gate nudges the current auto-poke cycle
-    /// has sent. Without a budget, a model that stops updating its todos gets
+    /// How many ownership-gate nudges the current auto-poke cycle has sent.
+    /// Without a budget, a model that stops updating its gated state gets
     /// nudged on every turn forever, silently burning an API call per tick.
-    todo_completion_gate_attempts: u8,
+    ///
+    /// The ownership gate and the completion-confidence gate keep SEPARATE
+    /// budgets and fingerprints. Fusing them lets one gate's progress mask the
+    /// other's stall (e.g. completion-confidence fixes resetting a genuinely
+    /// stuck ownership gate, or vice versa), which would silently disable the
+    /// circuit breaker for the stalled gate. Each budget is independently reset
+    /// by progress on that gate's own fingerprinted state, so a gate-by-gate-
+    /// converging model is not spuriously disarmed while a genuinely stalled
+    /// gate still exhausts its own budget.
+    todo_ownership_gate_attempts: u8,
+    /// Fingerprint of the owned-goal state the last ownership-gate nudge was
+    /// raised against. When the model makes genuine progress on that state (a
+    /// goal assessment that was low climbs, even if not yet passing), the
+    /// ownership budget resets. `None` means "no ownership nudge sent yet this
+    /// cycle" (fresh budget). Mirrors the single fingerprint + consecutive-
+    /// stall-counter idiom used by `last_auto_poke_fingerprint` and the
+    /// overnight auto-poke (`stalled_turns`).
+    todo_ownership_gate_fingerprint: Option<String>,
+    /// How many completion-confidence gate nudges the current auto-poke cycle
+    /// has sent. Independent of the ownership-gate budget (see
+    /// `todo_ownership_gate_attempts`), so completion-confidence progress
+    /// cannot mask an ownership-gate stall and vice versa.
+    todo_confidence_gate_attempts: u8,
+    /// Fingerprint of the completed-todo confidence state the last completion-
+    /// confidence gate nudge was raised against. Progress on that state resets
+    /// `todo_confidence_gate_attempts`. `None` means "no confidence nudge sent
+    /// yet this cycle" (fresh budget).
+    todo_confidence_gate_fingerprint: Option<String>,
     /// Last session/todo/goal state challenged by the ownership gate. Repeating
     /// the same check cannot resolve an external blocker or stale assessment.
     last_todo_ownership_fingerprint: Option<String>,
@@ -1243,9 +1309,9 @@ pub struct App {
     /// Sim-time at which processing started (video replay only)
     replay_processing_started_ms: Option<f64>,
     // Remember tool call ids that have appeared in the provider transcript
-    tool_call_ids: HashSet<String>,
+    tool_call_ids: HashSet<crate::session::ToolCallId>,
     // Remember tool call ids that already have outputs
-    tool_result_ids: HashSet<String>,
+    tool_result_ids: HashSet<crate::session::ToolCallId>,
     // Number of provider messages already indexed for missing tool-output repair
     tool_output_scan_index: usize,
     // Current session ID (from server in remote mode)
@@ -1560,6 +1626,20 @@ pub struct App {
     /// tick does not do a `Session::load` behind a pending reviewer on every
     /// tick, and so parallel tests do not share timing.
     last_review_loop_idle_poll: Option<Instant>,
+    /// When a review loop is running headlessly, the lens MACHINE name (as
+    /// `ReviewLens::name()`, e.g. "correctness") of the lens whose
+    /// `Request::HeadlessReview` is queued for / awaiting a
+    /// `ServerEvent::HeadlessReviewResult`. `None` when no headless review is in
+    /// flight. Stored as the machine name (not the human label) so both the
+    /// drain and the server resolve it via `ReviewLens::from_name`, which only
+    /// matches machine names. The async run loop drains this to send the request;
+    /// the result handler clears it and feeds the verdict to the loop.
+    pending_headless_review: Option<String>,
+    /// Request id of the in-flight headless review (returned by the drain when
+    /// it sends `Request::HeadlessReview`). `apply_headless_review_result`
+    /// drops a `HeadlessReviewResult` whose id does not match, so a stale/late
+    /// result from a previous lens or loop cannot mis-apply.
+    active_headless_request_id: Option<u64>,
     // Tab completion state: (base_input, suggestion_index)
     // base_input is the original input before cycling, suggestion_index is current position
     tab_completion_state: Option<(String, usize)>,
@@ -1654,6 +1734,13 @@ pub struct App {
     catchup_return_stack: Vec<String>,
     pending_catchup_resume: Option<PendingCatchupResume>,
     in_flight_catchup_resume: Option<PendingCatchupResume>,
+    pending_handoff_resume: Option<PendingHandoffResume>,
+    /// In-flight `handoff_resume_by_id` so "Handoff ready" is only claimed once
+    /// the server acknowledges via `HandoffResumed` (or a matching `Error`).
+    pending_handoff_ack: Option<PendingHandoffAck>,
+    /// In-flight `handoff_list` to the connected server (fed to the `/handoff`
+    /// overlay over SSH, where the client's local store is the wrong host).
+    pending_remote_handoff_list: Option<PendingRemoteHandoffList>,
     /// Login picker overlay (None = not visible)
     login_picker_overlay: Option<RefCell<super::login_picker::LoginPicker>>,
     /// Account picker overlay (None = not visible)

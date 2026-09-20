@@ -329,7 +329,7 @@ impl App {
     /// Format a `Duration` as a short human string (e.g. "6 minutes").
     fn format_duration_for_message(wait: Duration) -> String {
         let secs = wait.as_secs();
-        if secs >= 60 && secs % 60 == 0 {
+        if secs >= 60 && secs.is_multiple_of(60) {
             let minutes = secs / 60;
             if minutes == 1 {
                 "1 minute".to_string()
@@ -517,7 +517,10 @@ impl App {
             auto_poke_default_on: features.auto_poke,
             todo_confidence_spike_challenged: false,
             todo_gate_digest_delivered: false,
-            todo_completion_gate_attempts: 0,
+            todo_ownership_gate_attempts: 0,
+            todo_ownership_gate_fingerprint: None,
+            todo_confidence_gate_attempts: 0,
+            todo_confidence_gate_fingerprint: None,
             last_todo_ownership_fingerprint: None,
             todo_final_response_requested: false,
             last_auto_poke_fingerprint: None,
@@ -771,6 +774,8 @@ impl App {
             auto_server_reload: display.auto_server_reload,
             pending_queued_dispatch: false,
             last_review_loop_idle_poll: None,
+            pending_headless_review: None,
+            active_headless_request_id: None,
             tab_completion_state: None,
             command_suggestion_selected: 0,
             app_started: Instant::now(),
@@ -814,6 +819,9 @@ impl App {
             catchup_return_stack: Vec::new(),
             pending_catchup_resume: None,
             in_flight_catchup_resume: None,
+            pending_handoff_resume: None,
+            pending_handoff_ack: None,
+            pending_remote_handoff_list: None,
             login_picker_overlay: None,
             account_picker_overlay: None,
             usage_overlay: None,
@@ -969,7 +977,10 @@ impl App {
             auto_poke_default_on: features.auto_poke,
             todo_confidence_spike_challenged: false,
             todo_gate_digest_delivered: false,
-            todo_completion_gate_attempts: 0,
+            todo_ownership_gate_attempts: 0,
+            todo_ownership_gate_fingerprint: None,
+            todo_confidence_gate_attempts: 0,
+            todo_confidence_gate_fingerprint: None,
             last_todo_ownership_fingerprint: None,
             todo_final_response_requested: false,
             last_auto_poke_fingerprint: None,
@@ -1223,6 +1234,8 @@ impl App {
             auto_server_reload: display.auto_server_reload,
             pending_queued_dispatch: false,
             last_review_loop_idle_poll: None,
+            pending_headless_review: None,
+            active_headless_request_id: None,
             tab_completion_state: None,
             command_suggestion_selected: 0,
             app_started: Instant::now(),
@@ -1266,6 +1279,9 @@ impl App {
             catchup_return_stack: Vec::new(),
             pending_catchup_resume: None,
             in_flight_catchup_resume: None,
+            pending_handoff_resume: None,
+            pending_handoff_ack: None,
+            pending_remote_handoff_list: None,
             login_picker_overlay: None,
             account_picker_overlay: None,
             usage_overlay: None,
