@@ -1444,8 +1444,12 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         // event-count growth (not tail-id compare) for robustness.
         let recorded = self.event_map.events.len() > events_before;
         
-        // Keep backward compatibility
-        self.messages.insert(index, message);
+        // Keep backward compatibility. Clamp the index to the live length to
+        // match `derive_messages` (which clamps `InsertMessage` to `len`): an
+        // out-of-range index must not panic the legacy vector while replay
+        // tolerates it. `index == len` is a valid end-append.
+        let idx = index.min(self.messages.len());
+        self.messages.insert(idx, message);
         self.mark_memory_profile_dirty();
         self.mark_messages_full_dirty();
         if !recorded {
@@ -1755,6 +1759,15 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
     /// Callers outside `jcode-base` should use this instead of reaching into
     /// `event_map` so the append path stays consistent. Returns `false` if the
     /// event was rejected by validation (and therefore not recorded).
+    ///
+    /// This appends to the *event log only*. It does **not** update the legacy
+    /// surface vectors (`messages`, `compaction`, `memory_injections`,
+    /// `replay_events`), so a caller that appends a state-carrying event
+    /// (`AppendMessage`/`InsertMessage`/`SetCompaction`/`ReplayEvent`/
+    /// `MemoryInjection`) must update the corresponding legacy field itself (or
+    /// call the dedicated `Session` method that keeps them in sync), otherwise
+    /// the two sources of truth diverge. For log-only events (`ClearAll`,
+    /// compaction brackets, plugin `Unknown`) no legacy update is needed.
     pub fn append_session_event(&mut self, event: SessionEvent) -> bool {
         // Capture whether the event was recorded before mutating (append_event
         // skips invalid events internally).

@@ -120,6 +120,45 @@ fn test_insert_message_at_end_keeps_event_log_consistent() {
 }
 
 #[test]
+fn test_insert_message_out_of_range_clamps_like_derive() {
+    // `insert_message` with an out-of-range index (`index > len`) must not panic
+    // the legacy vector. `derive_messages` clamps an `InsertMessage` to the live
+    // length (an end-append), so the legacy path clamps identically to keep the
+    // two sources of truth consistent and to avoid a `Vec::insert` panic.
+    let mut session = Session::create_with_id("test_insert_oob".to_string(), None, None);
+    let msg1 = StoredMessage {
+        id: "msg1".to_string(),
+        role: Role::User,
+        content: vec![text_block("one")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    };
+    let msg_oob = StoredMessage {
+        id: "oob".to_string(),
+        role: Role::Assistant,
+        content: vec![text_block("out of range")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    };
+    session.append_stored_message(msg1.clone());
+    let len_before = session.messages.len();
+    // index far beyond the live length.
+    session.insert_message(len_before + 100, msg_oob.clone());
+
+    // Must not panic; the OOB insert clamps to an end-append.
+    assert_eq!(session.messages.len(), 2);
+    assert_eq!(session.messages[1].id, "oob", "OOB insert clamps to end-append");
+    let derived = session.derive_messages();
+    assert_eq!(derived.len(), 2, "derive and legacy must agree on the clamped insert");
+    assert_eq!(derived[1].id, "oob");
+    session.rederive_all_checked().expect("event log must agree with legacy vector");
+}
+
+#[test]
 fn test_event_map_compaction_operations() {
     let mut session = Session::create_with_id(
         "test_session_3".to_string(),
