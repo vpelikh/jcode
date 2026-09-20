@@ -661,6 +661,15 @@ pub(super) async fn handle_set_working_dir(
         // server and gather_git_info derive.
         Ok(Some(resolved)) => {
             crate::session_list_cache::invalidate();
+            // Keep the swarm member's recorded working dir coherent with the
+            // agent's new bound directory. Consumers (e.g. comm_session) prefer
+            // the live agent dir, but fall back to member.working_dir, so a
+            // stale value would mis-direct spawns to the pre-/cd path.
+            let mut members = swarm_members.write().await;
+            if let Some(member) = members.get_mut(&session_id) {
+                member.working_dir = Some(std::path::PathBuf::from(&resolved));
+            }
+            drop(members);
             let event = ServerEvent::SessionWorkingDirChanged {
                 session_id: session_id.clone(),
                 working_dir: resolved.clone(),
@@ -683,11 +692,13 @@ pub(super) async fn handle_set_working_dir(
             );
         }
         // The request resolved to the already-bound directory; treat it as a
-        // silent no-op. Neither a change event nor a Done is emitted so the
-        // client does not spam a redundant "working directory changed" notice
-        // for a `/cd` to the current dir. Log server-side so a repeated /cd is
-        // still observable when debugging.
+        // no-op. No change event is emitted (so the client does not spam a
+        // redundant "working directory changed" notice for a `/cd` to the
+        // current dir), but a Done still resolves the request so any client
+        // waiting on the request id does not hang. Log server-side so a
+        // repeated /cd is still observable when debugging.
         Ok(None) => {
+            let _ = client_event_tx.send(ServerEvent::Done { id });
             crate::logging::event_info(
                 "SESSION_LIFECYCLE",
                 vec![

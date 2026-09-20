@@ -395,39 +395,98 @@ fn resolve_working_dir(base: &std::path::Path, dir: &str) -> anyhow::Result<Stri
     if dir.is_empty() {
         anyhow::bail!("working directory must not be empty");
     }
-    let expanded = if let Some(rest) = dir.strip_prefix("~/") {
-        match dirs::home_dir() {
-            Some(home) => home.join(rest),
-            None => std::path::PathBuf::from(dir),
-        }
+    let mapped = if let Some(rest) = dir.strip_prefix("~/") {
+        let home = dirs::home_dir().ok_or_else(|| {
+            anyhow::anyhow!("cannot expand `~/` because the home directory is not resolvable")
+        })?;
+        // `PathBuf::join` with an absolute path resets to that path, so a
+        // leading slash in `rest` (e.g. `~//etc` from a doubled slash) would
+        // escape the home dir and resolve against the filesystem root. Trim all
+        // leading slashes so `~/...` stays relative to home.
+        let rest = rest.trim_start_matches('/');
+        home.join(rest)
     } else if dir == "~" {
-        dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from(dir))
+        dirs::home_dir().ok_or_else(|| {
+            anyhow::anyhow!("cannot expand `~` because the home directory is not resolvable")
+        })?
     } else {
         std::path::PathBuf::from(dir)
     };
 
-    let candidate = if expanded.is_absolute() {
-        expanded
+    let candidate = if mapped.is_absolute() {
+        mapped
     } else {
-        base.join(expanded)
+        base.join(mapped)
     };
 
-    if !candidate.exists() || !candidate.is_dir() {
+    if !candidate.exists() {
         anyhow::bail!("directory does not exist: {}", candidate.display());
+    }
+    if !candidate.is_dir() {
+        anyhow::bail!("not a directory: {}", candidate.display());
     }
 
     // Canonicalize to collapse `.`/`..` and resolve symlinks, matching how the
-    // git info cache and compass derive their keys. Fall back to a lexical
-    // cleanup when canonicalization fails so the path stays usable.
+    // git info cache and compass derive their keys. If canonicalization fails
+    // (rare, e.g. a permissions hiccup), fall back to a lexical normalization
+    // that still collapses `.`/`..` so the stored path stays clean and stable.
     match std::fs::canonicalize(&candidate) {
         Ok(canonical) => Ok(canonical.to_string_lossy().into_owned()),
-        Err(_) => Ok(candidate.to_string_lossy().into_owned()),
+        Err(_) => Ok(lexically_normalize(&candidate).to_string_lossy().into_owned()),
+    }
+}
+
+/// Collapse `.` and `..` path components lexically without touching the
+/// filesystem, used as a graceful fallback when `std::fs::canonicalize` fails.
+fn lexically_normalize(path: &std::path::Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                // A `..` at the root stays at the root; otherwise drop the last
+                // component if present, else keep the `..`.
+                if out.as_os_str().is_empty() || out == std::path::Path::new("/") {
+                    // stay put at root/empty
+                } else if !out.pop() {
+                    out.push(component.as_os_str());
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        std::path::PathBuf::from(".")
+    } else {
+        out
     }
 }
 
 #[cfg(test)]
 mod resolve_working_dir_tests {
     use super::resolve_working_dir;
+
+    use super::lexically_normalize;
+
+    #[test]
+    fn lexical_normalize_collapses_dotdot_and_curdir() {
+        assert_eq!(
+            lexically_normalize(std::path::Path::new("/a/./b/../c")).to_str().unwrap(),
+            "/a/c"
+        );
+        assert_eq!(
+            lexically_normalize(std::path::Path::new("a/../b")).to_str().unwrap(),
+            "b"
+        );
+        assert_eq!(
+            lexically_normalize(std::path::Path::new("/..")).to_str().unwrap(),
+            "/"
+        );
+        assert_eq!(
+            lexically_normalize(std::path::Path::new(".")).to_str().unwrap(),
+            "."
+        );
+    }
 
     #[test]
     fn absolute_path_is_normalized() {
@@ -455,6 +514,20 @@ mod resolve_working_dir_tests {
         std::fs::create_dir_all(&base).unwrap();
         let err = resolve_working_dir(&base, "does-not-exist").unwrap_err();
         assert!(err.to_string().contains("does not exist"));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn file_is_rejected_as_not_a_directory() {
+        let base = std::env::temp_dir().join("jcode-wd-file-base");
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("a-file");
+        std::fs::write(&file, b"x").unwrap();
+        let err = resolve_working_dir(&base, "a-file").unwrap_err();
+        assert!(
+            err.to_string().contains("not a directory"),
+            "a path that exists as a file must be rejected with an accurate error, got: {err}"
+        );
         std::fs::remove_dir_all(&base).unwrap();
     }
 
@@ -497,6 +570,16 @@ mod resolve_working_dir_tests {
             std::path::Path::new(&bare),
             home.canonicalize().unwrap().as_path(),
             "bare ~ must resolve to the home directory"
+        );
+
+        // `~//subdir` (a doubled slash) must NOT escape home to the filesystem
+        // root; it must stay relative to home. PathBuf::join would reset to the
+        // absolute `/subdir` if the leading slash were not trimmed.
+        let double = resolve_working_dir(std::path::Path::new("/tmp"), "~//subdir").unwrap();
+        assert_eq!(
+            std::path::Path::new(&double),
+            sub.canonicalize().unwrap().as_path(),
+            "~//... must remain relative to home, not escape to the filesystem root"
         );
 
         if let Some(prev) = prev_home {
