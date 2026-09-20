@@ -61,6 +61,16 @@ impl RetryAfter {
         }
     }
 
+    /// Build a retry deadline from a plain (already validated) delay. Used by
+    /// providers that extract a server-suggested wait from an error body rather
+    /// than a `Retry-After` header, so the hint flows through the same
+    /// `RetryAfterError` channel to the outer retry loop.
+    pub fn from_duration(delay: Duration) -> Self {
+        Self {
+            deadline: Instant::now() + delay.min(MAX_RETRY_AFTER),
+        }
+    }
+
     /// Time still remaining on the hint. Time spent reading and classifying an
     /// error response counts toward the requested wait.
     pub fn remaining(self) -> Duration {
@@ -215,5 +225,24 @@ mod tests {
         };
         let error = error_with_retry_after("rate limited".to_string(), Some(retry_after));
         assert_eq!(retry_after_from_error(&error), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn from_duration_builds_a_bounded_deadline() {
+        // A body-parsed wait (no header) flows through from_duration.
+        let retry_after = RetryAfter::from_duration(Duration::from_secs(9));
+        let error = error_with_retry_after("token limit".to_string(), Some(retry_after));
+        let remaining = retry_after_from_error(&error).unwrap();
+        assert!(remaining <= Duration::from_secs(9));
+        assert!(remaining > Duration::from_secs(8));
+    }
+
+    #[test]
+    fn from_duration_caps_oversized_waits() {
+        let retry_after = RetryAfter::from_duration(Duration::from_secs(3600));
+        let error = error_with_retry_after("token limit".to_string(), Some(retry_after));
+        let remaining = retry_after_from_error(&error).unwrap();
+        assert!(remaining <= MAX_RETRY_AFTER);
+        assert!(remaining > MAX_RETRY_AFTER - Duration::from_secs(1));
     }
 }
