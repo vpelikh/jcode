@@ -11,9 +11,9 @@ use super::swarm_mutation_state::{
     finish_request as finish_swarm_mutation_request, request_key as swarm_mutation_request_key,
 };
 use super::{
-    ClientConnectionInfo, SwarmEventType, SwarmMember, SwarmState, SwarmTaskProgress,
-    VersionedPlan, broadcast_swarm_plan, broadcast_swarm_plan_with_previous, fanout_session_event,
-    persist_swarm_state_for, set_member_task_label, truncate_detail,
+    ClientConnectionInfo, SwarmMember, SwarmTaskProgress,
+    VersionedPlan, broadcast_swarm_plan, fanout_session_event,
+    set_member_task_label, truncate_detail,
 };
 use crate::agent::Agent;
 use crate::plan::{
@@ -450,17 +450,14 @@ async fn plan_graph_status_for(
 /// staleness monitors and salvage flows to everything the previous run did.
 /// Only the assignment-scoped fields are refreshed, and the terminal/stale
 /// markers are cleared because the task is queued again.
-async fn requeue_existing_assignment(
-    swarm_id: &str,
+fn requeue_existing_assignment(
+    plan: &mut VersionedPlan,
     req_session_id: &str,
     assignee_session: &str,
     task_id: &str,
     assignment_summary: String,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
 ) -> Option<(String, HashSet<String>, usize)> {
     let now_ms = now_unix_ms();
-    let mut plans = swarm_plans.write().await;
-    let plan = plans.get_mut(swarm_id)?;
     let item = plan.items.iter_mut().find(|item| item.id == task_id)?;
     item.assigned_to = Some(assignee_session.to_string());
     item.status = "queued".to_string();
@@ -612,6 +609,7 @@ async fn next_runnable_task_id_reclaiming_stranded(
     swarm_id: &str,
     swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
     swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    swarm: &SwarmServiceHandle,
 ) -> Option<String> {
     if let Some(task_id) = next_unassigned_runnable_task_id(swarm_id, swarm_plans).await {
         return Some(task_id);
@@ -636,18 +634,23 @@ async fn next_runnable_task_id_reclaiming_stranded(
         }
     };
 
-    let mut plans = swarm_plans.write().await;
-    let plan = plans.get_mut(swarm_id)?;
-    let stranded_id = crate::plan::next_stranded_runnable_item_id(plan, &assignee_is_dead)?;
-    if crate::plan::reclaim_stranded_assignment(plan, &stranded_id) {
-        crate::logging::info(&format!(
-            "swarm {}: reclaimed stranded task '{}' from dead assignee for re-dispatch",
-            swarm_id, stranded_id
-        ));
-        Some(stranded_id)
-    } else {
-        None
-    }
+    // The reclaim write runs in the swarm handle so this selection path never
+    // touches the raw plans map (Tier 3).
+    swarm
+        .reclaim_stranded_task(swarm_id, |plan| {
+            let stranded_id =
+                crate::plan::next_stranded_runnable_item_id(plan, &assignee_is_dead)?;
+            if crate::plan::reclaim_stranded_assignment(plan, &stranded_id) {
+                crate::logging::info(&format!(
+                    "swarm {}: reclaimed stranded task '{}' from dead assignee for re-dispatch",
+                    swarm_id, stranded_id
+                ));
+                Some(stranded_id)
+            } else {
+                None
+            }
+        })
+        .await
 }
 
 async fn resolve_assignment_target_for_task(
@@ -766,43 +769,31 @@ fn spawn_assigned_task_run(
     let swarm_plans = swarm.swarm_state().plans.clone();
     let swarm_coordinators = swarm.swarm_state().coordinators.clone();
     tokio::spawn(async move {
-        {
-            let now_ms = now_unix_ms();
-            let mut plans = swarm_plans.write().await;
-            if let Some(plan) = plans.get_mut(&swarm_id)
-                && let Some(item) = plan.items.iter_mut().find(|item| item.id == task_id)
-            {
-                item.status = "running".to_string();
-                let progress = plan.task_progress.entry(task_id.clone()).or_default();
-                progress.assigned_session_id = Some(target_session.clone());
-                progress.assignment_summary = Some(truncate_detail(&assignment_text, 120));
-                progress.started_at_unix_ms = Some(now_ms);
-                progress.last_heartbeat_unix_ms = Some(now_ms);
-                progress.last_detail = Some(truncate_detail(&assignment_text, 120));
-                progress.last_checkpoint_unix_ms = Some(now_ms);
-                progress.checkpoint_summary = Some("task started".to_string());
-                progress.completed_at_unix_ms = None;
-                progress.stale_since_unix_ms = None;
-                progress.heartbeat_count = Some(progress.heartbeat_count.unwrap_or(0) + 1);
-                progress.checkpoint_count = Some(progress.checkpoint_count.unwrap_or(0) + 1);
-                plan.version += 1;
-            }
-        }
-        let swarm_state = SwarmState {
-            members: Arc::clone(&swarm_members),
-            swarms_by_id: Arc::clone(&swarms_by_id),
-            plans: Arc::clone(&swarm_plans),
-            coordinators: Arc::clone(&swarm_coordinators),
-        };
-        persist_swarm_state_for(&swarm_id, &swarm_state).await;
-        broadcast_swarm_plan(
-            &swarm_id,
-            Some("task_running".to_string()),
-            &swarm_plans,
-            &swarm_members,
-            &swarms_by_id,
-        )
-        .await;
+        swarm
+            .mutate_task_status(&swarm_id, "task_running", |plan| {
+                let now_ms = now_unix_ms();
+                if let Some(item) = plan
+                    .items
+                    .iter_mut()
+                    .find(|item| item.id == task_id.clone())
+                {
+                    item.status = "running".to_string();
+                    let progress = plan.task_progress.entry(task_id.clone()).or_default();
+                    progress.assigned_session_id = Some(target_session.clone());
+                    progress.assignment_summary = Some(truncate_detail(&assignment_text, 120));
+                    progress.started_at_unix_ms = Some(now_ms);
+                    progress.last_heartbeat_unix_ms = Some(now_ms);
+                    progress.last_detail = Some(truncate_detail(&assignment_text, 120));
+                    progress.last_checkpoint_unix_ms = Some(now_ms);
+                    progress.checkpoint_summary = Some("task started".to_string());
+                    progress.completed_at_unix_ms = None;
+                    progress.stale_since_unix_ms = None;
+                    progress.heartbeat_count = Some(progress.heartbeat_count.unwrap_or(0) + 1);
+                    progress.checkpoint_count = Some(progress.checkpoint_count.unwrap_or(0) + 1);
+                    plan.version += 1;
+                }
+            })
+            .await;
         set_member_task_label(&target_session, &assignment_text, &swarm_members).await;
         swarm
             .set_member_status(
@@ -897,13 +888,18 @@ fn spawn_assigned_task_run(
                         .map(|plan| plan.items.clone())
                         .unwrap_or_default()
                 };
-                let mut applied_disposition = TurnEndDisposition::LeaveAlone;
-                {
-                    let now_ms = now_unix_ms();
-                    let mut plans = swarm_plans.write().await;
-                    if let Some(plan) = plans.get_mut(&swarm_id)
-                        && let Some(item) = plan.items.iter_mut().find(|item| item.id == task_id)
-                    {
+                // The whole disposition transaction (plan write + persist +
+                // diff-aware broadcast) runs in the swarm handle (Tier 3).
+                swarm
+                    .mutate_task_disposition(&swarm_id, Some(&previous_items), |plan| {
+                        let now_ms = now_unix_ms();
+                        let Some(item) = plan
+                            .items
+                            .iter_mut()
+                            .find(|item| item.id == task_id.clone())
+                        else {
+                            return "task_completed";
+                        };
                         // A worker turn ends in one of three ways for its node:
                         //  1. it decomposed the node via `expand_node` -> the node is
                         //     now a composite synthesis/join point that must stay
@@ -931,7 +927,6 @@ fn spawn_assigned_task_run(
                         match turn_end_disposition(is_deep, &item.status, expanded, prior_requeues)
                         {
                             TurnEndDisposition::AutoComplete => {
-                                applied_disposition = TurnEndDisposition::AutoComplete;
                                 item.status = "done".to_string();
                                 let progress =
                                     plan.task_progress.entry(task_id.clone()).or_default();
@@ -943,9 +938,9 @@ fn spawn_assigned_task_run(
                                 progress.checkpoint_count =
                                     Some(progress.checkpoint_count.unwrap_or(0) + 1);
                                 plan.version += 1;
+                                "task_completed"
                             }
                             TurnEndDisposition::RequeueNoArtifact => {
-                                applied_disposition = TurnEndDisposition::RequeueNoArtifact;
                                 item.status = "queued".to_string();
                                 item.assigned_to = None;
                                 let progress =
@@ -963,9 +958,9 @@ fn spawn_assigned_task_run(
                                 progress.checkpoint_count =
                                     Some(progress.checkpoint_count.unwrap_or(0) + 1);
                                 plan.version += 1;
+                                "task_requeued_no_artifact"
                             }
                             TurnEndDisposition::FailNoArtifact => {
-                                applied_disposition = TurnEndDisposition::FailNoArtifact;
                                 item.status = "failed".to_string();
                                 let progress =
                                     plan.task_progress.entry(task_id.clone()).or_default();
@@ -981,32 +976,12 @@ fn spawn_assigned_task_run(
                                 progress.checkpoint_count =
                                     Some(progress.checkpoint_count.unwrap_or(0) + 1);
                                 plan.version += 1;
+                                "task_failed_no_artifact"
                             }
-                            TurnEndDisposition::LeaveAlone => {}
+                            TurnEndDisposition::LeaveAlone => "task_completed",
                         }
-                    }
-                }
-                let swarm_state = SwarmState {
-                    members: Arc::clone(&swarm_members),
-                    swarms_by_id: Arc::clone(&swarms_by_id),
-                    plans: Arc::clone(&swarm_plans),
-                    coordinators: Arc::clone(&swarm_coordinators),
-                };
-                persist_swarm_state_for(&swarm_id, &swarm_state).await;
-                let plan_reason = match applied_disposition {
-                    TurnEndDisposition::RequeueNoArtifact => "task_requeued_no_artifact",
-                    TurnEndDisposition::FailNoArtifact => "task_failed_no_artifact",
-                    _ => "task_completed",
-                };
-                broadcast_swarm_plan_with_previous(
-                    &swarm_id,
-                    Some(plan_reason.to_string()),
-                    Some(&previous_items),
-                    &swarm_plans,
-                    &swarm_members,
-                    &swarms_by_id,
-                )
-                .await;
+                    })
+                    .await;
                 // The worker's member status reflects its own turn (it ran to
                 // completion) even when its node was requeued/failed for missing
                 // an artifact: lifecycle and node state are separate axes, and a
@@ -1021,40 +996,28 @@ fn spawn_assigned_task_run(
                     .await;
             }
             Err(error) => {
-                {
-                    let now_ms = now_unix_ms();
-                    let mut plans = swarm_plans.write().await;
-                    if let Some(plan) = plans.get_mut(&swarm_id)
-                        && let Some(item) = plan.items.iter_mut().find(|item| item.id == task_id)
-                    {
-                        item.status = "failed".to_string();
-                        let progress = plan.task_progress.entry(task_id.clone()).or_default();
-                        progress.last_heartbeat_unix_ms = Some(now_ms);
-                        progress.last_checkpoint_unix_ms = Some(now_ms);
-                        progress.checkpoint_summary =
-                            Some(truncate_detail(&format!("task failed: {}", error), 120));
-                        progress.completed_at_unix_ms = Some(now_ms);
-                        progress.stale_since_unix_ms = None;
-                        progress.checkpoint_count =
-                            Some(progress.checkpoint_count.unwrap_or(0) + 1);
-                        plan.version += 1;
-                    }
-                }
-                let swarm_state = SwarmState {
-                    members: Arc::clone(&swarm_members),
-                    swarms_by_id: Arc::clone(&swarms_by_id),
-                    plans: Arc::clone(&swarm_plans),
-                    coordinators: Arc::clone(&swarm_coordinators),
-                };
-                persist_swarm_state_for(&swarm_id, &swarm_state).await;
-                broadcast_swarm_plan(
-                    &swarm_id,
-                    Some("task_failed".to_string()),
-                    &swarm_plans,
-                    &swarm_members,
-                    &swarms_by_id,
-                )
-                .await;
+                swarm
+                    .mutate_task_status(&swarm_id, "task_failed", |plan| {
+                        let now_ms = now_unix_ms();
+                        if let Some(item) = plan
+                            .items
+                            .iter_mut()
+                            .find(|item| item.id == task_id.clone())
+                        {
+                            item.status = "failed".to_string();
+                            let progress = plan.task_progress.entry(task_id.clone()).or_default();
+                            progress.last_heartbeat_unix_ms = Some(now_ms);
+                            progress.last_checkpoint_unix_ms = Some(now_ms);
+                            progress.checkpoint_summary =
+                                Some(truncate_detail(&format!("task failed: {}", error), 120));
+                            progress.completed_at_unix_ms = Some(now_ms);
+                            progress.stale_since_unix_ms = None;
+                            progress.checkpoint_count =
+                                Some(progress.checkpoint_count.unwrap_or(0) + 1);
+                            plan.version += 1;
+                        }
+                    })
+                    .await;
                 swarm
                     .set_member_status(
                         &target_session,
@@ -1265,51 +1228,22 @@ pub(super) async fn handle_comm_assign_role(
         return;
     };
 
+    if let Err(message) = swarm
+        .assign_member_role(&swarm_id, &target_session, &role, &req_session_id)
+        .await
     {
-        let mut members = swarm_members.write().await;
-        if let Some(member) = members.get_mut(&target_session) {
-            member.role = role.clone();
-        } else {
-            finish_swarm_mutation_request(
-                swarm_mutation_runtime,
-                &mutation_state,
-                PersistedSwarmMutationResponse::Error {
-                    message: format!("Unknown session '{}'", target_session),
-                    retry_after_secs: None,
-                },
-            )
-            .await;
-            return;
-        }
-    }
-
-    if role == "coordinator" {
-        {
-            let mut coordinators = swarm_coordinators.write().await;
-            coordinators.insert(swarm_id.clone(), target_session.clone());
-        }
-        let mut members = swarm_members.write().await;
-        if let Some(member) = members.get_mut(&req_session_id)
-            && member.session_id != target_session
-        {
-            member.role = "agent".to_string();
-        }
-    }
-
-    persist_swarm_state_for(&swarm_id, swarm.swarm_state()).await;
-
-    swarm.broadcast_swarm_status(&swarm_id).await;
-    swarm
-        .record_swarm_event(
-            req_session_id,
-            None,
-            Some(swarm_id),
-            SwarmEventType::Notification {
-                notification_type: "role_assignment".to_string(),
-                message: format!("{} -> {}", target_session, role),
+        finish_swarm_mutation_request(
+            swarm_mutation_runtime,
+            &mutation_state,
+            PersistedSwarmMutationResponse::Error {
+                message,
+                retry_after_secs: None,
             },
         )
         .await;
+        return;
+    }
+
     finish_swarm_mutation_request(
         swarm_mutation_runtime,
         &mutation_state,
@@ -1380,9 +1314,7 @@ async fn handle_comm_assign_task_with_mode(
     swarm: &SwarmServiceHandle,
 ) {
     let swarm_members = &swarm.swarm_state().members;
-    let swarms_by_id = &swarm.swarm_state().swarms_by_id;
     let swarm_plans = &swarm.swarm_state().plans;
-    let swarm_coordinators = &swarm.swarm_state().coordinators;
     let swarm_mutation_runtime = swarm.swarm_mutation_runtime();
     let sessions = &session.sessions;
     let requested_target_session = target_session.and_then(|target| {
@@ -1394,16 +1326,14 @@ async fn handle_comm_assign_task_with_mode(
         (!trimmed.is_empty()).then(|| trimmed.to_string())
     });
 
-    let swarm_id = match require_plan_driver_swarm(
-        id,
-        &req_session_id,
-        "Only the coordinator can assign tasks.",
-        client_event_tx,
-        swarm_members,
-        swarm_plans,
-        swarm_coordinators,
-    )
-    .await
+    let swarm_id = match swarm
+        .require_plan_driver_swarm(
+            id,
+            &req_session_id,
+            "Only the coordinator can assign tasks.",
+            client_event_tx,
+        )
+        .await
     {
         Some(swarm_id) => swarm_id,
         None => return,
@@ -1475,12 +1405,9 @@ async fn handle_comm_assign_task_with_mode(
         }
     };
 
-    let (selected_task_id, task_content, participant_ids, plan_item_count, blocked_reason) = {
+    let (selected_task_id, task_content, participant_ids, _plan_item_count, blocked_reason) = swarm
+        .record_task_assignment(&swarm_id, &req_session_id, |plan| {
         let now_ms = now_unix_ms();
-        let mut plans = swarm_plans.write().await;
-        let plan = plans
-            .entry(swarm_id.clone())
-            .or_insert_with(VersionedPlan::new);
         let selected_task_id = requested_task_id
             .clone()
             .or_else(|| next_unassigned_runnable_item_id(plan));
@@ -1576,7 +1503,8 @@ async fn handle_comm_assign_task_with_mode(
         } else {
             (None, None, HashSet::new(), 0, blocked_reason)
         }
-    };
+        })
+        .await;
 
     // The plan write above either recorded the assignment (from here
     // `assignment_loads` marks the target busy) or abandoned it (no runnable
@@ -1620,34 +1548,6 @@ async fn handle_comm_assign_task_with_mode(
         .await;
         return;
     };
-
-    let swarm_state = SwarmState {
-        members: Arc::clone(swarm_members),
-        swarms_by_id: Arc::clone(swarms_by_id),
-        plans: Arc::clone(swarm_plans),
-        coordinators: Arc::clone(swarm_coordinators),
-    };
-    persist_swarm_state_for(&swarm_id, &swarm_state).await;
-
-    broadcast_swarm_plan(
-        &swarm_id,
-        Some("task_assigned".to_string()),
-        swarm_plans,
-        swarm_members,
-        swarms_by_id,
-    )
-    .await;
-    swarm
-        .record_swarm_event(
-            req_session_id.clone(),
-            None,
-            Some(swarm_id.clone()),
-            SwarmEventType::PlanUpdate {
-                swarm_id: swarm_id.clone(),
-                item_count: plan_item_count,
-            },
-        )
-        .await;
 
     let coordinator_name = {
         let members = swarm_members.read().await;
@@ -1778,27 +1678,24 @@ pub(super) async fn handle_comm_assign_next(
 ) {
     let swarm_members = &swarm.swarm_state().members;
     let swarm_plans = &swarm.swarm_state().plans;
-    let swarm_coordinators = &swarm.swarm_state().coordinators;
     let sessions = &session.sessions;
     let soft_interrupt_queues = &session.soft_interrupt_queues;
     if target_session.is_none() {
-        let swarm_id = match require_plan_driver_swarm(
-            id,
-            &req_session_id,
-            "Only the coordinator can assign tasks.",
-            client_event_tx,
-            swarm_members,
-            swarm_plans,
-            swarm_coordinators,
-        )
-        .await
+        let swarm_id = match swarm
+            .require_plan_driver_swarm(
+                id,
+                &req_session_id,
+                "Only the coordinator can assign tasks.",
+                client_event_tx,
+            )
+            .await
         {
             Some(swarm_id) => swarm_id,
             None => return,
         };
 
         let Some(selected_task_id) =
-            next_runnable_task_id_reclaiming_stranded(&swarm_id, swarm_plans, swarm_members).await
+            next_runnable_task_id_reclaiming_stranded(&swarm_id, swarm_plans, swarm_members, swarm).await
         else {
             let _ = client_event_tx.send(ServerEvent::Error {
                 id,
@@ -1933,9 +1830,7 @@ pub(super) async fn handle_comm_task_control(
     swarm: &SwarmServiceHandle,
 ) {
     let swarm_members = &swarm.swarm_state().members;
-    let swarms_by_id = &swarm.swarm_state().swarms_by_id;
     let swarm_plans = &swarm.swarm_state().plans;
-    let swarm_coordinators = &swarm.swarm_state().coordinators;
     let sessions = &session.sessions;
     let Some(action) = TaskControlAction::parse(&action) else {
         let _ = client_event_tx.send(ServerEvent::Error {
@@ -1946,16 +1841,14 @@ pub(super) async fn handle_comm_task_control(
         return;
     };
 
-    let swarm_id = match require_plan_driver_swarm(
-        id,
-        &req_session_id,
-        "Only the coordinator can control assigned tasks.",
-        client_event_tx,
-        swarm_members,
-        swarm_plans,
-        swarm_coordinators,
-    )
-    .await
+    let swarm_id = match swarm
+        .require_plan_driver_swarm(
+            id,
+            &req_session_id,
+            "Only the coordinator can control assigned tasks.",
+            client_event_tx,
+        )
+        .await
     {
         Some(swarm_id) => swarm_id,
         None => return,
@@ -2096,34 +1989,19 @@ pub(super) async fn handle_comm_task_control(
             };
 
             if agent_is_idle {
-                if snapshot.status != "queued"
-                    && requeue_existing_assignment(
-                        &swarm_id,
-                        &req_session_id,
-                        &assignee,
-                        &task_id,
-                        assignment_text.clone(),
-                        swarm_plans,
-                    )
-                    .await
-                    .is_some()
-                {
-                    let swarm_state = SwarmState {
-                        members: Arc::clone(swarm_members),
-                        swarms_by_id: Arc::clone(swarms_by_id),
-                        plans: Arc::clone(swarm_plans),
-                        coordinators: Arc::clone(swarm_coordinators),
-                    };
-                    persist_swarm_state_for(&swarm_id, &swarm_state).await;
-                    broadcast_swarm_plan(
-                        &swarm_id,
-                        Some(format!("task_{}", action.as_str())),
-                        swarm_plans,
-                        swarm_members,
-                        swarms_by_id,
-                    )
-                    .await;
-                }
+                let _requeued = snapshot.status != "queued"
+                    && swarm
+                        .requeue_assignment(&swarm_id, &format!("task_{}", action.as_str()), |plan| {
+                            requeue_existing_assignment(
+                                plan,
+                                &req_session_id,
+                                &assignee,
+                                &task_id,
+                                assignment_text.clone(),
+                            )
+                            .map(|_| ())
+                        })
+                        .await;
 
                 spawn_assigned_task_run(
                     agent_arc,
@@ -2403,75 +2281,4 @@ pub(super) fn handle_client_debug_response(
     client_debug_response_tx: &broadcast::Sender<(u64, String)>,
 ) {
     let _ = client_debug_response_tx.send((id, output));
-}
-
-/// Authorize a session to drive task dispatch for its swarm plan.
-///
-/// Light mode keeps the single-coordinator rule: a coordinator is the one driver,
-/// which matches the cheap fan-out preset. Deep mode follows the task-DAG
-/// ownership model (see `docs/SWARM_TASK_GRAPH.md` section 2): the plan is a tree
-/// of ownership over a graph, and the agent that seeded/participates in the graph
-/// must be able to dispatch it even when another session already holds the
-/// swarm-level coordinator slot. Without this, a deep-mode agent that joins a
-/// shared swarm can seed a graph but is then blocked from spawning/assigning any
-/// of it, so nothing ever runs.
-///
-/// Returns the swarm id when the caller is the coordinator, or (deep mode only) a
-/// participant of the swarm's plan.
-async fn require_plan_driver_swarm(
-    id: u64,
-    req_session_id: &str,
-    permission_error: &str,
-    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-) -> Option<String> {
-    let swarm_id = {
-        let members = swarm_members.read().await;
-        members
-            .get(req_session_id)
-            .and_then(|member| member.swarm_id.clone())
-    };
-    let Some(swarm_id) = swarm_id else {
-        let _ = client_event_tx.send(ServerEvent::Error {
-            id,
-            message: "Not in a swarm.".to_string(),
-            retry_after_secs: None,
-        });
-        return None;
-    };
-
-    let is_coordinator = {
-        let coordinators = swarm_coordinators.read().await;
-        coordinators
-            .get(&swarm_id)
-            .map(|coordinator| coordinator == req_session_id)
-            .unwrap_or(false)
-    };
-    if is_coordinator {
-        return Some(swarm_id);
-    }
-
-    // Deep mode: any participant of the plan may drive its own task graph.
-    let is_deep_participant = {
-        let plans = swarm_plans.read().await;
-        plans
-            .get(&swarm_id)
-            .map(|plan| {
-                jcode_plan::bridge::parse_mode(&plan.mode) == jcode_plan::dag::Mode::Deep
-                    && plan.participants.contains(req_session_id)
-            })
-            .unwrap_or(false)
-    };
-    if is_deep_participant {
-        return Some(swarm_id);
-    }
-
-    let _ = client_event_tx.send(ServerEvent::Error {
-        id,
-        message: permission_error.to_string(),
-        retry_after_secs: None,
-    });
-    None
 }

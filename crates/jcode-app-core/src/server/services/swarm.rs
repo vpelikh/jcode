@@ -3,7 +3,7 @@
 use crate::protocol::ServerEvent;
 use crate::server::{
     AwaitMembersRuntime, FileTouchService, Server, SharedContext, SwarmEvent, SwarmEventType,
-    SwarmMember, SwarmMutationRuntime, SwarmState,
+    SwarmMember, SwarmMutationRuntime, SwarmState, VersionedPlan,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -368,6 +368,53 @@ impl SwarmServiceHandle {
         members
             .get(session_id)
             .is_none_or(|member| member.status != "running")
+    }
+
+    /// Resolve the swarm id a member currently belongs to, if any.
+    pub(crate) async fn member_swarm_id(&self, session_id: &str) -> Option<String> {
+        let members = self.swarm_state.members.read().await;
+        members
+            .get(session_id)
+            .and_then(|member| member.swarm_id.clone())
+    }
+
+    /// Resolve the swarm ids of two members in one read.
+    ///
+    /// Returns `(req_swarm, target_swarm)`. This is used by the
+    /// same-swarm-access guard in the comm read helpers.
+    pub(crate) async fn member_swarm_ids(
+        &self,
+        req_session_id: &str,
+        target_session: &str,
+    ) -> (Option<String>, Option<String>) {
+        let members = self.swarm_state.members.read().await;
+        (
+            members
+                .get(req_session_id)
+                .and_then(|member| member.swarm_id.clone()),
+            members
+                .get(target_session)
+                .and_then(|member| member.swarm_id.clone()),
+        )
+    }
+
+    /// Whether `req_session_id` may read the full context of `target_session`:
+    /// always true for the session itself, otherwise requires `req_session_id`
+    /// to be a swarm coordinator. Mirrors the swarm-aware context permission
+    /// guard used by the comm read helpers.
+    pub(crate) async fn can_read_full_context(
+        &self,
+        req_session_id: &str,
+        target_session: &str,
+    ) -> bool {
+        if req_session_id == target_session {
+            return true;
+        }
+        let members = self.swarm_state.members.read().await;
+        members
+            .get(req_session_id)
+            .map(|member| member.role == "coordinator")
+            .unwrap_or(false)
     }
 
     /// Rename a swarm member's identity when its session id changes (resume /
@@ -785,11 +832,231 @@ impl SwarmServiceHandle {
         )
         .await;
     }
+
+    /// Require that `req_session_id` is the coordinator of its own swarm.
+    ///
+    /// Resolves the requesting session's swarm id, verifies the session is its
+    /// coordinator, and returns `Some(swarm_id)` on success. On failure sends
+    /// the appropriate `ServerEvent::Error` and returns `None`. Mirrors the
+    /// `require_coordinator_swarm` permission guard used by the plan-decision
+    /// handlers.
+    pub(crate) async fn require_coordinator_swarm(
+        &self,
+        id: u64,
+        req_session_id: &str,
+        permission_error: &str,
+        client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+    ) -> Option<String> {
+        let (swarm_id, is_coordinator) = {
+            let members = self.swarm_state.members.read().await;
+            let swarm_id = members
+                .get(req_session_id)
+                .and_then(|member| member.swarm_id.clone());
+            let is_coordinator = if let Some(ref swarm_id) = swarm_id {
+                let coordinators = self.swarm_state.coordinators.read().await;
+                coordinators
+                    .get(swarm_id)
+                    .map(|coordinator| coordinator == req_session_id)
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+            (swarm_id, is_coordinator)
+        };
+
+        if !is_coordinator {
+            let _ = client_event_tx.send(ServerEvent::Error {
+                id,
+                message: permission_error.to_string(),
+                retry_after_secs: None,
+            });
+            return None;
+        }
+
+        match swarm_id {
+            Some(swarm_id) => Some(swarm_id),
+            None => {
+                let _ = client_event_tx.send(ServerEvent::Error {
+                    id,
+                    message: "Not in a swarm.".to_string(),
+                    retry_after_secs: None,
+                });
+                None
+            }
+        }
+    }
+
+    /// Guard that `req_session_id` and `target_session` belong to the same
+    /// swarm. Sends an error and returns `false` when they do not. Mirrors the
+    /// `ensure_same_swarm_access` permission guard used by the comm read
+    /// helpers.
+    pub(crate) async fn ensure_same_swarm_access(
+        &self,
+        id: u64,
+        req_session_id: &str,
+        target_session: &str,
+        client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+    ) -> bool {
+        let (req_swarm, target_swarm) = self.member_swarm_ids(req_session_id, target_session).await;
+
+        if req_swarm.is_some() && req_swarm == target_swarm {
+            true
+        } else {
+            let _ = client_event_tx.send(ServerEvent::Error {
+                id,
+                message: format!(
+                    "Session '{}' is not in the same swarm as requester '{}'",
+                    target_session, req_session_id
+                ),
+                retry_after_secs: None,
+            });
+            false
+        }
+    }
+
+    /// Require that `req_session_id` may drive the plan for its swarm: either it
+    /// is the coordinator, or the plan runs in deep mode and the session is a
+    /// participant. Returns `Some(swarm_id)` on success, else sends the
+    /// permission error and returns `None`. Mirrors the `require_plan_driver_swarm`
+    /// guard used by the assign / task-control handlers.
+    pub(crate) async fn require_plan_driver_swarm(
+        &self,
+        id: u64,
+        req_session_id: &str,
+        permission_error: &str,
+        client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+    ) -> Option<String> {
+        let swarm_id = self.member_swarm_id(req_session_id).await;
+        let Some(swarm_id) = swarm_id else {
+            let _ = client_event_tx.send(ServerEvent::Error {
+                id,
+                message: "Not in a swarm.".to_string(),
+                retry_after_secs: None,
+            });
+            return None;
+        };
+
+        let is_coordinator = {
+            let coordinators = self.swarm_state.coordinators.read().await;
+            coordinators
+                .get(&swarm_id)
+                .map(|coordinator| coordinator == req_session_id)
+                .unwrap_or(false)
+        };
+        if is_coordinator {
+            return Some(swarm_id);
+        }
+
+        // Deep mode: any participant of the plan may drive its own task graph.
+        let is_deep_participant = {
+            let plans = self.swarm_state.plans.read().await;
+            plans
+                .get(&swarm_id)
+                .map(|plan| {
+                    jcode_plan::bridge::parse_mode(&plan.mode) == jcode_plan::dag::Mode::Deep
+                        && plan.participants.contains(req_session_id)
+                })
+                .unwrap_or(false)
+        };
+        if is_deep_participant {
+            return Some(swarm_id);
+        }
+
+        let _ = client_event_tx.send(ServerEvent::Error {
+            id,
+            message: permission_error.to_string(),
+            retry_after_secs: None,
+        });
+        None
+    }
+
+    /// Clear `swarm_id`'s coordinator, demoting any swarm members whose role is
+    /// `coordinator` back to `agent`, then persist the change. Returns whether
+    /// a coordinator was actually removed. This is the debug
+    /// `swarm:clear_coordinator` operation.
+    pub(crate) async fn clear_coordinator(&self, swarm_id: &str) -> bool {
+        // Never nest these independent locks: persistence re-reads
+        // coordinators, so retaining a write guard here self-deadlocks.
+        let removed = {
+            let mut coordinators = self.swarm_state.coordinators.write().await;
+            coordinators.remove(swarm_id).is_some()
+        };
+        if removed {
+            {
+                let mut members = self.swarm_state.members.write().await;
+                for member in members.values_mut() {
+                    if member.swarm_id.as_deref() == Some(swarm_id) && member.role == "coordinator"
+                    {
+                        member.role = "agent".to_string();
+                    }
+                }
+            }
+            let swarm_state = SwarmState {
+                members: self.swarm_state.members.clone(),
+                swarms_by_id: self.swarm_state.swarms_by_id.clone(),
+                plans: self.swarm_state.plans.clone(),
+                coordinators: self.swarm_state.coordinators.clone(),
+            };
+            super::super::persist_swarm_state_for(swarm_id, &swarm_state).await;
+        }
+        removed
+    }
+
+    /// Clear `swarm_id`'s plan: remove it from the plans map, re-persist so the
+    /// on-disk state drops it too (otherwise the next restart resurrects the
+    /// stale plan graph), and broadcast a `plan_cleared` `ServerEvent::SwarmPlan`
+    /// to every attached session so their TUIs drop the resident item graph.
+    /// Returns the removed plan, or `None` if no plan existed. This is the
+    /// debug `swarm:clear_plan` operation.
+    pub(crate) async fn clear_plan(&self, swarm_id: &str) -> Option<VersionedPlan> {
+        let removed = {
+            let mut plans = self.swarm_state.plans.write().await;
+            plans.remove(swarm_id)
+        };
+        let removed = removed?;
+
+        let swarm_state = SwarmState {
+            members: self.swarm_state.members.clone(),
+            swarms_by_id: self.swarm_state.swarms_by_id.clone(),
+            plans: self.swarm_state.plans.clone(),
+            coordinators: self.swarm_state.coordinators.clone(),
+        };
+        super::super::persist_swarm_state_for(swarm_id, &swarm_state).await;
+
+        let clear_event = ServerEvent::SwarmPlan {
+            swarm_id: swarm_id.to_string(),
+            version: removed.version.saturating_add(1),
+            items: Vec::new(),
+            participants: Vec::new(),
+            reason: Some("plan_cleared".to_string()),
+            summary: None,
+        };
+        let session_ids: Vec<String> = {
+            let swarms = self.swarm_state.swarms_by_id.read().await;
+            swarms
+                .get(swarm_id)
+                .map(|s| s.iter().cloned().collect())
+                .unwrap_or_default()
+        };
+        {
+            let members = self.swarm_state.members.read().await;
+            for sid in session_ids {
+                if let Some(member) = members.get(&sid) {
+                    let _ = member.event_tx.send(clear_event.clone());
+                    for tx in member.event_txs.values() {
+                        let _ = tx.send(clear_event.clone());
+                    }
+                }
+            }
+        }
+        Some(removed)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::VersionedPlan;
 
     fn base_handle() -> SwarmServiceHandle {
         SwarmServiceHandle::test_with_state(
@@ -825,7 +1092,8 @@ mod tests {
         let second = handle.get_shared_context("swarm-1", "k").await;
         assert_eq!(second.as_ref().expect("entry").value, "v2");
         assert_eq!(
-            second.as_ref().expect("entry").created_at, created,
+            second.as_ref().expect("entry").created_at,
+            created,
             "created_at should survive a plain re-insert"
         );
     }
@@ -852,7 +1120,11 @@ mod tests {
             .set_shared_context("swarm-1", "empty", "solo".to_string(), "sess", None, true)
             .await;
         assert_eq!(
-            handle.get_shared_context("swarm-1", "empty").await.unwrap().value,
+            handle
+                .get_shared_context("swarm-1", "empty")
+                .await
+                .unwrap()
+                .value,
             "solo"
         );
     }
@@ -895,10 +1167,7 @@ mod tests {
                 .is_some_and(|s| s.contains("sess-1"))
         );
         // Reverse index: sess-1 -> swarm-1 -> {chan-a}
-        let rev = handle
-            .channel_subscriptions_by_session_map()
-            .read()
-            .await;
+        let rev = handle.channel_subscriptions_by_session_map().read().await;
         assert!(
             rev.get("sess-1")
                 .and_then(|sw| sw.get("swarm-1"))
@@ -1025,6 +1294,65 @@ mod tests {
             coordinators.get("swarm-test").map(String::as_str),
             Some("new"),
             "routing a coordinator through a rename must point at the new session id"
+        );
+    }
+
+    async fn insert_member(
+        handle: &SwarmServiceHandle,
+        session_id: &str,
+        swarm_id: &str,
+        role: &str,
+    ) {
+        let member = SwarmMember {
+            session_id: session_id.to_string(),
+            event_tx: mpsc::unbounded_channel().0,
+            event_txs: HashMap::new(),
+            working_dir: None,
+            swarm_id: Some(swarm_id.to_string()),
+            swarm_enabled: true,
+            status: "ready".to_string(),
+            detail: None,
+            task_label: None,
+            friendly_name: None,
+            report_back_to_session_id: None,
+            latest_completion_report: None,
+            role: role.to_string(),
+            joined_at: Instant::now(),
+            last_status_change: Instant::now(),
+            is_headless: false,
+            output_tail: None,
+            todo_progress: None,
+            todo_items: Vec::new(),
+            runtime: Default::default(),
+        };
+        handle
+            .swarm_state()
+            .members
+            .write()
+            .await
+            .insert(session_id.to_string(), member);
+    }
+
+    #[tokio::test]
+    async fn member_swarm_id_and_ids_resolve_membership() {
+        let handle = base_handle();
+        assert_eq!(handle.member_swarm_id("sess-1").await, None);
+
+        insert_member(&handle, "sess-1", "swarm-A", "agent").await;
+        insert_member(&handle, "sess-2", "swarm-A", "coordinator").await;
+        insert_member(&handle, "sess-3", "swarm-B", "agent").await;
+        assert_eq!(
+            handle.member_swarm_id("sess-1").await,
+            Some("swarm-A".into())
+        );
+        assert_eq!(handle.member_swarm_id("sess-missing").await, None);
+        assert_eq!(
+            handle.member_swarm_ids("sess-1", "sess-2").await,
+            (Some("swarm-A".into()), Some("swarm-A".into()))
+        );
+        assert_eq!(
+            handle.member_swarm_ids("sess-1", "sess-3").await,
+            (Some("swarm-A".into()), Some("swarm-B".into()))
         );
     }
 
@@ -1262,5 +1590,228 @@ mod tests {
             Some("new"),
             "coordinator follows the renamed session once the external lock is released"
         );
+    }
+
+    async fn ensure_same_swarm_access_accepts_same_swarm_and_rejects_foreign() {
+        let handle = base_handle();
+        insert_member(&handle, "req", "swarm-A", "agent").await;
+        insert_member(&handle, "same", "swarm-A", "agent").await;
+        insert_member(&handle, "other", "swarm-B", "agent").await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        assert!(
+            handle.ensure_same_swarm_access(1, "req", "same", &tx).await,
+            "same-swarm members pass"
+        );
+        let recipient_unmatched = handle
+            .ensure_same_swarm_access(2, "req", "other", &tx)
+            .await;
+        assert!(!recipient_unmatched, "different swarm is rejected");
+        match rx.try_recv() {
+            Ok(ServerEvent::Error { id, .. }) => assert_eq!(id, 2),
+            other => panic!("expected error event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn require_coordinator_swarm_grants_only_the_coordinator() {
+        let handle = base_handle();
+        insert_member(&handle, "sess-1", "swarm-A", "coordinator").await;
+        insert_member(&handle, "sess-2", "swarm-A", "agent").await;
+        handle
+            .swarm_state()
+            .coordinators
+            .write()
+            .await
+            .insert("swarm-A".to_string(), "sess-1".to_string());
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        assert_eq!(
+            handle
+                .require_coordinator_swarm(1, "sess-1", "denied", &tx)
+                .await,
+            Some("swarm-A".into()),
+            "coordinator is granted"
+        );
+        assert_eq!(
+            handle
+                .require_coordinator_swarm(2, "sess-2", "denied", &tx)
+                .await,
+            None,
+            "plain member is denied"
+        );
+        assert_eq!(
+            handle
+                .require_coordinator_swarm(3, "ghost", "denied", &tx)
+                .await,
+            None,
+            "unknown session is denied"
+        );
+    }
+
+    #[tokio::test]
+    async fn can_read_full_context_allows_self_and_coordinator() {
+        let handle = base_handle();
+        insert_member(&handle, "coord", "swarm-A", "coordinator").await;
+        insert_member(&handle, "agent-1", "swarm-A", "agent").await;
+        insert_member(&handle, "agent-2", "swarm-A", "agent").await;
+        // Self always allowed.
+        assert!(
+            handle.can_read_full_context("agent-1", "agent-1").await,
+            "self is always readable"
+        );
+        // Coordinator reading any target in the swarm.
+        assert!(
+            handle.can_read_full_context("coord", "agent-2").await,
+            "coordinator may read any member"
+        );
+        assert!(
+            !handle.can_read_full_context("agent-1", "agent-2").await,
+            "non-coordinator may not read other members"
+        );
+    }
+
+    #[tokio::test]
+    async fn require_plan_driver_swarm_grants_coordinator_and_deep_participant() {
+        let handle = base_handle();
+        insert_member(&handle, "coord", "swarm-A", "coordinator").await;
+        insert_member(&handle, "member", "swarm-A", "agent").await;
+        handle
+            .swarm_state()
+            .coordinators
+            .write()
+            .await
+            .insert("swarm-A".to_string(), "coord".to_string());
+        // Deep-mode plan where `member` participates.
+        handle.swarm_state().plans.write().await.insert(
+            "swarm-A".to_string(),
+            VersionedPlan {
+                items: Vec::new(),
+                version: 1,
+                participants: HashSet::from(["member".to_string()]),
+                task_progress: HashMap::new(),
+                mode: "deep".to_string(),
+                node_meta: HashMap::new(),
+            },
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        assert_eq!(
+            handle
+                .require_plan_driver_swarm(1, "coord", "denied", &tx)
+                .await,
+            Some("swarm-A".into()),
+            "coordinator may drive the plan"
+        );
+        assert_eq!(
+            handle
+                .require_plan_driver_swarm(2, "member", "denied", &tx)
+                .await,
+            Some("swarm-A".into()),
+            "deep-mode participant may drive the plan"
+        );
+        assert_eq!(
+            handle
+                .require_plan_driver_swarm(3, "ghost", "denied", &tx)
+                .await,
+            None,
+            "unknown session is denied"
+        );
+    }
+
+    #[tokio::test]
+    async fn require_plan_driver_swarm_denies_non_coordinator_in_light_mode() {
+        let handle = base_handle();
+        insert_member(&handle, "coord", "swarm-A", "coordinator").await;
+        insert_member(&handle, "member", "swarm-A", "agent").await;
+        handle
+            .swarm_state()
+            .coordinators
+            .write()
+            .await
+            .insert("swarm-A".to_string(), "coord".to_string());
+        // Light-mode plan: only the single coordinator may drive.
+        handle.swarm_state().plans.write().await.insert(
+            "swarm-A".to_string(),
+            VersionedPlan {
+                items: Vec::new(),
+                version: 1,
+                participants: HashSet::from(["member".to_string()]),
+                task_progress: HashMap::new(),
+                mode: "light".to_string(),
+                node_meta: HashMap::new(),
+            },
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        assert_eq!(
+            handle
+                .require_plan_driver_swarm(1, "member", "denied", &tx)
+                .await,
+            None,
+            "light-mode non-coordinator cannot drive"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_coordinator_demotes_members_and_reports_removal() {
+        let handle = base_handle();
+        insert_member(&handle, "coord", "swarm-A", "coordinator").await;
+        insert_member(&handle, "agent", "swarm-A", "agent").await;
+        handle
+            .swarm_state()
+            .coordinators
+            .write()
+            .await
+            .insert("swarm-A".to_string(), "coord".to_string());
+
+        assert!(
+            handle.clear_coordinator("swarm-A").await,
+            "removes coordinator"
+        );
+
+        let coordinators = handle.swarm_state().coordinators.read().await;
+        assert!(!coordinators.contains_key("swarm-A"));
+        drop(coordinators);
+        let members = handle.swarm_state().members.read().await;
+        assert_eq!(
+            members.get("coord").map(|m| m.role.as_str()),
+            Some("agent"),
+            "former coordinator is demoted to agent"
+        );
+        assert_eq!(members.get("agent").map(|m| m.role.as_str()), Some("agent"));
+
+        // Clearing a swarm with no coordinator reports no removal.
+        assert!(!handle.clear_coordinator("swarm-A").await);
+    }
+
+    #[tokio::test]
+    async fn clear_plan_removes_persisted_plan() {
+        let handle = base_handle();
+        handle.swarm_state().plans.write().await.insert(
+            "swarm-A".to_string(),
+            VersionedPlan {
+                items: Vec::new(),
+                version: 3,
+                participants: HashSet::new(),
+                task_progress: HashMap::new(),
+                mode: "deep".to_string(),
+                node_meta: HashMap::new(),
+            },
+        );
+
+        let removed = handle.clear_plan("swarm-A").await;
+        assert_eq!(
+            removed.map(|p| p.version),
+            Some(3),
+            "returns the removed plan"
+        );
+        assert!(
+            handle.swarm_state().plans.read().await.is_empty(),
+            "plan is dropped from the map"
+        );
+
+        // Clearing a missing plan is a no-op returning None.
+        assert!(handle.clear_plan("swarm-nope").await.is_none());
     }
 }

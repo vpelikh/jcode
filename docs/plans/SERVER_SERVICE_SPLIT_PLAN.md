@@ -1176,3 +1176,93 @@ this Tier 1:
 The convergence gate ("zero flat swarm-map args in any pub/super *router*
 handler signature") is met on the client/swarm boundary; tests stay green
 (1480 passing) and clippy clean after each landed slice.
+
+## Tier 3 follow-up: shared swarm-access permission guards landed (2026-09)
+
+First slice of the deferred Tier 3 follow-up (plan item #2). Adds encapsulated
+`SwarmServiceHandle` methods for the membership / coordinator permission checks
+that the comm handlers repeated as body-local free functions, then migrates the
+call sites onto the handle.
+
+- **`member_swarm_id(session_id)`** and **`member_swarm_ids(req, target)`**
+  resolve a member's swarm id (optionally two at once) behind the handle instead
+  of each caller binding `swarm.swarm_state().members` and `read().await`-ing it.
+- **`can_read_full_context(req, target)`** encapsulates the swarm-aware context
+  permission guard (self always allowed, otherwise coordinator-only).
+- **`ensure_same_swarm_access(id, req, target, client_event_tx)`** encapsulates
+  the same-swarm guard that sends the "not in the same swarm" `ServerEvent::Error`
+  and returns whether access is granted.
+- **`require_coordinator_swarm(id, req, permission_error, client_event_tx)`**
+  encapsulates the coordinator-of-own-swarm guard used by the plan-decision
+  handlers, returning `Some(swarm_id)` on success or the error event + `None`.
+
+Migrated call sites:
+
+- `comm_sync.rs`: all three same-swarm-access guard uses (`handle_comm_summary`,
+  `handle_comm_status`, `handle_comm_get_context`) and the coordinator full-context
+  guard now route through the handle methods; the body-local `swarm_members`
+  re-bindings and the two free functions (`ensure_same_swarm_access`,
+  `can_read_full_context`) are deleted.
+- `comm_plan.rs`: `handle_comm_propose_plan` resolves its swarm id via
+  `member_swarm_id`; `handle_comm_approve_plan` / `handle_comm_reject_plan` use
+  the handle's `require_coordinator_swarm`, and the free
+  `require_coordinator_swarm` helper is deleted.
+
+For each migrated site the flat map args were dropped from the shared helper
+signatures; callers that still need direct map access for deeper mutation keep
+only the specific `swarm_state()` bindings they actually use.
+
+Zero behavior change; the `jcode-app-core` server suite stays green (477 passing)
+and clippy adds no new warnings. Four new unit tests cover the added handle
+methods (`member_swarm_id*/member_swarm_ids`, `can_read_full_context`,
+`require_coordinator_swarm`, `ensure_same_swarm_access`).
+
+Remaining Tier 3 follow-up: the deeper direct-`swarm_state()` mutation sites
+(`comm_control`, `comm_await`, `comm_sync` resync, `debug_swarm_write`, session
+helpers) that have no shared permission helper yet, and the file_touch /
+shared_context / channel-subscription index ownership decision.
+
+### `require_plan_driver_swarm` moved onto the handle (2026-09)
+
+Second Tier 3 follow-up slice. The deep/light-mode plan-driver authorization guard
+(used by the assign and task-control handlers) is now a `SwarmServiceHandle` method
+instead of a body-local free function.
+
+- **`require_plan_driver_swarm(id, req_session_id, permission_error,
+  client_event_tx)`** encapsulates the coordinator-or-deep-participant authorization:
+  it accepts the coordinator, or a participant when the swarm plan runs in deep
+  mode (light mode keeps the single-coordinator rule). It routes the "Not in a
+  swarm" and permission errors through the handle instead of the caller binding
+  members/plans/coordinators.
+- `comm_control.rs`: all three call sites (`handle_comm_assign_task_with_mode`,
+  `handle_comm_assign_next`, `handle_comm_task_control`) now call the handle
+  method; the flat `swarm_members`/`swarm_plans`/`swarm_coordinators` args are
+  dropped from the guard, and the free `require_plan_driver_swarm` helper (with
+  its light/deep-mode doc comment) is deleted. One now-unused
+  `swarm_coordinators` binding is removed.
+
+Zero behavior change; the server suite stays green (479 passing) and clippy adds
+no new warnings. Two unit tests cover coordinator vs deep-participant grant and
+light-mode denial.
+
+### `clear_coordinator` / `clear_plan` moved onto the handle (2026-09)
+
+Third Tier 3 follow-up slice. The two standalone debug swarm mutations
+(`swarm:clear_coordinator`, `swarm:clear_plan`) are now `SwarmServiceHandle`
+methods instead of reaching into the raw `swarm_state` maps from
+`debug_swarm_write.rs`.
+
+- **`clear_coordinator(swarm_id)`** removes the coordinator and demotes any
+  `coordinator`-role member back to `agent`, then persists the change, returning
+  whether a coordinator was actually removed.
+- **`clear_plan(swarm_id)`** removes the plan from the plans map, re-persists so
+  the on-disk state drops it (preventing resurrect on restart), broadcasts a
+  `plan_cleared` `ServerEvent::SwarmPlan` to attached sessions so their TUIs drop
+  the resident item graph, and returns the removed plan (or `None`).
+- `debug_swarm_write.rs`: the two `swarm:clear_*` branches now call the handle
+  methods, removing ~12 direct `swarm_state().` accesses (the coordinator/members/
+  plans/coordinators clones, persist, and clear-event fan-out).
+
+Zero behavior change; the server suite stays green (481 passing) and clippy adds
+no new warnings. Two unit tests cover coordinator demotion/removal reporting and
+plan removal + missing-plan no-op.
