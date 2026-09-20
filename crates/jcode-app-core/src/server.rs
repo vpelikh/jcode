@@ -1398,25 +1398,16 @@ impl Server {
             });
         }
 
-        // Spawn the bus monitor for swarm coordination
-        let monitor_file_touch = self.file_touch.clone();
-        let monitor_swarm_members = Arc::clone(&self.swarm_state.members);
-        let monitor_swarms_by_id = Arc::clone(&self.swarm_state.swarms_by_id);
+        // Spawn the bus monitor for swarm coordination. Swarm state flows in via the
+        // swarm service handle (Slice 4); only session-scoped state is cloned.
+        let monitor_swarm = services::SwarmServiceHandle::from_server(self);
         let monitor_sessions = Arc::clone(&self.sessions);
         let monitor_soft_interrupt_queues = Arc::clone(&self.soft_interrupt_queues);
-        let monitor_event_history = Arc::clone(&self.event_history);
-        let monitor_event_counter = Arc::clone(&self.event_counter);
-        let monitor_swarm_event_tx = self.swarm_event_tx.clone();
         tokio::spawn(async move {
             Self::monitor_bus(
-                monitor_file_touch,
-                monitor_swarm_members,
-                monitor_swarms_by_id,
+                &monitor_swarm,
                 monitor_sessions,
                 monitor_soft_interrupt_queues,
-                monitor_event_history,
-                monitor_event_counter,
-                monitor_swarm_event_tx,
             )
             .await;
         });
@@ -2013,20 +2004,20 @@ impl Server {
     }
 
     /// Monitor the global Bus for FileTouch events and detect conflicts
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "bus monitor needs file state, swarm state, sessions, queues, and event history sinks"
-    )]
     async fn monitor_bus(
-        file_touch: FileTouchService,
-        swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>>,
-        swarms_by_id: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+        swarm: &services::SwarmServiceHandle,
         sessions: Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>,
         soft_interrupt_queues: SessionInterruptQueues,
-        event_history: Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-        event_counter: Arc<std::sync::atomic::AtomicU64>,
-        swarm_event_tx: broadcast::Sender<SwarmEvent>,
     ) {
+        // Swarm-domain state is reached through the swarm service handle. These
+        // locals keep the body single-homed on the handle's fields instead of a
+        // flat pass-through argument bag (server service split, Slice 4).
+        let file_touch = swarm.file_touch.clone();
+        let swarm_members = Arc::clone(&swarm.swarm_state.members);
+        let swarms_by_id = Arc::clone(&swarm.swarm_state.swarms_by_id);
+        let event_history = swarm.event_history.clone();
+        let event_counter = Arc::clone(&swarm.event_counter);
+        let swarm_event_tx = swarm.swarm_event_tx.clone();
         let mut receiver = Bus::global().subscribe();
         let mut last_cleanup = Instant::now();
         const TOUCH_EXPIRY: Duration = Duration::from_secs(30 * 60); // 30 min
