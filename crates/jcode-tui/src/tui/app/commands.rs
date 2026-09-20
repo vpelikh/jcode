@@ -1595,6 +1595,163 @@ fn handle_git_command(app: &mut App, trimmed: &str) -> bool {
     true
 }
 
+/// Parsed `/worktree` arguments.
+///
+/// The command name is unique; the directory is derived from it
+/// (`<repo>/.worktrees/<name>`), and the branch defaults to a `feat/` branch
+/// named after the worktree unless an explicit `-b <branch>` is supplied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct WorktreeSpec {
+    /// The worktree name, used both for the folder and (by default) the branch.
+    pub name: String,
+    /// The branch to create and check out. When `None`, `feat/<name>` is used.
+    pub branch: Option<String>,
+}
+
+/// Parse the arguments of a `/worktree` command.
+pub(super) fn parse_worktree_spec(rest: &str) -> Result<WorktreeSpec, String> {
+    let tokens: Vec<&str> = rest.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Err("Usage: /worktree <name> [-b <branch>]".to_string());
+    }
+    // Optional `-b <branch>`; the name must come first so git-style option
+    // ordering (`-b` then name) is rejected early with a clear message.
+    if tokens[0] == "-b" {
+        return Err(
+            "Usage: /worktree <name> [-b <branch>]  (the worktree name must come first)"
+                .to_string(),
+        );
+    }
+    let name = tokens[0].to_string();
+    if name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+        return Err(format!(
+            "Invalid worktree name '{name}': use a single path segment (e.g. 'panel-settings')."
+        ));
+    }
+    // Reject anything that could be mistaken for an option so a typo like
+    // `/worktree -x name` fails loudly instead of creating `-x`.
+    if name.starts_with('-') {
+        return Err(format!(
+            "Invalid worktree name '{name}': a name cannot start with '-'."
+        ));
+    }
+
+    let mut branch = None;
+    let mut i = 1;
+    while i < tokens.len() {
+        match tokens[i] {
+            "-b" | "--branch" => {
+                let value = tokens.get(i + 1).ok_or_else(|| {
+                    "Usage: /worktree <name> -b <branch>  (branch missing after -b)".to_string()
+                })?;
+                if value.starts_with('-') {
+                    return Err(format!("Invalid branch '{value}': expected a branch name."));
+                }
+                branch = Some(value.to_string());
+                i += 2;
+            }
+            other => {
+                return Err(format!(
+                    "Unexpected argument '{other}'. Usage: /worktree <name> [-b <branch>]"
+                ));
+            }
+        }
+    }
+
+    Ok(WorktreeSpec { name, branch })
+}
+
+/// Resolve the main repo root owning `work_dir`.
+///
+/// Works from the main checkout or any linked worktree: the git common dir
+/// (`.git` for the main repo / the superproject) is always the same, and the
+/// main checkout is its direct parent. Returns an error when `work_dir` is not
+/// inside a git repository reachable from this client.
+fn main_repo_root_for_work_dir(work_dir: &std::path::Path) -> Result<PathBuf, String> {
+    let common_dir =
+        run_git_command(work_dir, &["rev-parse", "--path-format=absolute", "--git-common-dir"])
+            .map_err(|error| {
+                format!(
+                    "No git repository found for {}: {}",
+                    work_dir.display(),
+                    error
+                )
+            })?;
+    let common = std::path::Path::new(&common_dir).to_path_buf();
+    let root = common
+        .parent()
+        .ok_or_else(|| format!("Unable to determine repository root from {}", common.display()))?;
+    Ok(root.to_path_buf())
+}
+
+/// Create a new git worktree and return its absolute path.
+///
+/// Pure computation (no `App` borrow): resolves the repo root from `work_dir`,
+/// creates `<repo>/.worktrees/<name>` on a new branch (`feat/<name>` by default,
+/// or the `<branch>` given via `-b`), and cleans up any empty target dir left
+/// behind on a partial failure. This is the blocking git path, so async callers
+/// run it on a blocking thread (see `invoke_new_worktree`).
+pub(super) fn create_git_worktree_at(
+    work_dir: PathBuf,
+    spec: &WorktreeSpec,
+) -> Result<PathBuf, String> {
+    let repo_root = main_repo_root_for_work_dir(&work_dir)?;
+    let branch = match &spec.branch {
+        Some(branch) => branch.clone(),
+        None => format!("feat/{}", spec.name),
+    };
+    let worktree_dir = repo_root.join(".worktrees").join(&spec.name);
+
+    if worktree_dir.exists() {
+        return Err(format!(
+            "Worktree '{}' already exists at {}.",
+            spec.name,
+            worktree_dir.display()
+        ));
+    }
+
+    run_git_command(
+        &repo_root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            "-q",
+            worktree_dir.to_str().unwrap_or_default(),
+        ],
+    )
+    .map_err(|error| {
+        // `git worktree add` creates the target dir while preparing; if it
+        // fails partway (e.g. branch name collision) it may leave an empty dir
+        // behind. Clean it up so a retry with a corrected name is clean.
+        if worktree_dir.read_dir().map(|mut it| it.next().is_none()).unwrap_or(false) {
+            let _ = std::fs::remove_dir(&worktree_dir);
+        }
+        error
+    })?;
+
+    Ok(worktree_dir)
+}
+
+/// Resolve the session's working directory for git operations.
+///
+/// Exposed so async callers can grab the owned dir before offloading the
+/// blocking git work to a worker thread.
+pub(super) fn session_work_dir(app: &App) -> Result<PathBuf, String> {
+    git_command_repo_dir(app)
+}
+
+/// [`create_git_worktree_at`] using the session working directory.
+///
+/// Test-only: async callers use [`session_work_dir`] + `spawn_blocking`
+/// (`create_git_worktree_at`) so the blocking git call runs on a worker thread.
+#[cfg(test)]
+pub(super) fn create_git_worktree(app: &App, spec: &WorktreeSpec) -> Result<PathBuf, String> {
+    let work_dir = git_command_repo_dir(app)?;
+    create_git_worktree_at(work_dir, spec)
+}
+
 fn transcript_opened_message(path: &std::path::Path) -> String {
     format!("Opened transcript file:\n\n  {}", path.display())
 }

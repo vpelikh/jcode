@@ -266,6 +266,81 @@ pub(in crate::tui::app) async fn handle_remote_key_event(
     .await
 }
 
+/// Shared execution for the `/worktree` command and the new-worktree auto
+/// trigger: create a git worktree and move the session into it in place.
+///
+/// Enforces the same guard the slash handler used to (rejects while the agent
+/// is working). Returns the created worktree's absolute path only when the
+/// session was actually moved into it (the chained `/cd` succeeded), or `None`
+/// when the request could not be fully honored — either the worktree was not
+/// created, or it was created but the session could not be moved into it (an
+/// explanatory notice is shown in both cases).
+pub(in crate::tui::app) async fn invoke_new_worktree(
+    app: &mut App,
+    remote: &mut RemoteConnection,
+    spec: app_mod::commands::WorktreeSpec,
+) -> Option<std::path::PathBuf> {
+    if app.is_processing {
+        app.push_display_message(DisplayMessage::error(
+            "The agent is currently working. Wait for it to finish, then run /worktree again."
+                .to_string(),
+        ));
+        return None;
+    }
+
+    // Resolve the owned working dir first (cheap), then offload the blocking
+    // `git worktree add` to a worker thread so a slow git call never stalls the
+    // async event loop.
+    let work_dir = match app_mod::commands::session_work_dir(app) {
+        Ok(dir) => dir,
+        Err(error) => {
+            app.push_display_message(DisplayMessage::error(error));
+            return None;
+        }
+    };
+    let spec_for_task = spec.clone();
+    let created = tokio::task::spawn_blocking(move || {
+        app_mod::commands::create_git_worktree_at(work_dir, &spec_for_task)
+    })
+    .await;
+
+    match created {
+        Ok(Ok(worktree_dir)) => {
+            // Chain a /cd into the fresh worktree so the session's
+            // tools/skills/AGENTS.md/git widget re-scope to it.
+            if remote
+                .set_working_dir(worktree_dir.display().to_string())
+                .await
+                .is_ok()
+            {
+                Some(worktree_dir)
+            } else {
+                // The worktree was created but we could not move into it; still
+                // surface the created path so the user can /cd manually if the
+                // server round-trip failed. Deliberately do NOT return the path
+                // as a completed move, so a caller (e.g. the auto-trigger)
+                // does not advertise the session as running in the worktree.
+                app.push_display_message(DisplayMessage::system(format!(
+                    "Created worktree {}. The session could not be moved into it automatically; use /cd {} to switch.",
+                    worktree_dir.display(),
+                    worktree_dir.display()
+                )));
+                None
+            }
+        }
+        Ok(Err(error)) => {
+            app.push_display_message(DisplayMessage::error(error));
+            None
+        }
+        Err(join_error) => {
+            app.push_display_message(DisplayMessage::error(format!(
+                "Worktree creation task failed: {join_error}"
+            )));
+            None
+        }
+    }
+}
+
 async fn handle_remote_key_internal(
     app: &mut App,
     code: KeyCode,
@@ -2161,6 +2236,29 @@ async fn handle_remote_key_internal(
                         return Ok(());
                     }
                     remote.set_working_dir(new_dir.to_string()).await?;
+                    return Ok(());
+                }
+
+                if trimmed == "/worktree" || trimmed.starts_with("/worktree ") {
+                    // Create a trimmed git worktree in the session's repo and
+                    // move the session into it in place (chaining a /cd). The
+                    // user only names the feature; the folder/branch are derived:
+                    //   /worktree panel-settings
+                    //     -> <repo>/.worktrees/panel-settings on feat/panel-settings
+                    //   /worktree -b fix/widgets widgets
+                    //     -> <repo>/.worktrees/widgets on fix/widgets
+                    let rest = trimmed
+                        .strip_prefix("/worktree")
+                        .unwrap_or_default()
+                        .trim();
+                    let spec = match app_mod::commands::parse_worktree_spec(rest) {
+                        Ok(spec) => spec,
+                        Err(error) => {
+                            app.push_display_message(DisplayMessage::error(error));
+                            return Ok(());
+                        }
+                    };
+                    self::invoke_new_worktree(app, remote, spec).await;
                     return Ok(());
                 }
 

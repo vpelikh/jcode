@@ -13,6 +13,9 @@ impl App {
             "cd" => {
                 "/cd <directory>\nChange the session's working directory (e.g. into a linked git worktree).\n\nParts that follow the directory: AGENTS.md, project skills, the default cwd for shell/read/write tools, and the git info widget. History is preserved.\n\nSupports absolute paths, relative paths (resolved from the current working directory), and ~ for the home directory."
             }
+            "worktree" => {
+                "/worktree <name>\nCreate a git worktree in the session's repository and move the session into it in place.\n\nCreates <repo>/.worktrees/<name> on a new branch feat/<name>, then chains a /cd so the session's tools, skills, AGENTS.md, and git info widget re-scope to the new worktree. History is preserved.\n\n/worktree <name> -b <branch>\nUse an explicit branch instead of the default feat/<name>."
+            }
             "cache" => {
                 "/cache stats\nShow KV cache stats for this session: cache read/write totals, hit ratios, current baseline, and recent miss attributions.\n\n/cache\nToggle Anthropic cache TTL between 5 minutes and 1 hour.\n\n/cache 1h  or  /cache 5m\nSet Anthropic cache TTL explicitly."
             }

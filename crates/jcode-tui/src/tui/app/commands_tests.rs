@@ -1,6 +1,7 @@
 use super::ensure_swarm_prompt_edit_path;
 use super::parse_diff_mode_name;
 use super::parse_manual_subagent_spec;
+use super::{create_git_worktree, main_repo_root_for_work_dir, parse_worktree_spec};
 
 #[test]
 fn parse_diff_mode_name_maps_known_aliases() {
@@ -357,6 +358,254 @@ mod colors {
         assert!(
             !dispatch_local_command(&mut app, "/colorscheme dracula"),
             "/colorscheme must not be claimed by /colors"
+        );
+    }
+}
+
+/// Unit tests for the `/worktree` helpers: argument parsing and worktree
+/// creation.
+mod worktree {
+    #[test]
+    fn parse_worktree_spec_takes_a_name_and_defaults_the_branch() {
+        let spec = super::parse_worktree_spec("panel-settings").unwrap();
+        assert_eq!(spec.name, "panel-settings");
+        assert_eq!(spec.branch, None);
+    }
+
+    #[test]
+    fn parse_worktree_spec_accepts_an_explicit_branch() {
+        let spec = super::parse_worktree_spec("widgets -b fix/widgets").unwrap();
+        assert_eq!(spec.name, "widgets");
+        assert_eq!(spec.branch.as_deref(), Some("fix/widgets"));
+    }
+
+    #[test]
+    fn parse_worktree_spec_accepts_long_branch_flag() {
+        let spec = super::parse_worktree_spec("widgets --branch fix/widgets").unwrap();
+        assert_eq!(spec.name, "widgets");
+        assert_eq!(spec.branch.as_deref(), Some("fix/widgets"));
+    }
+
+    #[test]
+    fn parse_worktree_spec_rejects_empty_input() {
+        let err = super::parse_worktree_spec("").unwrap_err();
+        assert!(err.contains("Usage: /worktree"), "{err}");
+    }
+
+    #[test]
+    fn parse_worktree_spec_requires_name_before_branch() {
+        let err = super::parse_worktree_spec("-b fix/x widgets").unwrap_err();
+        assert!(err.contains("name must come first"), "{err}");
+    }
+
+    #[test]
+    fn parse_worktree_spec_rejects_multi_segment_names() {
+        for bad in ["a/b", "a\\b", ".", ".."] {
+            let err = super::parse_worktree_spec(bad).unwrap_err();
+            assert!(err.contains("single path segment"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn parse_worktree_spec_rejects_option_like_names() {
+        let err = super::parse_worktree_spec("-x").unwrap_err();
+        assert!(err.contains("cannot start with '-'"), "{err}");
+    }
+
+    #[test]
+    fn parse_worktree_spec_rejects_branch_missing_value() {
+        let err = super::parse_worktree_spec("widgets -b").unwrap_err();
+        assert!(err.contains("branch missing after -b"), "{err}");
+    }
+
+    #[test]
+    fn parse_worktree_spec_rejects_unexpected_arguments() {
+        let err = super::parse_worktree_spec("widgets extra").unwrap_err();
+        assert!(err.contains("Unexpected argument 'extra'"), "{err}");
+    }
+
+    #[test]
+    fn parse_worktree_spec_rejects_option_like_branch() {
+        let err = super::parse_worktree_spec("widgets -b -x").unwrap_err();
+        assert!(err.contains("expected a branch name"), "{err}");
+    }
+
+    /// Real `git worktree add` against a throwaway repo: proves the helper
+    /// derives the repo root from the session working dir, creates
+    /// `/.worktrees/<name>` on a `feat/<name>` branch, and returns the path.
+    /// Cleanup removes the linked worktree and its branch so the temp repo can
+    /// be torn down.
+    #[test]
+    fn create_git_worktree_makes_and_returns_the_worktree() {
+        use crate::tui::app::tests::create_test_app;
+        use std::process::Command;
+
+        // Stand up a throwaway repo with one commit so `git worktree add` has a
+        // branch tip to check out.
+        let home = tempfile::tempdir().expect("temp home");
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for (args, envs) in [
+            (vec!["init", "-b", "main"], vec![]),
+            (vec!["add", "."], vec![]),
+            (vec!["commit", "-m", "init"], vec![("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")]),
+        ] {
+            let mut cmd = Command::new("git");
+            cmd.args(&args).current_dir(&repo);
+            for (k, v) in envs {
+                cmd.env(k, v);
+            }
+            if args[0] == "add" {
+                std::fs::write(repo.join("file.txt"), "hi\n").unwrap();
+            }
+            assert!(cmd.output().unwrap().status.success(), "git {args:?}");
+        }
+
+        // Point the session at the repo root: `create_git_worktree` must derive
+        // the repo from it.
+        let mut app = create_test_app();
+        app.session.working_dir = Some(repo.display().to_string());
+
+        let spec = super::parse_worktree_spec("feat-panel").unwrap();
+        let wt_path = super::create_git_worktree(&app, &spec).unwrap();
+        let wanted = repo.join(".worktrees").join("feat-panel");
+        assert_eq!(wt_path, wanted);
+        assert!(wanted.join("file.txt").exists(), "worktree should be populated");
+
+        // The created worktree is on feat/feat-panel.
+        let branch = Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(&wanted)
+            .output()
+            .unwrap();
+        let branch = String::from_utf8_lossy(&branch.stdout);
+        assert_eq!(branch.trim(), "feat/feat-panel");
+
+        // A second call with the same name must report it already exists.
+        let err = super::create_git_worktree(&app, &spec).unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+
+        // Cleanup: remove the worktree and its branch so the temp dir can drop.
+        let cleanup = Command::new("git")
+            .args(["worktree", "remove", "--force", &wt_path.display().to_string()])
+            .current_dir(&repo)
+            .output();
+        if let Ok(out) = cleanup {
+            let _ = Command::new("git")
+                .args(["branch", "-D", "feat/feat-panel"])
+                .current_dir(&repo)
+                .output();
+            drop(out);
+        }
+    }
+
+    #[test]
+    fn main_repo_root_from_a_linked_worktree_points_to_the_main_checkout() {
+        use std::process::Command;
+
+        let home = tempfile::tempdir().expect("temp home");
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for (args, envs) in [
+            (vec!["init", "-b", "main"], vec![]),
+            (vec!["add", "."], vec![]),
+            (vec!["commit", "-m", "init"], vec![("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")]),
+        ] {
+            let mut cmd = Command::new("git");
+            cmd.args(&args).current_dir(&repo);
+            for (k, v) in envs {
+                cmd.env(k, v);
+            }
+            if args[0] == "add" {
+                std::fs::write(repo.join("file.txt"), "hi\n").unwrap();
+            }
+            assert!(cmd.output().unwrap().status.success(), "git {args:?}");
+        }
+
+        // Create a linked worktree, then verify the main root is resolved from
+        // inside it (mimicking a session already working in a worktree).
+        let linked = repo.join(".worktrees").join("existing");
+        let ok = Command::new("git")
+            .args(["worktree", "add", "-b", "feat/existing", &linked.display().to_string()])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(ok.status.success(), "seed worktree failed");
+
+        let root = super::main_repo_root_for_work_dir(&linked).unwrap();
+        assert_eq!(root, repo);
+
+        let _ = Command::new("git")
+            .args(["worktree", "remove", "--force", &linked.display().to_string()])
+            .current_dir(&repo)
+            .output();
+        let _ = Command::new("git")
+            .args(["branch", "-D", "feat/existing"])
+            .current_dir(&repo)
+            .output();
+    }
+
+    #[test]
+    fn create_git_worktree_in_non_git_dir_reports_no_repo() {
+        use crate::tui::app::tests::create_test_app;
+
+        // A temp dir that is not inside a git repository.
+        let home = tempfile::tempdir().expect("temp home");
+        let non_repo = home.path().join("not-a-repo");
+        std::fs::create_dir_all(&non_repo).unwrap();
+
+        let mut app = create_test_app();
+        app.session.working_dir = Some(non_repo.display().to_string());
+
+        let spec = super::parse_worktree_spec("panel").unwrap();
+        let err = super::create_git_worktree(&app, &spec).unwrap_err();
+        assert!(
+            err.contains("No git repository found") || err.contains("not accessible"),
+            "expected a missing-repo error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn create_git_worktree_rejects_already_existing_branch_and_cleans_empty_dir() {
+        use crate::tui::app::tests::create_test_app;
+        use std::process::Command;
+
+        // Throwaway repo with a pre-existing `feat/used` branch so that
+        // `git worktree add -b feat/used <dir>` fails partway (branch
+        // collision) and must clean up the empty target dir it created.
+        let home = tempfile::tempdir().expect("temp home");
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for (args, envs) in [
+            (vec!["init", "-b", "main"], vec![]),
+            (vec!["add", "."], vec![]),
+            (vec!["commit", "-m", "init"], vec![("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")]),
+            (vec!["branch", "feat/used"], vec![]),
+        ] {
+            let mut cmd = Command::new("git");
+            cmd.args(&args).current_dir(&repo);
+            for (k, v) in envs {
+                cmd.env(k, v);
+            }
+            if args[0] == "add" {
+                std::fs::write(repo.join("file.txt"), "hi\n").unwrap();
+            }
+            assert!(cmd.output().unwrap().status.success(), "git {args:?}");
+        }
+
+        let mut app = create_test_app();
+        app.session.working_dir = Some(repo.display().to_string());
+
+        // A worktree name whose default branch already exists must fail...
+        let spec = super::parse_worktree_spec("used").unwrap();
+        let err = super::create_git_worktree(&app, &spec).unwrap_err();
+        assert!(!err.is_empty(), "branch collision must be reported");
+
+        // ...and must NOT leave a partial empty dir behind.
+        let leftover = repo.join(".worktrees").join("used");
+        assert!(
+            !leftover.exists(),
+            "failed worktree creation must clean up its empty target dir"
         );
     }
 }
