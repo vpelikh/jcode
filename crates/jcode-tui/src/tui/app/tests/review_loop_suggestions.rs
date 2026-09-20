@@ -306,3 +306,66 @@ fn review_loop_manual_start_clears_stale_reviewer() {
         "manual restart must reseed from the first lens"
     );
 }
+
+// The auto-seed path (`maybe_enter_review_loop`) is the product entry point when
+// review-rounds run by default. The `TestHarness` guard normally skips it in
+// unit tests, so this pins the gating decisions directly: default-on config
+// seeds the loop for a non-harness, local, non-replay session; the harness and
+// remote guards each prevent seeding.
+#[test]
+fn review_loop_auto_seed_respects_defaults_and_guards() {
+    use super::AppRuntimeMode;
+
+    let fresh = || {
+        let mut app = create_test_app();
+        // Non-harness product path (the loop runs for local sessions).
+        app.runtime_mode = AppRuntimeMode::RemoteClient;
+        app.is_remote = false;
+        app.is_replay = false;
+        app.autoreview_enabled = true; // resolved from the enabled default
+        app.pending_queued_dispatch = false;
+        app.improve_mode = None;
+        app.session.review_loop = None;
+        app
+    };
+
+    // (1) Default-on config seeds the loop for a product local session.
+    let mut app = fresh();
+    let msgs_before = app.display_messages.len();
+    super::commands::maybe_enter_review_loop(&mut app);
+    assert!(
+        app.session.review_loop.as_ref().is_some_and(|s| !s.finished),
+        "default-on config must auto-seed the review loop"
+    );
+    assert!(
+        app.display_messages.len() > msgs_before,
+        "seeding must push a review-loop status message"
+    );
+
+    // (2) Seeding is once per session: a second call must not restart it.
+    let len_before = app.display_messages.len();
+    super::commands::maybe_enter_review_loop(&mut app);
+    assert_eq!(
+        app.display_messages.len(),
+        len_before,
+        "auto-seed must not run twice for the same session"
+    );
+
+    // (3) Harness mode never seeds (keeps tests deterministic).
+    let mut app = fresh();
+    app.runtime_mode = AppRuntimeMode::TestHarness;
+    super::commands::maybe_enter_review_loop(&mut app);
+    assert!(
+        app.session.review_loop.is_none(),
+        "TestHarness runtime must not auto-seed"
+    );
+
+    // (4) Remote sessions never auto-seed.
+    let mut app = fresh();
+    app.is_remote = true;
+    super::commands::maybe_enter_review_loop(&mut app);
+    assert!(
+        app.session.review_loop.is_none(),
+        "remote session must not auto-seed"
+    );
+}
