@@ -134,7 +134,7 @@ async fn test_simple_response() -> Result<()> {
         StreamEvent::MessageEnd {
             stop_reason: Some("end_turn".to_string()),
         },
-        StreamEvent::SessionId("test-session-123".to_string()),
+        StreamEvent::SessionId("test-session-123".to_string().into()),
     ]);
 
     let provider: Arc<dyn jcode::provider::Provider> = Arc::new(provider);

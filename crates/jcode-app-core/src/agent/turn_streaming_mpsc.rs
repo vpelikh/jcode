@@ -1,4 +1,5 @@
 use super::*;
+use crate::session::ToolCallId;
 
 /// Largest byte index `<= index` that is a UTF-8 char boundary in `text`.
 /// Equivalent to the unstable `str::floor_char_boundary`, reimplemented so the
@@ -118,6 +119,43 @@ impl Agent {
                     repaired
                 ));
             }
+
+            // Scheduled per-step prune (takeaway #6): before the next API call,
+            // shrink already-consumed oversized nodes. New results, screenshots
+            // and interrupts appended after the latest assistant are in the
+            // unconsumed suffix and remain intact until the model has read them
+            // once. Both the image and tool-result caps run on every step: a
+            // consumed oversized node from a prior turn must be reclaimed even
+            // on pure-text follow-ups, or it lingers in every subsequent prompt.
+            let pruned = self.session.prune_consumed_transcript(
+                &crate::compaction::prune::PrunePolicy::node_caps_with(
+                    crate::config::config().compaction.prune_tool_result_max_bytes,
+                    crate::config::config().compaction.prune_image_max_bytes,
+                ),
+            );
+            if !pruned.is_empty() {
+                self.note_prune_applied();
+                crate::logging::info(&format!(
+                    "[prune] per-step shrink for session {}: {} image(s), {} tool result(s)",
+                    self.session.id,
+                    pruned.images_stripped,
+                    pruned.tool_results_truncated,
+                ));
+                self.session.save()?;
+            }
+
+            // Model-degradation mitigation checkpoint (Slice 3): if the route
+            // tracker reached the Compact rung across prior turns, trigger a
+            // compaction before the next API call so we do not keep degrading
+            // under the same long context.
+            if let Some(notice) = self.maybe_mitigate_degradation() {
+                crate::logging::info(&format!("[degradation] {notice}"));
+                // Surface to the user via the same status channel the stream
+                // already uses for phase/progress notices (Slice 5 parity with
+                // the non-streaming loop's terminal print).
+                let _ = event_tx.send(ServerEvent::StatusDetail { detail: notice });
+            }
+
             // Start provider transport setup before deriving and potentially
             // compacting the request history. This is the first point where the
             // stable request settings are available.
@@ -180,12 +218,19 @@ impl Agent {
             // wait and response stream.
             self.session.release_provider_messages_cache();
 
-            let mut cache_signature_messages =
-                if crate::config::config().features.message_timestamps {
-                    Message::with_timestamps(&messages)
-                } else {
-                    messages.iter().cloned().collect()
-                };
+            // Build the cache-signature transcript from the RAW messages, not
+            // the with_timestamps-decorated copy that is actually sent. The
+            // cache-relevant projection already strips the struct metadata and
+            // the derived `[<rfc3339>]` / `[tool timing: ...]` text tags, so
+            // raw and decorated hash identically for cache purposes; hashing
+            // raw keeps the server signature byte-agreeing with the TUI local
+            // path (which also hashes raw) on *every* input, including a user
+            // message that genuinely begins with an RFC3339-shaped tag (where
+            // the raw local path strips it but the decorated projection would
+            // preserve it). Computing the signature on the same raw source the
+            // TUI uses also keeps the derived-tag strip a pure defense-in-depth
+            // backstop rather than a load-bearing correctness requirement.
+            let mut cache_signature_messages: Vec<Message> = messages.iter().cloned().collect();
             let mut ephemeral_signature_messages = Vec::new();
 
             // Inject memory as a user message at the end (preserves cache prefix)
@@ -351,7 +396,7 @@ impl Agent {
             let mut usage_cache_creation: Option<u64> = None;
             let mut saw_message_end = false;
             let mut stop_reason: Option<String> = None;
-            let mut sdk_tool_results: std::collections::HashMap<String, (String, bool)> =
+            let mut sdk_tool_results: std::collections::HashMap<ToolCallId, (String, bool)> =
                 std::collections::HashMap::new();
             let provider_name = self.provider.name().to_string();
             let store_reasoning_content =
@@ -368,7 +413,7 @@ impl Agent {
             let mut hidden_activity_last = Instant::now();
             let mut openai_reasoning_items: Vec<ContentBlock> = Vec::new();
             let mut openai_native_compaction: Option<(String, usize, Option<u64>)> = None;
-            let mut tool_id_to_name: std::collections::HashMap<String, String> =
+            let mut tool_id_to_name: std::collections::HashMap<ToolCallId, String> =
                 std::collections::HashMap::new();
 
             let mut retry_after_compaction = false;
@@ -572,7 +617,7 @@ impl Agent {
                             });
                         }
                         let _ = event_tx.send(ServerEvent::ToolStart {
-                            id: id.clone(),
+                            id: id.clone().to_string(),
                             name: name.clone(),
                         });
                         tool_id_to_name.insert(id.clone(), name.clone());
@@ -598,7 +643,7 @@ impl Agent {
                             tool.refresh_intent_from_input();
 
                             let _ = event_tx.send(ServerEvent::ToolExec {
-                                id: tool.id.clone(),
+                                id: tool.id.clone().to_string(),
                                 name: tool.name.clone(),
                             });
 
@@ -625,7 +670,7 @@ impl Agent {
                             .cloned()
                             .unwrap_or_default();
                         let _ = event_tx.send(ServerEvent::ToolDone {
-                            id: tool_use_id.clone(),
+                            id: tool_use_id.clone().to_string(),
                             name: tool_name,
                             output: content.clone(),
                             error: if is_error {
@@ -797,16 +842,10 @@ impl Agent {
                         });
                     }
                     StreamEvent::SessionId(sid) => {
-                        // This is the *provider's* session id (Gemini/Claude
-                        // CLI/Grok resume handle). It must never be forwarded
-                        // as `ServerEvent::SessionId`: the client treats that
-                        // event as the jcode session id and rebinds
-                        // `remote_session_id` to it, so the next reload or
-                        // reconnect resumes a session that does not exist and
-                        // the user lands in an empty new session while the
-                        // real transcript sits untouched on disk.
-                        self.provider_session_id = Some(sid.clone());
-                        self.session.provider_session_id = Some(sid);
+                        self.provider_session_id = Some(sid.clone().to_string());
+                        self.session.provider_session_id = Some(sid.clone().to_string());
+                        let _ =
+                            event_tx.send(ServerEvent::SessionId { session_id: sid.to_string() });
                     }
                     StreamEvent::OpenAIReasoning {
                         id,
@@ -1047,13 +1086,13 @@ impl Agent {
             if !had_tool_calls_before
                 && !tool_calls.is_empty()
                 && let Some(tc) = tool_calls.last()
-                && tc.id.starts_with("fallback_text_call_")
+                && tc.id.as_str().starts_with("fallback_text_call_")
             {
                 let _ = event_tx.send(ServerEvent::TextReplace {
                     text: text_content.clone(),
                 });
                 let _ = event_tx.send(ServerEvent::ToolStart {
-                    id: tc.id.clone(),
+                    id: tc.id.clone().to_string(),
                     name: tc.name.clone(),
                 });
                 tool_id_to_name.insert(tc.id.clone(), tc.name.clone());
@@ -1061,7 +1100,7 @@ impl Agent {
                     delta: tc.input.to_string(),
                 });
                 let _ = event_tx.send(ServerEvent::ToolExec {
-                    id: tc.id.clone(),
+                    id: tc.id.clone().to_string(),
                     name: tc.name.clone(),
                 });
             }
@@ -1325,7 +1364,7 @@ impl Agent {
                 if let Some(error_msg) = tc.validation_error() {
                     logging::warn(&error_msg);
                     let _ = event_tx.send(ServerEvent::ToolDone {
-                        id: tc.id.clone(),
+                        id: tc.id.clone().to_string(),
                         name: tc.name.clone(),
                         output: error_msg.clone(),
                         error: Some(error_msg.clone()),
@@ -1370,7 +1409,7 @@ impl Agent {
                 let ctx = ToolContext {
                     session_id: self.session.id.clone(),
                     message_id: message_id.clone(),
-                    tool_call_id: tc.id.clone(),
+                    tool_call_id: tc.id.clone().to_string(),
                     working_dir: self.working_dir().map(PathBuf::from),
                     stdin_request_tx: self.stdin_request_tx.clone(),
                     graceful_shutdown_signal: Some(self.graceful_shutdown.clone()),
@@ -1467,14 +1506,14 @@ impl Agent {
                         Ok(output) => {
                             let output = cap_tool_output_for_history(&tc.name, output);
                             let _ = event_tx.send(ServerEvent::ToolDone {
-                                id: tc.id.clone(),
+                                id: tc.id.clone().to_string(),
                                 name: tc.name.clone(),
                                 output: output.output.clone(),
                                 error: None,
                             });
 
                             let side_pane_images =
-                                tool_output_side_pane_images(&tc.id, &tc.name, &tc.input, &output);
+                                tool_output_side_pane_images(tc.id.as_str(), &tc.name, &tc.input, &output);
                             if !side_pane_images.is_empty() {
                                 logging::info(&format!(
                                     "SidePaneImages: emitting {} image(s) from tool '{}' (session={})",
@@ -1499,7 +1538,7 @@ impl Agent {
                         Err(e) => {
                             let error_msg = format!("Error: {}", e);
                             let _ = event_tx.send(ServerEvent::ToolDone {
-                                id: tc.id.clone(),
+                                id: tc.id.clone().to_string(),
                                 name: tc.name.clone(),
                                 output: error_msg.clone(),
                                 error: Some(error_msg.clone()),
@@ -1533,7 +1572,7 @@ impl Agent {
                         reload_interrupted_tool_result(tc, tool_elapsed.as_secs_f64());
 
                     let _ = event_tx.send(ServerEvent::ToolDone {
-                        id: tc.id.clone(),
+                        id: tc.id.clone().to_string(),
                         name: tc.name.clone(),
                         output: interrupted_msg.clone(),
                         error: if is_error {
@@ -1587,7 +1626,7 @@ impl Agent {
                     );
 
                     let _ = event_tx.send(ServerEvent::ToolDone {
-                        id: tc.id.clone(),
+                        id: tc.id.clone().to_string(),
                         name: tc.name.clone(),
                         output: bg_msg.clone(),
                         error: None,
@@ -1623,6 +1662,12 @@ impl Agent {
                 self.session.save()?;
             }
 
+            // This iteration made forward progress (tool results were committed):
+            // record a clean turn so the route-scoped degradation tracker decays
+            // any prior stalled-promise blip instead of pinning an escalated rung.
+            // Mirrors the non-streaming loop's `record_clean_turn()` on clean exit.
+            self.record_clean_turn();
+
             // === INJECTION POINT D: All tools done, before next API call ===
             // This is the safest point for non-urgent injection since all tool_results
             // have been added and the conversation is in a valid state.
@@ -1639,8 +1684,11 @@ impl Agent {
             // model-visible nudge so the model changes approach instead of burning
             // tokens in a stuck loop. This runs after all results are committed so
             // the transcript reflects the full batch.
-            if let Some(reminder) =
-                super::guard::repeat_reminder_from_transcript(&self.session.messages)
+            let repeat_threshold = super::guard::repeat_reminder_threshold();
+            if let Some(reminder) = super::guard::repeat_reminder_from_transcript(
+                &self.session.messages,
+                repeat_threshold,
+            )
             {
                 let text = match reminder.content.first() {
                     Some(ContentBlock::Text { text, .. }) => text.clone(),
@@ -1673,7 +1721,7 @@ mod tests {
 
     fn tool_call(name: &str, input: serde_json::Value) -> ToolCall {
         ToolCall {
-            id: "toolu_test".to_string(),
+            id: "toolu_test".to_string().into(),
             name: name.to_string(),
             input,
             intent: None,
