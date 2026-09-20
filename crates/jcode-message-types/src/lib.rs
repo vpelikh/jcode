@@ -375,6 +375,58 @@ pub fn stable_message_hash(message: &Message) -> u64 {
 /// text by `Message::with_timestamps` before this projection runs (and
 /// system-reminder messages skip timestamp injection entirely), so removing
 /// the struct-level `timestamp` field cannot hide a real content change.
+///
+/// The same reasoning applies to the *derived* text tags: `with_timestamps`
+/// prepends `[<timestamp>]` to user text and `[tool timing: start=... finish=...
+/// duration=...]` to tool-result content, reconstructing both from
+/// `timestamp` / `tool_duration_ms`. If the same already-sent user or
+/// tool-result message is re-serialized with a backfilled timestamp or
+/// duration on a later turn, `with_timestamps` produces a different text tag
+/// even though the *payload* sent upstream is byte-identical. Those derived
+/// tags are the textual echo of the same volatile metadata we already strip
+/// above, so the cache-relevant projection must remove them too; otherwise a
+/// purely metadata-driven re-timestamp flips the per-message hash and reports
+/// a spurious `harness:_prefix_changed` KV-cache miss.
+fn strip_injected_timestamp_tag(text: &str) -> &str {
+    // `with_timestamps` prepends either "[<rfc3339 with ms>] " (user text) or
+    // "[tool timing: start=... finish=... duration=...] " (tool result) to the
+    // first content block of a user message. Only strip when the tag is a
+    // leading, self-contained bracket run followed by whitespace; leave
+    // genuine leading `[`...`]` user content untouched.
+    if text.starts_with("[tool timing: ") {
+        if let Some(end) = text.find("] ") {
+            return text.get(end + 2..).unwrap_or(text);
+        }
+    } else if let Some(end) = text.find("] ") {
+        let tag = &text[1..end];
+        if is_rfc3339_timestamp_tag(tag) {
+            return text.get(end + 2..).unwrap_or(text);
+        }
+    }
+    text
+}
+
+fn is_rfc3339_timestamp_tag(tag: &str) -> bool {
+    // Matches the output of `Message::format_timestamp`:
+    // `YYYY-MM-DDTHH:MM:SS.mmmZ` (chrono `to_rfc3339_opts(Millis, true)`).
+    // Positions: 4y-2m-2d T 2h-2m-2s . 3ms Z = 17 digits.
+    let bytes = tag.as_bytes();
+    if bytes.len() != "0000-00-00T00:00:00.000Z".len() {
+        return false;
+    }
+    for (i, &expected) in b"0000-00-00T00:00:00.000Z".iter().enumerate() {
+        let at = bytes[i];
+        if expected == b'0' {
+            if !at.is_ascii_digit() {
+                return false;
+            }
+        } else if at != expected {
+            return false;
+        }
+    }
+    true
+}
+
 pub fn cache_relevant_message_value(message: &Message) -> serde_json::Value {
     let mut value = serde_json::to_value(message).unwrap_or(serde_json::Value::Null);
     if let serde_json::Value::Object(map) = &mut value {
@@ -395,6 +447,27 @@ pub fn cache_relevant_message_value(message: &Message) -> serde_json::Value {
                     // message each turn; it marks where caching ends, not the
                     // cached content itself.
                     block.remove("cache_control");
+                    // Drop the volatile timestamp/timing tag that
+                    // `with_timestamps` baked into text. It is the textual echo
+                    // of the `timestamp` field stripped above, so it must not
+                    // key the cache prefix (see the projection docs).
+                    if let Some(text) = block.get_mut("text").and_then(|t| t.as_str()) {
+                        let stripped = strip_injected_timestamp_tag(text).to_string();
+                        if let Some(text_value) = block.get_mut("text") {
+                            *text_value = serde_json::Value::String(stripped);
+                        }
+                    }
+                } else if let serde_json::Value::Object(block) = block
+                    && block.get("type").and_then(|kind| kind.as_str()) == Some("tool_result")
+                {
+                    // Tool-result content carries the derived `[tool timing: ...]`
+                    // tag from `tool_duration_ms`; strip it for the same reason.
+                    if let Some(content) = block.get_mut("content").and_then(|c| c.as_str()) {
+                        let stripped = strip_injected_timestamp_tag(content).to_string();
+                        if let Some(content_value) = block.get_mut("content") {
+                            *content_value = serde_json::Value::String(stripped);
+                        }
+                    }
                 }
             }
         }
@@ -934,6 +1007,332 @@ mod tests {
             cache_relevant_message_hashes(&[original]),
             cache_relevant_message_hashes(&[edited]),
             "real content edits must still change the hash"
+        );
+    }
+
+    #[test]
+    fn cache_relevant_hashes_strip_derived_timestamp_and_timing_tags() {
+        // The full request pipeline runs `Message::with_timestamps` *before* the
+        // cache-relevant hash, which bakes volatile metadata into content as:
+        //   user text      -> "[<rfc3339>] {text}"
+        //   tool result    -> "[tool timing: start=... finish=... duration=...] {content}"
+        // If the same already-sent user/tool-result message is reconstructed with
+        // a later timestamp or backfilled duration on the next turn, those derived
+        // tags differ even though the payload sent upstream is byte-identical. The
+        // projection must strip them, exactly as it strips the struct-level
+        // timestamp/tool_duration_ms fields, or the prefix hash flips spuriously
+        // (harness:_prefix_changed). A genuinely edited payload must still differ.
+        let t0 = chrono::Utc::now();
+
+        // (a) Timestamped user text with a re-derived timestamp.
+        let sent_user = Message::with_timestamps(&[Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "build the thing".to_string(),
+                cache_control: None,
+            }],
+            timestamp: Some(t0),
+            tool_duration_ms: None,
+        }])[0]
+            .clone();
+        let re_timestamped_user = Message::with_timestamps(&[Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "build the thing".to_string(),
+                cache_control: None,
+            }],
+            timestamp: Some(t0 + chrono::Duration::seconds(5)),
+            tool_duration_ms: None,
+        }])[0]
+            .clone();
+        assert_eq!(
+            cache_relevant_message_hashes(std::slice::from_ref(&sent_user)),
+            cache_relevant_message_hashes(&[re_timestamped_user]),
+            "re-derived user timestamp must not change the cache-relevant hash"
+        );
+
+        // (b) Tool-result content with a backfilled duration / later timestamp.
+        let sent_tool = Message::with_timestamps(&[Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "tc-1".into(),
+                content: "ls output".to_string(),
+                is_error: None,
+            }],
+            timestamp: Some(t0),
+            tool_duration_ms: None,
+        }])[0]
+            .clone();
+        let backfilled_tool = Message::with_timestamps(&[Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "tc-1".into(),
+                content: "ls output".to_string(),
+                is_error: None,
+            }],
+            timestamp: Some(t0 + chrono::Duration::seconds(3)),
+            tool_duration_ms: Some(1234),
+        }])[0]
+            .clone();
+        assert_eq!(
+            cache_relevant_message_hashes(&[sent_tool]),
+            cache_relevant_message_hashes(&[backfilled_tool]),
+            "backfilled timing metadata must not change the cache-relevant hash"
+        );
+
+        // (c) A real payload edit must still be detected after the same tagging.
+        let edited_user = Message::with_timestamps(&[Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "build something else".to_string(),
+                cache_control: None,
+            }],
+            timestamp: Some(t0),
+            tool_duration_ms: None,
+        }])[0]
+            .clone();
+        assert_ne!(
+            cache_relevant_message_hashes(&[sent_user]),
+            cache_relevant_message_hashes(&[edited_user]),
+            "real content edits must still change the hash after tag stripping"
+        );
+    }
+
+    /// Config independence: the fix must hold both with `message_timestamps` on
+    /// (when `with_timestamps` prepends `[<rfc3339>]` / `[tool timing: ...]` to
+    /// user content) and with it off (when messages are sent raw). The projection
+    /// strips the derived tags in the first case and strips the struct-level
+    /// `timestamp`/`tool_duration_ms` fields in both cases, so the same user
+    /// message must hash identically whether or not `with_timestamps` ran.
+    #[test]
+    fn cache_relevant_hashes_config_independent_of_with_timestamps() {
+        let t0 = chrono::Utc::now();
+        let raw = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "stable payload".to_string(),
+                cache_control: None,
+            }],
+            timestamp: Some(t0),
+            tool_duration_ms: None,
+        };
+
+        // message_timestamps=false: hash the raw message.
+        let raw_hash = cache_relevant_message_hashes(std::slice::from_ref(&raw));
+        // message_timestamps=true: hash the with_timestamps output.
+        let tagged_hash = cache_relevant_message_hashes(
+            &[Message::with_timestamps(std::slice::from_ref(&raw))[0].clone()],
+        );
+
+        assert_eq!(
+            raw_hash,
+            tagged_hash,
+            "cache-relevant hash must be identical with or without with_timestamps"
+        );
+
+        // Same holds for a tool-result message (timing tag path).
+        let tool = Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "tc-1".into(),
+                content: "ls output".to_string(),
+                is_error: None,
+            }],
+            timestamp: Some(t0),
+            tool_duration_ms: Some(1234),
+        };
+        assert_eq!(
+            cache_relevant_message_hashes(std::slice::from_ref(&tool)),
+            cache_relevant_message_hashes(
+                &[Message::with_timestamps(std::slice::from_ref(&tool))[0].clone()]
+            ),
+            "tool-result timing tag must not change the hash with or without with_timestamps"
+        );
+    }
+
+    #[test]
+    fn cache_relevant_strip_conservative_on_genuine_leading_brackets() {
+        let t0 = chrono::Utc::now();
+
+        // The realistic injected form: a genuine RFC3339 tag prepended by
+        // `Message::with_timestamps`. It must be stripped.
+        let timestamped = Message::with_timestamps(std::slice::from_ref(&Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "preamble".to_string(),
+                cache_control: None,
+            }],
+            timestamp: Some(t0),
+            tool_duration_ms: None,
+        }))[0]
+            .clone();
+
+        let projected = cache_relevant_message_value(&timestamped);
+        let text = projected
+            .get("content")
+            .and_then(|c| c.get(0))
+            .and_then(|b| b.get("text"))
+            .and_then(|t| t.as_str())
+            .expect("text block");
+        assert_eq!(text, "preamble", "injected [ts] tag must be stripped");
+
+        // Genuine leading-bracket user content must NOT be stripped. The
+        // matcher is shape-based (digit positions), so it conservatively
+        // preserves anything that is not an exact RFC3339-shaped tag: an empty
+        // bracket, a plain note, a fenced code block, and a tag with the wrong
+        // delimiter/width. A timestamp-shaped string IS stripped even if the
+        // date is calendar-impossible (the matcher does not validate calendar
+        // validity), which we assert explicitly below.
+        for genuine in [
+            "[note] keep me".to_string(),
+            "[] empty bracket".to_string(),
+            "[2026-13-99T99:99:99Z] wrong-width tag kept".to_string(), // missing fractional .mmm
+            "```\n[code]\n```".to_string(),
+        ] {
+            let m = Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: genuine.clone(),
+                    cache_control: None,
+                }],
+                timestamp: Some(t0),
+                tool_duration_ms: None,
+            };
+            let value = cache_relevant_message_value(&m);
+            let kept = value
+                .get("content")
+                .and_then(|c| c.get(0))
+                .and_then(|b| b.get("text"))
+                .and_then(|t| t.as_str())
+                .expect("text block");
+            assert_eq!(
+                kept, &genuine,
+                "genuine leading-bracket content must not be stripped: {genuine:?}"
+            );
+        }
+
+        // A timestamp-shaped tag with an impossible calendar date is still
+        // stripped: `is_rfc3339_timestamp_tag` only validates digit placement,
+        // not calendar validity. Documented so the trade-off is explicit.
+        let impossible_date = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "[2026-13-99T99:99:99.999Z] stripped".to_string(),
+                cache_control: None,
+            }],
+            timestamp: Some(t0),
+            tool_duration_ms: None,
+        };
+        let value = cache_relevant_message_value(&impossible_date);
+        let kept = value
+            .get("content")
+            .and_then(|c| c.get(0))
+            .and_then(|b| b.get("text"))
+            .and_then(|t| t.as_str())
+            .expect("text block");
+        assert_eq!(
+            kept, "stripped",
+            "timestamp-shaped tag is stripped even with an impossible date"
+        );
+    }
+
+    /// Property test: `Message::format_timestamp` emits a *variable-width*
+    /// RFC3339 fraction (chrono trims trailing zeros, so `.500Z` becomes `.5Z`
+    /// and `.000Z` becomes no fraction). The strip matcher must handle every
+    /// emitted shape, or a re-timestamp whose fraction happens to end in zero
+    /// would fall through and re-introduce the false `harness: prefix changed`.
+    #[test]
+    fn cache_relevant_strip_handles_all_format_timestamp_shapes() {
+        let base = chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        // Sweep fractions covering every trailing-zero profile chrono can emit:
+        // no fraction, 1, 2, and 3 significant digits.
+        let fractions_ms = [
+            0i64,       // .000 -> no fraction
+            10,         // .010 -> ".01"
+            100,        // .100 -> ".1"
+            1,          // .001 -> ".001"
+            309,        // .309 -> full 3 digits
+            500,        // .500 -> ".5"
+            999,        // .999 -> full
+            123_456 % 1000, // arbitrary
+        ];
+        for frac in fractions_ms {
+            let ts = base + chrono::Duration::milliseconds(frac);
+            let done = with_timestamped_preamble(ts);
+            let value = cache_relevant_message_value(&done);
+            let text = value
+                .get("content")
+                .and_then(|c| c.get(0))
+                .and_then(|b| b.get("text"))
+                .and_then(|t| t.as_str())
+                .expect("text block");
+            assert_eq!(
+                text, "preamble",
+                "format_timestamp fraction {frac:?} must be stripped; ts={}",
+                Message::format_timestamp(&ts)
+            );
+        }
+    }
+
+    fn with_timestamped_preamble(ts: chrono::DateTime<chrono::Utc>) -> Message {
+        Message::with_timestamps(std::slice::from_ref(&Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "preamble".to_string(),
+                cache_control: None,
+            }],
+            timestamp: Some(ts),
+            tool_duration_ms: None,
+        }))[0]
+            .clone()
+    }
+
+    /// Deterministic sweep: across many metadata-only variations (timestamps by
+    /// ms and second offsets) the cache-relevant hash must remain constant,
+    /// while a real payload edit always changes it. This closes the loop for
+    /// the headless/desktop detector, whose prefix-hash chain is built from the
+    /// same projection.
+    #[test]
+    fn cache_relevant_hashes_stable_across_metadata_sweep() {
+        let base = chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let build = |text: &str, ts: chrono::DateTime<chrono::Utc>| {
+            Message::with_timestamps(std::slice::from_ref(&Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: text.to_string(),
+                    cache_control: None,
+                }],
+                timestamp: Some(ts),
+                tool_duration_ms: None,
+            }))[0]
+                .clone()
+        };
+
+        let reference_hash = cache_relevant_message_hashes(&[build("stable payload", base)]);
+
+        for offset_ms in 0..200u64 {
+            let m = build("stable payload", base + chrono::Duration::milliseconds(offset_ms as i64));
+            assert_eq!(
+                reference_hash,
+                cache_relevant_message_hashes(&[m]),
+                "timestamp-only change must not alter the cache-relevant hash ({offset_ms}ms)"
+            );
+        }
+        for secs in 1..400i64 {
+            let m = build("stable payload", base + chrono::Duration::seconds(secs));
+            assert_eq!(
+                reference_hash,
+                cache_relevant_message_hashes(&[m]),
+                "timestamp-only change must not alter the cache-relevant hash ({secs}s)"
+            );
+        }
+
+        // Real payload edit MUST change the hash.
+        let edited = build("stable payload EDITED", base);
+        assert_ne!(
+            reference_hash,
+            cache_relevant_message_hashes(&[edited]),
+            "a real payload edit must change the cache-relevant hash"
         );
     }
 
