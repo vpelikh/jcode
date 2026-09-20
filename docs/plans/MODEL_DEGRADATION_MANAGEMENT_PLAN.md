@@ -40,6 +40,25 @@ degradation-management system.
 - The streaming turn loop now records a clean turn (`record_clean_turn`) after
   committing tool results, matching the non-streaming loop, so a genuine
   recovery decays the rung instead of pinning a stale escalation.
+- A compaction that is actually APPLIED (not just requested) now resets the
+  route-scoped degradation tracker (`note_compaction_applied` -> `reset()`).
+  Previously a successful compaction left the rung elevated with
+  `compact_recommended` set, so the next minor stall (which per-turn first-
+  detection recording surfaces quickly) immediately escalated to
+  `RouteFallback` and switched the user's model right after a compaction that
+  already restored the context. Regression-tested by
+  `successful_compaction_resets_degradation_rung` (mutation-validated), and
+  re-arms detection afterwards (a later re-degradation re-reaches Compact). The
+  reset is guarded to fire from the `Compact` rung and from a pre-switch
+  `RouteFallback` rung (per the plan's L3 -- recovered --> Idle), so an applied
+  compaction restores Idle rather than continuing toward a stale model switch. A
+  `Watch` session (single stall, below mitigation threshold) keeps its
+  accumulation so an unrelated routine compaction cannot delay detecting a slow-
+  degrading session (`compaction_apply_preserves_watch_level_accumulation`,
+  mutation-validated); and the terminal `Escalated` rung is preserved so an
+  unrelated compaction cannot dismiss a user-surfaced "switch models yourself"
+  escalation (`compaction_apply_does_not_clear_terminal_escalated`,
+  mutation-validated).
 - An end-to-end test (`degraded_streaming_session_reaches_compact_and_mitigation_
   fires`) runs two degraded turns through the public streaming loop and asserts
   the loop's own mitigation checkpoint consumes the Compact one-shot — the

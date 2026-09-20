@@ -7,6 +7,38 @@ impl Agent {
         self.locked_tools = None;
         self.provider_session_id = None;
         self.session.provider_session_id = None;
+        // A compaction was actually applied (not just requested): reset the
+        // route-scoped degradation tracker when the current rung is `Compact`.
+        // Compaction is the `Compact`-rung mitigation; when it succeeds it is
+        // supposed to restore forward progress, so per the plan's mitigation
+        // ladder (L2 -- recovered --> Idle) the session should stop carrying an
+        // elevated `Compact` rung. Without this, the tracker keeps
+        // `compact_recommended` set, and the next stall (now arriving faster
+        // under per-turn first-detection recording) immediately escalates to
+        // `RouteFallback` and switches the user's model — right after a
+        // compaction that already restored the context. Any continued real
+        // degradation re-accumulates from Healthy on the next turns.
+        //
+        // Reset only from a rung whose mitigation is (or was) compaction:
+        // `Compact`, and `RouteFallback` before the model switch has actually
+        // happened. When an applied compaction restores forward progress the
+        // session should return to Idle per the plan (L2 -- recovered --> Idle,
+        // L3 -- recovered --> Idle) instead of continuing toward a stale model
+        // switch. A `Watch` session (a single stall, below the mitigation
+        // threshold) must NOT have its accumulation erased by a
+        // routine/unrelated auto-compaction — that would delay detection of a
+        // genuinely-degrading session. And a terminal `Escalated` rung (user
+        // told to switch models themselves) must NOT be cleared by an unrelated
+        // compaction applying afterward; `Escalated` is terminal and only an
+        // explicit `reset()`/route change (or a route-model switch) should
+        // clear it.
+        match self.degradation.rung() {
+            crate::agent::degradation::Rung::Compact
+            | crate::agent::degradation::Rung::RouteFallback => {
+                self.degradation.reset();
+            }
+            _ => {}
+        }
     }
 
     /// Invalidate provider context after a deterministic prune. Unlike a real
