@@ -199,13 +199,13 @@ prompt_entry_animation = true
 # the sole owner of bash command output.
 # show_bash_output = true
 
-# Show the technical detail on tool rows (default: false). When on, bash tool
+# Show the technical detail on tool rows (default: true). When on, bash tool
 # rows render a verbose block with the full executed command (wrapped), the
 # working directory (when known), the execution time, and the exit code; other
 # tool rows show their technical detail (command, file path, args) next to the
 # intent. When off, rows with an intent show just the intent; rows without an
 # intent still show the technical detail.
-# tool_call_details = false
+# tool_call_details = true
 
 # Occasionally surface a "learn this keybinding" nudge (in a distinct color)
 # when you keep doing something the slow way (e.g. /resume) instead of using
