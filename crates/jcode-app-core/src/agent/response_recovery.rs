@@ -389,10 +389,8 @@ impl Agent {
         if Self::is_guardrail_stop_reason(stop_reason) {
             return Ok(false);
         }
-        if let Some(reason) = stop_reason {
-            if Self::should_continue_after_stop_reason(reason) {
-                return Ok(false);
-            }
+        if stop_reason.is_some_and(Self::should_continue_after_stop_reason) {
+            return Ok(false);
         }
         if !Self::is_stalled_promise_text(text_content) {
             return Ok(false);
