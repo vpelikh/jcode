@@ -65,7 +65,6 @@ async fn handle_clear_session_replaces_runtime_handles_and_updates_shutdown_regi
         "swarm-test".to_string(),
         HashSet::from([old_session_id.to_string()]),
     )])));
-    let file_touch = FileTouchService::new();
     let channel_subscriptions = Arc::new(RwLock::new(HashMap::<
         String,
         HashMap<String, HashSet<String>>,
