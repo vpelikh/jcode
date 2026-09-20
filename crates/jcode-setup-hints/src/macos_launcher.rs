@@ -182,10 +182,14 @@ fn macos_desktop_app_launcher_dir() -> Result<PathBuf> {
 /// executable. Fails with a helpful build hint when it is not present.
 fn desktop2_sibling_binary() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("could not locate the running jcode executable")?;
-    find_desktop2_sibling(&exe).ok_or_else(|| {
+    // `current_exe()` may return the launcher symlink (e.g. `~/.local/bin/jcode`
+    // -> `~/.jcode/builds/current/jcode` -> versions/.../jcode). Canonicalize so
+    // the desktop sibling is looked up next to the real binary, not the symlink.
+    let real_exe = std::fs::canonicalize(&exe).unwrap_or_else(|_| exe.clone());
+    find_desktop2_sibling(&real_exe).ok_or_else(|| {
         anyhow::anyhow!(
             "jcode-desktop2 binary not found next to {} or in a sibling target/selfdev. Build it with `cargo build --profile selfdev -p jcode-desktop2` first.",
-            exe.display()
+            real_exe.display()
         )
     })
 }
@@ -198,6 +202,10 @@ fn desktop2_sibling_binary() -> Result<PathBuf> {
 /// 2. Dev fallback: a `jcode` binary in target/{debug,dev,selfdev,release}
 ///    where the desktop was built separately into target/selfdev.
 fn find_desktop2_sibling(jcode: &Path) -> Option<PathBuf> {
+    // Resolve any symlink chain in the `jcode` path first: the launcher may be a
+    // symlink (e.g. `~/.local/bin/jcode` -> `~/.jcode/builds/current/jcode` ->
+    // versions/.../jcode), and the desktop sibling lives next to the real binary.
+    let jcode = std::fs::canonicalize(jcode).unwrap_or_else(|_| jcode.to_path_buf());
     let parent = jcode.parent()?;
     let sibling = parent.join(MACOS_DESKTOP_APP_EXECUTABLE);
     if sibling.is_file() {

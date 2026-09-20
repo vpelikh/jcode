@@ -88,6 +88,15 @@ version_dir="$builds_dir/versions/$hash"
 mkdir -p "$version_dir"
 install -m 755 "$bin" "$version_dir/jcode"
 
+# Install the native desktop app sibling (jcode-desktop2) when present, so
+# `setup-launcher --desktop` can bundle it into Jcode Desktop.app. The release
+# profile builds the whole workspace, so the sibling is expected next to jcode.
+desktop_bin="$repo_root/target/$profile/jcode-desktop2"
+if [ -x "$desktop_bin" ]; then
+  install -m 755 "$desktop_bin" "$version_dir/jcode-desktop2"
+  echo "Installed desktop sibling: $version_dir/jcode-desktop2"
+fi
+
 # Update stable symlink
 stable_dir="$builds_dir/stable"
 mkdir -p "$stable_dir"
@@ -119,6 +128,11 @@ case "$(uname -s)" in
   Darwin)
     if "$install_dir/jcode" setup-launcher </dev/null >/dev/null 2>&1; then
       echo "Installed macOS launcher and turn-notification broker."
+    fi
+    # Bundle the native desktop app from the jcode-desktop2 sibling when present.
+    if [ -x "$version_dir/jcode-desktop2" ] && \
+         "$install_dir/jcode" setup-launcher --desktop </dev/null >/dev/null 2>&1; then
+      echo "Installed macOS Jcode Desktop.app."
     fi
     if "$install_dir/jcode" setup-hotkey </dev/null >/dev/null 2>&1; then
       echo "Configured system-wide jcode launch hotkeys (when supported)."
