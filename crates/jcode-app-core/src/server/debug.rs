@@ -11,30 +11,27 @@ use super::debug_events::{
     maybe_handle_event_query_command, maybe_handle_event_subscription_command,
 };
 use super::debug_help::{debug_help_text, parse_namespaced_command, swarm_debug_help_text};
-use super::debug_jobs::{DebugJob, maybe_handle_job_command};
+use super::debug_jobs::maybe_handle_job_command;
 use super::debug_server_state::maybe_handle_server_state_command;
 use super::debug_session_admin::maybe_handle_session_admin_command;
 use super::debug_swarm_read::maybe_handle_swarm_read_command;
 use super::debug_swarm_write::{DebugSwarmWriteContext, maybe_handle_swarm_write_command};
 use super::debug_testers::execute_tester_command;
-use super::{
-    FileTouchService, ServerIdentity, SharedContext, SwarmEvent, SwarmMember, VersionedPlan,
-    debug_control_allowed, fanout_session_event,
+use super::services::{
+    ClientServiceHandle, DebugServiceHandle, SessionServiceHandle, SwarmServiceHandle,
 };
-use crate::agent::Agent;
+use super::{
+    ServerIdentity, SwarmMember, debug_control_allowed, fanout_session_event,
+};
 use crate::ambient_runner::AmbientRunnerHandle;
 use crate::protocol::{Request, ServerEvent, TranscriptMode, decode_request, encode_event};
-use crate::provider::Provider;
 use crate::transport::Stream;
 use anyhow::Result;
-use jcode_agent_runtime::InterruptSignal;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
-
-type ChannelSubscriptions = Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
+use tokio::sync::{RwLock, mpsc};
 
 #[derive(Default)]
 pub(super) struct ClientDebugState {
@@ -249,32 +246,38 @@ pub(super) async fn inject_transcript(
 )]
 pub(super) async fn handle_debug_client(
     stream: Stream,
-    sessions: Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>,
-    is_processing: Arc<RwLock<bool>>,
-    session_id: Arc<RwLock<String>>,
-    provider: Arc<dyn Provider>,
-    client_connections: Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
-    swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    shared_context: Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
-    swarm_plans: Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    swarm_coordinators: Arc<RwLock<HashMap<String, String>>>,
-    file_touch: FileTouchService,
-    channel_subscriptions: ChannelSubscriptions,
-    channel_subscriptions_by_session: ChannelSubscriptions,
-    client_debug_state: Arc<RwLock<ClientDebugState>>,
-    client_debug_response_tx: broadcast::Sender<(u64, String)>,
-    debug_jobs: Arc<RwLock<HashMap<String, DebugJob>>>,
-    event_history: Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
-    event_counter: Arc<std::sync::atomic::AtomicU64>,
-    swarm_event_tx: broadcast::Sender<SwarmEvent>,
+    session_service: SessionServiceHandle,
+    client_service: ClientServiceHandle,
+    swarm_service: SwarmServiceHandle,
+    debug_service: DebugServiceHandle,
     server_identity: ServerIdentity,
     server_start_time: std::time::Instant,
     ambient_runner: Option<AmbientRunnerHandle>,
     mcp_pool: Option<Arc<crate::mcp::SharedMcpPool>>,
-    shutdown_signals: Arc<RwLock<HashMap<String, InterruptSignal>>>,
-    soft_interrupt_queues: super::SessionInterruptQueues,
 ) -> Result<()> {
+    // Destructure the service handles back into the flat locals the body uses,
+    // preserving every downstream reference (Slice 3 of the server service split).
+    let sessions = session_service.sessions;
+    let is_processing = session_service.is_processing;
+    let session_id = session_service.session_id;
+    let provider = client_service.provider;
+    let client_connections = client_service.client_connections;
+    let swarm_members = swarm_service.swarm_state.members;
+    let swarms_by_id = swarm_service.swarm_state.swarms_by_id;
+    let shared_context = swarm_service.shared_context;
+    let swarm_plans = swarm_service.swarm_state.plans;
+    let swarm_coordinators = swarm_service.swarm_state.coordinators;
+    let file_touch = swarm_service.file_touch;
+    let channel_subscriptions = swarm_service.channel_subscriptions;
+    let channel_subscriptions_by_session = swarm_service.channel_subscriptions_by_session;
+    let client_debug_state = debug_service.client_debug_state;
+    let client_debug_response_tx = debug_service.client_debug_response_tx;
+    let debug_jobs = debug_service.debug_jobs;
+    let event_history = swarm_service.event_history;
+    let event_counter = swarm_service.event_counter;
+    let swarm_event_tx = swarm_service.swarm_event_tx;
+    let shutdown_signals = session_service.shutdown_signals;
+    let soft_interrupt_queues = session_service.soft_interrupt_queues;
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();

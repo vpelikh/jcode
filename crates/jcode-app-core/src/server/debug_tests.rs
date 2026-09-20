@@ -1,6 +1,6 @@
 mod tests {
     use super::super::*;
-    use crate::server::debug_jobs::DebugJobStatus;
+    use crate::server::debug_jobs::{DebugJob, DebugJobStatus};
 
     #[test]
     fn client_debug_state_registers_unregisters_and_falls_back() {
