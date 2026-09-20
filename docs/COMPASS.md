@@ -202,3 +202,13 @@ background build finishes, or use the `allow_raw_fallback` escape hatch — and
 the redirect is safely gated on `prefer_compass_query` + `compass_query` being
 invokable under the session tool policy (same `session_tool_is_disabled` check
 the pre-warm uses).
+
+The `allow_raw_fallback` escape hatch is not free: once a redirect fires for a
+session, that session must make a real `compass_query` attempt before
+`allow_raw_fallback` is accepted again (see `tool::compass_enforcement`). This
+closes a prod-observed bypass where a model retried `agentgrep` with
+`allow_raw_fallback: true` on the turn immediately after a redirect and never
+attempted `compass_query` at all. The restriction is cleared by any actual
+`compass_query` execution — including a `building-in-background` fail-fast — so
+a project Compass genuinely cannot index still reaches raw grep after one real
+attempt.

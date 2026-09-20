@@ -4,17 +4,7 @@ use crate::{terminal_eprintln as eprintln, terminal_println as println};
 impl Agent {
     /// Run a single turn with the given user message
     pub async fn run_once(&mut self, user_message: &str) -> Result<()> {
-        let input_id = self.add_message(
-            Role::User,
-            vec![ContentBlock::Text {
-                text: user_message.to_string(),
-                cache_control: None,
-            }],
-        );
-        if !user_message.trim().is_empty() {
-            self.begin_model_usage_turn(&input_id);
-        }
-        self.session.save()?;
+self.append_user_context_message(user_message, Vec::new())?;
         if trace_enabled() {
             eprintln!("[trace] session_id {}", self.session.id);
         }
@@ -32,18 +22,11 @@ impl Agent {
         user_message: &str,
         display_role: Option<crate::session::StoredDisplayRole>,
     ) -> Result<String> {
-        let input_id = self.add_message_with_display_role(
-            Role::User,
-            vec![ContentBlock::Text {
-                text: user_message.to_string(),
-                cache_control: None,
-            }],
+self.append_user_context_message_with_display_role(
+            user_message,
+            Vec::new(),
             display_role,
-        );
-        if !user_message.trim().is_empty() {
-            self.begin_model_usage_turn(&input_id);
-        }
-        self.session.save()?;
+        )?;
         if trace_enabled() {
             eprintln!("[trace] session_id {}", self.session.id);
         }
@@ -116,6 +99,30 @@ impl Agent {
         self.append_user_context_message_with_display_role(user_message, images, None)
     }
 
+    /// Resolve the handoff context block for the first visible user message.
+    ///
+    /// Honors an explicit manual selection ([`Self::handoff_resume_id`]) set by
+    /// `/handoffres`; otherwise falls back to the automatic latest-for-project
+    /// handoff. A manually selected snapshot is consumed here so it applies once
+    /// and never re-injects on a later turn or session, keeping manual selection
+    /// from regressing the default auto-injection at the next session start.
+    fn render_first_message_handoff(&mut self) -> Option<String> {
+        let override_id = self.handoff_resume_id.take();
+        if let Some(session_id) = override_id.as_deref() {
+            // The manual selection is consumed even on a failed render (a stale
+            // or retired snapshot must not re-trigger on a later turn). When it
+            // cannot be rendered, fall back to the automatic latest-for-project
+            // handoff rather than booting with no context.
+            if let Some(rendered) = crate::handoff::render_handoff(session_id) {
+                return Some(rendered);
+            }
+        }
+        self.session
+            .working_dir
+            .as_deref()
+            .and_then(|wd| crate::handoff::render_boot_context_and_consume(Some(std::path::Path::new(wd))))
+    }
+
     fn append_user_context_message_with_display_role(
         &mut self,
         user_message: &str,
@@ -126,8 +133,23 @@ impl Agent {
             .into_iter()
             .map(|(media_type, data)| ContentBlock::Image { media_type, data })
             .collect();
+
+        // Prepend the previous session's handoff to the very first user message
+        // of a fresh conversation, so the model sees "where the last session
+        // stopped" on turn one. This must happen here, before the message is
+        // added: `build_system_prompt_split` runs only *after* the user message
+        // is already in the session, so gating on message count there can never
+        // see an empty conversation for the first turn.
+        let mut text = user_message.to_string();
+        let is_first_visible_message = self.visible_conversation_message_count() == 0;
+        if is_first_visible_message
+            && let Some(handoff) = self.render_first_message_handoff()
+        {
+            text = format!("{handoff}\n\n{text}");
+        }
+
         blocks.push(ContentBlock::Text {
-            text: user_message.to_string(),
+            text,
             cache_control: None,
         });
 
@@ -637,7 +659,7 @@ impl Agent {
         let message_id = self.add_message(
             Role::Assistant,
             vec![ContentBlock::ToolUse {
-                id: tool_call_id,
+                id: tool_call_id.into(),
                 name: tool_name,
                 input,
                 thought_signature: None,
@@ -649,7 +671,7 @@ impl Agent {
 
     pub fn add_manual_tool_result(
         &mut self,
-        tool_call_id: String,
+        tool_call_id: impl Into<crate::session::ToolCallId>,
         output: crate::tool::ToolOutput,
         duration_ms: u64,
     ) -> Result<()> {
@@ -661,14 +683,14 @@ impl Agent {
 
     pub fn add_manual_tool_error(
         &mut self,
-        tool_call_id: String,
+        tool_call_id: impl Into<crate::session::ToolCallId>,
         error: String,
         duration_ms: u64,
     ) -> Result<()> {
         self.add_message_with_duration(
             Role::User,
             vec![ContentBlock::ToolResult {
-                tool_use_id: tool_call_id,
+                tool_use_id: tool_call_id.into(),
                 content: error,
                 is_error: Some(true),
             }],
@@ -738,10 +760,27 @@ impl Agent {
         // A failed load must leave the current Agent and its concurrency lease
         // alive. Close it only after the replacement is ready to install.
         self.mark_closed();
+        // Capture the session we are switching away from before replacing it, so
+        // we can clear its compass soft-redirect state below.
+        let previous_session_id = self.session.id.clone();
         // Restore provider_session_id for Claude CLI session resume
         self.provider_session_id = session.provider_session_id.clone();
         self.session = session;
         self.refresh_agents_md_snapshot();
+        // A session being switched away from may carry an outstanding
+        // compass-query-first redirect (set when an `agentgrep` call was
+        // redirected). Clearing it here prevents the pending state from leaking
+        // onto a later session that reuses the id (which would otherwise block
+        // `allow_raw_fallback` until that new session happened to call
+        // compass_query).
+        crate::tool::compass_enforcement::clear_redirect_pending(&previous_session_id);
+        // The session being restored is a fresh in-memory activation: its
+        // outstanding-redirect state is tied to the previous in-memory lifetime,
+        // not to this restore. Reset it so a stale in-memory flag (e.g. from a
+        // session that was abandoned without a switch-away clear) cannot block
+        // `allow_raw_fallback` here. The restored conversation still carries the
+        // original redirect guidance if one is relevant.
+        crate::tool::compass_enforcement::clear_redirect_pending(&self.session.id);
         self._tool_policy_registration = crate::tool::register_session_tool_policy(
             &self.session.id,
             self.allowed_tools.clone(),
@@ -771,6 +810,10 @@ impl Agent {
                 ));
             } else {
                 self.reconcile_explicit_provider_pin_route();
+                // The model/route was (re)applied on this freshly-assigned
+                // session; reset the degradation cycle so the restored route
+                // does not inherit any prior history for this Agent.
+                self.degradation.reset_for_route(self.current_route_key());
             }
         } else {
             self.session.model = Some(self.provider_model());
