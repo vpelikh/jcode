@@ -375,7 +375,10 @@ impl Frame {
         // The column normally keeps a 120-unit floor, but on a window too
         // narrow to hold the floor alongside the sidebar it must shrink to
         // fit rather than push `right` past the edge.
-        let column = (available - gutter * 2.0).clamp(120.0, MEASURE).min(available).max(1.0);
+        let column = (available - gutter * 2.0)
+            .clamp(120.0, MEASURE)
+            .min(available)
+            .max(1.0);
         let left = (sidebar
             + ((available - column) / 2.0).max(gutter.min((available - column).max(0.0))))
         // The sidebar can be wider than the window at the 240-unit floor, so
@@ -928,14 +931,8 @@ mod tests {
         // A window wide enough for the sidebar and the minimum column always
         // pushes the page clear of the sidebar.
         for (width, scale) in [(1100usize, 1.0), (800, 1.0), (1400, 1.75), (400, 1.0)] {
-            let frame = Frame::with_content_sidebar(
-                (width as u32, 720),
-                scale,
-                1,
-                false,
-                0.0,
-                SIDEBAR,
-            );
+            let frame =
+                Frame::with_content_sidebar((width as u32, 720), scale, 1, false, 0.0, SIDEBAR);
             assert!(
                 frame.left >= SIDEBAR - 0.001,
                 "at ({width},{scale}) the column started under the sidebar"
@@ -950,14 +947,8 @@ mod tests {
         // on-paper: the column stays above zero and never runs off the right
         // edge, even though the sidebar overhangs the leftover width.
         for (width, scale) in [(300usize, 1.0), (260, 1.0), (240, 1.0)] {
-            let frame = Frame::with_content_sidebar(
-                (width as u32, 720),
-                scale,
-                1,
-                false,
-                0.0,
-                SIDEBAR,
-            );
+            let frame =
+                Frame::with_content_sidebar((width as u32, 720), scale, 1, false, 0.0, SIDEBAR);
             assert!(
                 frame.right <= frame.width + 0.001,
                 "at ({width},{scale}) the column ran off-paper"

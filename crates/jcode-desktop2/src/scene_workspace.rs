@@ -7,9 +7,9 @@
 //! [`crate::workspace`], each clipped to a rounded window with its own border
 //! ring, so where one session ends and the next begins is legible at a glance.
 
-use crate::{Model, paint, scene, scene_file_tree, strip, workspace};
-use vello::Scene;
+use crate::{paint, scene, scene_file_tree, strip, workspace, Model};
 use vello::kurbo::{Affine, Rect, RoundedRect, Stroke};
+use vello::Scene;
 
 /// Corner radius of a session page, in logical units. Soft enough to read as
 /// a window, square enough that the transcript inside does not lose its
@@ -358,7 +358,9 @@ mod tests {
         };
         let luma = |x: u32, y: u32| {
             let i = ((y * size.0 + x) * 4) as usize;
-            (0.2126 * pixels[i] as f64 + 0.7152 * pixels[i + 1] as f64 + 0.0722 * pixels[i + 2] as f64)
+            (0.2126 * pixels[i] as f64
+                + 0.7152 * pixels[i + 1] as f64
+                + 0.0722 * pixels[i + 2] as f64)
                 / 255.0
         };
         let clip = |v: f64| v.max(0.0) as u32;
@@ -387,8 +389,8 @@ mod tests {
         );
         let window_x = column.x + button.x0;
         let mid_y = column.y + workspace::VERTICAL_INSET + button.y0 + button.height() / 2.0;
-        let dark = (clip(window_x)..=clip(window_x + button.width()))
-            .any(|x| luma(x, clip(mid_y)) < 0.9);
+        let dark =
+            (clip(window_x)..=clip(window_x + button.width())).any(|x| luma(x, clip(mid_y)) < 0.9);
         assert!(
             dark,
             "the focused sessions button was not drawn clear of the explorer"
