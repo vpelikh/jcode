@@ -1,4 +1,3 @@
-#![expect(clippy::await_holding_lock, reason = "tests intentionally hold locks across awaits")]
 use super::*;
 
 /// Point the process at a temp jcode home and return it with a restore guard.
@@ -142,7 +141,7 @@ fn a_config_write_that_breaks_toml_syntax_is_reported_loudly() {
 /// End-to-end through the real `write` tool: the path an agent actually takes
 /// when a user says "change this setting".
 #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
+#[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
 async fn the_write_tool_reports_config_changes_end_to_end() {
     use crate::tool::{Tool, ToolContext};
 
@@ -197,7 +196,7 @@ async fn the_write_tool_reports_config_changes_end_to_end() {
 /// `apply_patch` reaches config.toml through its own write paths, so it gets
 /// the same report as write/edit.
 #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
+#[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
 async fn apply_patch_reports_config_changes() {
     use crate::tool::{Tool, ToolContext};
 

@@ -1013,7 +1013,6 @@ impl Tool for TodoTool {
 
 #[cfg(test)]
 mod tests {
-    #![expect(clippy::await_holding_lock, reason = "tests intentionally hold locks across awaits")]
 
     use super::*;
 

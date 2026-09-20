@@ -1836,7 +1836,6 @@ fn render_selection(category: &str, tool_name: &str, listing: &Value) -> Result<
 
 #[cfg(test)]
 mod tests {
-    #![expect(clippy::await_holding_lock, reason = "tests intentionally hold locks across awaits")]
 
     use super::*;
 

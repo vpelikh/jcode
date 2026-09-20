@@ -1,4 +1,3 @@
-#![expect(clippy::await_holding_lock, reason = "tests intentionally hold locks across awaits")]
 use super::*;
 use crate::bus::{BackgroundTaskProgressSource, BackgroundTaskStatus};
 use crate::tool::StdinInputRequest;
@@ -909,7 +908,7 @@ fn gate_ctx(working_dir: &str) -> ToolContext {
 }
 
 #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
+#[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
 async fn bash_refuses_to_delete_the_home_directory() {
     // The #604 incident, at the real tool boundary.
     let _env_lock = crate::storage::lock_test_env();
@@ -1017,7 +1016,7 @@ async fn bash_does_not_interfere_with_ordinary_commands() {
 }
 
 #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
+#[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
 async fn indirect_dispatch_paths_cannot_bypass_the_gate() {
     // batch, and every other caller, dispatch through Tool::execute rather than
     // reimplementing it, so the gate lives at the only chokepoint. Assert that

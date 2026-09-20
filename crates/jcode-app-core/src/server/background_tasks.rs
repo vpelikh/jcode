@@ -575,7 +575,6 @@ pub(super) async fn dispatch_ui_activity(
 }
 
 #[cfg(test)]
-#[expect(clippy::items_after_test_module, reason = "test module sits before shared test helpers")]
 mod tests {
     use super::*;
     use crate::bus::{BatchProgress, ToolEvent, ToolStatus};

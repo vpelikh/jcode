@@ -130,6 +130,7 @@ fn legacy() -> HashMap<RouteKey, ModelUsage> {
 pub fn enrich_routes(routes: &mut [ModelRoute]) {
     let mut usage = legacy();
     let mut started: Option<u64> = None;
+    #[allow(clippy::type_complexity)] // Tracking-row + per-route usage tuple; kept inline for the DB read.
     let read = || -> Result<(u64, Vec<(RouteKey, u64, Option<u64>)>)> {
         let db = Connection::open_with_flags(path()?, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         db.busy_timeout(Duration::from_secs(2))?;
