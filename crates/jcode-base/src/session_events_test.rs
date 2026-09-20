@@ -1117,7 +1117,7 @@ fn test_replace_after_truncate_replays_deterministically() {
         map.append_event(SessionEvent {
             timestamp: chrono::Utc::now(),
             event_id: format!("rehydrate_{}", id).into(),
-            op: SessionEventOp::AppendMessage { message_id: MessageId::from(id.to_string()), message: mk(id) },
+            op: SessionEventOp::AppendMessage { message_id: MessageId::from(id), message: mk(id) },
             parent_id: None,
             version: 1,
         });
@@ -1343,7 +1343,7 @@ fn test_replace_after_clear_replays_deterministically() {
         map.append_event(SessionEvent {
             timestamp: chrono::Utc::now(),
             event_id: format!("rehydrate_{}", id).into(),
-            op: SessionEventOp::AppendMessage { message_id: MessageId::from(id.to_string()), message: mk(id) },
+            op: SessionEventOp::AppendMessage { message_id: MessageId::from(id), message: mk(id) },
             parent_id: None,
             version: 1,
         });
@@ -2095,7 +2095,7 @@ fn test_replace_messages_clamps_out_of_range_bounds() {
         map2.append_event(SessionEvent {
             timestamp: chrono::Utc::now(),
             event_id: format!("append_{}", id).into(),
-            op: SessionEventOp::AppendMessage { message_id: MessageId::from(id.to_string()), message: mk(id) },
+            op: SessionEventOp::AppendMessage { message_id: MessageId::from(id), message: mk(id) },
             parent_id: None,
             version: 1,
         });
@@ -2139,7 +2139,7 @@ fn test_replace_messages_reversed_bounds_do_not_panic() {
             timestamp: chrono::Utc::now(),
             event_id: format!("append_{}", id).into(),
             op: SessionEventOp::AppendMessage {
-                message_id: MessageId::from(id.to_string()),
+                message_id: MessageId::from(id),
                 message: mk(id),
             },
             parent_id: None,

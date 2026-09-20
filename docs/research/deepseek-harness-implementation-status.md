@@ -97,6 +97,7 @@ at log-inspection time.
 | Commit | Change |
 |---|---|
 | `6e7b9cdc2` | **Branded identity types.** New `crates/jcode-base/src/session/branded.rs` defines `EventId` (`SessionEvent.event_id` + `parent_id`), `MessageId` (`AppendMessage.message_id`), and `CompactionId` (`CompactionStart.compaction_id`) as `#[repr(transparent)]` newtypes over `String` with **`#[serde(transparent)]`** — the on-disk/on-wire format is byte-identical to the previous raw `String` fields, so persisted event logs round-trip unchanged. `SessionEventError::InvalidEventId`/`InvalidMessageContent` now carry the branded types too. Wired through the `SessionEventMap` producers (`session.rs`, `event_types.rs`), the app-core `SetCompaction` site (`agent.rs`), and every test/`invariant`s construction site. 4 new unit tests. |
+| `05b0546c2`, `4a3de549e` | **Backward-compat locks.** `05b0546c2` proves a literal pre-branding `SessionEventOp`/`SessionEvent` JSON payload (raw-string ids) deserializes and re-serializes with the same semantic payload. `4a3de549e` proves the real `Session::load` path hydrates a journal written in the pre-branding shape (bare-string `append_events` ids) and re-derives the transcript + compaction correctly — no migration needed for existing persisted sessions. |
 
   **Interpretation noted.** Takeaway #12's shortlist mentions branding
   session/tool-call/job/compaction ids broadly. This branch scopes branding to

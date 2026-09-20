@@ -795,6 +795,11 @@ impl SessionEventMap {
     }
     
     /// Validate a message content
+    ///
+    /// `event_id` is the id of the containing event, used only as a diagnostic
+    /// fallback for the `MessageId` in the error when the message itself carries
+    /// no id. In the append path the event id equals the message id, so this
+    /// preserves the exact pre-branding error value.
     fn validate_message(message: &StoredMessage, event_id: &EventId) -> Result<(), SessionEventError> {
         if message.id.is_empty() && event_id.is_empty() {
             return Err(SessionEventError::InvalidMessageContent {
