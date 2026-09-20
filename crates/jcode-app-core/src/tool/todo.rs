@@ -561,6 +561,14 @@ fn record_reframe_observations(
                     .map(|state| state.as_str().to_string()),
             });
         }
+        // Settle the architecture before verifying it, matching the gate order.
+        if !crate::todo::trade_off_passes(goal) {
+            observations.push(GateObservation {
+                kind: GateObservationKind::TradeOff,
+                group: goal.group.clone(),
+                state: goal.trade_off.map(|state| state.as_str().to_string()),
+            });
+        }
         if !crate::todo::feedback_loop_relevance_passes(goal) {
             observations.push(GateObservation {
                 kind: GateObservationKind::FeedbackLoopRelevance,
@@ -586,13 +594,6 @@ fn record_reframe_observations(
                 state: goal
                     .feedback_loop_traceability
                     .map(|state| state.as_str().to_string()),
-            });
-        }
-        if !crate::todo::trade_off_passes(goal) {
-            observations.push(GateObservation {
-                kind: GateObservationKind::TradeOff,
-                group: goal.group.clone(),
-                state: goal.trade_off.map(|state| state.as_str().to_string()),
             });
         }
     }
