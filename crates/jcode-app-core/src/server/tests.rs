@@ -3,8 +3,8 @@
 use super::services::{SessionServiceHandle, SwarmServiceHandle};
 use super::{
     AwaitMembersRuntime, FileAccess, FileTouchService, Server, SessionInterruptQueues, SwarmMember,
-    SwarmMutationRuntime, SwarmState, dispatch_background_task_completion, file_activity_scope_label,
-    persist_swarm_state_snapshot, remove_session_entry,
+    SwarmMutationRuntime, SwarmState, dispatch_background_task_completion,
+    file_activity_scope_label, persist_swarm_state_snapshot, remove_session_entry,
 };
 use crate::agent::Agent;
 use crate::bus::{
@@ -508,10 +508,8 @@ async fn background_task_wake_runs_live_session_immediately_when_idle() {
     };
 
     let (swarms_by_id, event_history, event_counter, swarm_event_tx) = empty_swarm_status_state();
-    let session_handle = test_session_service_handle(
-            Arc::clone(&sessions),
-            Arc::clone(&soft_interrupt_queues),
-        );
+    let session_handle =
+        test_session_service_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
     let swarm_handle = test_swarm_service_handle(
         Arc::clone(&swarm_members),
         Arc::clone(&swarms_by_id),
@@ -610,10 +608,8 @@ async fn external_background_task_wake_emits_request_without_starting_turn() {
     };
     let (swarms_by_id, event_history, event_counter, swarm_event_tx) = empty_swarm_status_state();
 
-    let session_handle = test_session_service_handle(
-            Arc::clone(&sessions),
-            Arc::clone(&soft_interrupt_queues),
-        );
+    let session_handle =
+        test_session_service_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
     let swarm_handle = test_swarm_service_handle(
         Arc::clone(&swarm_members),
         Arc::clone(&swarms_by_id),
@@ -895,10 +891,8 @@ async fn background_task_notify_without_wake_does_not_queue_soft_interrupt() {
     };
 
     let (swarms_by_id, event_history, event_counter, swarm_event_tx) = empty_swarm_status_state();
-    let session_handle = test_session_service_handle(
-            Arc::clone(&sessions),
-            Arc::clone(&soft_interrupt_queues),
-        );
+    let session_handle =
+        test_session_service_handle(Arc::clone(&sessions), Arc::clone(&soft_interrupt_queues));
     let swarm_handle = test_swarm_service_handle(
         Arc::clone(&swarm_members),
         Arc::clone(&swarms_by_id),
