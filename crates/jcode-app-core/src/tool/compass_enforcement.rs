@@ -22,7 +22,7 @@
 //! query that clears it, and the flag is also dropped when a session is switched
 //! away, so a stale id cannot linger for a session the daemon has stopped using.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 
 /// Sessions with an outstanding, unsatisfied `compass_query` redirect.
@@ -69,6 +69,76 @@ pub(crate) fn redirect_pending(session_id: &str) -> bool {
         .lock()
         .map(|map| map.contains(session_id))
         .unwrap_or(false)
+}
+
+/// Per-session counters tracking how often the model reaches for `compass_query`
+/// vs a raw full-text `agentgrep` grep. This is the measurement hook for the
+/// "use semantic search first" guidance: after the snippet-rendering fix ships,
+/// these counters (queried via [`search_usage_snapshot`] or logged) let us confirm
+/// whether the compass_query:agentgrep-grep ratio actually improves, before
+/// committing to a stricter enforcement rule. The counters are process-scoped,
+/// keyed by session id, and never persisted (like the pending-redirect set).
+///
+/// `agentgrep` calls in `find`/`outline`/`trace` mode are NOT counted — they are
+/// distinct operations compass does not replace, so they are not part of the
+/// "semantic vs raw grep" question this measures.
+#[derive(Default, Clone, Copy, Debug)]
+struct SearchUsage {
+    compass_query: u32,
+    agentgrep_grep_raw: u32,
+}
+
+static SEARCH_USAGE: LazyLock<Mutex<HashMap<String, SearchUsage>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Record one tool call for the compass-vs-raw-grep measurement. `is_compass`
+/// selects `compass_query`; otherwise the call is treated as an `agentgrep`
+/// grep. Always called from `Registry::execute`. After each `compass_query`
+/// (a rare, meaningful event) the running per-session survey is logged, giving
+/// a cheap post-ship signal of whether the snippet-rendering fix actually lifts
+/// the compass_query:agentgrep-grep ratio before committing to stricter
+/// enforcement.
+pub(crate) fn record_search_usage(session_id: &str, is_compass: bool) {
+    if session_id.is_empty() {
+        return;
+    }
+    let mut entry = None;
+    if let Ok(mut map) = SEARCH_USAGE.lock() {
+        let e = map.entry(session_id.to_string()).or_default();
+        if is_compass {
+            e.compass_query = e.compass_query.saturating_add(1);
+        } else {
+            e.agentgrep_grep_raw = e.agentgrep_grep_raw.saturating_add(1);
+        }
+        entry = Some(*e);
+    }
+    if is_compass
+        && let Some(u) = entry
+    {
+        crate::logging::event_info(
+            "COMPASS_SEARCH_USAGE",
+            [
+                ("session_id", session_id.to_string()),
+                ("compass_query", u.compass_query.to_string()),
+                ("agentgrep_grep_raw", u.agentgrep_grep_raw.to_string()),
+            ],
+        );
+    }
+}
+
+/// Snapshot a session's compass-vs-raw-grep usage, returning `(compass_query,
+/// agentgrep_grep_raw)`. Used by tests to assert the measurement pipeline works;
+/// `None` for a session that made no counted calls.
+#[cfg(test)]
+pub(crate) fn search_usage_snapshot(session_id: &str) -> Option<(u32, u32)> {
+    if session_id.is_empty() {
+        return None;
+    }
+    SEARCH_USAGE
+        .lock()
+        .ok()
+        .and_then(|m| m.get(session_id).copied())
+        .map(|u| (u.compass_query, u.agentgrep_grep_raw))
 }
 
 /// The coercive output returned when an `agentgrep` call asks for the raw
@@ -532,5 +602,20 @@ mod decide_enforcement_tests {
             EnforcementDecision::Intercept { redirect: true, .. } => {}
             other => panic!("expected redirect for empty grep input, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn search_usage_counter_tracks_compass_vs_raw_grep_per_session() {
+        let sid = "search_usage_test_1";
+        // Fresh session: no counted calls yet.
+        assert_eq!(search_usage_snapshot(sid), None);
+        record_search_usage(sid, false); // agentgrep grep
+        record_search_usage(sid, false); // agentgrep grep
+        record_search_usage(sid, true); // compass_query
+        assert_eq!(search_usage_snapshot(sid), Some((1, 2)));
+        // Empty ids and unrecorded sessions are ignored.
+        record_search_usage("", true);
+        assert_eq!(search_usage_snapshot(""), None);
+        assert_eq!(search_usage_snapshot("other_sid"), None);
     }
 }

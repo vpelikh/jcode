@@ -22,6 +22,37 @@ blocking a turn on a multi-minute cold build.
   it. On a cold index that build can take minutes on a large repo, which is
   exactly the stall pre-warming removes.
 
+## Result format
+
+Each hit is rendered with its qualified name, source file, node kind, score,
+and matched fields, **plus a compact source snippet** of the declaration read
+from disk. Showing the actual code is what makes `compass_query` a genuine
+substitute for `agentgrep` on symbol/declaration lookups: an earlier version
+returned only a bare ranked list of node names + paths, so a precise lookup
+(e.g. "definition of `SessionId`") surfaced fuzzy unrelated matches and the
+model abandoned compass for a raw grep — the dominant reason `agentgrep`
+grep calls outnumbered `compass_query` in real sessions.
+
+Snippet details:
+- Extracted from the current file on disk (not the index snapshot) relative to
+  the session working directory, **falling back to the git worktree toplevel**
+  so a session bound to a repo subdirectory still resolves the repo-relative
+  source path Compass stores.
+- Span is `[start_line, end_line)` from the node's source anchor, capped at 8
+  lines with a `...` fold marker for longer nodes (bounding context-window cost).
+- Only the **top 8 results** get a fenced snippet; the rest are listed as
+  name/file/kind rows (still fully ranked) so one query cannot tile many fences
+  into context (`tool::compass_query::MAX_SNIPPET_ROWS`).
+- Source files are read **once per query** and shared across results that land
+  in the same file (`tool::compass_query::SourceCache`), so a wide query does
+  not re-open the same file per hit.
+- Best-effort: a missing/unreadable file, an `..`-escaping or absolute path, or
+  an out-of-range anchor renders no snippet without failing the query (see
+  `tool::compass_query::resolve_source_text`).
+- Reads are bounded: only the top 8 results trigger any file read, each unique
+  file is read at most once, and only that file's line windows are materialized
+  into the report (never the whole file body).
+
 ## Cache locations
 
 All Compass cache data lives under the **jcode home** (`~/.jcode`, or
@@ -185,6 +216,12 @@ a panic in a pre-warm thread cannot brick later dedup or cooldown.
 - A per-SHA pre-warm happens only for the SHA a session subscribes to; if a
   session quickly switches branches, the new SHA cold-builds unless another
   subscribe pre-warms it.
+- The `allow_raw_fallback` enforcement re-arms only once per session (after any
+  single `compass_query` attempt). Re-arming it per redirect is considered but
+  deferred (see the weighted trade-off in the enforcement section): it would
+  force `compass_query` usage but risks false-blocking legitimate out-of-index
+  searches. Revisit only if post-ship measurement shows fallback reliance is
+  unchanged despite the source-snippet results.
 
 ## Integration with compass-first enforcement
 
@@ -216,3 +253,55 @@ are unaffected (they are never redirected and never blocked). The restriction is
 also not applied when `compass_query` has since become unavailable to the session
 (removed or disabled by policy), and the pending flag is reset on a fresh session
 bind or restore, so a re-attached or restored session is never stale-blocked.
+
+Because the pending flag clears after *one* genuine `compass_query` attempt,
+session logs historically show models satisfying that single required call and
+then running the bulk of their grep searches with `allow_raw_fallback: true`
+(often 75–91% of grep calls in a session). The source-snippet rendering above
+attacks the underlying cause — making `compass_query` actually answer the
+declaration/structure queries that previously pushed the model to grep.
+
+### Considered alternative: re-arm the raw-fallback gate per redirect
+
+A stricter alternative is to *not* clear the pending flag on the first compass
+attempt, so every redirected grep (or each new search intent) requires a fresh
+`compass_query` before `allow_raw_fallback` is honored. Weighing:
+
+- **Effectiveness:** would force `compass_query` usage to approximate the grep
+  rate more closely, since a raw-fallback grep must be re-earned each time.
+  Stronger guarantee than relying on the model finding snippets useful.
+- **Cost — false-blocking risk (the decisive drawback):** the whole point of
+  `allow_raw_fallback` is legitimate out-of-index searches (build output, logs,
+  vendored/generated code, files outside the indexed tree). Re-arming per grep
+  means a session doing real work there pays a `compass_query` round-trip before
+  every such grep — wasted turns, budget, and a "call compass that won't help"
+  workflow. The existing one-attempt-per-session rule is already a compromise;
+  our data shows it is *after* that one attempt that models over-use the hatch,
+  which the snippet fix targets directly.
+- **Cost — complexity:** the flag becomes a per-session *counter*/intent-map
+  with state transitions across restore/bind (the current set already has
+  documented edge cases). More state to keep correct under session switching.
+- **Compatibility:** changes behavior for existing sessions mid-flight; harder
+  to reason about for `find`/`outline`/`trace` which legitimately bypass.
+- **Maintenance:** two mechanisms (enforcement + result quality) both poking at
+  the same behavior makes a future regression harder to attribute.
+
+**Decision:** keep the one-attempt gate and rely on the source-snippet fix as the
+primary lever — it removes the underlying reason (bare results drove models to
+grep) without risking legitimate out-of-index searches. A measurement of 114
+real `compass_query` results reinforces the deferral:
+- 92% (105/114) returned non-empty hits, so a "arm the gate on hits" rule would
+  have kept the escape hatch closed for almost every real compass call;
+- but 22% of compass-with-hits calls were followed by a raw-fallback grep in the
+  same session — the model went back to grep even though compass returned
+  results, i.e. hit-count is a poor proxy for "compass answered." Arming the gate
+  on hits would therefore false-block real searches in that ~22% of cases, which
+  is exactly what the escape hatch exists to avoid.
+
+Because hit-count cannot separate "answered" from "noise," the enforcement is
+**deferred pending real-world measurement**: `tool::compass_enforcement` now
+records per-session `compass_query` vs raw-`agentgrep`-grep counts (logged as
+`COMPASS_SEARCH_USAGE`) so a post-ship check can confirm whether the snippet fix
+lifts the ratio. Re-arm the gate only if that measurement shows reliance is
+unchanged *and* the extra compass round-trips on out-of-index searches are
+acceptable.
