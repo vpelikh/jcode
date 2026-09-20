@@ -1263,6 +1263,24 @@ fn todo_goal_score_spans(goal: &crate::todo::TodoGoal) -> Vec<Span<'static>> {
         );
         states.push(("Closed feedback loop", state, color));
     }
+    // Trade-off is surfaced before the feedback-loop rows to match the gate
+    // order: settle on the architecture before verifying it.
+    if !crate::todo::trade_off_passes(goal) {
+        let (state, color) = goal.trade_off.map_or_else(
+            || ("missing".to_string(), todo_failure_color()),
+            |state| {
+                let color = if state
+                    <= crate::todo::TradeOffState::NoneConsidered
+                {
+                    todo_failure_color()
+                } else {
+                    todo_warning_color()
+                };
+                (state.as_str().to_string(), color)
+            },
+        );
+        states.push(("Trade-off", state, color));
+    }
     if !crate::todo::feedback_loop_relevance_passes(goal) {
         let (state, color) = goal.feedback_loop_relevance.map_or_else(
             || ("missing".to_string(), todo_failure_color()),
@@ -1304,22 +1322,6 @@ fn todo_goal_score_spans(goal: &crate::todo::TodoGoal) -> Vec<Span<'static>> {
             },
         );
         states.push(("Traceability", state, color));
-    }
-    if !crate::todo::trade_off_passes(goal) {
-        let (state, color) = goal.trade_off.map_or_else(
-            || ("missing".to_string(), todo_failure_color()),
-            |state| {
-                let color = if state
-                    <= crate::todo::TradeOffState::NoneConsidered
-                {
-                    todo_failure_color()
-                } else {
-                    todo_warning_color()
-                };
-                (state.as_str().to_string(), color)
-            },
-        );
-        states.push(("Trade-off", state, color));
     }
 
     if states.is_empty() {
@@ -1646,6 +1648,15 @@ fn push_todo_goal_details(
                         .to_string(),
                 ));
             }
+            if !crate::todo::trade_off_passes(goal) {
+                states.push((
+                    "Trade-off",
+                    goal.trade_off
+                        .map(|state| state.as_str())
+                        .unwrap_or("missing")
+                        .to_string(),
+                ));
+            }
             if !crate::todo::feedback_loop_relevance_passes(goal) {
                 states.push((
                     "Relevance",
@@ -1668,15 +1679,6 @@ fn push_todo_goal_details(
                 states.push((
                     "Traceability",
                     goal.feedback_loop_traceability
-                        .map(|state| state.as_str())
-                        .unwrap_or("missing")
-                        .to_string(),
-                ));
-            }
-            if !crate::todo::trade_off_passes(goal) {
-                states.push((
-                    "Trade-off",
-                    goal.trade_off
                         .map(|state| state.as_str())
                         .unwrap_or("missing")
                         .to_string(),
