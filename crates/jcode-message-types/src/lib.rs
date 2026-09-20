@@ -364,10 +364,15 @@ pub fn extend_stable_hash(acc: u64, next: u64) -> u64 {
 /// the in-flight copy hashed for the request signature, so the raw hash of
 /// the same message differed across turns and falsely flagged a prefix edit.
 ///
-/// For user messages the human-readable timestamp is already baked into the
-/// text by `Message::with_timestamps` before this projection runs (and
-/// system-reminder messages skip timestamp injection entirely), so removing
-/// the struct-level `timestamp` field cannot hide a real content change.
+/// For user messages the human-readable timestamp is *also* echoed into that
+/// text by `Message::with_timestamps` when a caller decorates before projecting
+/// (system-reminder messages skip timestamp injection entirely), so removing the
+/// struct-level `timestamp` field cannot hide a real content change: the same
+/// bytes are stripped whether they live in the field or the derived text tag.
+/// The production TUI/server cache paths hash the *raw* messages before
+/// `with_timestamps`, so the derived-tag strip below is a defense-in-depth
+/// backstop for any caller that hashes decorated input; keeping the projection
+/// stable across both raw and decorated input is what makes the two agree.
 ///
 /// The same reasoning applies to the *derived* text tags: `with_timestamps`
 /// prepends `[<timestamp>]` to user text and `[tool timing: start=... finish=...
@@ -1011,16 +1016,20 @@ mod tests {
 
     #[test]
     fn cache_relevant_hashes_strip_derived_timestamp_and_timing_tags() {
-        // The full request pipeline runs `Message::with_timestamps` *before* the
-        // cache-relevant hash, which bakes volatile metadata into content as:
+        // When callers run `Message::with_timestamps` on the messages fed to the
+        // cache-relevant hash, it bakes volatile metadata into content as:
         //   user text      -> "[<rfc3339>] {text}"
         //   tool result    -> "[tool timing: start=... finish=... duration=...] {content}"
-        // If the same already-sent user/tool-result message is reconstructed with
-        // a later timestamp or backfilled duration on the next turn, those derived
-        // tags differ even though the payload sent upstream is byte-identical. The
-        // projection must strip them, exactly as it strips the struct-level
-        // timestamp/tool_duration_ms fields, or the prefix hash flips spuriously
-        // (harness:_prefix_changed). A genuinely edited payload must still differ.
+        // (The production TUI/server paths hash raw messages before
+        // with_timestamps, so this strip is a defense-in-depth backstop there,
+        // but some callers still hash decorated input and the projection must
+        // tolerate it.) If the same already-sent user/tool-result message is
+        // reconstructed with a later timestamp or backfilled duration on the next
+        // turn, those derived tags differ even though the payload sent upstream
+        // is byte-identical. The projection must strip them, exactly as it strips
+        // the struct-level timestamp/tool_duration_ms fields, or the prefix hash
+        // flips spuriously (harness:_prefix_changed). A genuinely edited payload
+        // must still differ.
         let t0 = chrono::Utc::now();
 
         // (a) Timestamped user text with a re-derived timestamp.
@@ -1512,7 +1521,7 @@ mod tool_use_block_tests {
     #[test]
     fn to_tool_use_block_preserves_thought_signature() {
         let call = ToolCall {
-            id: "toolu_1".to_string(),
+            id: "toolu_1".into(),
             name: "websearch".to_string(),
             input: serde_json::json!({"query": "water testing"}),
             intent: None,
@@ -1526,7 +1535,7 @@ mod tool_use_block_tests {
                 thought_signature,
                 ..
             } => {
-                assert_eq!(id, "toolu_1");
+                assert_eq!(id.as_str(), "toolu_1");
                 assert_eq!(name, "websearch");
                 assert_eq!(
                     thought_signature.as_deref(),
@@ -1543,7 +1552,7 @@ mod tool_use_block_tests {
     #[test]
     fn thought_signature_round_trips_through_session_json() {
         let block = ToolCall {
-            id: "toolu_2".to_string(),
+            id: "toolu_2".into(),
             name: "bash".to_string(),
             input: serde_json::json!({"command": "ls"}),
             intent: None,
@@ -1567,7 +1576,7 @@ mod tool_use_block_tests {
     #[test]
     fn absent_signature_stays_absent() {
         let block = ToolCall {
-            id: "toolu_3".to_string(),
+            id: "toolu_3".into(),
             name: "read".to_string(),
             input: serde_json::json!({}),
             intent: None,
