@@ -31,6 +31,107 @@ pub(in crate::tui::app) async fn send_interleave_now(
     }
 }
 
+/// Clear the client-side session state that accompanies a transcript discard.
+///
+/// Mirrors every cleanup `/clear` performs so callers that also discard the
+/// conversation (`/clear`, `/handoffres`) do not leave orphaned UI state (queued
+/// messages, pasted/pending content, inline images, streaming/live panes, swarm
+/// plan items, or side-panel pages) behind for the next message.
+fn clear_session_state_after_discard(app: &mut App) {
+    app.clear_provider_messages();
+    app.clear_display_messages();
+    app.queued_messages.clear();
+    app.pasted_contents.clear();
+    app.pending_images.clear();
+    app.clear_inline_image_state();
+    app.clear_streaming_render_state();
+    app.clear_live_usage_state();
+    // Full transcript discard orphanes diagrams and side-panel pages, matching
+    // the `/clear` rationale.
+    crate::tui::mermaid::clear_active_diagrams();
+    app.swarm_plan_items.clear();
+    app.swarm_plan_version = None;
+    app.swarm_plan_swarm_id = None;
+    app_mod::commands_review::clear_side_panel_for_new_session(app);
+    app.is_processing = false;
+    app.status = ProcessingStatus::Idle;
+}
+
+/// Set which saved handoff this session boots from on its first message.
+///
+/// `/handoffres <session_id>` clears the current conversation in place (like
+/// `/clear`) so the next message is the first visible one, then sets the
+/// override on the server. Always clearing guarantees the override fires; a
+/// selection is resolved locally first so an unknown id fails fast client-side.
+async fn handle_handoff_resume_command(
+    app: &mut App,
+    remote: &mut RemoteConnection,
+    trimmed: &str,
+) -> Result<()> {
+    if app.is_processing {
+        app.push_display_message(DisplayMessage::error(
+            "The agent is currently working. Wait for it to finish, then run /handoffres again.".to_string(),
+        ));
+        return Ok(());
+    }
+    let session_id = trimmed.strip_prefix("/handoffres").unwrap_or_default().trim();
+    if session_id.is_empty() {
+        app.push_display_message(DisplayMessage::error(
+            "Usage: /handoffres <session_id>  (list ids with /handoff)".to_string(),
+        ));
+        return Ok(());
+    }
+    // Resolve and preview the target before telling the server, so an unknown
+    // id fails fast client-side.
+    let preview = match crate::handoff::render_handoff(session_id) {
+        Some(block) => block,
+        None => {
+            app.push_display_message(DisplayMessage::error(format!(
+                "No saved handoff with id {session_id:?}. List them with /handoff."
+            )));
+            return Ok(());
+        }
+    };
+    let selected = session_id.to_string();
+    // A handoff override only applies to the first visible user message, so the
+    // server conversation must be empty for the next message to be treated as
+    // first. Clear it in place on the server (same session id, like `/clear`).
+    // We always clear rather than gating on client-visible messages: after a
+    // reconnect the client's display cache may not yet show server history, so
+    // a client-side empty check could wrongly skip the clear and leave the
+    // override set but never fired. Clearing an already-empty session is a
+    // harmless no-op, so always clearing is both simpler and correct.
+    remote.clear().await?;
+    clear_session_state_after_discard(app);
+    remote.set_handoff_resume(Some(selected)).await?;
+    // Show the handoff's headline (first content line, i.e. the intent) rather
+    // than the always-present "[Handoff from previous session]" header.
+    let preview_line = preview
+        .lines()
+        .nth(1)
+        .map(str::to_string)
+        .filter(|line| !line.trim().is_empty())
+        .unwrap_or_else(|| "[Handoff from previous session]".to_string());
+    app.push_display_message(DisplayMessage::system(format!(
+        "Handoff ready: {}\n{}",
+        session_id, preview_line
+    )));
+    app.set_status_notice("Handoff selected");
+    Ok(())
+}
+
+/// `/handoff` lists the saved handoffs the user can resume from, newest first.
+/// Every persisted snapshot is shown (not only the latest per project, so a
+/// superseded handoff is still selectable). Each row carries the `session_id`
+/// the user should pass to `/handoffres`. Shares the message builder with the
+/// local fallback so the two outputs cannot drift.
+fn handle_handoff_command(app: &mut App, _trimmed: &str) -> Result<()> {
+    app.push_display_message(DisplayMessage::system(
+        app_mod::commands::handoff_listing_message(true),
+    ));
+    Ok(())
+}
+
 pub(in crate::tui::app) async fn handle_remote_update_command(
     app: &mut App,
     remote: &mut RemoteConnection,
@@ -1793,24 +1894,7 @@ async fn handle_remote_key_internal(
 
                 if trimmed == "/clear" {
                     remote.clear().await?;
-                    app.clear_provider_messages();
-                    app.clear_display_messages();
-                    app.queued_messages.clear();
-                    app.pasted_contents.clear();
-                    app.pending_images.clear();
-                    app.clear_inline_image_state();
-                    app.clear_streaming_render_state();
-                    app.clear_live_usage_state();
-                    // Full transcript discard: diagrams and side panel pages
-                    // are both orphaned (same rationale as
-                    // reset_current_session; side panel is #605).
-                    crate::tui::mermaid::clear_active_diagrams();
-                    app.swarm_plan_items.clear();
-                    app.swarm_plan_version = None;
-                    app.swarm_plan_swarm_id = None;
-                    super::super::commands_review::clear_side_panel_for_new_session(app);
-                    app.is_processing = false;
-                    app.status = ProcessingStatus::Idle;
+                    clear_session_state_after_discard(app);
                     app.set_status_notice("Session cleared");
                     return Ok(());
                 }
@@ -1945,6 +2029,29 @@ async fn handle_remote_key_internal(
 
                 if trimmed == "/active" {
                     app.open_active_sessions_picker();
+                    return Ok(());
+                }
+
+                if trimmed == "/handoff" || trimmed.starts_with("/handoff ") {
+                    return handle_handoff_command(app, trimmed);
+                }
+
+                if trimmed == "/handoffres" || trimmed.starts_with("/handoffres ") {
+                    return handle_handoff_resume_command(app, remote, trimmed).await;
+                }
+
+                if trimmed == "/handoff-clear" || trimmed == "/handoffcancel" {
+                    if app.is_processing {
+                        app.push_display_message(DisplayMessage::error(
+                            "The agent is currently working. Wait for it to finish, then run /handoff-clear again.".to_string(),
+                        ));
+                        return Ok(());
+                    }
+                    remote.set_handoff_resume(None).await?;
+                    app.push_display_message(DisplayMessage::system(
+                        "Handoff override cleared; automatic latest-for-project injection restored.".to_string(),
+                    ));
+                    app.set_status_notice("Handoff selection cleared");
                     return Ok(());
                 }
 

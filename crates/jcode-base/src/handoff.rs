@@ -26,6 +26,7 @@ use crate::todo::{TodoItem, load_plan, load_todos};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -350,6 +351,81 @@ pub fn render_boot_context(working_dir: Option<&Path>) -> Option<String> {
     if snapshot.project_key != key {
         return None;
     }
+    render_snapshot(&snapshot)
+}
+
+/// List the saved handoffs available for manual selection, one per project.
+///
+/// Returns the latest unfinished handoff per project from the index, newest
+/// first. These are the rows the `/handoff` picker offers, keyed by
+/// `session_id`, so manual resume can override automatic latest-for-project
+/// injection without regressing it.
+pub fn list_saved_handoffs() -> Vec<IndexEntry> {
+    let mut entries: Vec<IndexEntry> = load_index().latest;
+    entries.sort_by(|a, b| b.ended_at.cmp(&a.ended_at));
+    entries
+}
+
+/// List every persisted handoff snapshot, including archived ones that are no
+/// longer the latest for their project (and so absent from the index).
+///
+/// Unlike [`list_saved_handoffs`], this scans the snapshot directory directly so
+/// an older snapshot that was superseded by a newer handoff in the same project
+/// is still discoverable for manual selection. Returns newest first. Snapshot
+/// files that fail to load (corrupt or identity-mismatched) are skipped; the
+/// directory-scoped scan is bounded by the handoffs directory size.
+pub fn list_all_handoffs() -> Vec<HandoffSnapshot> {
+    let Ok(dir) = handoffs_dir() else {
+        return Vec::new();
+    };
+    let mut snapshots = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return snapshots;
+    };
+    let mut seen = HashSet::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        // `index.json` is the index, not a snapshot; `.lock` is not json.
+        if file_name == "index.json" {
+            continue;
+        }
+        let session_id = file_name
+            .strip_suffix(".json")
+            .unwrap_or_default()
+            .to_string();
+        if session_id.is_empty() || !seen.insert(session_id.clone()) {
+            continue;
+        }
+        if let Some(snapshot) = load_snapshot(&session_id) {
+            snapshots.push(snapshot);
+        }
+    }
+    snapshots.sort_by(|a, b| b.ended_at.cmp(&a.ended_at));
+    snapshots
+}
+
+/// Render a specific handoff snapshot by id as a compact markdown block, for
+/// a manually selected resume. Returns `None` when no such snapshot exists or
+/// its identity check fails.
+pub fn render_handoff(session_id: &str) -> Option<String> {
+    let snapshot = load_snapshot(session_id)?;
+    render_snapshot(&snapshot)
+}
+
+/// Render a snapshot as a compact markdown block for first-message injection.
+///
+/// Shared by automatic latest-for-project injection ([`render_boot_context`])
+/// and manual selection ([`render_handoff`]) so the rendered shape is identical
+/// and bounded regardless of how the handoff was chosen.
+fn render_snapshot(snapshot: &HandoffSnapshot) -> Option<String> {
     let mut out = String::from("[Handoff from previous session]");
     if let Some(intent) = &snapshot.intent {
         out.push_str(&format!("\nIntent: {}", truncate(intent, 2048)));

@@ -11,7 +11,7 @@ a fresh session's first message receives the saved handoff exactly once.
 Live model continuation was exercised end to end with a working provider: a
 fresh session recovered the exact pending marker from the saved handoff.
 
-**Planned:** manual selection, snapshot pruning, and remote fallback.
+**Planned:** snapshot pruning and remote fallback.
 
 ## Purpose
 
@@ -26,10 +26,43 @@ can use on its first turn.
 - A project-keyed index for finding the latest unfinished handoff.
 - First-message context injection, including image-first conversations.
 - Promotion of a saved handoff into a durable project initiative.
+- A `/handoff` picker that lists saved handoffs (all snapshots, newest first)
+  and a `/handoffres <session_id>` command that boots a fresh conversation from
+  a selected handoff, overriding the automatic latest-for-project injection.
 
-Manual selection, snapshot pruning, and remote fallback are future work.
+Manual selection is implemented. Snapshot pruning and remote fallback remain
+future work.
 
 ## Lifecycle
+
+### Manual selection
+
+`handoff::list_saved_handoffs()` reads the index (newest first, one per
+project) for the `/handoff` picker, and `handoff::render_handoff(id)` renders a
+specific snapshot for `list_saved_handoffs`-driven resume.
+`handoff::list_all_handoffs()` scans the snapshot directory so archived
+handoffs that are no longer the latest for their project stay selectable
+(marked `[archived]` in `/handoff`). The selected snapshot is carried from the
+TUI to the server via the `set_handoff_resume` protocol request and stored as a
+transient, one-shot override on the agent.
+
+`/handoffres` clears the current conversation in place (like `/clear`) so the
+next message is the first visible one, then sets the override; always clearing
+guarantees the override fires even right after a reconnect when the client's
+display cache has not yet loaded server history. `/handoff-clear`
+(alias `/handoffcancel`) sends `set_handoff_resume(None)` to restore automatic
+injection. `/handoff` lists handoffs locally by reading the shared handoff
+store — the same client-side filesystem pattern the session picker uses for its
+listing — while the mutating `set_handoff_resume` path goes through the server
+because it changes the live agent. The commands also have a local fallback that
+lists handoffs (and notes that resume needs a connected server), so they degrade
+gracefully while disconnected.
+
+At first-message injection ([`render_first_message_handoff`]), the override is
+honored if present and consumed immediately; otherwise the default
+latest-for-project handoff is used. Because the override applies only to the
+first visible message and is cleared after injection, manual selection never
+regresses the automatic behavior on a later turn or session.
 
 ### Capture
 
@@ -133,31 +166,46 @@ for choosing among multiple work streams.
 
 | Component | Location |
 | --- | --- |
-| Capture, identity, index, rendering, promotion | `crates/jcode-base/src/handoff.rs` |
+| Capture, identity, index, rendering, promotion, listing, specific render | `crates/jcode-base/src/handoff.rs` |
 | Module registration | `crates/jcode-base/src/lib.rs` |
 | Disconnect hook | `crates/jcode-app-core/src/server/client_disconnect_cleanup.rs` |
-| First-message injection | `crates/jcode-app-core/src/agent/turn_execution.rs` |
+| First-message injection and manual override | `crates/jcode-app-core/src/agent/turn_execution.rs` |
+| `set_handoff_resume` protocol + server handler | `crates/jcode-protocol/src/wire.rs`, `crates/jcode-app-core/src/server/client_actions.rs`, `client_lifecycle.rs` |
+| TUI `/handoff`, `/handoffres`, `/handoff-clear` commands + local fallback | `crates/jcode-tui/src/tui/app/remote/key_handling.rs`, `commands.rs`, `backend.rs`, `state_ui_input_helpers.rs` |
 | Storage and public-API tests | `crates/jcode-base/src/handoff_tests.rs` |
-| Injection tests | `crates/jcode-app-core/src/agent_tests.rs` |
+| Injection + override tests | `crates/jcode-app-core/src/agent_tests.rs` |
 | Disconnect integration tests | `crates/jcode-app-core/src/server/client_disconnect_grace_tests.rs` |
 
 ## Testing
 
 ```bash
 cargo test -p jcode-base --lib handoff::tests
+cargo test -p jcode-app-core --lib manual_handoff_override_injects_selected_snapshot_once
+cargo test -p jcode-app-core --lib stale_manual_handoff_override_falls_back_to_auto_inject
+cargo test -p jcode-app-core --lib handle_set_handoff_resume_overrides_auto_inject_and_errors_on_unknown
+cargo test -p jcode-app-core --lib handle_set_handoff_resume_none_clears_override
 cargo test -p jcode-app-core --lib first_user_message_injects_handoff_once
 cargo test -p jcode-app-core --lib cleanup_persists_handoff_for_session_with_open_todos
+cargo test -p jcode-tui --lib local_handoff_listing
 ```
 
 Coverage includes capture and index persistence, concurrent writers, timestamp
 ordering, terminal-todo retirement, cross-checkout portability, origin changes,
 project isolation, invalid filenames, corrupt-index recovery, bounded rendering,
-initiative promotion, text/image-first injection, and cleanup lock release.
-Tests use temporary storage and restore the prior environment.
+initiative promotion, text/image-first injection, cleanup lock release, picker
+listing (latest per project, newest first), archive listing (`list_all_handoffs`
+surfaces superseded snapshots), specific-snapshot rendering, manual override
+beating auto-inject, a stale-override fallback (a retired snapshot falls back to
+auto-inject instead of booting context-less, and the stale id is consumed), the
+`set_handoff_resume` server handler (valid set replies `Done` and wins over
+auto-inject; unknown id replies `Error`; `None` restores auto-injection), a
+no-regression guard that a manual selection does not disturb the default, and
+the TUI local `/handoff` fallback (surfaces archived handoffs; `/handoffres`
+explains a server is needed). Tests use temporary storage and restore the prior
+environment.
 
 ## Future work
 
-- A `/handoff` picker and `/handoffres` command for manual selection.
 - Snapshot pruning beyond the index's project-entry cap.
 - Optional fallback after a failed live-session migration, using handoff files
   already available on the target host.

@@ -499,6 +499,22 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/resume", "Open session picker"),
     RegisteredCommand::public("/sessions", "Alias for /resume"),
     RegisteredCommand::public("/session", "Alias for /resume"),
+    RegisteredCommand::public(
+        "/handoff",
+        "List saved handoffs (all snapshots, newest first) to resume from",
+    ),
+    RegisteredCommand::public(
+        "/handoffres",
+        "Resume a fresh session from a specific handoff by id (see /handoff)",
+    ),
+    RegisteredCommand::public(
+        "/handoff-clear",
+        "Clear the selected handoff and restore automatic injection",
+    ),
+    RegisteredCommand::public(
+        "/handoffcancel",
+        "Alias for /handoff-clear",
+    ),
     RegisteredCommand::public("/active", "Manage live sessions (working vs ready)"),
     RegisteredCommand::public("/catchup", "Open Catch Up picker"),
     RegisteredCommand::public("/back", "Return to the previous Catch Up session"),

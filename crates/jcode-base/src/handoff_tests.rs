@@ -693,3 +693,129 @@ impl Drop for HandoffTestEnv {
         }
     }
 }
+
+/// list_saved_handoffs returns one entry per project, newest first, ready for
+/// the `/handoff` picker.
+#[test]
+fn list_saved_handoffs_returns_latest_per_project_newest_first() {
+    let _guard = crate::storage::lock_test_env();
+    let _env = HandoffTestEnv::new();
+
+    let mut a1 = fixture("proj-a-1", "git:https://example.com/a.git");
+    a1.ended_at = Utc::now() - chrono::Duration::hours(2);
+    let mut a2 = fixture("proj-a-2", "git:https://example.com/a.git");
+    a2.ended_at = Utc::now() - chrono::Duration::hours(1);
+    let mut b = fixture("proj-b", "git:https://example.com/b.git");
+    b.ended_at = Utc::now();
+    // Older project A entry must not shadow the newer one for a in the index.
+    write_snapshot(&a2).unwrap();
+    write_snapshot(&a1).unwrap();
+    write_snapshot(&b).unwrap();
+
+    let listed = list_saved_handoffs();
+    let keys: Vec<&str> = listed.iter().map(|e| e.project_key.as_str()).collect();
+    assert_eq!(keys, vec![
+        "git:https://example.com/b.git",
+        "git:https://example.com/a.git",
+    ]);
+    // Newest first ordering across projects.
+    let a_entry = listed
+        .iter()
+        .find(|e| e.project_key == "git:https://example.com/a.git")
+        .expect("project A present");
+    assert_eq!(a_entry.session_id, "proj-a-2", "latest A wins");
+}
+
+/// render_handoff renders a specific snapshot regardless of project, while
+/// render_boot_context keeps resolving the latest for the working dir.
+#[test]
+fn render_handoff_selects_an_arbitrary_snapshot() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let home = env._home.path();
+    let cwd = home.join("project");
+    std::fs::create_dir_all(&cwd).ok();
+
+    let mut older = fixture("older", &project_key(Some(&cwd)).unwrap());
+    older.ended_at = Utc::now() - chrono::Duration::hours(5);
+    older.intent = Some("older work".into());
+    write_snapshot(&older).unwrap();
+
+    let mut newer = fixture("newer", &project_key(Some(&cwd)).unwrap());
+    newer.intent = Some("newer work".into());
+    write_snapshot(&newer).unwrap();
+
+    // Boot context picks the latest automatically.
+    let boot = render_boot_context(Some(&cwd)).unwrap();
+    assert!(boot.contains("newer work"));
+
+    // Manual selection can still target the older snapshot directly.
+    let manual = render_handoff("older").expect("older renderable");
+    assert!(manual.contains("older work"));
+    assert!(!manual.contains("newer work"));
+
+    // Unknown ids and malformed lookups resolve to None.
+    assert!(render_handoff("no-such-session").is_none());
+}
+
+/// Manual selection cannot regress automatic boot injection: calling the picker
+/// listing or a specific render leaves the default latest-for-project intact.
+#[test]
+fn manual_render_does_not_disturb_auto_inject() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let home = env._home.path();
+    let cwd = home.join("project");
+    std::fs::create_dir_all(&cwd).ok();
+
+    let snapshot = fixture("auto-target", &project_key(Some(&cwd)).unwrap());
+    write_snapshot(&snapshot).unwrap();
+
+    // Exercise the picker + a manual render; then confirm auto behavior is
+    // unchanged and still points at the same latest snapshot.
+    let _listing = list_saved_handoffs();
+    let _manual = render_handoff("auto-target");
+
+    assert_eq!(
+        latest_handoff_for_project(Some(&cwd)).as_deref(),
+        Some("auto-target")
+    );
+    let boot = render_boot_context(Some(&cwd)).expect("auto context present");
+    assert!(boot.contains("[Handoff from previous session]"));
+}
+
+/// list_all_handoffs surfaces archived snapshots that are no longer the latest
+/// for their project (so absent from the index), newest first.
+#[test]
+fn list_all_handoffs_includes_archived_and_is_newest_first() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let home = env._home.path();
+    let cwd = home.join("project");
+    std::fs::create_dir_all(&cwd).ok();
+
+    let mut older = fixture("older", &project_key(Some(&cwd)).unwrap());
+    older.ended_at = Utc::now() - chrono::Duration::hours(2);
+    write_snapshot(&older).unwrap();
+    let mut newer = fixture("newer", &project_key(Some(&cwd)).unwrap());
+    newer.ended_at = Utc::now() - chrono::Duration::hours(1);
+    write_snapshot(&newer).unwrap();
+    // A snapshot from a different project, to confirm cross-project coverage.
+    let other = fixture("other-proj", "git:https://example.com/other.git");
+    write_snapshot(&other).unwrap();
+
+    // The index only keeps the latest per project.
+    let indexed = list_saved_handoffs();
+    let indexed_ids: Vec<&str> = indexed.iter().map(|e| e.session_id.as_str()).collect();
+    assert!(indexed_ids.contains(&"newer"), "index has newer");
+    assert!(!indexed_ids.contains(&"older"), "index drops archived older");
+
+    // list_all_handoffs sees every snapshot, newest first.
+    let all = list_all_handoffs();
+    let all_ids: Vec<&str> = all.iter().map(|s| s.session_id.as_str()).collect();
+    assert_eq!(
+        all_ids,
+        vec!["other-proj", "newer", "older"],
+        "all snapshots surfaced newest first"
+    );
+}
