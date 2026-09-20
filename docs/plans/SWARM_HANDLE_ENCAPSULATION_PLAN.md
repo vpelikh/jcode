@@ -4,9 +4,11 @@ Status: Plan for the Tier 3 "true encapsulation" follow-up flagged by
 `SERVER_SERVICE_SPLIT_PLAN.md`. Tier 1 (mechanical convergence onto
 `&SwarmServiceHandle`) is landed; this documents how to *close* the split by
 privatizing the handle's fields so all mutations must go through handle
-methods. **All seven slices are landed (2026-09);** the done criteria below are
-met except the optional stricter `SwarmState` sub-field privatization (see
-`swarm_state` slice note).
+methods. **All seven slices are delivered (2026-09); the field boundary is
+closed, but the "all mutations route through handle methods" done-criterion is
+only partially met — the entangled orchestration mutations remain (see the
+Done criteria status block).** The optional stricter `SwarmState` sub-field
+privatization is also out of scope (see the `swarm_state` slice note).
 
 Scope: `crates/jcode-app-core/src/server/services/swarm.rs` +
 `crates/jcode-app-core/src/server/**`.
@@ -103,9 +105,10 @@ API the handle wraps). Instead:
    cover most mutations), then plans/coordinators/swarms_by_id.
    *(landed 2026-09)* The handle's `swarm_state` field is private behind a
    `swarm_state()` read-only accessor; ~167 direct `swarm.swarm_state.<map>`
-   accesses across 23 files route through it. Live-path mutations already went
-   through handle methods (no functional write accesses remained after
-   convergence), so this closes the handle boundary. The `SwarmState` struct's
+   accesses across 23 files route through it. Note: the single-purpose
+   teardown/rename/registration mutations now route through the handle, while
+   the entangled orchestration mutations still touch the maps in place through
+   the accessor (see the Done criteria status block). The `SwarmState` struct's
    own four maps stay `pub` (state.rs remains the domain API the handle wraps,
    per non-goals); a stricter future boundary could snapshot-ify or further
    private the sub-fields, out of scope here.
@@ -150,28 +153,32 @@ API the handle wraps). Instead:
 `swarm.channel_subscriptions{,_by_session}` and the two runtime handles are
 private; zero non-`services/swarm.rs` code reaches them; all mutations go
 through handle methods; suite green + clippy clean.
-**Achieved (partial).** Every named handle field is private and cross-module
-code reaches them only through documented read accessors. The single-purpose
-teardown/rename mutations are routed through handle methods
-(`remove_session_member` / `take_session_membership`, `rename_member_session`
-now also rewrites coordinators, resume/detached cleanup), and all four
-member-removal write sites in the session lifecycle funnel through the handle.
-`debug_swarm_write` / persistence-test code is a documented privileged
-observer. `Server.swarm_state` (the handle's constructor source) remains a pub
-field, out of scope.
-
-**Known remaining boundary (honest):** the deeper live orchestration (subscribe
-`working-dir`/swarm-id rebind in `handle_set_feature` or `handle_detach`,
-plus several plan/coordinator writes in `comm_graph`, `comm_session`,
-`comm_control`, `comm_plan`, `comm_sync`, `client_actions`, `headless`, and
-`background_tasks`) still mutate the swarm maps in place *after* borrowing them
-through the accessor. These are the plan's "risk concentration": their
-mutations are interleaved with persistence, event emission, broadcasting, and
-coordinator re-election, so pulling them into the handle requires keeping the
-borrow order identical. Not done in this pass; follow-up slices should route
-each onto a handle method/reconstructed `SwarmState` argument. Field-level
-encapsulation (the tier's core) is complete; mutation routing is the remaining
-part of "all mutations go through handle methods".
+**Status: field boundary MET, mutation funnel PARTIALLY met.**
+- **Field boundary (met):** every named handle field is private; zero
+  non-`services/swarm.rs` code references the raw fields — cross-module access
+  goes through documented read accessors.
+- **Single-purpose mutations (met):** teardown/rename/registration route
+  through handle methods — `remove_session_member` / `take_session_membership`,
+  `rename_member_session` (also rewrites coordinators), resume/detached cleanup,
+  and `register_headless_member` (headless registration).
+- **Remaining (not met):** "all mutations go through handle methods" does not
+  hold — the entangled orchestration in `comm_graph`, `comm_session`,
+  `comm_control`, `comm_plan`, `comm_sync`, `client_actions`, `background_tasks`
+  still mutates `members` / `swarms_by_id` / `plans.participants` / `coordinators`
+  in place *after* borrowing them through the accessor (~25 write sites
+  measured 2026-09). These are the plan's "risk concentration": the writes are
+  interleaved with plan/task mutations, persistence, coordinator re-election,
+  and subscriber fan-out (e.g. `plan.participants.insert` is always paired with
+  a `version += 1` / task-progress update and a `participants.clone()` fan-out
+  inside the same `plans.write()` scope), so leaf extraction would hold the very
+  lock it itself takes (deadlock risk) or split logical mutations. Routing these
+  is out of scope for this pass; follow-up slices should pull each *whole
+  transaction* (map write + its interleaved fields + fan-out) onto a handle
+  method keeping borrow order identical.
+- `debug_swarm_write` / persistence-test code is a documented privileged
+  observer. `Server.swarm_state` (the handle's constructor source) is pub, out
+  of scope. Full app-core lib suite green (1542), clippy clean on changed
+  files.
 
 ## Review notes (2026-09)
 
@@ -193,10 +200,11 @@ part of "all mutations go through handle methods".
 - **Direct unit tests for the Tier-3 handle methods (added 2026-09).** The
   earlier review pass noted the new handle methods were only covered
   transitively via callers. `services/swarm.rs` now carries a dedicated
-  `#[cfg(test)] mod tests` with six tests locking the behavior of
-  `set_shared_context` (plain upsert, created_at preservation, append
-  semantics), `get_shared_context` / `remove_shared_context` /
-  `shared_context_entries`, `subscribe_session_to_channel` /
-  `unsubscribe_session_from_channel` (both forward and reverse indexes), and
-  `read_event_sources` (seeded sinks round-trip). Added 6 tests; suite 1494
-  green, clippy clean.
+  `#[cfg(test)] mod tests` locking the behavior of `set_shared_context`
+  (plain upsert, created_at preservation, append semantics),
+  `get_shared_context` / `remove_shared_context` / `shared_context_entries`,
+  `subscribe_session_to_channel` / `unsubscribe_session_from_channel` (both
+  forward and reverse indexes), `read_event_sources` (seeded sinks
+  round-trip), the runtime accessors, the file-touch accessor,
+  `remove_session_member`, `rename_member_session` (coordinator rewrite), and
+  `register_headless_member`. Suite green (1542), clippy clean.
