@@ -511,6 +511,22 @@ impl Session {
             // dropped, so persist it even without a visible conversation line.
             || !self.replay_events.is_empty()
             || !self.memory_injections.is_empty()
+            // Log-only event-log signals (plugin `Unknown` escape-hatch events,
+            // bare compaction-bracket markers) carry durable meaning even when
+            // they are not accompanied by a message/compaction/configured state.
+            // Unlike a blanket `!event_map.is_empty()`, this deliberately
+            // EXCLUDES the placeholder session-context AppendMessage event (and
+            // every ordinary message event), so the untouched-panel lazy-save
+            // gate still holds: a fresh session whose only event is the auto-added
+            // context stub is still skipped until a real conversation starts.
+            || self.event_map.events.iter().any(|e| {
+                matches!(
+                    e.op,
+                    SessionEventOp::Unknown { .. }
+                        | SessionEventOp::CompactionStart { .. }
+                        | SessionEventOp::CompactionEnd { .. }
+                )
+            })
             // An actively-run session (a PID marker was registered via
             // `mark_active`/`mark_active_with_pid`) must persist even before a
             // conversation message exists so restart/crash recovery can find it.
