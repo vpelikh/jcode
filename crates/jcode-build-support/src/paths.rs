@@ -185,7 +185,21 @@ fn selfdev_build_command_for_target_on_platform(
     };
     let specs = match target {
         SelfDevBuildTarget::Tui => vec![("jcode", "jcode")],
-        SelfDevBuildTarget::All | SelfDevBuildTarget::Auto => vec![("jcode", "jcode")],
+        // desktop2 launches the harness API bridge as a sibling executable.
+        // Building only the app leaves a fresh target directory unable to
+        // start its runtime because the bridge is neither beside it nor on
+        // PATH.
+        SelfDevBuildTarget::Desktop2 => vec![
+            ("jcode-desktop2", "jcode-desktop2"),
+            ("jcode-harness-api-server", "jcode-harness-api-bridge"),
+        ],
+        SelfDevBuildTarget::All | SelfDevBuildTarget::Auto => {
+            vec![
+                ("jcode", "jcode"),
+                ("jcode-desktop2", "jcode-desktop2"),
+                ("jcode-harness-api-server", "jcode-harness-api-bridge"),
+            ]
+        }
     };
     let wrapper = repo_dir.join("scripts").join("dev_cargo.sh");
     // `bash` on Windows may resolve to WSL, which cannot use the native Rust
@@ -202,7 +216,11 @@ fn selfdev_build_command_for_target_on_platform(
                     SELFDEV_CARGO_PROFILE,
                     package,
                     binary,
-                    ""
+                    if *package == "jcode-desktop2" {
+                        " --lib"
+                    } else {
+                        ""
+                    }
                 )
             })
             .collect::<Vec<_>>()
@@ -243,6 +261,9 @@ fn cargo_build_args(specs: &[(&str, &str)]) -> Vec<String> {
             "--bin".to_string(),
             (*binary).to_string(),
         ]);
+        if *package == "jcode-desktop2" {
+            args.push("--lib".to_string());
+        }
     }
     args
 }
@@ -253,7 +274,15 @@ fn display_build_command(program: &str, specs: &[(&str, &str)]) -> String {
         .map(|(package, binary)| {
             format!(
                 "{} build --profile {} -p {} --bin {}{}",
-                program, SELFDEV_CARGO_PROFILE, package, binary, ""
+                program,
+                SELFDEV_CARGO_PROFILE,
+                package,
+                binary,
+                if *package == "jcode-desktop2" {
+                    " --lib"
+                } else {
+                    ""
+                }
             )
         })
         .collect::<Vec<_>>()
@@ -289,14 +318,28 @@ fn porcelain_path(line: &str) -> String {
 /// routing is testable: getting this wrong means `selfdev build` silently
 /// builds the wrong binary and a reload appears to do nothing.
 fn build_target_for_paths<'a>(paths: impl Iterator<Item = &'a str>) -> SelfDevBuildTarget {
+    let mut desktop2 = false;
+    let mut other = false;
     for path in paths {
         let path = path.trim();
         if path.is_empty() {
             continue;
         }
-        return SelfDevBuildTarget::Tui;
+        if path == "Cargo.toml" || path == "Cargo.lock" || path.starts_with(".cargo/") {
+            // Workspace-wide changes can affect every binary.
+            desktop2 = true;
+            other = true;
+        } else if path.starts_with("crates/jcode-desktop2/") {
+            desktop2 = true;
+        } else {
+            other = true;
+        }
     }
-    SelfDevBuildTarget::Tui
+    match (desktop2, other) {
+        (true, false) => SelfDevBuildTarget::Desktop2,
+        (false, _) => SelfDevBuildTarget::Tui,
+        _ => SelfDevBuildTarget::All,
+    }
 }
 
 fn shell_escape(value: &str) -> String {
@@ -657,7 +700,18 @@ mod tests {
         let repo = repo_fixture(false);
         let cases = [
             (SelfDevBuildTarget::Tui, vec!["-p jcode "]),
-            (SelfDevBuildTarget::All, vec!["-p jcode "]),
+            (
+                SelfDevBuildTarget::Desktop2,
+                vec!["-p jcode-desktop2 ", "--bin jcode-harness-api-bridge"],
+            ),
+            (
+                SelfDevBuildTarget::All,
+                vec![
+                    "-p jcode ",
+                    "-p jcode-desktop2 ",
+                    "--bin jcode-harness-api-bridge",
+                ],
+            ),
         ];
         for (target, expected) in cases {
             let command = selfdev_build_command_for_target(repo.path(), target);
@@ -670,6 +724,17 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A single-target build must not drag in the other binaries: building the
+    /// desktop app when only the TUI changed wastes minutes.
+    #[test]
+    fn single_targets_do_not_build_other_binaries() {
+        let repo = repo_fixture(false);
+        let tui = selfdev_build_command_for_target(repo.path(), SelfDevBuildTarget::Tui);
+        assert!(!tui.display.contains("jcode-desktop"));
+        let desktop2 = selfdev_build_command_for_target(repo.path(), SelfDevBuildTarget::Desktop2);
+        assert!(!desktop2.display.contains("-p jcode "));
     }
 
     #[test]
@@ -728,7 +793,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_cargo_args_build_the_tui_for_all() {
+    fn windows_cargo_args_build_every_requested_target() {
         let repo = repo_fixture(false);
         let command = selfdev_build_command_for_target_on_platform(
             repo.path(),
@@ -746,19 +811,38 @@ mod tests {
                 "jcode",
                 "--bin",
                 "jcode",
+                "-p",
+                "jcode-desktop2",
+                "--bin",
+                "jcode-desktop2",
+                "--lib",
+                "-p",
+                "jcode-harness-api-server",
+                "--bin",
+                "jcode-harness-api-bridge",
             ]
         );
     }
 
-    /// `auto` routes every repository change to the remaining TUI binary.
+    /// `auto` must route a change to the binary that contains it. Before
+    /// desktop2 was added here, editing it built the TUI instead.
     #[test]
     fn auto_routes_changed_paths_to_the_right_binary() {
         let cases: Vec<(Vec<&str>, SelfDevBuildTarget)> = vec![
             (vec![], SelfDevBuildTarget::Tui),
             (vec!["src/main.rs"], SelfDevBuildTarget::Tui),
             (vec!["crates/jcode-tui/src/lib.rs"], SelfDevBuildTarget::Tui),
-            (vec!["Cargo.toml"], SelfDevBuildTarget::Tui),
-            (vec!["Cargo.lock"], SelfDevBuildTarget::Tui),
+            (
+                vec!["crates/jcode-desktop2/src/main.rs"],
+                SelfDevBuildTarget::Desktop2,
+            ),
+            (
+                vec!["crates/jcode-desktop2/src/editor.rs", "src/main.rs"],
+                SelfDevBuildTarget::All,
+            ),
+            // Workspace manifests can affect everything.
+            (vec!["Cargo.toml"], SelfDevBuildTarget::All),
+            (vec!["Cargo.lock"], SelfDevBuildTarget::All),
         ];
         for (paths, expected) in cases {
             assert_eq!(
@@ -786,6 +870,9 @@ mod tests {
     fn build_targets_parse_from_their_names() {
         for (name, expected) in [
             ("tui", SelfDevBuildTarget::Tui),
+            ("desktop2", SelfDevBuildTarget::Desktop2),
+            ("desktop", SelfDevBuildTarget::Desktop2),
+            ("jcode-desktop2", SelfDevBuildTarget::Desktop2),
             ("all", SelfDevBuildTarget::All),
             ("auto", SelfDevBuildTarget::Auto),
         ] {
@@ -793,12 +880,6 @@ mod tests {
                 SelfDevBuildTarget::parse(Some(name)).expect("parse"),
                 expected,
                 "target name `{name}` parsed wrong"
-            );
-        }
-        for removed in ["desktop", "desktop2", "jcode-desktop2"] {
-            assert!(
-                SelfDevBuildTarget::parse(Some(removed)).is_err(),
-                "removed target `{removed}` must not remain available"
             );
         }
         assert!(SelfDevBuildTarget::parse(Some("nonsense")).is_err());
