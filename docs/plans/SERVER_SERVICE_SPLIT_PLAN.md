@@ -500,9 +500,11 @@ swarm-domain argument bag, and the membership operations have moved onto
 Debug now routes all of its swarm-state interaction through the
 `SwarmServiceHandle`: `debug_swarm_read`, `debug_server_state` (and its two
 memory helpers), and `debug_swarm_write` (via `DebugSwarmWriteContext`). Seam E
-(debug consumes swarm state through the service, not raw maps) is complete. The
-remaining work is the ownership-move slices still pending (`monitor_bus` to
-service APIs).
+(debug consumes swarm state through the service, not raw maps) is complete.
+`monitor_bus` (Seam D) now takes the `SwarmServiceHandle` for its swarm-domain
+state, keeping only session-scoped state as parameters. The remaining swarm
+state-routing work is incremental forwarding-surface reduction (some session
+functions still call swarm-domain free functions via handle-bound locals).
 
 ---
 
