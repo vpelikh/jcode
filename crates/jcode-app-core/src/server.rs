@@ -1402,9 +1402,6 @@ impl Server {
         let monitor_file_touch = self.file_touch.clone();
         let monitor_swarm_members = Arc::clone(&self.swarm_state.members);
         let monitor_swarms_by_id = Arc::clone(&self.swarm_state.swarms_by_id);
-        let monitor_swarm_plans = Arc::clone(&self.swarm_state.plans);
-        let monitor_swarm_coordinators = Arc::clone(&self.swarm_state.coordinators);
-        let monitor_shared_context = Arc::clone(&self.shared_context);
         let monitor_sessions = Arc::clone(&self.sessions);
         let monitor_soft_interrupt_queues = Arc::clone(&self.soft_interrupt_queues);
         let monitor_event_history = Arc::clone(&self.event_history);
@@ -1415,9 +1412,6 @@ impl Server {
                 monitor_file_touch,
                 monitor_swarm_members,
                 monitor_swarms_by_id,
-                monitor_swarm_plans,
-                monitor_swarm_coordinators,
-                monitor_shared_context,
                 monitor_sessions,
                 monitor_soft_interrupt_queues,
                 monitor_event_history,
@@ -2027,9 +2021,6 @@ impl Server {
         file_touch: FileTouchService,
         swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>>,
         swarms_by_id: Arc<RwLock<HashMap<String, HashSet<String>>>>,
-        _swarm_plans: Arc<RwLock<HashMap<String, VersionedPlan>>>,
-        _swarm_coordinators: Arc<RwLock<HashMap<String, String>>>,
-        _shared_context: Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
         sessions: Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>,
         soft_interrupt_queues: SessionInterruptQueues,
         event_history: Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
