@@ -1425,9 +1425,21 @@ fn onboarding_banner_renders_prompt_and_both_action_rows() {
         review_x < 50,
         "suggested prompt should span the visual center: {lines:#?}"
     );
+    // The blank-session action stays secondary in the bottom-right. It is
+    // right-aligned, so its right edge hugs the buffer's right edge; assert on
+    // that edge rather than a fixed `start_x` (which drifted when e90512dd6
+    // lengthened the label from "Start a new session" to "Start in the
+    // current directory" and pushed the text's left column left).
+    // start_x/slicing are byte offsets (the row mixes ASCII and multi-byte
+    // box glyphs), so convert to display columns (chars) to measure margins.
+    let start_col = lines[start_y][..start_x].chars().count();
+    let start_box = lines[start_y][start_x..].trim_end();
+    let start_right = start_col + start_box.chars().count();
+    let right_margin = buffer.area.width as usize - start_right;
     assert!(
-        start_y >= buffer.area.height as usize - 3 && start_x >= 95,
-        "blank-session action should stay secondary in the bottom-right: {lines:#?}"
+        start_y >= buffer.area.height as usize - 3 && right_margin <= 3,
+        "blank-session action should stay secondary in the bottom-right \
+         (start_y={start_y} right_margin={right_margin}): {lines:#?}"
     );
 }
 

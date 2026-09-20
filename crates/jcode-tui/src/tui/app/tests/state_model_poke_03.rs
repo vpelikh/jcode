@@ -2609,6 +2609,7 @@ fn test_finish_turn_auto_poke_queues_confidence_summary_when_todos_done() {
                 feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
                 feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::MainPaths),
                 feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
+                trade_off: Some(crate::todo::TradeOffState::SomeConsidered),
                 ..Default::default()
             }],
         )
@@ -2626,9 +2627,9 @@ fn test_finish_turn_auto_poke_queues_confidence_summary_when_todos_done() {
         assert!(super::commands::is_poke_message(summary));
         assert!(super::commands::is_todo_confidence_summary_message(summary));
         assert!(summary.starts_with(crate::todo::TODO_COMPLETION_CONTINUATION_MESSAGE));
-        // The continuation self-identifies as an automated follow-up so the model
-        // does not mistake it for a user message, but never discloses private
-        // calibration details.
+        // The continuation self-identifies as an automated follow-up ([auto],
+        // post-79de395cb) so the model does not mistake it for a user message,
+        // but never discloses private calibration details.
         assert!(summary.starts_with("[auto]"));
         assert!(!summary.to_ascii_lowercase().contains("threshold"));
         // The model is told exactly which completed todos to recheck.
@@ -2772,6 +2773,7 @@ fn test_finish_turn_challenges_confidence_spike_once() {
                 feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
                 feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::MainPaths),
                 feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
+                trade_off: Some(crate::todo::TradeOffState::SomeConsidered),
                 ..Default::default()
             }],
         )
