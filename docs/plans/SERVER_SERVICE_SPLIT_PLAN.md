@@ -35,6 +35,14 @@ reduce argument fanout **without changing the single-process runtime model**.
 > `client_comm_message`) now route through `SessionServiceHandle::
 > queue_soft_interrupt`. The Tier 3 field-privatization pass is complete: every
 > `SwarmServiceHandle` field is now private (see the landed-slice sections below).
+> The Tier 3 follow-up is underway: the shared swarm-access guards
+> (`member_swarm_id`/`member_swarm_ids`, `can_read_full_context`,
+> `ensure_same_swarm_access`, `require_coordinator_swarm`,
+> `require_plan_driver_swarm`, `coordinator_identity`) now live on the handle, and
+> the standalone debug swarm mutations (`clear_coordinator`, `clear_plan`) and the
+> debug approve/reject coordinator checks route through it too; the remaining
+> deep `comm_graph` / `comm_session` / `comm_await` / `comm_sync` resync /
+> session-lifecycle `.swarm_state()` sites are deferred dedicated slices.
 > This summary describes the problems the split set out to solve and the current
 > state.
 

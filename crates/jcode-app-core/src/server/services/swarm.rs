@@ -929,6 +929,14 @@ impl SwarmServiceHandle {
     /// participant. Returns `Some(swarm_id)` on success, else sends the
     /// permission error and returns `None`. Mirrors the `require_plan_driver_swarm`
     /// guard used by the assign / task-control handlers.
+    ///
+    /// Light mode keeps the single-coordinator rule (matching the cheap fan-out
+    /// preset): only the coordinator is a driver. Deep mode follows the task-DAG
+    /// ownership model (see `docs/SWARM_TASK_GRAPH.md` section 2): the plan is a
+    /// tree of ownership, so the agent that seeded / participates in the graph
+    /// may dispatch it even when another session holds the swarm-level
+    /// coordinator slot — otherwise a deep-mode agent that joins a shared swarm
+    /// could seed a graph but then be blocked from spawning/assigning any of it.
     pub(crate) async fn require_plan_driver_swarm(
         &self,
         id: u64,

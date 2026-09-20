@@ -591,6 +591,7 @@ async fn handle_debug_graph_op(arg: &str, ctx: &DebugSwarmWriteContext<'_>) -> S
 mod tests {
     use super::*;
     use std::time::Duration;
+    use tokio::sync::mpsc;
 
     struct EnvGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
@@ -661,5 +662,124 @@ mod tests {
             .expect("command failed")
             .expect("command was not handled");
         assert!(response.contains("Coordinator cleared"));
+    }
+
+    fn debug_ctx_for<'a>(
+        session_id: &'a Arc<RwLock<String>>,
+        swarm: &'a SwarmServiceHandle,
+    ) -> DebugSwarmWriteContext<'a> {
+        DebugSwarmWriteContext { session_id, swarm }
+    }
+
+    #[tokio::test]
+    async fn approve_reject_plan_gates_on_coordinator_identity() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let _env = isolated_runtime(&dir);
+        let shared_context = Arc::new(RwLock::new(HashMap::new()));
+        let swarm = crate::server::test_util::TestSwarmBuilder::default()
+            .shared_context(Arc::clone(&shared_context))
+            .build();
+        // agent-1 becomes coordinator, agent-2 a plain member, in the same swarm.
+        swarm
+            .ensure_member(
+                "agent-1",
+                "conn-1",
+                Some("agent-1".to_string()),
+                None,
+                Some("swarm-A".to_string()),
+                true,
+                &mpsc::unbounded_channel().0,
+            )
+            .await;
+        swarm
+            .ensure_member(
+                "agent-2",
+                "conn-2",
+                Some("agent-2".to_string()),
+                None,
+                Some("swarm-A".to_string()),
+                true,
+                &mpsc::unbounded_channel().0,
+            )
+            .await;
+        swarm
+            .swarm_state()
+            .coordinators
+            .write()
+            .await
+            .insert("swarm-A".to_string(), "agent-1".to_string());
+
+        // A non-coordinator member cannot approve (goes through coordinator_identity).
+        let session_id = Arc::new(RwLock::new("agent-2".to_string()));
+        let ctx = debug_ctx_for(&session_id, &swarm);
+        let err = maybe_handle_swarm_write_command("swarm:approve_plan:agent-2 agent-1", &ctx)
+            .await
+            .expect_err("non-coordinator approve must be rejected");
+        assert!(
+            err.to_string().contains("Only the coordinator"),
+            "approve gate message, got: {err}"
+        );
+
+        // Reject is gated the same way.
+        let err = maybe_handle_swarm_write_command("swarm:reject_plan:agent-2 agent-1", &ctx)
+            .await
+            .expect_err("non-coordinator reject must be rejected");
+        assert!(
+            err.to_string().contains("Only the coordinator"),
+            "reject gate message, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn approve_plan_accepts_coordinator_and_merges_proposal() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let _env = isolated_runtime(&dir);
+        let proposal =
+            r#"[{"id":"task-1","content":"do the thing","status":"pending","priority":"high"}]"#;
+        let shared_context = Arc::new(RwLock::new(HashMap::from([(
+            "swarm-A".to_string(),
+            HashMap::from([(
+                "plan_proposal:agent-2".to_string(),
+                crate::server::SharedContext {
+                    key: "plan_proposal:agent-2".to_string(),
+                    value: proposal.to_string(),
+                    from_session: "agent-2".to_string(),
+                    from_name: Some("agent-2".to_string()),
+                    created_at: std::time::Instant::now(),
+                    updated_at: std::time::Instant::now(),
+                },
+            )]),
+        )])));
+        let swarm = crate::server::test_util::TestSwarmBuilder::default()
+            .shared_context(Arc::clone(&shared_context))
+            .build();
+        swarm
+            .ensure_member(
+                "agent-1",
+                "conn-1",
+                Some("agent-1".to_string()),
+                None,
+                Some("swarm-A".to_string()),
+                true,
+                &mpsc::unbounded_channel().0,
+            )
+            .await;
+        swarm
+            .swarm_state()
+            .coordinators
+            .write()
+            .await
+            .insert("swarm-A".to_string(), "agent-1".to_string());
+
+        let session_id = Arc::new(RwLock::new("agent-1".to_string()));
+        let ctx = debug_ctx_for(&session_id, &swarm);
+        let output = maybe_handle_swarm_write_command("swarm:approve_plan:agent-1 agent-2", &ctx)
+            .await
+            .expect("coordinator approve should succeed")
+            .expect("command should be handled");
+        assert!(
+            output.contains("\"approved\":true"),
+            "coordinator approve should merge the proposal, got: {output}"
+        );
     }
 }
