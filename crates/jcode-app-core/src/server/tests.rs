@@ -1,9 +1,10 @@
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
 
-use super::services::SessionServiceHandle;
+use super::services::{SessionServiceHandle, SwarmServiceHandle};
 use super::{
-    FileAccess, Server, SessionInterruptQueues, SwarmMember, dispatch_background_task_completion,
-    file_activity_scope_label, persist_swarm_state_snapshot, remove_session_entry,
+    AwaitMembersRuntime, FileAccess, FileTouchService, Server, SessionInterruptQueues, SwarmMember,
+    SwarmMutationRuntime, SwarmState, dispatch_background_task_completion, file_activity_scope_label,
+    persist_swarm_state_snapshot, remove_session_entry,
 };
 use crate::agent::Agent;
 use crate::bus::{
@@ -411,6 +412,36 @@ fn test_session_service_handle(
     }
 }
 
+/// A minimal swarm service handle for tests that exercise background-task /
+/// swarm-await delivery. The members map is shared so the code under test sees
+/// each test's seeded membership; the remaining state is inert defaults.
+#[allow(clippy::too_many_arguments)]
+fn test_swarm_service_handle(
+    swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>>,
+    swarms_by_id: Arc<RwLock<HashMap<String, std::collections::HashSet<String>>>>,
+    event_history: Arc<RwLock<std::collections::VecDeque<super::SwarmEvent>>>,
+    event_counter: Arc<std::sync::atomic::AtomicU64>,
+    swarm_event_tx: broadcast::Sender<super::SwarmEvent>,
+) -> SwarmServiceHandle {
+    SwarmServiceHandle {
+        swarm_state: SwarmState {
+            members: swarm_members,
+            swarms_by_id,
+            plans: Arc::new(RwLock::new(HashMap::new())),
+            coordinators: Arc::new(RwLock::new(HashMap::new())),
+        },
+        shared_context: Arc::new(RwLock::new(HashMap::new())),
+        file_touch: FileTouchService::new(),
+        channel_subscriptions: Arc::new(RwLock::new(HashMap::new())),
+        channel_subscriptions_by_session: Arc::new(RwLock::new(HashMap::new())),
+        event_history,
+        event_counter,
+        swarm_event_tx,
+        await_members_runtime: AwaitMembersRuntime::default(),
+        swarm_mutation_runtime: SwarmMutationRuntime::default(),
+    }
+}
+
 fn persisted_headless_member(
     session_id: &str,
     swarm_id: &str,
@@ -481,16 +512,14 @@ async fn background_task_wake_runs_live_session_immediately_when_idle() {
             Arc::clone(&sessions),
             Arc::clone(&soft_interrupt_queues),
         );
-    dispatch_background_task_completion(
-        &task,
-        &session_handle,
-        &swarm_members,
-        &swarms_by_id,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
-    )
-    .await;
+    let swarm_handle = test_swarm_service_handle(
+        Arc::clone(&swarm_members),
+        Arc::clone(&swarms_by_id),
+        Arc::clone(&event_history),
+        Arc::clone(&event_counter),
+        swarm_event_tx.clone(),
+    );
+    dispatch_background_task_completion(&task, &session_handle, &swarm_handle).await;
 
     let notification = timeout(Duration::from_secs(2), async {
         loop {
@@ -585,16 +614,14 @@ async fn external_background_task_wake_emits_request_without_starting_turn() {
             Arc::clone(&sessions),
             Arc::clone(&soft_interrupt_queues),
         );
-    dispatch_background_task_completion(
-        &task,
-        &session_handle,
-        &swarm_members,
-        &swarms_by_id,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
-    )
-    .await;
+    let swarm_handle = test_swarm_service_handle(
+        Arc::clone(&swarm_members),
+        Arc::clone(&swarms_by_id),
+        Arc::clone(&event_history),
+        Arc::clone(&event_counter),
+        swarm_event_tx.clone(),
+    );
+    dispatch_background_task_completion(&task, &session_handle, &swarm_handle).await;
 
     let event = timeout(Duration::from_secs(2), member_event_rx.recv())
         .await
@@ -872,16 +899,14 @@ async fn background_task_notify_without_wake_does_not_queue_soft_interrupt() {
             Arc::clone(&sessions),
             Arc::clone(&soft_interrupt_queues),
         );
-    dispatch_background_task_completion(
-        &task,
-        &session_handle,
-        &swarm_members,
-        &swarms_by_id,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
-    )
-    .await;
+    let swarm_handle = test_swarm_service_handle(
+        Arc::clone(&swarm_members),
+        Arc::clone(&swarms_by_id),
+        Arc::clone(&event_history),
+        Arc::clone(&event_counter),
+        swarm_event_tx.clone(),
+    );
+    dispatch_background_task_completion(&task, &session_handle, &swarm_handle).await;
 
     let notification = timeout(Duration::from_secs(2), member_event_rx.recv())
         .await
