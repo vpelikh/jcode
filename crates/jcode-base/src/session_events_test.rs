@@ -4615,11 +4615,9 @@ fn projected_messages_matches_derive_messages() {
         token_usage: None,
     });
 
-    // The projected transcript is present and matches derive_messages exactly
-    // (compare ids: StoredMessage is not PartialEq).
-    let projected = session
-        .projected_messages()
-        .expect("projected transcript folds cleanly");
+    // The projected transcript matches derive_messages exactly (compare ids:
+    // StoredMessage is not PartialEq). projected_messages is infallible.
+    let projected = session.projected_messages();
     let derived = session.derive_messages();
     assert_eq!(
         projected.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),

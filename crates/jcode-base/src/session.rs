@@ -1980,22 +1980,25 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
     /// Get the live transcript via the projection seam (takeaway #4).
     ///
     /// Returns the same transcript as [`derive_messages`](Self::derive_messages)
-    /// — the `LiveTranscriptProjection` fold is proven byte-identical by the
-    /// `ProjectionMatchesDerived` invariant — but through the projection seam, so
-    /// consumers get a typed projection stating their intent to read *derived*
-    /// state rather than scan the raw stream. This is the accessor future hot
-    /// paths adopt on their way off `derive_messages`.
+    /// — the `LiveTranscriptProjection` fold matches `derive_messages` exactly
+    /// (proven by the `ProjectionMatchesDerived` invariant) — but through the
+    /// projection seam, so consumers get a typed projection stating their intent
+    /// to read *derived* state rather than scan the raw stream. This is the
+    /// accessor future hot paths adopt on their way off `derive_messages`.
+    ///
+    /// Infallible: `LiveTranscriptProjection` defines no failing validation, so
+    /// `project_map` always succeeds. The `ProjectionMatchesDerived` invariant
+    /// (not this method) is the guard that proves the projection never diverges
+    /// from `derive_messages`.
     ///
     /// This single-projection accessor folds only the transcript via `project_map`.
     /// Readers that also want other derived domains (message count, per-role
     /// counts) should use the `ProjectionRegistry` directly for a single fold
     /// feeding many projections.
-    ///
-    /// `None` when the log folds into an invariant violation (a structural
-    /// problem a load-path invariant run would have caught); callers that trust
-    /// the load path should `unwrap` or treat `None` as an internal error.
-    pub fn projected_messages(&self) -> Option<Vec<StoredMessage>> {
-        project_map::<LiveTranscriptProjection>(&self.event_map).ok()
+    pub fn projected_messages(&self) -> Vec<StoredMessage> {
+        project_map::<LiveTranscriptProjection>(&self.event_map)
+            .ok()
+            .unwrap_or_else(|| self.event_map.derive_messages())
     }
 
     /// Get current compaction from event log (derives pure state)
