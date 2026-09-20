@@ -1510,6 +1510,62 @@ fn test_replace_messages_clamps_out_of_range_bounds() {
 }
 
 #[test]
+fn test_replace_messages_reversed_bounds_do_not_panic() {
+    // Regression: a ReplaceMessages whose `start_index > end_index` (reversed
+    // span) must not panic inside `Vec::splice` during replay. The event log is
+    // corruption-tolerant by design, so a malformed event must degrade to a no-op
+    // rather than crash `derive_messages`. (Producers never emit reversed bounds
+    // through the current API; this guards the replay path against a bad event.)
+    use crate::session::event_types::SessionEventMap;
+
+    let mk = |id: &str| StoredMessage {
+        id: id.to_string(),
+        role: Role::User,
+        content: vec![text_block(id)],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    };
+    let mut map = SessionEventMap::default();
+    for id in ["a", "b", "c"] {
+        map.append_event(SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: format!("append_{}", id),
+            op: SessionEventOp::AppendMessage {
+                message_id: id.to_string(),
+                message: mk(id),
+            },
+            parent_id: None,
+            version: 1,
+        });
+    }
+    // Reversed span: start_index 2 > end_index 1.
+    map.append_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "reversed".into(),
+        op: SessionEventOp::ReplaceMessages {
+            start_index: 2,
+            end_index: 1,
+            messages: vec![mk("X")],
+        },
+        parent_id: None,
+        version: 1,
+    });
+    // Must not panic; the reversed span degrades to a point-insertion at `start`
+    // (end is clamped up to start, matching equal-bounds semantics), never a
+    // crash. This keeps replay corruption-tolerant.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| map.derive_messages()));
+    let messages = result.expect("derive_messages must not panic on reversed bounds");
+    let ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
+    assert_eq!(
+        ids,
+        vec!["a", "b", "X", "c"],
+        "reversed span degrades to an insertion at start (no panic)"
+    );
+}
+
+#[test]
 fn test_memory_injection_and_replay_event_derived_order_matches_legacy() {
     // Round B: at the public Session API boundary, derived memory injections and
     // replay events must come back in the same submission order as the legacy
@@ -2035,6 +2091,37 @@ fn test_compact_transcript_with_bracket_produces_balanced_durable_bracket() {
     assert_eq!(back.compaction.as_ref().map(|c| &c.summary_text), Some(&"summarized".to_string()));
     back.rederive_all_checked()
         .expect("reloaded bracket producer log must stay consistent");
+}
+
+/// An `Unknown` event constructed in-memory with a **non-object** `data` payload
+/// (e.g. `data: json!(123)`) must serialize to exactly one top-level `op` key.
+/// Regression for a bug where the non-object branch emitted `op` inside the
+/// match *and* again after it, producing invalid JSON with duplicate keys:
+/// `{"op":"x","data":123,"op":"x"}`. The serialized form is also shape-stable
+/// after the first round-trip (a scalar becomes the object-wrapped form, matching
+/// the on-wire shape, and stays stable on subsequent round-trips).
+#[test]
+fn test_unknown_op_in_memory_non_object_serializes_single_op() {
+    let op = SessionEventOp::Unknown {
+        event_type: "plugin_scalar".to_string(),
+        data: serde_json::json!(123),
+    };
+    // The RAW serialized string must contain exactly one `op` key (no duplicates).
+    let json = serde_json::to_string(&op).expect("serialize in-memory non-object");
+    let raw_op_count = json.matches("\"op\":").count();
+    assert_eq!(
+        raw_op_count,
+        1,
+        "in-memory non-object Unknown must serialize exactly one op key; got: {json}"
+    );
+    // The round-trip must be stable: after the first deserialize the value settles
+    // into the object-wrapped wire form and stays unchanged on further round-trips.
+    let back: SessionEventOp = serde_json::from_str(&json).expect("deserialize");
+    let json2 = serde_json::to_string(&back).expect("re-serialize");
+    let again: SessionEventOp = serde_json::from_str(&json2).expect("re-deserialize");
+    let json3 = serde_json::to_string(&again).expect("re-serialize 2");
+    assert_eq!(json2, json3, "shape must stabilize after first round-trip");
+    assert_eq!(json2.matches("\"op\":").count(), 1);
 }
 
 /// The `Unknown` escape hatch must round-trip **stably** even when the remaining
