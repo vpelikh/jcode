@@ -1851,6 +1851,7 @@ fn command_palette_open_does_not_move_existing_rows() {
 ///   - the caret is shown again (`ESC[?25h`) with a set cursor position.
 #[test]
 fn scroll_repaint_hides_cursor_before_cell_moves_via_draw_core() {
+    use regex::Regex;
     let mut app = create_test_app();
     app.force_full_repaint = true; // the exact flag scroll_up/scroll_down set
 
@@ -1866,20 +1867,23 @@ fn scroll_repaint_hides_cursor_before_cell_moves_via_draw_core() {
         String::from_utf8_lossy(&output).into_owned()
     };
 
+    // A cell `MoveTo` is `ESC[<row>;<col>H`. Match that exact pattern rather than
+    // the first bare `H` (which could also hit an unrelated CSI command), so the
+    // ordering assertion is precise: the cursor `Hide` must come before any move.
     let hide = "\u{1b}[?25l";
-    assert!(
-        stream.contains('H'),
-        "SoftRepaint must actually emit cell moves; got: {stream:?}"
-    );
+    let move_re = Regex::new(r"\x1b\[[0-9]+;[0-9]+H").expect("static move-regex");
+    let first_moveto = move_re
+        .find(&stream)
+        .expect("SoftRepaint must emit a cell MoveTo");
     assert!(
         stream.contains(hide),
         "scroll-triggered repaint must hide the cursor for the diff flush; got: {stream:?}"
     );
     let hide_at = stream.find(hide).expect("hide present");
-    let first_moveto = stream.find('H').expect("move present");
     assert!(
-        hide_at <= first_moveto,
-        "Hide must precede the first MoveTo; hide@{hide_at} move@{first_moveto}"
+        hide_at <= first_moveto.start(),
+        "Hide must precede the first MoveTo; hide@{hide_at} move@{}",
+        first_moveto.start()
     );
     assert!(
         stream.contains("\u{1b}[?25h"),
