@@ -1252,10 +1252,23 @@ pub(in crate::tui::app) fn handle_server_event(
             completed_current_message || auto_poked
         }
         ServerEvent::Error {
+            id,
             message,
             retry_after_secs,
             ..
         } => {
+            // A handoff_resume_by_id rejection: the server did not arm the
+            // override (unknown or blank id), so the live conversation was left
+            // untouched. Resolve the pending ack with a real failure instead of
+            // letting it linger with an optimistic "Handoff ready".
+            if app.take_pending_handoff_ack(id).is_some() {
+                app.push_display_message(DisplayMessage::error(format!(
+                    "Failed to apply handoff resume: {}",
+                    message
+                )));
+                app.set_status_notice("Handoff not applied");
+                return false;
+            }
             // The server rejects a Message request with this error while its
             // previous turn is still running. This typically happens when a
             // reload/reconnect raced the turn-end dispatch: the history
@@ -3043,6 +3056,19 @@ pub(in crate::tui::app) fn handle_server_event(
                     "Handoff adopted on this server: {session_id}"
                 )));
                 app.set_status_notice("Handoff imported");
+            }
+            false
+        }
+        ServerEvent::HandoffResumed { id, session_id } => {
+            // Only surface "Handoff ready" for the handoff we are actually
+            // awaiting (the in-flight request this reply acknowledges). A
+            // stray/unrelated `HandoffResumed` is ignored.
+            if let Some(pending) = app.take_pending_handoff_ack(id) {
+                app.push_display_message(DisplayMessage::system(format!(
+                    "Handoff ready: {}\n{}",
+                    session_id, pending.preview_line
+                )));
+                app.set_status_notice("Handoff selected");
             }
             false
         }

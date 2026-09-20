@@ -48,8 +48,10 @@ const LEDGER: &[(&str, Disposition)] = &[
     ("GetCompactedHistory", ClientInternal),
     ("GetHistory", Covered),
     ("GetModelCatalog", Covered),
+    ("HandoffApply", ClientInternal),
     ("HandoffImport", ClientInternal),
     ("HandoffList", ClientInternal),
+    ("HandoffResumeById", ClientInternal),
     ("HeadlessReview", Gap("a client cannot trigger a headless code review without the TUI")),
     // Create/attach session bootstrap requests state through the API bridge.
     ("GetState", Covered),

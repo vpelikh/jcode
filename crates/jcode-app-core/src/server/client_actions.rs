@@ -3,15 +3,14 @@
 use super::client_lifecycle::process_message_streaming_mpsc;
 use super::services::{SessionServiceHandle, SwarmServiceHandle};
 use super::{
-    ClientConnectionInfo, SwarmState, fanout_session_event, persist_swarm_state_for,
-    swarm_id_for_session, truncate_detail,
+    ClientConnectionInfo, fanout_session_event, truncate_detail,
 };
 use crate::agent::Agent;
 use crate::protocol::{FeatureToggle, NotificationType, ServerEvent};
 use crate::session::Session;
 use crate::util::truncate_str;
 use jcode_agent_runtime::{SoftInterruptSource, StreamError};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Instant;
@@ -382,13 +381,6 @@ pub(super) async fn handle_set_feature(
     swarm: &SwarmServiceHandle,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
-    // Swarm-domain state is reached through the swarm service handle. These
-    // locals keep the body single-homed on the handle's fields instead of a
-    // flat pass-through argument bag (server service split, Slice 4).
-    let swarm_members = &swarm.swarm_state().members;
-    let swarms_by_id = &swarm.swarm_state().swarms_by_id;
-    let swarm_coordinators = &swarm.swarm_state().coordinators;
-    let swarm_plans = &swarm.swarm_state().plans;
     match feature {
         FeatureToggle::Memory => {
             let mut agent_guard = agent.lock().await;
@@ -447,68 +439,9 @@ pub(super) async fn handle_set_feature(
                 return;
             }
             *swarm_enabled = enabled;
-
-            let (old_swarm_id, working_dir) = {
-                let mut members = swarm_members.write().await;
-                if let Some(member) = members.get_mut(client_session_id) {
-                    let old = member.swarm_id.clone();
-                    let wd = member.working_dir.clone();
-                    member.swarm_enabled = enabled;
-                    if !enabled {
-                        member.swarm_id = None;
-                        member.role = "agent".to_string();
-                    }
-                    (old, wd)
-                } else {
-                    (None, None)
-                }
-            };
-
-            if let Some(ref old_id) = old_swarm_id {
-                swarm.remove_session_from_swarm(client_session_id, old_id).await;
-                swarm.remove_session_channel_subscriptions(client_session_id).await;
-            }
-
-            if enabled {
-                let _ = working_dir;
-                let new_swarm_id = swarm_id_for_session(client_session_id);
-                if let Some(ref id) = new_swarm_id {
-                    {
-                        let mut swarms = swarms_by_id.write().await;
-                        swarms
-                            .entry(id.clone())
-                            .or_insert_with(HashSet::new)
-                            .insert(client_session_id.to_string());
-                    }
-
-                    {
-                        let mut members = swarm_members.write().await;
-                        if let Some(member) = members.get_mut(client_session_id) {
-                            member.swarm_id = Some(id.clone());
-                            member.role = "agent".to_string();
-                        }
-                    }
-
-                    swarm.broadcast_swarm_status(id).await;
-                    let swarm_state = SwarmState {
-                        members: Arc::clone(swarm_members),
-                        swarms_by_id: Arc::clone(swarms_by_id),
-                        plans: Arc::clone(swarm_plans),
-                        coordinators: Arc::clone(swarm_coordinators),
-                    };
-                    persist_swarm_state_for(id, &swarm_state).await;
-                } else {
-                    let _ = client_event_tx.send(ServerEvent::SwarmStatus {
-                        members: Vec::new(),
-                    });
-                }
-            } else {
-                let _ = client_event_tx.send(ServerEvent::SwarmStatus {
-                    members: Vec::new(),
-                });
-            }
-
-            let _ = client_event_tx.send(ServerEvent::Done { id });
+            swarm
+                .toggle_swarm_membership(id, client_session_id, enabled, client_event_tx)
+                .await;
         }
     }
 }
@@ -872,9 +805,7 @@ pub(super) async fn handle_handoff_apply(
         Some(session_id) => {
             // Import succeeded: now clear the session and boot it fresh from
             // the adopted snapshot, all server-side (no client round trips).
-            let mut guard = agent.lock().await;
-            guard.clear();
-            guard.set_handoff_resume(Some(session_id.clone()));
+            clear_and_arm_handoff_resume(agent, &session_id).await;
             crate::logging::event_info(
                 "HANDOFF",
                 vec![
@@ -891,6 +822,79 @@ pub(super) async fn handle_handoff_apply(
                 id,
                 message: "could not adopt handoff payload (malformed or no project for session)"
                     .to_string(),
+                retry_after_secs: None,
+            });
+        }
+    }
+}
+
+/// Atomically clear the live conversation and arm the handoff-resume override
+/// to `snapshot_id` in a single step under the agent lock.
+///
+/// Both `handle_handoff_apply` and `handle_handoff_resume_by_id` boot the
+/// current session from a handoff by (1) clearing the in-place conversation so
+/// the next user message is treated as first, and (2) setting the one-shot
+/// override so first-message injection boots from that snapshot. Extracting
+/// this shared, lock-held sequence removes the drift risk of two call sites
+/// doing it slightly differently (which would make one path fail to clear or
+/// fail to arm). Returns the resulting session id (the agent may rekey/mint a
+/// new session id on clear, e.g. an import id).
+async fn clear_and_arm_handoff_resume(
+    agent: &Arc<Mutex<Agent>>,
+    snapshot_id: &str,
+) -> String {
+    let mut guard = agent.lock().await;
+    guard.clear();
+    guard.set_handoff_resume(Some(snapshot_id.to_string()));
+    guard.session_id().to_string()
+}
+
+/// Atomically boot the current session from an *already-present* server-side
+/// handoff snapshot, in one server-side hop.
+///
+/// Mirrors `handle_handoff_apply` but for snapshots already in the server's
+/// store (selected via the `/handoff` overlay or `/handoffres <id>`), so no
+/// payload is shipped. The snapshot must exist (`load_snapshot`); otherwise the
+/// conversation is left untouched and the server replies with `Error`. On
+/// success the current conversation is cleared and the handoff-resume override
+/// is armed, atomically under the agent lock, and the server replies
+/// [`ServerEvent::HandoffResumed`] with the session id.
+pub(super) async fn handle_handoff_resume_by_id(
+    id: u64,
+    session_id: String,
+    agent: &Arc<Mutex<Agent>>,
+    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+) {
+    let session_id = session_id.trim().to_string();
+    if session_id.is_empty() {
+        let _ = client_event_tx.send(ServerEvent::Error {
+            id,
+            message: "handoff session id must not be empty".to_string(),
+            retry_after_secs: None,
+        });
+        return;
+    }
+    match crate::handoff::load_snapshot(&session_id) {
+        Some(_) => {
+            let session_after = clear_and_arm_handoff_resume(agent, &session_id).await;
+            crate::logging::event_info(
+                "HANDOFF",
+                vec![
+                    ("phase", "resumed_by_id".to_string()),
+                    ("request_id", id.to_string()),
+                    ("session_id", session_after),
+                    ("handoff", session_id.clone()),
+                ],
+            );
+            let _ = client_event_tx.send(ServerEvent::HandoffResumed { id, session_id });
+        }
+        None => {
+            crate::logging::warn(&format!(
+                "[handoff] resume_by_id request {id} rejected (no snapshot {session_id:?})"
+            ));
+            let _ = client_event_tx.send(ServerEvent::Error {
+                id,
+                message: format!("no saved handoff with id {session_id:?}"),
                 retry_after_secs: None,
             });
         }

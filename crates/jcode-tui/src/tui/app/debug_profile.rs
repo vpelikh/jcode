@@ -211,6 +211,11 @@ impl App {
             .as_ref()
             .map(estimate_pending_handoff_resume_bytes)
             .unwrap_or(0);
+        let pending_handoff_ack_bytes = self
+            .pending_handoff_ack
+            .as_ref()
+            .map(estimate_pending_handoff_ack_bytes)
+            .unwrap_or(0);
         let input_undo_stack_bytes: usize = self
             .input_undo_stack
             .iter()
@@ -424,6 +429,7 @@ impl App {
             "pending_catchup_resume_bytes": pending_catchup_resume_bytes,
             "in_flight_catchup_resume_bytes": in_flight_catchup_resume_bytes,
             "pending_handoff_resume_bytes": pending_handoff_resume_bytes,
+            "pending_handoff_ack_bytes": pending_handoff_ack_bytes,
             "input_undo_stack_bytes": input_undo_stack_bytes,
             "stashed_input_bytes": stashed_input_bytes,
             "pending_soft_interrupts_bytes": pending_soft_interrupts_bytes,
@@ -468,6 +474,8 @@ impl App {
             "handoff": {
                 "present": self.pending_handoff_resume.is_some(),
                 "pending_estimate_bytes": pending_handoff_resume_bytes,
+                "ack_present": self.pending_handoff_ack.is_some(),
+                "ack_estimate_bytes": pending_handoff_ack_bytes,
             },
             "pending_interrupts": {
                 "soft_interrupts_count": self.pending_soft_interrupts.len(),
@@ -807,6 +815,10 @@ fn estimate_pending_catchup_resume_bytes(value: &PendingCatchupResume) -> usize 
 
 fn estimate_pending_handoff_resume_bytes(value: &PendingHandoffResume) -> usize {
     value.session_id.capacity() + value.preview_line.capacity()
+}
+
+fn estimate_pending_handoff_ack_bytes(value: &PendingHandoffAck) -> usize {
+    value.preview_line.capacity()
 }
 
 fn estimate_rendered_images_bytes(images: &[crate::session::RenderedImage]) -> usize {

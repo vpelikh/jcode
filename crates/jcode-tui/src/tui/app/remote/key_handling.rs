@@ -82,10 +82,12 @@ async fn handle_remote_handoff_command(
 
 /// Set which saved handoff this session boots from on its first message.
 ///
-/// `/handoffres <session_id>` clears the current conversation in place (like
-/// `/clear`) so the next message is the first visible one, then sets the
-/// override on the server. Always clearing guarantees the override fires; a
-/// selection is resolved locally first so an unknown id fails fast client-side.
+/// `/handoffres <session_id>` boots the current conversation from a specific
+/// saved handoff. The clear (so the next message is the first visible one) and
+/// the handoff-resume override set happen atomically server-side via a single
+/// `handoff_resume_by_id` request, so a transport drop cannot leave the session
+/// cleared but the override unarmed. A selection is resolved locally first so an
+/// unknown id fails fast client-side.
 async fn handle_handoff_resume_command(
     app: &mut App,
     remote: &mut RemoteConnection,
@@ -115,24 +117,18 @@ async fn handle_handoff_resume_command(
     let selected = session_id.to_string();
     // A handoff override only applies to the first visible user message, so the
     // server conversation must be empty for the next message to be treated as
-    // first. Clear it in place on the server (same session id, like `/clear`).
-    // We always clear rather than gating on client-visible messages: after a
-    // reconnect the client's display cache may not yet show server history, so
-    // a client-side empty check could wrongly skip the clear and leave the
-    // override set but never fired. Clearing an already-empty session is a
-    // harmless no-op, so always clearing is both simpler and correct.
-    remote.clear().await?;
+    // first. The atomic request clears it in place on the server (same session
+    // id, like `/clear`) and arms the override in one hop, so a transport drop
+    // cannot leave the session cleared but the override unarmed.
+    let request_id = remote.handoff_resume_by_id(selected).await?;
     clear_session_state_after_discard(app);
-    remote.set_handoff_resume(Some(selected)).await?;
     // Show the handoff's headline (intent) rather than the always-present
-    // "[Handoff from previous session]" header. Shared with the interactive
-    // `/handoff` overlay so the two paths cannot drift.
+    // "[Handoff from previous session]" header once the server acknowledges.
+    // Shared with the interactive `/handoff` overlay so the two paths cannot
+    // drift.
     let preview_line = app_mod::commands::handoff_headline(session_id);
-    app.push_display_message(DisplayMessage::system(format!(
-        "Handoff ready: {}\n{}",
-        session_id, preview_line
-    )));
-    app.set_status_notice("Handoff selected");
+    app.set_pending_handoff_ack(request_id, preview_line);
+    app.set_status_notice("Applying handoff…");
     Ok(())
 }
 
@@ -2062,6 +2058,10 @@ async fn handle_remote_key_internal(
                         return Ok(());
                     }
                     remote.set_handoff_resume(None).await?;
+                    // Clear any outstanding resume ack: it refers to a now
+                    // superseded selection, so its HandoffResumed must not later
+                    // surface a stale "Handoff ready".
+                    app.clear_pending_handoff_ack();
                     app.push_display_message(DisplayMessage::system(
                         "Handoff override cleared; automatic latest-for-project injection restored.".to_string(),
                     ));

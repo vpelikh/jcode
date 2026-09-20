@@ -401,6 +401,26 @@ pub enum Request {
         disposition: Option<String>,
     },
 
+    /// Atomically boot the current session from an *already-present* server-side
+    /// handoff, in one server-side hop: clear the current conversation and set
+    /// the handoff-resume override to the named snapshot in a single request.
+    ///
+    /// This is the counterpart to `handoff_apply` for the case where the
+    /// snapshot is already in the server's store (e.g. selected from the
+    /// `/handoff` overlay or named in `/handoffres <id>`), so no payload is
+    /// shipped. Unlike a client-side `clear` followed by `set_handoff_resume`,
+    /// the two operations happen atomically server-side, so a transport drop in
+    /// between cannot leave the session cleared but the resume override unarmed.
+    ///
+    /// The snapshot must exist server-side (`load_snapshot`); otherwise the
+    /// conversation is left untouched and the server replies with `Error`. On
+    /// success it replies [`ServerEvent::HandoffResumed`] with the session id.
+    #[serde(rename = "handoff_resume_by_id")]
+    HandoffResumeById {
+        id: u64,
+        session_id: String,
+    },
+
     /// Split the current session — clone conversation into a new session
     #[serde(rename = "split")]
     Split { id: u64 },
@@ -1718,6 +1738,16 @@ pub enum ServerEvent {
         /// suitable for `/handoffres`. Empty on malformed or rejected payloads
         /// (the server then also emits `Error`).
         #[serde(default, skip_serializing_if = "String::is_empty")]
+        session_id: String,
+    },
+
+    /// Reply to `Request::HandoffResumeById` — the current session has been
+    /// cleared and armed to boot from the named handoff snapshot.
+    #[serde(rename = "handoff_resumed")]
+    HandoffResumed {
+        /// Echoes the request id.
+        id: u64,
+        /// The handoff session id the session was armed to boot from.
         session_id: String,
     },
 }

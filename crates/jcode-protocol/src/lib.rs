@@ -607,6 +607,7 @@ impl Request {
             Request::HandoffList { id } => *id,
             Request::HandoffImport { id, .. } => *id,
             Request::HandoffApply { id, .. } => *id,
+            Request::HandoffResumeById { id, .. } => *id,
             Request::Split { id } => *id,
             Request::Transfer { id } => *id,
             Request::Compact { id } => *id,

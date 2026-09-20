@@ -33,6 +33,15 @@ green. The full shipped `jcode`
 binary also builds, links (all four wire tags present in the linked artifact),
 and executes cleanly (`jcode --version`).
 
+**Atomic resume-by-id (2026-09).** The remaining resume-by-id correctness gap is
+closed: selecting a handoff from the `/handoff` overlay *or* running
+`/handoffres <id>` now clears the conversation and arms the handoff-resume
+override in a single server-side hop (`Request::HandoffResumeById`, replied with
+`ServerEvent::HandoffResumed`), instead of the split `clear()` +
+`set_handoff_resume(id)` pair that could leave a cleared conversation with no
+override if the transport dropped between them. See "Future work" for the
+landed notes and test coverage.
+
 ## Purpose
 
 Preserve unfinished work across sessions without requiring the user to repeat
@@ -308,8 +317,9 @@ the prior environment.
   `Request::HandoffList` plus `ServerEvent::HandoffListed` expose the server-side
   store so a client can discover what the *target host* has saved. The remote
   `/handoff` overlay is fed from that listing over SSH. A combined atomic
-  "clear + adopt + resume" apply request would be the natural next step and is
-  listed below.
+  "clear + adopt + resume" apply request landed as `HandoffApply`, and the
+  equivalent no-payload atomic resume-by-id landed as `HandoffResumeById` (both
+  listed below as landed).
 
 - **Picker row model (landed 2026-09).** The interactive overlay's handoff
   surface is decoupled from the session-shaped one. `session_picker.rs` now
@@ -373,21 +383,79 @@ the prior environment.
   (`handle_handoff_apply_imports_clears_and_arms_resume`), a protocol wire
   roundtrip, and a client `RemoteConnection::handoff_apply` method.
 
-  The resume-by-id path is *not* converted: when a snapshot is already on the
-  server and the user just selects it (the `/handoff` overlay), the client still
-  performs `clear()` then `set_handoff_resume(id)` as two requests
-  (`apply_handoff_resume`). That split is a distinct, still-open gap listed
-  below. Independent of the row model.
+  The resume-by-id path is *also* converted now: **atomic resume-by-id (landed
+  2026-09).** `Request::HandoffResumeById { id, session_id }` clears the live
+  conversation *and* arms the handoff-resume override to the named snapshot in
+  a single server-side hop. `handle_handoff_resume_by_id` resolves the snapshot
+  first (a missing id replies `Error` and leaves the conversation untouched),
+  then clears the session and sets the override under the agent lock. The
+  `/handoff` overlay now sends this one request instead of the split
+  `clear()` + `set_handoff_resume(id)` pair, and the manual `/handoffres <id>`
+  command does the same, so a transport drop can no longer leave a cleared
+  conversation with the override unarmed. `ServerEvent::HandoffResumed`
+  acknowledges the armed id. Covered by `handle_handoff_resume_by_id_clears_and_arms_atomically`,
+  a protocol wire roundtrip, a real-socket `Request::HandoffResumeById` round
+  trip, a client `RemoteConnection::handoff_resume_by_id` method, and the
+  updated `apply_handoff_resume` TUI flow (now a single atomic request).
 
-- **Atomic resume-by-id (follow-up, deferred).** The `/handoff` picker selects a
-  snapshot already saved on the server by id, so it cannot use the payload-based
-  `HandoffApply`. Instead `apply_handoff_resume` issues `remote.clear()` then
-  `set_handoff_resume(id)` — two requests that can split if the transport drops
-  between them, leaving a cleared conversation with no override (auto-inject
-  wins). A single request that clears *and* arms the resume override by id
-  (no payload import) would make this atomic. Mirrors the manual `/handoffres`
-  flow. Consistent with `handoff_import`/`handoff_apply` being wire surfaces
-  awaiting a consumer.
+  The handler test proves the acceptance boundary through the *real* first-message
+  path: it seeds a newer, auto-latest snapshot that is *not* the one picked, then
+  calls `append_user_context_message` (which drives `render_first_message_handoff`)
+  and asserts the fresh first message carries the picked (non-latest) intent — so
+  the armed override beats the store's auto-latest. The real-socket test verifies
+  resume-by-id arms the live-agent override without rebasing the on-disk store
+  (auto-latest stays `newer-me`), completing the integration boundary: dispatch
+  over the wire + live-override resolution + first-message injection each
+  exercised independently.
+
+  **Design decision and trade-off.** The alternative was to reuse `HandoffApply`
+  for the already-present-snapshot case by having the client `export_handoff` the
+  local snapshot and send the payload in `HandoffApply`, or to extend
+  `SetHandoffResume` to also clear. Reusing `HandoffApply` lost because it ships a
+  full payload (extra bytes every selection) and rekeys/refreshes the snapshot on
+  server-side `import_handoff`, minting a new `import-<source>` id — so the picked
+  snapshot's *identity* would change and the client could no longer address the
+  exact row the user selected. Extending `SetHandoffResume` to also clear lost
+  because it conflated two orthogonal semantics (arm-only vs clear+arm) in one
+  request that callers must opt into with a flag, and it left `None` (restore
+  auto-inject) ambiguous. The chosen `HandoffResumeById` keeps the semantic
+  (`clear + arm by id`) explicit and addressable, costs one extra wire variant
+  and one extra handler (small, localized surface), and gains: no payload round
+  trip, the picked id stays stable, and the server resolves the snapshot before
+  clearing (a missing id is a harmless no-op instead of a cleared session).
+
+  **Two trade-offs of this branch were later closed:**
+  - **Shared clear+arm helper.** `clear_and_arm_handoff_resume` centralizes the
+    lock-held `clear()` + `set_handoff_resume(id)` sequence, used by both
+    `handle_handoff_apply` and `handle_handoff_resume_by_id`, removing the drift
+    risk of two boot-from-handoff sites doing it slightly differently.
+  - **Non-optimistic client ack.** `apply_handoff_resume` and the manual
+    `/handoffres` command no longer claim "Handoff ready" the moment the request
+    is sent. They record a pending `PendingHandoffAck` (request id + preview) and
+    surface "Handoff ready" only when `ServerEvent::HandoffResumed` arrives (or
+    a real "Failed to apply handoff resume" on a matching `Error`); a disconnect
+    clears the pending ack so the client never reports ready for a lost request.
+
+  Remaining (intentionally not closed): the new wire variant is the inherent cost
+  of atomicity (not removable); the client-side `render_handoff` fast-fail over
+  SSH is pre-existing advisory (server is authoritative); and the mock providers
+  discard their prompt so a recording-provider acceptance test is a
+  disproportionate harness (the loop is closed at the transcript boundary).
+
+  **Review fixes (post-landing).** The debug memory profile now also accounts
+  for the in-flight `PendingHandoffAck` bytes (it previously covered only
+  `PendingHandoffResume`). And `Request::HandoffApply` now goes through the same
+  `reject_if_agent_busy` guard as `HandoffResumeById`/`Clear`, so both
+  boot-from-handoff paths refuse to clear a conversation that is mid-turn
+  (they were inconsistent: `HandoffApply` previously cleared without the guard).
+
+  Two further review fixes: `apply_handoff_resume` clears the destructive local
+  display state (queued/pasted content, `is_processing`) only *after* the request
+  is successfully sent, so a failed send no longer discards local state for a
+  clear+arm that never reached the server (matching the manual `/handoffres`
+  path's ordering). And `/handoff-clear` now clears any outstanding
+  `PendingHandoffAck`, so a superseded resume selection can't later surface a
+  stale "Handoff ready" when its `HandoffResumed` arrives.
 
 - **Wire-model duplication (follow-up, deferred).** `HandoffWireModel` and the
   session-shaped `Row`/display projection carry overlapping session fields.

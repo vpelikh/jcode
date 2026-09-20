@@ -2005,7 +2005,9 @@ fn remote_submit_input_never_strands_a_local_pending_turn() {
 }
 
 #[test]
-fn apply_handoff_resume_sends_clear_then_handoff_resume_and_reports_ready() {
+fn apply_handoff_resume_sends_single_atomic_resume_request_and_reports_ready() {
+    use tokio::io::AsyncBufReadExt;
+
     let mut app = create_test_app();
     app.is_processing = false;
     // Seed local display state that `/handoffres` must discard (mirroring the
@@ -2022,18 +2024,30 @@ fn apply_handoff_resume_sends_clear_then_handoff_resume_and_reports_ready() {
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     let _guard = rt.enter();
     let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    let peer = remote.take_dummy_peer().unwrap();
+    let (reader, _writer) = peer.into_split();
+    let mut reader = tokio::io::BufReader::new(reader);
     let id_before = remote.next_request_id_for_test();
 
     let result = rt.block_on(super::apply_handoff_resume(&mut app, &mut remote, &request));
     assert_eq!(result, Ok(()), "applying a handoff should succeed");
 
-    // The flow sends two requests: `/clear`, then `set_handoff_resume`.
-    // Each increments `next_request_id`, so exactly 2 more were consumed.
+    // The flow sends exactly one request: the atomic `handoff_resume_by_id`.
+    // It increments `next_request_id` once, so exactly 1 more was consumed.
     assert_eq!(
         remote.next_request_id_for_test(),
-        id_before + 2,
-        "clear + set_handoff_resume should both be sent"
+        id_before + 1,
+        "the atomic handoff_resume_by_id request should be the only request sent"
     );
+
+    // Read the single wire request and assert it is the atomic variant with the
+    // named session id (no separate Clear + SetHandoffResume pair).
+    let mut line = String::new();
+    rt.block_on(async { reader.read_line(&mut line).await.unwrap() });
+    let parsed = serde_json::from_str::<crate::protocol::Request>(&line).unwrap();
+    assert!(matches!(&parsed, crate::protocol::Request::HandoffResumeById { id, session_id }
+        if *id == id_before && session_id == "handoff-abc"),
+        "expected a single atomic HandoffResumeById, got: {line}");
 
     // Local queued/pasted state is discarded, matching the manual `/handoffres`.
     assert!(
@@ -2045,18 +2059,95 @@ fn apply_handoff_resume_sends_clear_then_handoff_resume_and_reports_ready() {
         "clear_session_state_after_discard should clear pasted content"
     );
 
-    // The tick asserts on a "Handoff ready" message and the status notice.
+    // The request was sent and is now awaited: the client must NOT yet claim
+    // "Handoff ready" (that is resolved by `HandoffResumed`/`Error`).
+    let messages = app.display_messages();
+    assert!(
+        !messages.iter().any(|m| m.content.contains("Handoff ready")),
+        "the client must not claim Handoff ready before the server acknowledges, got: {:?}",
+        messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        app.status_notice.as_ref().map(|(s, _)| s.as_str()),
+        Some("Applying handoff…")
+    );
+
+    // The core of the non-optimistic change: the client must have recorded the
+    // in-flight ack (request id + preview) so HandoffResumed/Error can resolve
+    // it. Without `set_pending_handoff_ack`, the ack is None and the client has
+    // nothing to resolve — so this assertion pins that behavior.
+    let ack = app.take_pending_handoff_ack(id_before);
+    let ack = ack.expect("a successfully-sent resume must record a pending ack");
+    assert_eq!(ack.preview_line, "Resume this work");
+}
+
+#[test]
+fn handoff_resumed_resolves_pending_ack_and_reports_ready() {
+    let mut app = create_test_app();
+    app.is_processing = false;
+
+    // Simulate an in-flight handoff_resume_by_id request awaiting its reply.
+    app.set_pending_handoff_ack(7, "Resume this work".to_string());
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    let needs_redraw = handle_server_event(
+        &mut app,
+        ServerEvent::HandoffResumed {
+            id: 7,
+            session_id: "handoff-abc".to_string(),
+        },
+        &mut remote,
+    );
+    let _ = needs_redraw;
+
+    // Only the acknowledged handoff surfaces "Handoff ready" with its preview.
     let messages = app.display_messages();
     assert!(
         messages.iter().any(|m| m.content.contains("Handoff ready")
             && m.content.contains("handoff-abc")
             && m.content.contains("Resume this work")),
-        "expected a Handoff ready message, got: {:?}",
+        "expected a Handoff ready message for the acknowledged handoff, got: {:?}",
         messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>()
     );
     assert_eq!(
         app.status_notice.as_ref().map(|(s, _)| s.as_str()),
         Some("Handoff selected")
+    );
+}
+
+#[test]
+fn handoff_error_resolves_pending_ack_to_not_applied() {
+    let mut app = create_test_app();
+    app.is_processing = false;
+
+    app.set_pending_handoff_ack(9, "Resume this work".to_string());
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    handle_server_event(
+        &mut app,
+        ServerEvent::Error {
+            id: 9,
+            message: "no saved handoff with id \"handoff-abc\"".to_string(),
+            retry_after_secs: None,
+        },
+        &mut remote,
+    );
+
+    let messages = app.display_messages();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.content.contains("Failed to apply handoff resume")),
+        "a handoff rejection must surface a real failure, got: {:?}",
+        messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        app.status_notice.as_ref().map(|(s, _)| s.as_str()),
+        Some("Handoff not applied")
     );
 }
 
@@ -2157,11 +2248,45 @@ fn handoff_listed_is_ignored_without_a_matching_pending_request() {
 }
 
 #[test]
-fn apply_handoff_resume_reports_failure_without_panicking() {
-    // A broken socket makes the first `clear()` write fail; the helper must
-    // report the error as `Err(())` after pushing an error message, never panic.
+fn handoff_resumed_without_pending_ack_is_ignored() {
     let mut app = create_test_app();
     app.is_processing = false;
+
+    // No `set_pending_handoff_ack` was called, so the request id does not match
+    // an in-flight handoff; the client must not claim "Handoff ready" for a
+    // stray/unrelated `HandoffResumed`.
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    let needs_redraw = handle_server_event(
+        &mut app,
+        ServerEvent::HandoffResumed {
+            id: 55,
+            session_id: "handoff-ready".to_string(),
+        },
+        &mut remote,
+    );
+    let _ = needs_redraw;
+
+    let messages = app.display_messages();
+    assert!(
+        !messages.iter().any(|m| m.content.contains("Handoff ready")),
+        "an unmatched HandoffResumed must not claim Handoff ready, got: {:?}",
+        messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn apply_handoff_resume_reports_failure_without_panicking() {
+    // A broken socket makes the atomic `handoff_resume_by_id` write fail; the
+    // helper must report the error as `Err(())` after pushing an error message,
+    // never panic. A failed send must also NOT discard local display state
+    // (queued/pasted content), because the clear+arm never happened server-side —
+    // only a successful send clears it (matching `/clear`).
+    let mut app = create_test_app();
+    app.is_processing = false;
+    app.queued_messages.push("stale prompt".to_string());
+    app.pasted_contents.push("pasted".to_string());
 
     let request = crate::tui::app::PendingHandoffResume {
         session_id: "handoff-xyz".to_string(),
@@ -2176,6 +2301,13 @@ fn apply_handoff_resume_reports_failure_without_panicking() {
 
     let result = rt.block_on(super::apply_handoff_resume(&mut app, &mut remote, &request));
     assert_eq!(result, Err(()), "a failed clear should surface as Err(())");
+
+    // Local state survives a failed send: nothing was cleared for an operation
+    // that never reached the server.
+    assert!(
+        !app.queued_messages.is_empty() && !app.pasted_contents.is_empty(),
+        "a failed send must not discard local queued/pasted state"
+    );
 
     let messages = app.display_messages();
     assert!(
