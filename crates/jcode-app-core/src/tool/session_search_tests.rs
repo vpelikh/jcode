@@ -48,8 +48,14 @@ fn run_report(home: &Path, query: &str, options: &SearchOptions) -> SearchReport
         &QueryProfile::new(query),
         options,
         "test-log-session",
+        &never_abort(),
     )
     .expect("search succeeds")
+}
+
+/// A cancellation flag that is never set, so search runs to completion.
+fn never_abort() -> CheckAbort {
+    Arc::new(AtomicBool::new(false))
 }
 
 fn run_search(home: &Path, query: &str, options: &SearchOptions) -> Vec<SearchResult> {
@@ -208,6 +214,7 @@ fn bench_real_session_search_corpus() {
             &QueryProfile::new(query),
             &options,
             "benchmark-log-session",
+            &never_abort(),
         )
         .expect("search succeeds");
         eprintln!(
@@ -230,6 +237,7 @@ fn bench_real_session_search_corpus() {
             &QueryProfile::new(query),
             &options,
             "benchmark-log-session",
+            &never_abort(),
         )
         .expect("search succeeds");
         eprintln!(
@@ -260,7 +268,7 @@ fn stop_word_only_query_is_not_actionable() {
 
         let options = SearchOptions::for_test("current-session");
         let results =
-            search_sessions_blocking(&home.join("sessions"), &query, &options, "test-log-session")
+            search_sessions_blocking(&home.join("sessions"), &query, &options, "test-log-session", &never_abort())
                 .expect("search succeeds");
         assert!(results.results.is_empty());
     });
@@ -810,4 +818,79 @@ async fn session_search_deadline_is_model_visible_on_hang() {
         text.contains("timed out after"),
         "expected a model-visible timeout error, got: {text}"
     );
+}
+
+#[tokio::test]
+async fn abort_on_drop_guard_arms_the_flag_when_the_future_is_dropped() {
+    // deepseek-harness F8 Part A, mechanism check. The pre-set-flag test proves
+    // a cancelled scan short-circuits; this one proves the *trigger*: the
+    // `AbortOnDrop` guard held by the executing future must set the shared flag
+    // when that future is dropped. `execute_with_deadline` drops the inner
+    // future on timeout, so this pins the real path — a timed-out call leaves
+    // the flag armed for the already-spawned blocking scan.
+    let abort = Arc::new(AtomicBool::new(false));
+    assert!(!abort.load(Ordering::Relaxed), "flag must start clear");
+    // The guard is created *inside* the future, exactly like `execute` does
+    // before its `spawn_blocking(...).await`. The async state machine holds it
+    // for the whole future, so the timeout dropping the future drops the guard.
+    let dropped = jcode_tool_core::execute_with_deadline(
+        Some(std::time::Duration::from_millis(20)),
+        SessionSearchTool::new().name(),
+        async {
+            let _guard = AbortOnDrop(abort.clone());
+            // Simulate the running blocking scan: await forever, just as
+            // `execute` does while its blocking scan is in flight.
+            std::future::pending::<()>().await;
+            Ok::<_, anyhow::Error>(())
+        },
+    )
+    .await;
+    assert!(dropped.is_err(), "the hung call must be dropped by the deadline");
+    assert!(
+        abort.load(Ordering::Relaxed),
+        "dropping the timed-out future must drop the guard and arm the flag"
+    );
+}
+
+#[test]
+fn pre_abort_flag_short_circuits_the_scan() {
+    // deepseek-harness F8 Part A: the cooperative cancel flag is checked at
+    // every scan boundary, so a call that is cancelled before (or during) the
+    // jcode scan must not deserialize/score the candidate files. This test sets
+    // the flag up front and pins that the scan returns a usable, empty report
+    // without loading any of the saved sessions.
+    with_temp_home(|home| {
+        // Several sessions that WOULD match if scanned; they prove the scan did
+        // not run to completion.
+        for i in 0..5 {
+            save_test_session(
+                &format!("abort-session-{i}"),
+                vec![(Role::User, vec![text("needle-that-must-not-be-scored")])],
+            );
+        }
+
+        let abort = Arc::new(AtomicBool::new(true));
+        let mut options = SearchOptions::for_test("current-session");
+        options.exhaustive = true; // bypass the index so the scan is required
+        let report = search_sessions_blocking(
+            &home.join("sessions"),
+            &QueryProfile::new("needle-that-must-not-be-scored"),
+            &options,
+            "test-log-session",
+            &abort,
+        )
+        .expect("a cancelled scan still succeeds and returns a report");
+        assert!(
+            report.results.is_empty(),
+            "a scan cancelled up front must score nothing"
+        );
+        assert_eq!(
+            report.scanned_jcode_sessions, 0,
+            "a scan cancelled up front must skip even file enumeration"
+        );
+        assert_eq!(
+            report.candidate_jcode_sessions, 0,
+            "a scan cancelled up front must reach no candidate files"
+        );
+    });
 }

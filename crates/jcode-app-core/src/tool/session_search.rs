@@ -38,6 +38,8 @@ use serde_json::{Value, json};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 /// Max session snapshots/journals to deserialize after raw pre-filtering.
@@ -56,6 +58,32 @@ const MAX_CONTEXT_MESSAGES: usize = 5;
 const INDEX_SCORE_CANDIDATE_MULTIPLIER: usize = 2;
 /// Legacy JSON index file superseded by the binary token-hash indexes.
 const LEGACY_INDEX_FILE_NAME: &str = "session_search_recent_index_v1.json";
+
+/// Cooperative cancellation flag for the blocking scan (deepseek-harness F8 Part A).
+///
+/// `search_sessions_blocking` runs on `spawn_blocking` threads, so it cannot be
+/// pulled off the CPU by dropping the async future around it; dropping only the
+/// outer future leaves the blocking task running to completion. Instead each scan
+/// iteration checks this shared flag and returns early. The flag is set by an
+/// `AbortOnDrop` guard that fires when the executing future is dropped, i.e. when
+/// `execute_with_deadline`'s timeout elapses. This reclaims the blocking threads
+/// early without any cross-thread disruption: the scan is read-only, so bailing
+/// out at a candidate boundary is always safe and leaves no partial writes.
+type CheckAbort = Arc<AtomicBool>;
+
+/// Sets the shared abort flag when dropped.
+///
+/// Created in `execute` before the scan is spawned and held until the executing
+/// future ends. When `execute_with_deadline` times out it drops that future, the
+/// guard's `Drop` runs, and the already-running `spawn_blocking` workers observe
+/// the flag at their next candidate boundary and stop early.
+struct AbortOnDrop(CheckAbort);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct SearchInput {
@@ -135,17 +163,17 @@ impl SessionSearchTool {
     /// exceeds this budget into a clear, model-visible timeout error instead of
     /// stalling the whole session.
     ///
-    /// Cancellation safety: the scan is **read-only and idempotent**. On
+    /// Cancellation safety (deepseek-harness F8 Part A): the scan is
+    /// **read-only and idempotent**, and it is now also **cooperatively
+    /// abortable**. `execute` holds an `AbortOnDrop` guard for the life of the
+    /// executing future; when `execute_with_deadline`'s timeout fires it drops
+    /// that future, the guard sets a shared `AtomicBool`, and every scan loop
+    /// (raw pre-filter, index build, scoring deserialize, external loaders)
+    /// checks the flag at each candidate boundary and stops early. So on
     /// timeout the turn returns immediately with the model-visible timeout
-    /// error, while the already-spawned `spawn_blocking` work continues to
-    /// completion in the background. That work only reads and deserializes
-    /// session files (no writes, no external side effects), so nothing is
-    /// corrupted or orphaned; a default-scope scan is additionally bounded by
-    /// the session-file cap. The cost is that the blocking threads are not
-    /// reclaimed early — the acknowledged trade-off, tracked as Part A
-    /// (abortable scan loop) in the deepseek-harness status doc. This is why a
-    /// deadline is safe here even though the join block does not abort the
-    /// underlying scan.
+    /// error **and** the blocking threads are reclaimed at the next candidate
+    /// boundary instead of running every file to completion. A default-scope
+    /// scan is additionally bounded by the session-file cap.
     pub const EXECUTION_TIMEOUT_SECS: u64 = 60;
 
     /// Whole-call budget for an expanded scope (takeaway #7, Part B).
@@ -184,7 +212,10 @@ pub fn spawn_recent_index_warmup() {
             if collection.files.is_empty() {
                 return Ok(0);
             }
-            let _ = jcode_index_candidates(&collection.files, &empty_query)?;
+            // Background warmup is unattended and must finish, so it uses a
+            // never-cancelled flag (no deadline is racing it).
+            let never_abort = Arc::new(AtomicBool::new(false));
+            let _ = jcode_index_candidates(&collection.files, &empty_query, &never_abort)?;
             Ok(collection.files.len())
         })()
         .unwrap_or_else(|err| {
@@ -582,11 +613,19 @@ impl Tool for SessionSearchTool {
             exhaustive,
         };
 
+        // Cooperative cancellation: this guard lives for the whole executing future
+        // and sets the shared flag when that future is dropped (i.e. when
+        // `execute_with_deadline`'s timeout elapses), so the blocking scan can bail
+        // out at its next candidate boundary instead of running to the end.
+        let abort = Arc::new(AtomicBool::new(false));
+        let _abort_on_drop = AbortOnDrop(abort.clone());
+
         let report = tokio::task::spawn_blocking({
             let session_id = ctx.session_id.clone();
+            let abort = abort.clone();
             let query = query.clone();
             let options = options.clone();
-            move || search_sessions_blocking(&sessions_dir, &query, &options, &session_id)
+            move || search_sessions_blocking(&sessions_dir, &query, &options, &session_id, &abort)
         })
         .await??;
 
@@ -681,9 +720,15 @@ fn search_sessions_blocking(
     query: &QueryProfile,
     options: &SearchOptions,
     log_session_id: &str,
+    abort: &CheckAbort,
 ) -> Result<SearchReport> {
     let mut report = SearchReport::default();
     if !query.is_actionable() {
+        return Ok(report);
+    }
+    // Cancelled up front: skip even file enumeration so a timed-out call that
+    // the turn has already left reclaims the blocking thread immediately.
+    if abort.load(Ordering::Relaxed) {
         return Ok(report);
     }
 
@@ -702,7 +747,7 @@ fn search_sessions_blocking(
             if !files.is_empty() {
                 let using_index = !options.exhaustive;
                 let mut candidates = if options.exhaustive {
-                    let raw_filter_outcomes = filter_candidates_parallel(&files, query);
+                    let raw_filter_outcomes = filter_candidates_parallel(&files, query, abort);
                     report.read_errors += raw_filter_outcomes
                         .iter()
                         .map(|outcome| outcome.read_errors)
@@ -712,13 +757,13 @@ fn search_sessions_blocking(
                         .flat_map(|outcome| outcome.candidates)
                         .collect()
                 } else {
-                    match jcode_index_candidates(&files, query) {
+                    match jcode_index_candidates(&files, query, abort) {
                         Ok(candidates) => candidates,
                         Err(err) => {
                             crate::logging::warn(&format!(
                                 "session_search index unavailable; falling back to raw scan: {err}"
                             ));
-                            let raw_filter_outcomes = filter_candidates_parallel(&files, query);
+                            let raw_filter_outcomes = filter_candidates_parallel(&files, query, abort);
                             report.read_errors += raw_filter_outcomes
                                 .iter()
                                 .map(|outcome| outcome.read_errors)
@@ -744,7 +789,7 @@ fn search_sessions_blocking(
                     report.truncated = true;
                 }
 
-                let search_outcomes = score_candidates_parallel(&candidates, query, options);
+                let search_outcomes = score_candidates_parallel(&candidates, query, options, abort);
                 report.parse_errors += search_outcomes
                     .iter()
                     .map(|outcome| outcome.parse_errors)
@@ -759,7 +804,7 @@ fn search_sessions_blocking(
     }
 
     if options.include_external {
-        let external_report = search_external_sessions(query, options);
+        let external_report = search_external_sessions(query, options, abort);
         report.scanned_external_sessions += external_report.scanned_external_sessions;
         report
             .external_sources
@@ -887,7 +932,11 @@ fn remove_legacy_index() {
 fn jcode_index_candidates(
     files: &[SessionFileCandidate],
     query: &QueryProfile,
+    abort: &CheckAbort,
 ) -> Result<Vec<SessionFileCandidate>> {
+    if abort.load(Ordering::Relaxed) {
+        return Ok(Vec::new());
+    }
     let index_path = index_dir()?.join("session_search_jcode_index_v2.bin");
     let specs: Vec<IndexFileSpec> = files
         .iter()
@@ -933,6 +982,7 @@ fn modified_time_or_epoch(path: &Path) -> SystemTime {
 fn filter_candidates_parallel(
     files: &[SessionFileCandidate],
     query: &QueryProfile,
+    abort: &CheckAbort,
 ) -> Vec<RawFilterOutcome> {
     if files.is_empty() {
         return Vec::new();
@@ -946,6 +996,9 @@ fn filter_candidates_parallel(
             handles.push(scope.spawn(move || {
                 let mut outcome = RawFilterOutcome::default();
                 for candidate in chunk {
+                    if abort.load(Ordering::Relaxed) {
+                        break;
+                    }
                     if path_matches_query(&candidate.session_id_hint, query) {
                         outcome.candidates.push(candidate.clone());
                         continue;
@@ -1005,6 +1058,7 @@ fn score_candidates_parallel(
     candidates: &[SessionFileCandidate],
     query: &QueryProfile,
     options: &SearchOptions,
+    abort: &CheckAbort,
 ) -> Vec<SearchWorkerOutcome> {
     if candidates.is_empty() {
         return Vec::new();
@@ -1018,6 +1072,9 @@ fn score_candidates_parallel(
             handles.push(scope.spawn(move || {
                 let mut outcome = SearchWorkerOutcome::default();
                 for candidate in chunk {
+                    if abort.load(Ordering::Relaxed) {
+                        break;
+                    }
                     match Session::load_from_path(&candidate.snapshot_path) {
                         Ok(session) => {
                             append_session_results(&mut outcome.results, &session, query, options)
@@ -1043,7 +1100,11 @@ fn score_candidates_parallel(
     })
 }
 
-fn search_external_sessions(query: &QueryProfile, options: &SearchOptions) -> SearchReport {
+fn search_external_sessions(
+    query: &QueryProfile,
+    options: &SearchOptions,
+    abort: &CheckAbort,
+) -> SearchReport {
     let mut report = SearchReport::default();
     let mut records = Vec::new();
 
@@ -1064,7 +1125,7 @@ fn search_external_sessions(query: &QueryProfile, options: &SearchOptions) -> Se
                 report.truncated = true;
             }
         }
-        records.extend(load_claude_candidates_parallel(&candidates, query, options));
+        records.extend(load_claude_candidates_parallel(&candidates, query, options, abort));
     }
 
     collect_external_jsonl_source(
@@ -1075,6 +1136,7 @@ fn search_external_sessions(query: &QueryProfile, options: &SearchOptions) -> Se
         query,
         options,
         load_codex_external_session,
+        abort,
     );
     collect_external_jsonl_source(
         &mut records,
@@ -1084,6 +1146,7 @@ fn search_external_sessions(query: &QueryProfile, options: &SearchOptions) -> Se
         query,
         options,
         load_pi_external_session,
+        abort,
     );
     collect_opencode_external_sessions(&mut records, &mut report, options);
     collect_external_jsonl_source(
@@ -1094,7 +1157,11 @@ fn search_external_sessions(query: &QueryProfile, options: &SearchOptions) -> Se
         query,
         options,
         load_cursor_external_session,
+        abort,
     );
+    if abort.load(Ordering::Relaxed) {
+        return report;
+    }
 
     if records.len() > options.max_scan_sessions.saturating_mul(5) {
         records.truncate(options.max_scan_sessions.saturating_mul(5));
@@ -1103,6 +1170,9 @@ fn search_external_sessions(query: &QueryProfile, options: &SearchOptions) -> Se
 
     report.scanned_external_sessions = records.len();
     for record in records {
+        if abort.load(Ordering::Relaxed) {
+            break;
+        }
         append_external_session_results(&mut report.results, &record, query, options);
     }
     report.external_sources.sort_unstable();
@@ -1118,6 +1188,7 @@ fn collect_external_jsonl_source(
     query: &QueryProfile,
     options: &SearchOptions,
     loader: fn(&Path, bool) -> ImportCoreResult<Option<ExternalSessionRecord>>,
+    abort: &CheckAbort,
 ) {
     if !source_matches_filter(source, options) {
         return;
@@ -1129,6 +1200,9 @@ fn collect_external_jsonl_source(
         return;
     }
     report.external_sources.push(source);
+    if abort.load(Ordering::Relaxed) {
+        return;
+    }
     let paths = collect_recent_files_recursive(&root, "jsonl", options.max_scan_sessions);
     let mut candidates = external_index_candidate_paths(source, &paths, query);
     // Like the jcode path, cap how many candidate files get fully parsed.
@@ -1140,7 +1214,7 @@ fn collect_external_jsonl_source(
             report.truncated = true;
         }
     }
-    let outcomes = load_external_candidates_parallel(&candidates, query, options, loader);
+    let outcomes = load_external_candidates_parallel(&candidates, query, options, loader, abort);
     for outcome in outcomes {
         report.parse_errors += outcome.parse_errors;
         records.extend(outcome.records);
@@ -1212,6 +1286,7 @@ fn load_external_candidates_parallel(
     query: &QueryProfile,
     options: &SearchOptions,
     loader: fn(&Path, bool) -> ImportCoreResult<Option<ExternalSessionRecord>>,
+    abort: &CheckAbort,
 ) -> Vec<ExternalLoadOutcome> {
     if paths.is_empty() {
         return Vec::new();
@@ -1225,6 +1300,9 @@ fn load_external_candidates_parallel(
             handles.push(scope.spawn(move || {
                 let mut outcome = ExternalLoadOutcome::default();
                 for path in chunk {
+                    if abort.load(Ordering::Relaxed) {
+                        break;
+                    }
                     if !external_path_or_raw_matches_query(path, query) {
                         continue;
                     }
@@ -1318,6 +1396,7 @@ fn load_claude_candidates_parallel(
     sessions: &[jcode_import_core::ClaudeCodeSessionInfo],
     query: &QueryProfile,
     options: &SearchOptions,
+    abort: &CheckAbort,
 ) -> Vec<ExternalSessionRecord> {
     if sessions.is_empty() {
         return Vec::new();
@@ -1331,6 +1410,9 @@ fn load_claude_candidates_parallel(
             handles.push(scope.spawn(move || {
                 let mut records = Vec::new();
                 for session in chunk {
+                    if abort.load(Ordering::Relaxed) {
+                        break;
+                    }
                     let path = PathBuf::from(&session.full_path);
                     if !external_path_or_raw_matches_query(&path, query)
                         && !external_text_matches_query(&session.session_id, query)
