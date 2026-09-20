@@ -1721,14 +1721,13 @@ pub(super) fn create_git_worktree_at(
             worktree_dir.to_str().unwrap_or_default(),
         ],
     )
-    .map_err(|error| {
+    .inspect_err(|_error| {
         // `git worktree add` creates the target dir while preparing; if it
         // fails partway (e.g. branch name collision) it may leave an empty dir
         // behind. Clean it up so a retry with a corrected name is clean.
         if worktree_dir.read_dir().map(|mut it| it.next().is_none()).unwrap_or(false) {
             let _ = std::fs::remove_dir(&worktree_dir);
         }
-        error
     })?;
 
     Ok(worktree_dir)
