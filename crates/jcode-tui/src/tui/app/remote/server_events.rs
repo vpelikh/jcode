@@ -1323,6 +1323,44 @@ pub(in crate::tui::app) fn handle_server_event(
                     return false;
                 }
             }
+            // A 429 rate-limit with no concrete reset time (e.g. a free-tier
+            // "Rate limit exceeded" body and no `Retry-After` header) must not be
+            // given up after a few sub-second backoffs. Honor any explicit server
+            // wait; otherwise retry on an hourly cadence so a reopened usage
+            // window is picked up automatically instead of hammering the endpoint
+            // (issue: opencode.ai FreeUsageLimitError surfaces `status: 429`
+            // without a reset time, which previously exhausted the auto-retry
+            // budget in ~12s and then stopped). Once the hourly retry budget is
+            // spent the error is treated as non-transient and a manual offer is
+            // surfaced, so a permanently capped key can never hold the turn forever.
+            if let Some(pending) = app.rate_limit_pending_message.as_ref() {
+                match app_mod::model_context::rate_limit_retry_wait(
+                    &message,
+                    retry_after_secs,
+                    pending.retry_attempts,
+                ) {
+                    app_mod::model_context::RateLimitRetry::Wait(wait) => {
+                        if app.schedule_pending_remote_retry_in(wait, "Rate limited") {
+                            return false;
+                        }
+                    }
+                    // The hourly budget is spent: the turn can never clear this
+                    // rate limit (permanently capped key / misclassified error),
+                    // so stop auto-retrying and let the caller surface a manual
+                    // retry offer. Emit telemetry so the stall is diagnosable.
+                    app_mod::model_context::RateLimitRetry::Exhausted => {
+                        crate::logging::warn(&format!(
+                            "[rate-limit] 429 hourly retry budget exhausted after {} attempts; \
+                             falling back to a manual retry offer. last error: {}",
+                            pending.retry_attempts,
+                            crate::logging::truncate_for_log(&message, 240)
+                        ));
+                    }
+                    // Not a recognized rate limit: leave it to the normal error
+                    // path below (do not log; this is the common case).
+                    app_mod::model_context::RateLimitRetry::NotRateLimit => {}
+                }
+            }
             // Connectivity failures (DNS, connection reset, no route, transient
             // TLS, timeouts) are always transient: the request never reached the
             // provider. Hold the turn and resume when the network recovers,
