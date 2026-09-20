@@ -1,10 +1,10 @@
 # Review Rounds After Work Is Complete
 
-Status: implemented (branch `jc/review-rounds`, worktree `.worktrees/review-rounds`)
+Status: implemented (branch `jc/gate-recheck`, worktree `jcode-gate-recheck`)
 
 ## Implementation notes
 
-Phases 1–6 are implemented and unit-tested on branch `jc/review-rounds`.
+Phases 1–6 are implemented and unit-tested on branch `jc/gate-recheck`.
 
 - Report-contract parser, lens definitions, fingerprint/stall helpers, and persisted
   state live in `crates/jcode-session-types/src/review.rs` (engine types) and the
@@ -248,6 +248,14 @@ excluded from auto-seeding for determinism.
 
 gates pass → review loop → if review fixed files, re-run gates **once**; if still
 failing, surface + stop (no ping-pong).
+
+This re-run is implemented: when the loop converges and its `record.files_touched`
+is non-empty (the review changed files after the gates first passed), it re-runs the
+ownership and completion-confidence gates once against the post-fix state. A failing
+gate in that one re-run surfaces a "review fixed files, but the completion assessment
+now disagrees" message, records the same todo-gate telemetry the primary gate path
+uses (Ownership / Completion / ConfidenceSpike), and stops; it never re-enters the
+review loop, so there is no gates↔review ping-pong.
 
 ## Config (on `AutoReviewConfig`)
 
