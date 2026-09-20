@@ -235,9 +235,26 @@ fn judge_visible_tool_summary(tool: &ToolCall) -> Option<String> {
 }
 
 fn build_judge_visible_transcript_messages(parent_session: &Session) -> Vec<StoredMessage> {
+    // A judge must never see the parent's private chain-of-thought. Clone the
+    // parent and drop reasoning/thinking blocks so `render_messages` (which
+    // otherwise re-renders reasoning under the Full display mode) has no
+    // reasoning left to include, regardless of the current display setting.
+    let mut visible = parent_session.clone();
+    for message in &mut visible.messages {
+        message.content.retain(|block| {
+            !matches!(
+                block,
+                ContentBlock::Reasoning { .. }
+                    | ContentBlock::ReasoningTrace { .. }
+                    | ContentBlock::AnthropicThinking { .. }
+                    | ContentBlock::OpenAIReasoning { .. }
+            )
+        });
+    }
+
     let mut transcript = Vec::new();
 
-    for rendered in crate::session::render_messages(parent_session) {
+    for rendered in crate::session::render_messages(&visible) {
         match rendered.role.as_str() {
             "user" => {
                 if !rendered.content.trim().is_empty() {
