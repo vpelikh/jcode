@@ -194,14 +194,16 @@ prompt_entry_animation = true
 # results directly in the chat.
 # show_agentgrep_output = false
 
-# Show up to the last three non-empty lines of bash output beneath the tool
-# summary (default: false).
-# show_bash_output = false
+# Render the full, untrimmed bash command output beneath the tool summary
+# (default: true). When false, no bash output is shown at all. This flag is
+# the sole owner of bash output; show_bash_details handles metadata (command,
+# working directory, execution time, exit code) only.
+# show_bash_output = true
 
 # Enrich bash tool rows into a verbose details block showing the working
 # directory (when known), execution time, the full executed command, and the
-# command output (default: true). Independent of show_bash_output, which only
-# shows the last few output lines.
+# exit code (default: true). This flag controls bash *metadata*; it never
+# renders the command output, which is governed solely by show_bash_output.
 # show_bash_details = true
 
 # Show the dimmed technical detail (command, file path, args) next to the

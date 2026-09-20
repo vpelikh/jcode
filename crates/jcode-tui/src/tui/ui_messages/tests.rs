@@ -2166,10 +2166,23 @@ fn render_tool_message_shows_bash_output_when_enabled() {
         .map(extract_line_text)
         .collect::<Vec<_>>();
 
-    assert_eq!(rendered.len(), 4);
-    assert!(!rendered.iter().any(|line| line.trim() == "one"));
-    assert!(rendered.iter().any(|line| line.trim() == "two"));
-    assert!(rendered.iter().any(|line| line.trim() == "four"));
+    // show_bash_output renders the full, untrimmed output: every line appears.
+    assert!(
+        rendered.iter().any(|line| line.trim() == "one"),
+        "first output line should be shown: {rendered:?}"
+    );
+    assert!(
+        rendered.iter().any(|line| line.trim() == "two"),
+        "second output line should be shown: {rendered:?}"
+    );
+    assert!(
+        rendered.iter().any(|line| line.trim() == "three"),
+        "third output line should be shown: {rendered:?}"
+    );
+    assert!(
+        rendered.iter().any(|line| line.trim() == "four"),
+        "last output line should be shown: {rendered:?}"
+    );
     crate::tui::ui::tools_ui::tests_show_bash_output_override::set(false);
 }
 
@@ -2281,23 +2294,121 @@ fn render_tool_message_shows_bash_details_block_when_enabled() {
         rendered.contains("$ git status"),
         "verbose details should show the full command: {rendered}"
     );
+    // show_bash_details owns metadata only: it must NOT render the command
+    // output or an "Output:" label, which belong solely to show_bash_output.
     assert!(
-        rendered.contains("Output:"),
-        "verbose details should label the command result: {rendered}"
+        !rendered.contains("On branch main"),
+        "show_bash_details must not render bash output: {rendered}"
     );
     assert!(
-        rendered.contains("On branch main"),
-        "verbose details should show the real command output (not the metadata footers): {rendered}"
+        !rendered.contains("Untracked files"),
+        "show_bash_details must not render bash output: {rendered}"
+    );
+    assert!(
+        !rendered.contains("Output:"),
+        "show_bash_details must not label command output: {rendered}"
     );
     assert!(
         !rendered.contains("Working directory:"),
-        "metadata footers should be filtered out of the output block: {rendered}"
+        "metadata footers should be filtered out: {rendered}"
     );
     assert!(
         !rendered.contains("Execution time:"),
-        "execution-time footer should be filtered out of the output block: {rendered}"
+        "execution-time footer should be filtered out: {rendered}"
     );
     crate::tui::ui::tools_ui::tests_show_bash_details_override::set(false);
+}
+
+#[test]
+fn long_bash_command_and_output_wrap_instead_of_truncating() {
+    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(true);
+    crate::tui::ui::tools_ui::tests_show_bash_output_override::set(true);
+
+    // A command and output line far wider than the 40-col pane.
+    let long_command = "find . -type f -name '*.png' -not -path './node_modules/*' -exec sh -c 'cp \"$1\" /tmp/backup/${1//\\//_}' _ {} \\;";
+    let long_output = "module.exports = { build: { target: 'esnext', rollupOptions: { external: ['node:fs', 'node:path'] } }, plugins: [react(), tailwind(), { name: 'wrangler', apply: 'build' }] };";
+
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: format!("{long_output}\n\nWorking directory: /repo\n\nExecution time: 3ms\n\nExit code: 0"),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_bash_long".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({ "command": long_command }),
+            intent: Some("Run heavy command".to_string()),
+            thought_signature: None,
+        }),
+    };
+
+    let rendered = render_tool_message(&msg, 40, crate::config::DiffDisplayMode::Off)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let compact = without_whitespace(&rendered);
+
+    // The full command must survive (wrapped across rows), never elided.
+    assert!(
+        compact.contains(&without_whitespace(long_command)),
+        "long command must wrap and stay complete: {rendered}"
+    );
+    assert!(
+        compact.contains(&without_whitespace(long_output)),
+        "long output line must wrap and stay complete: {rendered}"
+    );
+
+    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(false);
+    crate::tui::ui::tools_ui::tests_show_bash_output_override::set(false);
+}
+
+#[test]
+fn bash_row_has_no_trimmed_command_summary_when_details_are_on() {
+    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(true);
+    crate::tui::ui::tools_ui::tests_show_bash_output_override::set(true);
+
+    // A command that is short enough to fit, with no intent, so the former
+    // behavior would have put a "$ git diff --stat -" summary on the row.
+    let command = "git diff --stat -";
+
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "working tree clean\n\nWorking directory: /Users/vasilypelikh/IdeaProjects/vpelikh/github/jcode\n\nExecution time: 1ms\n\nExit code: 0".to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_bash_row".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({ "command": command }),
+            intent: None,
+            thought_signature: None,
+        }),
+    };
+
+    // Narrow width so the old row-summary path would trim "$ <command>" to
+    // "$ …".
+    let rendered = render_tool_message(&msg, 40, crate::config::DiffDisplayMode::Off)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // The row must not show a lossy trimmed "$ …" summary command.
+    assert!(
+        !rendered.lines().any(|l| l.contains("$ …")),
+        "row must not show a trimmed command summary when details are on: {rendered}"
+    );
+    // The full command must be present (in the details block, wrapped).
+    assert!(
+        rendered.contains(&format!("$ {command}")),
+        "full command should render in the details block: {rendered}"
+    );
+
+    crate::tui::ui::tools_ui::tests_show_bash_details_override::set(false);
+    crate::tui::ui::tools_ui::tests_show_bash_output_override::set(false);
 }
 
 fn gmail_draft_message(content: &str, input: serde_json::Value) -> DisplayMessage {
