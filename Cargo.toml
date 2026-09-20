@@ -216,7 +216,8 @@ tempfile = "3"
 # to skip optional default feature stacks.
 #
 # jemalloc is a default feature: it gives a page-returning allocator whose
-# decay tuning (in src/main.rs) releases freed heap back to the OS, so a
+# decay tuning (applied at build time via JEMALLOC_SYS_WITH_MALLOC_CONF in
+# .cargo/config.toml) releases freed heap back to the OS, so a
 # long-running daemon's RSS is bounded to real use instead of growing into
 # retained arenas. This applies on every platform (macOS system malloc
 # retains forever; glibc's arena retention is also released by jemalloc's
