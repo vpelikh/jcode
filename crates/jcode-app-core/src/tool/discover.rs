@@ -2779,6 +2779,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
     async fn execute_records_off_catalog_selection_without_provider_information() {
         let _guard = crate::storage::lock_test_env();
         let prev_home = std::env::var_os("JCODE_HOME");
@@ -2838,6 +2839,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
     async fn details_executes_through_public_tool_interface() {
         let _guard = crate::storage::lock_test_env();
         let prev_home = std::env::var_os("JCODE_HOME");
@@ -2909,6 +2911,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
     async fn git_category_executes_end_to_end_with_enabled_config_and_local_server() {
         let _guard = crate::storage::lock_test_env();
         let prev_home = std::env::var_os("JCODE_HOME");
