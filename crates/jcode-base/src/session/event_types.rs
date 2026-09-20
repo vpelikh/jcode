@@ -616,24 +616,28 @@ impl SessionEventMap {
     /// session needs to resolve.
     pub fn orphaned_compaction(&self) -> Option<&SessionEvent> {
         // Track the most recent start that has not been matched by a later end.
-        let mut open_depth = 0usize;
-        let mut open: Option<&SessionEvent> = None;
+        // A LIFO stack: each `CompactionEnd` pops the innermost open `Start`,
+        // so an unmatched `Start` that is nested *below* a closed bracket is
+        // reported correctly (a naive depth counter would wrongly keep the
+        // closed inner `Start` around when a later `End` pops the depth back
+        // past zero). Compaction runs are non-nesting in practice, but the log
+        // is corruption-tolerant by design and must still identify the true
+        // orphan on a malformed sequence.
+        let mut open: Vec<&SessionEvent> = Vec::new();
         for event in &self.events {
             match &event.op {
                 SessionEventOp::CompactionStart { .. } => {
-                    open_depth += 1;
-                    open = Some(event);
+                    open.push(event);
                 }
                 SessionEventOp::CompactionEnd { .. } => {
-                    open_depth = open_depth.saturating_sub(1);
-                    if open_depth == 0 {
-                        open = None;
-                    }
+                    open.pop();
                 }
                 _ => {}
             }
         }
-        open
+        // The innermost (latest) unmatched Start is what a resumed session needs
+        // to resolve. `open` is non-empty exactly when a bracket is orphaned.
+        open.last().copied()
     }
 
     /// Open a compaction bracket by appending a `CompactionStart` marker.

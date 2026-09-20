@@ -274,6 +274,64 @@ fn test_compaction_bracket_orphan_detection_on_crash() {
     );
 }
 
+/// Nested-bracket corruption tolerance: `[Start A, Start B, End B]` leaves A
+/// orphaned, but the naive "last Start after depth>0" tracking would wrongly
+/// report the *closed* B. `orphaned_compaction` must return the innermost
+/// unmatched Start (A), not the closed B.
+#[test]
+fn test_orphaned_compaction_reports_innermost_unmatched_start() {
+    let mut map = SessionEventMap::default();
+    map.append_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "a".to_string(),
+        op: SessionEventOp::CompactionStart {
+            compaction_id: "outer".to_string(),
+            covers_up_to_turn: 5,
+        },
+        parent_id: None,
+        version: 1,
+    });
+    map.append_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "b".to_string(),
+        op: SessionEventOp::CompactionStart {
+            compaction_id: "inner".to_string(),
+            covers_up_to_turn: 5,
+        },
+        parent_id: None,
+        version: 1,
+    });
+    // Close the inner bracket; the OUTER one is the real orphan.
+    map.append_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "end_b".to_string(),
+        op: SessionEventOp::CompactionEnd {
+            compaction: StoredCompactionState {
+                summary_text: "inner".to_string(),
+                openai_encrypted_content: None,
+                covers_up_to_turn: 5,
+                original_turn_count: 20,
+                compacted_count: 5,
+            },
+        },
+        parent_id: None,
+        version: 1,
+    });
+
+    let orphan = map
+        .orphaned_compaction()
+        .expect("the outer bracket must remain orphaned");
+    match &orphan.op {
+        SessionEventOp::CompactionStart { compaction_id, .. } => {
+            assert_eq!(
+                compaction_id, "outer",
+                "orphaned_compaction must report the innermost *unmatched* start"
+            );
+        }
+        _ => panic!("orphan must be a CompactionStart marker"),
+    }
+}
+
 /// A `CompactionEnd` without a preceding `CompactionStart` is itself an orphan
 /// (an "unpaired close") and must be flagged by the bracket invariant.
 #[test]
