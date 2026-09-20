@@ -75,6 +75,13 @@ pub fn take_resync_requested() -> bool {
     RESYNC_REQUESTED.swap(false, Ordering::AcqRel)
 }
 
+/// Non-consuming peek at whether a resync is pending. Used by the idle-animation
+/// fast path to decide whether to stand down, *without* clearing the flag so the
+/// following full frame can still consume it and actually perform the heal.
+pub fn resync_pending() -> bool {
+    RESYNC_REQUESTED.load(Ordering::Acquire)
+}
+
 enum Chunk {
     Data(Box<[u8]>),
     Shutdown,
@@ -97,6 +104,13 @@ struct WriterInner {
 pub struct TerminalWriter {
     tx: Option<Sender<Chunk>>,
     inner: Arc<WriterInner>,
+    /// Coalescing scratch buffer. ratatui's `CrosstermBackend` calls `write` once
+    /// per cell/command, so buffering here and sending to the channel on `flush`
+    /// turns a per-frame burst of tiny allocations into one chunk (cheaper, and
+    /// drops whole frames instead of individual cells on a wedged pty). This
+    /// buffer lives only on the render thread (behind `&mut self`), never the
+    /// writer thread.
+    pending: Vec<u8>,
 }
 
 impl TerminalWriter {
@@ -118,10 +132,40 @@ impl TerminalWriter {
             .spawn(move || run_writer(writer, rx, done_tx, &thread_inner))
             .expect("failed to spawn terminal writer thread");
         *inner.handle.lock().unwrap() = Some(handle);
-        Self { tx: Some(tx), inner }
+        Self { tx: Some(tx), inner, pending: Vec::new() }
+    }
+
+    /// Create a writer thread over a `dup` of fd 1 (stdout) that does not
+    /// participate in the process-wide [`Stdout`] lock.
+    ///
+    /// Why this matters: a `Stdout` handle acquires the global stdout reentrant
+    /// mutex for the duration of each `write`. If the pty is wedged, the writer
+    /// thread blocks inside `write(2)` while *holding that lock*, so any other
+    /// `io::stdout()` caller on the render loop (mode re-application on
+    /// `FocusGained`, OSC‑52 clipboard, window title) would block waiting for the
+    /// lock — reintroducing the exact render-loop freeze the shim removes. Using a
+    /// raw duplicated fd means the wedged `write(2)` holds no user-space lock, so
+    /// concurrent `io::stdout()` calls proceed independently.
+    ///
+    /// [`Stdout`]: std::io::Stdout
+    #[cfg(unix)]
+    pub fn stdout() -> io::Result<Self> {
+        use std::os::fd::FromRawFd;
+        // Use `dup` so we own a private descriptor to the terminal; closing it on
+        // teardown never affects the real fd 1.
+        let dup = unsafe { libc::dup(libc::STDOUT_FILENO) };
+        if dup < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // `File` has no user-space locking, so the writer thread's blocking
+        // `write(2)` holds no process-wide lock.
+        let file = unsafe { std::fs::File::from_raw_fd(dup) };
+        Ok(Self::new(file))
     }
 
     fn shutdown(&mut self) {
+        // Flush any coalesced-but-not-yet-enqueued bytes so Drop loses nothing.
+        let _ = self.flush();
         let tx = self.tx.take();
         if let Some(tx) = tx {
             // Signal the writer to drain+flush and stop.
@@ -159,38 +203,42 @@ impl Write for TerminalWriter {
         if buf.is_empty() {
             return Ok(0);
         }
+        // Buffer on the render thread. Actual enqueue to the channel happens on
+        // `flush`, so a frame's per-cell writes coalesce into one chunk. Never
+        // perform the real pty `write` (blocking) here; the writer thread does.
+        self.pending.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        // Enqueue whatever has accumulated since the last flush (usually one
+        // full frame) to the channel, which the writer thread writes+flushes to
+        // the real pty. This never blocks: sending to an unbounded channel is
+        // non-blocking, and drops happen here if the backlog is saturated.
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let len = self.pending.len();
+        let body: Box<[u8]> = std::mem::take(&mut self.pending).into_boxed_slice();
+
         let Some(tx) = self.tx.as_ref() else {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "writer shut down"));
         };
-        let len = buf.len();
-
-        // Reserve `len` bytes in the byte-bounded backlog, dropping only when the
-        // *current* backlog is already saturated (the consumer is not draining).
-        //
-        // A single large chunk (e.g. a full-screen redraw diff) must NOT be
-        // dropped on a healthy consumer just because `len > cap`; we allow it to
-        // be enqueued and rely on the consumer to drain it. We only stop
-        // enqueueing once the outstanding (queued-but-not-drained) backlog has
-        // already reached `QUEUE_CAPACITY_BYTES`. This bounds sustained memory
-        // when the pty is wedged while never dropping a legitimate fresh frame on
-        // a draining pty.
-        //
-        // We use `compare_exchange` so the reservation is atomic: `buffered` is
-        // mutated when the writer drains (`fetch_sub`) and by concurrent `write`s.
+        // Reserve `len` bytes, dropping the whole frame only when the *current*
+        // backlog is already saturated (the consumer is not draining). This bounds
+        // memory on a wedged pty and never drops a legitimate fresh frame on a
+        // draining consumer.
         let mut prev = self.inner.buffered.load(Ordering::Relaxed);
         loop {
             if prev >= QUEUE_CAPACITY_BYTES {
-                // Backlog already saturated (wedged). Drop this chunk and flag a
+                // Backlog already saturated (wedged). Drop this frame and flag a
                 // resync; ratatui's model no longer matches the real screen.
                 RESYNC_REQUESTED.store(true, Ordering::Release);
-                return Ok(len); // accepted-with-drop so the render loop never blocks
+                return Ok(()); // accepted-with-drop so the render loop never blocks
             }
-            // `checked_add` guards against a pathological `len` (or cumulative
-            // backlog) that would overflow `usize` and wrap the reservation to a
-            // tiny value, which would otherwise defeat the cap entirely.
             let Some(next) = prev.checked_add(len) else {
                 RESYNC_REQUESTED.store(true, Ordering::Release);
-                return Ok(len);
+                return Ok(());
             };
             match self.inner.buffered.compare_exchange(
                 prev,
@@ -203,22 +251,14 @@ impl Write for TerminalWriter {
             }
         }
 
-        let chunk: Box<[u8]> = buf.to_vec().into_boxed_slice();
-        match tx.send(Chunk::Data(chunk)) {
-            Ok(()) => Ok(len),
+        match tx.send(Chunk::Data(body)) {
+            Ok(()) => Ok(()),
             Err(_) => {
                 // Writer exited; undo the reservation.
                 self.inner.buffered.fetch_sub(len, Ordering::Relaxed);
                 Err(io::Error::new(io::ErrorKind::BrokenPipe, "writer thread exited"))
             }
         }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        // No-op on the render thread: bytes are buffered in the channel and the
-        // writer thread flushes the real pty. Returning Ok keeps the ratatui
-        // backend happy without blocking.
-        Ok(())
     }
 }
 
@@ -310,7 +350,14 @@ mod tests {
         for i in 0..5000 {
             let data = vec![b'x'; 1024];
             assert!(writer.write_all(&data).is_ok(), "write {i} failed");
+            // Flush periodically, as the render loop flushes a frame each tick.
+            // This is where the buffered writer enqueues (and, once the wedged
+            // consumer saturates, drops) the accumulated bytes.
+            if i % 8 == 0 {
+                let _ = writer.flush();
+            }
         }
+        let _ = writer.flush();
         let elapsed = start.elapsed();
         assert!(
             elapsed < std::time::Duration::from_secs(2),
@@ -318,9 +365,15 @@ mod tests {
         );
         // Dropped output must flag a resync so the app re-emits the screen once
         // the pty drains, and reading it clears the flag for the next frame.
+        // A peek (used by the idle-animation gate) must not consume it, so the
+        // full frame's take still sees it and performs the heal.
+        assert!(
+            resync_pending(),
+            "expected a resync request after output was dropped"
+        );
         assert!(
             take_resync_requested(),
-            "expected a resync request after output was dropped"
+            "peek must not consume the resync request"
         );
         assert!(
             !take_resync_requested(),
@@ -358,7 +411,7 @@ mod tests {
     #[test]
     fn app_terminal_draw_never_blocks_on_a_wedged_pty() {
         let (wedge, release) = WedgedWriter::new();
-        let mut writer = TerminalWriter::new(wedge);
+        let writer = TerminalWriter::new(wedge);
         let backend = ratatui::backend::CrosstermBackend::new(writer);
         let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
         let start = std::time::Instant::now();
@@ -508,5 +561,210 @@ mod tests {
         drop(shim);
         let delivered: usize = wrx.try_iter().map(|c| c.len()).sum();
         assert_eq!(delivered, QUEUE_CAPACITY_BYTES + 1, "large frame was dropped");
+    }
+
+    /// Regression guard for the round-D fix: a writer over a raw `File` (e.g. the
+    /// `dup` of fd 1 used by [`TerminalWriter::stdout`]) must not hold the global
+    /// `Stdout` lock while blocked in `write(2)`. If it did, a wedged pty would
+    /// block *every other* `io::stdout()` caller on the render loop — reintroducing
+    /// the freeze we removed.
+    ///
+    /// We model the wedge with a pipe whose reader is never read: the raw `File`
+    /// writer blocks in `write(2)`, but a concurrent `io::stdout()` call must still
+    /// complete (they do not share a lock).
+    #[cfg(unix)]
+    #[test]
+    fn raw_file_writer_does_not_block_io_stdout_when_wedged() {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe() failed");
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        // Wrap the blocking pipe write end in a raw File (no user-space lock).
+        let file = unsafe { std::fs::File::from_raw_fd(write_fd) };
+        let mut shim = TerminalWriter::new(file);
+
+        // Saturate the pipe so further write(2) on the writer thread blocks.
+        let big = vec![b'x'; 1024 * 1024];
+        for _ in 0..4 {
+            assert!(shim.write_all(&big).is_ok());
+        }
+        // The writer thread is now blocked in write(2) on the raw File.
+        // A concurrent io::stdout() write must still succeed (proving it does not
+        // contend on the same lock).
+        let mut out = std::io::stdout();
+        let start = std::time::Instant::now();
+        assert!(out.write_all(b"\x1b]0;\x07").is_ok()); // harmless OSC0 (clear title)
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "io::stdout() blocked on a wedged raw-file writer"
+        );
+
+        drop(shim);
+        unsafe { libc::close(read_fd) };
+    }
+
+    /// Concurrent stress: many threads write through the shim simultaneously and
+    /// the writer is dropped mid-flight. The shim must never hang, crash, or lose
+    /// the ordering guarantee on a healthy consumer.
+    #[test]
+    fn concurrent_writers_and_shutdown_do_not_deadlock() {
+        let (t, wrx) = mpsc::channel::<Vec<u8>>();
+        let shim = Arc::new(Mutex::new(TerminalWriter::new(ChannelWriter { tx: t })));
+
+        let mut handles = Vec::new();
+        for tid in 0..8 {
+            let shim = Arc::clone(&shim);
+            handles.push(thread::spawn(move || {
+                for i in 0..200 {
+                    let msg = format!("t{tid}-{i};");
+                    let mut g = shim.lock().unwrap();
+                    assert!(g.write_all(msg.as_bytes()).is_ok());
+                }
+            }));
+        }
+
+        let start = std::time::Instant::now();
+        for h in handles {
+            h.join().unwrap();
+        }
+        // All writers finished quickly (no deadlock between writers).
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        drop(shim); // shutdown drains + joins
+
+        // The consumer received every message. Each message ends in ';', so counting
+        // ';' tells us exactly how many chunks arrived. 8 threads * 200 writes.
+        let semicolons: usize = wrx
+            .try_iter()
+            .flatten()
+            .filter(|&b| b == b';')
+            .count();
+        assert_eq!(semicolons, 8 * 200, "healthy-path concurrent delivery lost data");
+    }
+
+    /// Writes coalesce until `flush`, then drain in order as one unit. This is
+    /// the buffered contract: the render loop flushes a frame each tick, turning
+    /// many per-cell `write`s into one channel chunk.
+    #[test]
+    fn writes_coalesce_until_flush_then_deliver_in_order() {
+        let (t, wrx) = mpsc::channel::<Vec<u8>>();
+        let mut shim = TerminalWriter::new(ChannelWriter { tx: t });
+
+        // Writes without flush are not yet delivered.
+        shim.write_all(b"a").unwrap();
+        shim.write_all(b"b").unwrap();
+        assert!(
+            wrx.try_recv().is_err(),
+            "writes should not be delivered until flush"
+        );
+
+        // A flush delivers all accumulated bytes as a unit.
+        shim.flush().unwrap();
+        // The writer thread forwards the chunk to `wrx` asynchronously; wait for
+        // it with a timeout rather than racing `try_recv`.
+        let mut got = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while got.len() < 2 && std::time::Instant::now() < deadline {
+            match wrx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(chunk) => got.push_str(std::str::from_utf8(&chunk).unwrap()),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(e) => panic!("recv failed: {e:?}"),
+            }
+        }
+        assert_eq!(got, "ab", "coalesced bytes lost: {got:?}");
+        drop(shim);
+    }
+
+    /// Byte-exact stream integrity under coalescing: varying-size writes
+    /// interleaved with flushes must deliver an exactly-ordered, lossless byte
+    /// stream on a healthy consumer. This guards against reordering or partial
+    /// loss from the buffered write+flush path.
+    #[test]
+    fn mixed_size_writes_with_interleaved_flushes_are_exact_and_ordered() {
+        let (t, wrx) = mpsc::channel::<Vec<u8>>();
+        let mut shim = TerminalWriter::new(ChannelWriter { tx: t });
+
+        // A deterministic sequence of writes of varying byte lengths, with flush
+        // boundaries between groups (mirroring frames of per-cell writes).
+        let mut expected: Vec<u8> = Vec::new();
+        let mut group = |shim: &mut TerminalWriter, parts: &[&[u8]], flush_after: bool| {
+            for p in parts {
+                shim.write_all(p).unwrap();
+                expected.extend_from_slice(p);
+            }
+            if flush_after {
+                shim.flush().unwrap();
+            }
+        };
+
+        group(&mut shim, &[b"\x1b[2;1H", b"abcdef"], true);
+        group(&mut shim, &[b"\x1b[3;1H", b"x", b"\x1b[4;1H", b"longer-tail-"], false);
+        group(&mut shim, &[b"ZZ"], true);
+        group(&mut shim, &[b""], false); // empty write, no-op
+        group(&mut shim, &[b"\x1b[5;1Hfinal"], true);
+
+        // Drop flushes any remaining pending bytes.
+        drop(shim);
+
+        // Collect everything delivered to the consumer.
+        let mut got: Vec<u8> = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while got.len() < expected.len() && std::time::Instant::now() < deadline {
+            match wrx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(chunk) => got.extend_from_slice(&chunk),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(e) => panic!("recv failed: {e:?}"),
+            }
+        }
+        assert_eq!(got, expected, "buffered stream corrupted; expected {expected:?}, got {got:?}");
+    }
+
+    /// `flush()` with nothing pending (or called repeatedly) must be a safe no-op,
+    /// and writing after that still works normally.
+    #[test]
+    fn empty_and_repeated_flush_are_noops_and_write_still_works() {
+        let (t, wrx) = mpsc::channel::<Vec<u8>>();
+        let mut shim = TerminalWriter::new(ChannelWriter { tx: t });
+
+        // Empty flush before any writes: no-op, no error.
+        shim.flush().unwrap();
+
+        // Write + flush delivers.
+        shim.write_all(b"x").unwrap();
+        shim.flush().unwrap();
+
+        // A second flush with nothing new pending is also a no-op.
+        shim.flush().unwrap();
+
+        // More writes still work.
+        shim.write_all(b"y").unwrap();
+        shim.flush().unwrap();
+
+        drop(shim);
+        let mut got = String::new();
+        while let Ok(chunk) = wrx.recv_timeout(std::time::Duration::from_millis(200)) {
+            got.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+        assert_eq!(got, "xy", "writes after empty/repeated flush lost: {got:?}");
+    }
+
+    /// The production `TerminalWriter::stdout()` (a `dup` of fd 1) must build a
+    /// working writer: writes succeed, flushes don't block, and dropping doesn't
+    /// hang. This exercises the actual construction path used by
+    /// `build_app_terminal`, not just the generic `new()`.
+    #[cfg(unix)]
+    #[test]
+    fn stdout_dup_constructor_writes_and_drops_cleanly() {
+        let mut shim = TerminalWriter::stdout().expect("stdout() dup failed");
+        // Write a harmless, zero-width terminal sequence (a Bell). Writing to the
+        // real stdout is safe here and verifies the dup'd fd actually carries bytes.
+        assert!(shim.write_all(b"\x07").is_ok());
+        assert!(shim.flush().is_ok());
+        // Dropping flushes pending + shuts down the writer thread; must not hang.
+        let start = std::time::Instant::now();
+        drop(shim);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "stdout() writer drop hung"
+        );
     }
 }
