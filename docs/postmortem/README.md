@@ -27,9 +27,9 @@ class it describes probably needs its own design doc — link to that instead.
 Each postmortem names a stable, reviewable home for the guardrail it added.
 That may be a crate (`crates/jcode-command-risk`), a named code path, a test
 suite, or a documented invariant. The test or enforcement that would have
-caught the class *before it shipped* is the most valuable guardrail of all.
-When a guardrail is fully effective, a follow-up happening later and forcing
-authors to rediscover the same class.
+caught the class *before it shipped* is the most valuable guardrail of all: it
+is what stops a later occurrence from going unnoticed while forcing a new
+author to rediscover the same class.
 
 ## What this archive is for
 
