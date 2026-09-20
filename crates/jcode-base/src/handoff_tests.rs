@@ -784,6 +784,64 @@ fn manual_render_does_not_disturb_auto_inject() {
     assert!(boot.contains("[Handoff from previous session]"));
 }
 
+/// Automatic first-message injection consumes the latest-for-project handoff:
+/// `render_boot_context_and_consume` renders it once and retires it from the
+/// index, so a *fresh* later session in the same project no longer re-injects
+/// the same stale snapshot (the bug where an old handoff keeps popping up in
+/// every new session). Manual render (`render_handoff`) must not consume it.
+#[test]
+fn auto_inject_consumes_latest_handoff_once() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let home = env._home.path();
+    let cwd = home.join("project");
+    std::fs::create_dir_all(&cwd).ok();
+
+    crate::todo::save_todos(
+        "prev-session",
+        &[crate::todo::TodoItem {
+            id: "t".into(),
+            content: "resume the split".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: None,
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    crate::todo::save_plan(
+        "prev-session",
+        &crate::todo::TodoPlan {
+            user_intention: Some("continue server split".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    capture("prev-session", Some(&cwd), "closed", None).expect("capture");
+
+    // First fresh session consumes the handoff at boot.
+    let first = render_boot_context_and_consume(Some(&cwd)).expect("first boot injects");
+    assert!(first.contains("continue server split"));
+    // The same session's later messages do not re-inject (idempotent within
+    // the conversation is handled upstream, but the store no longer surfaces it
+    // for a fresh session either).
+    assert!(render_boot_context_and_consume(Some(&cwd)).is_none());
+
+    // A brand-new later session in the same project must NOT see the stale
+    // handoff again — this is the reported bug.
+    assert!(
+        render_boot_context(Some(&cwd)).is_none(),
+        "consumed handoff must not re-inject on a fresh later session"
+    );
+    assert!(
+        latest_handoff_for_project(Some(&cwd)).is_none(),
+        "consumed handoff must be retired from the index"
+    );
+    // The snapshot file is archived, so explicit manual resume still works.
+    assert!(render_handoff("prev-session").is_some());
+}
+
 /// list_all_handoffs surfaces archived snapshots that are no longer the latest
 /// for their project (so absent from the index), newest first.
 #[test]
