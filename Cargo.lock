@@ -3760,7 +3760,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "futures",
+ "http-body 1.0.1",
  "httpdate",
  "jcode-logging",
  "jcode-message-types",

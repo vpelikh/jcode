@@ -331,7 +331,7 @@ fn vscdb_missing_key_returns_error() {
         result
             .unwrap_err()
             .to_string()
-            .contains("not found or empty")
+            .contains("not found in")
     );
 }
 

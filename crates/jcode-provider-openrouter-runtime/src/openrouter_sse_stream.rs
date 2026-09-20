@@ -246,7 +246,6 @@ async fn stream_response(
             req,
             payload,
             stream_idle_timeout,
-            &jcode_provider_core::transport::endpoint_label(&url),
             move |sent| {
                 let detail = jcode_provider_core::transport::upload_progress_label(
                     sent,
@@ -268,7 +267,17 @@ async fn stream_response(
                 }
             },
         )
-    })?;
+        .await
+        .with_context(|| {
+            let hint = local_endpoint_troubleshooting_hint(&api_base, &model);
+            format!(
+                "Failed to send OpenAI-compatible chat request\n  endpoint: {}\n  model: {}\n  auth: {}\n{}",
+                url,
+                model,
+                auth.label(),
+                hint
+            )
+        })?;
 
     let connect_ms = connect_start.elapsed().as_millis();
     jcode_base::logging::info(&format!(
