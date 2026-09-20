@@ -144,6 +144,28 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
 
     let _ = check_debug_command(app, remote).await;
 
+    // Self-drive the review loop from the idle tick. After a lens reviewer is
+    // spawned there is no further turn-end event to re-poll it (a spawned
+    // reviewer runs asynchronously in its own window, and a CLEAN verdict does
+    // not create a synthetic fix turn), so without this the loop stalls right
+    // after the first spawn and review rounds never actually execute. Guarded
+    // so we only poll when a loop is active and no turn/dispatch is in flight.
+    // We deliberately do NOT fold its return into `needs_redraw`: a reviewer
+    // still in flight returns "pending" on every tick and forcing a redraw
+    // there would defeat idle-redraw throttling. Loop progress (spawning the
+    // next lens, queuing a fix, converging) pushes display messages / status
+    // notices that request redraws on their own.
+    //
+    // The idle self-drive is debounced and guarded by
+    // `maybe_poll_review_loop_from_idle` (see commands_review.rs): it throttles
+    // how often we do the `Session::load` behind a pending reviewer poll, and it
+    // holds the Round-E guard against spawning a premature post-fix re-check
+    // while the review's own fix turn is still queued-but-undispatched (which
+    // would review the PRE-fix tree).
+    if crate::tui::app::commands::is_review_loop_active(app) && !app.is_processing {
+        let _ = crate::tui::app::commands::maybe_poll_review_loop_from_idle(app);
+    }
+
     if !app.is_processing {
         if let Some(request) = app.take_pending_catchup_resume() {
             match remote.resume_session(&request.target_session_id).await {

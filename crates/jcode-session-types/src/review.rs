@@ -329,11 +329,13 @@ pub struct ReviewLoopState {
     /// polling the same reviewer instead of spawning a duplicate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_reviewer_id: Option<String>,
-    /// Session id of the single reviewer session used for the entire review loop.
-    /// When set, all lens reviews reuse this same session instead of spawning new
-    /// ones, creating a truly single-window review experience.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reviewer_session_id: Option<String>,
+    /// How many times the current lens's reviewer has been respawned after
+    /// being lost (see `reviewer_respawn`): caps how many times a transient
+    /// reviewer loss is retried before the loop hard-finalizes. Reset to zero
+    /// whenever an active reviewer is *spawned fresh* (not a respawn) or a
+    /// verdict is consumed, so a later lens still gets its full budget.
+    #[serde(default)]
+    pub reviewer_respawn_count: u32,
     /// Whether the most recent fix turn actually changed files on disk. A
     /// *productive* (file-changing) re-check never counts against the stall
     /// cap, even if the open-findings set did not shrink: the fix may have been
@@ -358,7 +360,7 @@ impl Default for ReviewLoopState {
             phase: ReviewLoopPhase::Lenses,
             awaiting_postfix_recheck: false,
             active_reviewer_id: None,
-            reviewer_session_id: None,
+            reviewer_respawn_count: 0,
             last_fix_touched_files: false,
             fix_baseline_tree: None,
         }
@@ -689,9 +691,13 @@ mod review_tests {
         let mut state = ReviewLoopState::default();
         state.last_fix_touched_files = true;
         state.fix_baseline_tree = Some(" M src/foo.rs".to_string());
+        // The reviewer-loss respawn budget is part of the round-tripped state so
+        // a session resumed mid-respawn keeps its remaining budget.
+        state.reviewer_respawn_count = 1;
         let json = serde_json::to_string(&state).unwrap();
         let back: ReviewLoopState = serde_json::from_str(&json).unwrap();
         assert!(back.last_fix_touched_files);
         assert_eq!(back.fix_baseline_tree.as_deref(), Some(" M src/foo.rs"));
+        assert_eq!(back.reviewer_respawn_count, 1);
     }
 }

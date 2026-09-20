@@ -424,6 +424,50 @@ mod review_loop_tests {
     }
 
     #[test]
+    fn fix_in_first_pass_still_enters_confirmation() {
+        // A lens that required a fix (findings -> re-check -> clean) must not
+        // break the loop's progression: it advances through the remaining lenses,
+        // enters the confirmation pass, and converges the same as an all-clean run.
+        let mut s = clean_state();
+        // First lens finds a bug, gets fixed, re-check clean.
+        assert_eq!(next_action(&mut s), ReviewLoopAction::SpawnReviewer(ReviewLens::Correctness));
+        match apply_verdict(&mut s, &findings("off by one"), 3) {
+            ReviewLoopAction::QueueFixTurn(_) => {}
+            other => panic!("expected fix turn, got {other:?}"),
+        }
+        assert_eq!(next_action(&mut s), ReviewLoopAction::SpawnReviewer(ReviewLens::Correctness));
+        match apply_verdict(&mut s, &ReviewReport::Clean, 3) {
+            ReviewLoopAction::SpawnReviewer(ReviewLens::EdgesErrors) => {}
+            other => panic!("expected advance to edges, got {other:?}"),
+        }
+        // Remaining 5 lenses clean -> first pass ends, confirmation begins.
+        for _ in 1..6 {
+            let lens = s.current_lens.unwrap();
+            match next_action(&mut s) {
+                ReviewLoopAction::SpawnReviewer(l) => assert_eq!(l, lens),
+                other => panic!("expected spawn, got {other:?}"),
+            }
+            match apply_verdict(&mut s, &ReviewReport::Clean, 3) {
+                ReviewLoopAction::SpawnReviewer(_) | ReviewLoopAction::Converged => {}
+                other => panic!("expected spawn/converged, got {other:?}"),
+            }
+        }
+        assert!(s.phase_is_confirmation(), "must enter confirmation after a fixed first-pass lens");
+        // Confirmation completes cleanly.
+        for i in 0..6 {
+            let lens = s.current_lens.unwrap();
+            assert_eq!(next_action(&mut s), ReviewLoopAction::SpawnReviewer(lens));
+            match apply_verdict(&mut s, &ReviewReport::Clean, 3) {
+                ReviewLoopAction::SpawnReviewer(_) if i < 5 => {}
+                ReviewLoopAction::Converged if i == 5 => {}
+                other => panic!("unexpected at confirmation step {i}: {other:?}"),
+            }
+        }
+        assert!(s.finished);
+        assert_eq!(s.finish_reason.as_deref(), Some("converged"));
+    }
+
+    #[test]
     fn stall_cap_force_stops() {
         let mut s = clean_state();
         next_action(&mut s);

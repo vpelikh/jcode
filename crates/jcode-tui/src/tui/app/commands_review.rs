@@ -1081,6 +1081,17 @@ pub(super) fn handle_autoreview_command_local(app: &mut App, trimmed: &str) -> b
             true
         }
         "now" => {
+            // The per-lens review loop already covers this finished work, so a
+            // redundant one-shot autoreview would spawn a second reviewer over
+            // the same session. Suppress it (matching the design intent that
+            // "one-shot is suppressed so both don't fire on the same turn").
+            if is_review_loop_active(app) {
+                app.push_display_message(DisplayMessage::system(
+                    "Review loop is already active; /autoreview now suppressed to avoid double-review (use /review-loop stop first if you want a one-shot).".to_string(),
+                ));
+                app.set_status_notice("Autoreview: suppressed (review loop active)");
+                return true;
+            }
             if let Err(error) = launch_autoreview_window_local(app) {
                 app.push_display_message(DisplayMessage::error(format!(
                     "Failed to launch autoreview: {}",
@@ -1261,6 +1272,96 @@ pub(super) fn is_review_loop_active(app: &App) -> bool {
         .unwrap_or(false)
 }
 
+/// True when the review loop has a fix turn queued-but-not-yet-dispatched.
+///
+/// A review fix turn on the remote client is sent through `queued_messages`
+/// (there is no `pending_turn` handler remotely). `pending_queued_dispatch` is
+/// the first signal one is queued, but after a failed send the message is
+/// restored to `queued_messages` without re-arming the flag. While the fix is
+/// unborn, `active_reviewer_id` is None and `awaiting_postfix_recheck` is true,
+/// so polling the loop would spawn the post-fix re-check reviewer against the
+/// PRE-fix tree. This is the narrow guard the idle self-drive uses: it blocks
+/// only on the review's own unborn fix — not on an unrelated `interleave_message`
+/// or system reminder, which should not stall lens progress.
+pub(super) fn review_fix_pending(app: &App) -> bool {
+    app.session
+        .review_loop
+        .as_ref()
+        .is_some_and(|s| {
+            s.awaiting_postfix_recheck && (app.pending_queued_dispatch || !app.queued_messages.is_empty())
+        })
+}
+
+/// Minimum interval between idle-self-drive polls of an in-flight reviewer.
+///
+/// `step_review_loop` calls `Session::load` (which replays the session journal)
+/// on every idle tick when a reviewer is pending. The idle tick fires many
+/// times per second, so that would put continuous disk reads behind what is
+/// often a long-running reviewer. We poll aggressively on real turn-end events
+/// (not throttled), but the *idle* self-drive — whose only job is to notice
+/// that an async reviewer eventually finished — is debounced to this interval.
+/// A reviewer taking longer than the interval is polled at most once per
+/// interval instead of on every tick, which cuts the load rate by ~an order of
+/// magnitude while keeping latency to noticed-verdict bounded by the interval.
+const REVIEW_LOOP_IDLE_POLL_DEBOUNCE: std::time::Duration =
+    std::time::Duration::from_millis(250);
+
+/// How many times a lens's reviewer may be respawned after being lost before
+/// the loop hard-finalizes with `reviewer_unavailable`. A single transient loss
+/// (terminal killed, OOM'd, window closed) is retried so one bad reviewer does
+/// not silently abort the rest of the 6-lens loop, but an unbounded retry could
+/// loop forever on a persistently-broken environment, so the budget is capped.
+const REVIEW_LOOP_MAX_REVIEWER_RESPAWNS: u32 = 2;
+
+/// How long a reviewer session may go without writing anything (no verdict, no
+/// messages) before it is treated as stale/dead. A reviewer whose process died
+/// (e.g. its terminal was killed, or it was orphaned by a reload) leaves its
+/// session file on disk with no verdict and a frozen `updated_at`, so polling it
+/// would return "Pending" forever and the loop would stall on that lens. We use
+/// `Session.updated_at` (refreshed on every save) as the liveness signal: if a
+/// no-verdict reviewer has been QUIET for this long, its process is gone, so we
+/// treat it as Gone and let the bounded respawn (then finalize) take over. The
+/// window is deliberately generous to never misclassify a slow-but-live reviewer
+/// that simply has not written yet or is reasoning across a long tool call.
+const REVIEW_LOOP_STALE_REVIEWER_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30 * 60);
+
+/// Poll the review loop from an idle tick if the debounce window has elapsed.
+///
+/// Returns `true` only when a poll actually ran. Callers do not fold this into
+/// `needs_redraw`; loop progress pushes its own display/status updates.
+pub(super) fn maybe_poll_review_loop_from_idle(app: &mut App) -> bool {
+    // While a queued follow-up is about to be dispatched (pending_queued_dispatch),
+    // do not also step the review loop: the run loop will dispatch that message
+    // (setting is_processing) and the loop would otherwise double-schedule a
+    // reviewer against it. This covers both a review fix (via review_fix_pending)
+    // and a poke/gate continuation queued in a loop gap (which #2's interleave
+    // can now produce while awaiting_postfix_recheck is false).
+    if app.pending_queued_dispatch {
+        return false;
+    }
+    // Round-E narrow guard: never self-drive while the review's own fix turn is
+    // queued-but-undispatched (would spawn the re-check reviewer against the
+    // pre-fix tree). This deliberately does NOT use `has_queued_followups()`:
+    // an unrelated interleave message or hidden reminder must not stall lens
+    // progress.
+    if review_fix_pending(app) {
+        return false;
+    }
+    let now = Instant::now();
+    let due = match app.last_review_loop_idle_poll {
+        Some(prev) if now.duration_since(prev) < REVIEW_LOOP_IDLE_POLL_DEBOUNCE => false,
+        _ => {
+            app.last_review_loop_idle_poll = Some(now);
+            true
+        }
+    };
+    if !due {
+        return false;
+    }
+    step_review_loop(app)
+}
+
 /// Enter the review loop after the completion gates pass. Seeded on the session
 /// so it survives reloads; the actual reviewing is driven by turn-end followups.
 pub(super) fn maybe_enter_review_loop(app: &mut App) {
@@ -1309,6 +1410,10 @@ pub(super) fn maybe_enter_review_loop(app: &mut App) {
         .get_or_insert_with(crate::session::ReviewLoopState::new);
     review_loop::enter_review_loop(state);
     state.active_reviewer_id = None;
+    // A fresh loop must not inherit the idle-poll debounce clock from a previous
+    // (just-finished) loop; otherwise the first tick would treat it as a recent
+    // poll and delay the first reviewer spawn by up to the debounce interval.
+    app.last_review_loop_idle_poll = None;
     let _ = app.session.save();
     app.push_display_message(DisplayMessage::system(
         "🔁 Review loop started: reviewing the finished work across 6 lenses.".to_string(),
@@ -1330,29 +1435,21 @@ fn spawn_loop_reviewer(app: &mut App, lens: jcode_session_types::ReviewLens) -> 
         .clone()
         .unwrap_or_else(|| current_autoreview_model_summary(app));
 
-    // Reuse a single reviewer session across all lens reviews when one already
-    // exists, otherwise spawn a fresh one and remember its id for reuse. This
-    // gives the post-completion review loop a single, persistent reviewer
-    // window instead of opening a new terminal per lens.
-    let reviewer_session_id = app
-        .session
-        .review_loop
-        .as_ref()
-        .and_then(|s| s.reviewer_session_id.clone());
-
-    let reuse_existing = reviewer_session_id.is_some();
-    let session_id = match reviewer_session_id {
-        Some(reused_id) => reused_id,
-        None => {
-            let (id, _name) =
-                clone_session_for_review(app, "review-loop", initial_model, None)?;
-            // Persist the id so subsequent lens reviews reuse this same window.
-            if let Some(state) = app.session.review_loop.as_mut() {
-                state.reviewer_session_id = Some(id.clone());
-            }
-            id
-        }
-    };
+    // Each lens gets its own fresh reviewer session + client process. This is
+    // the per-lens independence the proposal requires (see
+    // `docs/proposals/review-rounds.md`): a lens review runs on a clean slate,
+    // untainted by an earlier lens's prompt or verdict.
+    //
+    // Reusing a single `reviewer_session_id` across lenses does NOT work: the
+    // startup prompt is delivered via the one-shot `client-input-<id>` handoff
+    // file, which a headed client process consumes only once at launch
+    // (`--fresh-spawn --resume <id>`, see `tui_lifecycle_runtime.rs`). On the
+    // second lens we do not launch a new process, so the already-running
+    // reviewer never receives the new lens prompt and `poll_loop_reviewer`
+    // would wait forever (or mis-read a stale verdict still in the reused
+    // session's history). We deliberately spawn fresh per lens.
+    let (session_id, _name) =
+        clone_session_for_review(app, "review-loop", initial_model, None)?;
 
     prepare_review_spawned_session(
         &session_id,
@@ -1363,19 +1460,13 @@ fn spawn_loop_reviewer(app: &mut App, lens: jcode_session_types::ReviewLens) -> 
         None,
     );
 
-    // Only open a terminal the first time. A reused reviewer session already
-    // has its window open; re-injecting the prompt into the existing session
-    // re-points it at the current lens.
-    if !reuse_existing {
-        let exe = super::launch_client_executable();
-        let cwd = active_working_dir(app)
-            .filter(|path| path.is_dir())
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-        let socket = std::env::var("JCODE_SOCKET").ok();
-        super::spawn_in_new_terminal(&exe, &session_id, &cwd, socket.as_deref())?;
-    }
-
+    let exe = super::launch_client_executable();
+    let cwd = active_working_dir(app)
+        .filter(|path| path.is_dir())
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let socket = std::env::var("JCODE_SOCKET").ok();
+    super::spawn_in_new_terminal(&exe, &session_id, &cwd, socket.as_deref())?;
     Ok(session_id)
 }
 
@@ -1414,7 +1505,38 @@ fn poll_loop_reviewer(reviewer_id: &str) -> PollResult {
             return PollResult::Report(report);
         }
     }
+    // No verdict yet. Before declaring "Pending", rule out a DEAD reviewer: if
+    // the session has not written anything (updated_at frozen) for a long time,
+    // its process is gone (terminal killed / orphaned by a reload) even though
+    // the session file still exists. Polling it would otherwise return Pending
+    // forever and the loop would stall on this lens. The timeout is generous so
+    // a slow-but-live reviewer (which writes messages and refreshes updated_at)
+    // is never misclassified.
+    if reviewer_session_stale(
+        session.updated_at,
+        chrono::Utc::now(),
+        REVIEW_LOOP_STALE_REVIEWER_TIMEOUT,
+    ) {
+        return PollResult::Gone;
+    }
     PollResult::Pending
+}
+
+/// True when a no-verdict reviewer session has been silent (updated_at frozen)
+/// for at least `timeout`. Used to detect a reviewer whose process died but
+/// whose session file persists, so the loop does not poll it as Pending forever.
+/// `updated_at` is treated as the activity clock (refreshed on each save); a
+/// live reviewer writing messages stays "fresh" and is never misclassified.
+pub(super) fn reviewer_session_stale(
+    updated_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+    timeout: std::time::Duration,
+) -> bool {
+    let idle = now
+        .signed_duration_since(updated_at)
+        .to_std()
+        .unwrap_or(std::time::Duration::ZERO);
+    idle >= timeout
 }
 
 /// Step the review loop from the turn-end followups hook. Returns true when a
@@ -1436,20 +1558,44 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
         match poll_loop_reviewer(&reviewer_id) {
             PollResult::Gone => {
                 // The reviewer child session disappeared (deleted/unloadable).
-                // Finalize the loop instead of polling forever: signal the user
-                // and stop. The loop is left "finished" so it does not restart
-                // on the next turn-end.
+                // Retry a bounded number of times before giving up: a single
+                // transient loss (terminal killed, OOM, window closed) should
+                // not silently abort the other 5 lenses. Clear the stale id and
+                // respawn the same lens; once the budget is exhausted, finalize
+                // the loop with a terminal reason so it cannot keep spinning.
                 state.active_reviewer_id = None;
-                state.finished = true;
-                state.finish_reason = Some("reviewer_unavailable".to_string());
-                let digest = review_loop::build_and_store_digest(&mut state);
-                app.push_display_message(DisplayMessage::system(format!(
-                    "{digest}\n\n(Review loop stopped: the in-flight reviewer session is gone.)"
-                )));
-                app.session.review_loop = Some(state);
-                let _ = app.session.save();
-                app.set_status_notice("Review loop: reviewer gone");
-                false
+                if state.reviewer_respawn_count < REVIEW_LOOP_MAX_REVIEWER_RESPAWNS {
+                    state.reviewer_respawn_count += 1;
+                    let lens = state.current_lens.unwrap_or(jcode_session_types::ReviewLens::Correctness);
+                    app.push_display_message(DisplayMessage::system(format!(
+                        "↻ Review loop: the '{}' reviewer session was lost; respawning (attempt {} of {}).",
+                        lens.label(),
+                        state.reviewer_respawn_count,
+                        REVIEW_LOOP_MAX_REVIEWER_RESPAWNS,
+                    )));
+                    let respawned = spawn_review_loop_reviewer(app, &mut state, lens);
+                    // Only claim the lost reviewer was respawned if the spawn
+                    // actually succeeded. On failure `spawn_review_loop_reviewer`
+                    // sets its own "spawn failed" status + finalized the loop;
+                    // overwriting it here would misreport a failed respawn as
+                    // an in-progress one.
+                    if respawned {
+                        app.set_status_notice("Review loop: respawning lost reviewer");
+                    }
+                    respawned
+                } else {
+                    state.finished = true;
+                    state.finish_reason = Some("reviewer_unavailable".to_string());
+                    let digest = review_loop::build_and_store_digest(&mut state);
+                    app.push_display_message(DisplayMessage::system(format!(
+                        "{digest}\n\n(Review loop stopped: the reviewer session kept being lost after {} respawns.)",
+                        REVIEW_LOOP_MAX_REVIEWER_RESPAWNS,
+                    )));
+                    app.session.review_loop = Some(state);
+                    let _ = app.session.save();
+                    app.set_status_notice("Review loop: reviewer gone");
+                    false
+                }
             }
             PollResult::Pending => {
                 // Reviewer still working: wait, don't stall.
@@ -1458,6 +1604,10 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
             }
             PollResult::Report(report) => {
                 state.active_reviewer_id = None;
+                // A verdict was consumed: the loss-budget for this lens's
+                // reviewer is spent, so the next reviewer (a later lens, or the
+                // re-check after a fix) starts with a full respawn budget.
+                state.reviewer_respawn_count = 0;
                 // Determine whether the fix turn actually changed files: compare
                 // the baseline captured at fix-queue time against the current
                 // working tree. A file-touching fix is productive repair work and
@@ -1494,18 +1644,45 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
                         let prompt = format!(
                             "The reviewer found the following issues. Fix them:\n\n{summary}"
                         );
-                        // Capture the working-tree signature so the next
-                        // re-check can tell whether the fix actually changed
-                        // files (a productive, file-touching fix must not count
-                        // toward the stall cap even if the open set did not
-                        // shrink).
+                        // Capture the working-tree signature so the next re-check
+                        // can tell whether the fix actually changed files (a
+                        // productive, file-touching fix must not count toward the
+                        // stall cap even if the open set did not shrink).
                         if let Some(cwd) = active_working_dir(app) {
                             if let Some(sig) = working_tree_signature(&cwd) {
                                 app.session.review_loop.as_mut().unwrap().fix_baseline_tree =
                                     Some(sig);
                             }
                         }
-                        super::commands_improve::start_synthetic_user_turn(app, prompt);
+                        if app.is_remote {
+                            // R-G1: the remote client has NO `pending_turn`
+                            // handler -- `start_synthetic_user_turn` sets
+                            // `pending_turn`, which only the local `run()`
+                            // loop consumes. On the product TUI (remote
+                            // server-client) the synthetic fix turn would never
+                            // be sent, so the loop would stall after the first
+                            // findings. Enqueue the fix prompt instead:
+                            // `process_remote_followups` drains `queued_messages`
+                            // on the remote run loop and dispatches it via
+                            // `begin_remote_send` (which sets is_processing,
+                            // streams, emits Done -> the loop re-polls the
+                            // re-check reviewer). The server owns the transcript
+                            // on the remote path (echo), so we do NOT add the
+                            // message locally here -- that would double-record it.
+                            app.queued_messages.push(prompt);
+                            // Round-E guard: until the fix turn is actually
+                            // dispatched (begin_remote_send sets is_processing),
+                            // `is_processing` is still false and `active_reviewer_id`
+                            // is None, so an idle tick would otherwise spawn the
+                            // post-fix re-check reviewer prematurely (reviewing the
+                            // pre-fix tree). Marking pending_queued_dispatch both
+                            // guards the tick-poll off and forces the remote run
+                            // loop to clear-and-dispatch the queued fix on its next
+                            // iteration.
+                            app.pending_queued_dispatch = true;
+                        } else {
+                            super::commands_improve::start_synthetic_user_turn(app, prompt);
+                        }
                         true
                     }
                     review_loop::ReviewLoopAction::Converged => {
@@ -1652,6 +1829,11 @@ fn spawn_review_loop_reviewer(
             state.active_reviewer_id = Some(id);
             app.session.review_loop = Some(state.clone());
             let _ = app.session.save();
+            // Surface the lens actually being reviewed so the parent status bar
+            // tracks loop progress. The spawned reviewer runs in its own window;
+            // this is the parent-side signal that the loop advanced (and it makes
+            // the next idle redraw show the current lens rather than a stale one).
+            app.set_status_notice(format!("Review loop: reviewing {}", lens.label()));
             true
         }
         Err(error) => {
@@ -1691,6 +1873,14 @@ pub(super) fn handle_review_loop_command_local(app: &mut App, trimmed: &str) -> 
             // Mutual exclusion: starting a review loop clears improve/refactor.
             app.improve_mode = None;
             app.session.improve_mode = None;
+            // Also cancel any improve/refactor continuation that was queued
+            // (e.g. interrupt_and_queue_synthetic_message during a busy state):
+            // the review loop now owns the turn, and a leftover improve "fix
+            // this" prompt must not be dispatched mid-review. Mirror the
+            // clear_review_loop_on_improve / /review-loop stop semantics.
+            app.queued_messages.clear();
+            app.hidden_queued_system_messages.clear();
+            app.pending_queued_dispatch = false;
             let state = app
                 .session
                 .review_loop
@@ -1698,8 +1888,9 @@ pub(super) fn handle_review_loop_command_local(app: &mut App, trimmed: &str) -> 
             review_loop::enter_review_loop(state);
             // Match the auto-entry path (maybe_enter_review_loop): a manual
             // start must not keep polling a stale in-flight reviewer from a
-            // previous run/lens.
+            // previous run/lens, nor inherit the prior loop's idle-poll debounce.
             state.active_reviewer_id = None;
+            app.last_review_loop_idle_poll = None;
             let _ = app.session.save();
             app.push_display_message(DisplayMessage::system(
                 "🔁 Review loop started (manual). Reviewing across 6 lenses.".to_string(),
@@ -1710,10 +1901,22 @@ pub(super) fn handle_review_loop_command_local(app: &mut App, trimmed: &str) -> 
         "stop" => {
             if let Some(state) = app.session.review_loop.as_mut() {
                 state.finish_with("user_stopped");
+                // Cancel any review fix turn that is queued-but-not-yet-dispatched
+                // (remote path stages the fix into queued_messages). After stop
+                // the loop is finished, but the queued "fix them" prompt would
+                // still be dispatched by the run loop as if it were a user
+                // message, which is exactly what "stop the review" should prevent.
+                app.queued_messages.clear();
+                app.hidden_queued_system_messages.clear();
+                app.pending_queued_dispatch = false;
+                // Emit a digest of what was reviewed before the stop, matching
+                // the other terminal paths (converge/stall/gone/spawn_failed) so
+                // `/review-loop status` shows the partial outcome.
+                let digest = super::review_loop::build_and_store_digest(state);
                 let _ = app.session.save();
-                app.push_display_message(DisplayMessage::system(
-                    "Review loop stopped.".to_string(),
-                ));
+                app.push_display_message(DisplayMessage::system(format!(
+                    "Review loop stopped.\n\n{digest}"
+                )));
                 app.set_status_notice("Review loop: stopped");
             } else {
                 app.push_display_message(DisplayMessage::system(
@@ -1765,6 +1968,12 @@ pub(super) fn handle_review_loop_command_local(app: &mut App, trimmed: &str) -> 
 pub(super) fn clear_review_loop_on_improve(app: &mut App) {
     if app.session.review_loop.as_ref().map(|s| !s.finished).unwrap_or(false) {
         app.session.review_loop = None;
+        // Cancel any review fix turn that is queued-but-undispatched, mirroring
+        // `/review-loop stop`: the loop is being replaced by improve/refactor,
+        // so a stranded "fix them" prompt must not be dispatched later.
+        app.queued_messages.clear();
+        app.hidden_queued_system_messages.clear();
+        app.pending_queued_dispatch = false;
         let _ = app.session.save();
     }
 }

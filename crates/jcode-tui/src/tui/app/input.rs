@@ -1630,7 +1630,31 @@ impl App {
             if self.deliver_deferred_gate_digest_if_needed() {
                 return true;
             }
-            return super::commands::step_review_loop(self);
+            // Round-E guard (same as the idle self-drive): while the review's
+            // own fix turn is queued-but-undispatched, stepping the loop would
+            // spawn the post-fix re-check reviewer against the PRE-fix tree
+            // (awaiting_postfix_recheck is true, active_reviewer_id is None).
+            // The turn-end path must not step in that window either; it just
+            // owns the continuation so poke does not double-fire into it.
+            if super::commands::review_fix_pending(self) {
+                return true;
+            }
+            let stepped = super::commands::step_review_loop(self);
+            if stepped {
+                // The loop scheduled real work (spawned a reviewer / queued a
+                // fix). When it spawned an in-flight reviewer we must NOT poke:
+                // a poke nudge would dispatch during the reviewer's run window
+                // and collide with the Round-E fix-then-dispatch logic (which
+                // also uses queued_messages + pending_queued_dispatch). When it
+                // queued a fix, poke() no-ops anyway (has_queued_followups is
+                // true). Either way the loop owns the continuation this turn.
+                return true;
+            }
+            // The loop is idle at this turn-end (between verdicts, or just
+            // finalized). Fall through so auto-poke and overnight followups can
+            // still fire instead of being suppressed for the whole loop. This is
+            // the safe interleave: poke's own guards (has_queued_followups /
+            // pending_queued_dispatch) still protect the review loop's queue.
         }
         self.schedule_auto_poke_followup_if_needed()
             || self.schedule_overnight_poke_followup_if_needed()
