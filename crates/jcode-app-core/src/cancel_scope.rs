@@ -25,10 +25,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// A shared cancellation flag plus a [`Drop`]-armed guard.
 ///
 /// The flag is readable from any thread via [`CancelScope::cancelled`]; a
-/// [`CancelScope::guard`] (or [`CancelScope::guard_into`]) arms it once when
-/// dropped, so a loop can bail at a convenient boundary after a timer or an
-/// abandoned call drops the surrounding future.
-#[derive(Debug, Default, Clone)]
+/// [`CancelScope::guard`] arms it once when dropped, so a loop can bail at a
+/// convenient boundary after a timer or an abandoned call drops the surrounding
+/// future.
+#[derive(Debug, Clone)]
 pub struct CancelScope {
     flag: Arc<AtomicBool>,
 }

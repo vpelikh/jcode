@@ -514,7 +514,8 @@ constructed at 96 sites, too invasive for one tool's benefit).
   - index build (`jcode_index_candidates`),
   - scoring deserialize (`score_candidates_parallel`),
   - external JSONL loads (`load_external_candidates_parallel`),
-  - claude loads (`load_claude_candidates_parallel`), and
+  - claude loads (`load_claude_candidates_parallel`),
+  - the opencode external scan (`collect_opencode_external_sessions`), and
   - the external result fold (`search_external_sessions`),
   plus an **entry-point short-circuit** in `search_sessions_blocking` so a flag
   already set when the blocking call starts skips even file enumeration and
