@@ -1849,3 +1849,100 @@ fn test_fork_preserves_aged_events() {
     let ids: Vec<String> = fork.derive_messages().iter().map(|m| m.id.clone()).collect();
     assert_eq!(ids, vec!["m0"], "fork must not drop an aged (validated-at-insert) event");
 }
+
+/// The event log is the authoritative append-only record and now persists in
+/// the snapshot. After a **snapshot** round-trip (no journaling), the
+/// persisted log must be kept as-is on reload, including a log-bracketed
+/// compaction (CompactionStart/End markers) and any `Unknown` plugin event
+/// that a rebuild-from-legacy-vectors cannot reproduce.
+#[test]
+fn test_persisted_event_log_survives_snapshot_round_trip_with_bracket_and_unknown() {
+    use std::io::Write;
+
+    let dir = std::env::temp_dir().join(format!(
+        "jcode_event_log_snapshot_rt_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("session.json");
+
+    let mut session = Session::create_with_id(
+        "snapshot_bracket_rt".to_string(),
+        None,
+        Some("Snapshot bracket".to_string()),
+    );
+    session.append_stored_message(StoredMessage {
+        id: "m1".to_string(),
+        role: Role::User,
+        content: vec![text_block("hello")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+
+    // A balanced compaction bracket (takeaway #5), plus a plugin `Unknown`
+    // event only the event log can carry (takeaway #13). Neither is a legacy
+    // vector, so they prove the persisted log (not a rebuild) is authoritative.
+    let compaction = StoredCompactionState {
+        summary_text: "summarized".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 1,
+    };
+    session.event_map.start_compaction("comp_1", 1);
+    // Bracket start does not touch the legacy vectors; a real producer would
+    // call replace_messages first, but for this persistence test we emulate
+    // the surface the log derives after the bracket closes.
+    session.event_map.end_compaction(compaction.clone());
+    session.compaction = Some(compaction.clone()); // legacy vector mirrors the close
+
+    let unknown_event = SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "plugin_1".to_string(),
+        op: SessionEventOp::Unknown {
+            event_type: "review_round".to_string(),
+            data: serde_json::json!({ "rounds": 3 }),
+        },
+        parent_id: None,
+        version: 1,
+    };
+    session.event_map.append_event(unknown_event);
+
+    // Sanity: the in-memory log has the bracket markers + unknown preserved.
+    assert!(session.event_map.orphaned_compaction().is_none());
+
+    // Persist to a snapshot and reload through the real load path.
+    let json = serde_json::to_string(&session).expect("serialize");
+    let mut f = std::fs::File::create(&path).unwrap();
+    f.write_all(json.as_bytes()).unwrap();
+    drop(f);
+
+    let loaded = Session::load_from_path(&path).expect("load_from_path");
+    let kept = {
+        // reconcile already ran inside load; assert the authoritative log kept.
+        loaded.event_map.events.iter().any(|e| {
+            matches!(e.op, SessionEventOp::CompactionStart { .. })
+                && matches!(&e.op, SessionEventOp::CompactionStart { .. })
+        })
+    };
+    assert!(
+        kept,
+        "persisted bracket (CompactionStart) must survive the snapshot round-trip"
+    );
+    assert!(
+        loaded.event_map.events.iter().any(|e| matches!(
+            e.op,
+            SessionEventOp::Unknown { .. }
+        )),
+        "persisted Unknown plugin event must survive the snapshot round-trip"
+    );
+    assert!(
+        loaded.event_map.orphaned_compaction().is_none(),
+        "balanced bracket must remain balanced after reload"
+    );
+
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

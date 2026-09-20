@@ -411,6 +411,13 @@ pub struct SessionEventMap {
 }
 
 impl SessionEventMap {
+    /// True when the log holds no committed events. Used to keep empty logs out
+    /// of a serialized snapshot (a session with no events round-trips in the
+    /// historical byte format).
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
     /// Update caches when appending an event (SetCompaction / ClearAll).
     fn update_caches(&mut self, event: &SessionEvent) {
         match &event.op {

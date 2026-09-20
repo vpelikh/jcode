@@ -110,6 +110,258 @@ fn rename_title_preserves_generated_title_for_clear() {
 }
 
 #[test]
+fn generated_title_derives_from_first_user_message() {
+    let mut session = Session::create_with_id("session_gen_title_123".to_string(), None, None);
+    assert!(session.title.is_none());
+
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "Fix the flaky login test".to_string(),
+            cache_control: None,
+        }],
+    );
+    assert_eq!(session.title.as_deref(), Some("Fix the flaky login test"));
+    assert_eq!(session.display_title(), Some("Fix the flaky login test"));
+}
+
+#[test]
+fn generated_title_is_not_set_for_injected_internal_messages() {
+    let mut session = Session::create_with_id("session_gen_title_inj_123".to_string(), None, None);
+    assert!(session.title.is_none());
+
+    // Session-context/system reminder injected as a User message.
+    session.add_message_with_display_role(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "<system-reminder>\ncontext</system-reminder>".to_string(),
+            cache_control: None,
+        }],
+        Some(StoredDisplayRole::System),
+    );
+    assert!(session.title.is_none());
+
+    // Cross-agent notification injection.
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "[NOTIFICATION]\nYou received 1 notification(s)".to_string(),
+            cache_control: None,
+        }],
+    );
+    assert!(session.title.is_none());
+
+    // The first real user message seeds the title.
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "Actual task".to_string(),
+            cache_control: None,
+        }],
+    );
+    assert_eq!(session.title.as_deref(), Some("Actual task"));
+}
+
+#[test]
+fn generated_title_does_not_overwrite_explicit_title() {
+    let mut session = Session::create_with_id(
+        "session_gen_title_exp_123".to_string(),
+        None,
+        Some("Explicit title".to_string()),
+    );
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "First prompt".to_string(),
+            cache_control: None,
+        }],
+    );
+    assert_eq!(session.title.as_deref(), Some("Explicit title"));
+}
+
+#[test]
+fn generated_title_uses_first_user_message_not_later_ones() {
+    let mut session = Session::create_with_id("session_gen_first_123".to_string(), None, None);
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "First real prompt".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "A later prompt".to_string(),
+            cache_control: None,
+        }],
+    );
+    assert_eq!(session.title.as_deref(), Some("First real prompt"));
+}
+
+#[test]
+fn generated_title_backfills_history_session_without_title() {
+    // A session that predates title generation: it has user messages but no
+    // generated title. Adding any message must backfill it from the existing
+    // first genuine user prompt instead of staying empty.
+    let mut session = Session::create_with_id("gen_backfill_123".to_string(), None, None);
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "Original historical prompt".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.add_message(
+        Role::Assistant,
+        vec![ContentBlock::Text {
+            text: "some response".to_string(),
+            cache_control: None,
+        }],
+    );
+    // Simulate a title-less historical session by clearing the auto-derived title.
+    session.title = None;
+
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "a new prompt".to_string(),
+            cache_control: None,
+        }],
+    );
+    // Uses the original prompt from history, not the new one.
+    assert_eq!(
+        session.title.as_deref(),
+        Some("Original historical prompt")
+    );
+}
+
+#[test]
+fn generated_title_skips_image_only_first_message() {
+    let mut session = Session::create_with_id("gen_image_first_123".to_string(), None, None);
+    // An image-only user message has no text, so no title is derived yet.
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Image {
+            media_type: "image/png".to_string(),
+            data: "deadbeef".to_string(),
+        }],
+    );
+    assert!(session.title.is_none());
+
+    // The next real text message seeds the title (image-only did not block it).
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "Analyze this screenshot".to_string(),
+            cache_control: None,
+        }],
+    );
+    assert_eq!(session.title.as_deref(), Some("Analyze this screenshot"));
+}
+
+#[test]
+fn generated_title_backfills_skipping_injected_notification() {
+    // A session whose transcript already contains an injected notification
+    // before any real prompt: the backfill must skip it and use the first real
+    // user message instead of the notification text.
+    let mut session = Session::create_with_id("gen_backfill_notif_123".to_string(), None, None);
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "[NOTIFICATION]\nYou received 1 notification(s)".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "The actual request".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.title = None;
+
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "a later prompt".to_string(),
+            cache_control: None,
+        }],
+    );
+    assert_eq!(session.title.as_deref(), Some("The actual request"));
+}
+
+#[test]
+fn generated_title_uses_text_block_in_multi_block_message() {
+    let mut session = Session::create_with_id("gen_multiblock_123".to_string(), None, None);
+    // A single user message with image then text: the title must come from the
+    // text block, not be blocked by the leading image.
+    session.add_message(
+        Role::User,
+        vec![
+            ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: "deadbeef".to_string(),
+            },
+            ContentBlock::Text {
+                text: "Explain this diagram".to_string(),
+                cache_control: None,
+            },
+        ],
+    );
+    assert_eq!(session.title.as_deref(), Some("Explain this diagram"));
+}
+
+#[test]
+fn generated_title_is_truncated_to_max_chars() {
+    let mut session = Session::create_with_id("session_gen_trunc_123".to_string(), None, None);
+    let long_prompt = "x".repeat(200);
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: long_prompt.clone(),
+            cache_control: None,
+        }],
+    );
+    let title = session.title.as_deref().expect("title set");
+    // Truncated to 72 chars with a trailing ellipsis, matching importers.
+    assert!(title.chars().count() <= 72);
+    assert!(title.ends_with('…'));
+}
+
+#[test]
+fn generated_title_persists_through_save_and_load() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-gen-title-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let session_id = "session_gen_title_persist";
+    let mut session = Session::create_with_id(session_id.to_string(), None, None);
+    assert!(session.title.is_none());
+
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "Refactor the config loader".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+
+    let loaded = Session::load(session_id)?;
+    assert_eq!(
+        loaded.title.as_deref(),
+        Some("Refactor the config loader")
+    );
+    assert_eq!(loaded.display_title(), Some("Refactor the config loader"));
+    Ok(())
+}
+
+#[test]
 fn test_debug_memory_profile_reports_messages_and_provider_cache() {
     let mut session = Session::create_with_id(
         "session_memory_profile_test".to_string(),
@@ -127,13 +379,13 @@ fn test_debug_memory_profile_reports_messages_and_provider_cache() {
         Role::Assistant,
         vec![
             ContentBlock::ToolUse {
-                id: "tool_1".to_string(),
+                id: "tool_1".to_string().into(),
                 name: "bash".to_string(),
                 input: serde_json::json!({"command": "echo hi"}),
                 thought_signature: None,
             },
             ContentBlock::ToolResult {
-                tool_use_id: "tool_1".to_string(),
+                tool_use_id: "tool_1".to_string().into(),
                 content: "hi".to_string(),
                 is_error: None,
             },
@@ -146,6 +398,7 @@ fn test_debug_memory_profile_reports_messages_and_provider_cache() {
         covers_up_to_turn: 7,
         original_turn_count: 9,
         compacted_count: 7,
+        physically_consolidated: false,
     });
 
     let _ = session.provider_messages();
@@ -166,6 +419,23 @@ fn test_debug_memory_profile_reports_messages_and_provider_cache() {
             .as_u64()
             .unwrap_or(0)
             > 0
+    );
+    // The event-sourced log is a distinct memory consumer (every message is
+    // duplicated as an AppendMessage event plus metadata), so the memory profile
+    // must surface it and fold it into the totals.
+    assert_eq!(
+        profile["event_log"]["count"],
+        session.event_map.events.len()
+    );
+    let event_log_bytes = profile["event_log"]["json_bytes"].as_u64().unwrap_or(0);
+    assert!(
+        event_log_bytes > 0,
+        "event_log.json_bytes must be > 0 once events exist"
+    );
+    let total_bytes = profile["totals"]["json_bytes"].as_u64().unwrap_or(0);
+    assert!(
+        total_bytes >= event_log_bytes,
+        "totals.json_bytes must include the event log footprint"
     );
 }
 
@@ -631,6 +901,65 @@ fn load_for_remote_startup_preserves_messages_and_replay_but_skips_heavy_vectors
     Ok(())
 }
 
+/// A log-only plugin `Unknown` event appended AFTER the first save is carried
+/// in the journal's `append_events`. `load_for_remote_startup` must replay it so
+/// the stub's event log is not lossy for log-only events (regression for the
+/// previous behavior that dropped journal `append_events`).
+#[test]
+fn load_for_remote_startup_preserves_journaled_log_only_events() -> Result<()> {
+    use crate::session::event_types::{SessionEvent, SessionEventOp};
+
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-remote-startup-logonly-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let session_id = "session_remote_startup_logonly";
+    let mut session = Session::create_with_id(session_id.to_string(), None, None);
+    session.append_stored_message(StoredMessage {
+        id: "m1".to_string(),
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+        display_role: None,
+        timestamp: Some(Utc::now()),
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    session.save()?; // first save -> snapshot
+
+    // Append a log-only plugin event; the next save goes to the journal.
+    assert!(
+        session.append_session_event(SessionEvent {
+            timestamp: Utc::now(),
+            event_id: "plugin_remote_1".to_string().into(),
+            op: SessionEventOp::Unknown {
+                event_type: "plugin/remote".to_string(),
+                data: serde_json::json!({ "k": "v" }),
+            },
+            parent_id: None,
+            version: 1,
+        }),
+        "plugin event must be recorded"
+    );
+    session.save()?;
+
+    // The remote-startup stub must preserve the journaled log-only event.
+    let loaded = Session::load_for_remote_startup(session_id)?;
+    assert!(
+        loaded.event_map.events.iter().any(|e| matches!(
+            &e.op,
+            SessionEventOp::Unknown { event_type, .. } if event_type == "plugin/remote"
+        )),
+        "load_for_remote_startup must preserve the journaled plugin Unknown event"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_create_marks_debug_when_test_session_env_enabled() {
     let _env_lock = lock_env();
@@ -683,6 +1012,14 @@ fn test_recover_crashed_sessions_preserves_debug_flag() -> Result<()> {
 
     let recovered = Session::load(&recovered_ids[0])?;
     assert!(recovered.is_debug);
+    // The crash-recovery path (create_with_id + add_message + save) must produce
+    // a session whose event log is consistent and reloadable.
+    recovered
+        .rederive_all_checked()
+        .expect("recovered session must have a consistent event log");
+    assert_eq!(recovered.messages.len(), 2, // recovery header + copied message
+        "recovered session must carry the recovery header and the surviving text message"
+    );
     Ok(())
 }
 
@@ -822,7 +1159,7 @@ fn test_save_persists_full_session_content() -> Result<()> {
     session.add_message(
         Role::User,
         vec![ContentBlock::ToolResult {
-            tool_use_id: "tool_1".to_string(),
+            tool_use_id: "tool_1".to_string().into(),
             content: "OPENROUTER_API_KEY=sk-or-v1-abcdefghijklmnopqrstuvwxyz0123456789".to_string(),
             is_error: None,
         }],
@@ -831,7 +1168,7 @@ fn test_save_persists_full_session_content() -> Result<()> {
     session.add_message(
         Role::Assistant,
         vec![ContentBlock::ToolUse {
-            id: "tool_2".to_string(),
+            id: "tool_2".to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({
                 "command": "echo ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123"
@@ -879,6 +1216,7 @@ fn test_save_persists_compaction_state() -> Result<()> {
         covers_up_to_turn: 8,
         original_turn_count: 8,
         compacted_count: 8,
+        physically_consolidated: false,
     });
 
     // Add a message so save() does not early-return (persist guard).
@@ -954,6 +1292,50 @@ fn test_save_persists_reasoning_effort() -> Result<()> {
     let loaded = Session::load("session_reasoning_effort_persist_test")?;
     assert_eq!(loaded.model.as_deref(), Some("gpt-5.4"));
     assert_eq!(loaded.reasoning_effort.as_deref(), Some("xhigh"));
+    Ok(())
+}
+
+/// `review_loop` is a serialized field in `SessionJournalMeta` and must survive
+/// a save/load round trip. Regression for a gap where `apply_journal_meta`
+/// dropped it (the field was written to the snapshot and tracked by
+/// `metadata_requires_snapshot` but never applied on reload), so a journaled
+/// `review_loop` would be lost if it ever diverged from the snapshot value.
+#[test]
+fn test_save_persists_review_loop_state() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-review-loop-save-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let mut session = Session::create_with_id(
+        "session_review_loop_persist_test".to_string(),
+        None,
+        Some("review loop persistence test".to_string()),
+    );
+    session.review_loop = Some(crate::session::ReviewLoopState {
+            stall_turns: 2,
+            ..Default::default()
+        });
+
+    // Add a message so save() does not early-return (persist guard).
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "placeholder".to_string(),
+            cache_control: None,
+        }],
+    );
+
+    session.save()?;
+
+    let loaded = Session::load("session_review_loop_persist_test")?;
+    assert_eq!(
+        loaded.review_loop.as_ref().map(|r| (r.stall_turns, r.finished)),
+        Some((2, false)),
+        "review_loop must survive a save/load round trip"
+    );
     Ok(())
 }
 
@@ -1108,6 +1490,12 @@ fn test_journal_replay_skips_corrupt_line_and_keeps_tail() -> Result<()> {
     assert_eq!(loaded.messages.len(), 2);
     assert_eq!(loaded.messages[0].content_preview(), "first");
     assert_eq!(loaded.messages[1].content_preview(), "third");
+    // The event log (journaled via `append_events`) must survive the torn line
+    // alongside the messages, and derive to the same transcript.
+    let derived = loaded.derive_messages();
+    assert_eq!(derived.len(), 2, "event log must survive the torn line");
+    assert_eq!(derived[1].content_preview(), "third");
+    loaded.rederive_all_checked().expect("event log must stay consistent after torn line");
 
     let remote = Session::load_for_remote_startup(session_id)?;
     assert_eq!(remote.messages.len(), 2);
@@ -1169,6 +1557,11 @@ fn test_journal_replay_salvages_glued_entries_on_torn_line() -> Result<()> {
     assert_eq!(loaded.messages.len(), 2);
     assert_eq!(loaded.messages[0].content_preview(), "first");
     assert_eq!(loaded.messages[1].content_preview(), "third");
+    // The event log (journaled via `append_events`) must also survive the glued
+    // torn line and derive to the same transcript.
+    let derived = loaded.derive_messages();
+    assert_eq!(derived.len(), 2, "event log must survive the glued torn line");
+    loaded.rederive_all_checked().expect("event log must stay consistent after glued torn line");
     Ok(())
 }
 
@@ -1232,6 +1625,17 @@ fn test_corrupt_journal_heals_via_checkpoint_on_next_save() -> Result<()> {
     let reloaded = Session::load(session_id)?;
     assert_eq!(reloaded.messages.len(), 2);
     assert_eq!(reloaded.messages[1].content_preview(), "after heal");
+    // The heal (corrupt journal -> checkpoint) must not desync the event log:
+    // after reload, the derived transcript agrees with the legacy vectors and
+    // the event count matches the message count.
+    reloaded
+        .rederive_all_checked()
+        .expect("corrupt-journal heal must keep the event log consistent");
+    assert_eq!(
+        reloaded.event_map.derive_messages().len(),
+        reloaded.messages.len(),
+        "healed session event log must derive exactly the reloaded messages"
+    );
     Ok(())
 }
 
@@ -1246,7 +1650,7 @@ fn test_redacted_for_export_redacts_tool_result_and_tool_input() -> Result<()> {
     session.add_message(
         Role::User,
         vec![ContentBlock::ToolResult {
-            tool_use_id: "tool_1".to_string(),
+            tool_use_id: "tool_1".to_string().into(),
             content: "OPENROUTER_API_KEY=sk-or-v1-abcdefghijklmnopqrstuvwxyz0123456789".to_string(),
             is_error: None,
         }],
@@ -1255,7 +1659,7 @@ fn test_redacted_for_export_redacts_tool_result_and_tool_input() -> Result<()> {
     session.add_message(
         Role::Assistant,
         vec![ContentBlock::ToolUse {
-            id: "tool_2".to_string(),
+            id: "tool_2".to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({
                 "command": "echo ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123",
@@ -1381,7 +1785,7 @@ fn test_summarize_tool_calls_includes_tool_only_assistant_messages() {
     session.add_message(
         Role::Assistant,
         vec![ContentBlock::ToolUse {
-            id: "tool_1".to_string(),
+            id: "tool_1".to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({
                 "command": "pwd"
@@ -1808,6 +2212,7 @@ fn test_render_messages_shows_recent_compacted_history_by_default() {
         covers_up_to_turn: 2,
         original_turn_count: 2,
         compacted_count: 2,
+        physically_consolidated: false,
     });
 
     let rendered = render_messages(&session);
@@ -1857,6 +2262,7 @@ fn test_render_messages_can_expand_compacted_history_window() {
         covers_up_to_turn: 2,
         original_turn_count: 2,
         compacted_count: 2,
+        physically_consolidated: false,
     });
 
     // A small compacted prefix (few renderable messages, a single turn) must
@@ -1933,6 +2339,7 @@ fn test_compacted_history_truncates_only_when_long_and_many_turns() {
         covers_up_to_turn: prefix_turns,
         original_turn_count: prefix_turns,
         compacted_count,
+        physically_consolidated: false,
     });
 
     let total_renderable = prefix_turns * 5; // 100
@@ -2002,6 +2409,7 @@ fn test_compacted_history_never_truncates_single_long_turn() {
         covers_up_to_turn: 1,
         original_turn_count: 1,
         compacted_count,
+        physically_consolidated: false,
     });
 
     // Even with a tiny requested window, a single long turn is never truncated.
@@ -2062,6 +2470,7 @@ fn test_compacted_history_window_counts_renderable_messages_not_hidden_reminders
         covers_up_to_turn: 4,
         original_turn_count: 4,
         compacted_count: 4,
+        physically_consolidated: false,
     });
 
     let (rendered, _images, info) = render_messages_and_images_with_compacted_history(&session, 1);
@@ -2099,13 +2508,13 @@ fn test_render_messages_and_images_share_tool_resolution_and_labels() {
         Role::Assistant,
         vec![
             ContentBlock::ToolUse {
-                id: "tool_img_1".to_string(),
+                id: "tool_img_1".to_string().into(),
                 name: "view_image".to_string(),
                 input: serde_json::json!({"file_path": "/tmp/screenshot.png"}),
                 thought_signature: None,
             },
             ContentBlock::ToolResult {
-                tool_use_id: "tool_img_1".to_string(),
+                tool_use_id: "tool_img_1".to_string().into(),
                 content: "rendered image".to_string(),
                 is_error: None,
             },
@@ -2236,7 +2645,7 @@ fn test_render_images_anchors_tool_and_user_images() {
     session.add_message(
         Role::Assistant,
         vec![ContentBlock::ToolUse {
-            id: "tool-call-1".to_string(),
+            id: "tool-call-1".to_string().into(),
             name: "read".to_string(),
             input: serde_json::json!({"file_path": "shot.png"}),
             thought_signature: None,
@@ -2247,7 +2656,7 @@ fn test_render_images_anchors_tool_and_user_images() {
         Role::User,
         vec![
             ContentBlock::ToolResult {
-                tool_use_id: "tool-call-1".to_string(),
+                tool_use_id: "tool-call-1".to_string().into(),
                 content: "read image".to_string(),
                 is_error: None,
             },
@@ -2287,7 +2696,7 @@ fn test_render_images_attached_label_message_does_not_shift_prompt_ordinals() {
     session.add_message(
         Role::Assistant,
         vec![ContentBlock::ToolUse {
-            id: "tool-call-2".to_string(),
+            id: "tool-call-2".to_string().into(),
             name: "read".to_string(),
             input: serde_json::json!({"file_path": "shot.png"}),
             thought_signature: None,
@@ -2297,7 +2706,7 @@ fn test_render_images_attached_label_message_does_not_shift_prompt_ordinals() {
         Role::User,
         vec![
             ContentBlock::ToolResult {
-                tool_use_id: "tool-call-2".to_string(),
+                tool_use_id: "tool-call-2".to_string().into(),
                 content: "read image".to_string(),
                 is_error: None,
             },
@@ -2440,7 +2849,7 @@ fn test_rewind_targets_match_rendered_transcript_numbering() {
     session.add_message(
         Role::Assistant,
         vec![ContentBlock::ToolUse {
-            id: "tool_1".to_string(),
+            id: "tool_1".to_string().into(),
             name: "bash".to_string(),
             input: serde_json::json!({"command": "ls"}),
             thought_signature: None,
@@ -2451,7 +2860,7 @@ fn test_rewind_targets_match_rendered_transcript_numbering() {
     session.add_message(
         Role::User,
         vec![ContentBlock::ToolResult {
-            tool_use_id: "tool_1".to_string(),
+            tool_use_id: "tool_1".to_string().into(),
             content: "file-a file-b".to_string(),
             is_error: None,
         }],
@@ -2595,6 +3004,1480 @@ fn test_rewind_after_undo_uses_the_new_target_not_the_previous_one() {
     assert_eq!(session.rewind_target_count(), 11);
 }
 
+/// After a snapshot, appending a message persists through the journal (append
+/// path). The journal now carries both the appended legacy vectors *and* the
+/// appended event-log entries (`SessionJournalEntry::append_events`), so on
+/// reload the log-only events (compaction brackets, plugin `Unknown`) survive a
+/// crash recovered purely from the journal — they are not collapsed into a
+/// rebuild-from-legacy-vectors.
+#[test]
+fn test_journal_append_reload_keeps_sources_consistent() -> Result<()> {
+    use crate::session::event_types::{SessionEvent, SessionEventOp};
+
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-event-journal-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_journal_event_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("journal".to_string()));
+    session.append_stored_message(StoredMessage {
+        id: "m1".to_string(),
+        role: Role::User,
+        content: vec![crate::message::ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+
+    // Bracket + plugin Unknown event only the event log carries.
+    let compaction = StoredCompactionState {
+        summary_text: "summarized".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 1,
+        physically_consolidated: false,
+    };
+    session.event_map.start_compaction("comp_1", 1);
+    session.event_map.end_compaction(compaction.clone());
+    session.compaction = Some(compaction.clone());
+    let plugin_event = SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "plugin_1".to_string().into(),
+        op: SessionEventOp::Unknown {
+            event_type: "review_round".to_string(),
+            data: serde_json::json!({ "rounds": 3 }),
+        },
+        parent_id: None,
+        version: 1,
+    };
+    session.event_map.append_event(plugin_event);
+
+    // First save → snapshot (no journal).
+    session.save()?;
+    let journal_path = session_journal_path(id)?;
+    assert!(!journal_path.exists(), "first save is a snapshot, no journal yet");
+
+    // Reload then append via the journal path.
+    let mut live = Session::load(id)?;
+    assert!(
+        live.event_map.events
+            .iter()
+            .any(|e| matches!(e.op, SessionEventOp::Unknown { .. })),
+        "snapshot reload must keep the plugin Unknown event"
+    );
+    live.append_stored_message(StoredMessage {
+        id: "m2".to_string(),
+        role: Role::User,
+        content: vec![crate::message::ContentBlock::Text {
+            text: "world".to_string(),
+            cache_control: None,
+        }],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    live.save()?;
+    assert!(journal_path.exists(), "second save must be a journal append");
+
+    let reloaded = Session::load(id)?;
+    assert_eq!(
+        reloaded.messages.len(),
+        2,
+        "legacy transcript must include the journal message"
+    );
+    assert_eq!(
+        reloaded.compaction.as_ref().map(|c| &c.summary_text),
+        Some(&"summarized".to_string())
+    );
+    // The log-only events must survive the journal reload, not be lost to a
+    // rebuild-from-legacy-vectors (takeaways #5 / #13 / #3).
+    assert!(
+        reloaded.event_map.events.iter().any(|e| matches!(
+            e.op,
+            SessionEventOp::CompactionStart { .. }
+        )),
+        "compaction bracket (CompactionStart) must survive the journal reload"
+    );
+    assert!(
+        reloaded.event_map.events.iter().any(|e| matches!(
+            e.op,
+            SessionEventOp::Unknown { .. }
+        )),
+        "plugin Unknown event must survive the journal reload"
+    );
+    assert!(
+        reloaded.event_map.orphaned_compaction().is_none(),
+        "balanced bracket must remain balanced after journal reload"
+    );
+    // The event log must agree with the legacy vectors after reload.
+    reloaded
+        .rederive_all_checked()
+        .expect("event log must agree with legacy vectors after journal reload");
+    Ok(())
+}
+
+/// A compaction that crashes mid-summarize leaves an open `CompactionStart`
+/// bracket with no matching `CompactionEnd` (takeaway #5). The orphan marker is
+/// a log-only event, so it must survive a journal-append + reload: a crash
+/// recovered from the journal must still surface the "incomplete compaction"
+/// state instead of silently losing the marker and trusting a half-applied
+/// summary.
+#[test]
+fn test_orphaned_compaction_bracket_survives_journal_reload() -> Result<()> {
+    use crate::session::event_types::SessionEventOp;
+
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-event-orphan-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_journal_orphan_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("orphan".to_string()));
+    session.append_stored_message(StoredMessage {
+        id: "m1".to_string(),
+        role: Role::User,
+        content: vec![crate::message::ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    // Crash simulation: a CompactionStart is appended but no CompactionEnd.
+    session.event_map.start_compaction("comp_1", 1);
+    assert!(
+        session.event_map.orphaned_compaction().is_some(),
+        "in-memory orphan bracket must be detected"
+    );
+
+    // First save → snapshot carries the orphan marker.
+    session.save()?;
+    let journal_path = session_journal_path(id)?;
+    assert!(!journal_path.exists(), "first save is a snapshot, no journal yet");
+
+    // Reload then grow the log via the journal path (e.g. a new user message
+    // before the process decides how to resolve the orphan).
+    let mut live = Session::load(id)?;
+    assert!(
+        live.event_map.orphaned_compaction().is_some(),
+        "orphan must survive the snapshot reload"
+    );
+    live.append_stored_message(StoredMessage {
+        id: "m2".to_string(),
+        role: Role::User,
+        content: vec![crate::message::ContentBlock::Text {
+            text: "world".to_string(),
+            cache_control: None,
+        }],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    live.save()?;
+    assert!(journal_path.exists(), "second save must be a journal append");
+
+    let reloaded = Session::load(id)?;
+    assert_eq!(
+        reloaded.messages.len(),
+        2,
+        "legacy transcript must include the journal message"
+    );
+    assert!(
+        reloaded
+            .event_map
+            .events
+            .iter()
+            .any(|e| matches!(e.op, SessionEventOp::CompactionStart { .. })),
+        "orphaned CompactionStart marker must survive the journal reload"
+    );
+    assert!(
+        reloaded.event_map.orphaned_compaction().is_some(),
+        "orphaned bracket must be detectable after journal reload (takeaway #5)"
+    );
+    // The acceptance check for the 'incomplete compaction' state is the public
+    // invariant registry flagging the CompactionBracket invariant as violated.
+    let inv = InvariantRegistry::builtin();
+    let inv_log = inv.check(&reloaded.event_map);
+    assert!(
+        !inv_log.is_green(),
+        "orphaned bracket must surface as a CompactionBracket violation after reload"
+    );
+    assert!(
+        inv_log
+            .violations
+            .iter()
+            .any(|v| v.invariant == "session.compaction_bracket_balanced"),
+        "the CompactionBracket invariant must be the reported violation"
+    );
+    // The event log must still agree with the legacy vectors.
+    reloaded
+        .rederive_all_checked()
+        .expect("event log must agree with legacy vectors after orphan reload");
+    Ok(())
+}
+
+/// End-to-end acceptance through the **public** session API: a user creates a
+/// session, adds messages, saves, reloads, grows the journal, and reloads
+/// again. This is the real persistence path the TUI/server use
+/// (`Session::create_with_id` + `add_message`/`save`/`load`). After each
+/// reload we run the invariant + projection registry (takeaways #3/#4) and
+/// require it green: the event log must always agree with the legacy vectors,
+/// tool-pairing must be balanced, and the projected message count must match
+/// the transcript.
+#[test]
+fn event_sourced_log_survives_public_api_session_lifecycle() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-integration-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "integration_public_api_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("lifecycle".to_string()));
+    // Real user messages through the public API.
+    session.add_message(
+        Role::User,
+        vec![crate::message::ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.add_message(
+        Role::Assistant,
+        vec![crate::message::ContentBlock::Text {
+            text: "hi there".to_string(),
+            cache_control: None,
+        }],
+    );
+    // First save → snapshot.
+    session.save()?;
+    let journal_path = session_journal_path(id)?;
+    assert!(!journal_path.exists());
+
+    fn assert_invariants_green(session: &Session, label: &str) {
+        let inv = InvariantRegistry::builtin();
+        let log = inv.check(&session.event_map);
+        assert!(
+            log.is_green(),
+            "{label}: invariant registry must be green, got {} violation(s): {:?}",
+            log.violations.len(),
+            log.violations
+                .iter()
+                .map(|v| format!("{}: {}", v.invariant, v.message))
+                .collect::<Vec<_>>()
+        );
+        // Projection (takeaway #4): one fold, typed state, matches transcript.
+        let count = crate::session::project_map::<crate::session::MessageCountProjection>(
+            &session.event_map,
+        )
+        .expect("projection must fold");
+        assert_eq!(
+            count,
+            session.messages.len(),
+            "{label}: projected message count must match the transcript",
+        );
+    }
+
+    // Reload 1: pure snapshot.
+    let reloaded = Session::load(id)?;
+    assert_eq!(reloaded.messages.len(), 2);
+    assert_invariants_green(&reloaded, "after snapshot reload");
+
+    // Grow the log through the journal append path (real public API again).
+    let mut live = Session::load(id)?;
+    live.add_message(
+        Role::User,
+        vec![crate::message::ContentBlock::Text {
+            text: "world".to_string(),
+            cache_control: None,
+        }],
+    );
+    live.save()?;
+    assert!(journal_path.exists(), "second save must be a journal append");
+
+    // Reload 2: snapshot + journal replay.
+    let reloaded2 = Session::load(id)?;
+    assert_eq!(reloaded2.messages.len(), 3);
+    assert_invariants_green(&reloaded2, "after journal reload");
+    // Derived state agrees with the legacy vectors (the loaded server state).
+    reloaded2
+        .rederive_all_checked()
+        .expect("public lifecycle must keep the event log consistent");
+    Ok(())
+}
+
+/// Edge case for takeaway #13: a plugin `Unknown` event appended through the
+/// public `Session::append_session_event` API must survive the real persistence
+/// path — not just a map round-trip. Here it is recorded after a snapshot save
+/// (so it is journal-appended, not in the snapshot), then the session is
+/// reloaded through the public `load` API and the plugin event must still be in
+/// the log alongside the journal-replayed message.
+#[test]
+fn unknown_plugin_event_survives_public_api_journal_append_reload() -> Result<()> {
+    use crate::session::event_types::{SessionEvent, SessionEventOp};
+
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-unknown-journal-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_unknown_journal_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("unknown".to_string()));
+    session.add_message(
+        Role::User,
+        vec![crate::message::ContentBlock::Text {
+            text: "m1".to_string(),
+            cache_control: None,
+        }],
+    );
+    // First save → snapshot.
+    session.save()?;
+    let journal_path = session_journal_path(id)?;
+    assert!(!journal_path.exists(), "first save is a snapshot");
+
+    // Append the plugin event through the public API, then another real message,
+    // then save → journal append path.
+    let appended = session.append_session_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "plugin_checkpoint_1".to_string().into(),
+        op: SessionEventOp::Unknown {
+            event_type: "plugin/checkpoint".to_string(),
+            data: serde_json::json!({ "turns": 42, "sha": "abc" }),
+        },
+        parent_id: None,
+        version: 1,
+    });
+    assert!(appended, "append_session_event must record the plugin event");
+    session.add_message(
+        Role::User,
+        vec![crate::message::ContentBlock::Text {
+            text: "m2".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+    assert!(journal_path.exists(), "second save must be a journal append");
+
+    // Reload through the public API: both the journal message and the plugin
+    // event must survive, and the event log must stay consistent.
+    let reloaded = Session::load(id)?;
+    assert_eq!(reloaded.messages.len(), 2);
+    assert!(
+        reloaded.event_map.events.iter().any(|e| matches!(
+            e.op,
+            SessionEventOp::Unknown { .. }
+        )),
+        "plugin Unknown event must survive the journal append + reload (takeaway #13)"
+    );
+    match reloaded
+        .event_map
+        .events
+        .iter()
+        .find(|e| matches!(e.op, SessionEventOp::Unknown { .. }))
+        .map(|e| &e.op)
+    {
+        Some(SessionEventOp::Unknown { event_type, data }) => {
+            assert_eq!(event_type, "plugin/checkpoint");
+            assert_eq!(data.get("turns").and_then(|v| v.as_u64()), Some(42));
+        }
+        other => panic!("plugin event payload not preserved: {other:?}"),
+    }
+    reloaded
+        .rederive_all_checked()
+        .expect("event log must stay consistent after plugin-event journal reload");
+    Ok(())
+}
+
+/// Upgrade/migration failure mode: a session snapshot written *before* the
+/// event log was persisted (no `event_map` field in the JSON) must still load
+/// through the public API. The load path (`reconcile_event_map_after_load`)
+/// should rebuild the log from the legacy vectors so the two sources of truth
+/// agree. This is exactly how pre-upgrade sessions are read after installing a
+/// newer build that persists `event_map`.
+#[test]
+fn session_without_persisted_event_map_loads_via_rebuild() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-migration-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_pre_persistence_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("legacy".to_string()));
+    session.add_message(
+        Role::User,
+        vec![crate::message::ContentBlock::Text {
+            text: "legacy hello".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.add_message(
+        Role::Assistant,
+        vec![crate::message::ContentBlock::Text {
+            text: "legacy world".to_string(),
+            cache_control: None,
+        }],
+    );
+
+    // Simulate a pre-persistence snapshot: serialize, then strip any persisted
+    // event log so the on-disk file is the historical format.
+    let json = serde_json::to_string(&session).expect("serialize session");
+    let mut obj: serde_json::Value = serde_json::from_str(&json).expect("parse session json");
+    if let serde_json::Value::Object(ref mut map) = obj {
+        map.remove("event_map");
+    }
+    let path = crate::session::storage_paths::session_path(id)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, serde_json::to_string(&obj).expect("re-serialize legacy snapshot"))?;
+
+    // Public load path: must rebuild the event log from the legacy vectors.
+    let loaded = Session::load(id)?;
+    assert_eq!(loaded.messages.len(), 2, "legacy messages must load");
+    assert!(
+        !loaded.event_map.events.is_empty(),
+        "old-format snapshot must hydrate a rebuilt event log"
+    );
+    // The rebuilt log agrees with the legacy vectors.
+    loaded
+        .rederive_all_checked()
+        .expect("rebuilt event log must agree with legacy vectors after migration");
+    // Invariant registry must be green on the migrated session.
+    let inv = InvariantRegistry::builtin();
+    let log = inv.check(&loaded.event_map);
+    assert!(
+        log.is_green(),
+        "migrated snapshot must satisfy the invariant registry, got: {:?}",
+        log.violations
+            .iter()
+            .map(|v| format!("{}: {}", v.invariant, v.message))
+            .collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
+/// Lazy-save gate: a session whose ONLY signal is a log-only plugin `Unknown`
+/// event (escape hatch, takeaway #13) appended through the public API must be
+/// persisted even though it has no conversation message, no compaction, and no
+/// configured state — otherwise the durable plugin marker is silently dropped
+/// and lost. This pins the narrow exception added to the save gate: a log-only
+/// event forces persistence, while a fresh session whose only event is the
+/// auto-added session-context placeholder is still skipped (lazy save holds).
+#[test]
+fn log_only_plugin_event_forces_persistence_without_message() -> Result<()> {
+    use crate::session::event_types::{SessionEvent, SessionEventOp};
+
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-logonly-plugin-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    // --- Control: a fresh session with only the placeholder context message is
+    // NOT persisted (lazy-save gate still holds). ---
+    let control_id = "logonly_control_untouched";
+    let mut control = Session::create_with_id(control_id.to_string(), None, None);
+    assert!(control.ensure_initial_session_context_message());
+    control.save()?;
+    assert!(
+        !session_path(control_id)?.exists(),
+        "a fresh session whose only event is the placeholder context must stay lazy-saved"
+    );
+
+    // --- Subject: the same untouched session, but a plugin appends a log-only
+    // Unknown event. It must now be persisted even with no message. ---
+    let id = "logonly_plugin_saved";
+    let mut session = Session::create_with_id(id.to_string(), None, None);
+    assert!(session.ensure_initial_session_context_message());
+    let appended = session.append_session_event(SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "plugin_marker".to_string().into(),
+        op: SessionEventOp::Unknown {
+            event_type: "plugin/marker".to_string(),
+            data: serde_json::json!({ "submission": true }),
+        },
+        parent_id: None,
+        version: 1,
+    });
+    assert!(appended, "log-only plugin event must be recorded");
+    session.save()?;
+    assert!(
+        session_path(id)?.exists(),
+        "a log-only plugin Unknown event must force persistence even without a message"
+    );
+
+    // Reload: the plugin marker must survive.
+    let reloaded = Session::load(id)?;
+    assert!(
+        reloaded
+            .event_map
+            .events
+            .iter()
+            .any(|e| matches!(&e.op, SessionEventOp::Unknown { event_type, .. }
+                if event_type == "plugin/marker")),
+        "log-only plugin marker must survive save + reload"
+    );
+    assert!(
+        reloaded.messages.is_empty() || !reloaded.has_message_beyond_session_context(),
+        "the session still has no real conversation"
+    );
+    reloaded
+        .rederive_all_checked()
+        .expect("event log must stay consistent after log-only event persistence");
+    Ok(())
+}
+
+/// Failure mode: a torn journal append (dead-writer crash mid-append) followed
+/// by a glued complete entry is salvaged by re-parsing the recoverable entry.
+/// The salvaged entry must preserve **log-only events** (here a plugin `Unknown`
+/// event appended via the public API) as well as messages, so replay survives
+/// both the corruption and the event log's journal persistence (#13).
+#[test]
+fn test_journal_salvage_preserves_unknown_event_from_glued_entry() -> Result<()> {
+    use crate::session::event_types::{SessionEvent, SessionEventOp};
+
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-journal-event-salvage-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_journal_event_salvage";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("salvage".to_string()));
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "first".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?; // snapshot, no journal
+
+    // Second save: append a message via the journal (entry 1).
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "second".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+
+    // Third save: append only a log-only plugin Unknown event. Since this is a
+    // pure event-append (no vector delta), the journal entry carries the event
+    // in `append_events` (entry 2).
+    assert!(
+        session.append_session_event(SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: "plugin_salvage_1".to_string().into(),
+            op: SessionEventOp::Unknown {
+                event_type: "plugin/checkpoint".to_string(),
+                data: serde_json::json!({ "salvaged": true }),
+            },
+            parent_id: None,
+            version: 1,
+        }),
+        "plugin event must be recorded"
+    );
+    session.save()?;
+    let journal_path = session_journal_path(id)?;
+    assert!(journal_path.exists(), "second save must be a journal append");
+
+    // Simulate a torn write (dead-writer crash mid-append): entry 2 (which carries
+// the plugin event) is torn so its tail is truncated, then a complete copy of
+// entry 2 appears glued (no newline) directly after the torn fragment — the
+// exact scenario `salvage_glued_journal_entries` recovers by scanning for a
+// fresh `{"meta":` start and re-parsing.
+let journal = std::fs::read_to_string(&journal_path)?;
+let lines: Vec<&str> = journal.lines().collect();
+assert_eq!(lines.len(), 2, "two journal entries expected");
+let torn = &lines[1][..lines[1].len() * 3 / 4];
+std::fs::write(
+    &journal_path,
+    format!("{}\n{}{}\n", lines[0], torn, lines[1]),
+)?;
+
+    // Reload: the message and the log-only Unknown event must both survive.
+    let loaded = Session::load(id)?;
+    assert_eq!(loaded.messages.len(), 2, "both messages must reload");
+    assert!(
+        loaded.event_map.events.iter().any(|e| matches!(
+            e.op,
+            SessionEventOp::Unknown { .. }
+        )),
+        "log-only plugin event must survive journal salvage"
+    );
+    loaded
+        .rederive_all_checked()
+        .expect("event log must stay consistent after journal salvage");
+    Ok(())
+}
+
+/// Fork is a derived operation on the event-sourced log: the child's event map
+/// is the parent's prefix up to the boundary. A fork truncates the event log,
+/// so my persistence guard (`event_map.events.len() < events_len`) must force a
+/// full snapshot on the fork's first save (a tail-delta journal entry would
+/// misrepresent the truncated log). After reload, the fork's event log and
+/// legacy vectors must agree.
+#[test]
+fn forked_session_persists_truncated_event_log_via_snapshot() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-fork-persist-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let parent_id = "fork_parent_rt";
+    let mut parent = Session::create_with_id(parent_id.to_string(), None, Some("parent".to_string()));
+    for i in 0..5 {
+        parent.append_stored_message(StoredMessage {
+            id: format!("m{i}"),
+            role: Role::User,
+            content: vec![crate::message::ContentBlock::Text {
+                text: format!("msg {i}"),
+                cache_control: None,
+            }],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+    // Persist the parent so its snapshot + persist_state.events_len are set.
+    parent.save()?;
+    assert_eq!(parent.messages.len(), 5);
+
+    // Fork at boundary 3 (inclusive): the child keeps events 0..=3 → 4 messages.
+    let mut fork = parent.fork_up_to_boundary(3);
+    assert_eq!(fork.messages.len(), 4);
+    assert_eq!(fork.event_map.events.len(), 4);
+
+    // Save the fork with a distinct id. The truncated event log (< events_len
+    // inherited from the parent) must force a snapshot, not a journal append.
+    let fork_id = fork.id.clone();
+    fork.save()?;
+    let fork_journal = session_journal_path(&fork_id)?;
+    assert!(
+        !fork_journal.exists(),
+        "fork's truncated event log must force a snapshot, not a journal append"
+    );
+
+    // Reload the fork: event log and legacy vectors must agree and be bounded.
+    let reloaded = Session::load(&fork_id)?;
+    assert_eq!(reloaded.messages.len(), 4);
+    assert_eq!(reloaded.event_map.events.len(), 4);
+    reloaded
+        .rederive_all_checked()
+        .expect("fork reload must keep event log consistent with truncated vectors");
+    Ok(())
+}
+
+/// A fork that keeps the *entire* event log (boundary at the last index) must
+/// still persist a loadable snapshot under its own (new) id. `fork_up_to_boundary`
+/// clones the parent's persist_state (snapshot_exists, events_len, ...), but the
+/// fork's id has no snapshot file yet — so a fork that keeps all events must not
+/// be written via the journal-append path (which would leave a journal with no
+/// snapshot, orphaned and unloadable). Saving it must force a snapshot.
+#[test]
+fn fork_keeping_all_events_still_writes_a_loadable_snapshot() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-fork-full-persist-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let parent_id = "fork_full_parent_rt";
+    let mut parent = Session::create_with_id(parent_id.to_string(), None, Some("parent".to_string()));
+    for i in 0..3 {
+        parent.append_stored_message(StoredMessage {
+            id: format!("m{i}"),
+            role: Role::User,
+            content: vec![crate::message::ContentBlock::Text {
+                text: format!("msg {i}"),
+                cache_control: None,
+            }],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+    parent.save()?;
+    assert_eq!(parent.event_map.events.len(), 3);
+
+    // Fork keeping ALL events (boundary 2 = last index).
+    let mut fork = parent.fork_up_to_boundary(2);
+    assert_eq!(fork.event_map.events.len(), 3);
+    assert_eq!(fork.messages.len(), 3);
+    assert_ne!(fork.id, parent_id);
+
+    let fork_id = fork.id.clone();
+    fork.save()?;
+
+    // A journal-append with no snapshot would orphan the fork; the fork must have
+    // a snapshot under its own id and be loadable.
+    assert!(
+        session_path(&fork_id)?.exists(),
+        "fork keeping all events must write its own snapshot, not just a journal"
+    );
+    let loaded = Session::load(&fork_id)?;
+    assert_eq!(loaded.messages.len(), 3);
+    assert_eq!(loaded.event_map.events.len(), 3);
+    loaded
+        .rederive_all_checked()
+        .expect("fork keeping all events must reload consistently");
+    Ok(())
+}
+
+/// Clearing a non-empty session must persist (unrecoverable data-loss guard
+/// notwithstanding). `clear_messages()` emits a ClearAll event AND empties the
+/// legacy vectors; the next save must checkpoint this cleared state. If the
+/// unchecked shrink-guard treats every empty checkpoint as an accidental wipe,
+/// the clear is never persisted and a reload resurrects the old transcripts —
+/// the event-sourced log (which durably has the ClearAll) then diverges from the
+/// legacy vectors it reconciles against.
+#[test]
+fn clear_messages_persists_via_event_consistent_checkpoint() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-clear-persist-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_clear_persist_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("clear".to_string()));
+    session.add_message(
+        Role::User,
+        vec![crate::message::ContentBlock::Text {
+            text: "keep me".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+    assert!(!session.messages.is_empty());
+
+    // Clear the transcript (intentional user action, not a crash-wipe).
+    session.clear_messages();
+    assert!(session.messages.is_empty());
+    // The clear must persist; if the shrink-guard blocks it, this errors.
+    session.save()?;
+
+    let reloaded = Session::load(id)?;
+    assert!(
+        reloaded.messages.is_empty(),
+        "cleared session must reload empty (the ClearAll is the durable record)"
+    );
+    reloaded
+        .rederive_all_checked()
+        .expect("cleared reload must keep event log consistent");
+    Ok(())
+}
+
+/// A compaction applied to a *running* session via the public `set_compaction`
+/// API, then saved through the journal-append path (after a prior snapshot),
+/// must survive reload: the SetCompaction event is journaled as a log-only
+/// event and the legacy compaction vector is restored from journal meta.
+#[test]
+fn compaction_via_public_api_survives_journal_append_reload() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-compaction-journal-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_compaction_journal_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("compaction".to_string()));
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "before".to_string(),
+            cache_control: None,
+        }],
+    );
+    // First save → snapshot, no journal.
+    session.save()?;
+    let journal_path = session_journal_path(id)?;
+    assert!(!journal_path.exists(), "first save is a snapshot");
+
+    // Compact the running session via the public API, then append a message so
+    // the next save goes through the journal append path.
+    session.set_compaction(StoredCompactionState {
+        summary_text: "compacted".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 1,
+        physically_consolidated: false,
+    });
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "after".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+    assert!(journal_path.exists(), "second save must be a journal append");
+
+    // Reload: compaction and the SetCompaction event must both survive.
+    let reloaded = Session::load(id)?;
+    assert_eq!(
+        reloaded.compaction.as_ref().map(|c| &c.summary_text),
+        Some(&"compacted".to_string()),
+        "compaction must survive the journal append + reload"
+    );
+    assert!(
+        reloaded.event_map.events.iter().any(|e| matches!(
+            e.op,
+            crate::session::event_types::SessionEventOp::SetCompaction { .. }
+        )),
+        "SetCompaction must be a durable event after the journal reload"
+    );
+    reloaded
+        .rederive_all_checked()
+        .expect("compaction journal reload must keep event log consistent");
+    Ok(())
+}
+
+/// When load reconciliation must rebuild the event log from divergent vectors,
+/// the freshly-rebuilt log must be persisted by the next save (as a snapshot,
+/// not a journal tail), so a subsequent reload stays consistent and does not
+/// rebuild every time. Exercise the full divergent-load → save → reload cycle.
+#[test]
+fn divergent_load_rebuilds_then_persists_and_stays_consistent() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-rebuild-load-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_rebuild_divergent_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("divergent".to_string()));
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "a".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?; // snapshot with events
+
+    // Make the on-disk vectors diverge from the event log: directly clear the
+    // legacy messages vector without emitting a ClearAll (a buggy producer),
+    // then persist via a fresh snapshot that drops the events.
+    let path = crate::session::storage_paths::session_path(id)?;
+    let mut json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path)?).expect("read snapshot");
+    if let serde_json::Value::Object(map) = &mut json {
+        map["messages"] = serde_json::Value::Array(vec![]);
+        map.remove("event_map");
+    }
+    std::fs::write(&path, serde_json::to_string(&json).expect("rewrite"))?;
+
+    // Load: the empty vectors vs. the (now-removed) event log must reconcile by
+    // rebuilding; the log must agree with the now-empty transcript.
+    let mut loaded = Session::load(id)?;
+    assert!(loaded.messages.is_empty());
+    loaded
+        .rederive_all_checked()
+        .expect("post-rebuild load must be consistent");
+
+    // The next save must persist the rebuilt log (snapshot), and a reload must
+    // not need to rebuild again — it reloads empty and consistent.
+    loaded.save()?;
+    let reloaded = Session::load(id)?;
+    assert!(reloaded.messages.is_empty());
+    reloaded
+        .rederive_all_checked()
+        .expect("post-save reload must be consistent");
+    Ok(())
+}
+
+/// Full-snapshot serialization contract: a Session carrying every kind of state
+/// (messages, compaction, memory injections, replay events, env snapshots, and
+/// an event log with a bracket + plugin Unknown) must round-trip through the
+/// public save/load unchanged and stay internally consistent.
+#[test]
+fn full_session_state_round_trips_through_public_persistence() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-full-rt-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_full_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("full".to_string()));
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.record_memory_injection("mem".to_string(), "content".to_string(), 1, 5, Vec::new());
+    session.record_replay_display_message("system", Some("title".to_string()), "boot");
+    session.record_env_snapshot(EnvSnapshot {
+        captured_at: Utc::now(),
+        reason: "roundtrip".to_string(),
+        session_id: id.to_string(),
+        working_dir: Some(temp_home.path().to_string_lossy().to_string()),
+        provider: "openai".to_string(),
+        model: "gpt-5.4".to_string(),
+        jcode_version: "test".to_string(),
+        jcode_git_hash: None,
+        jcode_git_dirty: None,
+        os: "linux".to_string(),
+        arch: "x86_64".to_string(),
+        pid: 42,
+        is_selfdev: false,
+        is_debug: false,
+        is_canary: false,
+        testing_build: None,
+        working_git: None,
+    });
+    // Compaction via the seam emits a balanced bracket.
+    session.set_compaction(StoredCompactionState {
+        summary_text: "compacted".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 1,
+        physically_consolidated: false,
+    });
+
+    session.save()?;
+    let loaded = Session::load(id)?;
+
+    // Every legacy vector survives.
+    assert_eq!(loaded.messages.len(), 1);
+    assert_eq!(loaded.memory_injections.len(), 1);
+    assert_eq!(loaded.replay_events.len(), 1);
+    assert_eq!(loaded.env_snapshots.len(), 1);
+    assert_eq!(
+        loaded.compaction.as_ref().map(|c| &c.summary_text),
+        Some(&"compacted".to_string())
+    );
+    // The event log agrees with all of it.
+    loaded
+        .rederive_all_checked()
+        .expect("full session must reload internally consistent");
+    let inv = InvariantRegistry::builtin();
+    assert!(
+        inv.check(&loaded.event_map).is_green(),
+        "full session reload must satisfy the invariant registry"
+    );
+    Ok(())
+}
+
+/// Fields persisted in the snapshot but not carried in the journal meta must
+/// survive a journal-append + reload. `route_api_method` is one such field: it
+/// is set once per session and saved in the first snapshot, then a subsequent
+/// journal append must not silently drop it on reload.
+#[test]
+fn route_api_method_survives_journal_append_reload() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-route-journal-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_route_journal_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("route".to_string()));
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "m1".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.route_api_method = Some("POST".to_string());
+    // First save → snapshot carries route_api_method.
+    session.save()?;
+    let journal_path = session_journal_path(id)?;
+    assert!(!journal_path.exists());
+
+    // Journal-append (another message) after the snapshot.
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "m2".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+    assert!(journal_path.exists(), "second save must be a journal append");
+
+    let reloaded = Session::load(id)?;
+    assert_eq!(
+        reloaded.route_api_method.as_deref(),
+        Some("POST"),
+        "route_api_method must survive a journal-append reload (it lives in the snapshot)"
+    );
+    Ok(())
+}
+
+/// An empty full-replacement (`replace_messages(vec![])`) is a legitimate way to
+/// clear a transcript (distinct from `clear_messages`/ClearAll) and must persist:
+/// the empty checkpoint is backed by an empty-ReplaceMessages event, so it is an
+/// intentional clear, not an accidental wipe. Reload must stay empty + consistent.
+#[test]
+fn empty_replace_messages_persists_via_event_consistent_checkpoint() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-replace-empty-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_replace_empty_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("replace".to_string()));
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "will be cleared".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+    assert!(!session.messages.is_empty());
+
+    // Replace the transcript with nothing — a real, intentional clear path.
+    session.replace_messages(Vec::new());
+    assert!(session.messages.is_empty());
+    session.save()?;
+
+    let reloaded = Session::load(id)?;
+    assert!(
+        reloaded.messages.is_empty(),
+        "empty full-replacement must persist as an intentional clear"
+    );
+    reloaded
+        .rederive_all_checked()
+        .expect("empty-replacement reload must keep event log consistent");
+    Ok(())
+}
+
+/// Forking a session whose boundary cuts through an in-flight compaction bracket
+/// must yield a fork that is internally consistent, not corrupt. If the boundary
+/// keeps a `CompactionStart` but excludes its matching `CompactionEnd`, the fork
+/// legitimately carries an orphaned (incomplete) bracket that a producer can
+/// resolve by calling `compact_transcript_with_bracket` (crash-safe retry) — but
+/// the fork must serialize/reload cleanly and `derive_messages` must reflect the
+/// kept prefix only.
+#[test]
+fn fork_mid_bracket_is_consistent_and_resolvable() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-fork-bracket-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    // Build a parent: messages, then a balanced compaction bracket.
+    let parent_id = "fork_bracket_parent";
+    let mut parent = Session::create_with_id(parent_id.to_string(), None, Some("parent".to_string()));
+    parent.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "m0".to_string(),
+            cache_control: None,
+        }],
+    );
+    parent.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "m1".to_string(),
+            cache_control: None,
+        }],
+    );
+    let comp = StoredCompactionState {
+        summary_text: "s".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 1,
+        physically_consolidated: false,
+    };
+    // Event order: append(m0), append(m1), CompactionStart, CompactionEnd.
+    let start_idx = parent.event_map.events.len(); // will be CompactionStart index
+    parent.compact_transcript_with_bracket("comp_x", parent.messages.clone(), comp.clone(), 1);
+    let end_idx = parent.event_map.events.len() - 1;
+    assert!(start_idx < end_idx);
+
+    // Fork at the boundary *inside* the bracket: keep everything up to the
+    // CompactionStart (events 0..=start_idx) — the fork has an orphaned start.
+    let mut fork = parent.fork_up_to_boundary(start_idx);
+    assert!(
+        fork.event_map.orphaned_compaction().is_some(),
+        "fork cut mid-bracket must surface the orphaned CompactionStart"
+    );
+    // The fork must serialize and reload cleanly with the orphan still detectable.
+    fork.save()?;
+    let reloaded = Session::load(&fork.id)?;
+    assert!(reloaded.event_map.orphaned_compaction().is_some());
+    reloaded
+        .rederive_all_checked()
+        .expect("fork mid-bracket must reload consistent");
+    // Resolve the orphan via the crash-safe retry seam.
+    let mut resolved = reloaded;
+    resolved.compact_transcript_with_bracket(
+        "resolved",
+        resolved.messages.clone(),
+        comp.clone(),
+        1,
+    );
+    assert!(
+        resolved.event_map.orphaned_compaction().is_none(),
+        "retry seam must close the forked orphan"
+    );
+    resolved
+        .rederive_all_checked()
+        .expect("resolved fork must be consistent");
+    Ok(())
+}
+
+/// Multiple compaction changes across several journal appends must replay with
+/// LAST-WINS semantics: each journal entry's compaction meta and SetCompaction
+/// event are applied in order, and the reloaded session reflects only the final
+/// compaction while keeping the event log consistent.
+#[test]
+fn compaction_across_multiple_journal_appends_replays_last_wins() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-multi-compaction-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_multi_compaction_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("mc".to_string()));
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "m0".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?; // snapshot
+    let journal_path = session_journal_path(id)?;
+    assert!(!journal_path.exists());
+
+    // Compaction A via journal append.
+    session.set_compaction(StoredCompactionState {
+        summary_text: "compacted_a".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 1,
+        physically_consolidated: false,
+    });
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "m1".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+    assert!(journal_path.exists());
+
+    // Compaction B via another journal append (overrides A).
+    session.set_compaction(StoredCompactionState {
+        summary_text: "compacted_b".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 2,
+        original_turn_count: 2,
+        compacted_count: 2,
+        physically_consolidated: false,
+    });
+    session.save()?; // pure event-append: journals only append_events
+
+    let reloaded = Session::load(id)?;
+    assert_eq!(
+        reloaded.compaction.as_ref().map(|c| &c.summary_text),
+        Some(&"compacted_b".to_string()),
+        "last compaction must win across multi-entry replay"
+    );
+    // Both messages plus both compactions' events must be in the log; the last
+    // one derives as current.
+    assert_eq!(
+        reloaded.event_map.current_compaction().map(|c| c.summary_text).as_deref(),
+        Some("compacted_b"),
+        "event-derived current_compaction must reflect the last compaction"
+    );
+    reloaded
+        .rederive_all_checked()
+        .expect("multi-compaction journal replay must be consistent");
+    Ok(())
+}
+
+/// Upgrade/backward-compat: a journal written by an OLDER build (before the
+/// `append_events` field existed) must still load. The old journal carries only
+/// the legacy vectors; `append_events` deserializes empty (`#[serde(default)]`).
+/// On reload, the persisted event log (from the snapshot) must reconcile with the
+/// journal-appended messages without error.
+#[test]
+fn old_format_journal_without_append_events_still_loads() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-old-journal-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_old_journal_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("old".to_string()));
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "first".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?; // snapshot with event_log
+
+    // Add a message and save via journal (carries events).
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "second".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+    let journal_path = session_journal_path(id)?;
+    assert!(journal_path.exists());
+
+    // Simulate an OLD journal: rewrite the journal line, stripping `append_events`.
+    let line = std::fs::read_to_string(&journal_path)?;
+    let mut entry: serde_json::Value = serde_json::from_str(line.trim_end())?;
+    if let serde_json::Value::Object(map) = &mut entry {
+        map.remove("append_events");
+    }
+    std::fs::write(&journal_path, format!("{}\n", serde_json::to_string(&entry)?))?;
+
+    // Load: must not error; reconcile rebuilds from vectors since the journal has
+    // no events for "second", so both sources agree on the transcript.
+    let loaded = Session::load(id)?;
+    assert_eq!(loaded.messages.len(), 2, "both messages must load from message vectors");
+    loaded
+        .rederive_all_checked()
+        .expect("old-format journal load must stay consistent");
+    Ok(())
+}
+
+/// Clearing a session that already has BOTH a snapshot and a journal must
+/// checkpoint cleanly (the empty checkpoint is the intentional clear, not a
+/// destructive wipe), delete the journal, and reload empty with a consistent
+/// event log. This exercises `clear_intended` with a snapshot + journal present.
+#[test]
+fn clear_with_existing_snapshot_and_journal_checkpoints_cleanly() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-clear-journal-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_clear_journal_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("clear".to_string()));
+    session.add_message(
+        Role::User,
+        vec![crate::message::ContentBlock::Text {
+            text: "first".to_string(),
+            cache_control: None,
+        }],
+    );
+    // First save -> snapshot, no journal.
+    session.save()?;
+    let journal_path = session_journal_path(id)?;
+    assert!(!journal_path.exists(), "first save is a snapshot");
+
+    // Append another message -> the next save is a journal append (snapshot exists).
+    session.add_message(
+        Role::User,
+        vec![crate::message::ContentBlock::Text {
+            text: "second".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+    assert!(journal_path.exists(), "second save must be a journal append");
+
+    // Now clear the transcript. The empty checkpoint must not be refused as a
+    // destructive wipe (the ClearAll is the durable signal), must delete the
+    // journal, and reload empty + consistent.
+    session.clear_messages();
+    session.save()?;
+    assert!(
+        !journal_path.exists(),
+        "clear-then-save must checkpoint and delete the journal"
+    );
+
+    let reloaded = Session::load(id)?;
+    assert!(
+        reloaded.messages.is_empty(),
+        "cleared (snapshot+journal) session must reload empty"
+    );
+    reloaded
+        .rederive_all_checked()
+        .expect("cleared (snapshot+journal) reload must keep the event log consistent");
+    Ok(())
+}
+
+/// Backward-compat (takeaway #12) at the REAL persistence boundary: a session
+/// journal written by a pre-branding build carries `append_events` whose
+/// `SessionEvent.event_id` and `SessionEventOp::AppendMessage.message_id` /
+/// `CompactionStart.compaction_id` are plain JSON strings (no wrapper object).
+/// The branded newtypes are `#[serde(transparent)]`, so such a journal must load
+/// through `Session::load` and re-derive the same events — not just parse at the
+/// serde level, but survive the full journal → event-map reconciliation path.
+#[test]
+fn legacy_branded_ids_journal_loads_through_real_persistence() -> Result<()> {
+    use crate::session::event_types::{SessionEvent, SessionEventOp};
+
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-legacy-branded-journal-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_legacy_branded_journal_rt";
+    let mut session = Session::create_with_id(id.to_string(), None, Some("legacy".to_string()));
+    session.append_stored_message(StoredMessage {
+        id: "m1".to_string(),
+        role: Role::User,
+        content: vec![crate::message::ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+
+    // A compaction bracket + a plugin Unknown event that only the event log
+    // carries.
+    let compaction = StoredCompactionState {
+        summary_text: "summarized".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 1,
+        physically_consolidated: false,
+    };
+    session.event_map.start_compaction("comp_1", 1);
+    session.event_map.end_compaction(compaction.clone());
+    session.compaction = Some(compaction.clone());
+    let plugin_event = SessionEvent {
+        timestamp: chrono::Utc::now(),
+        event_id: "legacy_plugin".to_string().into(),
+        op: SessionEventOp::Unknown {
+            event_type: "review_round".to_string(),
+            data: serde_json::json!({ "rounds": 3 }),
+        },
+        parent_id: None,
+        version: 1,
+    };
+    session.event_map.append_event(plugin_event);
+
+    // First save → snapshot (no journal).
+    session.save()?;
+    let journal_path = session_journal_path(id)?;
+    assert!(!journal_path.exists(), "first save is a snapshot");
+
+    // Reload to seed the journal baseline, then append a message on the live
+    // session → journaled (append_events carries events).
+    let _baseline = Session::load(id)?;
+    session.append_stored_message(StoredMessage {
+        id: "m2".to_string(),
+        role: Role::User,
+        content: vec![crate::message::ContentBlock::Text {
+            text: "world".to_string(),
+            cache_control: None,
+        }],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    session.save()?;
+    assert!(
+        journal_path.exists(),
+        "second save must produce a journal carrying append_events"
+    );
+
+    // Simulate a PRE-BRANDING journal: leave the event id fields as bare JSON
+    // strings (the 'event_id' top-level and message_id/compaction_id under
+    // 'data'). This is exactly the raw-string shape a branding-era build wrote.
+    let line = std::fs::read_to_string(&journal_path)?;
+    let mut entry: serde_json::Value = serde_json::from_str(line.trim_end())?;
+    if let Some(events) = entry.get_mut("append_events").and_then(|v| v.as_array_mut()) {
+        for ev in events {
+            // event_id must be a bare string, not an object.
+            assert!(
+                ev.get("event_id").and_then(|v| v.as_str()).is_some(),
+                "persisted journal must keep event_id as a bare string"
+            );
+        }
+    } else {
+        return Err(anyhow!("journal append_events missing for event-carrying save"));
+    }
+    std::fs::write(&journal_path, format!("{}\n", serde_json::to_string(&entry)?))?;
+
+    // Reload through the real path: the legacy raw-string events must hydrate
+    // into the branded types and the transcript must re-derive to m1 + m2.
+    let loaded = Session::load(id)?;
+    let derived = loaded.derive_messages();
+    assert_eq!(derived.len(), 2, "m1 + m2 must survive legacy-journal load");
+    assert_eq!(derived[0].content_preview(), "hello");
+    assert_eq!(derived[1].content_preview(), "world");
+
+    // The plugin Unknown event (log-only) must have been replayed with its
+    // branded EventId intact.
+    let plugin_found = loaded
+        .event_map
+        .events
+        .iter()
+        .any(|e| e.event_id.as_str() == "legacy_plugin");
+    assert!(plugin_found, "log-only plugin event must survive legacy-journal load");
+
+    // The compaction bracket must have replayed to a consistent compaction.
+    assert!(loaded.compaction.is_some(), "compaction must survive");
+    loaded.rederive_all_checked().expect("legacy journal load stays consistent");
+    Ok(())
+}
+
 #[test]
 fn restored_tool_image_boundaries_follow_returned_history_rows() {
     let mut session = Session::create_with_id("image-boundaries".into(), None, None);
@@ -2666,6 +4549,7 @@ fn restored_tool_image_boundaries_follow_returned_history_rows() {
         covers_up_to_turn: 1,
         original_turn_count: 1,
         compacted_count: 1,
+        physically_consolidated: false,
     });
     let (messages, images, _) =
         render_messages_and_images_with_compacted_history(&session, usize::MAX);
