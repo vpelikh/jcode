@@ -258,9 +258,40 @@ bash/bg, and the background manager's adoption API) and should get its own
 dedicated session with a steering decision on the default for each tool.
 
 **Related (the `None`-fallback half is now DONE):** broaden the opt-in to the
-cancellable I/O tools that don't self-manage a timeout (`conversation_search`,
-`session_search`, `ambient`/schedule, `gmail`). The TUI info-widget
+cancellable I/O tools that don't self-manage a timeout. The TUI info-widget
 `background_info` `None`-session fallback was changed to show no indicator
 instead of a global aggregate (backward compat is not a goal), with an
 integration-test assertion covering the resolved-and-idle and unresolved-`None`
 cases.
+
+### Broadening the opt-in: session_search (partial)
+
+The concrete `None`-fallback half — give more tools a declared
+`execution_timeout()` — is partially delivered:
+
+- **`session_search` now opts in.** `SessionSearchTool` declares a 60s
+  whole-call deadline (`EXECUTION_TIMEOUT_SECS`). It is the clean fit: it scans
+  up to `MAX_MAX_SCAN_SESSIONS` (10k) session snapshots/journals on
+  `spawn_blocking` with no self-managed bound, so a slow disk or a pathological
+  exhaustive scan can otherwise hold the turn indefinitely. The scan is
+  **read-only and idempotent**, so when the registry wrap point times it out the
+  turn returns a clean model-visible "timed out after Ns" error immediately and
+  the underlying scan finishes harmlessly in the background (wasted CPU only,
+  no side effects or corrupted state). Two tests pin the declared constant and
+  the model-visible error contract via the shared `execute_with_deadline` wrap.
+
+- **Deliberately not opted in (documented, not a gap):**
+  - `gmail` — the whole-tool `execution_timeout()` cannot distinguish the
+    `connect` action's self-managed ~5-minute browser-approval poll (150×2s)
+    from the unbounded HTTP body reads on the other actions. A deadline short
+    enough to bind the reads would break `connect`; one long enough for
+    `connect` would not bound the reads. Splitting this needs an
+    action-scoped deadline, which is out of scope for the one-deadline seam.
+  - `conversation_search` — sync-dominant (`Session::load` + in-memory search),
+    almost no `await` points, so a `tokio::time::timeout` cannot meaningfully
+    interrupt it; a declared timeout would be a misleading claim.
+  - `ambient`/`schedule` — synchronous queue mutations and runner nudges, no
+    network/scan I/O that can hang; no hang risk to bound.
+
+The core F8 "promote-on-timeout" seam for `bash`/`bg`/`webfetch` remains a
+separate, behavior-changing follow-up as described above.
