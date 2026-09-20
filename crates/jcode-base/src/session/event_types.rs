@@ -169,6 +169,15 @@ impl Serialize for SessionEventOp {
             match data {
                 serde_json::Value::Object(fields) => {
                     for (k, v) in fields {
+                        // `op` is the reserved wire discriminator. Emitting a
+                        // payload field also named `op` alongside the tag would
+                        // produce duplicate `op` keys (invalid/ambiguous JSON),
+                        // silently corrupting the round trip. Skip it: the tag is
+                        // emitted exactly once below. A plugin payload that needs
+                        // `op` must use a different key (the tag is reserved).
+                        if k == OP_KEY {
+                            continue;
+                        }
                         map.serialize_entry(k, v)?;
                     }
                 }
