@@ -275,68 +275,88 @@ impl<'de> Deserialize<'de> for SessionEventOp {
 
         let mut clone = obj.clone();
         clone.remove(OP_KEY);
+        // Forward-compat fallback for the escape hatch: a known `op` tag may be a
+        // FUTURE core variant that was promoted from an `Unknown`, whose payload
+        // shape differs from what this build expects. If the per-variant parse
+        // fails, degrade to `Unknown` (preserving the full payload) rather than
+        // erroring — otherwise a single shape mismatch on one event would fail to
+        // load the whole journal. `remaining` is a copy of the fields WITHOUT the
+        // `op` tag, used as the Unknown payload.
+        let remaining = serde_json::Value::Object(clone.clone());
+        let make_unknown = |event_type: &str| SessionEventOp::Unknown {
+            event_type: event_type.to_string(),
+            data: remaining.clone(),
+        };
 
         match op {
             "append_message" => {
-                let fields = serde_json::from_value::<AppendMessageFields>(serde_json::Value::Object(clone))
-                    .map_err(serde::de::Error::custom)?;
-                Ok(SessionEventOp::AppendMessage {
-                    message_id: fields.message_id,
-                    message: fields.message,
-                })
+                match serde_json::from_value::<AppendMessageFields>(serde_json::Value::Object(clone)) {
+                    Ok(fields) => Ok(SessionEventOp::AppendMessage {
+                        message_id: fields.message_id,
+                        message: fields.message,
+                    }),
+                    Err(_) => Ok(make_unknown(op)),
+                }
             }
             "replace_messages" => {
-                let fields = serde_json::from_value::<ReplaceMessagesFields>(serde_json::Value::Object(clone))
-                    .map_err(serde::de::Error::custom)?;
-                Ok(SessionEventOp::ReplaceMessages {
-                    start_index: fields.start_index,
-                    end_index: fields.end_index,
-                    messages: fields.messages,
-                })
+                match serde_json::from_value::<ReplaceMessagesFields>(serde_json::Value::Object(clone)) {
+                    Ok(fields) => Ok(SessionEventOp::ReplaceMessages {
+                        start_index: fields.start_index,
+                        end_index: fields.end_index,
+                        messages: fields.messages,
+                    }),
+                    Err(_) => Ok(make_unknown(op)),
+                }
             }
             "insert_message" => {
-                let fields = serde_json::from_value::<InsertMessageFields>(serde_json::Value::Object(clone))
-                    .map_err(serde::de::Error::custom)?;
-                Ok(SessionEventOp::InsertMessage {
-                    index: fields.index,
-                    message: fields.message,
-                })
+                match serde_json::from_value::<InsertMessageFields>(serde_json::Value::Object(clone)) {
+                    Ok(fields) => Ok(SessionEventOp::InsertMessage {
+                        index: fields.index,
+                        message: fields.message,
+                    }),
+                    Err(_) => Ok(make_unknown(op)),
+                }
             }
             "memory_injection" => {
-                let fields = serde_json::from_value::<MemoryInjectionFields>(serde_json::Value::Object(clone))
-                    .map_err(serde::de::Error::custom)?;
-                Ok(SessionEventOp::MemoryInjection {
-                    memory_injection: fields.memory_injection,
-                })
+                match serde_json::from_value::<MemoryInjectionFields>(serde_json::Value::Object(clone)) {
+                    Ok(fields) => Ok(SessionEventOp::MemoryInjection {
+                        memory_injection: fields.memory_injection,
+                    }),
+                    Err(_) => Ok(make_unknown(op)),
+                }
             }
             "replay_event" => {
-                let fields = serde_json::from_value::<ReplayEventFields>(serde_json::Value::Object(clone))
-                    .map_err(serde::de::Error::custom)?;
-                Ok(SessionEventOp::ReplayEvent {
-                    replay_event: fields.replay_event,
-                })
+                match serde_json::from_value::<ReplayEventFields>(serde_json::Value::Object(clone)) {
+                    Ok(fields) => Ok(SessionEventOp::ReplayEvent {
+                        replay_event: fields.replay_event,
+                    }),
+                    Err(_) => Ok(make_unknown(op)),
+                }
             }
             "set_compaction" => {
-                let fields = serde_json::from_value::<SetCompactionFields>(serde_json::Value::Object(clone))
-                    .map_err(serde::de::Error::custom)?;
-                Ok(SessionEventOp::SetCompaction {
-                    compaction: fields.compaction,
-                })
+                match serde_json::from_value::<SetCompactionFields>(serde_json::Value::Object(clone)) {
+                    Ok(fields) => Ok(SessionEventOp::SetCompaction {
+                        compaction: fields.compaction,
+                    }),
+                    Err(_) => Ok(make_unknown(op)),
+                }
             }
             "compaction_start" => {
-                let fields = serde_json::from_value::<CompactionStartFields>(serde_json::Value::Object(clone))
-                    .map_err(serde::de::Error::custom)?;
-                Ok(SessionEventOp::CompactionStart {
-                    compaction_id: fields.compaction_id,
-                    covers_up_to_turn: fields.covers_up_to_turn,
-                })
+                match serde_json::from_value::<CompactionStartFields>(serde_json::Value::Object(clone)) {
+                    Ok(fields) => Ok(SessionEventOp::CompactionStart {
+                        compaction_id: fields.compaction_id,
+                        covers_up_to_turn: fields.covers_up_to_turn,
+                    }),
+                    Err(_) => Ok(make_unknown(op)),
+                }
             }
             "compaction_end" => {
-                let fields = serde_json::from_value::<CompactionEndFields>(serde_json::Value::Object(clone))
-                    .map_err(serde::de::Error::custom)?;
-                Ok(SessionEventOp::CompactionEnd {
-                    compaction: fields.compaction,
-                })
+                match serde_json::from_value::<CompactionEndFields>(serde_json::Value::Object(clone)) {
+                    Ok(fields) => Ok(SessionEventOp::CompactionEnd {
+                        compaction: fields.compaction,
+                    }),
+                    Err(_) => Ok(make_unknown(op)),
+                }
             }
             "clear_all" => {
                 // The derived unit variant serialized as just `{"op":"clear_all"}`.
