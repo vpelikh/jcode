@@ -1019,3 +1019,41 @@ Two more `pub(super)` handlers dropped flat swarm-map params for
 
 Zero behavior change; the full `jcode-app-core` lib suite stays green
 (1480 passing) and clippy introduces no new warnings.
+
+## Tier 1 convergence status (landed 2026-09)
+
+The flat swarm-map argument convergence on the swarm/client router boundary is
+complete. Every client-request router handler and swarm `comm_*` handler that
+was previously handed a flat `swarm_members` / `swarms_by_id` /
+`swarm_event_tx` / `event_history` bag now takes `&SwarmServiceHandle` and
+binds the maps as body locals. This includes `comm_await`, `comm_session`,
+`comm_control`, `comm_plan`, `comm_sync`, `comm_graph`, the client-request
+handlers (`handle_subscribe` / `handle_resume_session` / `handle_rename_session`
+/ `handle_set_working_dir` / `handle_reload` / `handle_set_feature` /
+`handle_notify_session` / `handle_agent_task` / `handle_comm_assign_role`),
+`live_turn` (`spawn_tracked_live_turn` / `idle_live_agent`),
+`background_tasks`, the `monitor_bus` swarm dispatchers, the debug
+swarm-read/write hops, and `debug_events::maybe_handle_event_query_command`.
+
+Remaining flat-map `pub(super)` functions are intentionally out of scope for
+this Tier 1:
+
+- **`state.rs` / `swarm.rs` domain foundation.** `fanout_session_event`,
+  `session_event_fanout_sender`, `update_member_status*`,
+  `broadcast_swarm_status*`, `record_swarm_event*`, `remove_session_*`, etc.
+  are the free functions the `SwarmServiceHandle` method layer is built on top
+  of. Their signatures are the domain API; the handle wraps them for callers.
+- **Maintenance / debug service slices (Seam D / Seam E).**
+  `reload::await_reload_signal` / `graceful_shutdown_sessions`,
+  `jade_relay::spawn_if_configured`, `debug::inject_transcript`,
+  `client_disconnect_cleanup::detach_client_attachment` each span several
+  service boundaries and belong to the maintenance/debug service extractions
+  in the dependency-direction plan (`Maintenance -> Sess/Swarm/Client`, debug
+  consumes snapshots). They are flagged for those dedicated slices.
+- **`spawn_or_resume_await_members`** intentionally keeps flat owned args
+  (it hands owned `Arc`/`Sender` clones to a spawned watcher task, per design
+  decision A).
+
+The convergence gate ("zero flat swarm-map args in any pub/super *router*
+handler signature") is met on the client/swarm boundary; tests stay green
+(1480 passing) and clippy clean after each landed slice.
