@@ -943,6 +943,218 @@ fn handle_server_event_applies_remote_memory_activity_snapshot() {
     crate::memory::clear_activity();
 }
 
+#[test]
+fn session_working_dir_changed_updates_app_for_active_session() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+    let mut app = create_test_app();
+    app.remote_session_id = Some("active_sess".to_string());
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    let handled = handle_server_event(
+        &mut app,
+        ServerEvent::SessionWorkingDirChanged {
+            session_id: "active_sess".to_string(),
+            working_dir: "/worktrees/feat-panel".to_string(),
+        },
+        &mut remote,
+    );
+
+    assert!(handled, "change for the active session must be consumed");
+    assert_eq!(
+        app.session.working_dir.as_deref(),
+        Some("/worktrees/feat-panel"),
+        "the local app session must re-scope to the new directory"
+    );
+    let last = app.display_messages().last().expect("display message");
+    assert_eq!(last.role, "system");
+    assert!(
+        last.content.contains("worktrees/feat-panel"),
+        "unexpected notice: {}",
+        last.content
+    );
+    assert_eq!(
+        app.status_notice.as_ref().map(|(s, _)| s.as_str()),
+        Some("Working directory changed")
+    );
+}
+
+#[test]
+fn session_working_dir_changed_ignored_for_other_session() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+    let mut app = create_test_app();
+    app.remote_session_id = Some("active_sess".to_string());
+    let original_dir = app.session.working_dir.clone();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    let handled = handle_server_event(
+        &mut app,
+        ServerEvent::SessionWorkingDirChanged {
+            session_id: "other_sess".to_string(),
+            working_dir: "/worktrees/other".to_string(),
+        },
+        &mut remote,
+    );
+
+    assert!(!handled, "a change for a non-active session must be ignored");
+    assert_eq!(
+        app.session.working_dir, original_dir,
+        "an unrelated session's working-dir change must not touch the local session"
+    );
+    assert!(
+        app.display_messages().is_empty(),
+        "no notice should be shown for a non-active session"
+    );
+}
+
+#[test]
+fn session_working_dir_same_value_is_idempotent() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+    let mut app = create_test_app();
+    app.remote_session_id = Some("active_sess".to_string());
+    app.session.working_dir = Some("/worktrees/feat-panel".to_string());
+    app.push_display_message(jcode_tui_messages::DisplayMessage::system(
+        "pre-existing".to_string(),
+    ));
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    let handled = handle_server_event(
+        &mut app,
+        ServerEvent::SessionWorkingDirChanged {
+            session_id: "active_sess".to_string(),
+            working_dir: "/worktrees/feat-panel".to_string(),
+        },
+        &mut remote,
+    );
+
+    // The working dir is unchanged, but a /cd to the same tree still surfaces a
+    // confirmation notice (the server suppresses the change event entirely on a
+    // true no-op, so reaching this handler always reports an actual change).
+    assert!(handled);
+    assert_eq!(
+        app.session.working_dir.as_deref(),
+        Some("/worktrees/feat-panel")
+    );
+    assert_eq!(app.display_messages().len(), 2, "a confirmation is appended");
+    let last = app.display_messages().last().expect("display message");
+    assert_eq!(last.role, "system");
+    assert!(last.content.contains("worktrees/feat-panel"));
+}
+
+#[test]
+fn cd_command_is_discoverable_in_suggestions_and_help() {
+    let app = create_test_app();
+
+    // Typing the prefix must surface /cd as a completion candidate.
+    let suggestions = app.get_suggestions_for("/cd");
+    assert!(
+        suggestions.iter().any(|(command, _)| command == "/cd"),
+        "typing /cd should suggest the /cd command, got {suggestions:?}"
+    );
+
+    // /help must carry the descriptive text so the command is discoverable.
+    let help = app
+        .command_help("cd")
+        .expect("/cd should have detailed help");
+    assert!(help.contains("/cd"), "help should include the command, got: {help}");
+    assert!(
+        help.to_lowercase().contains("working directory")
+            || help.to_lowercase().contains("worktree"),
+        "help should describe the working-directory purpose, got: {help}"
+    );
+}
+
+#[test]
+fn cd_keyhandler_submits_set_working_dir_request() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.remote_session_id = Some("active_sess".to_string());
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    let request_id_before = remote.next_request_id_for_test();
+
+    // A real directory so the request argument is coherent (the server does
+    // the canonicalization; the client only forwards the raw string).
+    let dir = std::env::current_dir().expect("cwd");
+    app.set_input_for_test(format!("/cd {}", dir.display()));
+
+    rt.block_on(app.handle_remote_key(KeyCode::Enter, KeyModifiers::empty(), &mut remote))
+        .expect("/cd submit should succeed");
+
+    assert!(
+        remote.next_request_id_for_test() > request_id_before,
+        "submitting /cd must send a SetWorkingDir request"
+    );
+    assert!(
+        app.input.is_empty(),
+        "the /cd command should be consumed from the input box"
+    );
+}
+
+#[test]
+fn cd_keyhandler_empty_arg_shows_usage_without_request() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+    let mut app = create_test_app();
+    app.is_remote = true;
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    let request_id_before = remote.next_request_id_for_test();
+
+    app.set_input_for_test("/cd".to_string());
+    rt.block_on(app.handle_remote_key(KeyCode::Enter, KeyModifiers::empty(), &mut remote))
+        .expect("/cd with no argument should be handled");
+
+    assert_eq!(
+        remote.next_request_id_for_test(),
+        request_id_before,
+        "an empty /cd must not send a request"
+    );
+    let last = app.display_messages().last().expect("display message");
+    assert_eq!(last.role, "error");
+    assert!(
+        last.content.contains("Usage: /cd"),
+        "empty /cd should show usage, got: {}",
+        last.content
+    );
+}
+
+#[test]
+fn cd_keyhandler_rejects_while_agent_is_processing() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.is_processing = true;
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    let request_id_before = remote.next_request_id_for_test();
+
+    app.set_input_for_test("/cd /tmp".to_string());
+    rt.block_on(app.handle_remote_key(KeyCode::Enter, KeyModifiers::empty(), &mut remote))
+        .expect("/cd while busy should be handled");
+
+    assert_eq!(
+        remote.next_request_id_for_test(),
+        request_id_before,
+        "/cd while the agent is working must not send a request"
+    );
+    let last = app.display_messages().last().expect("display message");
+    assert_eq!(last.role, "error");
+    assert!(
+        last.content.contains("currently working"),
+        "busy /cd should explain the wait, got: {}",
+        last.content
+    );
+}
+
 /// Reproduces the "stuck on loading session…" bug and verifies the watchdog
 /// recovers it: a remote connection that never receives the bootstrap History
 /// event (so `has_loaded_history()` stays false) must re-request `GetHistory`
