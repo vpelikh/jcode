@@ -716,6 +716,7 @@ pub(super) async fn handle_set_working_dir(
                     ("phase", "working_dir_error".to_string()),
                     ("request_id", id.to_string()),
                     ("session_id", client_session_id.to_string()),
+                    ("attempted_working_dir", working_dir.clone()),
                     ("error", error.clone()),
                     ("elapsed_ms", started.elapsed().as_millis().to_string()),
                 ],
