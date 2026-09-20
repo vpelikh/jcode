@@ -106,6 +106,48 @@ pub fn recent(limit: usize) -> Result<Vec<RecentSessionMetadata>> {
     Ok(entries)
 }
 
+/// Search recent sessions whose title, working dir, or id contains `query`
+/// (case-insensitive substring). Returns at most `limit` matches ordered by
+/// most-recently-active first. Powers the Telegram `/find` command so users
+/// can locate a session without paging through the full `/list`.
+pub fn search(query: &str, limit: usize) -> Result<Vec<RecentSessionMetadata>> {
+    let connection = open()?;
+    let like = format!("%{}%", query.replace('\\', "").replace('%', ""));
+    let mut statement = connection.prepare(
+        "SELECT session_id, working_dir, generated_title, custom_title,
+                todo_title, saved, updated_at_ms, last_active_at_ms
+         FROM recent_sessions
+         WHERE session_id LIKE 'session_%'
+           AND (
+             COALESCE(custom_title, '') LIKE ?1
+             OR COALESCE(todo_title, '') LIKE ?1
+             OR COALESCE(generated_title, '') LIKE ?1
+             OR COALESCE(working_dir, '') LIKE ?1
+             OR session_id LIKE ?1
+           )
+         ORDER BY COALESCE(last_active_at_ms, updated_at_ms) DESC
+         LIMIT ?2",
+    )?;
+    let entries = statement
+        .query_map(
+            params![like, i64::try_from(limit).unwrap_or(i64::MAX)],
+            |row| {
+                Ok(RecentSessionMetadata {
+                    session_id: row.get(0)?,
+                    working_dir: row.get(1)?,
+                    generated_title: row.get(2)?,
+                    custom_title: row.get(3)?,
+                    todo_title: row.get(4)?,
+                    saved: row.get(5)?,
+                    updated_at_ms: row.get(6)?,
+                    last_active_at_ms: row.get(7)?,
+                })
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(entries)
+}
+
 /// Update the index after a successful session persistence operation.
 pub fn upsert_session(session: &Session) -> Result<()> {
     upsert(&RecentSessionMetadata {
