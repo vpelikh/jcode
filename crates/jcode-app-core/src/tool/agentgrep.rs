@@ -246,6 +246,10 @@ impl Tool for AgentGrepTool {
                 "paths_only": {
                     "type": "boolean",
                     "description": "Return only matching paths instead of match excerpts where supported."
+                },
+                "allow_raw_fallback": {
+                    "type": "boolean",
+                    "description": "Skip the compass_query-first redirect and run raw grep for this call."
                 }
             }
         })

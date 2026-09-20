@@ -1,8 +1,9 @@
 mod agentgrep;
-mod compass_query;
+pub(crate) mod compass_query;
 pub mod ambient;
 mod apply_patch;
 mod bash;
+pub(crate) mod compass_enforcement;
 mod batch;
 mod bg;
 mod browser;
@@ -19,6 +20,13 @@ mod edit;
 mod edit_stats;
 mod feedback;
 mod gmail;
+// The `initiative` tool is not currently registered (a test asserts it is
+// deliberately *not* advertised in the registry). It is kept compiled in the
+// lib because it ships a complete Goals/initiative domain plus a side-panel
+// view that later pages the same (see the deepseek-harness status doc), while
+// staying unreachable until explicitly wired. It is therefore dominated by
+// `dead_code`; allow it rather than dropping the module or gating it to tests.
+#[allow(dead_code)]
 mod goal;
 pub mod inflight;
 mod invalid;
@@ -167,6 +175,26 @@ fn session_tool_policy(session_id: &str) -> Option<SessionToolPolicy> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(session_id)
         .cloned()
+}
+
+/// Whether the session's tool policy disables `name` for `session_id`. Mirrors
+/// the allow/deny logic in [`Registry::execute`] so callers can skip work for
+/// tools the session cannot actually invoke. Used to (a) gate the Compass
+/// pre-warm on session bind, and (b) decide whether the agentgrep→compass_query
+/// enforcement redirect is safe (i.e. `compass_query` is actually invokable).
+pub(crate) fn session_tool_is_disabled(session_id: &str, name: &str) -> bool {
+    let Some(policy) = session_tool_policy(session_id) else {
+        return false;
+    };
+    if tool_name_is_disabled(&policy.disabled_tools, name) {
+        return true;
+    }
+    if let Some(allowed) = policy.allowed_tools.as_ref() {
+        // If a caller-facing allow-list is present, disabled unless named.
+        !tool_name_is_allowed(allowed, name)
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -352,17 +380,21 @@ impl Registry {
             let mut m = HashMap::new();
             Self::insert_tool_timed(&mut m, &mut timings, "read", read::ReadTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "write", write::WriteTool::new);
-            Self::insert_tool_timed(
-                &mut m,
-                &mut timings,
-                "agentgrep",
-                agentgrep::AgentGrepTool::new,
-            );
+            // Advertise `compass_query` before `agentgrep` so the model reaches for
+            // the semantic search tool first (models bias toward earlier-listed
+            // tools). The tool-level enforcement redirect is the hard backstop;
+            // ordering nudges the model toward the intended first choice.
             Self::insert_tool_timed(
                 &mut m,
                 &mut timings,
                 "compass_query",
                 compass_query::CompassQueryTool::new,
+            );
+            Self::insert_tool_timed(
+                &mut m,
+                &mut timings,
+                "agentgrep",
+                agentgrep::AgentGrepTool::new,
             );
             Self::insert_tool_timed(
                 &mut m,
@@ -809,34 +841,15 @@ impl Registry {
         // interrupted one and inject a duplicate synthetic result. See
         // `tool::inflight`.
         let _in_flight = inflight::mark_tool_in_flight(&ctx.tool_call_id);
-        let tools = self.tools.read().await;
+        // Resolve the canonical tool name up front (pure, no lock needed) so we
+        // can snapshot the compass-first enforcement flag for agentgrep calls
+        // Confirmed what the snapshot is for: it must be read before taking the tools
+        // lock so a config reload cannot deadlock a re-entrant registry lookup.
+        // The `resolved_name == "agentgrep"` gate and the config read live in
+        // `compass_enforcement::prefer_compass_query_for` (see its doc).
         let resolved_name = Self::resolve_tool_name(name);
-        // Enforce product separation here too: batch/subcalls dispatch through
-        // the registry without going through Agent::validate_tool_allowed.
-        if matches!(
-            resolved_name,
-            "selfdev" | "debug_socket" | "desktop_selfdev" | "jcode_docs"
-        ) {
-            let desktop = ctx
-                .working_dir
-                .as_deref()
-                .and_then(jcode_selfdev_types::desktop_repo_root)
-                .is_some();
-            if desktop && resolved_name == "jcode_docs" {
-                anyhow::bail!(
-                    "Tool 'jcode_docs' is disabled in Desktop self-development mode. Read the working tree documentation instead."
-                );
-            }
-            if desktop && matches!(resolved_name, "selfdev" | "debug_socket") {
-                anyhow::bail!(
-                    "Tool '{}' targets Jcode CLI, not Desktop. Use 'desktop_selfdev'.",
-                    resolved_name
-                );
-            }
-            if !desktop && resolved_name == "desktop_selfdev" {
-                anyhow::bail!("Tool 'desktop_selfdev' requires a Jcode Desktop source checkout.");
-            }
-        }
+        let prefer_compass_query = compass_enforcement::prefer_compass_query_for(resolved_name);
+        let tools = self.tools.read().await;
         if let Some(policy) = session_tool_policy(&ctx.session_id) {
             if let Some(allowed) = policy.allowed_tools.as_ref()
                 && !self.tool_is_allowed(allowed, resolved_name)
@@ -864,8 +877,38 @@ impl Registry {
             }
         };
 
-        // Drop the lock before executing
-        drop(tools);
+        // Code-enforcement tier for the "use `compass_query` before `agentgrep`"
+        // guidance. The policy, decision, and side effects live entirely in
+        // `tool::compass_enforcement` (see `Registry::enforce_compass_first`),
+        // which returns a guidance result to short-circuit with, or `None` to
+        // run the tool normally. An interception sits before the `pre_tool`
+        // policy hook because it executes no tool; the model's follow-up
+        // `compass_query` (or bypassed agentgrep) is what the hook gates.
+        if let Some(intercept) = self.enforce_compass_first(
+            tools,
+            name,
+            resolved_name,
+            &input,
+            prefer_compass_query,
+            &ctx,
+        ) {
+            return Ok(intercept);
+        }
+
+        // Measurement for the "semantic search first" guidance: after the
+        // snippet-rendering fix ships, this per-session counter (compass_query
+        // vs raw `agentgrep` grep) shows whether the ratio actually improves,
+        // before committing to a stricter enforcement rule. Only real
+        // executions are counted (intercepted agentgrep greps already returned
+        // above), and find/outline/trace modes are excluded from the raw-grep
+        // side since compass does not replace them.
+        if resolved_name == "compass_query" {
+            compass_enforcement::record_search_usage(&ctx.session_id, true);
+        } else if resolved_name == "agentgrep"
+            && compass_enforcement::agentgrep_call_is_grep_mode(&input)
+        {
+            compass_enforcement::record_search_usage(&ctx.session_id, false);
+        }
 
         // User-configured pre_tool gate: external policy hook that can block
         // this call (exit 2). Skipped entirely when not configured.
@@ -899,8 +942,19 @@ impl Registry {
         );
 
         let started_at = std::time::Instant::now();
-        let result = tool.execute(input.clone(), ctx.clone()).await;
+        let result = jcode_tool_core::execute_with_deadline(
+            tool.execution_timeout(&input),
+            resolved_name,
+            tool.execute(input.clone(), ctx.clone()),
+        )
+        .await;
         let latency_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+
+        // A genuine `compass_query` attempt satisfies any outstanding redirect
+        // for the session (see `clear_compass_redirect_after_run`), whether it
+        // returned a warm result or a "building, try again" hint, so a project
+        // Compass genuinely cannot index still reaches raw grep afterward.
+        self.clear_compass_redirect_after_run(resolved_name, &ctx);
 
         crate::telemetry::record_tool_execution(resolved_name, &input, result.is_ok(), latency_ms);
         Self::fire_post_tool_hook(resolved_name, &ctx, &result, latency_ms);
