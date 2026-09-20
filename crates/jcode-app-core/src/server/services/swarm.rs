@@ -1128,4 +1128,105 @@ mod tests {
         .await;
         assert!(h2.swarm_state().swarms_by_id.read().await.is_empty());
     }
+
+    #[tokio::test]
+    async fn rename_completes_while_coordinator_write_is_held() {
+        // Regression guard for the coordinator rewrite folded into
+        // rename_member_session: the member/swarms writes must be released
+        // before the method acquires the coordinators write lock. If instead it
+        // held the member (or swarms) write while waiting on coordinators, a
+        // concurrent path that already holds coordinators would deadlock.
+        let handle = {
+            let s = SwarmState {
+                members: Arc::new(RwLock::new(HashMap::from([(
+                    "old".to_string(),
+                    {
+                        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+                        SwarmMember {
+                            session_id: "old".to_string(),
+                            event_tx,
+                            event_txs: HashMap::new(),
+                            working_dir: None,
+                            swarm_id: Some("swarm-test".to_string()),
+                            swarm_enabled: true,
+                            status: "ready".to_string(),
+                            detail: None,
+                            task_label: None,
+                            friendly_name: Some("old".to_string()),
+                            report_back_to_session_id: None,
+                            latest_completion_report: None,
+                            role: "agent".to_string(),
+                            joined_at: Instant::now(),
+                            last_status_change: Instant::now(),
+                            is_headless: false,
+                            output_tail: None,
+                            todo_progress: None,
+                            todo_items: Vec::new(),
+                            runtime: crate::protocol::SwarmMemberRuntime::default(),
+                        }
+                    },
+                )]))),
+                swarms_by_id: Arc::new(RwLock::new(HashMap::from([(
+                    "swarm-test".to_string(),
+                    HashSet::from(["old".to_string()]),
+                )]))),
+                plans: Arc::new(RwLock::new(HashMap::new())),
+                coordinators: Arc::new(RwLock::new(HashMap::from([(
+                    "swarm-test".to_string(),
+                    "old".to_string(),
+                )]))),
+            };
+            SwarmServiceHandle::test_with_state(
+                s,
+                Arc::new(RwLock::new(HashMap::new())),
+                Arc::new(RwLock::new(HashMap::new())),
+                Arc::new(RwLock::new(HashMap::new())),
+                SwarmMutationRuntime::default(),
+            )
+        };
+        let coordinators = handle.swarm_state().coordinators.clone();
+
+        // A concurrent owner holds the coordinators write lock. rename_member_session
+        // must NOT block before completing the members rename: it acquires
+        // members, then swarms, and only last tries coordinators. If it held a
+        // member (or swarm) write while waiting on the coordinator lock, the
+        // members rename would not be visible until the external lock drops,
+        // and with the guard held forever it would deadlock.
+        let guard = coordinators.write().await;
+        let rename_task = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                handle.rename_member_session("old", "new").await;
+            }
+        });
+
+        // The members rename must complete while the coordinator write is still
+        // held by us, proving the method reaches and releases the members write
+        // before waiting on coordinators.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if handle.swarm_state().members.read().await.contains_key("new") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("members rename must progress while the coordinator write lock is held");
+
+        // Release the coordinator lock; the rename completes its coordinator
+        // rewrite and the task finishes.
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(2), rename_task)
+            .await
+            .expect("rename task must finish once the coordinator lock is released")
+            .expect("rename task must not panic");
+
+        let coordinators = coordinators.read().await;
+        assert_eq!(
+            coordinators.get("swarm-test").map(String::as_str),
+            Some("new"),
+            "coordinator follows the renamed session once the external lock is released"
+        );
+    }
 }
