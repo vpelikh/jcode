@@ -1861,19 +1861,25 @@ fn scroll_repaint_hides_cursor_before_cell_moves_via_draw_core() {
     let hide = "\u{1b}[?25l";
     let show = "\u{1b}[?25h";
 
-    // Frame the same capture and ordering check for the two real full-frame
-    // invalidation branches. SoftRepaint is the scroll path (`scroll_up` /
-    // `scroll_down` set `force_full_repaint`); HardClear is the full redraw path
-    // (`force_full_redraw`, e.g. native terminal scroll or external commands),
-    // which clears then re-emits an even larger diff. Both must hide the caret
-    // before any `MoveTo`.
-    for arm in ["soft_repaint", "hard_clear"] {
+    // Frame the same capture and ordering check for all three real full-frame
+    // invalidation branches, because the hide must be unconditional across them:
+    //   - `soft_repaint`: the scroll path (`scroll_up`/`scroll_down` set
+    //     `force_full_repaint`); sentinel-invalidate only, no clear escape.
+    //   - `hard_clear`: the full-redraw path (`force_full_redraw`, e.g. native
+    //     terminal scroll or external commands); clears (ED2) then re-emits.
+    //   - `none`: a normal typing/streaming frame; no invalidation flag, yet it
+    //     still MoveTo s the cells that shift as content grows.
+    for arm in ["soft_repaint", "hard_clear", "none"] {
         let mut app = create_test_app();
         match arm {
             "soft_repaint" => app.force_full_repaint = true,
             "hard_clear" => app.force_full_redraw = true,
+            "none" => {} // no flag: a plain incremental frame
             _ => unreachable!(),
         }
+        // A fresh renderer has no `last_frame`, so even the `none` / plain frame
+        // emits the full surface on its first draw (every cell differs from the
+        // empty previous frame) — exactly the typing/streaming sweep we must cover.
 
         let stream = {
             let mut output: Vec<u8> = Vec::new();
@@ -1904,9 +1910,9 @@ fn scroll_repaint_hides_cursor_before_cell_moves_via_draw_core() {
         // check guards each distinct branch.
         let has_clear = stream.contains("\u{1b}[2J");
         match arm {
-            "soft_repaint" => assert!(
+            "soft_repaint" | "none" => assert!(
                 !has_clear,
-                "soft_repaint arm must not emit an ED2 clear; got: {stream:?}"
+                "{arm} arm must not emit an ED2 clear; got: {stream:?}"
             ),
             "hard_clear" => assert!(
                 has_clear,

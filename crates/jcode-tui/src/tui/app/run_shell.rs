@@ -613,7 +613,7 @@ impl StatusSpinnerRenderer {
         }
         self.last_frame = Some(completed_buffer);
         self.last_full_frame_at = Some(Instant::now());
-        // A full frame fully rewrote the whole screen, so ratatui's working buffer no
+        // A full frame rewrote the whole surface, so ratatui's working buffer no
         // longer matches `last_frame` outside the animated rows. Force the next
         // animation-only repaint to re-seed before it trusts that again.
         self.seeded_animation_area = None;
@@ -624,7 +624,7 @@ impl StatusSpinnerRenderer {
             self.last_full_frame_input.push_str(&app.input);
         }
         // Close the key-to-paint clock here rather than at render time: the user
-        // sees the keystroke when the stream reaches the screen, so anything
+        // sees the keystroke when the frame reaches the terminal, so anything
         // before the flush would understate the latency they feel.
         crate::tui::ui::note_frame_painted();
         Ok(())
