@@ -1,8 +1,7 @@
 use super::services::SwarmServiceHandle;
 use super::{
-    ClientConnectionInfo, ClientDebugState, FileTouchService, SessionInterruptQueues, SwarmEventType,
-    SwarmMember,
-    remove_background_tool_signal, remove_session_interrupt_queue,
+    ClientConnectionInfo, ClientDebugState, FileTouchService, SessionInterruptQueues,
+    SwarmEventType, SwarmMember, remove_background_tool_signal, remove_session_interrupt_queue,
     unregister_session_event_sender,
 };
 use crate::agent::Agent;
@@ -305,9 +304,13 @@ pub(super) async fn cleanup_client_connection(
                     },
                 )
                 .await;
-            swarm.remove_session_from_swarm(client_session_id, swarm_id).await;
+            swarm
+                .remove_session_from_swarm(client_session_id, swarm_id)
+                .await;
         }
-        swarm.remove_session_channel_subscriptions(client_session_id).await;
+        swarm
+            .remove_session_channel_subscriptions(client_session_id)
+            .await;
         file_touch.clear_session(client_session_id).await;
     }
 
