@@ -906,22 +906,12 @@ impl Agent {
         if !Self::is_stalled_promise_text(text_content) {
             return Ok(false);
         }
-        // Record a route-scoped degradation stall on the FIRST stalled-promise
-        // detection of a turn. `attempts` starts at 0 at the top of each turn
-        // (see `stalled_promise_continuations` in both turn loops), so this
-        // fires once per turn. This is what feeds the escalation ladder
-        // (Watch -> Compact -> RouteFallback): a session that emits
-        // action-promise filler *across turns* (e.g. DeepSeek-V4-Flash on a
-        // very long context) must accumulate toward mitigation even though no
-        // single turn exhausts the continuation budget. Recording at the first
-        // detection of each turn (rather than only after budget exhaustion)
-        // closes that causal gap. Note this deliberately counts one stall per
-        // turn, not per distinct filler episode within a turn: two separate
-        // filler blips separated by a tool call in the SAME turn undercount to
-        // one, which errs toward under-detection (safe). `recompute_rung` gates
-        // RouteFallback on an acknowledged compaction, so an isolated filler
-        // blip that recovers on a later turn decays back out via
-        // `record_clean_turn`.
+        // Record a route-scoped stall on the FIRST stalled-promise detection of
+        // a turn (`attempts` resets to 0 each turn in both turn loops). This
+        // closes the causal gap where cross-turn filler never exhausted a
+        // single turn's continuation budget, so the tracker never left Healthy.
+        // One stall per turn is deliberate (two blips in one turn undercount to
+        // one, safe); `record_clean_turn` decays on real recovery.
         if *attempts == 0 {
             self.degradation.record_stall(crate::agent::degradation::StallKind::StalledPromise);
         }

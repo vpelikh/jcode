@@ -38,8 +38,15 @@ degradation-management system.
   under-detection (safe); `record_clean_turn` on real tool progress decays the
   rung on legitimate recovery.
 - The streaming turn loop now records a clean turn (`record_clean_turn`) after
-  committing tool results, matching the non-streaming loop, so a genuine
-  recovery decays the rung instead of pinning a stale escalation.
+  committing tool results, so a genuine tool-progress recovery decays the rung
+  instead of pinning a stale escalation. This is intentionally STRICTER than
+  the non-streaming loop, which records a clean turn on ANY "no tool calls,
+  returning" completion (including turns that just exhausted the stalled-
+  promise budget). The streaming placement avoids labeling a degraded turn as
+  clean. The asymmetry is safe because `record_clean_turn` only decays
+  stall-window records older than the 5-minute window (`prune_expired`), so a
+  just-recorded stall is never erased — confirmed end-to-end by
+  `degraded_session_accumulates_to_compact_in_non_streaming_loop`.
 - A compaction that is actually APPLIED (not just requested) now resets the
   route-scoped degradation tracker (`note_compaction_applied` -> `reset()`).
   Previously a successful compaction left the rung elevated with
