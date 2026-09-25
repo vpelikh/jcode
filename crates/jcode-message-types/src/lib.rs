@@ -394,7 +394,25 @@ fn strip_injected_timestamp_tag(text: &str) -> &str {
     let Some(end) = text.find("] ") else {
         return text;
     };
-    let tag = &text[1..end];
+    // The strip only makes sense for a *prepended* `[...] ` tag, so the text
+    // must start with '['. Anything else is a genuine payload that merely
+    // contains "] " later. This guard also protects the slice below:
+    // - content beginning with "] " (e.g. a captured output line
+    //   "] but found ...") has `end == 0`, which would make `text[1..end]` a
+    //   backwards range (`1..0`) and panic with
+    //   "byte range starts at 1 but ends at 0";
+    // - content whose first character is multi-byte (e.g. "é] ...") has a
+    //   non-char-boundary at index 1, which would panic with
+    //   "start byte index 1 is not a char boundary".
+    if !text.starts_with('[') {
+        return text;
+    }
+    // `starts_with('[')` guarantees byte 1 is a char boundary and `end >= 1`,
+    // and `find` returns a char boundary, so this range is always valid. Use
+    // `get` anyway so no future edit can reintroduce a panic here.
+    let Some(tag) = text.get(1..end) else {
+        return text;
+    };
     // A real injected timing tag always carries the start/finish/duration
     // sub-structure; a genuine tool result that merely starts with
     // "[tool timing: ...]" (e.g. a heading or note) must be preserved.
@@ -1317,6 +1335,53 @@ mod tests {
             stripped, "ls output",
             "injected tool-timing tag with start/finish/duration must be stripped"
         );
+    }
+
+    /// Regression: content that *begins* with `"] "` must not panic. The old
+    /// implementation computed `text[1..end]` where `end = text.find("] ")`,
+    /// so a tool result like `"] but found ..."` (a real captured output whose
+    /// first bytes are `] `) produced the backwards range `1..0` and panicked
+    /// with "byte range starts at 1 but ends at 0". This took down the whole
+    /// message-processing task.
+    ///
+    /// The same slice also panicked when the first character was multi-byte
+    /// (index 1 inside a char), e.g. `"é] note"`, and when a genuine payload
+    /// merely contained `"] "` later. All must be preserved verbatim.
+    #[test]
+    fn cache_relevant_strip_preserves_non_tag_leading_content() {
+        for content in [
+            "] but found [Ticket2862Model:".to_string(),
+            "] ".to_string(),
+            "]\ntrailing".to_string(),
+            "é] note".to_string(),
+            "日本語] text".to_string(),
+            "output [dir] file".to_string(),
+            // Not bracket-led, but a timestamp-shaped run sits after index 1.
+            // Without the `starts_with('[')` guard the old `text[1..end]` tag
+            // matched and truncated this genuine payload to "tail".
+            "x2026-01-01T00:00:00.000Z] tail".to_string(),
+        ] {
+            let message = Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_test".into(),
+                    content: content.clone(),
+                    is_error: None,
+                }],
+                timestamp: None,
+                tool_duration_ms: None,
+            };
+            // Must not panic, and the leading-"] " text must be preserved
+            // verbatim since it is not an injected timing tag.
+            let projected = cache_relevant_message_value(&message);
+            let stripped = projected
+                .get("content")
+                .and_then(|c| c.get(0))
+                .and_then(|b| b.get("content"))
+                .and_then(|t| t.as_str())
+                .expect("tool result block");
+            assert_eq!(stripped, content, "leading-] content must be preserved");
+        }
     }
 
     /// Property test: `Message::format_timestamp` emits a fixed-width RFC3339
