@@ -1269,6 +1269,26 @@ pub(in crate::tui::app) fn handle_server_event(
                 app.set_status_notice("Handoff not applied");
                 return false;
             }
+            // A rejected `handoff_save` / `handoff_task_clear` (e.g. the agent
+            // was busy, or the capture task failed) likewise leaves the
+            // conversation untouched; clear the pending request so a later reply
+            // with the same id cannot be misattributed, and report the failure.
+            if app.take_pending_remote_handoff_save(id).is_some() {
+                app.push_display_message(DisplayMessage::error(format!(
+                    "Handoff save failed: {}",
+                    message
+                )));
+                app.set_status_notice("Handoff not saved");
+                return false;
+            }
+            if app.take_pending_remote_handoff_task_clear(id).is_some() {
+                app.push_display_message(DisplayMessage::error(format!(
+                    "Handoff task clear failed: {}",
+                    message
+                )));
+                app.set_status_notice("Handoff task not cleared");
+                return false;
+            }
             // The server rejects a Message request with this error while its
             // previous turn is still running. This typically happens when a
             // reload/reconnect raced the turn-end dispatch: the history
@@ -3047,6 +3067,64 @@ pub(in crate::tui::app) fn handle_server_event(
             }
             false
         }
+        ServerEvent::HandoffSaved {
+            id,
+            session_id,
+            summary,
+        } => {
+            if app.take_pending_remote_handoff_save(id).is_some() {
+                match session_id {
+                    Some(saved) => {
+                        let detail = summary
+                            .as_deref()
+                            .filter(|s| !s.trim().is_empty())
+                            .map(|s| format!("\n{s}"))
+                            .unwrap_or_default();
+                        app.push_display_message(DisplayMessage::system(format!(
+                            "Handoff saved: {saved}{detail}"
+                        )));
+                        app.set_status_notice("Handoff saved");
+                    }
+                    None => {
+                        app.push_display_message(DisplayMessage::system(
+                            "Nothing to save: the session has no open todos (or no resolvable project). Add a continuation prompt (e.g. /handoffsave review this branch) to hand off an explicit task."
+                                .to_string(),
+                        ));
+                        app.set_status_notice("Handoff: nothing to save");
+                    }
+                }
+            }
+            false
+        }
+        ServerEvent::HandoffTaskCleared {
+            id,
+            had_task,
+            removed,
+        } => {
+            if app.take_pending_remote_handoff_task_clear(id).is_some() {
+                let (message, notice) = if removed {
+                    (
+                        "Handoff task cleared; the snapshot had no open work left and was removed."
+                            .to_string(),
+                        "Handoff task cleared",
+                    )
+                } else if had_task {
+                    (
+                        "Handoff task cleared; any open work in the snapshot is untouched."
+                            .to_string(),
+                        "Handoff task cleared",
+                    )
+                } else {
+                    (
+                        "No saved handoff task to clear for this session.".to_string(),
+                        "No handoff task to clear",
+                    )
+                };
+                app.push_display_message(DisplayMessage::system(message));
+                app.set_status_notice(notice);
+            }
+            false
+        }
         ServerEvent::HandoffImported { id, session_id } => {
             let _ = id;
             if session_id.is_empty() {
@@ -3107,6 +3185,7 @@ fn open_picker_from_remote_handoffs(app: &mut App, handoffs: Vec<HandoffWireMode
                 .collect(),
             last_assistant_text: model.last_assistant_text,
             initiative_id: model.initiative_id,
+            continuation_prompt: model.continuation_prompt,
         });
     }
     app.open_handoff_picker_with(snapshots);

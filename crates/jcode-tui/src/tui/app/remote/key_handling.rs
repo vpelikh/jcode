@@ -132,6 +132,68 @@ async fn handle_handoff_resume_command(
     Ok(())
 }
 
+/// Explicitly save a handoff snapshot for the current connected session.
+///
+/// `/handoffsave [prompt]` checkpoints the session's open work without ending
+/// it. An optional trailing prompt records an explicit continuation task for the
+/// resumed session ("review this branch's changes"). This only makes sense
+/// against the connected *server* (the live session's todo state and working dir
+/// live there), so it issues a single `handoff_save` request and reports the
+/// server's actual outcome when `HandoffSaved` returns.
+pub(in crate::tui::app) async fn handle_handoff_save_command(
+    app: &mut App,
+    remote: &mut RemoteConnection,
+    trimmed: &str,
+) -> Result<()> {
+    if app.is_processing {
+        app.push_display_message(DisplayMessage::error(
+            "The agent is currently working. Wait for it to finish, then run /handoffsave again."
+                .to_string(),
+        ));
+        return Ok(());
+    }
+    let prompt = trimmed
+        .strip_prefix("/handoffsave")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let prompt = (!prompt.is_empty()).then_some(prompt);
+    let request_id = remote.handoff_save(prompt).await?;
+    app.set_pending_remote_handoff_save(request_id);
+    app.set_status_notice("Saving handoff…");
+    Ok(())
+}
+
+/// `/handofftask clear` drops the continuation task saved for the current
+/// session (a bare `/handoffsave` intentionally carries an existing task
+/// forward, so this is the explicit way to remove it). The server replies with
+/// whether a task was actually cleared, or that the whole snapshot was removed
+/// because it had no open work left. To *view* saved handoffs, use `/handoff`.
+pub(in crate::tui::app) async fn handle_handoff_task_command(
+    app: &mut App,
+    remote: &mut RemoteConnection,
+    trimmed: &str,
+) -> Result<()> {
+    let arg = trimmed.strip_prefix("/handofftask").unwrap_or_default().trim();
+    if arg != "clear" {
+        app.push_display_message(DisplayMessage::error(
+            "Usage: /handofftask clear  (drops the continuation task saved for this session; view handoffs with /handoff)".to_string(),
+        ));
+        return Ok(());
+    }
+    if app.is_processing {
+        app.push_display_message(DisplayMessage::error(
+            "The agent is currently working. Wait for it to finish, then run /handofftask clear again."
+                .to_string(),
+        ));
+        return Ok(());
+    }
+    let request_id = remote.handoff_task_clear().await?;
+    app.set_pending_remote_handoff_task_clear(request_id);
+    app.set_status_notice("Clearing handoff task…");
+    Ok(())
+}
+
 pub(in crate::tui::app) async fn handle_remote_update_command(
     app: &mut App,
     remote: &mut RemoteConnection,
@@ -2048,6 +2110,14 @@ async fn handle_remote_key_internal(
 
                 if trimmed == "/handoffres" || trimmed.starts_with("/handoffres ") {
                     return handle_handoff_resume_command(app, remote, trimmed).await;
+                }
+
+                if trimmed == "/handoffsave" || trimmed.starts_with("/handoffsave ") {
+                    return handle_handoff_save_command(app, remote, trimmed).await;
+                }
+
+                if trimmed == "/handofftask" || trimmed.starts_with("/handofftask ") {
+                    return handle_handoff_task_command(app, remote, trimmed).await;
                 }
 
                 if trimmed == "/handoff-clear" || trimmed == "/handoffcancel" {

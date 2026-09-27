@@ -453,6 +453,24 @@ pub(super) struct PendingRemoteHandoffList {
     pub request_id: u64,
 }
 
+/// An in-flight `handoff_save` request to the connected server. The `/handoffsave`
+/// command must not claim success until the server confirms it wrote a snapshot
+/// (or reports there was no open work), so the request id is recorded here and
+/// resolved when `ServerEvent::HandoffSaved` arrives.
+#[derive(Clone, Debug)]
+pub(super) struct PendingRemoteHandoffSave {
+    /// The request id echoed back in `HandoffSaved`.
+    pub request_id: u64,
+}
+
+/// An in-flight `handoff_task_clear` request whose `HandoffTaskCleared` reply
+/// should surface whether a saved task was actually cleared.
+#[derive(Clone, Debug)]
+pub(super) struct PendingRemoteHandoffTaskClear {
+    /// The request id echoed back in `HandoffTaskCleared`.
+    pub request_id: u64,
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct RemoteResumeActivity {
     pub session_id: String,
@@ -1741,6 +1759,12 @@ pub struct App {
     /// In-flight `handoff_list` to the connected server (fed to the `/handoff`
     /// overlay over SSH, where the client's local store is the wrong host).
     pending_remote_handoff_list: Option<PendingRemoteHandoffList>,
+    /// In-flight `handoff_save` so `/handoffsave` reports the server's actual
+    /// outcome (written snapshot vs. no open work) instead of optimistically.
+    pending_remote_handoff_save: Option<PendingRemoteHandoffSave>,
+    /// In-flight `handoff_task_clear` so `/handofftask clear` reports whether a
+    /// task was actually cleared.
+    pending_remote_handoff_task_clear: Option<PendingRemoteHandoffTaskClear>,
     /// Login picker overlay (None = not visible)
     login_picker_overlay: Option<RefCell<super::login_picker::LoginPicker>>,
     /// Account picker overlay (None = not visible)

@@ -2,6 +2,34 @@
 
 ## Status
 
+**Continuation prompts landed (2026-09).** A handoff can now carry an explicit
+continuation task for the next session. The user can ask in natural language
+("save a handoff with a prompt to review this branch's changes"); the model calls
+the new `handoff` tool (`action: save`, `prompt: ...`), and the task is stored on
+the snapshot's `continuation_prompt` field. `/handoffsave <prompt>` and
+`Request::HandoffSave { prompt }` expose the same capability directly over the
+wire. The boot block renders it first, as `Continue with this task: <prompt>`, so
+the resumed session boots *ready to perform the task*. When a prompt is present a
+snapshot is captured even with no open todos, because the task itself is the work
+being handed forward.
+
+**Manual, on-demand save landed (2026-09).** `/handoffsave` captures a snapshot
+for the running session (the counterpart to resume): `handoff::save_now` writes
+the snapshot with `disposition == "saved"`, `Request::HandoffSave` /
+`ServerEvent::HandoffSaved` carry it over the wire, the server handler captures
+the live session's open work, and the TUI reports the server's actual outcome
+(a written snapshot id, or an honest nothing-to-save) rather than claiming
+success optimistically. A manual save is additive: unlike disconnect `capture`,
+it never retires the existing live handoff when there is no open work. Covered by
+base, handler, real-socket, and TUI dispatch tests.
+
+**Clear a saved task (2026-09).** Because a bare save carries an existing task
+forward, `/handofftask clear` (and the `handoff` tool's `clear` action) is the
+explicit way to drop it: open work in the snapshot is kept, and a snapshot left
+with no work is removed entirely. An over-cap continuation prompt is cut with a
+visible truncation marker stored on the prompt itself, which the boot block shows
+once (no second, redundant notice).
+
 **Core functionality implemented and validated.** Capture, project indexing,
 first-message injection, and initiative promotion are complete. The full
 `jcode-app-core` suite passes (1469 tests), the TUI build and reload succeed,
@@ -46,12 +74,18 @@ landed notes and test coverage.
 
 Preserve unfinished work across sessions without requiring the user to repeat
 context or the agent to reread an entire transcript. When a session ends with
-open todos, save a structured snapshot that a fresh session in the same project
-can use on its first turn.
+open todos — or the user hands off an explicit continuation task — save a
+structured snapshot that a fresh session in the same project can use on its
+first turn.
 
 ## Current scope
 
 - Automatic snapshot capture during session disconnect cleanup.
+- Manual, on-demand capture via `/handoffsave [prompt]` (the counterpart to
+  resume), optionally recording an explicit continuation task.
+- A model-facing `handoff` tool (`save` / `clear`) so the agent can save or drop
+  a handoff task on the user's behalf.
+- Clearing a saved continuation task via `/handofftask clear`.
 - A project-keyed index for finding the latest unfinished handoff.
 - First-message context injection, including image-first conversations.
 - Promotion of a saved handoff into a durable project initiative.
@@ -125,9 +159,56 @@ captures a fresh handoff.
 ### Capture
 
 `handoff::capture()` reads the session's todo plan, open todos, optional assistant
-text, and attached initiative. Completed and cancelled todos are excluded. If no
-open work remains, no new snapshot is created and that session's index entries
-are retired. Its archived snapshot remains available for explicit promotion.
+text, and attached initiative. Completed and cancelled todos are excluded. A
+continuation prompt previously saved for the session is carried forward, so a
+disconnect capture neither drops it nor retires a prompt-only handoff. If no open
+work and no saved prompt remain, no new snapshot is created and that session's
+index entries are retired. Its archived snapshot remains available for explicit
+promotion.
+
+### Explicit save
+
+`handoff::save_now()` is the manual counterpart to `capture`: it builds and
+persists a snapshot for a *live* session (recorded with the
+`disposition == "saved"`) so the user can checkpoint "where I am" without ending
+the session. It is reached via `/handoffsave`.
+
+The command is wire-backed: `/handoffsave` issues `Request::HandoffSave` and the
+server captures the running session's open work, replying
+`ServerEvent::HandoffSaved` with the captured id (and its continuation task as a
+summary when one is set, otherwise its intent) when a snapshot was written, or no
+id when there is nothing to save. The client
+does not claim success optimistically: it records the in-flight request id and
+surfaces the server's actual outcome (a written snapshot, or an honest "nothing
+to save" for a session with no open work). A session with no open todos is left
+untouched — unlike `capture`, a manual save never retires the existing live
+handoff, because it is purely additive.
+
+### Continuation prompt
+
+A handoff may carry an explicit continuation task (`save_now_with_prompt`). This
+is how "hand off to a session that reviews this branch" is expressed: the model
+calls the `handoff` tool with a `prompt`, or the user runs `/handoffsave <prompt>`.
+The prompt is stored on `HandoffSnapshot.continuation_prompt` and rendered *first*
+in the boot block as `Continue with this task: <prompt>`, ahead of the historical
+intent/open-work context, so the resumed session treats it as a task to perform
+rather than background to be aware of. A non-empty prompt also lets a snapshot be
+captured when there is no open todo work. A whitespace-only prompt is treated as
+absent. The `handoff` tool is registered alongside `todo` and its description and
+parameter descriptions stay within the always-on prompt-cost caps. The
+`/handoff` picker preview leads with the task (labelled `Continue with this
+task:`), so a prompt-only handoff is not shown as an empty-work snapshot, and
+the task text remains filterable. A prompt outlives the session: a later
+disconnect capture for the same session carries it forward rather than dropping
+it (or retiring a prompt-only handoff as completed work), and a bare save without
+a new prompt does not clear the existing task. `/handofftask clear` (and the
+`handoff` tool's `clear` action) is the explicit way to drop a saved task:
+open work in the snapshot is kept, and a snapshot left with no work is removed
+entirely. An over-cap prompt is cut with a visible truncation notice rather than
+silently. Import treats a payload with a continuation prompt as meaningful even
+when it has no open todos, so a prompt-only handoff is portable across hosts and
+survives promotion into an initiative (the task becomes the goal's first next
+step and its title when no plan intent exists).
 
 The disconnect hook schedules capture on the blocking pool after releasing the
 global connection lock. It awaits persistence before returning, so completed
@@ -241,12 +322,13 @@ not as a crash-atomic multi-file transaction.
 | `session_id` | Source session identifier |
 | `project_key` | Git-origin or absolute-path identity |
 | `ended_at` | UTC capture timestamp |
-| `disposition` | `closed`, `crashed`, or `reloading` |
+| `disposition` | `closed`, `crashed`, `reloading`, or `saved` (explicit save) |
 | `working_dir` | Source working directory, when available |
 | `intent` | User intention from the todo plan |
 | `open_todos` | Item ID, content, status, group, and confidence |
 | `last_assistant_text` | Optional assistant text, capped at 4096 bytes |
 | `initiative_id` | Optional attached initiative identifier |
+| `continuation_prompt` | Optional explicit task for the resumed session, capped at 4096 bytes with a visible truncation marker |
 
 ## Design rationale
 
@@ -268,7 +350,10 @@ for choosing among multiple work streams.
 | Disconnect hook | `crates/jcode-app-core/src/server/client_disconnect_cleanup.rs` |
 | First-message injection and manual override | `crates/jcode-app-core/src/agent/turn_execution.rs` |
 | `set_handoff_resume` protocol + server handler | `crates/jcode-protocol/src/wire.rs`, `crates/jcode-app-core/src/server/client_actions.rs`, `client_lifecycle.rs` |
-| TUI `/handoff`, `/handoffres`, `/handoff-clear` commands + interactive handoff picker overlay | `crates/jcode-tui/src/tui/session_picker.rs`, `session_picker_tests.rs` (handoff data source), `crates/jcode-tui/src/tui/app/inline_interactive.rs` (overlay open/routing/pending resume), `crates/jcode-tui/src/tui/app/remote/key_handling.rs`, `commands.rs`, `remote.rs` (async drain) |
+| Explicit save (`save_now`) + `handoff_save` wire + `/handoffsave` command | `crates/jcode-base/src/handoff.rs`, `crates/jcode-protocol/src/wire.rs`, `crates/jcode-app-core/src/server/client_actions.rs`, `client_lifecycle.rs`, `crates/jcode-tui/src/tui/app/remote/key_handling.rs`, `remote/server_events.rs`, `crates/jcode-tui/src/tui/backend.rs` |
+| Clear a saved task (`clear_continuation_prompt`) + `handoff_task_clear` wire + `/handofftask clear` | same files, plus `handoff` tool `clear` action in `crates/jcode-app-core/src/tool/handoff.rs` |
+| Model-facing `handoff` tool + continuation prompt | `crates/jcode-app-core/src/tool/handoff.rs`, `crates/jcode-app-core/src/tool/mod.rs` (registration), `crates/jcode-base/src/handoff.rs` (`continuation_prompt` render) |
+| TUI `/handoff`, `/handoffres`, `/handoffsave`, `/handofftask clear`, `/handoff-clear` commands + interactive handoff picker overlay | `crates/jcode-tui/src/tui/session_picker.rs`, `session_picker_tests.rs` (handoff data source), `crates/jcode-tui/src/tui/app/inline_interactive.rs` (overlay open/routing/pending resume/save/task-clear), `crates/jcode-tui/src/tui/app/remote/key_handling.rs`, `commands.rs`, `remote.rs` (async drain) |
 | Storage and public-API tests | `crates/jcode-base/src/handoff_tests.rs` |
 | Injection + override tests | `crates/jcode-app-core/src/agent_tests.rs` |
 | Disconnect integration tests | `crates/jcode-app-core/src/server/client_disconnect_grace_tests.rs` |
@@ -283,7 +368,12 @@ cargo test -p jcode-app-core --lib handle_set_handoff_resume_overrides_auto_inje
 cargo test -p jcode-app-core --lib handle_set_handoff_resume_none_clears_override
 cargo test -p jcode-app-core --lib first_user_message_injects_handoff_once
 cargo test -p jcode-app-core --lib cleanup_persists_handoff_for_session_with_open_todos
+cargo test -p jcode-app-core --lib handle_handoff_save
+cargo test -p jcode-app-core --lib handle_handoff_task_clear
+cargo test -p jcode-app-core --lib handoff_tool
+cargo test -p jcode-app-core --lib real_socket_handoff_save
 cargo test -p jcode-tui --lib local_handoff_listing
+cargo test -p jcode-tui --lib handoff_save
 ```
 
 Coverage includes capture and index persistence, concurrent writers, timestamp
@@ -299,7 +389,27 @@ auto-inject; unknown id replies `Error`; `None` restores auto-injection), a
 no-regression guard that a manual selection does not disturb the default, the
 interactive `/handoff` overlay (opens in handoff mode over the saved store,
 newest first with archived snapshots visible, recency sorted) and that
-`/handoffres` explains a server is needed locally, snapshot pruning
+`/handoffres` explains a server is needed locally, explicit on-demand save
+(`save_now` writes a `"saved"` snapshot and indexes it; a save with no open work
+is additive and does not retire the live handoff; the `handoff_save` handler
+captures the live session and reports nothing-to-save with no id; a real-socket
+round trip drives `Request::HandoffSave` to the handler and confirms the on-disk
+snapshot; the TUI surfaces `HandoffSaved` only for the awaited request and
+distinguishes a written snapshot from nothing-to-save), continuation prompts
+(`save_now_with_prompt` stores a task and captures a workless session when one is
+given; the boot block leads with `Continue with this task:`; a whitespace prompt
+is ignored; the `handoff` tool saves the task, reports nothing-to-save without
+work or prompt, and rejects unsupported actions; swarm workers do not get the
+`handoff` tool so a worker cannot hijack the coordinator's project handoff (the
+`remove_coordinator_only_tools` helper is covered directly, asserting `handoff`
+and the other coordinator-only tools are stripped from a worker set while
+ordinary tools survive); the
+real-socket save carries the prompt and the summary reflects it; disconnect
+capture carries a saved prompt
+forward and does not retire a prompt-only handoff; `/handofftask clear` drops the
+task while keeping open work and removes a workless snapshot; an over-cap prompt
+carries a truncation notice; promoting a prompt-only handoff carries the task
+into the goal), snapshot pruning
 (per-project archived count
 cap, archived age cap, live handoffs never pruned, and per-project scoping),
 and portability (export/import round trip adopts a remote snapshot and makes it

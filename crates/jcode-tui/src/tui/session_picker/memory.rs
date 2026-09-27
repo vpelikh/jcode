@@ -22,7 +22,8 @@ fn estimate_handoff_snapshot_bytes(snapshot: &super::HandoffSnapshot) -> usize {
         + estimate_optional_string_bytes(&snapshot.working_dir)
         + estimate_optional_string_bytes(&snapshot.intent)
         + estimate_optional_string_bytes(&snapshot.last_assistant_text)
-        + estimate_optional_string_bytes(&snapshot.initiative_id);
+        + estimate_optional_string_bytes(&snapshot.initiative_id)
+        + estimate_optional_string_bytes(&snapshot.continuation_prompt);
     for todo in &snapshot.open_todos {
         bytes += todo.id.capacity()
             + todo.content.capacity()

@@ -1525,6 +1525,30 @@ pub(super) async fn update_member_status_with_report_tldr(
     }
 }
 
+/// Coordinator-only tools that a spawned swarm worker must not hold.
+///
+/// These are removed from the worker's allowed set so a worker cannot act on
+/// the coordinator's behalf. `handoff` is included deliberately: a worker saving
+/// a handoff would make it the project's live snapshot and hijack what the next
+/// top-level session boots from. `subagent`/`task` prevent recursive spawning,
+/// and `todo`/`todowrite`/`todoread` keep the worker from mutating the shared
+/// plan.
+pub(super) const COORDINATOR_ONLY_TOOLS: &[&str] = &[
+    "subagent",
+    "task",
+    "todo",
+    "todowrite",
+    "todoread",
+    "handoff",
+];
+
+/// Remove the coordinator-only tools from `allowed` in place.
+pub(super) fn remove_coordinator_only_tools(allowed: &mut HashSet<String>) {
+    for blocked in COORDINATOR_ONLY_TOOLS {
+        allowed.remove(*blocked);
+    }
+}
+
 pub(super) async fn run_swarm_task(
     agent: Arc<Mutex<Agent>>,
     description: &str,
@@ -1573,9 +1597,7 @@ pub(super) async fn run_swarm_task(
     );
 
     let mut allowed: HashSet<String> = registry.tool_names().await.into_iter().collect();
-    for blocked in ["subagent", "task", "todo", "todowrite", "todoread"] {
-        allowed.remove(blocked);
-    }
+    remove_coordinator_only_tools(&mut allowed);
     crate::config::config()
         .tools
         .apply_to_allowed_set(&mut allowed);
@@ -1786,6 +1808,38 @@ mod tests {
         assert_eq!(tasks[0].description, "A");
         assert_eq!(tasks[0].prompt, "B");
         assert_eq!(tasks[0].subagent_type.as_deref(), Some("general"));
+    }
+
+    /// A spawned worker must never hold the coordinator-only tools, and `handoff`
+    /// is one of them: a worker that could save a handoff would hijack the
+    /// project's live snapshot (what the next top-level session boots from).
+    #[test]
+    fn coordinator_only_tools_are_removed_from_a_worker_set() {
+        let mut allowed: HashSet<String> = [
+            "bash",
+            "read",
+            "handoff",
+            "todo",
+            "todoread",
+            "todowrite",
+            "subagent",
+            "task",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+        super::remove_coordinator_only_tools(&mut allowed);
+
+        for blocked in super::COORDINATOR_ONLY_TOOLS {
+            assert!(
+                !allowed.contains(*blocked),
+                "{blocked} must not be available to a spawned worker"
+            );
+        }
+        // Ordinary tools are untouched.
+        assert!(allowed.contains("bash"));
+        assert!(allowed.contains("read"));
     }
 
     #[test]

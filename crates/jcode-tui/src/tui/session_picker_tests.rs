@@ -2631,7 +2631,49 @@ fn make_handoff_snapshot(session_id: &str, intent: &str, todo: &str) -> super::H
         }],
         last_assistant_text: Some("wrapping up".to_string()),
         initiative_id: Some("init-1".to_string()),
+        continuation_prompt: None,
     }
+}
+
+/// A prompt-only handoff (no intent) should title its picker row with the task,
+/// not the opaque session id.
+#[test]
+fn handoff_picker_title_falls_back_to_continuation_task() {
+    let mut snapshot = make_handoff_snapshot("session_abc123", "tmp", "todo");
+    snapshot.intent = None;
+    snapshot.continuation_prompt = Some("review this branch's changes".to_string());
+
+    let picker = SessionPicker::for_handoffs(vec![snapshot]);
+    let session = picker.selected_session().expect("handoff row");
+    assert_eq!(
+        session.title, "review this branch's changes",
+        "a prompt-only handoff should be titled by its task"
+    );
+}
+
+/// The handoff picker's memory estimate must count the continuation prompt, a
+/// field that carries a potentially large user task, so the profile does not
+/// under-report a prompt-heavy handoff.
+#[test]
+fn handoff_memory_profile_counts_the_continuation_prompt() {
+    let mut snapshot = make_handoff_snapshot("handoff-mem", "intent", "todo");
+    snapshot.continuation_prompt = None;
+    let picker = SessionPicker::for_handoffs(vec![snapshot]);
+    let base = picker.debug_memory_profile()["all_sessions_estimate_bytes"]
+        .as_u64()
+        .expect("estimate present");
+
+    let mut snapshot = make_handoff_snapshot("handoff-mem", "intent", "todo");
+    snapshot.continuation_prompt = Some("x".repeat(4096));
+    let picker = SessionPicker::for_handoffs(vec![snapshot]);
+    let with_prompt = picker.debug_memory_profile()["all_sessions_estimate_bytes"]
+        .as_u64()
+        .expect("estimate present");
+
+    assert!(
+        with_prompt >= base + 4096,
+        "a 4096-byte continuation prompt should be counted in the estimate: {base} -> {with_prompt}"
+    );
 }
 
 #[test]
@@ -2855,6 +2897,42 @@ fn handoff_picker_search_enter_emits_handoff_selected_not_resume_target() {
 }
 
 #[test]
+fn handoff_picker_preview_leads_with_continuation_task() {
+    // A prompt-only handoff (no open todos) must show the task, not the
+    // misleading "no open todos recorded" fallback.
+    let mut snapshot = make_handoff_snapshot("handoff-task", "old intent", "old todo");
+    snapshot.open_todos.clear();
+    snapshot.last_assistant_text = None;
+    snapshot.continuation_prompt = Some("review this branch's changes".to_string());
+
+    let picker = SessionPicker::for_handoffs(vec![snapshot]);
+    let session = picker.selected_session().expect("handoff row");
+    let preview = session
+        .messages_preview
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        preview.contains("Continue with this task:"),
+        "preview should label the continuation task, got: {preview}"
+    );
+    assert!(
+        preview.contains("review this branch's changes"),
+        "preview should show the task text, got: {preview}"
+    );
+    assert!(
+        !preview.contains("No open todos recorded"),
+        "a task-only handoff must not show the empty-work fallback, got: {preview}"
+    );
+    // The task is filterable.
+    assert!(
+        session.search_index.contains("review this branch's changes"),
+        "the continuation task should be searchable"
+    );
+}
+
+#[test]
 fn handoff_picker_preview_bounds_long_todo_and_assistant_text() {
     let long_content = "x".repeat(1000);
     let long_assistant = "y".repeat(2000);
@@ -2874,6 +2952,7 @@ fn handoff_picker_preview_bounds_long_todo_and_assistant_text() {
         }],
         last_assistant_text: Some(long_assistant.clone()),
         initiative_id: None,
+        continuation_prompt: None,
     };
 
     let picker = SessionPicker::for_handoffs(vec![snapshot]);

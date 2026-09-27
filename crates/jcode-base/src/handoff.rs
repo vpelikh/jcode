@@ -10,8 +10,9 @@
 //! - **Mechanical, not LLM.** The snapshot is assembled from state that already
 //!   exists (the `todo` plan + list + session context). It deliberately does not
 //!   summarize the whole transcript; that is the memory extractor's heavier job.
-//! - **Only when there is open work.** A session with no non-terminal todos has
-//!   nothing to hand off and would only create noise.
+//! - **Only when there is something to hand off.** A snapshot is written only
+//!   when the session has open (non-terminal) todos or an explicit continuation
+//!   task; otherwise it would only create noise.
 //! - **Keyed by portable project identity.** The handoff must survive a change
 //!   of working-dir path (e.g. a different checkout directory or a remote
 //!   handoff). We key by the git remote URL when available, falling back to the
@@ -37,7 +38,8 @@ pub struct HandoffSnapshot {
     /// Portable identity for the project (git remote URL or absolute working dir).
     pub project_key: String,
     pub ended_at: DateTime<Utc>,
-    /// Why the session ended: "closed", "crashed", or "reloading".
+    /// Why the snapshot was written: "closed", "crashed", or "reloading" for a
+    /// disconnect capture, or "saved" for an explicit on-demand save.
     pub disposition: String,
     pub working_dir: Option<String>,
     /// The user's intent from the todo plan (`TodoPlan.user_intention`).
@@ -48,6 +50,13 @@ pub struct HandoffSnapshot {
     pub last_assistant_text: Option<String>,
     /// Durable initiative linked to this work, if one was attached.
     pub initiative_id: Option<String>,
+    /// An explicit continuation task/prompt captured with the handoff (e.g.
+    /// "review this branch's changes"). Rendered prominently in the boot
+    /// context so the resumed session boots *ready to do this task*, not just
+    /// aware of the old context. Set by an explicit save; a disconnect capture
+    /// carries a previously saved prompt forward rather than dropping it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_prompt: Option<String>,
 }
 
 /// A compact view of an open todo for a handoff.
@@ -121,13 +130,40 @@ pub fn build_snapshot(
     disposition: &str,
     transcript_for_extraction: Option<&str>,
 ) -> Option<HandoffSnapshot> {
+    build_snapshot_with_prompt(
+        session_id,
+        working_dir,
+        disposition,
+        transcript_for_extraction,
+        None,
+    )
+}
+
+/// Build a handoff snapshot that may carry an explicit continuation prompt.
+///
+/// When `continuation_prompt` is a non-empty task, a snapshot is produced even
+/// when there is no open todo work: the whole point of the save is to hand the
+/// *task* forward ("review this branch's changes"), which is itself the work.
+/// Without a prompt, an empty todo list yields `None` exactly as `build_snapshot`
+/// does.
+fn build_snapshot_with_prompt(
+    session_id: &str,
+    working_dir: Option<&Path>,
+    disposition: &str,
+    transcript_for_extraction: Option<&str>,
+    continuation_prompt: Option<&str>,
+) -> Option<HandoffSnapshot> {
     let plan = load_plan(session_id).unwrap_or_default();
     let todos = load_todos(session_id).unwrap_or_default();
     let open: Vec<TodoItem> = todos
         .into_iter()
         .filter(|t| t.status != "completed" && t.status != "cancelled")
         .collect();
-    if open.is_empty() {
+    let continuation_prompt = continuation_prompt
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(normalize_continuation_prompt);
+    if open.is_empty() && continuation_prompt.is_none() {
         return None;
     }
 
@@ -158,6 +194,7 @@ pub fn build_snapshot(
         open_todos,
         last_assistant_text,
         initiative_id: load_attached_initiative(session_id, working_dir),
+        continuation_prompt,
     })
 }
 
@@ -165,6 +202,11 @@ pub fn build_snapshot(
 ///
 /// Writes a per-session file and bumps a per-project index. Returns `None` when
 /// there is nothing to hand off, or logs and returns `None` on write failure.
+///
+/// A continuation prompt previously saved for this session (via
+/// [`save_now_with_prompt`] or the `handoff` tool) is carried forward: it names
+/// what the next session should do, so this rebuild neither drops it nor retires
+/// a prompt-only handoff as if the work were complete.
 pub fn capture(
     session_id: &str,
     working_dir: Option<&Path>,
@@ -179,11 +221,18 @@ pub fn capture(
             return None;
         }
     };
-    let Some(snapshot) = build_snapshot(
+    // A continuation prompt set by an explicit save (`/handoffsave <task>` or the
+    // `handoff` tool) is a user instruction with a lifetime longer than the
+    // session: it names what the *next* session should do. Read it before
+    // building so this disconnect capture neither drops it nor mistakes a
+    // prompt-only handoff (no open todos) for completed work.
+    let previous_prompt = load_snapshot(session_id).and_then(|s| s.continuation_prompt);
+    let Some(snapshot) = build_snapshot_with_prompt(
         session_id,
         working_dir,
         disposition,
         transcript_for_extraction,
+        previous_prompt.as_deref(),
     ) else {
         // A read failure is not evidence of completed work. Only retire a
         // snapshot when the persisted todo list was successfully read.
@@ -210,6 +259,86 @@ pub fn capture(
         Err(err) => {
             crate::logging::warn(&format!(
                 "[handoff] failed to persist handoff session={} error={}",
+                session_id, err
+            ));
+            None
+        }
+    }
+}
+
+/// Explicitly persist a handoff snapshot for a live session, on demand.
+///
+/// This is the manual counterpart to [`capture`]: it runs while the session is
+/// still open (via the `/handoffsave` command) instead of only at disconnect, so
+/// the user can checkpoint "where I am" without ending the session. The snapshot
+/// is recorded with `disposition == "saved"`.
+///
+/// Unlike [`capture`], a session with no open work is **not** retired: a manual
+/// save is purely additive and must never clear an existing index entry. Returns
+/// `None` when there is nothing to save (no open todos and no prompt, new or
+/// previously saved) or when the project identity cannot be resolved. A prompt
+/// already saved for this session is carried forward (see
+/// [`save_now_with_prompt`]).
+pub fn save_now(
+    session_id: &str,
+    working_dir: Option<&Path>,
+    transcript_for_extraction: Option<&str>,
+) -> Option<HandoffSnapshot> {
+    save_now_with_prompt(session_id, working_dir, transcript_for_extraction, None)
+}
+
+/// Explicitly persist a handoff snapshot carrying an optional continuation
+/// prompt/task for the session that resumes it.
+///
+/// Like [`save_now`], the snapshot is recorded with `disposition == "saved"` and
+/// is purely additive. A non-empty `continuation_prompt` ("review this branch's
+/// changes") is stored on the snapshot and rendered at the top of the boot
+/// context, so a later session in the same project boots *ready to perform that
+/// task*. When a prompt is present a snapshot is written even for a session with
+/// no open todos, because the task itself is the work being handed off.
+///
+/// A save without a prompt does not clear an existing one for the same session:
+/// it carries the previously saved task forward, so a bare `/handoffsave` (after
+/// setting a task earlier) never silently loses it.
+pub fn save_now_with_prompt(
+    session_id: &str,
+    working_dir: Option<&Path>,
+    transcript_for_extraction: Option<&str>,
+    continuation_prompt: Option<&str>,
+) -> Option<HandoffSnapshot> {
+    // Serialize the read of todo state and the index write, as `capture` does.
+    let _lock = match lock_store() {
+        Ok(lock) => lock,
+        Err(error) => {
+            crate::logging::warn(&format!("[handoff] cannot lock store for save: {error}"));
+            return None;
+        }
+    };
+    let incoming = continuation_prompt
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+    let carried_prompt = if incoming.is_some() {
+        None
+    } else {
+        load_snapshot(session_id).and_then(|s| s.continuation_prompt)
+    };
+    let prompt = incoming.or(carried_prompt.as_deref());
+    let snapshot = build_snapshot_with_prompt(
+        session_id,
+        working_dir,
+        "saved",
+        transcript_for_extraction,
+        prompt,
+    )?;
+    match write_snapshot_locked(&snapshot) {
+        Ok(()) => {
+            // Already holding the store lock, so run the unlocked body directly.
+            prune_archived_snapshots_locked();
+            Some(snapshot)
+        }
+        Err(err) => {
+            crate::logging::warn(&format!(
+                "[handoff] failed to save handoff session={} error={}",
                 session_id, err
             ));
             None
@@ -521,11 +650,17 @@ pub fn import_handoff(
 ) -> Option<String> {
     let project = project_key(working_dir)?;
     let mut snapshot: HandoffSnapshot = serde_json::from_str(payload).ok()?;
-    // A handoff is only meaningful when it carries unfinished work; reject a
-    // payload with no open todos, matching capture's contract (a captured
-    // snapshot always has open work). This also prevents importing a malformed
-    // or empty snapshot as a "live" handoff that auto-injects nothing useful.
-    if snapshot.open_todos.is_empty() {
+    // Normalize an incoming task to this host's cap so a foreign payload can
+    // never inject an over-cap (or whitespace-only) prompt into the boot context.
+    snapshot.continuation_prompt = snapshot
+        .continuation_prompt
+        .map(|p| normalize_continuation_prompt(&p))
+        .filter(|p| !p.trim().is_empty());
+    // A handoff is only meaningful when it carries unfinished work *or* an
+    // explicit continuation task. Reject a payload with neither, matching
+    // capture/build_snapshot's contract, so an empty snapshot cannot be adopted
+    // as a "live" handoff that auto-injects nothing useful.
+    if snapshot.open_todos.is_empty() && snapshot.continuation_prompt.is_none() {
         return None;
     }
     // Re-key to this host's project identity so lookup and injection find it.
@@ -777,6 +912,60 @@ fn delete_snapshot(session_id: &str) -> bool {
     }
 }
 
+/// Outcome of [`clear_continuation_prompt`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClearTaskOutcome {
+    /// Whether a continuation task was present and has now been cleared.
+    pub had_task: bool,
+    /// Whether the snapshot was removed entirely (it had no open work left).
+    pub removed: bool,
+}
+
+/// Clear a previously saved continuation prompt for a session.
+///
+/// Returns `Some(outcome)` when a snapshot exists for the session, or `None`
+/// when there is no such snapshot. When the snapshot had open work it is
+/// rewritten without the prompt; a snapshot that becomes empty (no open work, no
+/// prompt) is removed entirely so it cannot linger as a misleading live handoff.
+pub fn clear_continuation_prompt(session_id: &str) -> Option<ClearTaskOutcome> {
+    let _lock = lock_store().ok()?;
+    let mut snapshot = load_snapshot(session_id)?;
+    let had_task = snapshot
+        .continuation_prompt
+        .as_deref()
+        .is_some_and(|p| !p.trim().is_empty());
+    if !had_task {
+        return Some(ClearTaskOutcome {
+            had_task: false,
+            removed: false,
+        });
+    }
+    snapshot.continuation_prompt = None;
+    if snapshot.open_todos.is_empty() {
+        // Nothing left to hand off: drop the file and its index entry so it is
+        // not injected as an empty handoff.
+        let _ = delete_snapshot(session_id);
+        let _ = retire_session(session_id);
+        return Some(ClearTaskOutcome {
+            had_task: true,
+            removed: true,
+        });
+    }
+    match write_snapshot_locked(&snapshot) {
+        Ok(()) => Some(ClearTaskOutcome {
+            had_task: true,
+            removed: false,
+        }),
+        Err(err) => {
+            crate::logging::warn(&format!(
+                "[handoff] failed to clear continuation prompt session={} error={}",
+                session_id, err
+            ));
+            None
+        }
+    }
+}
+
 /// Render a specific handoff snapshot by id as a compact markdown block, for
 /// a manually selected resume. Returns `None` when no such snapshot exists or
 /// its identity check fails.
@@ -792,6 +981,19 @@ pub fn render_handoff(session_id: &str) -> Option<String> {
 /// and bounded regardless of how the handoff was chosen.
 fn render_snapshot(snapshot: &HandoffSnapshot) -> Option<String> {
     let mut out = String::from("[Handoff from previous session]");
+    // The explicit continuation task is the reason the resumed session exists,
+    // so it leads the block, ahead of the historical context. Phrasing it as a
+    // directive tells the model to perform the task, not merely to be aware of
+    // it.
+    if let Some(prompt) = &snapshot.continuation_prompt {
+        let prompt = prompt.trim();
+        if !prompt.is_empty() {
+            // The stored value is already normalized to the cap, carrying its own
+            // "truncated" marker on its own line when it was cut, so rendering it
+            // as-is shows the task (and the marker) without a second notice.
+            out.push_str(&format!("\nContinue with this task: {prompt}"));
+        }
+    }
     if let Some(intent) = &snapshot.intent {
         out.push_str(&format!("\nIntent: {}", truncate(intent, 2048)));
     }
@@ -840,16 +1042,27 @@ pub fn promote_to_initiative(
     let Some(snapshot) = load_snapshot(session_id) else {
         return Ok(None);
     };
+    let continuation = snapshot
+        .continuation_prompt
+        .clone()
+        .filter(|s| !s.trim().is_empty());
+    // A goal's id is the slug of its title, which becomes a filename; bound a
+    // task-derived title (a continuation prompt can be up to 4096 bytes) so the
+    // slug stays within filesystem name limits and promotion cannot fail.
+    let continuation_title = continuation
+        .as_deref()
+        .map(|c| truncate(c, 200));
     let title = snapshot
         .intent
         .clone()
         .filter(|s| !s.trim().is_empty())
+        .or_else(|| continuation_title.clone())
         .unwrap_or_else(|| format!("Continue from session {}", session_id));
-    let next_steps: Vec<String> = snapshot
-        .open_todos
-        .iter()
-        .map(|t| t.content.clone())
-        .collect();
+    // The explicit continuation task is the most important thing to carry over,
+    // so it leads the next steps (a prompt-only handoff would otherwise promote
+    // to a goal with no work at all).
+    let mut next_steps: Vec<String> = continuation.clone().into_iter().collect();
+    next_steps.extend(snapshot.open_todos.iter().map(|t| t.content.clone()));
     let description = snapshot
         .last_assistant_text
         .clone()
@@ -904,6 +1117,47 @@ fn git_remote_url(dir: &Path) -> Option<String> {
     }
     let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (!url.is_empty()).then_some(url)
+}
+
+const MAX_PROMPT_BYTES: usize = 4096;
+
+/// Marker appended to a stored continuation prompt that had to be cut. Detected
+/// on re-normalization so repeated captures never stack/gargle the notice.
+const PROMPT_TRUNCATION_MARKER: &str = "[continuation prompt truncated";
+
+/// Truncate to `max_bytes` on a char boundary, reporting whether any content was
+/// dropped so callers can append an explicit notice instead of silently cutting.
+fn truncate_notifying(s: &str, max_bytes: usize) -> (String, bool) {
+    if s.len() <= max_bytes {
+        return (s.to_string(), false);
+    }
+    (truncate(s, max_bytes), true)
+}
+
+/// Normalize a user-supplied continuation prompt to the stored cap.
+///
+/// Over-cap tasks are cut with a visible marker, but the result stays within
+/// `MAX_PROMPT_BYTES` (the marker's length is reserved up front). Re-normalizing
+/// an already-marked prompt is a no-op, so carrying a prompt forward across
+/// captures does not stack or garble the notice.
+fn normalize_continuation_prompt(p: &str) -> String {
+    let p = p.trim();
+    if p.len() <= MAX_PROMPT_BYTES {
+        return p.to_string();
+    }
+    if p.contains(PROMPT_TRUNCATION_MARKER) {
+        // Already marked yet still over the cap (e.g. a hand-crafted or imported
+        // payload). Hard-cut without stacking a second marker.
+        return truncate(p, MAX_PROMPT_BYTES);
+    }
+    let marker = format!("\n{PROMPT_TRUNCATION_MARKER} to {MAX_PROMPT_BYTES} bytes]");
+    let budget = MAX_PROMPT_BYTES.saturating_sub(marker.len());
+    let (text, truncated) = truncate_notifying(p, budget);
+    if truncated {
+        format!("{text}{marker}")
+    } else {
+        text
+    }
 }
 
 /// Truncate a string to a byte cap, splitting on a char boundary.

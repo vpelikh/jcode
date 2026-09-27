@@ -20,6 +20,7 @@ mod edit;
 mod edit_stats;
 mod feedback;
 mod gmail;
+mod handoff;
 // The `initiative` tool is not currently registered (a test asserts it is
 // deliberately *not* advertised in the registry). It is kept compiled in the
 // lib because it ships a complete Goals/initiative domain plus a side-panel
@@ -454,6 +455,7 @@ impl Registry {
                 jcode_docs::JcodeDocsTool::new,
             );
             Self::insert_tool_timed(&mut m, &mut timings, "todo", todo::TodoTool::new);
+            Self::insert_tool_timed(&mut m, &mut timings, "handoff", handoff::HandoffTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "bg", bg::BgTool::new);
             Self::insert_tool_timed(
                 &mut m,

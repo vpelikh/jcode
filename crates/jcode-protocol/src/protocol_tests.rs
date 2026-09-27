@@ -95,6 +95,89 @@ fn handoff_list_and_import_wire_roundtrip() {
 }
 
 #[test]
+fn handoff_save_wire_roundtrip() {
+    let save = super::decode_request(r#"{"type":"handoff_save","id":12}"#).unwrap();
+    assert!(matches!(
+        save,
+        super::Request::HandoffSave {
+            id: 12,
+            prompt: None
+        }
+    ));
+    assert_eq!(save.id(), 12);
+    assert_eq!(
+        serde_json::to_value(&save).unwrap(),
+        serde_json::json!({"type":"handoff_save","id":12})
+    );
+
+    // A continuation prompt is carried as an optional field.
+    let with_prompt =
+        super::decode_request(r#"{"type":"handoff_save","id":14,"prompt":"review this branch"}"#)
+            .unwrap();
+    assert!(matches!(&with_prompt, super::Request::HandoffSave {
+        id: 14, prompt: Some(p)
+    } if p == "review this branch"));
+    assert_eq!(
+        serde_json::to_value(&with_prompt).unwrap(),
+        serde_json::json!({"type":"handoff_save","id":14,"prompt":"review this branch"})
+    );
+
+    // A written snapshot echoes the captured id and summary.
+    let saved: super::ServerEvent = serde_json::from_value(serde_json::json!({
+        "type": "handoff_saved",
+        "id": 12,
+        "session_id": "s-abc",
+        "summary": "Finish the migration",
+    }))
+    .unwrap();
+    assert!(matches!(&saved, super::ServerEvent::HandoffSaved {
+        id: 12, session_id: Some(s), summary: Some(sum)
+    } if s == "s-abc" && sum == "Finish the migration"));
+
+    // No open work: both optional fields are omitted on the wire.
+    let nothing: super::ServerEvent =
+        serde_json::from_value(serde_json::json!({"type": "handoff_saved", "id": 13})).unwrap();
+    assert!(matches!(&nothing, super::ServerEvent::HandoffSaved {
+        id: 13, session_id: None, summary: None
+    }));
+    assert_eq!(
+        serde_json::to_value(&nothing).unwrap(),
+        serde_json::json!({"type": "handoff_saved", "id": 13})
+    );
+}
+
+#[test]
+fn handoff_task_clear_wire_roundtrip() {
+    let clear = super::decode_request(r#"{"type":"handoff_task_clear","id":15}"#).unwrap();
+    assert!(matches!(clear, super::Request::HandoffTaskClear { id: 15 }));
+    assert_eq!(clear.id(), 15);
+    assert_eq!(
+        serde_json::to_value(&clear).unwrap(),
+        serde_json::json!({"type":"handoff_task_clear","id":15})
+    );
+
+    // The reply reports whether a task was present and whether the snapshot was
+    // removed; both default to false when omitted.
+    let cleared: super::ServerEvent = serde_json::from_value(serde_json::json!({
+        "type": "handoff_task_cleared",
+        "id": 15,
+        "had_task": true,
+        "removed": false,
+    }))
+    .unwrap();
+    assert!(matches!(&cleared, super::ServerEvent::HandoffTaskCleared {
+        id: 15, had_task: true, removed: false
+    }));
+
+    let default: super::ServerEvent =
+        serde_json::from_value(serde_json::json!({"type": "handoff_task_cleared", "id": 16}))
+            .unwrap();
+    assert!(matches!(&default, super::ServerEvent::HandoffTaskCleared {
+        id: 16, had_task: false, removed: false
+    }));
+}
+
+#[test]
 fn handoff_apply_wire_roundtrip() {
     let apply = super::decode_request(
         r#"{"type":"handoff_apply","id":9,"payload":"{\"session_id\":\"src\"}","disposition":"interrupted"}"#,

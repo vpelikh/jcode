@@ -509,6 +509,18 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
         "Resume a fresh session from a specific handoff by id (pick with /handoff)",
     ),
     RegisteredCommand::public(
+        "/handoffsave",
+        "Capture a handoff snapshot for the current session now (optional continuation prompt)",
+    ),
+    RegisteredCommand::with_subcommands(
+        "/handofftask",
+        "Manage the continuation task saved for this session",
+        &[(
+            "/handofftask clear",
+            "Drop the continuation task saved for this session",
+        )],
+    ),
+    RegisteredCommand::public(
         "/handoff-clear",
         "Clear the selected handoff and restore automatic injection",
     ),

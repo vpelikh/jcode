@@ -605,6 +605,8 @@ impl Request {
             Request::SetWorkingDir { id, .. } => *id,
             Request::SetHandoffResume { id, .. } => *id,
             Request::HandoffList { id } => *id,
+            Request::HandoffSave { id, .. } => *id,
+            Request::HandoffTaskClear { id } => *id,
             Request::HandoffImport { id, .. } => *id,
             Request::HandoffApply { id, .. } => *id,
             Request::HandoffResumeById { id, .. } => *id,

@@ -684,6 +684,128 @@ pub(super) async fn handle_set_handoff_resume(
     let _ = client_event_tx.send(ServerEvent::Done { id });
 }
 
+/// Reply to `Request::HandoffSave` with the outcome of an explicit on-demand
+/// capture for the current session.
+///
+/// This is the write side of the manual save flow (`/handoffsave`). It reads
+/// the session's todo state and writes a snapshot with the "saved" disposition
+/// while the session stays open. An optional `prompt` records an explicit
+/// continuation task so the resumed session boots ready to perform it; when a
+/// prompt is present a snapshot is written even with no open work. With neither
+/// open work nor a prompt, no snapshot is written and the reply carries `None`
+/// so the client can render an honest "nothing to save" message instead of a
+/// false success.
+pub(super) async fn handle_handoff_save(
+    id: u64,
+    prompt: Option<String>,
+    agent: &Arc<Mutex<Agent>>,
+    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+) {
+    let (session_id, working_dir, transcript) = {
+        let guard = agent.lock().await;
+        let transcript = if guard.memory_enabled() {
+            Some(guard.build_transcript_for_extraction())
+        } else {
+            None
+        };
+        (
+            guard.session_id().to_string(),
+            guard.working_dir().map(std::path::PathBuf::from),
+            transcript,
+        )
+    };
+    // Disk + git work moves off the async executor, matching disconnect cleanup.
+    let saved = tokio::task::spawn_blocking(move || {
+        crate::handoff::save_now_with_prompt(
+            &session_id,
+            working_dir.as_deref(),
+            transcript.as_deref(),
+            prompt.as_deref(),
+        )
+    })
+    .await;
+    match saved {
+        Ok(Some(snapshot)) => {
+            crate::logging::event_info(
+                "HANDOFF",
+                vec![
+                    ("phase", "saved".to_string()),
+                    ("request_id", id.to_string()),
+                    ("session_id", snapshot.session_id.clone()),
+                    (
+                        "has_prompt",
+                        snapshot.continuation_prompt.is_some().to_string(),
+                    ),
+                ],
+            );
+            let _ = client_event_tx.send(ServerEvent::HandoffSaved {
+                id,
+                session_id: Some(snapshot.session_id),
+                summary: snapshot.continuation_prompt.or(snapshot.intent),
+            });
+        }
+        Ok(None) => {
+            // No open work (and no explicit prompt): nothing to save.
+            let _ = client_event_tx.send(ServerEvent::HandoffSaved {
+                id,
+                session_id: None,
+                summary: None,
+            });
+        }
+        Err(join_error) => {
+            // The capture task itself failed (panicked/cancelled). Report an
+            // honest error rather than the ambiguous "nothing to save".
+            crate::logging::warn(&format!(
+                "[handoff] save request {id} could not run capture: {join_error}"
+            ));
+            let _ = client_event_tx.send(ServerEvent::Error {
+                id,
+                message: "could not capture a handoff snapshot for this session".to_string(),
+                retry_after_secs: None,
+            });
+        }
+    }
+}
+
+/// Reply to `Request::HandoffTaskClear`: drop the continuation task saved for
+/// the current session, leaving any open work in the snapshot intact (and
+/// removing the snapshot entirely when it had no open work either).
+pub(super) async fn handle_handoff_task_clear(
+    id: u64,
+    agent: &Arc<Mutex<Agent>>,
+    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+) {
+    let session_id = {
+        let guard = agent.lock().await;
+        guard.session_id().to_string()
+    };
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::handoff::clear_continuation_prompt(&session_id)
+    })
+    .await;
+    match outcome {
+        // `Some(outcome)`: snapshot existed. `None`: no snapshot to clear.
+        Ok(result) => {
+            let (had_task, removed) = result.map_or((false, false), |o| (o.had_task, o.removed));
+            let _ = client_event_tx.send(ServerEvent::HandoffTaskCleared {
+                id,
+                had_task,
+                removed,
+            });
+        }
+        Err(join_error) => {
+            crate::logging::warn(&format!(
+                "[handoff] task-clear request {id} could not run: {join_error}"
+            ));
+            let _ = client_event_tx.send(ServerEvent::Error {
+                id,
+                message: "could not clear the saved handoff task for this session".to_string(),
+                retry_after_secs: None,
+            });
+        }
+    }
+}
+
 /// Reply to `Request::HandoffList` with the server-side handoff store, newest
 /// first.
 ///
@@ -723,6 +845,7 @@ pub(super) async fn handle_handoff_list(
                     .collect(),
                 last_assistant_text: snapshot.last_assistant_text,
                 initiative_id: snapshot.initiative_id,
+                continuation_prompt: snapshot.continuation_prompt,
                 payload,
             }
         })

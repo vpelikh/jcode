@@ -4,7 +4,7 @@ use super::{
     NotifySessionContext, clone_split_session, handle_notify_session, handle_rename_session,
     handle_resume_all_sessions, handle_set_feature, handle_set_handoff_resume,
     handle_set_working_dir, handle_split, handle_handoff_list, handle_handoff_import, handle_handoff_apply,
-    handle_handoff_resume_by_id,
+    handle_handoff_resume_by_id, handle_handoff_save, handle_handoff_task_clear,
 };
 use crate::agent::Agent;
 use crate::message::{ContentBlock, Message, Role, StreamEvent, ToolDefinition};
@@ -1890,6 +1890,168 @@ async fn handle_handoff_resume_by_id_clears_and_arms_atomically() -> Result<()> 
     Ok(())
 }
 
+/// handle_handoff_save explicitly captures a snapshot for the current live
+/// session, on demand, while the session stays open. The captured snapshot is
+/// written with the "saved" disposition and becomes the project's live handoff.
+/// A session with no open todos replies with no id (nothing to save).
+#[tokio::test]
+async fn handle_handoff_save_captures_live_session_and_reports_nothing_to_save() -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+    let wd = temp.path();
+    std::fs::create_dir_all(wd).ok();
+
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
+    let session_id = {
+        let mut guard = agent.lock().await;
+        guard.set_working_dir(wd.to_str().expect("utf8"));
+        guard.session_id().to_string()
+    };
+
+    // Seed open work for the *live* session id, then save.
+    crate::todo::save_todos(
+        &session_id,
+        &[crate::todo::TodoItem {
+            id: "t".into(),
+            content: "checkpoint live work".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: None,
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    crate::todo::save_plan(
+        &session_id,
+        &crate::todo::TodoPlan {
+            user_intention: Some("live checkpoint".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    handle_handoff_save(71, None, &agent, &tx).await;
+    let event = timeout(Duration::from_secs(2), rx.recv())
+        .await?
+        .expect("event");
+    match event {
+        ServerEvent::HandoffSaved {
+            id,
+            session_id: saved,
+            summary,
+        } => {
+            assert_eq!(id, 71);
+            assert_eq!(saved.as_deref(), Some(session_id.as_str()));
+            assert_eq!(summary.as_deref(), Some("live checkpoint"));
+        }
+        other => panic!("expected HandoffSaved, got {other:?}"),
+    }
+
+    // Persisted with the "saved" disposition and indexed as the live handoff.
+    let snapshot = crate::handoff::load_snapshot(&session_id).expect("snapshot persisted");
+    assert_eq!(snapshot.disposition, "saved");
+    assert_eq!(snapshot.open_todos.len(), 1);
+    assert_eq!(
+        crate::handoff::latest_handoff_for_project(Some(wd)).as_deref(),
+        Some(session_id.as_str())
+    );
+
+    // With all todos terminal, a second save reports nothing to save and does
+    // not synthesize a snapshot.
+    crate::todo::save_todos(&session_id, &[]).unwrap();
+    let (tx2, mut rx2) = mpsc::unbounded_channel();
+    handle_handoff_save(72, None, &agent, &tx2).await;
+    let event2 = timeout(Duration::from_secs(2), rx2.recv())
+        .await?
+        .expect("event");
+    match event2 {
+        ServerEvent::HandoffSaved {
+            id,
+            session_id,
+            summary,
+        } => {
+            assert_eq!(id, 72);
+            assert!(session_id.is_none(), "no open work => no captured id");
+            assert!(summary.is_none());
+        }
+        other => panic!("expected HandoffSaved, got {other:?}"),
+    }
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    Ok(())
+}
+
+/// handle_handoff_task_clear drops the saved continuation task and reports the
+/// outcome: whether a task was present, and whether the snapshot was removed.
+#[tokio::test]
+async fn handle_handoff_task_clear_reports_task_and_removal() -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+    let wd = temp.path();
+    std::fs::create_dir_all(wd).ok();
+
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
+    let session_id = {
+        let mut guard = agent.lock().await;
+        guard.set_working_dir(wd.to_str().expect("utf8"));
+        guard.session_id().to_string()
+    };
+
+    // No snapshot yet: clearing reports no task, no removal.
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    handle_handoff_task_clear(81, &agent, &tx).await;
+    match timeout(Duration::from_secs(2), rx.recv()).await?.expect("event") {
+        ServerEvent::HandoffTaskCleared {
+            id,
+            had_task,
+            removed,
+        } => {
+            assert_eq!(id, 81);
+            assert!(!had_task && !removed);
+        }
+        other => panic!("expected HandoffTaskCleared, got {other:?}"),
+    }
+
+    // Save a prompt-only handoff, then clear it: the snapshot is removed.
+    crate::handoff::save_now_with_prompt(&session_id, Some(wd), None, Some("review this branch"))
+        .expect("save");
+    let (tx2, mut rx2) = mpsc::unbounded_channel();
+    handle_handoff_task_clear(82, &agent, &tx2).await;
+    match timeout(Duration::from_secs(2), rx2.recv()).await?.expect("event") {
+        ServerEvent::HandoffTaskCleared {
+            id,
+            had_task,
+            removed,
+        } => {
+            assert_eq!(id, 82);
+            assert!(had_task && removed, "prompt-only clear removes the snapshot");
+        }
+        other => panic!("expected HandoffTaskCleared, got {other:?}"),
+    }
+    assert!(crate::handoff::load_snapshot(&session_id).is_none());
+
+    if let Some(prev) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    Ok(())
+}
+
 /// handle_handoff_list lists the server-side handoff store (newest first,
 /// including archived snapshots) as HandoffWireModel entries with their export
 /// payload attached, so a client can discover and re-adopt a snapshot.
@@ -2558,6 +2720,181 @@ async fn real_socket_handoff_resume_by_id_round_trips() -> Result<()> {
         }
         other => panic!("unknown id should yield Error, got {other:?}"),
     }
+
+    run_task.abort();
+    Ok(())
+}
+
+/// Real-socket integration: drive `Request::HandoffSave` through the wire so it
+/// reaches the real handler, exercising request framing and the server dispatch
+/// path. The server captures the *live* session's open work (seeded here for the
+/// session id it assigned at subscribe) and replies `HandoffSaved` with that id,
+/// proving the manual save flow is reachable end to end.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_socket_handoff_save_round_trips_and_captures_live_session() -> Result<()> {
+    use crate::protocol::Request;
+    use crate::server::Server;
+    use crate::transport::Stream;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let _guard = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().expect("temp home");
+    let sock_dir = tempfile::tempdir().expect("temp sock dir");
+    let socket_path = sock_dir.path().join("jcode-handoff-save.sock");
+
+    struct Restore {
+        prev: [(&'static str, Option<std::ffi::OsString>); 2],
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            for (key, prev) in &self.prev {
+                match prev {
+                    Some(v) => crate::env::set_var(key, v.clone()),
+                    None => crate::env::remove_var(key),
+                }
+            }
+        }
+    }
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let prev_socket = std::env::var_os("JCODE_SOCKET");
+    let _restore = Restore {
+        prev: [
+            ("JCODE_HOME", prev_home),
+            ("JCODE_SOCKET", prev_socket),
+        ],
+    };
+    crate::env::set_var("JCODE_HOME", home.path());
+    crate::env::set_var("JCODE_SOCKET", &socket_path);
+
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let provider: Arc<dyn Provider> = Arc::new(StreamingMockProvider::default());
+    let server = Server::new(provider);
+    let run_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut stream = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(s) = Stream::connect(&socket_path).await {
+                break s;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    })
+    .await
+    .expect("server should accept within 10s");
+
+    let subscribe = Request::Subscribe {
+        supports_pdf_panels: false,
+        id: 40,
+        working_dir: Some(work.to_string_lossy().into_owned()),
+        selfdev: None,
+        target_session_id: None,
+        client_instance_id: None,
+        client_has_local_history: false,
+        allow_session_takeover: false,
+        crash_on_disconnect: false,
+        continue_on_disconnect: false,
+        terminal_env: Vec::new(),
+    };
+    stream
+        .write_all((serde_json::to_string(&subscribe)? + "\n").as_bytes())
+        .await?;
+    let mut reader = tokio::io::BufReader::new(stream);
+
+    // The server assigns the session id; seed open work for it before saving.
+    let session_id = timeout(Duration::from_secs(5), async {
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).await?;
+            if n == 0 {
+                anyhow::bail!("connection closed before SessionId arrived");
+            }
+            if let Ok(crate::protocol::ServerEvent::SessionId { session_id }) =
+                serde_json::from_str::<crate::protocol::ServerEvent>(&line)
+            {
+                return Ok(session_id);
+            }
+        }
+    })
+    .await
+    .expect("SessionId reply should arrive")?;
+    crate::todo::save_todos(
+        &session_id,
+        &[crate::todo::TodoItem {
+            id: "t".into(),
+            content: "e2e saved work".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: None,
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    crate::todo::save_plan(
+        &session_id,
+        &crate::todo::TodoPlan {
+            user_intention: Some("e2e save intent".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let save = Request::HandoffSave {
+        id: 41,
+        prompt: Some("review this branch's changes".to_string()),
+    };
+    reader
+        .get_mut()
+        .write_all((serde_json::to_string(&save)? + "\n").as_bytes())
+        .await?;
+    let saved = timeout(Duration::from_secs(5), async {
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).await?;
+            if n == 0 {
+                anyhow::bail!("connection closed before HandoffSaved arrived");
+            }
+            if let Ok(ev) = serde_json::from_str::<crate::protocol::ServerEvent>(&line)
+                && matches!(ev, crate::protocol::ServerEvent::HandoffSaved { id: 41, .. })
+            {
+                return Ok(ev);
+            }
+        }
+    })
+    .await
+    .expect("HandoffSaved reply should arrive")?;
+    match saved {
+        crate::protocol::ServerEvent::HandoffSaved {
+            id,
+            session_id: saved_id,
+            summary,
+        } => {
+            assert_eq!(id, 41);
+            assert_eq!(saved_id.as_deref(), Some(session_id.as_str()));
+            // The continuation prompt leads the summary so the client shows the
+            // task, not just the plan intent.
+            assert_eq!(summary.as_deref(), Some("review this branch's changes"));
+        }
+        other => panic!("expected HandoffSaved, got {other:?}"),
+    }
+
+    // The snapshot is on disk with the manual "saved" disposition, carries the
+    // continuation prompt, and is the project's live handoff.
+    let snapshot = crate::handoff::load_snapshot(&session_id).expect("snapshot persisted");
+    assert_eq!(snapshot.disposition, "saved");
+    assert_eq!(
+        snapshot.continuation_prompt.as_deref(),
+        Some("review this branch's changes")
+    );
+    assert_eq!(
+        crate::handoff::latest_handoff_for_project(Some(&work)).as_deref(),
+        Some(session_id.as_str())
+    );
 
     run_task.abort();
     Ok(())

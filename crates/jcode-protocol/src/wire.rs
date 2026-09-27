@@ -361,6 +361,34 @@ pub enum Request {
     #[serde(rename = "handoff_list")]
     HandoffList { id: u64 },
 
+    /// Explicitly capture a handoff snapshot for the current session, on demand.
+    ///
+    /// This is the manual counterpart to the automatic disconnect capture: it
+    /// lets a client checkpoint the session's open work without ending it. The
+    /// server reads the session's todo plan/list and writes a snapshot with the
+    /// "saved" disposition, replying [`ServerEvent::HandoffSaved`] with the
+    /// captured id (or `None` when there was neither open work nor a prompt).
+    ///
+    /// An optional `prompt` records an explicit continuation task for the
+    /// resumed session (e.g. "review this branch's changes"). When present, a
+    /// snapshot is captured even for a session with no open todos, because the
+    /// task itself is the work being handed forward.
+    #[serde(rename = "handoff_save")]
+    HandoffSave {
+        id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+    },
+
+    /// Clear the continuation task (prompt) previously saved for the current
+    /// session, without deleting any open work the snapshot also carries.
+    ///
+    /// A save with no prompt carries an existing task forward, so this is the
+    /// explicit way to drop it. When the snapshot had no open work either, the
+    /// snapshot is removed entirely. Replies [`ServerEvent::HandoffTaskCleared`].
+    #[serde(rename = "handoff_task_clear")]
+    HandoffTaskClear { id: u64 },
+
     /// Adopt a portable handoff payload into this server's store and make it
     /// the live handoff for the current session's project (the remote-fallback
     /// counterpart to `export_handoff`/`import_handoff`).
@@ -898,7 +926,8 @@ pub struct HandoffWireModel {
     pub project_key: String,
     /// Capture timestamp, serialized as RFC3339 UTC on the wire.
     pub ended_at: chrono::DateTime<chrono::Utc>,
-    /// Why the session ended: "closed", "crashed", or "reloading".
+    /// Why the snapshot was written: "closed", "crashed", or "reloading" for a
+    /// disconnect capture, or "saved" for an explicit on-demand save.
     pub disposition: String,
     /// Source working directory, when recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -917,6 +946,10 @@ pub struct HandoffWireModel {
     /// Durable initiative linked to this work, if one was attached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initiative_id: Option<String>,
+    /// An explicit continuation task/prompt captured with the handoff, if any.
+    /// Lets a remote client show *what the resumed session is meant to do*.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_prompt: Option<String>,
     /// The full opaque export payload for this snapshot, for re-adoption on
     /// this host via `handoff_import`. Included so the client can ship the
     /// exact snapshot back to the server without a second round trip.
@@ -1726,6 +1759,37 @@ pub enum ServerEvent {
         id: u64,
         /// The server's saved handoffs (including archived snapshots).
         handoffs: Vec<HandoffWireModel>,
+    },
+
+    /// Reply to `Request::HandoffSave` — the outcome of an explicit, on-demand
+    /// handoff capture for the current session.
+    #[serde(rename = "handoff_saved")]
+    HandoffSaved {
+        /// Echoes the request id.
+        id: u64,
+        /// The captured session id when a snapshot was written (`Some`), or
+        /// `None` when there was neither open work nor a prompt to save.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        /// The captured snapshot's headline for a client confirmation: its
+        /// continuation prompt when one was given, otherwise its intent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+    },
+
+    /// Reply to `Request::HandoffTaskClear`. `had_task` is true when a saved
+    /// continuation task was present and is now cleared; `removed` is true
+    /// when the whole snapshot was dropped (it had no open work left).
+    #[serde(rename = "handoff_task_cleared")]
+    HandoffTaskCleared {
+        /// Echoes the request id.
+        id: u64,
+        /// Whether a continuation task was present and cleared.
+        #[serde(default)]
+        had_task: bool,
+        /// Whether the snapshot was removed entirely (no work remained).
+        #[serde(default)]
+        removed: bool,
     },
 
     /// Reply to `Request::HandoffImport` — the outcome of adopting a portable

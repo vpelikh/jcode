@@ -2650,6 +2650,30 @@ fn handoff_to_model(snapshot: HandoffSnapshot) -> HandoffModel {
     // block rather than a chat transcript, which is what the user wants to
     // scrutinize before resuming.
     let mut messages_preview: Vec<PreviewMessage> = Vec::new();
+    // The continuation task is the headline of a handoff saved with a prompt
+    // (`/handoffsave <task>`), so show it first, mirroring how the boot context
+    // leads with "Continue with this task:".
+    let continuation_task = snapshot
+        .continuation_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+    if let Some(prompt) = continuation_task {
+        messages_preview.push(PreviewMessage {
+            role: "meta".to_string(),
+            content: "Continue with this task:".to_string(),
+            tool_calls: Vec::new(),
+            tool_data: None,
+            timestamp: None,
+        });
+        messages_preview.push(PreviewMessage {
+            role: "assistant".to_string(),
+            content: safe_truncate(prompt, HANDOFF_ASSISTANT_TEXT_CAP).to_string(),
+            tool_calls: Vec::new(),
+            tool_data: None,
+            timestamp: None,
+        });
+    }
     if !snapshot.open_todos.is_empty() {
         messages_preview.push(PreviewMessage {
             role: "meta".to_string(),
@@ -2685,7 +2709,9 @@ fn handoff_to_model(snapshot: HandoffSnapshot) -> HandoffModel {
                 timestamp: None,
             });
         }
-    } else if let Some(assistant) = snapshot.last_assistant_text.as_deref() {
+    } else if let Some(assistant) = snapshot.last_assistant_text.as_deref()
+        && continuation_task.is_none()
+    {
         messages_preview.push(PreviewMessage {
             role: "meta".to_string(),
             content: "No open todos; last assistant context:".to_string(),
@@ -2700,7 +2726,7 @@ fn handoff_to_model(snapshot: HandoffSnapshot) -> HandoffModel {
             tool_data: None,
             timestamp: None,
         });
-    } else {
+    } else if continuation_task.is_none() {
         messages_preview.push(PreviewMessage {
             role: "meta".to_string(),
             content: "No open todos recorded for this handoff.".to_string(),
@@ -2729,10 +2755,22 @@ fn handoff_to_model(snapshot: HandoffSnapshot) -> HandoffModel {
     }
 
     let id = snapshot.session_id.clone();
+    // Prefer the plan intent as the row's identifying title, then fall back to
+    // the explicit continuation task (a prompt-only handoff has no intent, and
+    // its session id is opaque). Note this differs from `handoff_headline`,
+    // which leads with the task: the row title is a stable identity for the
+    // handoff, while the resume headline is the immediate directive. Both
+    // surface the task, so a prompt-only handoff is never shown as a bare id.
     let title = snapshot
         .intent
         .clone()
         .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            snapshot
+                .continuation_prompt
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+        })
         .unwrap_or_else(|| id.clone());
     let short_name = id.clone();
     let working_dir = snapshot.working_dir.clone();

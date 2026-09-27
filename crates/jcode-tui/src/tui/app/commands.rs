@@ -1954,9 +1954,10 @@ pub(super) fn handle_git_status_completed(app: &mut App, completed: GitStatusCom
 }
 
 /// The headline shown when a handoff is selected/resumed: the snapshot's
-/// first content line (its intent), falling back to a stable marker when there
-/// is no renderable content. Shared by the manual `/handoffres` command and the
-/// interactive `/handoff` overlay so the two paths cannot drift.
+/// first content line (its continuation task when one is saved, otherwise its
+/// intent), falling back to a stable marker when there is no renderable content.
+/// Shared by the manual `/handoffres` command and the interactive `/handoff`
+/// overlay so the two paths cannot drift.
 pub(super) fn handoff_headline(session_id: &str) -> String {
     crate::handoff::render_handoff(session_id)
         .and_then(|block| {
@@ -2047,6 +2048,27 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
     if trimmed == "/handoffres" || trimmed.starts_with("/handoffres ") {
         app.push_display_message(DisplayMessage::error(
             "/handoffres requires a live server connection; run it from a connected TUI (list ids with /handoff).".to_string(),
+        ));
+        return true;
+    }
+
+    if trimmed == "/handoffsave" || trimmed.starts_with("/handoffsave ") {
+        app.push_display_message(DisplayMessage::error(
+            "/handoffsave requires a live server connection; it captures a handoff for the running session (with an optional continuation prompt).".to_string(),
+        ));
+        return true;
+    }
+
+    if trimmed == "/handofftask clear" {
+        app.push_display_message(DisplayMessage::error(
+            "/handofftask clear requires a live server connection; it clears the continuation task saved for the running session.".to_string(),
+        ));
+        return true;
+    }
+
+    if trimmed == "/handofftask" || trimmed.starts_with("/handofftask ") {
+        app.push_display_message(DisplayMessage::error(
+            "Usage: /handofftask clear  (view saved handoffs with /handoff)".to_string(),
         ));
         return true;
     }

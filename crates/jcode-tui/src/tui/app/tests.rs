@@ -1926,6 +1926,197 @@ fn remote_done_finalizes_resumed_activity_without_current_message_id() {
     assert!(app.last_api_completed.is_some());
 }
 
+/// A server `Error` for an in-flight `handoff_save` / `handoff_task_clear`
+/// clears the pending request so a later reply cannot be misattributed, and
+/// surfaces the failure.
+#[test]
+fn remote_handoff_error_clears_pending_save_and_clear() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    app.is_remote = true;
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    app.set_pending_remote_handoff_save(21);
+    app.handle_server_event(
+        crate::protocol::ServerEvent::Error {
+            id: 21,
+            message: "Cannot handle handoff_save while the session is busy.".to_string(),
+            retry_after_secs: Some(1),
+        },
+        &mut remote,
+    );
+    assert!(
+        app.take_pending_remote_handoff_save(21).is_none(),
+        "the pending save must be cleared by its Error reply"
+    );
+    let msg = app
+        .display_messages()
+        .last()
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    assert!(msg.contains("Handoff save failed"), "got: {msg}");
+
+    app.set_pending_remote_handoff_task_clear(22);
+    app.handle_server_event(
+        crate::protocol::ServerEvent::Error {
+            id: 22,
+            message: "could not clear the saved handoff task for this session".to_string(),
+            retry_after_secs: None,
+        },
+        &mut remote,
+    );
+    assert!(
+        app.take_pending_remote_handoff_task_clear(22).is_none(),
+        "the pending task-clear must be cleared by its Error reply"
+    );
+    let msg = app
+        .display_messages()
+        .last()
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    assert!(msg.contains("Handoff task clear failed"), "got: {msg}");
+}
+
+/// `HandoffSaved` is only surfaced for the exact in-flight `/handoffsave`
+/// request, and it distinguishes a written snapshot from "nothing to save".
+#[test]
+fn remote_handoff_saved_reports_outcome_only_for_awaited_request() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    app.is_remote = true;
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    // A stray HandoffSaved with no matching request is ignored.
+    app.handle_server_event(
+        crate::protocol::ServerEvent::HandoffSaved {
+            id: 5,
+            session_id: Some("s-saved".to_string()),
+            summary: Some("Big refactor".to_string()),
+        },
+        &mut remote,
+    );
+    assert!(
+        app.display_messages().is_empty(),
+        "an unawaited HandoffSaved must not surface a message"
+    );
+
+    // The awaited request surfaces the saved id and its summary.
+    app.set_pending_remote_handoff_save(7);
+    app.handle_server_event(
+        crate::protocol::ServerEvent::HandoffSaved {
+            id: 7,
+            session_id: Some("s-saved".to_string()),
+            summary: Some("Big refactor".to_string()),
+        },
+        &mut remote,
+    );
+    let saved_msg = app
+        .display_messages()
+        .last()
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    assert!(
+        saved_msg.contains("Handoff saved: s-saved") && saved_msg.contains("Big refactor"),
+        "awaited save should report the id and summary, got: {saved_msg}"
+    );
+
+    // A second awaited request with no open work reports "nothing to save".
+    app.set_pending_remote_handoff_save(8);
+    app.handle_server_event(
+        crate::protocol::ServerEvent::HandoffSaved {
+            id: 8,
+            session_id: None,
+            summary: None,
+        },
+        &mut remote,
+    );
+    let nothing_msg = app
+        .display_messages()
+        .last()
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    assert!(
+        nothing_msg.contains("Nothing to save"),
+        "no-open-work save should explain there was nothing to save, got: {nothing_msg}"
+    );
+}
+
+/// `HandoffTaskCleared` is surfaced only for the awaited request, and reports
+/// the three outcomes: cleared with work kept, removed entirely, nothing to do.
+#[test]
+fn remote_handoff_task_cleared_reports_outcome_only_for_awaited_request() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    app.is_remote = true;
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    // A stray reply with no matching request is ignored.
+    app.handle_server_event(
+        crate::protocol::ServerEvent::HandoffTaskCleared {
+            id: 1,
+            had_task: true,
+            removed: false,
+        },
+        &mut remote,
+    );
+    assert!(app.display_messages().is_empty());
+
+    // Cleared, open work kept.
+    app.set_pending_remote_handoff_task_clear(2);
+    app.handle_server_event(
+        crate::protocol::ServerEvent::HandoffTaskCleared {
+            id: 2,
+            had_task: true,
+            removed: false,
+        },
+        &mut remote,
+    );
+    let kept = app
+        .display_messages()
+        .last()
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    assert!(kept.contains("Handoff task cleared"), "got: {kept}");
+    assert!(kept.contains("untouched"), "got: {kept}");
+
+    // Removed entirely (no work left).
+    app.set_pending_remote_handoff_task_clear(3);
+    app.handle_server_event(
+        crate::protocol::ServerEvent::HandoffTaskCleared {
+            id: 3,
+            had_task: true,
+            removed: true,
+        },
+        &mut remote,
+    );
+    let removed = app
+        .display_messages()
+        .last()
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    assert!(removed.contains("removed"), "got: {removed}");
+
+    // Nothing to clear.
+    app.set_pending_remote_handoff_task_clear(4);
+    app.handle_server_event(
+        crate::protocol::ServerEvent::HandoffTaskCleared {
+            id: 4,
+            had_task: false,
+            removed: false,
+        },
+        &mut remote,
+    );
+    let none = app
+        .display_messages()
+        .last()
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    assert!(none.contains("No saved handoff task"), "got: {none}");
+}
+
 #[test]
 fn oversized_pasted_submit_is_rejected_and_preserves_input() {
     let mut app = create_test_app();

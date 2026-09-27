@@ -5,7 +5,8 @@ use super::client_actions::{
     handle_set_handoff_resume, handle_set_subagent_model, handle_set_working_dir, handle_split,
     handle_stdin_response, handle_transfer, handle_trigger_memory_extraction,
     handle_handoff_list, handle_handoff_import, handle_handoff_apply,
-    handle_handoff_resume_by_id,
+    handle_handoff_resume_by_id, handle_handoff_save,
+    handle_handoff_task_clear,
 };
 use super::client_comm::{
     handle_comm_channel_members, handle_comm_list, handle_comm_list_channels, handle_comm_message,
@@ -2005,6 +2006,34 @@ pub(super) async fn handle_client(
 
             Request::HandoffList { id } => {
                 handle_handoff_list(id, &client_event_tx).await;
+            }
+
+            Request::HandoffSave { id, prompt } => {
+                if reject_if_agent_busy_for_request(
+                    id,
+                    "handoff_save",
+                    &client_session_id,
+                    client_is_processing,
+                    &agent,
+                    &client_event_tx,
+                ) {
+                    continue;
+                }
+                handle_handoff_save(id, prompt, &agent, &client_event_tx).await;
+            }
+
+            Request::HandoffTaskClear { id } => {
+                if reject_if_agent_busy_for_request(
+                    id,
+                    "handoff_task_clear",
+                    &client_session_id,
+                    client_is_processing,
+                    &agent,
+                    &client_event_tx,
+                ) {
+                    continue;
+                }
+                handle_handoff_task_clear(id, &agent, &client_event_tx).await;
             }
 
             Request::HandoffImport {

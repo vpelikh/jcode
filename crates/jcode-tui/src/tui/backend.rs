@@ -932,6 +932,31 @@ impl RemoteConnection {
         Ok(id)
     }
 
+    /// Ask the server to explicitly capture a handoff snapshot for the current
+    /// session, on demand (`/handoffsave`). An optional `prompt` records an
+    /// explicit continuation task for the resumed session. The result arrives
+    /// asynchronously via [`ServerEvent::HandoffSaved`], correlated by the
+    /// request id.
+    pub async fn handoff_save(&mut self, prompt: Option<String>) -> Result<u64> {
+        let id = self.next_request_id;
+        let request = Request::HandoffSave { id, prompt };
+        self.next_request_id += 1;
+        self.send_request(request).await?;
+        Ok(id)
+    }
+
+    /// Ask the server to clear the continuation task saved for the current
+    /// session (the explicit counterpart to a bare save, which carries an
+    /// existing task forward). The result arrives via
+    /// [`ServerEvent::HandoffTaskCleared`].
+    pub async fn handoff_task_clear(&mut self) -> Result<u64> {
+        let id = self.next_request_id;
+        let request = Request::HandoffTaskClear { id };
+        self.next_request_id += 1;
+        self.send_request(request).await?;
+        Ok(id)
+    }
+
     /// Ask the server to adopt a portable handoff payload as the live handoff
     /// for the current session's project. The outcome arrives asynchronously
     /// via [`ServerEvent::HandoffImported`] (or `Error` on rejection).
@@ -1686,6 +1711,44 @@ mod tests {
             && payload == "{\"session_id\":\"src\"}"
             && disposition.as_deref() == Some("interrupted")));
         assert_eq!(parsed.id(), apply_id);
+    }
+
+    #[tokio::test]
+    async fn handoff_save_sends_the_right_wire_request() {
+        use tokio::io::AsyncBufReadExt;
+
+        let mut remote = RemoteConnection::dummy();
+        let peer = remote.take_dummy_peer().unwrap();
+        let (reader, _writer) = peer.into_split();
+        let mut reader = BufReader::new(reader);
+
+        let save_id = remote
+            .handoff_save(Some("review this branch".to_string()))
+            .await
+            .unwrap();
+        let mut request = String::new();
+        reader.read_line(&mut request).await.unwrap();
+        let parsed = serde_json::from_str::<Request>(&request).unwrap();
+        assert!(matches!(&parsed, Request::HandoffSave { id, prompt }
+            if *id == save_id && prompt.as_deref() == Some("review this branch")));
+        assert_eq!(parsed.id(), save_id);
+    }
+
+    #[tokio::test]
+    async fn handoff_task_clear_sends_the_right_wire_request() {
+        use tokio::io::AsyncBufReadExt;
+
+        let mut remote = RemoteConnection::dummy();
+        let peer = remote.take_dummy_peer().unwrap();
+        let (reader, _writer) = peer.into_split();
+        let mut reader = BufReader::new(reader);
+
+        let clear_id = remote.handoff_task_clear().await.unwrap();
+        let mut request = String::new();
+        reader.read_line(&mut request).await.unwrap();
+        let parsed = serde_json::from_str::<Request>(&request).unwrap();
+        assert!(matches!(&parsed, Request::HandoffTaskClear { id } if *id == clear_id));
+        assert_eq!(parsed.id(), clear_id);
     }
 
     #[tokio::test]

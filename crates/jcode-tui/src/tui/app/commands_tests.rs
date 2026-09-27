@@ -852,6 +852,53 @@ fn local_handoff_listing_surfaces_archived_and_requires_server_for_resume() {
         msg.contains("requires a live server connection"),
         "local /handoffres should explain a server is needed: {msg}"
     );
+
+    // `/handoffsave` is likewise claimed locally but needs the live server to
+    // capture the running session's open work.
+    assert!(
+        dispatch_local_command(&mut app, "/handoffsave"),
+        "/handoffsave should be claimed in local dispatch"
+    );
+    let msg = app
+        .display_messages
+        .last()
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("requires a live server connection"),
+        "local /handoffsave should explain a server is needed: {msg}"
+    );
+
+    // `/handofftask clear` is likewise claimed locally but needs the server.
+    assert!(
+        dispatch_local_command(&mut app, "/handofftask clear"),
+        "/handofftask clear should be claimed in local dispatch"
+    );
+    let msg = app
+        .display_messages
+        .last()
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("requires a live server connection"),
+        "local /handofftask clear should explain a server is needed: {msg}"
+    );
+
+    // A bare `/handofftask` is not a show command; it prints usage instead of
+    // opening the picker (that is `/handoff`).
+    assert!(
+        dispatch_local_command(&mut app, "/handofftask"),
+        "/handofftask should be claimed in local dispatch"
+    );
+    let msg = app
+        .display_messages
+        .last()
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("Usage: /handofftask clear"),
+        "a bare /handofftask should print usage, got: {msg}"
+    );
 }
 
 /// `handoff_headline` returns the snapshot's intent as the headline (line after

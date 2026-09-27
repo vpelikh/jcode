@@ -121,6 +121,442 @@ async fn capture_only_writes_when_open_todos_exist() {
     assert_eq!(latest.as_deref(), Some("s-work"));
 }
 
+/// Explicit save writes a snapshot with the "saved" disposition and bumps the
+/// index while the session is still open, without ending anything.
+#[test]
+fn save_now_writes_snapshot_with_saved_disposition() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let home = &env._home;
+    let cwd = home.path().join("project");
+    std::fs::create_dir_all(&cwd).ok();
+
+    // No open todos -> nothing saved.
+    assert!(save_now("s-empty", Some(&cwd), None).is_none());
+    assert!(load_snapshot("s-empty").is_none());
+
+    crate::todo::save_todos(
+        "s-save",
+        &[TodoItem {
+            id: "t1".into(),
+            content: "checkpoint the migration".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: None,
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .expect("save todos");
+    crate::todo::save_plan(
+        "s-save",
+        &crate::todo::TodoPlan {
+            user_intention: Some("manual checkpoint".into()),
+            ..Default::default()
+        },
+    )
+    .expect("save plan");
+
+    let snap = save_now("s-save", Some(&cwd), None).expect("should save");
+    assert_eq!(snap.disposition, "saved");
+    assert_eq!(snap.intent.as_deref(), Some("manual checkpoint"));
+    assert_eq!(snap.open_todos.len(), 1);
+
+    // Persisted and indexed for later resolution.
+    let loaded = load_snapshot("s-save").expect("snapshot persisted");
+    assert_eq!(loaded.disposition, "saved");
+    assert_eq!(latest_handoff_for_project(Some(&cwd)).as_deref(), Some("s-save"));
+}
+
+/// A manual save with no open work must not retire an existing index entry: it
+/// is additive and never clears autosaved state the way `capture` does.
+#[test]
+fn save_now_without_open_work_does_not_retire_existing_handoff() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let home = &env._home;
+    let cwd = home.path().join("project");
+    std::fs::create_dir_all(&cwd).ok();
+
+    crate::todo::save_todos(
+        "s-live",
+        &[TodoItem {
+            id: "t1".into(),
+            content: "open work".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: None,
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .expect("save todos");
+    capture("s-live", Some(&cwd), "closed", None).expect("seed handoff");
+    assert_eq!(latest_handoff_for_project(Some(&cwd)).as_deref(), Some("s-live"));
+
+    // All todos terminal now, but a manual save must leave the index untouched.
+    crate::todo::save_todos("s-live", &[]).expect("clear todos");
+    assert!(save_now("s-live", Some(&cwd), None).is_none());
+    assert_eq!(
+        latest_handoff_for_project(Some(&cwd)).as_deref(),
+        Some("s-live"),
+        "manual save with no open work must not retire the live handoff"
+    );
+}
+
+/// A save with an explicit continuation prompt writes a snapshot even when the
+/// session has no open todos, stores the prompt, and renders it prominently so
+/// the resumed session boots ready to do the task.
+#[test]
+fn save_now_with_prompt_handles_task_without_open_work_and_renders_it() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let home = &env._home;
+    let cwd = home.path().join("project");
+    std::fs::create_dir_all(&cwd).ok();
+
+    // No todos at all, but an explicit task: the task itself is the work.
+    let snap = save_now_with_prompt(
+        "s-prompt",
+        Some(&cwd),
+        None,
+        Some("review this branch's changes"),
+    )
+    .expect("a continuation prompt should be saved even with no open todos");
+    assert_eq!(snap.disposition, "saved");
+    assert_eq!(
+        snap.continuation_prompt.as_deref(),
+        Some("review this branch's changes")
+    );
+    assert!(snap.open_todos.is_empty());
+
+    // The boot block leads with the task, ahead of any historical context.
+    let rendered = render_handoff("s-prompt").expect("handoff renders");
+    assert!(
+        rendered.contains("Continue with this task: review this branch's changes"),
+        "boot context should lead with the continuation task, got: {rendered}"
+    );
+    let task_at = rendered.find("Continue with this task").unwrap();
+    let header_at = rendered.find("[Handoff from previous session]").unwrap();
+    assert!(task_at > header_at, "task should follow the header");
+
+    // A blank prompt is not treated as a task (falls back to requiring work).
+    assert!(
+        save_now_with_prompt("s-blank", Some(&cwd), None, Some("   ")).is_none(),
+        "a whitespace-only prompt must not create a workless snapshot"
+    );
+
+    // A prompt longer than the cap is cut visibly, not silently.
+    let long = "z".repeat(5000);
+    let snap = save_now_with_prompt("s-long", Some(&cwd), None, Some(&long)).expect("save");
+    let stored = snap.continuation_prompt.expect("stored prompt");
+    assert!(
+        stored.contains("continuation prompt truncated"),
+        "an over-cap prompt must carry a truncation notice, got tail: {:?}",
+        &stored[stored.len().saturating_sub(80)..]
+    );
+    let rendered = render_handoff("s-long").expect("renders");
+    // The stored truncation marker renders inline, on its own line, exactly once.
+    assert!(
+        rendered.contains("Continue with this task:"),
+        "the boot block must include the (truncated) task"
+    );
+    assert_eq!(
+        rendered.matches("[continuation prompt truncated").count(),
+        1,
+        "the truncation marker must appear exactly once in the boot block, got: {rendered}"
+    );
+    assert!(
+        !rendered.contains("[Continuation task truncated"),
+        "render must not add a second truncation notice on top of the marker"
+    );
+}
+
+/// A continuation prompt written by an explicit save is a user instruction for
+/// the next session; a later disconnect capture for the same session must carry
+/// it forward rather than dropping it (which would silently lose the task when
+/// the user saves and then ends the session).
+#[test]
+fn capture_carries_forward_a_continuation_prompt() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let home = &env._home;
+    let cwd = home.path().join("project");
+    std::fs::create_dir_all(&cwd).ok();
+
+    crate::todo::save_todos(
+        "s-carry",
+        &[TodoItem {
+            id: "t1".into(),
+            content: "open work".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: None,
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .expect("save todos");
+    save_now_with_prompt(
+        "s-carry",
+        Some(&cwd),
+        None,
+        Some("review this branch's changes"),
+    )
+    .expect("explicit save");
+
+    // The session later disconnects; capture rebuilds from current state.
+    let captured = capture("s-carry", Some(&cwd), "closed", None).expect("capture");
+    assert_eq!(
+        captured.continuation_prompt.as_deref(),
+        Some("review this branch's changes"),
+        "disconnect capture must not drop a saved continuation prompt"
+    );
+    assert_eq!(
+        load_snapshot("s-carry")
+            .expect("persisted")
+            .continuation_prompt
+            .as_deref(),
+        Some("review this branch's changes")
+    );
+}
+
+/// `clear_continuation_prompt` drops the task and reports what happened: it
+/// keeps open work, and removes the whole snapshot when nothing is left.
+#[test]
+fn clear_continuation_prompt_removes_task_and_empty_snapshot() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let home = &env._home;
+    let cwd = home.path().join("project");
+    std::fs::create_dir_all(&cwd).ok();
+
+    // No snapshot at all -> None.
+    assert!(clear_continuation_prompt("s-none").is_none());
+
+    // Open work + a task: clearing keeps the work.
+    crate::todo::save_todos(
+        "s-with-work",
+        &[TodoItem {
+            id: "t1".into(),
+            content: "open work".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: None,
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .expect("save todos");
+    save_now_with_prompt("s-with-work", Some(&cwd), None, Some("review this branch"))
+        .expect("save with prompt");
+    let outcome = clear_continuation_prompt("s-with-work").expect("snapshot exists");
+    assert!(outcome.had_task && !outcome.removed);
+    let kept = load_snapshot("s-with-work").expect("still present");
+    assert!(kept.continuation_prompt.is_none(), "task cleared");
+    assert_eq!(kept.open_todos.len(), 1, "open work kept");
+
+    // No open work + a task: clearing removes the snapshot entirely.
+    save_now_with_prompt("s-task-only", Some(&cwd), None, Some("do the follow-up"))
+        .expect("prompt-only save");
+    let outcome = clear_continuation_prompt("s-task-only").expect("snapshot exists");
+    assert!(outcome.had_task && outcome.removed);
+    assert!(load_snapshot("s-task-only").is_none(), "snapshot removed");
+    assert!(
+        latest_handoff_for_project(Some(&cwd)).as_deref() != Some("s-task-only"),
+        "removed snapshot must not remain the live handoff"
+    );
+
+    // Nothing to clear when the snapshot has open work but no task.
+    crate::todo::save_todos(
+        "s-no-task",
+        &[TodoItem {
+            id: "t1".into(),
+            content: "open work".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            group: None,
+            confidence: None,
+            ..Default::default()
+        }],
+    )
+    .expect("save todos");
+    save_now("s-no-task", Some(&cwd), None).expect("save");
+    let outcome = clear_continuation_prompt("s-no-task").expect("snapshot exists");
+    assert!(!outcome.had_task && !outcome.removed);
+    assert!(
+        load_snapshot("s-no-task").is_some(),
+        "a snapshot with open work and no task must be left intact"
+    );
+}
+
+/// A bare save (no new prompt) must not clear a previously saved continuation
+/// task for the same session.
+#[test]
+fn save_without_prompt_keeps_the_existing_continuation_prompt() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let home = &env._home;
+    let cwd = home.path().join("project");
+    std::fs::create_dir_all(&cwd).ok();
+
+    save_now_with_prompt("s-keep", Some(&cwd), None, Some("finish the migration"))
+        .expect("prompt save");
+    // A later bare save must not drop the task.
+    let snap = save_now("s-keep", Some(&cwd), None).expect("bare save");
+    assert_eq!(
+        snap.continuation_prompt.as_deref(),
+        Some("finish the migration"),
+        "a bare save must carry an existing continuation prompt forward"
+    );
+    // A whitespace-only prompt is also "no new prompt", not a clear.
+    let snap = save_now_with_prompt("s-keep", Some(&cwd), None, Some("   ")).expect("blank save");
+    assert_eq!(
+        snap.continuation_prompt.as_deref(),
+        Some("finish the migration"),
+        "a blank prompt must not clear an existing continuation prompt"
+    );
+}
+
+/// A prompt-only handoff (no open todos) must survive a later disconnect
+/// capture instead of being retired as completed work.
+#[test]
+fn capture_does_not_retire_a_prompt_only_handoff() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let home = &env._home;
+    let cwd = home.path().join("project");
+    std::fs::create_dir_all(&cwd).ok();
+
+    save_now_with_prompt("s-prompt-only", Some(&cwd), None, Some("do the follow-up"))
+        .expect("prompt-only save");
+    assert_eq!(
+        latest_handoff_for_project(Some(&cwd)).as_deref(),
+        Some("s-prompt-only")
+    );
+
+    // No open todos, but the task is still outstanding: capture must keep it.
+    let captured = capture("s-prompt-only", Some(&cwd), "closed", None).expect("capture");
+    assert_eq!(captured.continuation_prompt.as_deref(), Some("do the follow-up"));
+    assert_eq!(captured.open_todos.len(), 0);
+    assert_eq!(
+        latest_handoff_for_project(Some(&cwd)).as_deref(),
+        Some("s-prompt-only"),
+        "a prompt-only handoff must not be retired by disconnect capture"
+    );
+}
+
+/// A captured (carried-forward) over-cap prompt must not stack or garble the
+/// truncation marker across repeated saves/captures, and must stay within the
+/// stored cap.
+#[test]
+fn over_cap_prompt_marker_is_idempotent_across_captures() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let home = &env._home;
+    let cwd = home.path().join("project");
+    std::fs::create_dir_all(&cwd).ok();
+
+    let long = "z".repeat(9000);
+    save_now_with_prompt("s-idem", Some(&cwd), None, Some(&long)).expect("save");
+    let first = load_snapshot("s-idem")
+        .expect("saved")
+        .continuation_prompt
+        .expect("prompt");
+
+    // A later capture (carry-forward) and a bare save must both leave it stable.
+    capture("s-idem", Some(&cwd), "closed", None).expect("capture");
+    let after_capture = load_snapshot("s-idem")
+        .expect("saved")
+        .continuation_prompt
+        .expect("prompt");
+    save_now("s-idem", Some(&cwd), None).expect("bare save");
+    let after_save = load_snapshot("s-idem")
+        .expect("saved")
+        .continuation_prompt
+        .expect("prompt");
+
+    for (label, value) in [
+        ("first", &first),
+        ("after_capture", &after_capture),
+        ("after_save", &after_save),
+    ] {
+        assert!(
+            value.len() <= MAX_PROMPT_BYTES,
+            "{label} prompt exceeds the stored cap: {} bytes",
+            value.len()
+        );
+        assert_eq!(
+            value.matches("[continuation prompt truncated").count(),
+            1,
+            "{label} prompt should carry exactly one truncation marker"
+        );
+    }
+    assert_eq!(first, after_capture, "capture must not change the prompt");
+    assert_eq!(first, after_save, "bare save must not change the prompt");
+}
+
+/// An over-cap payload imported from another host must be normalized to this
+/// host's cap, and a whitespace-only prompt must not make an empty payload a
+/// live handoff.
+#[test]
+fn import_normalizes_and_rejects_degenerate_prompts() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let cwd = env._home.path();
+    std::fs::create_dir_all(cwd).ok();
+
+    // Over-cap task (already marked, as a foreign host might send) is hard-cut.
+    let mut over = fixture("over", "git:https://example.com/e.git");
+    over.open_todos = Vec::new();
+    over.continuation_prompt = Some(format!(
+        "zzz[continuation prompt truncated to 4096 bytes]{}",
+        "y".repeat(8000)
+    ));
+    let payload = serde_json::to_string(&over).unwrap();
+    let adopted = import_handoff(&payload, Some(cwd), "closed").expect("over-cap import");
+    let stored = load_snapshot(&adopted).unwrap().continuation_prompt.unwrap();
+    assert!(
+        stored.len() <= MAX_PROMPT_BYTES,
+        "imported prompt must respect the cap, got {} bytes",
+        stored.len()
+    );
+
+    // Whitespace-only prompt + no work must be rejected, not adopted.
+    let mut blank = fixture("blank", "git:https://example.com/e.git");
+    blank.open_todos = Vec::new();
+    blank.continuation_prompt = Some("   ".to_string());
+    let payload = serde_json::to_string(&blank).unwrap();
+    assert!(
+        import_handoff(&payload, Some(cwd), "closed").is_none(),
+        "a whitespace-only prompt must not be adopted as a live handoff"
+    );
+}
+
+/// A snapshot written before `continuation_prompt` existed must still load and
+/// render: the field defaults to `None`.
+#[test]
+fn legacy_snapshot_without_prompt_field_loads_and_renders() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let dir = &env._home;
+    std::fs::create_dir_all(dir.path()).ok();
+    let session = "s-legacy";
+    let mut value = serde_json::to_value(fixture(session, "git:https://example.com/e.git")).unwrap();
+    value.as_object_mut().unwrap().remove("continuation_prompt");
+    let path = handoffs_dir().unwrap().join(format!("{session}.json"));
+    crate::storage::ensure_dir(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+    let loaded = load_snapshot(session).expect("legacy snapshot loads");
+    assert!(loaded.continuation_prompt.is_none());
+    let rendered = render_handoff(session).expect("renders");
+    assert!(
+        !rendered.contains("Continue with this task"),
+        "a legacy snapshot must not synthesize a task, got: {rendered}"
+    );
+}
+
 /// build_snapshot filters out completed/cancelled todos.
 #[test]
 fn open_filter_drops_completed_and_cancelled() {
@@ -194,6 +630,64 @@ async fn promote_to_initiative_creates_a_goal() {
             .expect("load")
             .is_some(),
         "promoted goal should be loadable"
+    );
+}
+
+/// A prompt-only handoff survives promotion: the task becomes the goal's first
+/// next step (a prompt-only handoff has no open todos, so without this the goal
+/// would carry no work).
+#[tokio::test]
+async fn promote_carries_the_continuation_prompt_into_the_goal() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let home = &env._home;
+    let cwd = home.path().join("project");
+    std::fs::create_dir_all(&cwd).ok();
+
+    save_now_with_prompt("s-promote-task", Some(&cwd), None, Some("review this branch"))
+        .expect("prompt-only save");
+
+    let goal_id = promote_to_initiative("s-promote-task", Some(&cwd))
+        .expect("promote should succeed")
+        .expect("promote should create a goal");
+    let goal = crate::goal::load_goal(
+        &goal_id,
+        Some(crate::goal::GoalScope::Project),
+        Some(&cwd),
+    )
+    .expect("load")
+    .expect("goal exists");
+    assert_eq!(
+        goal.title, "review this branch",
+        "the task should become the goal title when there is no plan intent"
+    );
+    assert!(
+        goal.next_steps.iter().any(|s| s.contains("review this branch")),
+        "the task should be carried into the goal's next steps, got: {:?}",
+        goal.next_steps
+    );
+}
+
+/// A very long continuation task must not break promotion: the goal id (slug of
+/// the title) becomes a filename, so it must stay within filesystem limits.
+#[tokio::test]
+async fn promote_bounds_a_long_continuation_task_title() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let home = &env._home;
+    let cwd = home.path().join("project");
+    std::fs::create_dir_all(&cwd).ok();
+
+    let long_task: String = std::iter::repeat_n("word ", 2000).collect();
+    save_now_with_prompt("s-promote-long", Some(&cwd), None, Some(&long_task))
+        .expect("prompt-only save");
+    let goal_id = promote_to_initiative("s-promote-long", Some(&cwd))
+        .expect("promotion must not fail on a long task")
+        .expect("goal created");
+    assert!(
+        goal_id.len() < 200,
+        "goal id must stay within filesystem limits, got {} bytes",
+        goal_id.len()
     );
 }
 
@@ -497,6 +991,7 @@ fn fixture(session: &str, project: &str) -> HandoffSnapshot {
         }],
         last_assistant_text: None,
         initiative_id: None,
+        continuation_prompt: None,
     }
 }
 
@@ -543,6 +1038,65 @@ fn concurrent_writers_preserve_every_project() {
             entry.project_key
         );
     }
+}
+
+/// Concurrent `save_now` calls for distinct sessions must not deadlock or lose
+/// index entries; each is serialized by the store lock.
+#[test]
+fn concurrent_save_now_writers_preserve_every_session() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let home = &env._home;
+    for n in 0..16 {
+        let cwd = home.path().join(format!("project-{n}"));
+        std::fs::create_dir_all(&cwd).ok();
+        crate::todo::save_todos(
+            &format!("s-save-{n}"),
+            &[TodoItem {
+                id: "t".into(),
+                content: format!("work {n}"),
+                status: "in_progress".into(),
+                priority: "high".into(),
+                group: None,
+                confidence: None,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        crate::todo::save_plan(
+            &format!("s-save-{n}"),
+            &crate::todo::TodoPlan {
+                user_intention: Some(format!("intent {n}")),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+    let barrier = std::sync::Barrier::new(16);
+    std::thread::scope(|scope| {
+        for n in 0..16 {
+            let barrier = &barrier;
+            let cwd = home.path().join(format!("project-{n}"));
+            scope.spawn(move || {
+                barrier.wait();
+                save_now(&format!("s-save-{n}"), Some(&cwd), None)
+                    .expect("save_now should succeed under contention");
+            });
+        }
+    });
+    let index = load_index();
+    assert_eq!(
+        index.latest.len(),
+        16,
+        "every concurrent save should be indexed exactly once"
+    );
+    for n in 0..16 {
+        let snap = load_snapshot(&format!("s-save-{n}")).expect("snapshot persisted");
+        assert_eq!(snap.disposition, "saved");
+        assert_eq!(snap.open_todos.len(), 1);
+    }
+    // No deadlock and no lingering temp/corrupt index.
+    assert!(load_index_opt().is_ok());
 }
 
 #[test]
@@ -1453,13 +2007,31 @@ fn import_rejects_empty_open_todos() {
 
     let mut empty = fixture("empty", "git:https://example.com/e.git");
     empty.open_todos = Vec::new();
+    empty.continuation_prompt = None;
     let payload = serde_json::to_string(&empty).unwrap();
 
     assert!(
         import_handoff(&payload, Some(cwd), "closed").is_none(),
-        "a payload with no open work must not be imported as a live handoff"
+        "a payload with no open work and no task must not be imported as a live handoff"
     );
     assert!(list_all_handoffs().is_empty(), "nothing adopted");
+
+    // A prompt-only handoff (no open todos, but an explicit continuation task)
+    // is meaningful and must be adoptable.
+    let mut task_only = fixture("task-only", "git:https://example.com/e.git");
+    task_only.open_todos = Vec::new();
+    task_only.continuation_prompt = Some("review this branch".to_string());
+    let payload = serde_json::to_string(&task_only).unwrap();
+    let adopted =
+        import_handoff(&payload, Some(cwd), "closed").expect("prompt-only handoff is importable");
+    assert_eq!(
+        load_snapshot(&adopted)
+            .expect("adopted snapshot")
+            .continuation_prompt
+            .as_deref(),
+        Some("review this branch"),
+        "import must preserve the continuation task"
+    );
 }
 
 /// Fix: repeatedly importing the same payload never overwrites an existing

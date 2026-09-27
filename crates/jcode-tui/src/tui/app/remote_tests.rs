@@ -2081,6 +2081,83 @@ fn apply_handoff_resume_sends_single_atomic_resume_request_and_reports_ready() {
     assert_eq!(ack.preview_line, "Resume this work");
 }
 
+/// `/handoffsave` sends exactly one `handoff_save` request and records the
+/// in-flight request so the server's actual outcome can be surfaced, without
+/// optimistically claiming success. A busy session is refused client-side.
+#[test]
+fn handoff_save_command_sends_one_request_and_records_pending() {
+    use tokio::io::AsyncBufReadExt;
+
+    let mut app = create_test_app();
+    app.is_processing = false;
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    let peer = remote.take_dummy_peer().unwrap();
+    let (reader, _writer) = peer.into_split();
+    let mut reader = tokio::io::BufReader::new(reader);
+    let id_before = remote.next_request_id_for_test();
+
+    rt.block_on(super::key_handling::handle_handoff_save_command(
+        &mut app,
+        &mut remote,
+        "/handoffsave review this branch",
+    ))
+    .expect("sending a save should succeed");
+
+    // Exactly one request was sent and it is `handoff_save`.
+    assert_eq!(
+        remote.next_request_id_for_test(),
+        id_before + 1,
+        "handoff_save should send exactly one request"
+    );
+    let mut line = String::new();
+    rt.block_on(async { reader.read_line(&mut line).await.unwrap() });
+    let parsed = serde_json::from_str::<crate::protocol::Request>(&line).unwrap();
+    assert!(
+        matches!(&parsed, crate::protocol::Request::HandoffSave { id, prompt } if *id == id_before && prompt.as_deref() == Some("review this branch")),
+        "expected a HandoffSave request, got: {line}"
+    );
+
+    // The client recorded the in-flight request and does NOT claim success yet.
+    assert!(
+        app.take_pending_remote_handoff_save(id_before).is_some(),
+        "a sent save must record the pending request for outcome resolution"
+    );
+    assert_eq!(
+        app.status_notice.as_ref().map(|(s, _)| s.as_str()),
+        Some("Saving handoff…")
+    );
+    assert!(
+        !app.display_messages()
+            .iter()
+            .any(|m| m.content.contains("Handoff saved")),
+        "the client must not claim the handoff was saved before the server confirms"
+    );
+
+    // A busy session is refused without sending anything.
+    app.is_processing = true;
+    let id_busy = remote.next_request_id_for_test();
+    rt.block_on(super::key_handling::handle_handoff_save_command(
+        &mut app,
+        &mut remote,
+        "/handoffsave",
+    ))
+    .expect("a busy save refusal is not an error");
+    assert_eq!(
+        remote.next_request_id_for_test(),
+        id_busy,
+        "a busy session must not send a handoff_save request"
+    );
+    assert!(
+        app.display_messages()
+            .iter()
+            .any(|m| m.content.contains("currently working")),
+        "a busy /handoffsave should explain why it was refused"
+    );
+}
+
 #[test]
 fn handoff_resumed_resolves_pending_ack_and_reports_ready() {
     let mut app = create_test_app();
@@ -2171,6 +2248,7 @@ fn handoff_listed_opens_picker_from_server_store_when_pending() {
         open_todos: Vec::new(),
         last_assistant_text: None,
         initiative_id: None,
+        continuation_prompt: None,
         payload: None,
     };
 
@@ -2235,6 +2313,7 @@ fn handoff_listed_is_ignored_without_a_matching_pending_request() {
                 open_todos: Vec::new(),
                 last_assistant_text: None,
                 initiative_id: None,
+                continuation_prompt: None,
                 payload: None,
             }],
         },

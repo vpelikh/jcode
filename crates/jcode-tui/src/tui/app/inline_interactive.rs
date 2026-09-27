@@ -2476,7 +2476,7 @@ impl App {
     pub(super) fn open_handoff_picker_with(&mut self, snapshots: Vec<HandoffSnapshot>) {
         if snapshots.is_empty() {
             self.push_display_message(DisplayMessage::system(
-                "No saved handoffs on the server. A handoff is captured when a session ends with unfinished work; once one exists, run /handoff to pick it.".to_string(),
+                "No saved handoffs on the server. A handoff is captured when a session ends with unfinished work, or on demand with /handoffsave (optionally with a continuation prompt); once one exists, run /handoff to pick it.".to_string(),
             ));
             return;
         }
@@ -2519,6 +2519,51 @@ impl App {
             .is_some_and(|pending| pending.request_id == request_id)
         {
             self.pending_remote_handoff_list.take()
+        } else {
+            None
+        }
+    }
+
+    /// Record an in-flight `handoff_save` request whose `HandoffSaved` reply
+    /// should surface the server's actual save outcome.
+    pub(super) fn set_pending_remote_handoff_save(&mut self, request_id: u64) {
+        self.pending_remote_handoff_save = Some(PendingRemoteHandoffSave { request_id });
+    }
+
+    /// Consume the pending remote handoff save if its request id matches the
+    /// reply that just arrived, so a stale/unrelated `HandoffSaved` is ignored.
+    pub(super) fn take_pending_remote_handoff_save(
+        &mut self,
+        request_id: u64,
+    ) -> Option<PendingRemoteHandoffSave> {
+        if self
+            .pending_remote_handoff_save
+            .as_ref()
+            .is_some_and(|pending| pending.request_id == request_id)
+        {
+            self.pending_remote_handoff_save.take()
+        } else {
+            None
+        }
+    }
+
+    /// Record an in-flight `handoff_task_clear` so its reply can be surfaced.
+    pub(super) fn set_pending_remote_handoff_task_clear(&mut self, request_id: u64) {
+        self.pending_remote_handoff_task_clear =
+            Some(PendingRemoteHandoffTaskClear { request_id });
+    }
+
+    /// Consume the pending task-clear if its request id matches the reply.
+    pub(super) fn take_pending_remote_handoff_task_clear(
+        &mut self,
+        request_id: u64,
+    ) -> Option<PendingRemoteHandoffTaskClear> {
+        if self
+            .pending_remote_handoff_task_clear
+            .as_ref()
+            .is_some_and(|pending| pending.request_id == request_id)
+        {
+            self.pending_remote_handoff_task_clear.take()
         } else {
             None
         }
