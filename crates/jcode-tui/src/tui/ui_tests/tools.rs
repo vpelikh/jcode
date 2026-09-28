@@ -1552,6 +1552,69 @@ fn test_tool_summary_compass_query_blank_query_is_empty() {
     assert!(summary.is_empty(), "summary={summary:?}");
 }
 
+/// A structural `compass_query` call names its operand via `query` (single-symbol
+/// modes) or `symbols` (explore): the summary must show it, falling back to a
+/// non-default mode name only with no operand.
+#[test]
+fn test_tool_summary_compass_query_structural_operand() {
+    let query_call = ToolCall {
+        id: "compass-op-1".to_string().into(),
+        name: "compass_query".to_string(),
+        input: serde_json::json!({ "mode": "callers", "query": "Registry::register" }),
+        intent: None,
+        thought_signature: None,
+    };
+    assert_eq!(tools_ui::get_tool_summary(&query_call), "'Registry::register'");
+
+    let symbols = ToolCall {
+        id: "compass-op-2".to_string().into(),
+        name: "compass_query".to_string(),
+        input: serde_json::json!({ "mode": "explore", "symbols": ["a::b", "c::d"] }),
+        intent: None,
+        thought_signature: None,
+    };
+    assert_eq!(tools_ui::get_tool_summary(&symbols), "'a::b'");
+
+    let mode_only = ToolCall {
+        id: "compass-op-3".to_string().into(),
+        name: "compass_query".to_string(),
+        input: serde_json::json!({ "mode": "discover", "query": "   " }),
+        intent: None,
+        thought_signature: None,
+    };
+    assert_eq!(tools_ui::get_tool_summary(&mode_only), "discover");
+}
+
+/// A blank leading `symbols` entry must be skipped (matching the tool, which
+/// filters blanks) so the summary shows the first real operand, not a blank row.
+#[test]
+fn test_tool_summary_compass_query_skips_blank_symbols_entry() {
+    let symbols = ToolCall {
+        id: "compass-op-4".to_string().into(),
+        name: "compass_query".to_string(),
+        input: serde_json::json!({ "mode": "explore", "symbols": ["", "  ", "real::sym"] }),
+        intent: None,
+        thought_signature: None,
+    };
+    assert_eq!(tools_ui::get_tool_summary(&symbols), "'real::sym'");
+}
+
+/// A `traverse` call must show both endpoints in the activity summary, not just
+/// the mode name.
+#[test]
+fn test_tool_summary_compass_query_traverse_shows_both_endpoints() {
+    let call = ToolCall {
+        id: "compass-op-5".to_string().into(),
+        name: "compass_query".to_string(),
+        input: serde_json::json!({
+            "mode": "traverse", "source": "crate::a", "target": "crate::b"
+        }),
+        intent: None,
+        thought_signature: None,
+    };
+    assert_eq!(tools_ui::get_tool_summary(&call), "'crate::a -> crate::b'");
+}
+
 /// A long `compass_query` respects the row width budget: the summary stays
 /// within `max_width` and preserves a meaningful focus token rather than being
 /// dropped entirely.

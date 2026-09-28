@@ -50,7 +50,10 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use compass_core::{build_graph_with_layers, BuildOptions, BuildPurpose};
 use compass_model::provenance::SourceAnchor;
-use compass_model::query_contract::{CodeQueryLimits, SearchRequest};
+use compass_model::query_contract::{
+    CallRequest, CodeQueryLimits, CodeQueryResponse, ExploreRequest, ImpactRequest,
+    NodeTrailRequest, SearchRequest,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -113,17 +116,143 @@ struct CompassCachePaths {
 
 #[derive(Debug, Deserialize)]
 struct CompassQueryInput {
-    /// The natural language or pattern query to run against the knowledge graph
-    query: String,
-    /// Optional path filter (file or directory substring)
+    /// The operand: the search text for `mode=search`, and the symbol for the
+    /// single-symbol structural modes (`callers`/`callees`/`impact`/`context`)
+    /// and `traverse`'s source. `explore` may pass a set via `symbols` instead.
+    #[serde(default)]
+    query: Option<String>,
+    /// Optional path filter: a file or directory prefix/segment (e.g. `src`,
+    /// `crates/foo/src/lib.rs`). Matched on whole path segments.
     #[serde(default)]
     path: Option<String>,
     /// Limit result count
     #[serde(default)]
     limit: Option<usize>,
-    /// Query intent (search, impact, discovery, callers, callees, traverse)
+    /// Query mode. `search` (default) is keyword/semantic symbol search;
+    /// `callers`/`callees`/`impact` resolve a symbol and return its call graph;
+    /// `explore` gathers a symbol's neighborhood and verified source; `traverse`
+    /// finds the evidence path between two symbols; `context` composes a
+    /// task-oriented packet (declaration + callers + callees + tests + impact +
+    /// source) for one target. Named `mode` (not `intent`) because `intent` is
+    /// the harness-wide, display-only "why" field every tool already carries.
     #[serde(default)]
-    intent: Option<String>,
+    mode: Option<String>,
+    /// A set of symbols for `mode=explore` only (overrides `query`). One call
+    /// gathers the neighborhood and connecting paths for the whole set, so a
+    /// session orients around several symbols without a call each. Blank entries
+    /// are ignored; other modes ignore `symbols` entirely (they use `query`).
+    #[serde(default)]
+    symbols: Option<Vec<String>>,
+    /// Explicit source symbol for `traverse` (overrides `query`).
+    #[serde(default)]
+    source: Option<String>,
+    /// Explicit target symbol for `traverse`.
+    #[serde(default)]
+    target: Option<String>,
+    /// Include heuristic (lower-confidence) structural evidence.
+    #[serde(default)]
+    include_heuristic: Option<bool>,
+}
+
+impl CompassQueryInput {
+    /// The scalar operand: `query` (the search text for `search`, the symbol for
+    /// the single-symbol structural modes). Empty when not supplied.
+    fn query_operand(&self) -> String {
+        self.query.clone().unwrap_or_default()
+    }
+
+    /// The first non-blank entry of `symbols`, if any. Only `explore` uses the
+    /// set; this feeds its operand-presence check.
+    fn first_symbol(&self) -> Option<String> {
+        self.symbols
+            .as_ref()
+            .and_then(|s| s.iter().find(|x| !x.trim().is_empty()))
+            .cloned()
+    }
+
+    /// Human-readable label naming what this call targeted, for the result title
+    /// and error message. Prefers the concrete operand(s) over a free-form query.
+    /// Bounded so neither a large `symbols` set nor a very long single operand can
+    /// balloon the title/header line.
+    fn display_target(&self, mode: QueryIntent) -> String {
+        // `explore` is the one mode that takes a set.
+        if mode == QueryIntent::Explore
+            && let Some(symbols) = self.symbols.as_ref()
+        {
+            let non_blank: Vec<String> = symbols
+                .iter()
+                .filter(|s| !s.trim().is_empty())
+                .cloned()
+                .collect();
+            if !non_blank.is_empty() {
+                return summarize_symbols(&non_blank);
+            }
+        }
+        let mut label = String::new();
+        for operand in [&self.source, &self.query] {
+            if let Some(value) = operand.as_ref().filter(|v| !v.trim().is_empty()) {
+                label = header_label(value);
+                break;
+            }
+        }
+        // `traverse` targets two symbols; name both so the header/title reads
+        // "from -> to" rather than naming only the source.
+        if let Some(target) = self.target.as_ref().filter(|t| !t.trim().is_empty()) {
+            let target = header_label(target);
+            if label.is_empty() {
+                label = target;
+            } else {
+                label = format!("{label} -> {target}");
+            }
+        }
+        header_label(&label)
+    }
+}
+
+/// Maximum characters of the operand label rendered in a report header or tool
+/// title. A wide `symbols` set is summarized rather than printed in full, so one
+/// call cannot flood the context with a thousands-of-characters title.
+const MAX_DISPLAY_TARGET_CHARS: usize = 120;
+
+/// Bound the report header label. Even a single operand can be long (a
+/// free-form `search` query may run to Compass's multi-kilobyte query cap), and
+/// the header is context the model pays for, so collapse and truncate it.
+fn header_label(query: &str) -> String {
+    let collapsed: String = query.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.len() <= MAX_DISPLAY_TARGET_CHARS {
+        return collapsed;
+    }
+    format!(
+        "{}…",
+        crate::util::truncate_str(&collapsed, MAX_DISPLAY_TARGET_CHARS)
+    )
+}
+
+/// Join a symbol set into a bounded label: as many entries as fit within
+/// [`MAX_DISPLAY_TARGET_CHARS`], then `… (+N more)` when some were omitted. A
+/// single oversized first entry is hard-truncated so the label stays bounded.
+fn summarize_symbols(symbols: &[String]) -> String {
+    // Always show at least the first entry, truncating it if it alone overflows.
+    let first = &symbols[0];
+    let first = if first.len() > MAX_DISPLAY_TARGET_CHARS {
+        format!("{}…", crate::util::truncate_str(first, MAX_DISPLAY_TARGET_CHARS))
+    } else {
+        first.clone()
+    };
+    let mut out = first;
+    let mut shown = 1usize;
+    for symbol in &symbols[1..] {
+        if out.len() + 2 + symbol.len() > MAX_DISPLAY_TARGET_CHARS {
+            break;
+        }
+        out.push_str(", ");
+        out.push_str(symbol);
+        shown += 1;
+    }
+    if shown < symbols.len() {
+        out.push_str(&format!(" … (+{} more)", symbols.len() - shown));
+    }
+    out
 }
 
 pub struct CompassQueryTool;
@@ -170,23 +299,42 @@ impl Tool for CompassQueryTool {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Natural language query or code pattern to search for."
+                    "description": "Search text (mode=search) or the symbol to resolve (callers/callees/impact/context, and traverse's source)."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": [
+                        "search", "callers", "callees", "impact", "explore",
+                        "discover", "traverse", "context"
+                    ],
+                    "description": "search; callgraph (callers/callees/impact); explore; discover; traverse; context. See Code search."
+                },
+                "symbols": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Symbol set for mode=explore only (overrides query)."
+                },
+                "source": {
+                    "type": "string",
+                    "description": "Source symbol for mode=traverse (overrides query)."
+                },
+                "target": {
+                    "type": "string",
+                    "description": "Target symbol for mode=traverse."
                 },
                 "path": {
                     "type": "string",
-                    "description": "Optional path filter (file or directory substring)."
+                    "description": "Path filter (file/dir segment, e.g. src). Not supported by mode=context."
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum results to return."
+                    "description": "Maximum results/nodes to return."
                 },
-                "intent": {
-                    "type": "string",
-                    "enum": ["search", "impact", "discovery", "callers", "callees", "traverse"],
-                    "description": "Advisory presentation hint shown in the UI: search, impact, discovery, callers, callees, or traverse."
+                "include_heuristic": {
+                    "type": "boolean",
+                    "description": "Include lower-confidence heuristic structural evidence. Ignored by mode=context."
                 }
-            },
-            "required": ["query"]
+            }
         })
     }
 
@@ -197,6 +345,10 @@ impl Tool for CompassQueryTool {
             .working_dir
             .clone()
             .ok_or_else(|| anyhow!("compass_query requires a working directory"))?;
+
+        // Resolve the mode up front so the pre-warm guidance and the query
+        // dispatch agree on whether this is a structural call.
+        let mode = QueryIntent::parse(params.mode.as_deref())?;
 
         // Resolve the Compass cache paths. All caches live under the jcode home
         // (`~/.jcode` or `$JCODE_HOME`), partitioned by repository/project id and
@@ -220,10 +372,7 @@ impl Tool for CompassQueryTool {
             && !wait_for_prewarm(&cache.graph_path, &cache.output_dir, PREWARM_JOIN_TIMEOUT)
                 .await
         {
-            let structural = !params
-                .intent
-                .as_deref()
-                .is_none_or(|i| matches!(i, "search"));
+            let structural = mode.is_structural();
             let guidance = if structural {
                 "This is a structural query, so `agentgrep` cannot fully \
                  substitute.\n\
@@ -271,30 +420,33 @@ impl Tool for CompassQueryTool {
         };
 
         let effective_limit = params.limit.unwrap_or(20).max(1);
+        let include_heuristic = params.include_heuristic.unwrap_or(false);
         let result = execute_query(
             &engine,
-            &params.query,
-            params.path.as_deref(),
+            mode,
+            &params,
             effective_limit,
-            params.intent.as_deref().unwrap_or("search"),
+            include_heuristic,
             &working_dir,
         );
 
         let reported_limit = effective_limit;
+        let label = params.display_target(mode);
         match result {
             Ok(output) => Ok(ToolOutput::new(output)
-                .with_title(format!("compass_query: {}", params.query))
+                .with_title(format!("compass_query: {label}"))
                 .with_metadata(json!({
                     "engine": "compass",
-                    "intent": params.intent.unwrap_or_else(|| "search".to_string()),
+                    "mode": mode.as_str(),
                     "limit": reported_limit,
                     "path_filter": params.path,
                 }))),
-            Err(e) => Ok(ToolOutput::new(format_query_error(
-                &e.to_string(),
-                &params.query,
-                &cache.output_dir,
-            ))),
+            Err(e) => Ok(ToolOutput::new(match e.downcast_ref::<InputError>() {
+                // A caller-input problem never reached the engine, so no cache
+                // advice applies.
+                Some(input) => input.to_string(),
+                None => format_query_error(&e.to_string(), &label, &cache.output_dir),
+            })),
         }
     }
 }
@@ -1285,61 +1437,794 @@ impl Drop for PrewarmMarkerGuard {
     }
 }
 
-/// Run a search through the Compass `CodeQueryEngine`. Returns a model-ready
-/// formatted report.
+/// The query intent selected by the caller.
+///
+/// Historically only `Search` was implemented; every other intent was a
+/// display-only hint passed to the renderer while the engine still ran a plain
+/// keyword search. This enum is now the real dispatch key: each structural
+/// intent maps to a distinct Compass query operation so one call returns the
+/// call graph / neighborhood / path the model actually asked for — which is
+/// exactly what lets a session answer structural questions from the index
+/// instead of reading many raw files.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueryIntent {
+    /// Keyword/semantic symbol search.
+    Search,
+    /// One-hop inbound calls of a symbol.
+    Callers,
+    /// One-hop outbound calls of a symbol.
+    Callees,
+    /// Bounded transitive impact radius of a symbol.
+    Impact,
+    /// Neighborhood (related symbols, connecting paths, verified source).
+    Explore,
+    /// Evidence path between two symbols.
+    Traverse,
+    /// Task-oriented evidence packet for one target.
+    Context,
+    /// Natural-language discovery: route the query to seeds and a bounded
+    /// structural neighborhood.
+    Discover,
+}
+
+impl QueryIntent {
+    fn parse(raw: Option<&str>) -> Result<Self> {
+        let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(Self::Search);
+        };
+        match raw.to_ascii_lowercase().as_str() {
+            "search" => Ok(Self::Search),
+            "callers" => Ok(Self::Callers),
+            "callees" => Ok(Self::Callees),
+            "impact" => Ok(Self::Impact),
+            "explore" => Ok(Self::Explore),
+            "discover" | "discovery" => Ok(Self::Discover),
+            "traverse" | "trail" | "path" | "node_trail" => Ok(Self::Traverse),
+            "context" | "task_context" => Ok(Self::Context),
+            other => Err(anyhow!(
+                "unknown compass_query mode {other:?}; expected one of \
+                 search, callers, callees, impact, explore, discover, \
+                 traverse, context"
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Search => "search",
+            Self::Callers => "callers",
+            Self::Callees => "callees",
+            Self::Impact => "impact",
+            Self::Explore => "explore",
+            Self::Traverse => "traverse",
+            Self::Context => "context",
+            Self::Discover => "discover",
+        }
+    }
+
+    /// Structural intents cannot be substituted by a raw grep, so their
+    /// pre-warm "still building" guidance points the model at retrying
+    /// `compass_query` rather than falling back to `agentgrep`.
+    fn is_structural(self) -> bool {
+        !matches!(self, Self::Search)
+    }
+}
+
+/// A single resolved node, flattened for rendering. Keeps the fields the report
+/// shows (identity, kind, roles, source anchor) out of Compass's richer
+/// `QueryNode` so rendering does not depend on the full contract type.
+struct NodeView {
+    id: String,
+    name: String,
+    qualified_name: String,
+    kind: String,
+    roles: Vec<String>,
+    file: Option<String>,
+    source: Option<SourceAnchor>,
+}
+
+/// A resolved edge between two nodes, flattened for rendering.
+struct EdgeView {
+    source: String,
+    target: String,
+    kind: String,
+}
+
+/// A node-to-node path, flattened to the node ids in traversal order.
+struct PathView {
+    node_ids: Vec<String>,
+    weakest_confidence: String,
+}
+
+/// Fully resolved, render-ready view of one Compass response. Both search and
+/// structural operations are normalized into this shape so a single renderer
+/// (and one source cache) serves every intent.
+struct ResponseView {
+    /// Search hits in ranked order (empty for structural operations).
+    hits: Vec<ResultRow>,
+    nodes: Vec<NodeView>,
+    edges: Vec<EdgeView>,
+    paths: Vec<PathView>,
+    /// Verified source files Compass already resolved from disk (explore/context).
+    files: Vec<FileView>,
+    truncated: bool,
+    diagnostics: Vec<String>,
+    /// True when a `path` filter removed results Compass did return, so an empty
+    /// report can say the filter excluded them rather than "no matches".
+    filtered_out: bool,
+    /// True when a `path` filter removed an edge Compass did return (both
+    /// endpoints present in the response but one outside the filter), so a
+    /// "no callers found" note is not shown when callers merely fell outside it.
+    filter_dropped_edges: bool,
+    /// The set of diagnostic codes Compass emitted. Used to phrase an empty
+    /// report correctly: an ambiguous operand needs qualifying, a reversed trail
+    /// needs the direction swapped, rather than "try a different symbol name".
+    diagnostic_codes: std::collections::BTreeSet<compass_model::query_contract::QueryDiagnosticCode>,
+}
+
+/// A digest-verified source file Compass resolved from disk.
+struct FileView {
+    path: String,
+    digest: String,
+    source: Option<String>,
+    truncated: bool,
+}
+
+/// Tracks source already emitted with a fenced body during one report render, so
+/// sibling `context` sections do not repeat it. Bodies are keyed by
+/// `(path, digest)` (a path could theoretically carry different content across
+/// sections); `paths` is the set of paths dumped at all, used to suppress a
+/// duplicate per-node declaration snippet for a file already shown in full.
+#[derive(Default)]
+struct RenderedFiles {
+    bodies: std::collections::HashSet<(String, String)>,
+    paths: std::collections::HashSet<String>,
+}
+
+impl RenderedFiles {
+    /// Number of distinct file bodies emitted so far.
+    fn len(&self) -> usize {
+        self.bodies.len()
+    }
+
+    /// Whether this exact `(path, digest)` body was already emitted.
+    fn contains_body(&self, path: &str, digest: &str) -> bool {
+        self.bodies.contains(&(path.to_string(), digest.to_string()))
+    }
+
+    /// Whether a body for this path (any digest) was already emitted.
+    fn contains_path(&self, path: &str) -> bool {
+        self.paths.contains(path)
+    }
+
+    /// Record an emitted body; returns false if it was already present.
+    fn insert(&mut self, path: &str, digest: &str) -> bool {
+        self.paths.insert(path.to_string());
+        self.bodies.insert((path.to_string(), digest.to_string()))
+    }
+}
+
+impl ResponseView {
+    fn node(&self, id: &str) -> Option<&NodeView> {
+        self.nodes.iter().find(|n| n.id == id)
+    }
+
+    /// Short display label for a node id: qualified name when known, else id.
+    fn label(&self, id: &str) -> String {
+        self.node(id)
+            .map(|n| n.qualified_name.clone())
+            .unwrap_or_else(|| id.to_string())
+    }
+}
+
+/// Marker for a caller-input error (a bad or absent operand, an unknown mode), as
+/// opposed to an engine/query failure. The tool distinguishes the two so it never
+/// tells the model to "clear the cache to force a rebuild" for a missing operand
+/// (the index is fine). Carried inside `anyhow::Error` and recovered by
+/// `downcast_ref`, so the helper signatures stay `anyhow`.
+#[derive(Debug)]
+struct InputError(String);
+
+impl std::fmt::Display for InputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InputError {}
+
+/// Build an input-error `anyhow::Error` (see [`InputError`]).
+fn input_error(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(InputError(message.into()))
+}
+
+/// Classify a Compass `QueryError` for the caller. An `InvalidParameter` kind is
+/// a caller-input problem (an unknown scope, an ambiguous symbol, a limit out of
+/// range), not a broken index, so it must be reported plainly rather than with
+/// "clear the cache to force a rebuild". Every other kind (corrupt artifact,
+/// graph invariant, internal, memory limit) is a genuine engine/index failure and
+/// keeps the rebuild guidance.
+fn map_engine_error(e: compass_query::QueryError) -> anyhow::Error {
+    use compass_query::QueryErrorKind;
+    if e.kind() == QueryErrorKind::InvalidParameter {
+        input_error(format!("compass_query rejected the request: {}", e.message()))
+    } else {
+        anyhow!("{}", e)
+    }
+}
+
+/// Classify a `build_task_context` failure like [`map_engine_error`]: an invalid
+/// request (bad target/limits) or an `InvalidParameter` from an inner query is a
+/// caller-input problem; the rest (schema, result, encoding) stay engine errors.
+fn map_task_context_error(e: compass_core::TaskContextError) -> anyhow::Error {
+    use compass_core::TaskContextError;
+    match e {
+        TaskContextError::InvalidRequest(message) => {
+            input_error(format!("compass_query rejected the request: {message}"))
+        }
+        TaskContextError::Query(err) => map_engine_error(err),
+        other => anyhow!("{other}"),
+    }
+}
+
+/// Run a query through the Compass `CodeQueryEngine`, dispatching on `mode`.
+/// Returns a model-ready formatted report.
 fn execute_query(
     engine: &compass_query::CodeQueryEngine,
-    query: &str,
-    path_filter: Option<&str>,
+    intent: QueryIntent,
+    params: &CompassQueryInput,
     limit: usize,
-    intent: &str,
+    include_heuristic: bool,
     working_dir: &Path,
 ) -> Result<String, anyhow::Error> {
+    let limits = CodeQueryLimits {
+        // Clamp instead of casting: a pathological usize > u32::MAX must not
+        // silently wrap to 0 and violate CodeQueryLimits::is_valid().
+        max_nodes: limit.clamp(1, u32::MAX as usize) as u32,
+        ..Default::default()
+    };
+
+    // The scalar operand for `search` and the single-symbol structural modes is
+    // `query` (or `source` for `traverse`'s from-end); `symbols` is the set for
+    // `explore` only. `target` names `traverse`'s to-end.
+    let query = params.query_operand();
+    let source = params
+        .source
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| query.clone());
+    let target = params.target.clone().unwrap_or_default();
+
+    // Reject an operand-less call with a clear message rather than silently
+    // searching for the empty string. `discover` uses its own non-empty check;
+    // `traverse` names its source/target explicitly below.
+    if intent != QueryIntent::Discover && intent != QueryIntent::Traverse {
+        let operand = match intent {
+            // `explore` takes a set; any one entry satisfies the check.
+            QueryIntent::Explore => params
+                .first_symbol()
+                .unwrap_or_else(|| query.clone()),
+            _ => query.clone(),
+        };
+        if operand.trim().is_empty() {
+            return Err(input_error(format!(
+                "compass_query mode={} requires an operand (set `query`{})",
+                intent.as_str(),
+                if intent == QueryIntent::Explore {
+                    " or `symbols`"
+                } else {
+                    ""
+                }
+            )));
+        }
+    }
+
+    // `explore` accepts a set: `symbols` wins (non-blank entries), else the
+    // scalar `query`. Computed here (not in the match arm) because the
+    // truncation note after rendering needs the requested/queried counts.
+    let mut explore_symbols: Vec<String> = match params.symbols.clone() {
+        Some(symbols) if symbols.iter().any(|s| !s.trim().is_empty()) => symbols
+            .into_iter()
+            .filter(|s| !s.trim().is_empty())
+            .collect(),
+        _ => vec![query.clone()],
+    };
+    if explore_symbols.is_empty() {
+        explore_symbols.push(query.clone());
+    }
+    let (explore_total, explore_queried) = clamp_explore_symbols(&mut explore_symbols);
+    let explore_limits = CodeQueryLimits {
+        max_candidates: limits
+            .max_candidates
+            .max(explore_queried as u32)
+            .min(COMPASS_MAX_CANDIDATES as u32),
+        max_source_bytes: MAX_VERIFIED_SOURCE_BYTES,
+        ..limits
+    };
+
+    // `traverse` diagnostic messages name their endpoints by raw node id; keep the
+    // operands and limits so we can resolve them to names after the call (the
+    // failed-trail path adds no nodes to the response to label from).
+    let traverse_relabel = (intent == QueryIntent::Traverse)
+        .then(|| (source.clone(), target.clone(), limits.clone()));
+
+    let response = match intent {
+        QueryIntent::Search => engine.search(SearchRequest {
+            query: query.clone(),
+            limits,
+        }),
+        QueryIntent::Callers => engine.callers(CallRequest {
+            symbol: query.clone(),
+            include_heuristic,
+            limits,
+        }),
+        QueryIntent::Callees => engine.callees(CallRequest {
+            symbol: query.clone(),
+            include_heuristic,
+            limits,
+        }),
+        QueryIntent::Impact => engine.impact(ImpactRequest {
+            symbol: query.clone(),
+            include_heuristic,
+            limits,
+        }),
+        QueryIntent::Explore => engine.explore(ExploreRequest {
+            symbols: explore_symbols,
+            root: working_dir.to_string_lossy().into_owned(),
+            include_heuristic,
+            limits: explore_limits,
+        }),
+        QueryIntent::Traverse => {
+            if source.trim().is_empty() {
+                return Err(input_error(
+                    "compass_query mode=traverse requires a `source` symbol \
+                     (set `source` or `query`)",
+                ));
+            }
+            if target.trim().is_empty() {
+                return Err(input_error(
+                    "compass_query mode=traverse requires a `target` symbol \
+                     (set `target`)",
+                ));
+            }
+            engine.node_trail(NodeTrailRequest {
+                source,
+                target,
+                include_heuristic,
+                limits,
+            })
+        }
+        QueryIntent::Context => {
+            // `build_task_context` composes its own report and offers no path
+            // scope, so a `path` filter would be silently ignored. Reject it
+            // rather than return an unscoped packet the caller thinks is scoped.
+            if params
+                .path
+                .as_deref()
+                .is_some_and(|p| !p.trim().is_empty())
+            {
+                return Err(input_error(
+                    "compass_query mode=context does not support a `path` filter; \
+                     scope the target by qualified name instead",
+                ));
+            }
+            return execute_task_context(engine, &query, limits, working_dir);
+        }
+        QueryIntent::Discover => {
+            return execute_discover(
+                engine,
+                &query,
+                params.path.as_deref(),
+                include_heuristic,
+                limit,
+                working_dir,
+            );
+        }
+    }
+    .map_err(map_engine_error)?;
+
+    let mut view = ResponseView::from(response, params.path.as_deref());
+    // Compass diagnostics can interpolate raw `sha256:` node ids (a failed
+    // `traverse` names its endpoints in the message). Prefer names wherever we
+    // can resolve the id: the response's own nodes first, then a companion search
+    // of the operands the caller supplied (the failed-trail case adds no nodes).
+    // `discover` handles its own diagnostics and returns before this point.
+    if !view.diagnostics.is_empty() {
+        let mut labels: HashMap<String, String> = view
+            .nodes
+            .iter()
+            .map(|n| (n.id.clone(), n.qualified_name.clone()))
+            .collect();
+        if let Some((source, target, limits)) = traverse_relabel {
+            for operand in [&source, &target] {
+                for (id, node) in resolve_candidate_labels(engine, operand, limits.clone()) {
+                    labels.entry(id).or_insert(node.qualified_name);
+                }
+            }
+        }
+        for diag in &mut view.diagnostics {
+            *diag = relabel_ids(diag, &labels);
+        }
+    }
+    // The header names the operand(s) the caller asked about. For `explore` that
+    // is the full `symbols` set (summarized); for other modes it is the scalar
+    // operand, falling back to `query` when only a free-form query was given.
+    let header_target = {
+        let target = params.display_target(intent);
+        if target.is_empty() {
+            query.clone()
+        } else {
+            target
+        }
+    };
+    let mut rendered = format_view(
+        &header_target,
+        intent,
+        limit,
+        params.path.as_deref(),
+        &view,
+        working_dir,
+    );
+    // Be explicit when an oversized explore set was trimmed to Compass's cap, so
+    // the model knows not every requested symbol was queried.
+    if intent == QueryIntent::Explore && explore_total > explore_queried {
+        rendered.push_str(&format!(
+            "\n**Note:** explore received {explore_total} symbols; only the first \
+             {explore_queried} were queried (Compass cap).\n"
+        ));
+    }
+    Ok(rendered)
+}
+
+/// Map candidate node ids (from a `context` ambiguous/not-found target) to human
+/// labels. Compass's task-context target carries only `SearchHit`s (node id,
+/// score), so we run a companion `search` for the same target and reuse the
+/// resolved nodes' qualified name, kind, roles, and file. Returns an empty map
+/// if the companion search fails, in which case the caller falls back to raw ids.
+fn resolve_candidate_labels(
+    engine: &compass_query::CodeQueryEngine,
+    target: &str,
+    limits: CodeQueryLimits,
+) -> HashMap<String, NodeView> {
     let request = SearchRequest {
-        query: query.to_string(),
-        limits: CodeQueryLimits {
-            // Clamp instead of casting: a pathological usize > u32::MAX must not
-            // silently wrap to 0 and violate CodeQueryLimits::is_valid().
-            max_nodes: limit.clamp(1, u32::MAX as usize) as u32,
+        query: target.to_string(),
+        limits,
+    };
+    match engine.search(request) {
+        Ok(response) => response
+            .nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.id.clone(),
+                    NodeView {
+                        id: node.id.clone(),
+                        name: node.name.clone(),
+                        qualified_name: node.qualified_name.clone(),
+                        kind: node.kind.as_str().to_string(),
+                        roles: node.roles.iter().map(|r| role_name(*r)).collect(),
+                        file: node.source.as_ref().map(|s| s.file.clone()),
+                        source: node.source.clone(),
+                    },
+                )
+            })
+            .collect(),
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// Replace every known node id inside `text` with its qualified name. Compass
+/// diagnostics interpolate raw ids (e.g. a failed `traverse` names its endpoints
+/// as `sha256:...`); substituting readable names keeps the diagnostic useful.
+/// Ids are matched whole and longest-first so a shorter id cannot corrupt a
+/// longer one that contains it as a prefix (ids are fixed-length hashes, but the
+/// ordering makes the intent explicit and safe for any scheme).
+fn relabel_ids(text: &str, labels: &HashMap<String, String>) -> String {
+    if labels.is_empty() {
+        return text.to_string();
+    }
+    let mut ids: Vec<&String> = labels.keys().collect();
+    ids.sort_by(|a, b| b.len().cmp(&a.len()));
+    let mut out = text.to_string();
+    for id in ids {
+        if out.contains(id.as_str()) {
+            out = out.replace(id.as_str(), &labels[id]);
+        }
+    }
+    out
+}
+
+/// Render a resolved node as a one-line label: `` `qualified_name` (kind, file)
+/// [roles] `` (falling back to the plain `name` when the qualified name is
+/// empty). The file and roles are omitted when absent. Used for `context`
+/// headers and candidate lists so neither leaks a raw `sha256:` node id.
+fn format_node_label(view: &NodeView) -> String {
+    let roles = if view.roles.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", view.roles.join(", "))
+    };
+    // Prefer the qualified name; fall back to the plain name when it is empty
+    // (matching the search-hit render path) so a label is never blank.
+    let display = if view.qualified_name.is_empty() {
+        &view.name
+    } else {
+        &view.qualified_name
+    };
+    match &view.file {
+        Some(file) => format!("`{display}` ({}, {}){roles}", view.kind, file),
+        None => format!("`{display}` ({}){roles}", view.kind),
+    }
+}
+
+/// Compose a task-oriented context packet with Compass's `build_task_context`.
+/// One call surfaces the declaration + verified source, exact callers/callees,
+/// related tests, and bounded transitive impact for a target, replacing the
+/// several file reads an agent would otherwise do to orient around a symbol.
+fn execute_task_context(
+    engine: &compass_query::CodeQueryEngine,
+    target: &str,
+    limits: CodeQueryLimits,
+    working_dir: &Path,
+) -> Result<String, anyhow::Error> {
+    use compass_core::{
+        build_task_context, TaskContextIntent, TaskContextLimits, TaskContextRequest,
+        TaskContextSectionKind, TaskContextTarget,
+    };
+
+    if target.trim().is_empty() {
+        return Err(input_error("compass_query mode=context requires a target symbol"));
+    }
+
+    let request = TaskContextRequest {
+        intent: TaskContextIntent::Explain,
+        target: target.to_string(),
+        repository_root: working_dir.to_string_lossy().into_owned(),
+        limits: TaskContextLimits {
+            query: CodeQueryLimits {
+                // `context` already fans out into several sub-queries; keep each
+                // bounded but allow the full neighborhood rather than truncating.
+                max_source_bytes: MAX_VERIFIED_SOURCE_BYTES,
+                ..limits
+            },
             ..Default::default()
         },
     };
 
-    let response = engine.search(request).map_err(|e| anyhow!("{}", e))?;
+    let context = build_task_context(engine, &request, &[]).map_err(map_task_context_error)?;
 
-    // Resolve each row's node + source file, then apply the optional path filter.
-    // We keep the node's source anchor so we can render a code snippet for each
-    // result (see `format_query`), read from disk so the model sees the
-    // declaration, not just a bare ranked name list. Showing real source is what
-    // makes compass a genuine substitute for grep on symbol/declaration lookups
-    // (and is why the escape hatch has historically been over-used).
-    let mut rows: Vec<ResultRow> = Vec::new();
-    for hit in &response.results {
-        let node = response.nodes.iter().find(|n| n.id == hit.node_id);
-        let Some(node) = node else {
-            continue;
-        };
-        let name = node.qualified_name.clone();
-        let file = node.source.as_ref().map(|s| s.file.clone());
-        // Apply path filter (substring match on the resolved file path).
-        if let (Some(filter), Some(path)) = (path_filter, &file)
-            && !path.contains(filter)
-        {
-            continue;
+    let mut out = String::new();
+    out.push_str(&format!("# Compass context: {}\n\n", header_label(target)));
+    out.push_str(&format!("**Target:** {}\n", header_label(target)));
+    match &context.target {
+        TaskContextTarget::Exact { node_id } => {
+            // Compass reports the raw node id; resolve it to a name/kind/file via
+            // a companion search so the header is readable (the sections below
+            // already name the declaration, but this line need not leak a hash).
+            let labels = resolve_candidate_labels(engine, target, limits);
+            match labels.get(node_id) {
+                Some(view) => {
+                    out.push_str(&format!("**Resolved node:** {}\n", format_node_label(view)));
+                }
+                None => out.push_str(&format!("**Resolved node:** {node_id}\n")),
+            }
         }
-        rows.push(ResultRow {
-            name,
-            file,
-            score: hit.score,
-            matched: hit.matched_fields.clone(),
-            // Capture the source anchor so `format_query` can resolve the node's
-            // source file (via `SourceCache`) and render a snippet from disk.
-            source: node.source.clone(),
-            kind: node.kind.as_str().to_string(),
-        });
+        TaskContextTarget::Ambiguous { candidates } | TaskContextTarget::NotFound { candidates } => {
+            // Compass returns candidate *ids* here, not names, so resolve them
+            // through a companion search for the same target. Raw `sha256:` ids
+            // are useless to the model; names/kinds/files let it pick the right
+            // symbol (and are what "refine with a qualified name" needs).
+            let labels = resolve_candidate_labels(engine, target, limits);
+            if matches!(context.target, TaskContextTarget::Ambiguous { .. }) {
+                out.push_str(&format!(
+                    "**Ambiguous target:** {} candidate(s); refine with a qualified \
+                     name or file:\n",
+                    candidates.len()
+                ));
+            } else if candidates.is_empty() {
+                out.push_str("**No exact match.** No similarly named symbols were found.\n");
+            } else {
+                out.push_str("**No exact match.** Closest candidates:\n");
+            }
+            for candidate in candidates.iter().take(MAX_CANDIDATE_ROWS) {
+                match labels.get(&candidate.node_id) {
+                    Some(candidate_view) => {
+                        out.push_str(&format!("- {}\n", format_node_label(candidate_view)));
+                    }
+                    // Fall back to the raw id only when the companion search did
+                    // not surface this candidate.
+                    None => out.push_str(&format!("- {}\n", candidate.node_id)),
+                }
+            }
+            out.push('\n');
+            return Ok(out);
+        }
     }
 
-    Ok(format_query(query, intent, limit, path_filter, &rows, working_dir))
+    // One shared set (and one shared file reader) across every section so a file
+    // that appears in several sections is read from disk and dumped only once.
+    let mut rendered_files = RenderedFiles::default();
+    let mut cache = SourceCache::default();
+    for section in &context.sections {
+        let title = match section.kind {
+            TaskContextSectionKind::DeclarationSource => "Declaration + source",
+            TaskContextSectionKind::ExactCallers => "Exact callers",
+            TaskContextSectionKind::ExactCallees => "Exact callees",
+            TaskContextSectionKind::ImplementationType => "Implementation / type",
+            TaskContextSectionKind::RelatedTests => "Related tests",
+            TaskContextSectionKind::TransitiveImpact => "Transitive impact",
+            TaskContextSectionKind::Framework => "Framework",
+        };
+        out.push_str(&format!("\n## {title}\n\n"));
+        let view = ResponseView::from(section.evidence.clone(), None);
+        render_view_body_inner(
+            &mut out,
+            &view,
+            working_dir,
+            MAX_SNIPPET_ROWS,
+            false,
+            &mut rendered_files,
+            &mut cache,
+        );
+    }
+
+    if !context.omissions.is_empty() {
+        out.push_str("\n**Omissions:**\n");
+        for omission in context.omissions.iter().take(MAX_CANDIDATE_ROWS) {
+            out.push_str(&format!("- {}: {}\n", omission.category, omission.reason));
+        }
+    }
+    Ok(out)
+}
+
+/// Route a natural-language question through Compass discovery (`CodeQueryEngine
+/// ::discover`). Discovery selects the most likely seed symbols for the question
+/// and returns a bounded structural neighborhood around them, so a session can
+/// start from a prose question ("how does auth reach the DB") instead of first
+/// guessing symbol names. Each seed is rendered with its source, then the
+/// neighborhood edges are listed.
+fn execute_discover(
+    engine: &compass_query::CodeQueryEngine,
+    question: &str,
+    path_filter: Option<&str>,
+    include_heuristic: bool,
+    limit: usize,
+    working_dir: &Path,
+) -> Result<String, anyhow::Error> {
+    use compass_model::query_contract::{
+        DiscoveryLimits, DiscoveryQueryRequest, DiscoveryScope, DiscoveryScopeKind,
+        MAX_DISCOVERY_SEEDS,
+    };
+
+    if question.trim().is_empty() {
+        return Err(input_error("compass_query mode=discover requires a non-empty query"));
+    }
+
+    // A `path` filter becomes a `Source` discovery scope, so a question can be
+    // constrained to a file or directory (e.g. only search within one crate).
+    let scope = match path_filter {
+        Some(path) if !path.trim().is_empty() => vec![DiscoveryScope {
+            kind: DiscoveryScopeKind::Source,
+            value: path.trim().to_string(),
+        }],
+        _ => Vec::new(),
+    };
+
+    let response = engine
+        .discover(DiscoveryQueryRequest {
+            question: question.to_string(),
+            direction: Default::default(),
+            relation_contexts: Vec::new(),
+            scope,
+            traversal: Default::default(),
+            include_heuristic,
+            limits: DiscoveryLimits {
+                // Compass caps discovery seeds; clamp within the valid range.
+                max_seeds: (limit.clamp(1, u32::MAX as usize) as u32).min(MAX_DISCOVERY_SEEDS),
+                ..Default::default()
+            },
+        })
+        .map_err(map_engine_error)?;
+
+    let mut out = String::new();
+    out.push_str(&format!("# Compass discover: {}\n\n", header_label(question)));
+    out.push_str("**Mode:** discover\n");
+    out.push_str(&format!("**Limit:** {limit}\n"));
+    if let Some(path) = path_filter.filter(|p| !p.trim().is_empty()) {
+        out.push_str(&format!("**Path filter:** {path}\n"));
+    }
+    out.push('\n');
+
+    // Discovery returns node records (id -> qualified name) for the seeds and
+    // their neighborhood; resolve ids to labels so the report names symbols
+    // rather than opaque digests. Fall back to the raw id when a node is absent.
+    // Shared with diagnostic relabeling below.
+    let labels: HashMap<String, String> = response
+        .nodes
+        .iter()
+        .map(|n| (n.id.clone(), n.qualified_name.clone()))
+        .collect();
+    let label = |id: &str| -> String {
+        labels
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| id.to_string())
+    };
+
+    // Compass caps discovery at MAX_DISCOVERY_SEEDS seeds regardless of the
+    // request, so note when the caller asked for more than it can return.
+    if limit > MAX_DISCOVERY_SEEDS as usize {
+        out.push_str(&format!(
+            "**Note:** discovery returns at most {MAX_DISCOVERY_SEEDS} seeds \
+             (Compass cap); requested limit was {limit}.\n\n"
+        ));
+    }
+
+    if response.seeds.is_empty() {
+        out.push_str("No seeds matched. Try more specific terms or `mode=search`.\n\n");
+    } else {
+        out.push_str(&format!("**Seeds ({}):**\n", response.seeds.len()));
+        let mut cache = SourceCache::default();
+        for seed in response.seeds.iter().take(MAX_CANDIDATE_ROWS) {
+            let file = seed.source.as_ref().map(|s| s.file.clone());
+            match &file {
+                Some(file) => out.push_str(&format!(
+                    "- {} (score {}, {file})\n",
+                    label(&seed.node_id),
+                    seed.score
+                )),
+                None => out.push_str(&format!(
+                    "- {} (score {})\n",
+                    label(&seed.node_id),
+                    seed.score
+                )),
+            }
+            for alt in seed.alternatives.iter().take(3) {
+                out.push_str(&format!("  - alt: {}\n", alt.qualified_name));
+            }
+            if let Some(anchor) = &seed.source
+                && let Some(text) = cache.snippet(working_dir, anchor)
+            {
+                out.push_str("\n```\n");
+                out.push_str(&text);
+                out.push_str("```\n");
+            }
+        }
+        out.push('\n');
+    }
+
+    if !response.edges.is_empty() {
+        out.push_str(&format!("**Neighborhood ({}):**\n", response.edges.len()));
+        for edge in response.edges.iter().take(MAX_EDGE_ROWS) {
+            out.push_str(&format!(
+                "- {} --{}--> {}\n",
+                label(&edge.source),
+                edge.kind.as_str(),
+                label(&edge.target)
+            ));
+        }
+        if response.edges.len() > MAX_EDGE_ROWS {
+            out.push_str(&format!(
+                "- … {} more edge(s) omitted\n",
+                response.edges.len() - MAX_EDGE_ROWS
+            ));
+        }
+        out.push('\n');
+    }
+
+    if response.truncated {
+        out.push_str("**Note:** discovery results were truncated by Compass bounds.\n\n");
+    }
+    if !response.diagnostics.is_empty() {
+        out.push_str("**Diagnostics:**\n");
+        // Compass discovery diagnostics can interpolate raw `sha256:` seed ids
+        // (e.g. "Seed <id> is ambiguous"); relabel with the seed names resolved
+        // above, matching the structural report.
+        for diag in response.diagnostics.iter().take(MAX_CANDIDATE_ROWS) {
+            out.push_str(&format!("- {}\n", relabel_ids(&diag.message, &labels)));
+        }
+    }
+    Ok(out)
 }
 
 /// Maximum number of results that get a full fenced source snippet. Beyond
@@ -1349,8 +2234,17 @@ fn execute_query(
 /// however; the cap bounds the *context*, not the result count.
 const MAX_SNIPPET_ROWS: usize = 8;
 
+/// Cap on ambiguous/omission lists so a single report section cannot grow
+/// without bound.
+const MAX_CANDIDATE_ROWS: usize = 12;
+
+/// Bound on Compass's own digest-verified source resolution for explore/context,
+/// so a large neighborhood cannot pull unbounded file bytes into one report.
+const MAX_VERIFIED_SOURCE_BYTES: u64 = 512 * 1024;
+
 /// One ranked search result, plus the source anchor and kind needed to render a
 /// code snippet alongside it.
+#[derive(Clone)]
 struct ResultRow {
     name: String,
     file: Option<String>,
@@ -1360,59 +2254,493 @@ struct ResultRow {
     kind: String,
 }
 
-/// Render the model-ready report for a query. Includes a compact source snippet
-/// for the top [`MAX_SNIPPET_ROWS`] results, read from disk relative to the
-/// session working directory, so a code or declaration lookup surfaces the
-/// actual code without a separate `read`/`agentgrep` step. Source reads are
-/// best-effort: a missing or unreadable file simply renders no snippet rather
-/// than failing the query.
-fn format_query(
+impl ResponseView {
+    /// Normalize a Compass `CodeQueryResponse` into the render-ready view,
+    /// applying the optional path filter to search hits and to structural nodes.
+    fn from(response: CodeQueryResponse, path_filter: Option<&str>) -> Self {
+        let node_view = |node: &compass_model::query_contract::QueryNode| NodeView {
+            id: node.id.clone(),
+            name: node.name.clone(),
+            qualified_name: node.qualified_name.clone(),
+            kind: node.kind.as_str().to_string(),
+            roles: node.roles.iter().map(|r| role_name(*r)).collect(),
+            file: node.source.as_ref().map(|s| s.file.clone()),
+            source: node.source.clone(),
+        };
+
+        let kept_ids: std::collections::HashSet<&str> = match path_filter {
+            Some(filter) => response
+                .nodes
+                .iter()
+                .filter(|n| {
+                    n.source
+                        .as_ref()
+                        .map(|s| path_matches_filter(filter, &s.file))
+                        .unwrap_or(false)
+                })
+                .map(|n| n.id.as_str())
+                .collect(),
+            None => response.nodes.iter().map(|n| n.id.as_str()).collect(),
+        };
+
+        let mut hits: Vec<ResultRow> = Vec::new();
+        for hit in &response.results {
+            if !kept_ids.contains(hit.node_id.as_str()) {
+                continue;
+            }
+            let Some(node) = response.nodes.iter().find(|n| n.id == hit.node_id) else {
+                continue;
+            };
+            hits.push(ResultRow {
+                name: node.qualified_name.clone(),
+                file: node.source.as_ref().map(|s| s.file.clone()),
+                score: hit.score,
+                matched: hit.matched_fields.clone(),
+                source: node.source.clone(),
+                kind: node.kind.as_str().to_string(),
+            });
+        }
+
+        let nodes: Vec<NodeView> = response
+            .nodes
+            .iter()
+            .filter(|n| kept_ids.contains(n.id.as_str()))
+            .map(node_view)
+            .collect();
+
+        let edges: Vec<EdgeView> = response
+            .edges
+            .iter()
+            .filter(|e| kept_ids.contains(e.source.as_str()) && kept_ids.contains(e.target.as_str()))
+            .map(|e| EdgeView {
+                source: e.source.clone(),
+                target: e.target.clone(),
+                kind: e.kind.as_str().to_string(),
+            })
+            .collect();
+
+        // An edge whose endpoint is a node Compass returned but the filter
+        // excluded: the relationship exists, just outside the filtered view.
+        let filter_dropped_edges = path_filter.is_some() && {
+            let returned_ids: std::collections::HashSet<&str> =
+                response.nodes.iter().map(|n| n.id.as_str()).collect();
+            response.edges.iter().any(|e| {
+                !(kept_ids.contains(e.source.as_str()) && kept_ids.contains(e.target.as_str()))
+                    && (returned_ids.contains(e.source.as_str())
+                        || returned_ids.contains(e.target.as_str()))
+            })
+        };
+
+        let paths: Vec<PathView> = response
+            .paths
+            .iter()
+            .filter(|p| {
+                // Keep a path only when the filter kept all of its nodes, so a
+                // filtered report never shows a chain with dropped/hidden nodes
+                // (which would fall back to raw ids).
+                p.node_ids
+                    .iter()
+                    .all(|id| kept_ids.contains(id.as_str()))
+            })
+            .map(|p| PathView {
+                node_ids: p.node_ids.clone(),
+                weakest_confidence: p.weakest_confidence.as_str().to_string(),
+            })
+            .collect();
+
+        let files: Vec<FileView> = response
+            .files
+            .iter()
+            .filter(|f| {
+                path_filter
+                    .map(|filter| path_matches_filter(filter, &f.path))
+                    .unwrap_or(true)
+            })
+            .map(|f| FileView {
+                path: f.path.clone(),
+                digest: f.content_digest.clone(),
+                source: f.source.clone(),
+                truncated: f.truncated,
+            })
+            .collect();
+
+        let diagnostics = response
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect();
+
+        let diagnostic_codes: std::collections::BTreeSet<_> =
+            response.diagnostics.iter().map(|d| d.code).collect();
+
+        // A path filter that removed nodes/results/source Compass did return makes
+        // an empty report a different situation from "nothing was found at all".
+        let filter_present = path_filter.is_some();
+        let filter_dropped_nodes = !response.nodes.is_empty() && kept_ids.is_empty();
+        let filter_dropped_hits = !response.results.is_empty() && hits.is_empty();
+        let filter_dropped_files = !response.files.is_empty() && files.is_empty();
+        let filtered_out = filter_present
+            && (filter_dropped_nodes || filter_dropped_hits || filter_dropped_files);
+
+        Self {
+            hits,
+            nodes,
+            edges,
+            paths,
+            files,
+            truncated: response.truncated,
+            diagnostics,
+            filtered_out,
+            filter_dropped_edges,
+            diagnostic_codes,
+        }
+    }
+}
+
+/// Render the model-ready report. Search renders ranked hits with source
+/// snippets; structural intents render the resolved node set, the edges between
+/// them, any traversed paths, and (for explore/context) the digest-verified
+/// source Compass already read. All source reads share one [`SourceCache`].
+fn format_view(
     query: &str,
-    intent: &str,
+    intent: QueryIntent,
     limit: usize,
     path_filter: Option<&str>,
-    rows: &[ResultRow],
+    view: &ResponseView,
     working_dir: &Path,
 ) -> String {
-    // Resolve each row's source file once, sharing a single read per unique
-    // file across all of that file's rows (a wide query often has several hits
-    // in the same file). `SourceCache` maps repo-relative path -> full file text
-    // resolved against the working dir/git toplevel.
-    let mut cache = SourceCache::default();
     let mut output = String::new();
-    output.push_str(&format!("# Compass query: {}\n\n", query));
-    output.push_str(&format!("**Intent:** {}\n", intent));
+    output.push_str(&format!("# Compass query: {}\n\n", header_label(query)));
+    output.push_str(&format!("**Mode:** {}\n", intent.as_str()));
     output.push_str(&format!("**Limit:** {}\n", limit));
     if let Some(p) = path_filter {
         output.push_str(&format!("**Path filter:** {}\n", p));
     }
-    output.push_str(&format!("\n**Found {} result(s)**\n\n", rows.len()));
+    output.push('\n');
 
-    for (i, row) in rows.iter().enumerate() {
-        output.push_str(&format!("## {}. {}\n\n", i + 1, row.name));
-        if let Some(file) = &row.file {
-            output.push_str(&format!("**File:** {}\n", file));
+    let mut rendered_files = RenderedFiles::default();
+    let mut cache = SourceCache::default();
+    render_view_body_inner(
+        &mut output,
+        view,
+        working_dir,
+        MAX_SNIPPET_ROWS,
+        matches!(intent, QueryIntent::Search),
+        &mut rendered_files,
+        &mut cache,
+    );
+    // `callers`/`callees`/`impact`/`explore` list the resolved symbols even when
+    // the graph has no relationships for them (only the seed is resolved). Say so
+    // explicitly, so a lone "Resolved symbols (1)" is not misread as results. Only
+    // fire when nothing else rendered: an `explore`/`context` report may carry
+    // verified source for the seed even with no relationships.
+    let structural_neighborhood = matches!(
+        intent,
+        QueryIntent::Callers | QueryIntent::Callees | QueryIntent::Impact | QueryIntent::Explore
+    );
+    if structural_neighborhood
+        && !view.nodes.is_empty()
+        && view.edges.is_empty()
+        && view.paths.is_empty()
+        && view.files.is_empty()
+        && view.diagnostics.is_empty()
+    {
+        if view.filter_dropped_edges {
+            // Relationships exist but their other endpoint fell outside the
+            // `path` filter, so do not claim the symbol has none.
+            output.push_str(
+                "No related symbols in the requested path. Relationships exist but \
+                 fall outside the `path` filter; widen or drop it.\n\n",
+            );
+        } else {
+            output.push_str(match intent {
+                QueryIntent::Callers => "No callers found for this symbol.\n\n",
+                QueryIntent::Callees => "No callees found for this symbol.\n\n",
+                QueryIntent::Impact => "No impacted symbols found for this symbol.\n\n",
+                _ => "No related symbols found in this symbol's neighborhood.\n\n",
+            });
         }
-        output.push_str(&format!("**Kind:** {}\n", row.kind));
-        output.push_str(&format!("**Score:** {:.3}\n", row.score));
-        if !row.matched.is_empty() {
-            output.push_str(&format!("**Matched:** {}\n", row.matched.join(", ")));
+    }
+    output
+}
+
+/// Body renderer shared by `format_view` and the `context` section loop.
+/// `snippet_rows` bounds how many ranked hits get a fenced source block. The
+/// `is_search` flag is set for a keyword search: such a report always prints its
+/// `Found N result(s)` header (even for zero hits, preserving the historical
+/// machine-readable contract callers assert on), whereas a structural view only
+/// prints this header when it actually has hits.
+///
+/// `rendered_files` accumulates the source-file paths already emitted with a
+/// fenced body across sibling calls (the `context` intent renders one view per
+/// section), so the same file is never dumped more than once in a report.
+/// `cache` is shared across those sibling calls for the same reason, so a file
+/// referenced by several `context` sections is read from disk only once.
+fn render_view_body_inner(
+    output: &mut String,
+    view: &ResponseView,
+    working_dir: &Path,
+    snippet_rows: usize,
+    is_search: bool,
+    rendered_files: &mut RenderedFiles,
+    cache: &mut SourceCache,
+) {
+    if is_search || !view.hits.is_empty() {
+        output.push_str(&format!("**Found {} result(s)**\n\n", view.hits.len()));
+        for (i, row) in view.hits.iter().enumerate() {
+            output.push_str(&format!("## {}. {}\n\n", i + 1, row.name));
+            if let Some(file) = &row.file {
+                output.push_str(&format!("**File:** {}\n", file));
+            }
+            output.push_str(&format!("**Kind:** {}\n", row.kind));
+            output.push_str(&format!("**Score:** {:.3}\n", row.score));
+            if !row.matched.is_empty() {
+                output.push_str(&format!("**Matched:** {}\n", row.matched.join(", ")));
+            }
+            if i < snippet_rows
+                && let Some(anchor) = &row.source
+                && let Some(text) = cache.snippet(working_dir, anchor)
+            {
+                output.push_str("\n```\n");
+                output.push_str(&text);
+                output.push_str("```\n");
+            }
+            output.push('\n');
         }
-        // Only the top `MAX_SNIPPET_ROWS` results get a fenced source snippet (and a
-        // file read); the rest stay as lean name/file/kind rows so a wide query
-        // cannot tile many fences (or trigger many reads) into the report.
-        if i < MAX_SNIPPET_ROWS
-            && let Some(anchor) = &row.source
-            && let Some(text) = cache.snippet(working_dir, anchor)
-        {
-            output.push_str("\n```\n");
-            output.push_str(&text);
-            output.push_str("```\n");
+    }
+
+    if !view.edges.is_empty() {
+        output.push_str(&format!("**Relationships ({}):**\n", view.edges.len()));
+        for edge in view.edges.iter().take(MAX_EDGE_ROWS) {
+            output.push_str(&format!(
+                "- {} --{}--> {}\n",
+                view.label(&edge.source),
+                edge.kind,
+                view.label(&edge.target)
+            ));
+        }
+        if view.edges.len() > MAX_EDGE_ROWS {
+            output.push_str(&format!(
+                "- … {} more edge(s) omitted\n",
+                view.edges.len() - MAX_EDGE_ROWS
+            ));
         }
         output.push('\n');
     }
 
-    output
+    if !view.paths.is_empty() {
+        output.push_str(&format!("**Paths ({}):**\n", view.paths.len()));
+        for (i, path) in view.paths.iter().enumerate().take(MAX_PATH_ROWS) {
+            let chain = path
+                .node_ids
+                .iter()
+                .map(|id| view.label(id))
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            output.push_str(&format!(
+                "{}. {} _(weakest confidence: {})_\n",
+                i + 1,
+                chain,
+                path.weakest_confidence
+            ));
+        }
+        if view.paths.len() > MAX_PATH_ROWS {
+            output.push_str(&format!(
+                "- … {} more path(s) omitted\n",
+                view.paths.len() - MAX_PATH_ROWS
+            ));
+        }
+        output.push('\n');
+    }
+
+    // Structural results that are not search hits still deserve their resolved
+    // declarations shown, so a `callers`/`callees`/`impact` report names and
+    // locates each node. Source is only rendered for nodes whose file did not
+    // already come back digest-verified below.
+    if view.hits.is_empty() && !view.nodes.is_empty() {
+        output.push_str(&format!("**Resolved symbols ({}):**\n", view.nodes.len()));
+        for node in view.nodes.iter().take(MAX_NODE_ROWS) {
+            output.push_str(&format!("- {}\n", format_node_label(node)));
+        }
+        if view.nodes.len() > MAX_NODE_ROWS {
+            output.push_str(&format!(
+                "- … {} more node(s) omitted\n",
+                view.nodes.len() - MAX_NODE_ROWS
+            ));
+        }
+        output.push('\n');
+
+        // Show the declaration source for the first few resolved symbols so a
+        // callers/callees/impact answer includes real code, not just names.
+        // Later nodes stay as lean rows so a wide structural query cannot tile
+        // many fences (or read many files) into one report. A node whose file is
+        // a *fresh* digest-verified file in this view, or already rendered in a
+        // sibling `context` section, is skipped so the file is not emitted twice.
+        // A stale verified file (source `None`) is not deduped: the node snippet
+        // is then the only fresh source the report can offer for that file.
+        let verified_fresh: std::collections::HashSet<&str> = view
+            .files
+            .iter()
+            .filter(|f| f.source.is_some())
+            .map(|f| f.path.as_str())
+            .collect();
+        for node in view.nodes.iter().take(MAX_NODE_SNIPPETS) {
+            let Some(anchor) = &node.source else { continue };
+            if verified_fresh.contains(anchor.file.as_str())
+                || rendered_files.contains_path(&anchor.file)
+            {
+                continue;
+            }
+            let Some(text) = cache.snippet(working_dir, anchor) else {
+                continue;
+            };
+            let label = if node.qualified_name.is_empty() {
+                &node.name
+            } else {
+                &node.qualified_name
+            };
+            output.push_str(&format!("`{label}`:\n\n```\n{text}```\n\n"));
+        }
+    }
+
+    // Digest-verified source that Compass resolved from disk (explore/context).
+    // This is the primary "read fewer files" win: the model gets real source for
+    // the neighborhood without issuing separate `read` calls. `rendered_files` is
+    // shared across the sibling section views of a `context` report, so a file
+    // that appears in several sections (e.g. the declaration file also carries an
+    // implementation relation) is dumped only once.
+    if !view.files.is_empty() {
+        for file in &view.files {
+            if rendered_files.len() >= MAX_SOURCE_FILES
+                && !rendered_files.contains_body(&file.path, &file.digest)
+            {
+                break;
+            }
+            if !rendered_files.insert(&file.path, &file.digest) {
+                continue;
+            }
+            match &file.source {
+                Some(text) => {
+                    output.push_str(&format!("### {}\n\n", file.path));
+                    output.push_str("```\n");
+                    output.push_str(text);
+                    if !text.ends_with('\n') {
+                        output.push('\n');
+                    }
+                    if file.truncated {
+                        output.push_str("... (truncated)\n");
+                    }
+                    output.push_str("```\n\n");
+                }
+                None => {
+                    output.push_str(&format!(
+                        "### {}\n\n_(source unavailable: index digest differs from disk; \
+                         re-run after rebuilding the index)_\n\n",
+                        file.path
+                    ));
+                }
+            }
+        }
+    }
+
+    if view.hits.is_empty() && view.nodes.is_empty() && view.files.is_empty() {
+        use compass_model::query_contract::QueryDiagnosticCode;
+        if view.filtered_out {
+            // Compass resolved the operand, but the `path` filter excluded every
+            // result; "try a different symbol name" would be wrong advice here.
+            output.push_str(
+                "No results in the requested path. Compass matched symbols, but the \
+                 `path` filter excluded them; widen or drop the filter.\n\n",
+            );
+        } else if view.diagnostic_codes.contains(&QueryDiagnosticCode::AmbiguousMatch) {
+            // The symbol matched several nodes, so nothing resolved to one target.
+            // Advise qualifying the name, not trying a different symbol.
+            output.push_str(
+                "No exact match: the operand is ambiguous (it matched several \
+                 symbols). Re-run with a qualified name or add a `path` to \
+                 disambiguate; see the diagnostics below.\n\n",
+            );
+        } else if view.diagnostic_codes.contains(&QueryDiagnosticCode::DirectionMismatch) {
+            // The two endpoints are connected, just not in the requested order.
+            output.push_str(
+                "No trail in the requested direction. A trail connects the two \
+                 symbols, but only from `target` to `source`; swap them.\n\n",
+            );
+        } else {
+            output.push_str("No matches. Try a different symbol name, a broader query, \
+                             or `mode=context` for a task-oriented packet.\n\n");
+        }
+    }
+
+    if view.truncated {
+        output.push_str("**Note:** results were truncated by Compass query bounds.\n\n");
+    }
+    if !view.diagnostics.is_empty() {
+        output.push_str("**Diagnostics:**\n");
+        for diag in view.diagnostics.iter().take(MAX_CANDIDATE_ROWS) {
+            output.push_str(&format!("- {diag}\n"));
+        }
+    }
+}
+
+/// Cap how many edges/nodes/paths/source files a single structural report
+/// renders, bounding one call's context cost.
+const MAX_EDGE_ROWS: usize = 40;
+const MAX_NODE_ROWS: usize = 40;
+/// How many resolved structural nodes get a fenced declaration snippet (each a
+/// source-file read), bounding the context cost of a wide call-graph answer.
+const MAX_NODE_SNIPPETS: usize = 6;
+const MAX_PATH_ROWS: usize = 10;
+const MAX_SOURCE_FILES: usize = 8;
+
+/// Compass's internal hard ceiling on `max_candidates` / explore symbols
+/// (`MAX_CODE_QUERY_CANDIDATES`). The constant is private to `compass-query`, so
+/// it is mirrored here; keep it in sync if the pinned Compass version changes.
+const COMPASS_MAX_CANDIDATES: usize = 256;
+
+/// Does a repo-relative `path` match a user-supplied path filter? Both sides are
+/// normalized into path segments first (split on `/` or `\`, dropping empty and
+/// `.` components), so a filter like `./src`, `.`, or `/` behaves like `src` or
+/// an empty filter. A filter then matches when its segment sequence appears as a
+/// contiguous run of the path's segments, so `src` matches `src/lib.rs` (and
+/// `crates/x/src/lib.rs`) but not `src2/lib.rs`, and `src/lib.rs` matches a
+/// trailing path segment but not `src/lib.rs.bak`.
+fn path_matches_filter(filter: &str, path: &str) -> bool {
+    fn segments(value: &str) -> Vec<&str> {
+        value
+            .split(['/', '\\'])
+            .filter(|part| !part.is_empty() && *part != ".")
+            .collect()
+    }
+    let filter_segments = segments(filter);
+    if filter_segments.is_empty() {
+        return true;
+    }
+    segments(path)
+        .windows(filter_segments.len())
+        .any(|window| window == filter_segments.as_slice())
+}
+
+/// snake_case name for a semantic node role, taken from Compass's own serde
+/// representation (`NodeRole` uses `#[serde(rename_all = "snake_case")]`) so the
+/// label never drifts from the vocabulary Compass defines.
+fn role_name(role: compass_model::code_graph::NodeRole) -> String {
+    serde_json::to_value(role)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_else(|| format!("{role:?}").to_lowercase())
+}
+
+/// Trim an explore symbol set to Compass's hard candidate ceiling in place.
+/// Compass rejects the whole request (not just the excess) above the ceiling, so
+/// this prevents an oversized `symbols` call from failing outright. Returns
+/// `(requested, queried)` so the caller can surface a truncation note.
+fn clamp_explore_symbols(symbols: &mut Vec<String>) -> (usize, usize) {
+    let total = symbols.len();
+    if total > COMPASS_MAX_CANDIDATES {
+        symbols.truncate(COMPASS_MAX_CANDIDATES);
+    }
+    (total, symbols.len())
 }
 
 /// Deduplicated source-file reader for a single query. Reads each unique file
@@ -1543,6 +2871,46 @@ mod tests {
     use jcode_tool_core::ToolExecutionMode;
     use std::io::Write;
     use std::path::PathBuf;
+
+    /// Build a hits-only [`ResponseView`] from raw rows and render it, so the
+    /// search-rendering tests exercise the same `render_view_body` path the
+    /// production `format_view` uses without hand-building a Compass response.
+    fn format_test_query(
+        query: &str,
+        limit: usize,
+        path_filter: Option<&str>,
+        rows: &[ResultRow],
+        working_dir: &Path,
+    ) -> String {
+        let view = ResponseView {
+            hits: rows.to_vec(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            paths: Vec::new(),
+            files: Vec::new(),
+            truncated: false,
+            diagnostics: Vec::new(),
+            filtered_out: false,
+            filter_dropped_edges: false,
+            diagnostic_codes: Default::default(),
+        };
+        format_view(query, QueryIntent::Search, limit, path_filter, &view, working_dir)
+    }
+
+    /// Build a minimal `CompassQueryInput` from a free-form query string, for
+    /// driving `execute_query` in integration tests.
+    fn input(query: &str) -> CompassQueryInput {
+        CompassQueryInput {
+            query: Some(query.to_string()),
+            path: None,
+            limit: None,
+            mode: None,
+            symbols: None,
+            source: None,
+            target: None,
+            include_heuristic: None,
+        }
+    }
 
     /// Test helper that sets `JCODE_HOME` for the duration of a test, so
     /// `resolve_compass_cache`/`execute` writes under a temp dir instead of the
@@ -2011,6 +3379,157 @@ mod tests {
         );
     }
 
+    // An operand-less call must return a plain input-error message, not the
+    // engine-failure text that (misleadingly) advises clearing the index cache:
+    // the query never reached the engine.
+    #[tokio::test]
+    async fn operand_less_call_reports_input_error_not_cache_advice() {
+        let (_home, root) = HomeGuard::set();
+        let root = root.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("main.rs"), "fn a() {}\n").unwrap();
+        let edge = resolve_compass_cache(&root);
+        let c = edge.clone();
+        build_compass_index(&root, &c.output_dir, &c.ast_cache_root).expect("build");
+
+        let ctx = ToolContext {
+            session_id: "s".into(),
+            message_id: "m".into(),
+            tool_call_id: "t".into(),
+            working_dir: Some(root),
+            stdin_request_tx: None,
+            graceful_shutdown_signal: None,
+            execution_mode: ToolExecutionMode::Direct,
+        };
+        let out = CompassQueryTool::new()
+            .execute(serde_json::json!({ "mode": "callers" }), ctx)
+            .await
+            .expect("execute");
+        assert!(
+            out.output.contains("requires an operand"),
+            "must name the missing operand, got: {}",
+            out.output
+        );
+        assert!(
+            !out.output.contains("clear the cache"),
+            "an input error must not advise clearing the cache, got: {}",
+            out.output
+        );
+    }
+
+    // A `context` call with a `path` filter is an input error, so it must read as
+    // a plain rejection rather than the engine-failure text with cache advice.
+    #[tokio::test]
+    async fn context_path_filter_reports_input_error_not_cache_advice() {
+        let (_home, root) = HomeGuard::set();
+        let root = root.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("main.rs"), "fn a() {}\n").unwrap();
+        let edge = resolve_compass_cache(&root);
+        let c = edge.clone();
+        build_compass_index(&root, &c.output_dir, &c.ast_cache_root).expect("build");
+
+        let ctx = ToolContext {
+            session_id: "s".into(),
+            message_id: "m".into(),
+            tool_call_id: "t".into(),
+            working_dir: Some(root),
+            stdin_request_tx: None,
+            graceful_shutdown_signal: None,
+            execution_mode: ToolExecutionMode::Direct,
+        };
+        let out = CompassQueryTool::new()
+            .execute(
+                serde_json::json!({ "mode": "context", "query": "a", "path": "main.rs" }),
+                ctx,
+            )
+            .await
+            .expect("execute");
+        assert!(
+            out.output.contains("does not support a `path` filter"),
+            "must name the unsupported filter, got: {}",
+            out.output
+        );
+        assert!(
+            !out.output.contains("clear the cache"),
+            "an input error must not advise clearing the cache, got: {}",
+            out.output
+        );
+    }
+
+    // An engine-side `InvalidParameter` (here a `discover` path scope matching no
+    // source) is the caller's mistake, not a broken index, so it must be reported
+    // as a plain rejection rather than with the "clear the cache" rebuild advice.
+    #[tokio::test]
+    async fn engine_invalid_parameter_reports_input_error_not_cache_advice() {
+        let (_home, root) = HomeGuard::set();
+        let root = root.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("main.rs"), "fn a() {}\n").unwrap();
+        let edge = resolve_compass_cache(&root);
+        let c = edge.clone();
+        build_compass_index(&root, &c.output_dir, &c.ast_cache_root).expect("build");
+
+        let ctx = ToolContext {
+            session_id: "s".into(),
+            message_id: "m".into(),
+            tool_call_id: "t".into(),
+            working_dir: Some(root),
+            stdin_request_tx: None,
+            graceful_shutdown_signal: None,
+            execution_mode: ToolExecutionMode::Direct,
+        };
+        let out = CompassQueryTool::new()
+            .execute(
+                serde_json::json!({
+                    "mode": "discover",
+                    "query": "how does auth reach the database",
+                    "path": "definitely/not/a/real/directory"
+                }),
+                ctx,
+            )
+            .await
+            .expect("execute");
+        assert!(
+            !out.output.contains("clear the cache"),
+            "an InvalidParameter must not advise clearing the cache, got: {}",
+            out.output
+        );
+        assert!(
+            out.output.contains("rejected the request"),
+            "an InvalidParameter must read as a plain rejection, got: {}",
+            out.output
+        );
+    }
+
+    // The classifier splits engine errors by kind: only `InvalidParameter` is a
+    // caller-input problem; a real index failure keeps the rebuild guidance.
+    #[test]
+    fn engine_error_classifier_splits_invalid_parameter_from_failures() {
+        use compass_query::{QueryError, QueryErrorKind};
+
+        let invalid = QueryError::new(QueryErrorKind::InvalidParameter, "bad", "boom");
+        assert!(
+            map_engine_error(invalid).downcast_ref::<InputError>().is_some(),
+            "InvalidParameter must classify as an input error"
+        );
+
+        let corrupt = QueryError::new(QueryErrorKind::CorruptArtifact, "bad", "boom");
+        assert!(
+            map_engine_error(corrupt).downcast_ref::<InputError>().is_none(),
+            "a real engine failure must not classify as an input error"
+        );
+
+        let invalid_request =
+            compass_core::TaskContextError::InvalidRequest("nope".to_string());
+        assert!(
+            map_task_context_error(invalid_request)
+                .downcast_ref::<InputError>()
+                .is_some(),
+            "an invalid task-context request must classify as an input error"
+        );
+    }
+
     /// Write a temp file (inside `dir`/rel) and return the dir + the repo-relative path.
     fn temp_src(content: &str, rel: &str) -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().unwrap();
@@ -2153,7 +3672,7 @@ mod tests {
             }),
             kind: "struct".to_string(),
         }];
-        let rendered = format_query("main", "search", 20, None, &rows, dir.path());
+        let rendered = format_test_query("main", 20, None, &rows, dir.path());
         assert!(rendered.contains("## 1. jcode::main"), "got: {rendered}");
         assert!(rendered.contains("**Kind:** struct"), "got: {rendered}");
         assert!(
@@ -2191,7 +3710,7 @@ mod tests {
                 kind: "function".to_string(),
             })
             .collect();
-        let rendered = format_query("many", "search", 20, None, &rows, dir.path());
+        let rendered = format_test_query("many", 20, None, &rows, dir.path());
         // All 20 rows are listed, but only MAX_SNIPPET_ROWS get fences.
         assert!(rendered.contains("## 20. f20"), "last row must be listed: {rendered}");
         let fences = rendered.matches("```").count();
@@ -2232,7 +3751,7 @@ mod tests {
             }),
             kind: "struct".to_string(),
         }];
-        let rendered = format_query("q", "search", 20, None, &rows, dir.path());
+        let rendered = format_test_query("q", 20, None, &rows, dir.path());
         assert!(rendered.contains("## 1. missing"));
         assert!(
             !rendered.contains("```"),
@@ -2255,7 +3774,7 @@ mod tests {
             }),
             kind: "struct".to_string(),
         };
-        let rendered = format_query("q", "search", 20, None, &[traversal], dir.path());
+        let rendered = format_test_query("q", 20, None, &[traversal], dir.path());
         assert!(
             !rendered.contains("root:"),
             "traversal path must not be read: {rendered}"
@@ -2279,7 +3798,7 @@ mod tests {
             }),
             kind: "struct".to_string(),
         };
-        let rendered = format_query("q", "search", 20, None, &[absolute], dir.path());
+        let rendered = format_test_query("q", 20, None, &[absolute], dir.path());
         assert!(
             !rendered.contains("fn real"),
             "absolute source path must be refused: {rendered}"
@@ -2336,10 +3855,10 @@ mod tests {
         // just this tool's hand-built fixtures.
         let out = execute_query(
             &engine,
-            "authenticate",
-            None,
+            QueryIntent::Search,
+            &input("authenticate"),
             u64::MAX as usize,
-            "search",
+            false,
             &root,
         )
         .expect("query with clamped limit must succeed");
@@ -2354,6 +3873,1234 @@ mod tests {
         assert!(
             out.contains("```"),
             "real compass query snippet must be fenced, got: {out}"
+        );
+    }
+
+    // The path filter matches whole path segments, so `src` does not over-match
+    // `src2`, and a file filter matches trailing segments.
+    #[test]
+    fn path_filter_matches_whole_segments() {
+        assert!(path_matches_filter("src", "src/lib.rs"));
+        assert!(path_matches_filter("src", "crates/x/src/lib.rs"));
+        assert!(!path_matches_filter("src", "src2/lib.rs"));
+        assert!(!path_matches_filter("src", "other/lib.rs"));
+        assert!(path_matches_filter("src/lib.rs", "crates/x/src/lib.rs"));
+        assert!(path_matches_filter("src/lib.rs", "src/lib.rs"));
+        assert!(!path_matches_filter("src/lib.rs", "src/lib.rs.bak"));
+        // An empty filter matches everything.
+        assert!(path_matches_filter("", "anything"));
+        assert!(path_matches_filter("/", "anything"));
+        // `.` / `./` prefixes (and a bare `.`) normalize away and must not filter
+        // everything out, which previously produced a silently empty report.
+        assert!(path_matches_filter("./src", "src/lib.rs"));
+        assert!(path_matches_filter("./src/lib.rs", "src/lib.rs"));
+        assert!(path_matches_filter("./", "x/y"));
+        assert!(path_matches_filter(".", "anything"));
+        // A contiguous run of segments, not a scattered subsequence.
+        assert!(path_matches_filter("crates/x", "crates/x/src/lib.rs"));
+        assert!(!path_matches_filter("x/src", "crates/x/other/src/lib.rs"));
+        // A filter with more segments than the path never matches (no panic).
+        assert!(!path_matches_filter("a/b/c/d", "a/b"));
+        assert!(!path_matches_filter("a", ""));
+    }
+
+    // The scalar operand for a single-symbol structural mode is `query`; an
+    // operand-less call is a clear error.
+    #[test]
+    fn structural_operand_can_be_supplied_via_query() {
+        let mut params = CompassQueryInput {
+            query: Some("foo".to_string()),
+            path: None,
+            limit: None,
+            mode: Some("callers".to_string()),
+            symbols: None,
+            source: None,
+            target: None,
+            include_heuristic: None,
+        };
+        assert_eq!(params.query_operand(), "foo");
+        assert_eq!(params.display_target(QueryIntent::Callers), "foo");
+
+        let (_tmp, root, output_dir, ast_cache_root) = make_isolated_project();
+        std::fs::write(root.join("main.rs"), "fn foo() {}\n").unwrap();
+        build_compass_index(&root, &output_dir, &ast_cache_root).expect("build");
+        let engine = compass_query::open(
+            &output_dir.join("compass-out/graph.json"),
+            None,
+            &output_dir,
+        )
+        .expect("open after build");
+        // An operand-less callers call errors rather than searching for "".
+        params.query = None;
+        let err = execute_query(&engine, QueryIntent::Callers, &params, 20, false, &root)
+            .expect_err("operand-less structural call must error");
+        assert!(err.to_string().contains("requires an operand"), "got: {err}");
+    }
+
+    // A `traverse` call must name both endpoints in its header/title, not just the
+    // source, so the report reads "from -> to".
+    #[test]
+    fn display_target_names_both_traverse_endpoints() {
+        let params = CompassQueryInput {
+            query: None,
+            source: Some("crate::a".to_string()),
+            target: Some("crate::b".to_string()),
+            ..input("x")
+        };
+        assert_eq!(
+            params.display_target(QueryIntent::Traverse),
+            "crate::a -> crate::b"
+        );
+
+        // Only a target (e.g. a malformed call) still yields a label, not blank.
+        let only_target = CompassQueryInput {
+            query: None,
+            source: None,
+            target: Some("crate::b".to_string()),
+            ..input("x")
+        };
+        assert_eq!(only_target.display_target(QueryIntent::Traverse), "crate::b");
+
+        // The combined label stays bounded even for two long endpoints.
+        let long = CompassQueryInput {
+            query: None,
+            source: Some("s".repeat(200)),
+            target: Some("t".repeat(200)),
+            ..input("x")
+        };
+        assert!(
+            long.display_target(QueryIntent::Traverse).chars().count()
+                <= MAX_DISPLAY_TARGET_CHARS + 1,
+            "the two-endpoint label must be bounded"
+        );
+    }
+
+    // `explore` takes a set via `symbols`; blank entries are skipped and the set
+    // is summarized in the label. Other modes use `query`, ignoring `symbols`.
+    #[test]
+    fn symbols_is_the_explore_set_only() {
+        let params = CompassQueryInput {
+            query: Some("scalar".to_string()),
+            symbols: Some(vec!["  ".to_string(), "real::sym".to_string()]),
+            ..input("x")
+        };
+        // `symbols` drives the explore label (blanks skipped).
+        assert_eq!(params.display_target(QueryIntent::Explore), "real::sym");
+        // `query` drives the label for the single-symbol modes.
+        assert_eq!(params.display_target(QueryIntent::Callers), "scalar");
+        assert_eq!(params.first_symbol().as_deref(), Some("real::sym"));
+        assert_eq!(params.query_operand(), "scalar");
+    }
+
+    // Semantic node roles render in Compass's own snake_case vocabulary, not via
+    // Debug (which would mangle multi-word variants).
+    #[test]
+    fn role_name_uses_snake_case() {
+        use compass_model::code_graph::NodeRole;
+        assert_eq!(role_name(NodeRole::RouteHandler), "route_handler");
+        assert_eq!(role_name(NodeRole::UiComponent), "ui_component");
+        assert_eq!(role_name(NodeRole::Service), "service");
+    }
+
+    // A node label must never be blank: when the qualified name is empty it falls
+    // back to the plain name, matching the search-hit render path.
+    #[test]
+    fn node_label_falls_back_to_name_when_qualified_name_empty() {
+        let node = NodeView {
+            id: "n:1".to_string(),
+            name: "handler".to_string(),
+            qualified_name: String::new(),
+            kind: "function".to_string(),
+            roles: Vec::new(),
+            file: Some("a.rs".to_string()),
+            source: None,
+        };
+        assert_eq!(format_node_label(&node), "`handler` (function, a.rs)");
+    }
+
+    /// The query intent parsed from the tool's `mode` field drives real Compass
+    /// operations. Every advertised value must parse, an unknown value must be a
+    /// clear error (not a silent fallback to search), and the structural set must be
+    /// recognized so pre-warm guidance stays accurate.
+    #[test]
+    fn query_intent_parses_every_advertised_value() {
+        assert_eq!(QueryIntent::parse(None).unwrap(), QueryIntent::Search);
+        assert_eq!(QueryIntent::parse(Some("")).unwrap(), QueryIntent::Search);
+        assert_eq!(QueryIntent::parse(Some("search")).unwrap(), QueryIntent::Search);
+        assert_eq!(QueryIntent::parse(Some("CALLERS")).unwrap(), QueryIntent::Callers);
+        assert_eq!(QueryIntent::parse(Some("callees")).unwrap(), QueryIntent::Callees);
+        assert_eq!(QueryIntent::parse(Some("impact")).unwrap(), QueryIntent::Impact);
+        assert_eq!(QueryIntent::parse(Some("explore")).unwrap(), QueryIntent::Explore);
+        assert_eq!(QueryIntent::parse(Some("discover")).unwrap(), QueryIntent::Discover);
+        // `discovery` is a legacy alias routed to discover.
+        assert_eq!(QueryIntent::parse(Some("discovery")).unwrap(), QueryIntent::Discover);
+        assert_eq!(QueryIntent::parse(Some("traverse")).unwrap(), QueryIntent::Traverse);
+        assert_eq!(QueryIntent::parse(Some("path")).unwrap(), QueryIntent::Traverse);
+        assert_eq!(QueryIntent::parse(Some("context")).unwrap(), QueryIntent::Context);
+
+        assert!(QueryIntent::parse(Some("nonsense")).is_err());
+        assert!(!QueryIntent::Search.is_structural());
+        for intent in [
+            QueryIntent::Callers,
+            QueryIntent::Callees,
+            QueryIntent::Impact,
+            QueryIntent::Explore,
+            QueryIntent::Discover,
+            QueryIntent::Traverse,
+            QueryIntent::Context,
+        ] {
+            assert!(intent.is_structural(), "{intent:?} must be structural");
+        }
+    }
+
+    // A structural intent must actually invoke the matching Compass operation and
+    // render its edges/nodes, not fall back to a keyword search. This drives the
+    // real engine built from an isolated project with a genuine call edge.
+    #[test]
+    fn callers_intent_returns_call_graph_not_search_hits() {
+        let (_tmp, root, output_dir, ast_cache_root) = make_isolated_project();
+        std::fs::write(
+            root.join("main.rs"),
+            "fn authenticate(user: &str) { let _ = user; }\n\
+             fn login() { authenticate(\"x\"); }\n",
+        )
+        .unwrap();
+        build_compass_index(&root, &output_dir, &ast_cache_root).expect("build");
+        let engine =
+            compass_query::open(&output_dir.join("compass-out/graph.json"), None, &output_dir)
+                .expect("open after build");
+
+        let out = execute_query(
+            &engine,
+            QueryIntent::Callers,
+            &input("authenticate"),
+            20,
+            false,
+            &root,
+        )
+        .expect("callers query must succeed");
+
+        assert!(
+            out.contains("**Mode:** callers"),
+            "report must name the callers mode, got: {out}"
+        );
+        // The caller (`login`) and the callee (`authenticate`) must both be listed
+        // as resolved symbols, with at least one relationship edge rendered.
+        assert!(
+            out.contains("Resolved symbols"),
+            "structural report must list resolved symbols, got: {out}"
+        );
+        assert!(
+            out.contains("Relationships"),
+            "callers report must render edges, got: {out}"
+        );
+    }
+
+    // A `callees` call on a leaf symbol resolves only the seed (no edges). The
+    // report must say there are no callees rather than presenting the seed row as
+    // if it were a result.
+    #[test]
+    fn callees_of_a_leaf_notes_no_relationships() {
+        let (_tmp, root, output_dir, ast_cache_root) = make_isolated_project();
+        std::fs::write(
+            root.join("main.rs"),
+            "fn authenticate(user: &str) { let _ = user; }\n\
+             fn login() { authenticate(\"x\"); }\n",
+        )
+        .unwrap();
+        build_compass_index(&root, &output_dir, &ast_cache_root).expect("build");
+        let engine =
+            compass_query::open(&output_dir.join("compass-out/graph.json"), None, &output_dir)
+                .expect("open after build");
+
+        // `authenticate` calls nothing.
+        let out = execute_query(
+            &engine,
+            QueryIntent::Callees,
+            &input("crate::authenticate"),
+            20,
+            false,
+            &root,
+        )
+        .expect("callees query must succeed");
+
+        assert!(
+            out.contains("No callees found"),
+            "a leaf callees report must state there are no callees, got: {out}"
+        );
+        assert!(
+            !out.contains("Relationships"),
+            "a leaf callees report must have no edges, got: {out}"
+        );
+    }
+
+    // `explore` on a leaf returns the seed's verified source (a real result), so
+    // the "no related symbols" note must NOT fire even though there are no edges.
+    #[test]
+    fn explore_leaf_with_source_omits_the_no_neighborhood_note() {
+        let (_tmp, root, output_dir, ast_cache_root) = make_isolated_project();
+        std::fs::write(
+            root.join("main.rs"),
+            "fn authenticate(user: &str) { let _ = user; }\n\
+             fn login() { authenticate(\"x\"); }\n",
+        )
+        .unwrap();
+        build_compass_index(&root, &output_dir, &ast_cache_root).expect("build");
+        let engine =
+            compass_query::open(&output_dir.join("compass-out/graph.json"), None, &output_dir)
+                .expect("open after build");
+
+        let out = execute_query(
+            &engine,
+            QueryIntent::Explore,
+            &input("crate::authenticate"),
+            20,
+            false,
+            &root,
+        )
+        .expect("explore query must succeed");
+
+        assert!(
+            out.contains("### main.rs"),
+            "explore must render the seed's verified source, got: {out}"
+        );
+        assert!(
+            !out.contains("No related symbols found"),
+            "the no-neighborhood note must not fire when source is rendered, got: {out}"
+        );
+    }
+
+    // A `path` filter that excludes a caller's directory must not make the report
+    // claim "No callers found" when a caller exists outside the filter.
+    #[test]
+    fn filtered_callers_do_not_claim_none_exist() {
+        let (_tmp, root, output_dir, ast_cache_root) = make_isolated_project();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::write(root.join("a/seed.rs"), "pub fn seed() {}\n").unwrap();
+        std::fs::write(
+            root.join("b/caller.rs"),
+            "pub fn caller() { crate::seed::seed(); }\n",
+        )
+        .unwrap();
+        build_compass_index(&root, &output_dir, &ast_cache_root).expect("build");
+        let engine =
+            compass_query::open(&output_dir.join("compass-out/graph.json"), None, &output_dir)
+                .expect("open after build");
+
+        // Scope to `a`, which holds the seed but not the caller in `b`.
+        let mut params = input("crate::seed::seed");
+        params.path = Some("a".to_string());
+        let out = execute_query(&engine, QueryIntent::Callers, &params, 20, false, &root)
+            .expect("callers query must succeed");
+
+        assert!(
+            !out.contains("No callers found"),
+            "a filtered-out caller must not be reported as none existing, got: {out}"
+        );
+        assert!(
+            out.contains("outside the `path` filter"),
+            "the report should say relationships fell outside the filter, got: {out}"
+        );
+    }
+
+    // `discover` must route a natural-language question to seed symbols and render
+    // them, rather than failing or falling back to a bare search.
+    #[test]
+    fn discover_intent_routes_a_natural_language_question() {
+        let (_tmp, root, output_dir, ast_cache_root) = make_isolated_project();
+        std::fs::write(
+            root.join("main.rs"),
+            "fn authenticate(user: &str) { let _ = user; }\n\
+             fn login() { authenticate(\"x\"); }\n",
+        )
+        .unwrap();
+        build_compass_index(&root, &output_dir, &ast_cache_root).expect("build");
+        let engine =
+            compass_query::open(&output_dir.join("compass-out/graph.json"), None, &output_dir)
+                .expect("open after build");
+
+        let out = execute_query(
+            &engine,
+            QueryIntent::Discover,
+            &input("authenticate"),
+            20,
+            false,
+            &root,
+        )
+        .expect("discover query must succeed");
+
+        assert!(
+            out.starts_with("# Compass discover:"),
+            "discover report must have its own header, got: {out}"
+        );
+        assert!(
+            out.contains("**Mode:** discover"),
+            "discover report must name the mode, got: {out}"
+        );
+    }
+
+    // `discover` must honor a `path` filter as a source scope, so a question can be
+    // constrained to a file or directory.
+    #[test]
+    fn discover_honors_path_scope() {
+        let (_tmp, root, output_dir, ast_cache_root) = make_isolated_project();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/auth.rs"),
+            "fn authenticate(user: &str) { let _ = user; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("main.rs"),
+            "fn unrelated() { let _ = 1; }\n",
+        )
+        .unwrap();
+        build_compass_index(&root, &output_dir, &ast_cache_root).expect("build");
+        let engine =
+            compass_query::open(&output_dir.join("compass-out/graph.json"), None, &output_dir)
+                .expect("open after build");
+
+        let mut params = input("authenticate");
+        params.path = Some("src".to_string());
+        let out = execute_query(&engine, QueryIntent::Discover, &params, 20, false, &root)
+            .expect("scoped discover must succeed");
+
+        assert!(
+            out.starts_with("# Compass discover:"),
+            "scoped discover report must have its own header, got: {out}"
+        );
+        assert!(
+            out.contains("**Path filter:** src"),
+            "scoped discover report must echo its path scope, got: {out}"
+        );
+    }
+
+    // A discovery diagnostic can name an ambiguous seed by raw node id; the
+    // report must relabel it to a name, matching the structural report.
+    #[test]
+    fn discover_diagnostics_name_seeds_not_raw_ids() {
+        let (_tmp, root, output_dir, ast_cache_root) = make_isolated_project();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::write(
+            root.join("a/m.rs"),
+            "pub fn handler_request_flow() -> u32 { 1 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("b/m.rs"),
+            "pub fn handler_request_flow() -> u32 { 2 }\n",
+        )
+        .unwrap();
+        build_compass_index(&root, &output_dir, &ast_cache_root).expect("build");
+        let engine =
+            compass_query::open(&output_dir.join("compass-out/graph.json"), None, &output_dir)
+                .expect("open after build");
+
+        // Two same-named functions make the seed ambiguous, which emits a
+        // diagnostic that Compass interpolates with raw node ids.
+        let out = execute_query(
+            &engine,
+            QueryIntent::Discover,
+            &input("handler request flow"),
+            20,
+            false,
+            &root,
+        )
+        .expect("discover must succeed");
+
+        assert!(
+            !out.contains("sha256:"),
+            "discover diagnostics must not leak raw node ids, got: {out}"
+        );
+        assert!(
+            out.contains("crate::m::handler_request_flow"),
+            "the seed should be named, got: {out}"
+        );
+    }
+
+    // `explore` with a symbol set must gather the whole neighborhood in one call
+    // (resolving every symbol), rather than requiring one call per symbol.
+    #[test]
+    fn explore_accepts_a_symbol_set() {
+        let (_tmp, root, output_dir, ast_cache_root) = make_isolated_project();
+        std::fs::write(
+            root.join("main.rs"),
+            "fn authenticate(user: &str) { let _ = user; }\n\
+             fn login() { authenticate(\"x\"); }\n\
+             fn logout() { let _ = login; }\n",
+        )
+        .unwrap();
+        build_compass_index(&root, &output_dir, &ast_cache_root).expect("build");
+        let engine =
+            compass_query::open(&output_dir.join("compass-out/graph.json"), None, &output_dir)
+                .expect("open after build");
+
+        let mut params = input("explore set");
+        params.symbols = Some(vec![
+            "crate::authenticate".to_string(),
+            "crate::login".to_string(),
+        ]);
+        let out = execute_query(&engine, QueryIntent::Explore, &params, 20, false, &root)
+            .expect("multi-symbol explore must succeed");
+
+        assert!(
+            out.contains("**Mode:** explore"),
+            "report must name the explore mode, got: {out}"
+        );
+        assert!(
+            out.contains("# Compass query: crate::authenticate, crate::login"),
+            "the header must name the whole symbol set, not just the first, got: {out}"
+        );
+        assert!(
+            out.contains("authenticate"),
+            "explore must resolve the first symbol, got: {out}"
+        );
+        assert!(
+            out.contains("login"),
+            "explore must resolve the second symbol, got: {out}"
+        );
+    }
+
+    // The `context` intent must compose a task packet for a target (declaration +
+    // callers + callees + tests + impact), resolving the target and surfacing its
+    // source in one call.
+    #[test]
+    fn context_intent_composes_task_packet() {
+        let (_tmp, root, output_dir, ast_cache_root) = make_isolated_project();
+        std::fs::write(
+            root.join("main.rs"),
+            "fn authenticate(user: &str) { let _ = user; }\n\
+             fn login() { authenticate(\"x\"); }\n",
+        )
+        .unwrap();
+        build_compass_index(&root, &output_dir, &ast_cache_root).expect("build");
+        let engine =
+            compass_query::open(&output_dir.join("compass-out/graph.json"), None, &output_dir)
+                .expect("open after build");
+
+        // `context` resolves exact ids/names/qualified names; Compass stores the
+        // plain `name` as `authenticate()`, so use the qualified name here.
+        let out = execute_query(
+            &engine,
+            QueryIntent::Context,
+            &input("crate::authenticate"),
+            20,
+            false,
+            &root,
+        )
+        .expect("context query must succeed");
+
+        assert!(
+            out.contains("# Compass context: crate::authenticate"),
+            "context report must name the target, got: {out}"
+        );
+        assert!(
+            out.contains("**Resolved node:** `crate::authenticate`"),
+            "the resolved node must be labeled by name, not a raw id, got: {out}"
+        );
+        assert!(
+            !out.contains("sha256:"),
+            "the context report must not leak raw node ids, got: {out}"
+        );
+        assert!(
+            out.contains("fn authenticate"),
+            "context must surface the declaration source, got: {out}"
+        );
+    }
+
+    // An ambiguous/not-found `context` target must list candidates with their
+    // resolved name/kind/file, not raw `sha256:` node ids, so the model can pick
+    // the right symbol (and know what to refine to).
+    #[test]
+    fn context_ambiguous_candidates_show_names_not_raw_ids() {
+        let (_tmp, root, output_dir, ast_cache_root) = make_isolated_project();
+        std::fs::write(
+            root.join("main.rs"),
+            "fn authenticate(user: &str) { let _ = user; }\n\
+             fn login() { authenticate(\"x\"); }\n",
+        )
+        .unwrap();
+        build_compass_index(&root, &output_dir, &ast_cache_root).expect("build");
+        let engine =
+            compass_query::open(&output_dir.join("compass-out/graph.json"), None, &output_dir)
+                .expect("open after build");
+
+        // `authenticate` (no namespace) does not resolve exactly, so Compass
+        // returns a not-found target with candidate ids.
+        let out = execute_query(
+            &engine,
+            QueryIntent::Context,
+            &input("authenticate"),
+            20,
+            false,
+            &root,
+        )
+        .expect("context query must succeed");
+
+        assert!(
+            out.contains("crate::authenticate"),
+            "candidates must be labeled with their qualified name, got: {out}"
+        );
+        assert!(
+            !out.contains("sha256:"),
+            "candidates must not leak raw node ids, got: {out}"
+        );
+    }
+
+    // Oversized explore symbol sets must be trimmed to Compass's hard ceiling so the
+    // call does not fail outright, and the requested/queried counts must be reported.
+    #[test]
+    fn clamp_explore_symbols_trims_to_cap() {
+        let mut small = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(clamp_explore_symbols(&mut small), (2, 2));
+        assert_eq!(small.len(), 2, "a set within the cap is untouched");
+
+        let mut oversized: Vec<String> =
+            (0..COMPASS_MAX_CANDIDATES + 5).map(|i| format!("s{i}")).collect();
+        let (requested, queried) = clamp_explore_symbols(&mut oversized);
+        assert_eq!(requested, COMPASS_MAX_CANDIDATES + 5);
+        assert_eq!(queried, COMPASS_MAX_CANDIDATES);
+        assert_eq!(oversized.len(), COMPASS_MAX_CANDIDATES);
+        assert_eq!(oversized.first().map(String::as_str), Some("s0"));
+    }
+
+    // A file already rendered as digest-verified source must not also be emitted as
+    // a resolved-node snippet, and a file appearing in several context sections must
+    // be rendered once.
+    #[test]
+    fn render_does_not_duplicate_verified_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let anchor = anchor("a.rs", 1, 2);
+        let view = ResponseView {
+            hits: Vec::new(),
+            nodes: vec![NodeView {
+                id: "node:a".to_string(),
+                name: "a".to_string(),
+                qualified_name: "crate::a".to_string(),
+                kind: "function".to_string(),
+                roles: Vec::new(),
+                file: Some("a.rs".to_string()),
+                source: Some(anchor.clone()),
+            }],
+            edges: Vec::new(),
+            paths: Vec::new(),
+            // The same file appears twice (as two context sections would produce).
+            files: vec![
+                FileView {
+                    path: "a.rs".to_string(),
+                    digest: "sha256:test".to_string(),
+                    source: Some("fn a() {}\n".to_string()),
+                    truncated: false,
+                },
+                FileView {
+                    path: "a.rs".to_string(),
+                    digest: "sha256:test".to_string(),
+                    source: Some("fn a() {}\n".to_string()),
+                    truncated: false,
+                },
+            ],
+            truncated: false,
+            diagnostics: Vec::new(),
+            filtered_out: false,
+            filter_dropped_edges: false,
+            diagnostic_codes: Default::default(),
+        };
+        let rendered = format_view("a", QueryIntent::Context, 20, None, &view, dir.path());
+        let headers = rendered.matches("### a.rs").count();
+        assert_eq!(headers, 1, "duplicate verified file must render once: {rendered}");
+        let fences = rendered.matches("```").count();
+        // exactly one fenced block (the single rendered file body).
+        assert_eq!(fences, 2, "one fenced block expected, got {fences}: {rendered}");
+    }
+
+    // A stale verified file (source digest differs from disk) must NOT suppress the
+    // node's own snippet: the snippet read from disk is the only fresh source.
+    #[test]
+    fn stale_verified_file_still_renders_node_snippet() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let view = ResponseView {
+            hits: Vec::new(),
+            nodes: vec![NodeView {
+                id: "node:a".to_string(),
+                name: "a".to_string(),
+                qualified_name: "crate::a".to_string(),
+                kind: "function".to_string(),
+                roles: Vec::new(),
+                file: Some("a.rs".to_string()),
+                source: Some(anchor("a.rs", 1, 2)),
+            }],
+            edges: Vec::new(),
+            paths: Vec::new(),
+            files: vec![FileView {
+                path: "a.rs".to_string(),
+                    digest: "sha256:test".to_string(),
+                source: None,
+                truncated: false,
+            }],
+            truncated: false,
+            diagnostics: Vec::new(),
+            filtered_out: false,
+            filter_dropped_edges: false,
+            diagnostic_codes: Default::default(),
+        };
+        let rendered = format_view("a", QueryIntent::Explore, 20, None, &view, dir.path());
+        assert!(
+            rendered.contains("1| fn a() {}"),
+            "stale verified file must still show the node snippet: {rendered}"
+        );
+        assert!(
+            rendered.contains("source unavailable"),
+            "stale verified file must be flagged: {rendered}"
+        );
+    }
+
+    // A shared `rendered_files` set (the `context` section loop) must suppress a
+    // file already emitted by a sibling section, whether it comes back as verified
+    // source or as a node snippet.
+    #[test]
+    fn shared_rendered_set_suppresses_sibling_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let make_view = || ResponseView {
+            hits: Vec::new(),
+            nodes: vec![NodeView {
+                id: "node:a".to_string(),
+                name: "a".to_string(),
+                qualified_name: "crate::a".to_string(),
+                kind: "function".to_string(),
+                roles: Vec::new(),
+                file: Some("a.rs".to_string()),
+                source: Some(anchor("a.rs", 1, 2)),
+            }],
+            edges: Vec::new(),
+            paths: Vec::new(),
+            files: vec![FileView {
+                path: "a.rs".to_string(),
+                    digest: "sha256:test".to_string(),
+                source: Some("fn a() {}\n".to_string()),
+                truncated: false,
+            }],
+            truncated: false,
+            diagnostics: Vec::new(),
+            filtered_out: false,
+            filter_dropped_edges: false,
+            diagnostic_codes: Default::default(),
+        };
+        let mut out = String::new();
+        let mut rendered_files = RenderedFiles::default();
+        let mut cache = SourceCache::default();
+        render_view_body_inner(
+            &mut out,
+            &make_view(),
+            dir.path(),
+            MAX_SNIPPET_ROWS,
+            false,
+            &mut rendered_files,
+            &mut cache,
+        );
+        // Sibling section with the same file: neither its body nor its node snippet
+        // may be emitted again.
+        render_view_body_inner(
+            &mut out,
+            &make_view(),
+            dir.path(),
+            MAX_SNIPPET_ROWS,
+            false,
+            &mut rendered_files,
+            &mut cache,
+        );
+        assert_eq!(
+            out.matches("### a.rs").count(),
+            1,
+            "sibling section must not re-emit a rendered file: {out}"
+        );
+    }
+
+    // Rendering a structural view must surface edges, paths, and verified source,
+    // and must not emit the empty-results message when it has content.
+    #[test]
+    fn structural_view_renders_edges_paths_and_source() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let view = ResponseView {
+            hits: Vec::new(),
+            nodes: vec![NodeView {
+                id: "node:a".to_string(),
+                name: "a".to_string(),
+                qualified_name: "crate::a".to_string(),
+                kind: "function".to_string(),
+                roles: vec!["service".to_string()],
+                file: Some("a.rs".to_string()),
+                source: Some(anchor("a.rs", 1, 2)),
+            }],
+            edges: vec![EdgeView {
+                source: "node:caller".to_string(),
+                target: "node:a".to_string(),
+                kind: "calls".to_string(),
+            }],
+            paths: vec![PathView {
+                node_ids: vec!["node:caller".to_string(), "node:a".to_string()],
+                weakest_confidence: "exact".to_string(),
+            }],
+            files: vec![FileView {
+                path: "a.rs".to_string(),
+                digest: "sha256:test".to_string(),
+                source: Some("fn a() {}\n".to_string()),
+                truncated: false,
+            }],
+            truncated: false,
+            diagnostics: Vec::new(),
+            filtered_out: false,
+            filter_dropped_edges: false,
+            diagnostic_codes: Default::default(),
+        };
+        let rendered = format_view("a", QueryIntent::Callers, 20, None, &view, dir.path());
+        assert!(rendered.contains("Relationships"), "got: {rendered}");
+        assert!(rendered.contains("calls"), "edge kind must render: {rendered}");
+        assert!(rendered.contains("Paths"), "paths must render: {rendered}");
+        assert!(
+            rendered.contains("node:caller -> crate::a"),
+            "path chain must render resolved labels: {rendered}"
+        );
+        assert!(
+            rendered.contains("### a.rs"),
+            "verified source file header must render: {rendered}"
+        );
+        assert!(
+            !rendered.contains("No matches"),
+            "content view must not claim no matches: {rendered}"
+        );
+    }
+
+    // More paths than MAX_PATH_ROWS must be truncated with an explicit omission
+    // note, matching the nodes/edges sections (never silently dropped).
+    #[test]
+    fn paths_section_notes_omitted_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = (0..MAX_PATH_ROWS + 3)
+            .map(|i| PathView {
+                node_ids: vec![format!("node:{i}")],
+                weakest_confidence: "exact".to_string(),
+            })
+            .collect();
+        let view = ResponseView {
+            hits: Vec::new(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            paths,
+            files: Vec::new(),
+            truncated: false,
+            diagnostics: Vec::new(),
+            filtered_out: false,
+            filter_dropped_edges: false,
+            diagnostic_codes: Default::default(),
+        };
+        let rendered = format_view("a", QueryIntent::Impact, 20, None, &view, dir.path());
+        assert!(
+            rendered.contains("more path(s) omitted"),
+            "an omitted-paths note must render, got: {rendered}"
+        );
+    }
+
+    // A `path` filter must drop paths (and their nodes/edges) that fall outside
+    // it, so a filtered `traverse` never shows a chain with hidden nodes as raw
+    // ids.
+    #[test]
+    fn path_filter_drops_paths_outside_it() {
+        let inside = compass_model::query_contract::QueryNode {
+            id: "n:inside".to_string(),
+            kind: compass_model::code_graph::NodeKind::Function,
+            roles: Vec::new(),
+            name: "inside".to_string(),
+            qualified_name: "crate::inside".to_string(),
+            language: None,
+            framework: None,
+            source: Some(anchor("src/a.rs", 1, 2)),
+            details: None,
+            evidence: Vec::new(),
+        };
+        let outside = compass_model::query_contract::QueryNode {
+            id: "n:outside".to_string(),
+            name: "outside".to_string(),
+            qualified_name: "crate::outside".to_string(),
+            source: Some(anchor("other/b.rs", 1, 2)),
+            ..inside.clone()
+        };
+        let response = CodeQueryResponse {
+            schema: compass_model::query_contract::CODE_QUERY_SCHEMA_V1.to_string(),
+            operation: compass_model::query_contract::CodeQueryOperation::Callers,
+            results: Vec::new(),
+            nodes: vec![inside, outside],
+            edges: Vec::new(),
+            files: Vec::new(),
+            paths: vec![compass_model::query_contract::QueryPath {
+                id: "p1".to_string(),
+                node_ids: vec!["n:inside".to_string(), "n:outside".to_string()],
+                edge_ids: Vec::new(),
+                weakest_resolution: compass_model::provenance::ResolutionState::Exact,
+                weakest_confidence: compass_model::provenance::EvidenceConfidence::Exact,
+            }],
+            diagnostics: Vec::new(),
+            limits: Default::default(),
+            truncated: false,
+        };
+        let view = ResponseView::from(response, Some("src"));
+        assert!(
+            view.paths.is_empty(),
+            "a path with any node outside the filter must be dropped"
+        );
+        assert_eq!(view.nodes.len(), 1, "only the in-filter node is kept");
+        assert_eq!(view.nodes[0].id, "n:inside");
+    }
+
+    // A `path` filter that removes every result Compass returned must set
+    // `filtered_out`, so an empty report blames the filter rather than the symbol.
+    #[test]
+    fn path_filter_that_excludes_all_sets_filtered_out() {
+        let node = compass_model::query_contract::QueryNode {
+            id: "n:a".to_string(),
+            kind: compass_model::code_graph::NodeKind::Function,
+            roles: Vec::new(),
+            name: "a".to_string(),
+            qualified_name: "crate::a".to_string(),
+            language: None,
+            framework: None,
+            source: Some(anchor("src/a.rs", 1, 2)),
+            details: None,
+            evidence: Vec::new(),
+        };
+        let response = CodeQueryResponse {
+            schema: compass_model::query_contract::CODE_QUERY_SCHEMA_V1.to_string(),
+            operation: compass_model::query_contract::CodeQueryOperation::Callers,
+            results: Vec::new(),
+            nodes: vec![node],
+            edges: Vec::new(),
+            files: Vec::new(),
+            paths: Vec::new(),
+            diagnostics: Vec::new(),
+            limits: Default::default(),
+            truncated: false,
+        };
+
+        // Excluded by the filter -> flagged; kept -> not flagged; no filter -> not.
+        assert!(ResponseView::from(response.clone(), Some("other")).filtered_out);
+        assert!(!ResponseView::from(response.clone(), Some("src")).filtered_out);
+        assert!(!ResponseView::from(response, None).filtered_out);
+    }
+
+    // When a path filter excluded everything, the report must say so instead of
+    // advising a different symbol name (the symbol did resolve).
+    #[test]
+    fn filtered_out_report_blames_the_filter_not_the_symbol() {
+        let view = ResponseView {
+            hits: Vec::new(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            paths: Vec::new(),
+            files: Vec::new(),
+            truncated: false,
+            diagnostics: Vec::new(),
+            filtered_out: true,
+            filter_dropped_edges: false,
+            diagnostic_codes: Default::default(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let out = format_view("crate::a", QueryIntent::Explore, 20, Some("other"), &view, dir.path());
+        assert!(
+            out.contains("path") && out.contains("filter"),
+            "the report should name the path filter as the cause, got: {out}"
+        );
+        assert!(
+            !out.contains("Try a different symbol name"),
+            "the report must not suggest the symbol was wrong, got: {out}"
+        );
+    }
+
+    // An ambiguous operand must be reported as such, not as "no matches": the
+    // symbol resolved, just to more than one node, so the advice is to qualify it.
+    #[test]
+    fn ambiguous_operand_report_advises_qualifying_not_retrying() {
+        let view = ResponseView {
+            hits: Vec::new(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            paths: Vec::new(),
+            files: Vec::new(),
+            truncated: false,
+            diagnostics: vec!["Symbol \"handler\" matched 2 nodes".to_string()],
+            filtered_out: false,
+            filter_dropped_edges: false,
+            diagnostic_codes: [compass_model::query_contract::QueryDiagnosticCode::AmbiguousMatch].into_iter().collect(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let out = format_view("handler", QueryIntent::Callers, 20, None, &view, dir.path());
+        assert!(
+            out.contains("ambiguous") && out.contains("qualified name"),
+            "the report should say the operand is ambiguous and how to fix it, got: {out}"
+        );
+        assert!(
+            !out.contains("Try a different symbol name"),
+            "an ambiguous symbol is not a wrong symbol name, got: {out}"
+        );
+    }
+
+    // A reversed trail (the two symbols are connected, just the other way) must be
+    // reported as a direction problem, not as "no matches".
+    #[test]
+    fn reversed_trail_report_names_the_direction() {
+        let view = ResponseView {
+            hits: Vec::new(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            paths: Vec::new(),
+            files: Vec::new(),
+            truncated: false,
+            diagnostics: vec!["A trail connects a and b, but not in the requested direction"
+                .to_string()],
+            filtered_out: false,
+            filter_dropped_edges: false,
+            diagnostic_codes: [compass_model::query_contract::QueryDiagnosticCode::DirectionMismatch]
+                .into_iter()
+                .collect(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let out = format_view(
+            "crate::a",
+            QueryIntent::Traverse,
+            20,
+            None,
+            &view,
+            dir.path(),
+        );
+        assert!(
+            out.contains("direction"),
+            "the report should name the direction problem, got: {out}"
+        );
+        assert!(
+            !out.contains("Try a different symbol name"),
+            "a reversed trail is not a wrong symbol name, got: {out}"
+        );
+    }
+
+    // A large symbol set must be summarized in the header, not printed in full.
+    #[test]
+    fn display_target_bounds_a_large_symbol_set() {
+        let params = CompassQueryInput {
+            symbols: Some((0..300).map(|i| format!("crate::some_symbol_{i}")).collect()),
+            ..input("x")
+        };
+        let target = params.display_target(QueryIntent::Explore);
+        assert!(
+            target.chars().count() <= MAX_DISPLAY_TARGET_CHARS + 32,
+            "the display target must be bounded, got {} chars",
+            target.chars().count()
+        );
+        assert!(
+            target.contains("more)"),
+            "an omitted-tail marker must be present, got: {target}"
+        );
+    }
+
+    // A pathological single symbol must not blow past the bound either.
+    #[test]
+    fn display_target_bounds_a_single_long_symbol() {
+        let params = CompassQueryInput {
+            symbols: Some(vec!["z".repeat(5000)]),
+            ..input("x")
+        };
+        let target = params.display_target(QueryIntent::Explore);
+        assert!(
+            target.chars().count() <= MAX_DISPLAY_TARGET_CHARS + 8,
+            "a single oversized symbol must be truncated, got {} chars",
+            target.chars().count()
+        );
+    }
+
+    // A long free-form query must not blow out the report header or the tool
+    // title; whitespace is collapsed and the text is truncated.
+    #[test]
+    fn header_label_bounds_a_long_query() {
+        let long = "z".repeat(10_000);
+        let label = header_label(&long);
+        assert!(
+            label.chars().count() <= MAX_DISPLAY_TARGET_CHARS + 1,
+            "the header label must be bounded, got {} chars",
+            label.chars().count()
+        );
+        assert!(label.ends_with('…'), "truncation must be marked, got: {label}");
+
+        assert_eq!(header_label("  fn   foo \n bar "), "fn foo bar");
+
+        let params = CompassQueryInput {
+            query: Some(long),
+            ..input("x")
+        };
+        assert!(
+            params.display_target(QueryIntent::Search).chars().count()
+                <= MAX_DISPLAY_TARGET_CHARS + 1,
+            "a long query operand must be bounded in the title too"
+        );
+    }
+
+    // Every report header must bound its operand, including the `context` and
+    // `discover` reports that build their own headers.
+    #[test]
+    fn context_and_discover_headers_are_bounded() {
+        let (_tmp, root, output_dir, ast_cache_root) = make_isolated_project();
+        std::fs::write(root.join("main.rs"), "fn a() {}\n").unwrap();
+        build_compass_index(&root, &output_dir, &ast_cache_root).expect("build");
+        let engine =
+            compass_query::open(&output_dir.join("compass-out/graph.json"), None, &output_dir)
+                .expect("open after build");
+
+        let long = "x".repeat(3000);
+        for intent in [QueryIntent::Context, QueryIntent::Discover] {
+            let out = execute_query(&engine, intent, &input(&long), 20, false, &root)
+                .expect("query must succeed");
+            let header = out.lines().next().unwrap_or_default();
+            // The label is bounded to MAX_DISPLAY_TARGET_CHARS; allow the
+            // `# Compass <mode>: ` prefix on top.
+            assert!(
+                header.chars().count() <= MAX_DISPLAY_TARGET_CHARS + 32,
+                "the {intent:?} header must be bounded, got {} chars: {header}",
+                header.chars().count()
+            );
+        }
+    }
+
+    // `traverse` without a target is a caller error, surfaced clearly rather than
+    // silently degraded to a search.
+    #[test]
+    fn traverse_requires_a_target_symbol() {
+        let (_tmp, root, output_dir, ast_cache_root) = make_isolated_project();
+        build_compass_index(&root, &output_dir, &ast_cache_root).expect("build");
+        let engine =
+            compass_query::open(&output_dir.join("compass-out/graph.json"), None, &output_dir)
+                .expect("open after build");
+
+        let mut params = input("authenticate");
+        params.mode = Some("traverse".to_string());
+        let err = execute_query(
+            &engine,
+            QueryIntent::Traverse,
+            &params,
+            20,
+            false,
+            &root,
+        )
+        .expect_err("traverse without target must error");
+        assert!(
+            err.to_string().contains("target"),
+            "error should mention the missing target, got: {err}"
+        );
+    }
+
+    // `traverse` with a target but no source must be a caller error too: an empty
+    // source would otherwise reach Compass and come back as a bare "No matches",
+    // which reads like a graph result rather than a malformed call.
+    #[test]
+    fn traverse_requires_a_source_symbol() {
+        let (_tmp, root, output_dir, ast_cache_root) = make_isolated_project();
+        build_compass_index(&root, &output_dir, &ast_cache_root).expect("build");
+        let engine =
+            compass_query::open(&output_dir.join("compass-out/graph.json"), None, &output_dir)
+                .expect("open after build");
+
+        let mut params = input("");
+        params.query = None;
+        params.mode = Some("traverse".to_string());
+        params.target = Some("logout".to_string());
+        let err = execute_query(
+            &engine,
+            QueryIntent::Traverse,
+            &params,
+            20,
+            false,
+            &root,
+        )
+        .expect_err("traverse without source must error");
+        assert!(
+            err.to_string().contains("source"),
+            "error should mention the missing source, got: {err}"
+        );
+    }
+
+    // A `traverse` whose endpoints resolve but whose trail only exists in the
+    // reverse direction must name its endpoints, not leak raw `sha256:` ids in the
+    // direction-mismatch diagnostic.
+    #[test]
+    fn traverse_direction_mismatch_names_its_endpoints() {
+        let (_tmp, root, output_dir, ast_cache_root) = make_isolated_project();
+        std::fs::write(
+            root.join("main.rs"),
+            "fn authenticate(user: &str) { let _ = user; }\n\
+             fn login() { authenticate(\"x\"); }\n",
+        )
+        .unwrap();
+        build_compass_index(&root, &output_dir, &ast_cache_root).expect("build");
+        let engine =
+            compass_query::open(&output_dir.join("compass-out/graph.json"), None, &output_dir)
+                .expect("open after build");
+
+        // `authenticate` does not call `login`; the trail only exists reversed.
+        let mut params = input("crate::authenticate");
+        params.source = Some("crate::authenticate".to_string());
+        params.target = Some("crate::login".to_string());
+        let out = execute_query(&engine, QueryIntent::Traverse, &params, 20, false, &root)
+            .expect("traverse must succeed");
+
+        assert!(
+            !out.contains("sha256:"),
+            "the traverse diagnostic must not leak raw node ids, got: {out}"
+        );
+        assert!(
+            out.contains("crate::authenticate") && out.contains("crate::login"),
+            "the diagnostic should name both endpoints, got: {out}"
+        );
+        assert!(
+            out.contains("direction") && !out.contains("Try a different symbol name"),
+            "a reversed trail must be reported as a direction problem, got: {out}"
+        );
+    }
+
+    // `relabel_ids` replaces whole ids longest-first and leaves unknown text alone.
+    #[test]
+    fn relabel_ids_replaces_known_ids_only() {
+        let mut labels = HashMap::new();
+        labels.insert("sha256:aa".to_string(), "crate::a".to_string());
+        labels.insert("sha256:aab".to_string(), "crate::ab".to_string());
+        let text = "trail connects sha256:aab and sha256:aa, not sha256:zz";
+        assert_eq!(
+            relabel_ids(text, &labels),
+            "trail connects crate::ab and crate::a, not sha256:zz"
+        );
+        assert_eq!(relabel_ids(text, &HashMap::new()), text);
+    }
+
+    // `context` composes its own report from Compass's task-context API, which
+    // has no path scope; a `path` filter must be rejected rather than silently
+    // ignored (which would return an unscoped packet the caller thinks is scoped).
+    #[test]
+    fn context_rejects_a_path_filter() {
+        let (_tmp, root, output_dir, ast_cache_root) = make_isolated_project();
+        build_compass_index(&root, &output_dir, &ast_cache_root).expect("build");
+        let engine =
+            compass_query::open(&output_dir.join("compass-out/graph.json"), None, &output_dir)
+                .expect("open after build");
+
+        let params = CompassQueryInput {
+            path: Some("src".to_string()),
+            ..input("authenticate")
+        };
+        let err = execute_query(&engine, QueryIntent::Context, &params, 20, false, &root)
+            .expect_err("context with a path filter must error");
+        assert!(
+            err.to_string().contains("path"),
+            "error should name the unsupported filter, got: {err}"
         );
     }
 
@@ -3359,7 +6106,7 @@ mod tests {
         };
         let out2 = CompassQueryTool::new()
             .execute(
-                serde_json::json!({ "query": "callers of authenticate", "intent": "callers" }),
+                serde_json::json!({ "query": "callers of authenticate", "mode": "callers" }),
                 ctx2,
             )
             .await

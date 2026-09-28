@@ -151,7 +151,7 @@ pub(crate) fn raw_fallback_blocked_output() -> super::ToolOutput {
     super::ToolOutput::new(concat!(
         "✋ `agentgrep` with `allow_raw_fallback` was refused: you were just ",
         "directed to `compass_query` but have not attempted it yet.\n\n",
-        "Call `compass_query` first (same intent + optional `path`) before falling ",
+        "Call `compass_query` first (same `mode` + optional `path`) before falling ",
         "back to raw grep. Once `compass_query` has been attempted, this ",
         "restriction clears and `agentgrep` with `allow_raw_fallback` is allowed again.",
     ))
@@ -270,7 +270,7 @@ pub(crate) fn compass_redirect_output(input: &serde_json::Value) -> super::ToolO
         "⚠️ `agentgrep` was intercepted before running: `compass_query` is available \
          for this workspace and must be attempted before raw grep.\n\n\
          Do not repeat this `agentgrep` call unchanged. Instead call `compass_query` \
-         with the same intent (natural language query + optional `path`{path_text}) to search the \
+         with the same `mode` (natural language query + optional `path`{path_text}) to search the \
          code graph first{query_text}{glob_text}. The first call may build the index for this \
          workspace; that is expected.\n\n\
          Only if `compass_query` genuinely cannot answer (for example you need to search \

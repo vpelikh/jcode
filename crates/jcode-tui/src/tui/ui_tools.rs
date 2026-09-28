@@ -1207,12 +1207,57 @@ pub(super) fn get_tool_summary_with_budget(
             .and_then(|v| v.as_str())
             .map(|q| quoted_query_display(q, bounded(40).saturating_sub(2)))
             .unwrap_or_default(),
-        "compass_query" => tool
-            .input
-            .get("query")
-            .and_then(|v| v.as_str())
-            .map(|q| quoted_query_display(q, bounded(40).saturating_sub(2)))
-            .unwrap_or_default(),
+        "compass_query" => {
+            let width = bounded(40).saturating_sub(2);
+            tool.input
+                .get("query")
+                .and_then(|v| v.as_str())
+                .filter(|q| !q.trim().is_empty())
+                .map(|q| quoted_query_display(q, width))
+                .or_else(|| {
+                    // A structural call may omit `query`; show its operand(s) so
+                    // the activity line is not blank (including a `traverse`
+                    // `source`/`target` pair).
+                    let operand = tool
+                        .input
+                        .get("symbols")
+                        .and_then(|v| v.as_array())
+                        .and_then(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str())
+                                .find(|s| !s.trim().is_empty())
+                        })
+                        .map(str::to_string)
+                        .or_else(|| {
+                            let source = tool
+                                .input
+                                .get("source")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.trim().is_empty());
+                            let target = tool
+                                .input
+                                .get("target")
+                                .and_then(|v| v.as_str())
+                                .filter(|t| !t.trim().is_empty());
+                            match (source, target) {
+                                (Some(s), Some(t)) => Some(format!("{s} -> {t}")),
+                                (Some(s), None) => Some(s.to_string()),
+                                (None, Some(t)) => Some(t.to_string()),
+                                (None, None) => None,
+                            }
+                        });
+                    match operand {
+                        Some(op) => Some(quoted_query_display(&op, width)),
+                        None => tool
+                            .input
+                            .get("mode")
+                            .and_then(|v| v.as_str())
+                            .filter(|m| !m.is_empty() && *m != "search")
+                            .map(str::to_string),
+                    }
+                })
+                .unwrap_or_default()
+        }
         "browser" => browser_summary(tool, max_width),
         "gmail" => {
             let action = tool

@@ -253,7 +253,16 @@ const DEFAULT_PREFERRED_TOOLS: &str = "# Default Preferred Tools\n\n\
     For any codebase discovery, search, or indexing task, use `compass_query` first.\n\
     Only fall back to `agentgrep` when `compass_query` is unavailable. Code search is\n\
     never optional between grep and a search skill: when a search skill is present,\n\
-    use it.";
+    use it.\n\
+    \n\
+    `compass_query`'s `mode` selects a real query: `search` (default) for symbols,\n\
+    `callers`/`callees`/`impact` for a symbol's call graph, `explore` for a symbol's\n\
+    (or set of symbols') neighborhood plus verified source, `discover` to route a\n\
+    natural-language question to symbols, `traverse` for the path between two\n\
+    symbols, and `context` for a task packet (declaration + callers + callees + tests\n\
+    + impact) about one target. Prefer these structural intents over reading many\n\
+    files to orient around a symbol: they answer from the index and return the\n\
+    relevant source, so a session reads fewer files.";
 
 const SKILL_DESC_MAX_CHARS: usize = 120;
 

@@ -30,6 +30,15 @@ Only fall back to `agentgrep` when `compass_query` is unavailable. Code search i
 never optional between grep and a search skill: when a search skill is present,
 use it.
 
+`compass_query`'s `mode` selects a real query: `search` (default) for symbols,
+`callers`/`callees`/`impact` for a symbol's call graph, `explore` for a symbol's
+(or set of symbols') neighborhood plus verified source, `discover` to route a
+natural-language question to symbols, `traverse` for the path between two
+symbols, and `context` for a task packet (declaration + callers + callees + tests
++ impact) about one target. Prefer these structural intents over reading many
+files to orient around a symbol: they answer from the index and return the
+relevant source, so a session reads fewer files.
+
 ## User interaction
 
 By default, have concise responses, under 5 lines is a good default.

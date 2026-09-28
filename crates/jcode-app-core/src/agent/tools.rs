@@ -140,7 +140,50 @@ fn tool_summary_line(tool: &ToolCall) -> Option<String> {
             .input
             .get("query")
             .and_then(|v| v.as_str())
-            .and_then(agent_query_summary),
+            .and_then(agent_query_summary)
+            .or_else(|| {
+                // `query` was already handled above; here fall back to a
+                // `symbols` set (`explore`) or a `source`/`target` pair
+                // (`traverse`). Fall back to the mode name only with no operand.
+                let operand = tool
+                    .input
+                    .get("symbols")
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str())
+                            .find(|s| !s.trim().is_empty())
+                    })
+                    .map(str::to_string)
+                    .or_else(|| {
+                        // `traverse`: join source -> target when present.
+                        let source = tool
+                            .input
+                            .get("source")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.trim().is_empty());
+                        let target = tool
+                            .input
+                            .get("target")
+                            .and_then(|v| v.as_str())
+                            .filter(|t| !t.trim().is_empty());
+                        match (source, target) {
+                            (Some(s), Some(t)) => Some(format!("{s} -> {t}")),
+                            (Some(s), None) => Some(s.to_string()),
+                            (None, Some(t)) => Some(t.to_string()),
+                            (None, None) => None,
+                        }
+                    });
+                match operand {
+                    Some(op) => agent_query_summary(&op),
+                    None => tool
+                        .input
+                        .get("mode")
+                        .and_then(|v| v.as_str())
+                        .filter(|m| !m.is_empty() && *m != "search")
+                        .map(str::to_string),
+                }
+            }),
         "agentgrep" => {
             // `query` describes grep/find searches. Other modes (outline, trace,
             // smart) use different fields (`file`, `terms`), so fall back to the
@@ -277,6 +320,67 @@ mod tests {
     fn tool_summary_blank_query_is_empty() {
         let line = tool_summary_line(&tool_call("compass_query", "   "));
         assert_eq!(line, None);
+    }
+
+    /// A structural compass_query call names its operand via `query`
+    /// (single-symbol modes) or `symbols` (explore); the summary must show it,
+    /// falling back to a non-default `mode` name only when there is no operand.
+    #[test]
+    fn tool_summary_compass_structural_operand() {
+        let query_call = ToolCall {
+            name: "compass_query".to_string(),
+            input: serde_json::json!({ "mode": "callers", "query": "Registry::register" }),
+            ..Default::default()
+        };
+        assert_eq!(
+            tool_summary_line(&query_call).as_deref(),
+            Some("'Registry::register'")
+        );
+
+        let symbols_call = ToolCall {
+            name: "compass_query".to_string(),
+            input: serde_json::json!({ "mode": "explore", "symbols": ["a::b", "c::d"] }),
+            ..Default::default()
+        };
+        assert_eq!(tool_summary_line(&symbols_call).as_deref(), Some("'a::b'"));
+
+        // No operand, non-default mode -> show the mode name.
+        let mode_only = ToolCall {
+            name: "compass_query".to_string(),
+            input: serde_json::json!({ "mode": "discover", "query": "" }),
+            ..Default::default()
+        };
+        assert_eq!(tool_summary_line(&mode_only).as_deref(), Some("discover"));
+    }
+
+    /// A blank first `symbols` entry must be skipped (matching the tool, which
+    /// filters blanks) so the summary shows the first real operand instead of
+    /// dropping the line entirely.
+    #[test]
+    fn tool_summary_compass_skips_blank_symbols_entry() {
+        let call = ToolCall {
+            name: "compass_query".to_string(),
+            input: serde_json::json!({ "mode": "explore", "symbols": ["", "  ", "real::sym"] }),
+            ..Default::default()
+        };
+        assert_eq!(tool_summary_line(&call).as_deref(), Some("'real::sym'"));
+    }
+
+    /// A `traverse` call names a `source`/`target` pair; the summary must show
+    /// both (not just the mode name).
+    #[test]
+    fn tool_summary_compass_traverse_shows_both_endpoints() {
+        let call = ToolCall {
+            name: "compass_query".to_string(),
+            input: serde_json::json!({
+                "mode": "traverse", "source": "crate::a", "target": "crate::b"
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            tool_summary_line(&call).as_deref(),
+            Some("'crate::a -> crate::b'")
+        );
     }
 
     #[test]

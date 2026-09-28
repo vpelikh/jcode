@@ -22,6 +22,75 @@ blocking a turn on a multi-minute cold build.
   it. On a cold index that build can take minutes on a large repo, which is
   exactly the stall pre-warming removes.
 
+## Query modes
+
+The `mode` field is a real dispatch key: it selects which Compass query
+operation runs. It is deliberately **not** named `intent`, because `intent` is
+the harness-wide, auto-injected, display-only "why" field every tool already
+carries (see `ensure_intent_in_schema`); overloading it would collide with that
+contract and with the UI activity line. `search` (the default) is
+keyword/semantic symbol search; the structural modes resolve a symbol and return
+its relationships, so a session answers call-graph/neighborhood questions from
+the index instead of reading many raw files.
+
+| mode | Compass operation | what it returns |
+| --- | --- | --- |
+| `search` | `CodeQueryEngine::search` | ranked symbol hits + source snippets |
+| `callers` | `::callers` | one-hop inbound calls of a symbol |
+| `callees` | `::callees` | one-hop outbound calls of a symbol |
+| `impact` | `::impact` | bounded transitive impact radius |
+| `explore` | `::explore` | neighborhood symbols, connecting paths, **digest-verified source** |
+| `discover` | `::discover` | natural-language question routed to seeds + neighborhood |
+| `traverse` | `::node_trail` | the evidence path between two symbols |
+| `context` | `compass_core::build_task_context` | declaration + callers + callees + tests + impact packet |
+
+Notes:
+- Operands: `query` is the scalar operand (the search text for `search`, the
+  symbol for `callers`/`callees`/`impact`/`context`, and `traverse`'s source);
+  `symbols` (an array) is used by `explore` only, to resolve a whole set in one
+  call; `source`/`target` name `traverse`'s endpoints (`source` falls back to
+  `query`). At least one of `query`/`symbols`/`source` is required; a call with
+  no operand is a clear error, and `traverse` requires both a source and a
+  target. `path` scopes
+  structural nodes/source and `discover` (matched on whole path segments, so
+  `src` does not match `src2`), but `context` does not support it (Compass's
+  task-context API has no path scope, so a `path` there is a clear error rather
+  than a silently ignored filter); `include_heuristic` opts into lower-confidence
+  structural evidence. When a `path` filter excludes every result Compass
+  returned, the (empty) report says the filter is the cause rather than "no
+  matches", so it does not misdirect the caller to try another symbol name.
+  Likewise, when an operand resolves to several nodes (Compass `AmbiguousMatch`),
+  the empty report tells the caller to qualify the name or add a `path` instead
+  of retrying, and a reversed `traverse` (Compass `DirectionMismatch`) says to
+  swap the endpoints. Every report header (including `context` and `discover`,
+  which build their own) and the tool title are bounded in length, so a large
+  `symbols` set or a very long operand is summarized rather than printed in full;
+  a `traverse` labels both endpoints (`source -> target`).
+  Diagnostics from every mode (including `discover`, whose seed-ambiguity message
+  can name a seed by raw node id) are relabeled to symbol names where the
+  response carries the node, so a report never leaks an opaque `sha256:` id.
+  A `callers`/`callees`/`impact`/`explore` query that resolves its symbol(s) but
+  finds no relationships says so explicitly ("No callers found", etc.) rather
+  than listing only the resolved seed as if it were a result. If the `path`
+  filter merely excluded the related symbols, it says that instead of claiming
+  none exist.
+- The structural report renders the resolved node set (name, kind, roles, file),
+  the edges between them, any traversed paths, and fenced declaration snippets
+  for the first few nodes; `explore`/`context` additionally render the source
+  Compass already verified from disk. This is the "read fewer files" win: one
+  call returns real code for a neighborhood instead of the model issuing
+  separate `read` calls. A `context` report renders each source file at most
+  once even when several sections reference it.
+- Structural reports are bounded (`MAX_EDGE_ROWS`, `MAX_NODE_ROWS`,
+  `MAX_NODE_SNIPPETS`, `MAX_PATH_ROWS`, `MAX_SOURCE_FILES`) so one call cannot
+  balloon context.
+- An unknown `mode` is a clear error rather than a silent fallback to search.
+- Errors are split by cause: a caller-input problem (a missing/invalid operand,
+  an unsupported filter, or a Compass `InvalidParameter` such as an unknown
+  `discover` scope) is reported plainly, while a genuine engine/index failure
+  (corrupt artifact, graph invariant, internal) keeps the "clear the cache to
+  force a rebuild" guidance.
+
 ## Result format
 
 Each hit is rendered with its qualified name, source file, node kind, score,
@@ -157,13 +226,13 @@ shared per-project build lock and turn a normally-instant warm query into a
 multi-minute blocking build — the exact stall pre-warming targets.
 `CompassQueryTool::execute` therefore checks `prewarm_in_flight` up front and,
 when a background build is active, returns a retryable "index building in
-background" message. The guidance is intent-aware:
+background" message. The guidance is mode-aware:
 
 - **Keyword/search** queries suggest using `agentgrep` in the meantime or
   retrying `compass_query` shortly.
-- **Structural** queries (`callers`, `callees`, `impact`, `discovery`,
-  `traverse`) note that `agentgrep` cannot fully substitute and point the agent
-  at retrying `compass_query` after the warm-up.
+- **Structural** queries (`callers`, `callees`, `impact`, `explore`,
+  `traverse`, `context`) note that `agentgrep` cannot fully substitute and point
+  the agent at retrying `compass_query` after the warm-up.
 
 Covered by `execute_fails_fast_while_prewarm_in_flight` and
 `query_racing_prewarm_is_safe`.
@@ -189,8 +258,8 @@ repos:
   via the JSON graph engine. Validation only checks schema + node/edge counts;
   lookup indices build from node/file data, not communities.
 - Communities are only surfaced by the `Community` discovery scope, which jcode
-  does not use (it only sends `search`/`impact`/`discovery`/`callers`/`callees`/
-  `traverse`).
+  does not use (it sends `search`/`callers`/`callees`/`impact`/`explore`/
+  `traverse`/`context`; none selects a community scope).
 - In `compass-query`, `ranking.rs`, `recall.rs`, and `index.rs` only *store*
   `community` as an empty column / `None` on a no-cluster build; they never
   weight it in scoring or recall. So the tuning cuts build work without changing
@@ -210,9 +279,9 @@ a panic in a pre-warm thread cannot brick later dedup or cooldown.
 ## Known limitations / future work
 
 - `no_cluster`/`no_viz` cut query surface for community-scoped discovery; if a
-  future `intent` ever needs communities, they can be re-enabled. (jcode's
-  `intent` value is currently display-only — it never selects a community
-  scope — so this is not active today.)
+  future `mode` ever needs communities, they can be re-enabled. (jcode's
+  `mode` never selects a community scope — it only maps to symbol- and
+  call-graph-level Compass operations — so this is not active today.)
 - A per-SHA pre-warm happens only for the SHA a session subscribes to; if a
   session quickly switches branches, the new SHA cold-builds unless another
   subscribe pre-warms it.
