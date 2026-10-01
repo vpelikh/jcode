@@ -796,6 +796,16 @@ fn default_system_prompt_contains_code_search_guidance() {
         DEFAULT_SYSTEM_PROMPT.contains("Code search is\nnever optional between grep and a search skill"),
         "system prompt should enforce the precedence rule"
     );
+    // The mode list must stay complete as modes are added.
+    for mode in [
+        "search", "callers", "callees", "impact", "explore", "discover", "traverse", "context",
+        "affected", "orientation",
+    ] {
+        assert!(
+            DEFAULT_SYSTEM_PROMPT.contains(mode),
+            "system prompt mode list should mention `{mode}`"
+        );
+    }
 }
 
 #[test]
@@ -959,6 +969,7 @@ fn prompt_guidance_missing_or_unreadable_project_keeps_global_content() {
     });
 }
 
+#[test]
 fn default_preferred_tools_guidance_matches_system_prompt_code_search_section() {
     // The built-in preferred-tools fallback must stay in sync with the base
     // system prompt's code-search section so the rule never drifts between the

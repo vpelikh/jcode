@@ -43,15 +43,22 @@ the index instead of reading many raw files.
 | `discover` | `::discover` | natural-language question routed to seeds + neighborhood |
 | `traverse` | `::node_trail` | the evidence path between two symbols |
 | `context` | `compass_core::build_task_context` | declaration + callers + callees + tests + impact packet |
+| `affected` | `compass_query::affected_nodes` | everyone who *depends on* a node (the reverse of `impact`): inbound dependents through the requested relations, to a bounded depth |
+| `orientation` | graph summary (jcode-composed) | repo map: file/symbol counts, top-level directories, hottest symbols |
 
 Notes:
 - Operands: `query` is the scalar operand (the search text for `search`, the
-  symbol for `callers`/`callees`/`impact`/`context`, and `traverse`'s source);
+  symbol for `callers`/`callees`/`impact`/`context`/`affected`, and `traverse`'s
+  source);
   `symbols` (an array) is used by `explore` only, to resolve a whole set in one
   call; `source`/`target` name `traverse`'s endpoints (`source` falls back to
   `query`). At least one of `query`/`symbols`/`source` is required; a call with
   no operand is a clear error, and `traverse` requires both a source and a
-  target. `path` scopes
+  target. `orientation` takes no operand (it maps the whole repo), so it is
+  exempt from the operand check. `relations` (an array, defaulting to Compass's
+  `DEFAULT_AFFECTED_RELATIONS`) and `depth` (default 2, matching Compass's CLI)
+  shape `affected` only; an all-blank `relations` override falls back to the
+  default set rather than silently following no relations. `path` scopes
   structural nodes/source and `discover` (matched on whole path segments, so
   `src` does not match `src2`), but `context` does not support it (Compass's
   task-context API has no path scope, so a `path` there is a clear error rather
@@ -259,11 +266,61 @@ repos:
   lookup indices build from node/file data, not communities.
 - Communities are only surfaced by the `Community` discovery scope, which jcode
   does not use (it sends `search`/`callers`/`callees`/`impact`/`explore`/
-  `traverse`/`context`; none selects a community scope).
+  `discover`/`traverse`/`context`/`affected`/`orientation`; none selects a
+  community scope). `orientation` in particular composes its map from the graph
+  rather than a community artifact (see below).
 - In `compass-query`, `ranking.rs`, `recall.rs`, and `index.rs` only *store*
   `community` as an empty column / `None` on a no-cluster build; they never
   weight it in scoring or recall. So the tuning cuts build work without changing
   result quality on any path jcode uses.
+
+### The `affected`/`orientation` graph load
+
+`affected` and `orientation` do not use `CodeQueryEngine` (which the other modes
+open); they use Compass's raw-graph surfaces (`compass_query::resolve_seed` +
+`affected_nodes`, and raw node/edge summaries; jcode renders the report itself so
+it can bound rows, apply `path`, and report in-scope counts), so they load
+`graph.json` through
+`compass_model::Graph::load_for_affected`. That is a bounded **compact
+projection** (only the attributes affected traversal, seed resolution, and
+rendering read) which Compass caches next to `graph.json` keyed by the graph
+signature. It runs on a blocking thread inside the same `with_build_lock`-
+serialized path the engine open uses, so concurrent calls stay safe and other
+modes are not slowed (the load happens only for these two modes).
+
+This load is **not** cheap, so two measures keep it off the query path:
+
+- **The engine is never opened for these modes.** Opening `CodeQueryEngine` on a
+  large repo is far slower than the graph load itself (measured ~58s on the
+  240MB graph, versus ~13s cold / microseconds warm for the graph). The
+  graph-only modes therefore use `ensure_fresh_graph`, which checks freshness
+  the same way the engine path does (`index_is_fresh`: git-SHA sidecar plus a
+  throttled mtime walk) and rebuilds a cold/stale index exactly like the engine
+  path, then loads the graph only when the index is actually served — never
+  opening the engine. On the real repo this cut a scoped `affected` call from
+  ~72s (engine open + graph load) to ~14s, and a warm `orientation` call to
+  ~0.16s.
+- **The loaded graph is cached process-globally**, keyed by `(graph_path, mtime)`
+  (`GRAPH_CACHE` in `compass_query.rs`), and shared as an `Arc<Graph>` so
+  repeated calls re-pay nothing. Measured on the 240MB graph: ~22s for the first
+  load and ~13s with Compass's compact cache; a warm cache hit is microseconds.
+  A rebuild (new mtime) transparently invalidates the entry, the entry is
+  inserted only after re-confirming the mtime is unchanged (so a concurrent
+  rebuild cannot leave a stale entry), and inserting evicts other entries for
+  the same path so at most one (large) graph per project is retained.
+
+### `orientation` builds a community-free map (trade-off)
+
+`orientation` summarizes the repository **without** communities. The alternative
+was to build the index with `no_cluster = false` so `analysis.json`/community
+columns land in the cache, but that would add a clustering pass to *every*
+pre-warm and cold build for *every* user just to serve one mode. Instead the map
+is derived from the graph jcode already has: distinct-file and symbol counts
+(the file count dedupes `source_file` paths, so it does not under-report when a
+graph has source-anchored nodes but no dedicated `file` node), top-level
+directories by file count, and the most-connected ("hottest") symbols. If a
+community-scoped map later proves worth the build cost, clustering can be
+re-enabled behind a config flag and the map can consume it.
 
 ## Concurrency safety
 
@@ -282,6 +339,16 @@ a panic in a pre-warm thread cannot brick later dedup or cooldown.
   future `mode` ever needs communities, they can be re-enabled. (jcode's
   `mode` never selects a community scope — it only maps to symbol- and
   call-graph-level Compass operations — so this is not active today.)
+  `orientation` is the one mode that *would* benefit from communities (a
+  clustered repo map), but it deliberately summarizes the graph without them to
+  avoid paying a clustering pass on every build; see "`orientation` builds a
+  community-free map" above. **Follow-up: community-backed `orientation`**
+  (deferred, not implemented) — design below.
+- `affected` follows a fixed relation set (`DEFAULT_AFFECTED_RELATIONS`) unless
+  the caller passes `relations`; it does not infer relations from the language.
+  A relation Compass did not extract (e.g. a dynamic dispatch it could not
+  resolve) will not appear, so an empty `affected` report means "no *indexed*
+  dependents", not "provably nothing depends on this".
 - A per-SHA pre-warm happens only for the SHA a session subscribes to; if a
   session quickly switches branches, the new SHA cold-builds unless another
   subscribe pre-warms it.
@@ -291,6 +358,40 @@ a panic in a pre-warm thread cannot brick later dedup or cooldown.
   force `compass_query` usage but risks false-blocking legitimate out-of-index
   searches. Revisit only if post-ship measurement shows fallback reliance is
   unchanged despite the source-snippet results.
+
+### Follow-up (deferred): community-backed `orientation`
+
+Not implemented. A richer `orientation` would list Compass's *communities*
+(labelled module clusters), "god nodes" (hubs), and cross-community surprises,
+instead of only top-level directories and hottest symbols. Compass already
+produces this: `compass_core::cluster_existing_graph` rewrites `graph.json`'s
+nodes with `community` metadata and emits `graph-overview.json` (labels, hubs,
+cohesion, surprises, suggested questions) plus `labels.json`. The lower-level
+`compass_graph::cluster` / `build_communities` compute the same communities
+in memory (no files written).
+
+**Measured cost of enabling it** (real jcode repo, 240MB graph, 91k nodes;
+temp-copy, non-destructive probe):
+
+| approach | measured |
+| --- | --- |
+| default build-time (`no_cluster = false`) every build | rejected: adds clustering to every pre-warm/cold build for all users (the exact cost `no_cluster` was set to avoid) |
+| `cluster_existing_graph` on the existing graph | **~81s** total: load 21.6s, cluster 7.7s, analyze 1.3s, report 49.9s, export 3.3s; 881 communities |
+
+The dominant terms are the redundant graph load (21.6s) and the one-shot
+`report` phase (49.9s), not the clustering itself (7.7s).
+
+**Recommended design (if pursued):** gate behind a config flag (e.g.
+`tools.compass_communities`, default **off**); on first use run clustering
+lazily once and cache the result next to the graph keyed by mtime (like
+`GRAPH_CACHE`) so it is paid once. To avoid the 49.9s one-shot report, call the
+lower-level `build_communities` (which takes a `code_graph::GraphDocument`, not
+the `model::Graph` the graph modes hold, so it needs that typed document rather
+than truly reusing the loaded graph) instead of `cluster_existing_graph`.
+`orientation` then renders community labels + hubs when present and falls back to
+the current directory/hottest-symbol map when not. Cost stays zero for users who
+never ask. This changes product cost/behavior and adds a config surface, so it
+needs sign-off on the flag name and default before implementing.
 
 ## Integration with compass-first enforcement
 

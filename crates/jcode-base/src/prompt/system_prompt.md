@@ -34,8 +34,10 @@ use it.
 `callers`/`callees`/`impact` for a symbol's call graph, `explore` for a symbol's
 (or set of symbols') neighborhood plus verified source, `discover` to route a
 natural-language question to symbols, `traverse` for the path between two
-symbols, and `context` for a task packet (declaration + callers + callees + tests
-+ impact) about one target. Prefer these structural intents over reading many
+symbols, `context` for a task packet (declaration + callers + callees + tests
++ impact) about one target, `affected` for everyone who depends on a symbol
+(the reverse of `impact`), and `orientation` for a bounded repository map.
+Prefer these structural intents over reading many
 files to orient around a symbol: they answer from the index and return the
 relevant source, so a session reads fewer files.
 

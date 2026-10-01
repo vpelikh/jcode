@@ -259,8 +259,10 @@ const DEFAULT_PREFERRED_TOOLS: &str = "# Default Preferred Tools\n\n\
     `callers`/`callees`/`impact` for a symbol's call graph, `explore` for a symbol's\n\
     (or set of symbols') neighborhood plus verified source, `discover` to route a\n\
     natural-language question to symbols, `traverse` for the path between two\n\
-    symbols, and `context` for a task packet (declaration + callers + callees + tests\n\
-    + impact) about one target. Prefer these structural intents over reading many\n\
+    symbols, `context` for a task packet (declaration + callers + callees + tests\n\
+    + impact) about one target, `affected` for everyone who depends on a symbol\n\
+    (the reverse of `impact`), and `orientation` for a bounded repository map.\n\
+    Prefer these structural intents over reading many\n\
     files to orient around a symbol: they answer from the index and return the\n\
     relevant source, so a session reads fewer files.";
 

@@ -54,11 +54,12 @@ use compass_model::query_contract::{
     CallRequest, CodeQueryLimits, CodeQueryResponse, ExploreRequest, ImpactRequest,
     NodeTrailRequest, SearchRequest,
 };
+use compass_model::{Graph, NodeIndex};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use super::{Tool, ToolContext, ToolOutput};
@@ -149,6 +150,14 @@ struct CompassQueryInput {
     /// Explicit target symbol for `traverse`.
     #[serde(default)]
     target: Option<String>,
+    /// Edge relations to follow for `mode=affected` (defaults to Compass's
+    /// [`DEFAULT_AFFECTED_RELATIONS`]). Other modes ignore it.
+    #[serde(default)]
+    relations: Option<Vec<String>>,
+    /// Traversal depth bound for `mode=affected` (default 2). Other modes ignore
+    /// it; `limit` remains the separate result-count bound.
+    #[serde(default)]
+    depth: Option<usize>,
     /// Include heuristic (lower-confidence) structural evidence.
     #[serde(default)]
     include_heuristic: Option<bool>,
@@ -232,25 +241,36 @@ fn header_label(query: &str) -> String {
 /// [`MAX_DISPLAY_TARGET_CHARS`], then `… (+N more)` when some were omitted. A
 /// single oversized first entry is hard-truncated so the label stays bounded.
 fn summarize_symbols(symbols: &[String]) -> String {
+    summarize_list(symbols, MAX_DISPLAY_TARGET_CHARS)
+}
+
+/// Join `items` with `, `, bounded to `max_chars`: always shows at least the
+/// first entry (truncating it if it alone overflows) and appends `… (+N more)`
+/// when the rest does not fit, so a caller-supplied list can never balloon a
+/// header line.
+fn summarize_list(items: &[String], max_chars: usize) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
     // Always show at least the first entry, truncating it if it alone overflows.
-    let first = &symbols[0];
-    let first = if first.len() > MAX_DISPLAY_TARGET_CHARS {
-        format!("{}…", crate::util::truncate_str(first, MAX_DISPLAY_TARGET_CHARS))
+    let first = &items[0];
+    let first = if first.len() > max_chars {
+        format!("{}…", crate::util::truncate_str(first, max_chars))
     } else {
         first.clone()
     };
     let mut out = first;
     let mut shown = 1usize;
-    for symbol in &symbols[1..] {
-        if out.len() + 2 + symbol.len() > MAX_DISPLAY_TARGET_CHARS {
+    for item in &items[1..] {
+        if out.len() + 2 + item.len() > max_chars {
             break;
         }
         out.push_str(", ");
-        out.push_str(symbol);
+        out.push_str(item);
         shown += 1;
     }
-    if shown < symbols.len() {
-        out.push_str(&format!(" … (+{} more)", symbols.len() - shown));
+    if shown < items.len() {
+        out.push_str(&format!(" … (+{} more)", items.len() - shown));
     }
     out
 }
@@ -299,15 +319,15 @@ impl Tool for CompassQueryTool {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Search text (mode=search) or the symbol to resolve (callers/callees/impact/context, and traverse's source)."
+                    "description": "Search text (mode=search) or the symbol for structural modes; traverse source."
                 },
                 "mode": {
                     "type": "string",
                     "enum": [
                         "search", "callers", "callees", "impact", "explore",
-                        "discover", "traverse", "context"
+                        "discover", "traverse", "context", "affected", "orientation"
                     ],
-                    "description": "search; callgraph (callers/callees/impact); explore; discover; traverse; context. See Code search."
+                    "description": "search, callers, callees, impact, explore, discover, traverse, context, affected, orientation."
                 },
                 "symbols": {
                     "type": "array",
@@ -330,9 +350,18 @@ impl Tool for CompassQueryTool {
                     "type": "integer",
                     "description": "Maximum results/nodes to return."
                 },
+                "relations": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Relations for mode=affected (default: calls, references, imports, inherits, ...)."
+                },
+                "depth": {
+                    "type": "integer",
+                    "description": "Traversal depth for mode=affected (default 2; 0 means no traversal). Ignored by other modes."
+                },
                 "include_heuristic": {
                     "type": "boolean",
-                    "description": "Include lower-confidence heuristic structural evidence. Ignored by mode=context."
+                    "description": "Include lower-confidence heuristic evidence. Ignored by context/affected/orientation."
                 }
             }
         })
@@ -396,42 +425,82 @@ impl Tool for CompassQueryTool {
             })));
         }
 
-        // Open (or build) the Compass query engine. A cold or stale index is
-        // (re)built in-process via Compass's library API. The build can take
-        // seconds for a large project, so it runs on a blocking thread; the
-        // project flock serializes concurrent builds, keeping the concurrency-
-        // safe contract intact.
-        let cache_edge = cache.clone();
-        let engine_res: std::result::Result<compass_query::CodeQueryEngine, (String, String)> =
-            tokio::task::spawn_blocking({
-                let edge = cache_edge.clone();
-                let working_dir = working_dir.clone();
-                move || ensure_fresh_engine(&edge, &working_dir)
+        let effective_limit = params.limit.unwrap_or(20).max(1);
+        let include_heuristic = params.include_heuristic.unwrap_or(false);
+        let graph_only = matches!(mode, QueryIntent::Affected | QueryIntent::Orientation);
+
+        // The graph-only modes (`affected`/`orientation`) use Compass's raw
+        // `Graph` (its affected traversal and repo-map surfaces live there) and
+        // never touch the engine, so they take an engine-free path: ensure the
+        // index is fresh and load the (process-globally cached) graph on a
+        // blocking thread under the project flock. Skipping the engine open is
+        // deliberate and load-bearing — on a large repo that open costs ~58s and
+        // dominates the call, while the cached graph load is microseconds.
+        let graph: Option<Arc<Graph>> = if graph_only {
+            let cache_edge = cache.clone();
+            let working_dir = working_dir.clone();
+            let loaded = tokio::task::spawn_blocking(move || {
+                ensure_fresh_graph(&cache_edge, &working_dir)
             })
             .await
-            .expect("compass index task panicked");
-        let engine = match engine_res {
-            Ok(engine) => engine,
-            Err((open_err, build_err)) => {
-                return Ok(ToolOutput::new(format_index_unavailable(
-                    &open_err, &build_err,
-                )));
+            .expect("compass graph task panicked");
+            match loaded {
+                Ok(graph) => Some(graph),
+                Err((open_err, build_err)) => {
+                    return Ok(ToolOutput::new(format_index_unavailable(
+                        &open_err, &build_err,
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
+        // The engine-backed modes open (or build) the Compass query engine. A cold
+        // or stale index is (re)built in-process via Compass's library API. The
+        // build can take seconds for a large project, so it runs on a blocking
+        // thread; the project flock serializes concurrent builds, keeping the
+        // concurrency-safe contract intact.
+        let engine = if graph_only {
+            None
+        } else {
+            let cache_edge = cache.clone();
+            let engine_res: std::result::Result<compass_query::CodeQueryEngine, (String, String)> =
+                tokio::task::spawn_blocking({
+                    let edge = cache_edge.clone();
+                    let working_dir = working_dir.clone();
+                    move || ensure_fresh_engine(&edge, &working_dir)
+                })
+                .await
+                .expect("compass index task panicked");
+            match engine_res {
+                Ok(engine) => Some(engine),
+                Err((open_err, build_err)) => {
+                    return Ok(ToolOutput::new(format_index_unavailable(
+                        &open_err, &build_err,
+                    )));
+                }
             }
         };
 
-        let effective_limit = params.limit.unwrap_or(20).max(1);
-        let include_heuristic = params.include_heuristic.unwrap_or(false);
         let result = execute_query(
-            &engine,
+            engine.as_ref(),
             mode,
             &params,
             effective_limit,
             include_heuristic,
             &working_dir,
+            graph.as_deref(),
         );
 
         let reported_limit = effective_limit;
-        let label = params.display_target(mode);
+        // `orientation` has no operand; label it by mode so the title/error is
+        // never blank (the other modes name the symbol/query they targeted).
+        let label = if mode == QueryIntent::Orientation {
+            "orientation".to_string()
+        } else {
+            params.display_target(mode)
+        };
         match result {
             Ok(output) => Ok(ToolOutput::new(output)
                 .with_title(format!("compass_query: {label}"))
@@ -752,6 +821,58 @@ fn lock_cached<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Process-global cache of the raw `compass_model::Graph` used by the graph-only
+/// modes (`affected`/`orientation`), keyed by `(graph_path, mtime)`. The
+/// non-`CodeQueryEngine` modes load the graph through
+/// [`Graph::load_for_affected`]; on a large repo that is a multi-second load
+/// (measured ~22s cold, ~13s with Compass's compact cache on a 240MB graph), so
+/// repeated calls in one process must not re-pay it. Keying on the file mtime
+/// means a rebuild (new `graph.json`) transparently invalidates the entry.
+type GraphCacheKey = (PathBuf, SystemTime);
+static GRAPH_CACHE: OnceLock<Mutex<HashMap<GraphCacheKey, Arc<Graph>>>> = OnceLock::new();
+
+/// Return the cached graph for this exact `(path, mtime)` without loading, if
+/// present. A hit also proves the on-disk graph is unchanged (a rebuild changes
+/// the mtime), so it is a direct cache hit for [`load_graph_cached`].
+fn graph_cache_fresh(graph_path: &Path, mtime: SystemTime) -> Option<Arc<Graph>> {
+    lock_cached(GRAPH_CACHE.get_or_init(|| Mutex::new(HashMap::new())))
+        .get(&(graph_path.to_path_buf(), mtime))
+        .cloned()
+}
+
+/// Load (or reuse) the raw graph for the graph-only modes. Returns the shared
+/// `Arc<Graph>` so callers never clone the (large) structure. Must be called on a
+/// blocking thread and under the project build lock, since the underlying loader
+/// may write Compass's compact projection cache next to `graph.json`.
+fn load_graph_cached(graph_path: &Path) -> Result<Arc<Graph>, String> {
+    let mtime = std::fs::metadata(graph_path)
+        .and_then(|m| m.modified())
+        .map_err(|e| format!("could not stat {}: {e}", graph_path.display()))?;
+    // A loaded entry for this exact `(path, mtime)` also proves the on-disk graph
+    // is unchanged, so it is reused without reloading.
+    if let Some(graph) = graph_cache_fresh(graph_path, mtime) {
+        return Ok(graph);
+    }
+    let key = (graph_path.to_path_buf(), mtime);
+    let graph = Arc::new(
+        Graph::load_for_affected(graph_path)
+            .map_err(|e| format!("could not load the Compass graph: {e}"))?,
+    );
+    // Re-stat and only insert when the file is unchanged, so a concurrent
+    // rebuild cannot leave a stale entry under the new mtime's key. On insert,
+    // evict any entry for the *same* path with a different mtime: a rebuild
+    // supersedes the old graph, and keeping one graph per graph file bounds the
+    // cache to the number of distinct projects a process touches (the graph is
+    // large, so retaining every historical build would leak memory in a
+    // long-lived daemon).
+    if std::fs::metadata(graph_path).and_then(|m| m.modified()).ok() == Some(mtime) {
+        let mut cache = lock_cached(GRAPH_CACHE.get_or_init(|| Mutex::new(HashMap::new())));
+        cache.retain(|(path, _), _| path != graph_path);
+        cache.insert(key, graph.clone());
+    }
+    Ok(graph)
+}
+
 /// Last time a correct staleness scan proved `cache_dir` fresh, keyed by cache dir
 /// so each project is throttled independently. Bounded in size by the number of
 /// distinct projects indexed in this process.
@@ -1047,95 +1168,24 @@ fn ensure_fresh_engine(
     cache: &CompassCachePaths,
     working_dir: &Path,
 ) -> std::result::Result<compass_query::CodeQueryEngine, (String, String)> {
-    let CompassCachePaths {
-        output_dir,
-        graph_path,
-        ast_cache_root,
-        build_lock_dir,
-        is_shared,
-    } = cache;
-    with_build_lock(build_lock_dir, || {
-        // Open an existing index. Reuse it only when source and branch haven't
-        // moved past it. The mtime scan that proves freshness is throttled to
-        // once per STALE_RESCAN_TTL per project (see `recently_scanned`/
-        // `record_scan`) so a busy agent doesn't re-stat the whole source tree
-        // on every call. Correctness holds because a scan always runs before
-        // reuse once the window lapses (or if no scan has been recorded yet for
-        // this cache), so a source change is caught by the first query after the
-        // window, never served indefinitely. A branch change bypasses the TTL
-        // and forces a rebuild immediately.
-        //
-        // `current_sha` is resolved lazily only when we actually have to
-        // reconcile staleness against an open index: it shells out to `git`, so
-        // we avoid that per query on the warm, recently-scanned path.
-        match compass_query::open(graph_path, None, output_dir) {
-            Ok(engine) => {
-                // Reuse the index only when nothing has moved past it.
-                // `index_is_stale` checks the cached git SHA first, so a
-                // branch/commit switch is detected immediately and bypasses the
-                // throttled mtime walk; otherwise it relies on the per-cache
-                // STALE_RESCAN_TTL to skip the walk, and finally walks the tree.
-                let current_sha = current_git_sha_cached(working_dir);
-                if !index_is_stale(working_dir, graph_path, current_sha.as_deref(), output_dir, *is_shared) {
-                    if !is_shared {
-                        record_scan(output_dir);
-                    }
-                    return Ok(engine);
-                }
-
-                // The shared index is keyed by the committed SHA and holds no
-                // worktree's uncommitted edits (see index_is_stale). For shared
-                // caches this branch is only reachable in the transient window
-                // after a checkout where the cached SHA lags HEAD. The output
-                // dir is already keyed by the current SHA, so we do NOT delete
-                // it here: Compass republishes atomically on rebuild, and
-                // removing it could destroy another worktree's still-in-use
-                // index on the same SHA. Non-shared caches (single output that
-                // evolves in place) still need a clean discard on source edits.
-                drop(engine);
-                if !is_shared {
-                    let _ = std::fs::remove_dir_all(output_dir);
-                    // Don't remove .compass-build.lock here - it's safe to leave
-                    // and removing it while holding the lock could block other
-                    // worktrees.
-                    let _ = std::fs::remove_file(output_dir.join(GIT_SHA_FILE));
-                }
-            }
-            Err(_) => {
-                // Missing or corrupt: rebuild below (current_sha is captured by
-                // build_compass_index itself).
+    let graph_path = &cache.graph_path;
+    let output_dir = &cache.output_dir;
+    with_build_lock(&cache.build_lock_dir, || {
+        // Decide freshness without opening the engine: `index_is_fresh` uses the
+        // git SHA sidecar and a throttled mtime walk, so opening a stale index
+        // first would pay the (large) open only to discard it and rebuild.
+        // Gate on the graph existing because `index_is_fresh` reports "fresh"
+        // for a missing index.
+        if graph_path.is_file() && index_is_fresh(cache, working_dir) {
+            // Fresh on disk: open and return. A fresh-but-unopenable index is a
+            // corrupt artifact, so fall through to rebuild rather than erroring.
+            if let Ok(engine) = compass_query::open(graph_path, None, output_dir) {
+                return Ok(engine);
             }
         }
-
-        // Build (covers missing, corrupt, stale, or branch change). `cache_root`
-        // lives under the project's branch-agnostic `.ast-cache` dir and is shared
-        // across all SHAs of the repo, so a branch switch only re-extracts the
-        // files that actually changed instead of rebuilding cold.
-        // `build_compass_index` also records the current git SHA sidecar, so a
-        // later branch switch is detected without walking the tree. For shared
-        // caches, the scan is intentionally skipped so each caller still
-        // validates freshness against its own working directory.
-        build_compass_index(working_dir, output_dir, ast_cache_root)
-            .map_err(|e| ("existing index missing or stale".to_string(), e.to_string()))?;
-        if !is_shared {
-            record_scan(output_dir);
-        } else {
-            // Prune unreachable, aged-out per-SHA graphs so the shared cache
-            // does not grow unbounded as the user visits many commits. Always
-            // keep the current HEAD's dir, even a detached HEAD with no ref.
-            //
-            // Run the prune even when the current SHA cannot be resolved (git
-            // unavailable, transient git failure): the hard cap must still bound
-            // the cache in that case, which is why `prune_stale_sha_outputs`
-            // treats an unknown reachability as "everything reachable" and caps
-            // by count. An empty `current_sha` (never equal to a real 40/64-hex
-            // SHA) means no dir is name-protected, but the just-built dir has the
-            // newest mtime and survives the cap's newest-kept rule.
-            if let Some(project_root) = output_dir.parent() {
-                let current_sha = current_git_sha_cached(working_dir).unwrap_or_default();
-                prune_stale_sha_outputs(project_root, working_dir, &current_sha);
-            }
-        }
+        // Missing, corrupt, or stale.
+        discard_stale_output(cache);
+        rebuild_stale_index(cache, working_dir)?;
         compass_query::open(graph_path, None, output_dir).map_err(|e| {
             (
                 "existing index missing or stale".to_string(),
@@ -1143,6 +1193,111 @@ fn ensure_fresh_engine(
             )
         })
     })
+}
+
+/// Ensure the project's Compass index exists and is fresh, returning the loaded
+/// raw graph. This is the engine-free counterpart of [`ensure_fresh_engine`],
+/// used by the graph-only modes (`affected`/`orientation`).
+///
+/// Those modes never touch `CodeQueryEngine`, and opening it on a large repo is
+/// prohibitively slow (measured ~58s on a 240MB graph, dominating the whole
+/// call), so this checks freshness by loading the compact affected projection
+/// instead — which the mode needs anyway and which [`load_graph_cached`] then
+/// reuses. The staleness logic is otherwise identical to [`ensure_fresh_engine`]:
+/// the same `index_is_stale` test, the same throttled scan, and the same rebuild
+/// under the project flock.
+fn ensure_fresh_graph(
+    cache: &CompassCachePaths,
+    working_dir: &Path,
+) -> std::result::Result<Arc<Graph>, (String, String)> {
+    let graph_path = &cache.graph_path;
+    with_build_lock(&cache.build_lock_dir, || {
+        // Decide freshness *before* paying the (large) load: `load_graph_cached`
+        // on a stale index would parse a graph we then throw away (~seconds on a
+        // large repo). The freshness check is the same `index_is_fresh` the
+        // engine path uses, so the two cannot drift, and it stays throttled (a
+        // warm, cached graph is still cheap to serve). Gate on the graph
+        // existing first, because `index_is_fresh` reports "fresh" for a missing
+        // index; the cold case is the rebuild below, not here.
+        if graph_path.is_file() && index_is_fresh(cache, working_dir) {
+            // Fresh on disk: load and return. A fresh-but-unloadable graph is a
+            // corrupt artifact, so fall through to rebuild rather than erroring
+            // (matching `ensure_fresh_engine`).
+            if let Ok(graph) = load_graph_cached(graph_path) {
+                return Ok(graph);
+            }
+        }
+        discard_stale_output(cache);
+        rebuild_stale_index(cache, working_dir)?;
+        load_graph_cached(graph_path)
+            .map_err(|e| ("existing index missing or stale".to_string(), e))
+    })
+}
+
+/// True when the index at `cache` is fresh for `working_dir`. Shared by
+/// [`ensure_fresh_engine`] and [`ensure_fresh_graph`] so both paths agree on
+/// staleness. Records the scan timestamp for non-shared caches.
+fn index_is_fresh(cache: &CompassCachePaths, working_dir: &Path) -> bool {
+    let current_sha = current_git_sha_cached(working_dir);
+    let fresh = !index_is_stale(
+        working_dir,
+        &cache.graph_path,
+        current_sha.as_deref(),
+        &cache.output_dir,
+        cache.is_shared,
+    );
+    if fresh && !cache.is_shared {
+        record_scan(&cache.output_dir);
+    }
+    fresh
+}
+
+/// Discard a stale/unusable output before a rebuild, preserving the shared-cache
+/// guarantees. Shared caches are keyed by the committed SHA and republished
+/// atomically by Compass, and the dir may still be in use by another worktree on
+/// the same SHA, so it is never deleted. A non-shared cache evolves in place and
+/// needs a clean discard on source edits. Callers must have dropped any open
+/// engine/graph first.
+fn discard_stale_output(cache: &CompassCachePaths) {
+    if !cache.is_shared {
+        let _ = std::fs::remove_dir_all(&cache.output_dir);
+        // Don't remove .compass-build.lock here - it's safe to leave and removing
+        // it while holding the lock could block other worktrees.
+        let _ = std::fs::remove_file(cache.output_dir.join(GIT_SHA_FILE));
+    }
+}
+
+/// Rebuild the index for `cache`, then apply the post-build bookkeeping both
+/// freshness paths need: record the scan (non-shared) or prune aged-out per-SHA
+/// graphs (shared). `build_compass_index` records the current git SHA sidecar,
+/// so a later branch switch is detected without walking the tree. The scan is
+/// deliberately skipped for shared caches so each caller validates freshness
+/// against its own working directory.
+fn rebuild_stale_index(
+    cache: &CompassCachePaths,
+    working_dir: &Path,
+) -> std::result::Result<(), (String, String)> {
+    build_compass_index(working_dir, &cache.output_dir, &cache.ast_cache_root)
+        .map_err(|e| ("existing index missing or stale".to_string(), e.to_string()))?;
+    if !cache.is_shared {
+        record_scan(&cache.output_dir);
+    } else {
+        // Prune unreachable, aged-out per-SHA graphs so the shared cache does
+        // not grow unbounded as the user visits many commits. Always keep the
+        // current HEAD's dir, even a detached HEAD with no ref.
+        //
+        // Run the prune even when the current SHA cannot be resolved (git
+        // unavailable, transient git failure): the hard cap must still bound the
+        // cache, which is why `prune_stale_sha_outputs` treats an unknown
+        // reachability as "everything reachable" and caps by count. An empty
+        // `current_sha` means no dir is name-protected, but the just-built dir
+        // has the newest mtime and survives the cap's newest-kept rule.
+        if let Some(project_root) = cache.output_dir.parent() {
+            let current_sha = current_git_sha_cached(working_dir).unwrap_or_default();
+            prune_stale_sha_outputs(project_root, working_dir, &current_sha);
+        }
+    }
+    Ok(())
 }
 
 /// Build a Compass knowledge-graph index for the project in-process, using the
@@ -1465,6 +1620,18 @@ enum QueryIntent {
     /// Natural-language discovery: route the query to seeds and a bounded
     /// structural neighborhood.
     Discover,
+    /// "What depends on this?" — the *reverse* of `impact`: walk inbound edges
+    /// (callers, importers, implementors, renderers, ...) from a seed out to a
+    /// bounded depth, so a session can size a change's blast radius. Backed by
+    /// Compass's `affected_nodes` traversal over the raw `compass_model::Graph`
+    /// rather than `CodeQueryEngine`.
+    Affected,
+    /// Repository map: a bounded, community-free overview (file/symbol counts,
+    /// top-level directories, hottest symbols) so a session can orient in an
+    /// unfamiliar repo. jcode builds the index with `no_cluster`/`no_viz`, so no
+    /// community/analysis artifact exists to summarize; this composes its own
+    /// map from the graph instead.
+    Orientation,
 }
 
 impl QueryIntent {
@@ -1481,10 +1648,14 @@ impl QueryIntent {
             "discover" | "discovery" => Ok(Self::Discover),
             "traverse" | "trail" | "path" | "node_trail" => Ok(Self::Traverse),
             "context" | "task_context" => Ok(Self::Context),
+            "affected" | "affected_nodes" => Ok(Self::Affected),
+            "orientation" | "repo_map" | "repo-map" | "map" | "overview" => {
+                Ok(Self::Orientation)
+            }
             other => Err(anyhow!(
                 "unknown compass_query mode {other:?}; expected one of \
                  search, callers, callees, impact, explore, discover, \
-                 traverse, context"
+                 traverse, context, affected, orientation"
             )),
         }
     }
@@ -1499,6 +1670,8 @@ impl QueryIntent {
             Self::Traverse => "traverse",
             Self::Context => "context",
             Self::Discover => "discover",
+            Self::Affected => "affected",
+            Self::Orientation => "orientation",
         }
     }
 
@@ -1670,12 +1843,13 @@ fn map_task_context_error(e: compass_core::TaskContextError) -> anyhow::Error {
 /// Run a query through the Compass `CodeQueryEngine`, dispatching on `mode`.
 /// Returns a model-ready formatted report.
 fn execute_query(
-    engine: &compass_query::CodeQueryEngine,
+    engine: Option<&compass_query::CodeQueryEngine>,
     intent: QueryIntent,
     params: &CompassQueryInput,
     limit: usize,
     include_heuristic: bool,
     working_dir: &Path,
+    graph: Option<&Graph>,
 ) -> Result<String, anyhow::Error> {
     let limits = CodeQueryLimits {
         // Clamp instead of casting: a pathological usize > u32::MAX must not
@@ -1698,7 +1872,10 @@ fn execute_query(
     // Reject an operand-less call with a clear message rather than silently
     // searching for the empty string. `discover` uses its own non-empty check;
     // `traverse` names its source/target explicitly below.
-    if intent != QueryIntent::Discover && intent != QueryIntent::Traverse {
+    if intent != QueryIntent::Discover
+        && intent != QueryIntent::Traverse
+        && intent != QueryIntent::Orientation
+    {
         let operand = match intent {
             // `explore` takes a set; any one entry satisfies the check.
             QueryIntent::Explore => params
@@ -1740,6 +1917,36 @@ fn execute_query(
             .min(COMPASS_MAX_CANDIDATES as u32),
         max_source_bytes: MAX_VERIFIED_SOURCE_BYTES,
         ..limits
+    };
+
+    // `affected` and `orientation` operate on the raw `compass_model::Graph`
+    // (Compass's affected traversal and repo-map surfaces live there), not on
+    // `CodeQueryEngine`. Dispatch them here, before the engine-response match,
+    // and return directly; the engine is `None` for these modes (the caller
+    // never opens it). Callers that drive `execute_query` without a graph get a
+    // clear "unavailable" message rather than a panic.
+    if matches!(intent, QueryIntent::Affected | QueryIntent::Orientation) {
+        let Some(graph) = graph else {
+            return Err(anyhow!(
+                "compass_query mode={} needs the Compass graph, which is not \
+                 available in this context",
+                intent.as_str()
+            ));
+        };
+        return match intent {
+            QueryIntent::Affected => execute_affected(graph, &query, params, limit),
+            QueryIntent::Orientation => execute_orientation(graph, params, limit),
+            _ => unreachable!("guarded above"),
+        };
+    }
+
+    // Every remaining mode is engine-backed; the caller opens the engine for
+    // them (and passes `None` only for the graph modes handled above).
+    let Some(engine) = engine else {
+        return Err(anyhow!(
+            "compass_query mode={} needs the Compass query engine",
+            intent.as_str()
+        ));
     };
 
     // `traverse` diagnostic messages name their endpoints by raw node id; keep the
@@ -1819,6 +2026,11 @@ fn execute_query(
                 limit,
                 working_dir,
             );
+        }
+        // Handled by the early return above (they need the raw graph, not the
+        // engine); unreachable here but required for exhaustiveness.
+        QueryIntent::Affected | QueryIntent::Orientation => {
+            unreachable!("graph modes return before the engine response match")
         }
     }
     .map_err(map_engine_error)?;
@@ -1934,6 +2146,37 @@ fn relabel_ids(text: &str, labels: &HashMap<String, String>) -> String {
     out
 }
 
+/// Like [`compass_model::NodeRecord::display_label`] but never falls back to the
+/// raw node id: a node with no label/name/qualified name/signature/file/location
+/// would otherwise render as its opaque `sha256:` identity. Falls back to the
+/// node kind, so a degenerate node is still identifiable without leaking an id.
+fn graph_node_display(node: &compass_model::NodeRecord) -> String {
+    let display = node.display_label();
+    // `display_label` falls back to the raw node id for a degenerate node. Rather
+    // than pattern-match specific id schemes (which drift), reject the fallback
+    // directly: the result is an id when it equals the node's id, or when it
+    // looks like a scheme-qualified digest (`word:<hex>`).
+    if display == node.id.as_str() || is_scheme_qualified_digest(&display) {
+        return format!("({})", node.kind_name());
+    }
+    display
+}
+
+/// True when `value` looks like an opaque `<scheme>:<hex>` node id (e.g.
+/// `sha256:...`), used to reject an id that slipped through as a display label.
+fn is_scheme_qualified_digest(value: &str) -> bool {
+    let Some((scheme, rest)) = value.split_once(':') else {
+        return false;
+    };
+    // Real content digests are sha256/md5/sha1/blake3 (>= 32 hex chars); a
+    // shorter run is more likely a label like `http:...` than an id, so require
+    // 32 to avoid misfiring on a legitimate label.
+    scheme.len() >= 3
+        && scheme.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && rest.len() >= 32
+        && rest.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 /// Render a resolved node as a one-line label: `` `qualified_name` (kind, file)
 /// [roles] `` (falling back to the plain `name` when the qualified name is
 /// empty). The file and roles are omitted when absent. Used for `context`
@@ -1955,6 +2198,279 @@ fn format_node_label(view: &NodeView) -> String {
         Some(file) => format!("`{display}` ({}, {}){roles}", view.kind, file),
         None => format!("`{display}` ({}){roles}", view.kind),
     }
+}
+
+/// Follow relations *inbound* to a seed and render everyone who depends on it —
+/// Compass's `affected` query, which is the reverse of `impact` (that walks
+/// outbound callers). Uses `resolve_seed`/`affected_nodes` from `compass-query`
+/// over the raw `compass_model::Graph`, then renders the report itself (so rows
+/// can be bounded, `path` applied, and in-scope counts reported).
+///
+/// The graph is provided by the caller, which loads it with
+/// [`Graph::load_for_affected`] (a bounded compact projection: it drops
+/// attributes irrelevant to affected traversal and caches the projection next to
+/// `graph.json`) under `spawn_blocking` + the project flock, so only this mode
+/// pays for the second load and no other mode is slowed. jcode bounds the header
+/// and the number of listed rows, and applies an optional `path` filter (Compass's
+/// traversal has no path scope) rather than silently ignoring it.
+fn execute_affected(
+    graph: &Graph,
+    query: &str,
+    params: &CompassQueryInput,
+    limit: usize,
+) -> Result<String, anyhow::Error> {
+    // Relations default to Compass's canonical affected set; blank entries are
+    // dropped, and an all-blank override falls back to the default rather than
+    // silently following no relations (which would report "nothing affected").
+    let relations: Vec<String> = match params.relations.clone() {
+        Some(list) if list.iter().any(|r| !r.trim().is_empty()) => list
+            .into_iter()
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty())
+            .collect(),
+        _ => compass_query::DEFAULT_AFFECTED_RELATIONS
+            .iter()
+            .map(|r| (*r).to_string())
+            .collect(),
+    };
+    // Honor an explicit depth exactly (including 0, which Compass treats as "no
+    // traversal"); only default when the caller omitted it. Clamping would
+    // silently override the caller's request.
+    let depth = params.depth.unwrap_or(DEFAULT_AFFECTED_DEPTH);
+
+    // Resolve the seed ourselves so an unmatched operand reads as a clear,
+    // input-shaped error (and a "not found" note rather than a bare body).
+    let Some(seed) = compass_query::resolve_seed(graph, query) else {
+        return Ok(format!(
+            "No unique node matched `{}` in the Compass graph. Qualify the name \
+             (e.g. a path or `crate::module::symbol`) or run `mode=search` to \
+             find the right node.\n",
+            header_label(query)
+        ));
+    };
+
+    // Apply an optional `path` filter to hits after traversal: Compass's
+    // `affected_nodes` has no path scope, so filtering post-hoc is what keeps a
+    // scoped request scoped rather than silently ignoring `path`.
+    let path_filter = params
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+
+    let hits = compass_query::affected_nodes(graph, seed, &relations, depth);
+    let seed_label = graph_node_display(graph.node(seed));
+
+    // Count the hits that survive the `path` filter separately from those the
+    // limit cuts, so the header count is the *in-scope* total and the truncation
+    // note attributes the shortfall to the right cause.
+    let mut in_scope = 0usize;
+    let mut dropped_by_path = 0usize;
+    let mut rows: Vec<(String, String, String)> = Vec::new();
+    for hit in &hits {
+        let node = graph.node(hit.node);
+        let file = node.string("source_file");
+        let file = file.trim();
+        if let Some(filter) = path_filter
+            && !file.is_empty()
+            && !path_matches_filter(filter, file)
+        {
+            dropped_by_path += 1;
+            continue;
+        }
+        in_scope += 1;
+        if rows.len() >= limit {
+            continue;
+        }
+        let location = node.string("source_location");
+        let location = location.trim();
+        let where_ = match (file.is_empty(), location.is_empty()) {
+            (true, _) => "(no file)".to_string(),
+            (false, true) => file.to_string(),
+            (false, false) => format!("{file}:{location}"),
+        };
+        rows.push((
+            header_label(&graph_node_display(node)),
+            hit.relation.clone(),
+            where_,
+        ));
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!("# Compass affected: {}\n\n", header_label(query)));
+    out.push_str(&format!("**Mode:** {}\n", QueryIntent::Affected.as_str()));
+    out.push_str(&format!("**Seed:** {}\n", header_label(&seed_label)));
+    // Bound like every other header line: a caller could pass many long relations.
+    // The cap clears the full default set (149 chars) so the common case is not
+    // truncated, while still bounding a pathological override.
+    out.push_str(&format!(
+        "**Relations:** {}\n",
+        summarize_list(&relations, MAX_RELATIONS_CHARS)
+    ));
+    out.push_str(&format!("**Depth:** {depth}\n"));
+    out.push_str(&format!("**Limit:** {limit}\n"));
+    if let Some(p) = path_filter {
+        out.push_str(&format!("**Path filter:** {p}\n"));
+    }
+    out.push('\n');
+
+    if hits.is_empty() {
+        out.push_str(&format!(
+            "No affected nodes. Nothing depends on `{}` through the requested \
+             relations within depth {depth}.\n",
+            header_label(&seed_label)
+        ));
+        return Ok(out);
+    }
+    if in_scope == 0 {
+        // Dependents exist but the filter excluded every one of them.
+        out.push_str(&format!(
+            "No affected nodes in the requested path. All {dropped_by_path} \
+             dependent(s) fell outside the `path` filter; widen or drop it.\n"
+        ));
+        return Ok(out);
+    }
+
+    out.push_str(&format!("**{in_scope} affected node(s)**\n\n"));
+    for (display, relation, where_) in &rows {
+        out.push_str(&format!("- {display} [{relation}] {where_}\n"));
+    }
+    if in_scope > rows.len() {
+        out.push_str(&format!(
+            "\n**Note:** showing {} of {in_scope} affected node(s) (limit {limit}).\n",
+            rows.len()
+        ));
+    }
+    if dropped_by_path > 0 {
+        out.push_str(&format!(
+            "\n**Note:** {dropped_by_path} affected node(s) fell outside the `path` filter.\n"
+        ));
+    }
+    Ok(out)
+}
+
+/// Compose a bounded, community-free repository map so a session can orient in
+/// an unfamiliar repo before drilling in with `search`/`context`.
+///
+/// jcode builds the index with `no_cluster = true` / `no_viz = true` (see
+/// "Build tuning" in docs/COMPASS.md), so `graph.json` carries no community
+/// column and there is no `analysis.json` to summarize. Rather than pay a
+/// clustering pass on every cold build for every user just to serve this one
+/// mode, the map is derived from the graph jcode already has: file/symbol
+/// counts, top-level directories by file count, and the most connected
+/// ("hottest") symbols. Communities can be re-enabled later if a
+/// community-scoped map proves worth the build cost.
+fn execute_orientation(
+    graph: &Graph,
+    params: &CompassQueryInput,
+    limit: usize,
+) -> Result<String, anyhow::Error> {
+    let path_filter = params
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+
+    // First pass: gather distinct source files and symbol candidates. Attribute
+    // reads are cheap; the heavy work is `degree`, deferred to a second pass so
+    // only candidate symbols pay for it. Files are deduped by path (not counted
+    // as file-kind nodes): a graph can have source-anchored nodes but no
+    // dedicated file node, so counting file-kind nodes would under-report.
+    let mut files: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut symbol_count = 0usize;
+    let mut candidates: Vec<(NodeIndex, String)> = Vec::new();
+    for (index, node) in graph.nodes() {
+        let file = node.string("source_file");
+        let file = file.trim();
+        if let Some(filter) = path_filter {
+            // A node with no file is kept only when no filter is active.
+            if file.is_empty() || !path_matches_filter(filter, file) {
+                continue;
+            }
+        }
+        if !file.is_empty() {
+            files.insert(file.to_string());
+        }
+        // A file-level node (or a node with no source anchor, which cannot be
+        // placed) is not a symbol; everything else is one.
+        let kind = node.kind_name();
+        if kind == ORIENTATION_FILE_KIND || file.is_empty() {
+            continue;
+        }
+        symbol_count += 1;
+        // Defer the degree walk to a second pass. Use the id-free display label:
+        // `node.label()` falls back to the opaque node id for a degenerate node,
+        // which must never be printed.
+        let label = graph_node_display(node);
+        if !label.trim().is_empty() {
+            candidates.push((index, label));
+        }
+    }
+    let file_count = files.len();
+
+    // Top-level directories by file count, derived from the same distinct-file
+    // set so the directory tally stays consistent with the headline count.
+    let mut dir_files: HashMap<String, usize> = HashMap::new();
+    for file in &files {
+        *dir_files.entry(top_level_dir(file)).or_insert(0) += 1;
+    }
+
+    let mut scored: Vec<(usize, String)> = candidates
+        .into_iter()
+        .map(|(index, label)| (graph.degree(index), label))
+        .collect();
+    // Sort by degree desc, then label asc (deterministic ties).
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+    let mut dirs: Vec<(String, usize)> = dir_files.into_iter().collect();
+    dirs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let mut out = String::new();
+    out.push_str("# Compass orientation: repository map\n\n");
+    out.push_str(&format!("**Mode:** {}\n", QueryIntent::Orientation.as_str()));
+    out.push_str(&format!("**Limit:** {limit}\n"));
+    if let Some(p) = path_filter {
+        out.push_str(&format!("**Path filter:** {p}\n"));
+    }
+    out.push('\n');
+    out.push_str(&format!(
+        "**Graph:** {file_count} file(s), {symbol_count} symbol(s)\n\n"
+    ));
+
+    out.push_str("## Top-level directories\n\n");
+    if dirs.is_empty() {
+        out.push_str("(none)\n\n");
+    } else {
+        for (dir, count) in dirs.iter().take(ORIENTATION_DIR_ROWS) {
+            out.push_str(&format!("- `{dir}` — {count} file(s)\n"));
+        }
+        if dirs.len() > ORIENTATION_DIR_ROWS {
+            out.push_str(&format!(
+                "- … {} more\n",
+                dirs.len() - ORIENTATION_DIR_ROWS
+            ));
+        }
+        out.push('\n');
+    }
+
+    out.push_str("## Hottest symbols (most connections)\n\n");
+    if scored.iter().all(|(degree, _)| *degree == 0) {
+        out.push_str("(none)\n\n");
+    } else {
+        let rows = limit.min(ORIENTATION_SYMBOL_ROWS);
+        for (degree, label) in scored.iter().take(rows) {
+            out.push_str(&format!("- {} — {degree} connection(s)\n", header_label(label)));
+        }
+        out.push('\n');
+    }
+
+    out.push_str(
+        "> This map is derived from the graph (no community clustering): Co\
+         mpass is built with `no_cluster`/`no_viz`, so no community or analysis \
+         artifact exists to summarize. Drill in with `mode=search`, `mode=context`, \
+         or `mode=affected`.\n",
+    );
+    Ok(out)
 }
 
 /// Compose a task-oriented context packet with Compass's `build_task_context`.
@@ -2693,6 +3209,37 @@ const MAX_NODE_SNIPPETS: usize = 6;
 const MAX_PATH_ROWS: usize = 10;
 const MAX_SOURCE_FILES: usize = 8;
 
+/// Default `affected` traversal depth when the caller does not pass `depth`.
+/// Mirrors Compass's own CLI default (`--depth` defaults to 2).
+const DEFAULT_AFFECTED_DEPTH: usize = 2;
+
+/// Cap for the `affected` report's `Relations:` header line. Clears the full
+/// default relation set (149 chars) so the common case is shown in full, while
+/// still bounding a pathological caller-supplied list.
+const MAX_RELATIONS_CHARS: usize = 200;
+
+/// Compass node kind for a file-level node; these are counted as files in the
+/// orientation map rather than as symbols.
+const ORIENTATION_FILE_KIND: &str = "file";
+/// Row caps for the orientation map's directory and hottest-symbol sections.
+const ORIENTATION_DIR_ROWS: usize = 12;
+const ORIENTATION_SYMBOL_ROWS: usize = 20;
+
+/// The leading path segment of a repo-relative file path (`a/b/c.rs` -> `a`), or
+/// the whole path when it has no directory. Never blank for a non-empty path.
+fn top_level_dir(file: &str) -> String {
+    let mut segments = file
+        .split(['/', '\\'])
+        .filter(|s| !s.is_empty() && *s != ".");
+    match (segments.next(), segments.next()) {
+        // A path with at least one separator: the first segment is the directory.
+        (Some(first), Some(_)) => first.to_string(),
+        // Separator-less (a root-level file) and empty both bucket under the
+        // repo root, so the section is always a directory listing.
+        _ => ".".to_string(),
+    }
+}
+
 /// Compass's internal hard ceiling on `max_candidates` / explore symbols
 /// (`MAX_CODE_QUERY_CANDIDATES`). The constant is private to `compass-query`, so
 /// it is mirrored here; keep it in sync if the pinned Compass version changes.
@@ -2908,6 +3455,8 @@ mod tests {
             symbols: None,
             source: None,
             target: None,
+            relations: None,
+            depth: None,
             include_heuristic: None,
         }
     }
@@ -3258,6 +3807,37 @@ mod tests {
     // no manual cache deletion required by the caller. This verifies a rebuild
     // actually happened (the index mtime advances) rather than just that the
     // query succeeds — a valid-but-stale index would also satisfy the latter.
+    #[tokio::test]
+    async fn ensure_fresh_graph_rebuilds_a_stale_index() {
+        let (_home, root) = HomeGuard::set();
+        let root = root.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("main.rs"), "fn authenticate() {}\n").unwrap();
+        let edge = resolve_compass_cache(&root);
+        let out_dir = edge.output_dir.join("compass-out");
+        build_compass_index(&root, &edge.output_dir, &edge.ast_cache_root).expect("build");
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let before = std::fs::metadata(&out_dir).unwrap().modified().unwrap();
+
+        // Add a source file so the built index is now stale. (No prior
+        // `ensure_fresh_graph` call, so no scan timestamp is recorded and the
+        // staleness walk is not throttled.)
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(root.join("added.rs"), "fn newly_added() {}\n").unwrap();
+
+        let graph = ensure_fresh_graph(&edge, &root).expect("rebuilt graph");
+        assert!(
+            graph
+                .nodes()
+                .any(|(_, n)| n.label().contains("newly_added")),
+            "a stale graph must be rebuilt to include the new file"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let after = std::fs::metadata(&out_dir).unwrap().modified().unwrap();
+        assert!(after > before, "the rebuild must refresh the index on disk");
+    }
+
     #[tokio::test]
     async fn stale_index_is_rebuilt_on_query() {
         let (_home, root) = HomeGuard::set();
@@ -3854,12 +4434,13 @@ mod tests {
         // compass query renders a source snippet from the built index — not
         // just this tool's hand-built fixtures.
         let out = execute_query(
-            &engine,
+            Some(&engine),
             QueryIntent::Search,
             &input("authenticate"),
             u64::MAX as usize,
             false,
             &root,
+            None,
         )
         .expect("query with clamped limit must succeed");
         assert!(
@@ -3916,6 +4497,8 @@ mod tests {
             symbols: None,
             source: None,
             target: None,
+            relations: None,
+            depth: None,
             include_heuristic: None,
         };
         assert_eq!(params.query_operand(), "foo");
@@ -3932,7 +4515,7 @@ mod tests {
         .expect("open after build");
         // An operand-less callers call errors rather than searching for "".
         params.query = None;
-        let err = execute_query(&engine, QueryIntent::Callers, &params, 20, false, &root)
+        let err = execute_query(Some(&engine), QueryIntent::Callers, &params, 20, false, &root, None)
             .expect_err("operand-less structural call must error");
         assert!(err.to_string().contains("requires an operand"), "got: {err}");
     }
@@ -4037,6 +4620,16 @@ mod tests {
         assert_eq!(QueryIntent::parse(Some("traverse")).unwrap(), QueryIntent::Traverse);
         assert_eq!(QueryIntent::parse(Some("path")).unwrap(), QueryIntent::Traverse);
         assert_eq!(QueryIntent::parse(Some("context")).unwrap(), QueryIntent::Context);
+        assert_eq!(QueryIntent::parse(Some("affected")).unwrap(), QueryIntent::Affected);
+        assert_eq!(QueryIntent::parse(Some("affected_nodes")).unwrap(), QueryIntent::Affected);
+        assert_eq!(
+            QueryIntent::parse(Some("orientation")).unwrap(),
+            QueryIntent::Orientation
+        );
+        // `repo_map`/`map`/`overview` are aliases routed to orientation.
+        assert_eq!(QueryIntent::parse(Some("repo_map")).unwrap(), QueryIntent::Orientation);
+        assert_eq!(QueryIntent::parse(Some("map")).unwrap(), QueryIntent::Orientation);
+        assert_eq!(QueryIntent::parse(Some("overview")).unwrap(), QueryIntent::Orientation);
 
         assert!(QueryIntent::parse(Some("nonsense")).is_err());
         assert!(!QueryIntent::Search.is_structural());
@@ -4048,6 +4641,8 @@ mod tests {
             QueryIntent::Discover,
             QueryIntent::Traverse,
             QueryIntent::Context,
+            QueryIntent::Affected,
+            QueryIntent::Orientation,
         ] {
             assert!(intent.is_structural(), "{intent:?} must be structural");
         }
@@ -4071,12 +4666,13 @@ mod tests {
                 .expect("open after build");
 
         let out = execute_query(
-            &engine,
+            Some(&engine),
             QueryIntent::Callers,
             &input("authenticate"),
             20,
             false,
             &root,
+            None,
         )
         .expect("callers query must succeed");
 
@@ -4094,6 +4690,522 @@ mod tests {
             out.contains("Relationships"),
             "callers report must render edges, got: {out}"
         );
+    }
+
+    // Build an isolated project whose call chain is `handler -> login ->
+    // authenticate`, plus a second file under `sub/`, and return the graph path.
+    fn build_affected_project() -> (tempfile::TempDir, PathBuf, PathBuf, Graph) {
+        let (tmp, root, output_dir, ast_cache_root) = make_isolated_project();
+        std::fs::write(
+            root.join("main.rs"),
+            "fn authenticate(user: &str) { let _ = user; }\n\
+             fn login() { authenticate(\"x\"); }\n\
+             fn handler() { login(); }\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/other.rs"), "pub fn other() {}\n").unwrap();
+        build_compass_index(&root, &output_dir, &ast_cache_root).expect("build");
+        let graph_path = output_dir.join("compass-out/graph.json");
+        let graph = Graph::load_for_affected(&graph_path).expect("load affected graph");
+        (tmp, root, graph_path, graph)
+    }
+
+    // `affected` walks inbound edges (the reverse of `impact`): callers of the
+    // seed, then callers of those callers, up to `depth`. It must name the seed,
+    // list the dependents with their relation and file, and never leak raw ids.
+    #[test]
+    fn affected_lists_inbound_dependents_to_the_requested_depth() {
+        let (_tmp, _root, _graph_path, graph) = build_affected_project();
+
+        let mut params = input("authenticate");
+        params.depth = Some(2);
+        let out = execute_affected(&graph, "authenticate", &params, 20)
+            .expect("affected query must succeed");
+
+        assert!(out.contains("**Mode:** affected"), "got: {out}");
+        assert!(out.contains("**Seed:** authenticate()"), "got: {out}");
+        // Direct caller (`login`) and transitive caller (`handler`) both appear.
+        assert!(out.contains("login() [calls]"), "got: {out}");
+        assert!(out.contains("handler() [calls]"), "got: {out}");
+        assert!(out.contains("**2 affected node(s)**"), "got: {out}");
+        assert!(
+            !out.contains("sha256:"),
+            "the report must not leak raw node ids, got: {out}"
+        );
+    }
+
+    // A depth of 1 stops at direct dependents, so the transitive caller is not
+    // reported.
+    #[test]
+    fn affected_depth_bounds_the_traversal() {
+        let (_tmp, _root, _graph_path, graph) = build_affected_project();
+
+        let mut params = input("authenticate");
+        params.depth = Some(1);
+        let out = execute_affected(&graph, "authenticate", &params, 20)
+            .expect("affected query must succeed");
+
+        assert!(out.contains("login() [calls]"), "got: {out}");
+        assert!(
+            !out.contains("handler()"),
+            "depth=1 must not report the transitive caller, got: {out}"
+        );
+    }
+
+    // The header count must be the *in-scope* (post-filter) total, and the
+    // truncation note must attribute a shortfall to the limit, not to a filter
+    // that removed nothing. Uses two dependents in different directories so a
+    // filter can remove one without removing all.
+    #[test]
+    fn affected_limit_and_filter_counts_are_accurate() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph_path = dir.path().join("graph.json");
+        let graph_json = serde_json::json!({
+            "directed": true, "multigraph": true, "graph": {},
+            "nodes": [
+                {"id": "seed", "label": "seed()", "source_file": "a/seed.rs"},
+                {"id": "caller_a", "label": "caller_a()", "source_file": "a/caller.rs"},
+                {"id": "caller_b", "label": "caller_b()", "source_file": "b/caller.rs"}
+            ],
+            "links": [
+                {"source": "caller_a", "target": "seed", "relation": "calls"},
+                {"source": "caller_b", "target": "seed", "relation": "calls"}
+            ]
+        });
+        std::fs::write(&graph_path, graph_json.to_string()).unwrap();
+        let graph = Graph::load_for_affected(&graph_path).expect("load");
+
+        // No filter, limit 1: two dependents in scope, one shown; the shortfall
+        // is attributed to the limit, with no spurious filter note.
+        let mut params = input("seed");
+        params.limit = Some(1);
+        let out = execute_affected(&graph, "seed", &params, 1).expect("affected");
+        assert!(out.contains("**2 affected node(s)**"), "in-scope count: {out}");
+        assert!(
+            out.contains("showing 1 of 2 affected node(s)"),
+            "limit shortfall must be attributed to the limit: {out}"
+        );
+        assert!(
+            !out.contains("fell outside the `path` filter"),
+            "no filter means no filter note: {out}"
+        );
+
+        // Filter to `a` keeps one of two: the header count is the in-scope total
+        // (1) and the exclusion is reported separately.
+        let mut params = input("seed");
+        params.path = Some("a".to_string());
+        let out = execute_affected(&graph, "seed", &params, 20).expect("affected");
+        assert!(out.contains("**1 affected node(s)**"), "in-scope count: {out}");
+        assert!(
+            out.contains("1 affected node(s) fell outside the `path` filter"),
+            "the exclusion must be reported: {out}"
+        );
+    }
+
+    // A fresh-but-unparseable graph.json (corrupt artifact) must be rebuilt, not
+    // surfaced as a hard failure - matching the engine path's behavior.
+    #[test]
+    fn ensure_fresh_graph_rebuilds_a_corrupt_index() {
+        let (_home, root) = HomeGuard::set();
+        let root = root.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("main.rs"), "fn authenticate() {}\n").unwrap();
+        let edge = resolve_compass_cache(&root);
+        let graph_path = edge.graph_path.clone();
+        build_compass_index(&root, &edge.output_dir, &edge.ast_cache_root).expect("build");
+
+        // Corrupt the graph artifact but keep the file present, so staleness checks
+        // still call it "fresh" (only the content is unparseable).
+        std::fs::write(&graph_path, b"{ not valid json").unwrap();
+        // Drop only *this* path's cached graph so the load really re-reads the
+        // corrupt file. Never clear the shared cache globally: sibling tests run
+        // in parallel and rely on their own entries (e.g. the Arc::ptr_eq reuse
+        // test).
+        lock_cached(GRAPH_CACHE.get_or_init(|| Mutex::new(HashMap::new())))
+            .retain(|(p, _), _| p != &graph_path);
+
+        let graph = ensure_fresh_graph(&edge, &root)
+            .expect("a corrupt index must be rebuilt, not surfaced as an error");
+        assert!(
+            graph.nodes().any(|(_, n)| n.label().contains("authenticate")),
+            "the rebuilt graph must contain the real symbols"
+        );
+    }
+
+    // An explicit `depth: 0` must be honored (Compass treats it as "no traversal")
+    // rather than silently clamped to 1, which would change the caller's request.
+    #[test]
+    fn affected_honors_explicit_zero_depth() {
+        let (_tmp, _root, _graph_path, graph) = build_affected_project();
+
+        let mut params = input("authenticate");
+        params.depth = Some(0);
+        let out = execute_affected(&graph, "authenticate", &params, 20)
+            .expect("affected query must succeed");
+        assert!(out.contains("**Depth:** 0"), "explicit depth 0 must be honored: {out}");
+        assert!(
+            !out.contains("login()"),
+            "depth=0 must not traverse to any dependent, got: {out}"
+        );
+    }
+
+    // An explicit `relations` list is honored; an all-blank override falls back
+    // to the default set rather than silently following no relations.
+    #[test]
+    fn affected_relations_override_and_blank_fallback() {
+        let (_tmp, _root, _graph_path, graph) = build_affected_project();
+
+        let mut params = input("authenticate");
+        params.relations = Some(vec!["imports".to_string()]);
+        let out = execute_affected(&graph, "authenticate", &params, 20)
+            .expect("affected query must succeed");
+        assert!(out.contains("**Relations:** imports\n"), "got: {out}");
+        assert!(out.contains("No affected nodes"), "got: {out}");
+
+        let mut params = input("authenticate");
+        params.relations = Some(vec!["  ".to_string()]);
+        let out = execute_affected(&graph, "authenticate", &params, 20)
+            .expect("affected query must succeed");
+        // The blank override falls back to the default set, which includes `calls`.
+        assert!(out.contains("calls"), "blank relations must fall back: {out}");
+        assert!(out.contains("login() [calls]"), "got: {out}");
+    }
+
+    // An operand that resolves to no unique node reads as a clear "not found"
+    // note (mirroring Compass's own message) rather than an empty body.
+    #[test]
+    fn affected_unknown_seed_is_reported_clearly() {
+        let (_tmp, _root, _graph_path, graph) = build_affected_project();
+        let out = execute_affected(&graph, "no_such_symbol_zzz", &input("x"), 20)
+            .expect("affected query must succeed");
+        assert!(
+            out.contains("No unique node matched"),
+            "an unknown seed must say so, got: {out}"
+        );
+        assert!(out.contains("mode=search"), "should point at search: {out}");
+    }
+
+    // A `path` filter is applied to the affected hits (Compass's traversal has no
+    // path scope), and the report says how many fell outside it.
+    #[test]
+    fn affected_path_filter_scopes_hits_and_notes_exclusions() {
+        let (_tmp, _root, _graph_path, graph) = build_affected_project();
+
+        let mut params = input("authenticate");
+        params.path = Some("sub".to_string());
+        let out = execute_affected(&graph, "authenticate", &params, 20)
+            .expect("affected query must succeed");
+        assert!(out.contains("**Path filter:** sub"), "got: {out}");
+        assert!(
+            !out.contains("- login()"),
+            "a scoped report must not list callers outside the filter: {out}"
+        );
+        assert!(
+            out.contains("No affected nodes in the requested path"),
+            "must say the filter excluded everything, got: {out}"
+        );
+    }
+
+    // `affected`/`orientation` need the raw graph; without one (e.g. a caller that
+    // has not loaded it) they error clearly instead of panicking.
+    #[test]
+    fn graph_modes_require_a_loaded_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = execute_query(
+            None,
+            QueryIntent::Affected,
+            &input("foo"),
+            20,
+            false,
+            dir.path(),
+            None,
+        )
+        .expect_err("affected without a loaded graph must error");
+        assert!(err.to_string().contains("needs the Compass graph"), "got: {err}");
+        assert!(err.to_string().contains("affected"), "got: {err}");
+    }
+
+    // Digest detection must reject any scheme-qualified hex id, not just the
+    // `sha256:`/`md5:` prefixes we happen to know, and must not misfire on a
+    // normal symbol label.
+    #[test]
+    fn scheme_qualified_digest_detection() {
+        let hex = "0123456789abcdef0123456789abcdef"; // 32 hex chars
+        assert!(is_scheme_qualified_digest(&format!("sha256:{hex}")));
+        assert!(is_scheme_qualified_digest(&format!("md5:{hex}")));
+        assert!(is_scheme_qualified_digest(&format!("blake3:{hex}")));
+        // Too short, not hex, or no scheme separator: not an id.
+        assert!(!is_scheme_qualified_digest("sha256:abc"));
+        assert!(!is_scheme_qualified_digest("http:0123456789abcdef")); // short
+        assert!(!is_scheme_qualified_digest("crate::module::symbol"));
+        assert!(!is_scheme_qualified_digest("HashMap::insert"));
+        assert!(!is_scheme_qualified_digest("main.rs"));
+    }
+
+    // A dependent node whose only identity is an opaque `sha256:` id (no
+    // label/name/qualified name/file) must not print that id: `display_label`
+    // would fall back to the id, so the renderer substitutes the node kind.
+    #[test]
+    fn affected_never_renders_an_opaque_id_for_a_degenerate_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph_path = dir.path().join("graph.json");
+        let graph_json = serde_json::json!({
+            "directed": true,
+            "multigraph": true,
+            "graph": {},
+            "nodes": [
+                {"id": "file", "label": "lib.rs", "source_file": "lib.rs"},
+                {"id": "member", "label": "run()", "source_file": "lib.rs", "source_location": "L2"},
+                {"id": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}
+            ],
+            "links": [
+                {"source": "file", "target": "member", "relation": "contains"},
+                {"source": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                 "target": "member", "relation": "calls"}
+            ]
+        });
+        std::fs::write(&graph_path, graph_json.to_string()).unwrap();
+        let graph = Graph::load_for_affected(&graph_path).expect("load");
+
+        let out = execute_affected(&graph, "lib.rs", &input("x"), 20).expect("affected");
+        assert!(
+            !out.contains("sha256:"),
+            "a degenerate dependent node must not leak its id, got: {out}"
+        );
+        assert!(
+            out.contains("(symbol) [calls]"),
+            "the degenerate node must fall back to a kind label, got: {out}"
+        );
+
+        // `orientation` renders labels from the same graph and must stay id-free
+        // too (a file-less node is skipped by its placement rule, so the guard
+        // there is defensive; the leak guarantee is what matters).
+        let mut orient = input("");
+        orient.query = None;
+        let out = execute_orientation(&graph, &orient, 20).expect("orientation");
+        assert!(
+            !out.contains("sha256:"),
+            "orientation must not leak a degenerate node id, got: {out}"
+        );
+    }
+
+    // The graph-only modes reuse one loaded graph per (path, mtime): a second load
+    // returns the same `Arc` (no re-parse), and touching the file (a rebuild)
+    // yields a fresh one so a stale graph is never served.
+    #[test]
+    fn graph_cache_reuses_until_the_graph_changes() {
+        let (_tmp, _root, graph_path, _direct_graph) = build_affected_project();
+
+        let first = load_graph_cached(&graph_path).expect("first load");
+        let second = load_graph_cached(&graph_path).expect("second load");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "an unchanged graph must be reused, not re-parsed"
+        );
+
+        // Simulate a rebuild rewriting graph.json: the mtime key must miss.
+        // `load_graph_cached` reads through `Graph::load_for_affected`, which
+        // reads the file; write a valid graph back with a newer mtime.
+        let bytes = std::fs::read(&graph_path).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(&graph_path, &bytes).unwrap();
+        let third = load_graph_cached(&graph_path).expect("third load");
+        assert!(
+            !Arc::ptr_eq(&first, &third),
+            "a rebuilt graph must not be served from the old cache entry"
+        );
+    }
+
+    // A caller-supplied `relations` list must not balloon the header: the
+    // `Relations:` line is bounded like every other header, while the full
+    // default set still renders in full.
+    #[test]
+    fn affected_relations_header_is_bounded() {
+        let (_tmp, _root, _graph_path, graph) = build_affected_project();
+
+        // The default set (149 chars) is shown in full.
+        let out = execute_affected(&graph, "authenticate", &input("authenticate"), 20)
+            .expect("affected");
+        assert!(
+            out.contains("renders"),
+            "the full default relations must render: {out}"
+        );
+
+        // A pathological override is summarized, not printed in full.
+        let mut params = input("authenticate");
+        params.relations = Some((0..500).map(|i| format!("relation_{i}")).collect());
+        let out = execute_affected(&graph, "authenticate", &params, 20)
+            .expect("affected");
+        let relations_line = out
+            .lines()
+            .find(|l| l.starts_with("**Relations:**"))
+            .expect("relations line");
+        assert!(
+            relations_line.chars().count() <= MAX_RELATIONS_CHARS + 64,
+            "relations line must be bounded, got {} chars: {relations_line}",
+            relations_line.chars().count()
+        );
+        assert!(
+            relations_line.contains("more)"),
+            "an oversized list must be summarized: {relations_line}"
+        );
+    }
+
+    // `affected` dispatches through `execute_query` and returns the report with NO
+    // engine, which is exactly how the production path calls it for graph modes
+    // (the engine is never opened for them).
+    #[test]
+    fn affected_dispatches_through_execute_query_without_an_engine() {
+        let (_tmp, root, _graph_path, graph) = build_affected_project();
+
+        let mut params = input("authenticate");
+        params.mode = Some("affected".to_string());
+        let out = execute_query(
+            None,
+            QueryIntent::Affected,
+            &params,
+            20,
+            false,
+            &root,
+            Some(&graph),
+        )
+        .expect("affected must dispatch");
+        assert!(out.contains("**Mode:** affected"), "got: {out}");
+        assert!(out.contains("login() [calls]"), "got: {out}");
+    }
+
+    // `orientation` dispatches through `execute_query` with NO engine (the
+    // production path for graph modes) and needs no operand.
+    #[test]
+    fn orientation_dispatches_through_execute_query_without_an_engine() {
+        let (_tmp, root, _graph_path, graph) = build_affected_project();
+
+        let mut params = input("");
+        params.query = None;
+        params.mode = Some("orientation".to_string());
+        let out = execute_query(
+            None,
+            QueryIntent::Orientation,
+            &params,
+            20,
+            false,
+            &root,
+            Some(&graph),
+        )
+        .expect("orientation must dispatch");
+        assert!(out.contains("**Mode:** orientation"), "got: {out}");
+        assert!(
+            out.contains("## Hottest symbols"),
+            "orientation must render its map: {out}"
+        );
+    }
+
+    // An engine-backed mode with no engine is a clear error, not a panic.
+    #[test]
+    fn engine_mode_without_an_engine_errors() {
+        let (_tmp, root, _graph_path, _graph) = build_affected_project();
+        let err =
+            execute_query(None, QueryIntent::Callers, &input("authenticate"), 20, false, &root, None)
+                .expect_err("an engine mode with no engine must error");
+        assert!(
+            err.to_string().contains("needs the Compass query engine"),
+            "got: {err}"
+        );
+    }
+
+    // `orientation` composes a community-free map: file/symbol counts, top-level
+    // directories by file count, and the most-connected symbols. It states that
+    // no community artifact exists rather than pretending to have one.
+    #[test]
+    fn orientation_counts_distinct_files_not_file_nodes() {
+        // A graph with source-anchored symbols but NO `file`-kind node: the
+        // headline file count must still reflect the two distinct files, not 0.
+        let dir = tempfile::tempdir().unwrap();
+        let graph_path = dir.path().join("graph.json");
+        let graph_json = serde_json::json!({
+            "directed": true, "multigraph": true, "graph": {},
+            "nodes": [
+                {"id": "f1", "label": "a()", "source_file": "a/x.rs", "symbol_kind": "function"},
+                {"id": "f2", "label": "b()", "source_file": "a/y.rs", "symbol_kind": "function"},
+                {"id": "f3", "label": "c()", "source_file": "a/y.rs", "symbol_kind": "function"}
+            ],
+            "links": [{"source": "f1", "target": "f2", "relation": "calls"}]
+        });
+        std::fs::write(&graph_path, graph_json.to_string()).unwrap();
+        let graph = Graph::load_for_affected(&graph_path).expect("load");
+
+        let mut params = input("");
+        params.query = None;
+        let out = execute_orientation(&graph, &params, 20).expect("orientation");
+        assert!(
+            out.contains("2 file(s)"),
+            "distinct source files must be counted even without file nodes: {out}"
+        );
+        assert!(out.contains("3 symbol(s)"), "got: {out}");
+        assert!(out.contains("- `a` — 2 file(s)"), "got: {out}");
+    }
+
+    #[test]
+    fn orientation_maps_the_repo_without_communities() {
+        let (_tmp, _root, _graph_path, graph) = build_affected_project();
+
+        let mut params = input("");
+        params.query = None;
+        let out = execute_orientation(&graph, &params, 20).expect("orientation");
+
+        assert!(out.contains("**Mode:** orientation"), "got: {out}");
+        // Two files (main.rs + sub/other.rs) and four symbols.
+        assert!(out.contains("2 file(s)"), "got: {out}");
+        assert!(out.contains("4 symbol(s)"), "got: {out}");
+        assert!(out.contains("## Top-level directories"), "got: {out}");
+        assert!(out.contains("- `sub` — 1 file(s)"), "got: {out}");
+        assert!(out.contains("- `.` — 1 file(s)"), "got: {out}");
+        assert!(
+            out.contains("## Hottest symbols (most connections)"),
+            "got: {out}"
+        );
+        assert!(out.contains("login() — 3 connection(s)"), "got: {out}");
+        assert!(
+            out.contains("no community clustering"),
+            "the map must document the missing communities: {out}"
+        );
+        assert!(!out.contains("sha256:"), "must not leak ids: {out}");
+    }
+
+    // The orientation map's hottest-symbol section is bounded by `limit`.
+    #[test]
+    fn orientation_bounds_the_hot_symbol_rows() {
+        let (_tmp, _root, _graph_path, graph) = build_affected_project();
+        let mut params = input("");
+        params.query = None;
+        let out = execute_orientation(&graph, &params, 1).expect("orientation");
+        assert_eq!(
+            out.matches(" connection(s)").count(),
+            1,
+            "limit=1 must render a single hot-symbol row: {out}"
+        );
+    }
+
+    // The new `relations`/`depth` fields are optional and must not break parsing
+    // of the existing input shape.
+    #[test]
+    fn affected_fields_default_when_absent() {
+        let parsed: CompassQueryInput =
+            serde_json::from_value(json!({"mode": "affected", "query": "foo"})).unwrap();
+        assert!(parsed.relations.is_none());
+        assert!(parsed.depth.is_none());
+        assert_eq!(QueryIntent::parse(parsed.mode.as_deref()).unwrap(), QueryIntent::Affected);
+
+        let parsed: CompassQueryInput = serde_json::from_value(json!({
+            "mode": "affected",
+            "query": "foo",
+            "relations": ["calls", "imports"],
+            "depth": 3
+        }))
+        .unwrap();
+        assert_eq!(parsed.relations.as_deref(), Some(&["calls".to_string(), "imports".to_string()][..]));
+        assert_eq!(parsed.depth, Some(3));
     }
 
     // A `callees` call on a leaf symbol resolves only the seed (no edges). The
@@ -4115,12 +5227,13 @@ mod tests {
 
         // `authenticate` calls nothing.
         let out = execute_query(
-            &engine,
+            Some(&engine),
             QueryIntent::Callees,
             &input("crate::authenticate"),
             20,
             false,
             &root,
+            None,
         )
         .expect("callees query must succeed");
 
@@ -4151,12 +5264,13 @@ mod tests {
                 .expect("open after build");
 
         let out = execute_query(
-            &engine,
+            Some(&engine),
             QueryIntent::Explore,
             &input("crate::authenticate"),
             20,
             false,
             &root,
+            None,
         )
         .expect("explore query must succeed");
 
@@ -4191,7 +5305,7 @@ mod tests {
         // Scope to `a`, which holds the seed but not the caller in `b`.
         let mut params = input("crate::seed::seed");
         params.path = Some("a".to_string());
-        let out = execute_query(&engine, QueryIntent::Callers, &params, 20, false, &root)
+        let out = execute_query(Some(&engine), QueryIntent::Callers, &params, 20, false, &root, None)
             .expect("callers query must succeed");
 
         assert!(
@@ -4221,12 +5335,13 @@ mod tests {
                 .expect("open after build");
 
         let out = execute_query(
-            &engine,
+            Some(&engine),
             QueryIntent::Discover,
             &input("authenticate"),
             20,
             false,
             &root,
+            None,
         )
         .expect("discover query must succeed");
 
@@ -4263,7 +5378,7 @@ mod tests {
 
         let mut params = input("authenticate");
         params.path = Some("src".to_string());
-        let out = execute_query(&engine, QueryIntent::Discover, &params, 20, false, &root)
+        let out = execute_query(Some(&engine), QueryIntent::Discover, &params, 20, false, &root, None)
             .expect("scoped discover must succeed");
 
         assert!(
@@ -4301,12 +5416,13 @@ mod tests {
         // Two same-named functions make the seed ambiguous, which emits a
         // diagnostic that Compass interpolates with raw node ids.
         let out = execute_query(
-            &engine,
+            Some(&engine),
             QueryIntent::Discover,
             &input("handler request flow"),
             20,
             false,
             &root,
+            None,
         )
         .expect("discover must succeed");
 
@@ -4342,7 +5458,7 @@ mod tests {
             "crate::authenticate".to_string(),
             "crate::login".to_string(),
         ]);
-        let out = execute_query(&engine, QueryIntent::Explore, &params, 20, false, &root)
+        let out = execute_query(Some(&engine), QueryIntent::Explore, &params, 20, false, &root, None)
             .expect("multi-symbol explore must succeed");
 
         assert!(
@@ -4383,12 +5499,13 @@ mod tests {
         // `context` resolves exact ids/names/qualified names; Compass stores the
         // plain `name` as `authenticate()`, so use the qualified name here.
         let out = execute_query(
-            &engine,
+            Some(&engine),
             QueryIntent::Context,
             &input("crate::authenticate"),
             20,
             false,
             &root,
+            None,
         )
         .expect("context query must succeed");
 
@@ -4430,12 +5547,13 @@ mod tests {
         // `authenticate` (no namespace) does not resolve exactly, so Compass
         // returns a not-found target with candidate ids.
         let out = execute_query(
-            &engine,
+            Some(&engine),
             QueryIntent::Context,
             &input("authenticate"),
             20,
             false,
             &root,
+            None,
         )
         .expect("context query must succeed");
 
@@ -4959,7 +6077,7 @@ mod tests {
 
         let long = "x".repeat(3000);
         for intent in [QueryIntent::Context, QueryIntent::Discover] {
-            let out = execute_query(&engine, intent, &input(&long), 20, false, &root)
+            let out = execute_query(Some(&engine), intent, &input(&long), 20, false, &root, None)
                 .expect("query must succeed");
             let header = out.lines().next().unwrap_or_default();
             // The label is bounded to MAX_DISPLAY_TARGET_CHARS; allow the
@@ -4985,12 +6103,13 @@ mod tests {
         let mut params = input("authenticate");
         params.mode = Some("traverse".to_string());
         let err = execute_query(
-            &engine,
+            Some(&engine),
             QueryIntent::Traverse,
             &params,
             20,
             false,
             &root,
+            None,
         )
         .expect_err("traverse without target must error");
         assert!(
@@ -5015,12 +6134,13 @@ mod tests {
         params.mode = Some("traverse".to_string());
         params.target = Some("logout".to_string());
         let err = execute_query(
-            &engine,
+            Some(&engine),
             QueryIntent::Traverse,
             &params,
             20,
             false,
             &root,
+            None,
         )
         .expect_err("traverse without source must error");
         assert!(
@@ -5050,7 +6170,7 @@ mod tests {
         let mut params = input("crate::authenticate");
         params.source = Some("crate::authenticate".to_string());
         params.target = Some("crate::login".to_string());
-        let out = execute_query(&engine, QueryIntent::Traverse, &params, 20, false, &root)
+        let out = execute_query(Some(&engine), QueryIntent::Traverse, &params, 20, false, &root, None)
             .expect("traverse must succeed");
 
         assert!(
@@ -5096,7 +6216,7 @@ mod tests {
             path: Some("src".to_string()),
             ..input("authenticate")
         };
-        let err = execute_query(&engine, QueryIntent::Context, &params, 20, false, &root)
+        let err = execute_query(Some(&engine), QueryIntent::Context, &params, 20, false, &root, None)
             .expect_err("context with a path filter must error");
         assert!(
             err.to_string().contains("path"),

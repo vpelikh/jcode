@@ -1585,6 +1585,29 @@ fn test_tool_summary_compass_query_structural_operand() {
     assert_eq!(tools_ui::get_tool_summary(&mode_only), "discover");
 }
 
+/// `affected` names its seed via `query`; `orientation` has no operand and must
+/// fall back to the mode name so the activity line is not blank.
+#[test]
+fn test_tool_summary_compass_query_affected_and_orientation() {
+    let affected = ToolCall {
+        id: "compass-op-aff".to_string().into(),
+        name: "compass_query".to_string(),
+        input: serde_json::json!({ "mode": "affected", "query": "SessionRegistry" }),
+        intent: None,
+        thought_signature: None,
+    };
+    assert_eq!(tools_ui::get_tool_summary(&affected), "'SessionRegistry'");
+
+    let orientation = ToolCall {
+        id: "compass-op-ori".to_string().into(),
+        name: "compass_query".to_string(),
+        input: serde_json::json!({ "mode": "orientation" }),
+        intent: None,
+        thought_signature: None,
+    };
+    assert_eq!(tools_ui::get_tool_summary(&orientation), "orientation");
+}
+
 /// A blank leading `symbols` entry must be skipped (matching the tool, which
 /// filters blanks) so the summary shows the first real operand, not a blank row.
 #[test]
