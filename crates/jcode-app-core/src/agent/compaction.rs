@@ -2,8 +2,203 @@ use super::*;
 use anyhow::Context;
 
 impl Agent {
+    /// Record a documented, intentional rewrite of the provider-facing prefix.
+    ///
+    /// Emitted on the next [`ServerEvent::KvCacheRequest`] so a remote client
+    /// attributes the resulting cache miss to a known harness-side cause
+    /// (per-step prune, tool-output repair, payload recovery) instead of raising
+    /// the "harness: prefix changed" alarm meant for unexplained edits. Keeping
+    /// the most recent occurrence means overlapping rewrites collapse to one
+    /// attribution, which is all the client needs.
+    pub(super) fn note_prefix_rewrite(&mut self, source: &str, detail: impl Into<String>) {
+        self.pending_kv_cache_rewrite = Some(crate::protocol::DocumentedCacheInvalidation {
+            source: source.to_string(),
+            detail: detail.into(),
+        });
+        // Any prefix rewrite invalidates the provider's cached prefix, so the
+        // next request cannot read from cache.
+        self.reset_warm_prefix_signal();
+    }
+
+    /// Clear the "provider still holds the prefix cached" signal.
+    ///
+    /// Call this at every point that rewrites the provider-facing prefix
+    /// (compaction, rewind, tool-output repair, payload recovery, tool-surface
+    /// change, native-compaction apply) or that observes a cold read. Routing
+    /// all such sites through one helper keeps `cache_warm_read_streak` and
+    /// `last_cache_read_at` reset together, so a future edit cannot clear one
+    /// and leave the other stale.
+    pub(super) fn reset_warm_prefix_signal(&mut self) {
+        self.cache_warm_read_streak = 0;
+        self.last_cache_read_at = None;
+    }
+
+    /// Whether the scheduled per-step prune should rewrite the consumed prefix
+    /// given the cache state and estimated reclaim.
+    ///
+    /// `0` reclaim (nothing oversized) never breaks the prefix. A cold cache
+    /// (no recent provider cache read) makes rewriting free, so prune always
+    /// runs. A warm cache is preserved unless the reclaim is material or context
+    /// pressure is already high.
+    pub(super) fn per_step_prune_worth_warm_prefix_break(
+        &self,
+        reclaim_estimate_bytes: usize,
+        pressure: Option<f32>,
+    ) -> bool {
+        let config = &crate::config::config().compaction;
+        // Opt-out restores the historical "shrink every step" behavior.
+        if !config.prune_preserve_warm_prefix {
+            return true;
+        }
+        if reclaim_estimate_bytes == 0 {
+            return true;
+        }
+        if !self.prefix_cache_is_warm() {
+            // Cache is cold: rewriting the prefix costs nothing extra.
+            return true;
+        }
+        if config.prune_warm_break_bytes > 0
+            && reclaim_estimate_bytes >= config.prune_warm_break_bytes
+        {
+            return true;
+        }
+        if config.prune_warm_break_bytes == 0 {
+            // Threshold disabled: any reclaim counts as material.
+            return true;
+        }
+        pressure.is_some_and(|value| value >= config.prune_warm_break_pressure)
+    }
+
+    /// Whether the provider is likely still holding the consumed prefix in its
+    /// prompt cache.
+    ///
+    /// Requires both a recent cache read (the provider demonstrated it matched
+    /// the prefix) and that the read happened within the provider/model's cache
+    /// TTL — past the TTL the provider may have evicted the entry, so a rewrite
+    /// is (nearly) free and there is nothing to protect. Providers that report
+    /// no cache telemetry never look warm, so pruning is unchanged for them.
+    pub(crate) fn prefix_cache_is_warm(&self) -> bool {
+        if self.cache_warm_read_streak == 0 {
+            return false;
+        }
+        let provider = self.provider.name().to_string();
+        let model = self.provider.model();
+        let Some(ttl_secs) = crate::provider::cache_ttl_for_provider_model(&provider, Some(&model))
+        else {
+            // No TTL policy for this provider: keep the read-based signal.
+            return true;
+        };
+        self.last_cache_read_at
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(ttl_secs))
+    }
+
+    /// Context pressure as a fraction of the effective token budget, from the
+    /// last reported usage. `None` before the first completed request or when the
+    /// provider advertises no window.
+    ///
+    /// The denominator is `min(context_window, compaction.max_context_tokens)`
+    /// when the latter is set, matching the compaction manager's `token_budget`
+    /// (`CompactionManager::capped_budget`). Compaction triggers at
+    /// `COMPACTION_THRESHOLD * token_budget`, so the gate's pressure must use the
+    /// same budget or a configured ceiling would make pressure read too low and
+    /// the high-pressure escape hatch would never fire.
+    ///
+    /// Deliberately usage-only: a local character estimate over the transcript
+    /// would clone the whole message list on every turn, and the providers whose
+    /// warmth the gate keys off (OpenAI/Anthropic) always report usage, so the
+    /// fallback would only run for providers that never report a cache read —
+    /// for which the gate is bypassed anyway. `None` therefore correctly means
+    /// "not warm, prune freely" for those.
+    pub(super) fn context_pressure_estimate(&self) -> Option<f32> {
+        let configured_cap = crate::config::config().compaction.max_context_tokens;
+        let window = self.provider.context_window();
+        // Mirror `CompactionManager::capped_budget`: a configured ceiling caps
+        // the budget, but a provider that advertises no window still yields a
+        // zero budget (and thus no pressure reading).
+        let budget = if configured_cap > 0 {
+            window.min(configured_cap)
+        } else {
+            window
+        };
+        if budget == 0 {
+            return None;
+        }
+        let provider_name = self.provider.name().to_string();
+        let usage_tokens = crate::compaction::effective_context_tokens_from_usage(
+            &provider_name,
+            self.last_usage.input_tokens,
+            self.last_usage.cache_read_input_tokens,
+            self.last_usage.cache_creation_input_tokens,
+        );
+        if usage_tokens > 0 {
+            return Some(usage_tokens as f32 / budget as f32);
+        }
+        None
+    }
+
+    /// Conservative estimate of how many base64/text bytes the per-step prune
+    /// could reclaim from the consumed prefix right now, without mutating the
+    /// transcript. Only nodes that exceed their configured cap are counted, so
+    /// an already-pruned transcript estimates zero (and never breaks the cache).
+    ///
+    /// The estimate counts `len - cap` per oversized node, but the real reclaim is
+    /// a little larger: a truncated tool result keeps only ~`cap * 3/4`, and a
+    /// replaced image keeps just a short text marker (reclaiming the full
+    /// payload). The under-count per node is therefore bounded by the node's cap
+    /// (~`cap / 4` for tool results, up to ~`cap` for images). It errs toward
+    /// preserving the cache: a reclaim within that margin above the break
+    /// threshold may be deferred one step, while a clearly material reclaim
+    /// still breaks through.
+    pub(super) fn estimated_consumed_prune_reclaim(&self) -> usize {
+        let tool_cap = {
+            let configured = crate::config::config().compaction.prune_tool_result_max_bytes;
+            if configured == 0 {
+                crate::compaction::EMERGENCY_TOOL_RESULT_MAX_CHARS
+            } else {
+                configured
+            }
+        };
+        let image_cap = {
+            let configured = crate::config::config().compaction.prune_image_max_bytes;
+            if configured == 0 {
+                crate::compaction::EMERGENCY_IMAGE_MAX_CHARS
+            } else {
+                configured
+            }
+        };
+        let end = self
+            .session
+            .messages
+            .iter()
+            .rposition(|m| m.role == Role::Assistant)
+            .unwrap_or(0);
+        let mut total = 0usize;
+        for message in &self.session.messages[..end] {
+            for block in &message.content {
+                match block {
+                    ContentBlock::ToolResult { content, .. } if content.len() > tool_cap => {
+                        // Count the overflow above the cap as reclaimed. This
+                        // under-counts slightly (truncation keeps only ~cap*3/4),
+                        // which errs toward preserving the warm cache; see the
+                        // doc comment above.
+                        total += content.len().saturating_sub(tool_cap);
+                    }
+                    ContentBlock::Image { data, .. } if data.len() > image_cap => {
+                        total += data.len().saturating_sub(image_cap);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        total
+    }
+
     pub(super) fn note_compaction_applied(&mut self) {
         self.cache_tracker.reset();
+        // Compaction rewrites the provider-facing transcript, so the prefix the
+        // provider may have cached is gone. Re-arm unconditional pruning until a
+        // fresh cache read proves the new prefix is warm.
+        self.reset_warm_prefix_signal();
         self.locked_tools = None;
         self.provider_session_id = None;
         self.session.provider_session_id = None;
@@ -30,11 +225,25 @@ impl Agent {
     /// transcript no longer matches what the provider cached. This path runs
     /// on the frequent scheduled per-step prune, so preserving `locked_tools`
     /// avoids churning the tool surface mid-turn.
-    pub(super) fn note_prune_applied(&mut self) {
+    pub(super) fn note_prune_applied(
+        &mut self,
+        report: &crate::compaction::prune::PruneReport,
+    ) {
         self.cache_tracker.reset();
         self.provider_session_id = None;
         self.session.provider_session_id = None;
-        // The per-step prune shrunk existing content in the consumed prefix
+        // The per-step prune shrinks the consumed prefix in place, so the
+        // provider's cached prefix no longer matches. Document the rewrite for
+        // the next `KvCacheRequest` so remote clients attribute the resulting
+        // miss instead of raising a "harness: prefix changed" alarm.
+        self.note_prefix_rewrite(
+            "per-step prune",
+            format!(
+                "{} image(s) replaced, {} tool result(s) truncated",
+                report.images_stripped, report.tool_results_truncated
+            ),
+        );
+        // The prune shrunk existing content in the consumed prefix
         // without changing message counts. Tell the compaction manager exactly
         // how much content now remains so it reseeds its rolling char estimate
         // from the already-pruned transcript instead of keeping a stale
@@ -68,6 +277,9 @@ impl Agent {
             self.sync_session_compaction_state_from_manager(&manager);
         }
         self.cache_tracker.reset();
+        // These recovery paths rewrite the provider-facing transcript, so any
+        // cached prefix is gone; re-arm unconditional per-step pruning.
+        self.reset_warm_prefix_signal();
         self.locked_tools = None;
         self.provider_session_id = None;
         self.session.provider_session_id = None;
@@ -237,6 +449,13 @@ impl Agent {
             // TUI `/prune` handler's `reseed_compaction_from_provider_messages`
             // and the 413 recovery path. Resetting also supersedes any in-flight
             // background compaction and drops the pre-prune over-count.
+            self.note_prefix_rewrite(
+                "prune command",
+                format!(
+                    "{} image(s) replaced, {} tool result(s) truncated",
+                    report.images_stripped, report.tool_results_truncated
+                ),
+            );
             self.reseed_compaction_from_pruned_transcript();
         }
         // Also retry persistence on a no-op after a previous failed save.
@@ -344,6 +563,9 @@ impl Agent {
         };
 
         self.cache_tracker.reset();
+        // These recovery paths rewrite the provider-facing transcript, so any
+        // cached prefix is gone; re-arm unconditional per-step pruning.
+        self.reset_warm_prefix_signal();
         self.locked_tools = None;
         self.provider_session_id = None;
         self.session.provider_session_id = None;
@@ -448,6 +670,14 @@ impl Agent {
             return false;
         }
 
+        self.note_prefix_rewrite(
+            "payload recovery",
+            format!(
+                "{} image(s) dropped, {} tool result(s) truncated",
+                stripped, truncated
+            ),
+        );
+
         // Persist the prune immediately so the mutation survives even if the
         // retry is interrupted; the caller also saves on a successful retry.
         if let Err(err) = self.session.save() {
@@ -473,6 +703,9 @@ impl Agent {
         }
 
         self.cache_tracker.reset();
+        // These recovery paths rewrite the provider-facing transcript, so any
+        // cached prefix is gone; re-arm unconditional per-step pruning.
+        self.reset_warm_prefix_signal();
         self.locked_tools = None;
         self.provider_session_id = None;
         self.session.provider_session_id = None;
@@ -517,6 +750,9 @@ impl Agent {
         }
 
         self.cache_tracker.reset();
+        // These recovery paths rewrite the provider-facing transcript, so any
+        // cached prefix is gone; re-arm unconditional per-step pruning.
+        self.reset_warm_prefix_signal();
         self.locked_tools = None;
         self.provider_session_id = None;
         self.session.provider_session_id = None;

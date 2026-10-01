@@ -671,6 +671,96 @@ fn documented_invalidation_downgrades_kv_cache_alarm_to_attribution() {
 }
 
 #[test]
+fn server_documented_rewrite_on_kv_request_attributed_not_alarmed() {
+    let _invalidation_guard = crate::storage::lock_test_env();
+    // The server prunes consumed transcript nodes on a frequent schedule, which
+    // legitimately changes the cached prefix. It now reports the rewrite on the
+    // KvCacheRequest event; the remote client must attribute the miss (a
+    // "refresh") instead of raising the "harness: prefix changed" alarm.
+    crate::provider::anthropic::set_cache_ttl_1h(true);
+    crate::cache_invalidation::clear_for_tests();
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    app.is_remote = true;
+    app.remote_provider_name = Some("OpenAI".to_string());
+    app.remote_provider_model = Some("gpt-5.5".to_string());
+    app.display_messages.push(DisplayMessage::user("live prompt"));
+
+    // Establish a baseline from a first request.
+    app.handle_server_event(
+        crate::protocol::ServerEvent::KvCacheRequest {
+            system_static_hash: 1,
+            tools_hash: 2,
+            messages_hash: 3,
+            message_hashes: vec![11, 22],
+            message_count: 2,
+            tool_count: 33,
+            system_static_chars: 11155,
+            tools_json_chars: 35228,
+            messages_json_chars: 198612,
+            ephemeral_hash: None,
+            ephemeral_chars: 0,
+            ephemeral_message_count: 0,
+            documented_invalidation: None,
+        },
+        &mut remote,
+    );
+    app.streaming.streaming_input_tokens = 50_000;
+    app.streaming.streaming_cache_read_tokens = Some(0);
+    app.streaming.streaming_cache_creation_tokens = Some(50_000);
+    app.kv_cache.current_api_usage_recorded = false;
+    app.record_completed_stream_cache_usage();
+
+    // The next request reports a mutated prefix (hash 99 replaces 22) plus a
+    // documented server-side prune. Without the signal this would be classified
+    // as `harness: prefix changed`.
+    app.handle_server_event(
+        crate::protocol::ServerEvent::KvCacheRequest {
+            system_static_hash: 1,
+            tools_hash: 2,
+            messages_hash: 4,
+            message_hashes: vec![11, 99],
+            message_count: 2,
+            tool_count: 33,
+            system_static_chars: 11155,
+            tools_json_chars: 35228,
+            messages_json_chars: 198612,
+            ephemeral_hash: None,
+            ephemeral_chars: 0,
+            ephemeral_message_count: 0,
+            documented_invalidation: Some(crate::protocol::DocumentedCacheInvalidation {
+                source: "per-step prune".to_string(),
+                detail: "1 tool result(s) truncated".to_string(),
+            }),
+        },
+        &mut remote,
+    );
+    app.streaming.streaming_input_tokens = 50_000;
+    app.streaming.streaming_cache_read_tokens = Some(0);
+    app.streaming.streaming_cache_creation_tokens = Some(50_000);
+    app.kv_cache.current_api_usage_recorded = false;
+    app.record_completed_stream_cache_usage();
+
+    let notice = app
+        .display_messages()
+        .iter()
+        .find(|message| message.role == "system" && message.content.contains("KV cache refresh"))
+        .expect("server-documented rewrite should push an attribution notice");
+    assert!(notice.content.contains("server transcript rewrite"), "{notice:?}");
+    assert!(
+        !app.display_messages()
+            .iter()
+            .any(|message| message.role == "system" && message.content.contains("KV cache miss")),
+        "server-documented rewrite must not raise the harness alarm"
+    );
+
+    crate::cache_invalidation::clear_for_tests();
+}
+
+#[test]
 fn kv_cache_baseline_stores_effective_prompt_tokens() {
     // For split-accounting providers (Anthropic), the reported `input` is only
     // the uncached remainder of the request. The baseline drives the cold-cache
@@ -985,6 +1075,7 @@ fn remote_token_usage_records_cache_stats_before_done_and_dedupes_snapshots() {
             ephemeral_hash: None,
             ephemeral_chars: 2,
             ephemeral_message_count: 0,
+            documented_invalidation: None,
         },
         &mut remote,
     );

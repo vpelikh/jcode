@@ -877,6 +877,10 @@ impl App {
         self.tool_output_scan_index = self.local_transcript_message_count();
 
         if repaired > 0 {
+            crate::cache_invalidation::record(
+                "tool-output repair",
+                format!("{repaired} missing tool output(s) recovered"),
+            );
             self.reseed_compaction_from_provider_messages();
             let _ = self.session.save();
         }

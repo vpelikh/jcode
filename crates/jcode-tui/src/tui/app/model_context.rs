@@ -988,6 +988,10 @@ impl App {
                 // not lost if the user does not resubmit (the retry path also
                 // saves, but this manual-resubmit branch returns here).
                 let _ = self.session.save();
+                crate::cache_invalidation::record(
+                    "payload recovery",
+                    format!("{stripped} image(s) dropped, {truncated} tool result(s) truncated"),
+                );
                 self.messages.clear();
                 self.reseed_compaction_from_provider_messages();
                 self.push_display_message(DisplayMessage::error(format!(
@@ -1169,6 +1173,10 @@ impl App {
         // Persist the prune so the in-memory mutation is not lost if the
         // retry fails or the user closes before a later save.
         let _ = self.session.save();
+        crate::cache_invalidation::record(
+            "payload recovery",
+            format!("{stripped} image(s) dropped, {truncated} tool result(s) truncated"),
+        );
 
         // Transcript changed: drop the local materialized scratch copy so the
         // next API call rebuilds from the reduced session, and reseed compaction

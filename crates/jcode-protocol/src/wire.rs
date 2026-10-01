@@ -957,6 +957,21 @@ pub struct HandoffWireModel {
     pub payload: Option<String>,
 }
 
+/// A documented, intentional rewrite of the provider-facing prefix that the
+/// server applied between the previous request and the current one.
+///
+/// Carried on [`ServerEvent::KvCacheRequest`] so a remote client can attribute
+/// a resulting KV-cache miss to a known harness-side cause (the frequent
+/// per-step prune, a tool-output repair, or payload recovery) instead of raising
+/// the "harness: prefix changed" alarm reserved for unexplained prefix edits.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DocumentedCacheInvalidation {
+    /// Short stable source label, e.g. `"per-step prune"`.
+    pub source: String,
+    /// Human-readable specifics, e.g. `"2 tool result(s) truncated"`.
+    pub detail: String,
+}
+
 /// Server event sent to client
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -1090,6 +1105,18 @@ pub enum ServerEvent {
         ephemeral_chars: usize,
         #[serde(default)]
         ephemeral_message_count: usize,
+        /// Documented, intentional server-side rewrite of the consumed prefix
+        /// that happened between the previous request and this one (per-step
+        /// prune, tool-output repair, payload recovery). The server prunes
+        /// consumed transcript nodes on a frequent schedule, which legitimately
+        /// changes the cached prefix; a remote client must attribute the
+        /// resulting cache miss to this cause instead of raising an
+        /// unexplained "harness: prefix changed" alarm.
+        ///
+        /// `#[serde(default)]` keeps older servers (no field) and older clients
+        /// (unknown field ignored) wire-compatible in both directions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        documented_invalidation: Option<DocumentedCacheInvalidation>,
     },
 
     /// Active transport/connection type for the current stream

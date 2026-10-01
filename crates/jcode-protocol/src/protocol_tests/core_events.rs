@@ -296,6 +296,55 @@ fn test_interrupted_event_decodes_from_json() -> Result<()> {
 }
 
 #[test]
+fn test_kv_cache_request_documented_invalidation_is_optional() -> Result<()> {
+    // Older servers omit `documented_invalidation`; newer clients must still
+    // decode the event (forward/backward wire compatibility).
+    let legacy = r#"{"type":"kv_cache_request","system_static_hash":1,"tools_hash":2,"messages_hash":3,"message_count":2,"tool_count":0}"#;
+    let decoded = parse_event_json(legacy)?;
+    let ServerEvent::KvCacheRequest {
+        documented_invalidation,
+        ..
+    } = decoded
+    else {
+        return Err(anyhow!("wrong event type"));
+    };
+    assert!(documented_invalidation.is_none());
+
+    // A rewrite-carrying event round-trips the source and detail.
+    let event = ServerEvent::KvCacheRequest {
+        system_static_hash: 1,
+        tools_hash: 2,
+        messages_hash: 3,
+        message_hashes: vec![11, 22],
+        message_count: 2,
+        tool_count: 0,
+        system_static_chars: 0,
+        tools_json_chars: 0,
+        messages_json_chars: 0,
+        ephemeral_hash: None,
+        ephemeral_chars: 0,
+        ephemeral_message_count: 0,
+        documented_invalidation: Some(DocumentedCacheInvalidation {
+            source: "per-step prune".to_string(),
+            detail: "1 tool result(s) truncated".to_string(),
+        }),
+    };
+    let json = encode_event(&event);
+    let decoded = parse_event_json(json.trim())?;
+    let ServerEvent::KvCacheRequest {
+        documented_invalidation,
+        ..
+    } = decoded
+    else {
+        return Err(anyhow!("wrong event type"));
+    };
+    let invalidation = documented_invalidation.expect("invalidation preserved");
+    assert_eq!(invalidation.source, "per-step prune");
+    assert_eq!(invalidation.detail, "1 tool result(s) truncated");
+    Ok(())
+}
+
+#[test]
 fn test_connection_type_event_roundtrip() -> Result<()> {
     let event = ServerEvent::ConnectionType {
         connection: "websocket".to_string(),

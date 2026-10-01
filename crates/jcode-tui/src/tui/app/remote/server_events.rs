@@ -912,8 +912,22 @@ pub(in crate::tui::app) fn handle_server_event(
             ephemeral_hash,
             ephemeral_chars,
             ephemeral_message_count,
+            documented_invalidation,
         } => {
             remote.reset_call_output_tokens_seen();
+            // A server-side prefix rewrite (per-step prune, repair, payload
+            // recovery) changes the cached prefix legitimately but cannot be
+            // seen in the message hashes alone. Record it so the miss is
+            // attributed ("KV cache refresh") instead of raising the
+            // "harness: prefix changed" alarm. `record` stamps `Instant::now()`,
+            // which is after the previous baseline's `completed_at`, so the
+            // attribution window in `maybe_push_kv_cache_miss_notice` matches.
+            if let Some(invalidation) = &documented_invalidation {
+                crate::cache_invalidation::record(
+                    "server transcript rewrite",
+                    format!("{}: {}", invalidation.source, invalidation.detail),
+                );
+            }
             app.begin_remote_kv_cache_request(app_mod::KvCacheRequestSignature {
                 system_static_hash,
                 tools_hash,

@@ -297,6 +297,9 @@ self.append_user_context_message_with_display_role(
         self.provider_session_id = None;
         self.session.provider_session_id = None;
         self.cache_tracker.reset();
+        // Rewind truncates the provider-facing transcript, so any cached prefix
+        // is gone; re-arm unconditional per-step pruning.
+        self.reset_warm_prefix_signal();
         self.locked_tools = None;
         self.reset_tool_output_tracking();
         self.persist_session_best_effort("conversation rewind");
@@ -315,6 +318,7 @@ self.append_user_context_message_with_display_role(
         self.session.provider_session_id = snapshot.session_provider_session_id;
         self.session.updated_at = chrono::Utc::now();
         self.cache_tracker.reset();
+        self.reset_warm_prefix_signal();
         self.locked_tools = None;
         self.reset_tool_output_tracking();
         self.persist_session_best_effort("conversation rewind undo");
@@ -328,6 +332,9 @@ self.append_user_context_message_with_display_role(
             logging::info("Tool list unlocked — next request will pick up current tools");
             self.locked_tools = None;
             self.cache_tracker.reset();
+            // Changing the tool surface rewrites the request prefix, so the
+            // provider's cached prefix is gone; re-arm unconditional pruning.
+            self.reset_warm_prefix_signal();
         }
         // Allow the late-MCP-registration recheck to fire once for the next
         // snapshot (e.g. after an explicit `mcp` reload).
@@ -494,6 +501,9 @@ self.append_user_context_message_with_display_role(
                 self.mcp_late_register_resolved = true;
                 self.locked_tools = None;
                 self.cache_tracker.reset();
+                // Rebuilding the tool snapshot rewrites the request prefix, so
+                // any cached prefix is gone; re-arm unconditional pruning.
+                self.reset_warm_prefix_signal();
             } else {
                 // No MCP tools have appeared. They may still be connecting, so
                 // leave the guard unset and re-check on the next turn. Once they

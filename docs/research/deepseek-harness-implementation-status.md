@@ -63,6 +63,19 @@ policy and report so every consumer stays in lockstep.
   builds the policy from them, falling back to the built-in defaults on zero.
   Wired at all 4 live call sites (`/prune`, agent, streaming Point-D, headless).
 
+  **Cache-awareness caveat.** Rewriting a consumed node changes the request
+  bytes, so the provider re-ingests the whole prefix — a small per-step trim can
+  therefore cost a full-prefix re-send every turn, which inverts the intended
+  saving. The scheduled per-step prune is now gated by
+  `Agent::per_step_prune_worth_warm_prefix_break`: when the provider last
+  reported a cache read (warm prefix) and context pressure is low, a trim that
+  would reclaim less than `CompactionConfig.prune_warm_break_bytes` (default
+  256 KiB) is deferred until the cache goes cold, pressure rises past
+  `prune_warm_break_pressure` (default 0.8), or the reclaim is
+  material. `CompactionConfig.prune_preserve_warm_prefix` (default true) opts
+  out. The manual `/prune` command and the 413 recovery path are unaffected:
+  they are explicit actions, not per-step churn.
+
   **Scope note on `/prune`: remote wire support delivered.** `/compact` works
   over SSH/remote via `Request::Compact` → `ServerEvent::CompactResult`. `/prune`
   now has the same parity: `Request::Prune` → `ServerEvent::PruneResult` gets a

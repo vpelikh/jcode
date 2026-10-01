@@ -109,25 +109,34 @@ impl Agent {
             // once. Both the image and tool-result caps run on every step: a
             // consumed oversized node from a prior turn must be reclaimed even
             // on pure-text follow-ups, or it lingers in every subsequent prompt.
-            let pruned = self.session.prune_consumed_transcript(
-                &crate::compaction::prune::PrunePolicy::node_caps_with(
-                    crate::config::config().compaction.prune_tool_result_max_bytes,
-                    crate::config::config().compaction.prune_image_max_bytes,
-                ),
-            );
-            if !pruned.is_empty() {
-                self.note_prune_applied();
-                logging::info(&format!(
-                    "[prune] per-step shrink in headless turn for session {}: {} image(s), {} tool result(s)",
-                    self.session.id,
-                    pruned.images_stripped,
-                    pruned.tool_results_truncated,
-                ));
-                if let Err(err) = self.session.save() {
-                    logging::warn(&format!(
-                        "Failed to persist per-step prune for session {}: {}",
-                        self.session.id, err
+            // Cache-aware gate (see `per_step_prune_worth_warm_prefix_break`):
+            // rewriting the consumed prefix forces a full re-ingest, so defer an
+            // immaterial trim while the provider still holds the prefix warm.
+            let prune_pressure = self.context_pressure_estimate();
+            if self.per_step_prune_worth_warm_prefix_break(
+                self.estimated_consumed_prune_reclaim(),
+                prune_pressure,
+            ) {
+                let pruned = self.session.prune_consumed_transcript(
+                    &crate::compaction::prune::PrunePolicy::node_caps_with(
+                        crate::config::config().compaction.prune_tool_result_max_bytes,
+                        crate::config::config().compaction.prune_image_max_bytes,
+                    ),
+                );
+                if !pruned.is_empty() {
+                    self.note_prune_applied(&pruned);
+                    logging::info(&format!(
+                        "[prune] per-step shrink in headless turn for session {}: {} image(s), {} tool result(s)",
+                        self.session.id,
+                        pruned.images_stripped,
+                        pruned.tool_results_truncated,
                     ));
+                    if let Err(err) = self.session.save() {
+                        logging::warn(&format!(
+                            "Failed to persist per-step prune for session {}: {}",
+                            self.session.id, err
+                        ));
+                    }
                 }
             }
 
@@ -826,6 +835,12 @@ impl Agent {
                 cache_read_input_tokens: usage_cache_read,
                 cache_creation_input_tokens: usage_cache_creation,
             };
+            if usage_cache_read.unwrap_or(0) > 0 {
+                self.cache_warm_read_streak = self.cache_warm_read_streak.saturating_add(1);
+                self.last_cache_read_at = Some(Instant::now());
+            } else {
+                self.reset_warm_prefix_signal();
+            }
 
             self.recover_text_wrapped_tool_call(&mut text_content, &mut tool_calls);
 

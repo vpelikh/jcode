@@ -653,6 +653,247 @@ async fn run_turn_streaming_mpsc_emits_native_compaction_for_client_cache_reset(
     );
 }
 
+#[tokio::test]
+async fn run_turn_streaming_mpsc_forwards_documented_prefix_rewrite_to_clients() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(SignatureSessionProvider::default());
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+    agent.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+    );
+
+    // A scheduled per-step prune (or repair / payload recovery) rewrote the
+    // consumed prefix before this turn.
+    agent.note_prefix_rewrite("per-step prune", "1 tool result(s) truncated");
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.run_turn_streaming_mpsc(tx).await.unwrap();
+
+    let mut saw_invalidation = false;
+    while let Ok(event) = rx.try_recv() {
+        if let ServerEvent::KvCacheRequest {
+            documented_invalidation,
+            ..
+        } = event
+        {
+            let invalidation = documented_invalidation
+                .expect("documented rewrite must be forwarded on KvCacheRequest");
+            assert_eq!(invalidation.source, "per-step prune");
+            assert_eq!(invalidation.detail, "1 tool result(s) truncated");
+            saw_invalidation = true;
+        }
+    }
+    assert!(
+        saw_invalidation,
+        "documented prefix rewrite must reach clients so they attribute the miss"
+    );
+    assert!(
+        agent.pending_kv_cache_rewrite.is_none(),
+        "the rewrite must be cleared after it is reported once"
+    );
+}
+
+/// Warm the agent's cache streak so the prune gate sees a warm prefix.
+fn mark_cache_warm(agent: &mut Agent) {
+    agent.cache_warm_read_streak = 3;
+    agent.last_cache_read_at = Some(std::time::Instant::now());
+}
+
+#[tokio::test]
+async fn warm_prefix_defers_immaterial_per_step_prune() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(SignatureSessionProvider::default());
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // A small consumed tool result a little above the 16 KiB cap: reclaiming it
+    // is immaterial next to re-ingesting a warm prefix. Low pressure, warm cache.
+    let oversized = "x".repeat(16 * 1024 + 1024);
+    agent.add_message(
+        Role::User,
+        vec![ContentBlock::ToolResult {
+            tool_use_id: "call-1".into(),
+            content: oversized.clone(),
+            is_error: None,
+        }],
+    );
+    // An assistant message marks the previous messages as consumed.
+    agent.add_message(
+        Role::Assistant,
+        vec![ContentBlock::Text {
+            text: "ok".to_string(),
+            cache_control: None,
+        }],
+    );
+    mark_cache_warm(&mut agent);
+
+    let reclaim = agent.estimated_consumed_prune_reclaim();
+    assert!(
+        reclaim > 0 && reclaim < 256 * 1024,
+        "test fixture should estimate an immaterial reclaim, got {reclaim}"
+    );
+    assert!(
+        !agent.per_step_prune_worth_warm_prefix_break(reclaim, Some(0.2)),
+        "an immaterial trim on a warm, low-pressure prefix must be deferred"
+    );
+    // High pressure overrides the deferral.
+    assert!(
+        agent.per_step_prune_worth_warm_prefix_break(reclaim, Some(0.95)),
+        "high context pressure must force the reclaim"
+    );
+    // A cold cache makes rewriting free.
+    agent.reset_warm_prefix_signal();
+    assert!(
+        agent.per_step_prune_worth_warm_prefix_break(reclaim, Some(0.2)),
+        "a cold cache must allow unconditional pruning"
+    );
+}
+
+#[tokio::test]
+async fn context_pressure_uses_configured_context_ceiling() {
+    let _guard = crate::storage::lock_test_env();
+    // Restore `JCODE_HOME` (and drop the config cache) even if an assertion
+    // below panics, so a failure cannot leak the temp home into other tests.
+    struct RestoreHome(Option<std::ffi::OsString>);
+    impl Drop for RestoreHome {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(home) => crate::env::set_var("JCODE_HOME", home),
+                None => crate::env::remove_var("JCODE_HOME"),
+            }
+            crate::config::Config::invalidate_cache();
+        }
+    }
+    let _restore = RestoreHome(std::env::var_os("JCODE_HOME"));
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-pressure-cap-")
+        .tempdir()
+        .expect("temp home");
+    std::fs::write(
+        temp_home.path().join("config.toml"),
+        "[compaction]\nmax_context_tokens = 1000\n",
+    )
+    .expect("write config");
+    crate::env::set_var("JCODE_HOME", temp_home.path());
+    crate::config::Config::invalidate_cache();
+
+    // A provider advertising a large window: without the configured ceiling the
+    // pressure would read as 900/100000 = 0.009 and never trip the gate.
+    let provider: Arc<dyn Provider> = Arc::new(PruneAccountingStreamProvider { context: 100_000 });
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+    agent.last_usage = TokenUsage {
+        input_tokens: 900,
+        output_tokens: 0,
+        cache_read_input_tokens: None,
+        cache_creation_input_tokens: None,
+    };
+
+    // The gate must use min(window, max_context_tokens) = 1000, matching the
+    // compaction manager's capped budget, so pressure = 900/1000 = 0.9.
+    let pressure = agent.context_pressure_estimate().expect("pressure computed");
+    assert!(
+        (pressure - 0.9).abs() < 0.01,
+        "pressure must use the configured ceiling as the denominator, got {pressure}"
+    );
+}
+
+#[tokio::test]
+async fn material_reclaim_breaks_warm_prefix() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(SignatureSessionProvider::default());
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // A multi-hundred-KiB dump: reclaiming it is worth a prefix re-ingest.
+    let huge = "x".repeat(400 * 1024);
+    agent.add_message(
+        Role::User,
+        vec![ContentBlock::ToolResult {
+            tool_use_id: "call-2".into(),
+            content: huge,
+            is_error: None,
+        }],
+    );
+    agent.add_message(
+        Role::Assistant,
+        vec![ContentBlock::Text {
+            text: "ok".to_string(),
+            cache_control: None,
+        }],
+    );
+    mark_cache_warm(&mut agent);
+
+    let reclaim = agent.estimated_consumed_prune_reclaim();
+    assert!(
+        reclaim >= 256 * 1024,
+        "fixture should estimate a material reclaim, got {reclaim}"
+    );
+    assert!(
+        agent.per_step_prune_worth_warm_prefix_break(reclaim, Some(0.1)),
+        "a material reclaim justifies breaking a warm prefix"
+    );
+}
+
+#[tokio::test]
+async fn stale_cache_read_loses_warmth_after_ttl() {
+    let _guard = crate::storage::lock_test_env();
+    // A provider whose name/model carry an explicit cache TTL policy, so the
+    // warmth gate can actually expire the read (SignatureSessionProvider is
+    // unrecognized and therefore always retains the read-based signal).
+    let provider: Arc<dyn Provider> = Arc::new(MidStreamModelSwitchProvider {
+        model: std::sync::Mutex::new("claude-opus-4-8".to_string()),
+        switch_to: "claude-opus-4-8".to_string(),
+    });
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    let oversized = "x".repeat(16 * 1024 + 1024);
+    agent.add_message(
+        Role::User,
+        vec![ContentBlock::ToolResult {
+            tool_use_id: "call-1".into(),
+            content: oversized,
+            is_error: None,
+        }],
+    );
+    agent.add_message(
+        Role::Assistant,
+        vec![ContentBlock::Text {
+            text: "ok".to_string(),
+            cache_control: None,
+        }],
+    );
+    mark_cache_warm(&mut agent);
+    assert!(
+        agent.prefix_cache_is_warm(),
+        "a fresh cache read must count as warm"
+    );
+
+    // The provider reported a read, but the TTL has since elapsed, so the entry
+    // may have been evicted: rewriting is now (nearly) free.
+    agent.last_cache_read_at = Some(
+        std::time::Instant::now()
+            - std::time::Duration::from_secs(
+                crate::provider::cache_ttl_for_provider_model("claude", None).unwrap_or(300) + 60,
+            ),
+    );
+    assert!(
+        !agent.prefix_cache_is_warm(),
+        "a stale cache read past the provider TTL must not protect the prefix"
+    );
+    let reclaim = agent.estimated_consumed_prune_reclaim();
+    assert!(
+        agent.per_step_prune_worth_warm_prefix_break(reclaim, Some(0.2)),
+        "once the cache read is stale, the immaterial trim must be allowed"
+    );
+}
+
 /// Provider that transparently switches its model mid-stream, mimicking the
 /// Anthropic retired-model fallback (`claude-fable-5` -> `claude-opus-4-8`).
 struct MidStreamModelSwitchProvider {
@@ -5323,6 +5564,72 @@ async fn text_only_turn_prunes_consumed_oversized_image() {
     assert!(
         marker.is_some(),
         "consumed oversized image must be pruned on a text-only turn"
+    );
+}
+/// Acceptance coverage for the cache-aware gate at the real turn-loop boundary:
+/// a warm cache with low pressure defers an immaterial per-step trim (the
+/// consumed oversized node survives), while priming the same transcript with a
+/// cold cache prunes it. Both branches drive the same `run_once_streaming_mpsc`
+/// entry the daemon uses, and the only difference between them is the cache
+/// state, so it isolates the gate rather than the prune machinery.
+#[tokio::test]
+async fn per_step_prune_gate_defers_when_warm_and_prunes_when_cold() {
+    async fn run_text_turn(warm: bool) -> Agent {
+        let provider: Arc<dyn Provider> = Arc::new(TextOnlyStreamProvider);
+        let registry = Registry::new(provider.clone()).await;
+        let mut agent = Agent::new(provider, registry);
+
+        // A consumed oversized tool result: the tool result (User), then an
+        // assistant ack, so it is in the consumed prefix (before the last
+        // assistant) and eligible for the per-step prune.
+        agent.session.add_message(
+            crate::message::Role::User,
+            vec![ContentBlock::ToolResult {
+                tool_use_id: "call-old".into(),
+                content: "x".repeat(16 * 1024 + 2048),
+                is_error: None,
+            }],
+        );
+        agent.session.add_message(
+            crate::message::Role::Assistant,
+            vec![ContentBlock::Text {
+                text: "ack".into(),
+                cache_control: None,
+            }],
+        );
+
+        // Prime the cache-warmth signal only for the warm case. The provider is
+        // text-only, so its TTL policy is unknown and the read-based signal
+        // (not the TTL) governs warmth; the timestamp is still set so the gate's
+        // TTL check cannot spuriously expire it within the test.
+        if warm {
+            mark_cache_warm(&mut agent);
+        }
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        agent
+            .run_once_streaming_mpsc("continue", Vec::new(), None, tx)
+            .await
+            .unwrap();
+        agent
+    }
+
+    let pruned = |agent: &Agent| {
+        agent.session.messages.iter().flat_map(|m| &m.content).any(
+            |b| matches!(b, ContentBlock::ToolResult { content, .. } if content.contains("chars truncated for context recovery")),
+        )
+    };
+
+    let warm_agent = run_text_turn(true).await;
+    assert!(
+        !pruned(&warm_agent),
+        "a warm cache with low pressure must defer the immaterial per-step trim"
+    );
+
+    let cold_agent = run_text_turn(false).await;
+    assert!(
+        pruned(&cold_agent),
+        "a cold cache must let the same trim run so the oversized node is reclaimed"
     );
 }
 /// A pure-text continuation turn over a PREVIOUS turn's consumed oversized tool

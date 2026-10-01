@@ -108,6 +108,7 @@ fn kv_cache_request_event(
     tools: &[ToolDefinition],
     system_static: &str,
     ephemeral_messages: &[Message],
+    documented_invalidation: Option<crate::protocol::DocumentedCacheInvalidation>,
 ) -> ServerEvent {
     let ephemeral_hash = if ephemeral_messages.is_empty() {
         None
@@ -127,6 +128,7 @@ fn kv_cache_request_event(
         ephemeral_hash,
         ephemeral_chars: stable_json_len(ephemeral_messages),
         ephemeral_message_count: ephemeral_messages.len(),
+        documented_invalidation,
     }
 }
 
@@ -247,6 +249,22 @@ pub struct Agent {
     mcp_late_register_resolved: bool,
     /// Override system prompt (used by ambient mode to inject a custom prompt)
     system_prompt_override: Option<String>,
+    /// Documented, intentional rewrite of the provider-facing prefix since the
+    /// previous request (per-step prune, tool-output repair, payload recovery).
+    /// Consumed by the next `KvCacheRequest` event so remote clients attribute
+    /// the resulting cache miss instead of raising a "harness: prefix changed"
+    /// alarm. Cleared after each request is reported.
+    pending_kv_cache_rewrite: Option<crate::protocol::DocumentedCacheInvalidation>,
+    /// Consecutive completed requests whose provider reported a non-zero cache
+    /// read. A non-zero value means the provider is holding the consumed prefix
+    /// in its prompt cache, so the scheduled per-step prune must not rewrite that
+    /// prefix for an immaterial gain (see `per_step_prune_worth_warm_prefix_break`).
+    cache_warm_read_streak: u32,
+    /// When the last provider-reported cache read landed. The per-step prune
+    /// gate only treats the prefix as warm while this is within the
+    /// provider/model cache TTL, so a stale read does not wrongly protect an
+    /// already-evicted prefix.
+    last_cache_read_at: Option<Instant>,
     /// When set, the first visible user message boots from this specific saved
     /// handoff instead of the automatic latest-for-project one. Cleared after
     /// it is consumed so it cannot re-inject on a later turn or session.
@@ -348,6 +366,9 @@ impl Agent {
             locked_tools: None,
             mcp_late_register_resolved: false,
             system_prompt_override: None,
+            pending_kv_cache_rewrite: None,
+            cache_warm_read_streak: 0,
+            last_cache_read_at: None,
             handoff_resume_id: None,
             agents_md_snapshot,
             memory_enabled: crate::config::config().features.memory,
@@ -692,6 +713,8 @@ impl Agent {
         self.background_tool_signal.reset();
         self.graceful_shutdown.reset();
         self.cache_tracker.reset();
+        self.pending_kv_cache_rewrite = None;
+        self.reset_warm_prefix_signal();
         self.last_usage = TokenUsage::default();
         self.locked_tools = None;
         self.mcp_late_register_resolved = false;
@@ -793,6 +816,9 @@ impl Agent {
         }
 
         self.cache_tracker.reset();
+        // Native compaction rewrites the provider-facing transcript, so any
+        // cached prefix is gone; re-arm unconditional per-step pruning.
+        self.reset_warm_prefix_signal();
         self.locked_tools = None;
         self.mcp_late_register_resolved = false;
         self.provider_session_id = None;
@@ -1032,6 +1058,13 @@ impl Agent {
             self.cache_tracker.reset();
             self.locked_tools = None;
             self.mcp_late_register_resolved = false;
+            // Repairing missing tool outputs inserts synthetic results into the
+            // consumed transcript, changing the cached prefix. Document it so
+            // remote clients attribute the miss rather than alarm.
+            self.note_prefix_rewrite(
+                "tool-output repair",
+                format!("{repaired} missing tool output(s) recovered"),
+            );
         }
 
         repaired

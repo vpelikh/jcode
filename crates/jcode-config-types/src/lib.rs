@@ -433,6 +433,37 @@ pub struct CompactionConfig {
     /// (`PrunePolicy::node_caps` default.)
     pub prune_image_max_bytes: usize,
 
+    /// [prune] When true (default), the scheduled per-step prune will not rewrite
+    /// an already-consumed prefix that the provider still has cached unless the
+    /// reclaimed payload is large enough to be worth the resend.
+    ///
+    /// Changing any node in the cached prefix forces the provider to re-ingest
+    /// the whole prefix, which costs far more than a small trim saves — so a
+    /// tiny per-node trim that runs every turn can turn an otherwise warm cache
+    /// into one full-prefix re-send per turn. With this on, such trims are
+    /// deferred; they still happen once the cache goes cold, once context
+    /// pressure is high, or once the reclaimed payload is material. Set false to
+    /// restore the historical "shrink every step" behavior.
+    #[serde(default = "default_true")]
+    pub prune_preserve_warm_prefix: bool,
+
+    /// [prune] Reclaimed payload (UTF-8 bytes) at or above which the scheduled
+    /// per-step prune will rewrite an otherwise-warm cached prefix. Below this,
+    /// with a warm cache and low context pressure, the trim is deferred so the
+    /// provider does not have to re-ingest the whole prefix for a small saving.
+    /// 0 disables the threshold (always treat reclaim as material). Default
+    /// 262144 (256 KiB).
+    #[serde(default = "default_prune_warm_break_bytes")]
+    pub prune_warm_break_bytes: usize,
+
+    /// [prune] Context pressure (effective tokens / token budget) at or above
+    /// which the scheduled per-step prune runs regardless of cache warmth, so an
+    /// over-budget transcript is still reclaimed. The budget is
+    /// `min(context_window, max_context_tokens)`, matching the compaction
+    /// trigger. Default 0.8.
+    #[serde(default = "default_prune_warm_break_pressure")]
+    pub prune_warm_break_pressure: f32,
+
     /// When true, the live producer physically consolidates `session.messages`
     /// into `[summary_message, recent_tail...]` on compaction completion (both
     /// auto-compaction and manual `/compact`), using the log-bracketed seam
@@ -465,6 +496,9 @@ impl Default for CompactionConfig {
             max_context_tokens: 0,
             prune_tool_result_max_bytes: 16384,
             prune_image_max_bytes: 1024,
+            prune_preserve_warm_prefix: true,
+            prune_warm_break_bytes: default_prune_warm_break_bytes(),
+            prune_warm_break_pressure: default_prune_warm_break_pressure(),
             physically_consolidate: false,
         }
     }
@@ -1221,6 +1255,16 @@ impl Default for NativeScrollbarConfig {
 }
 fn default_true() -> bool {
     true
+}
+
+/// Default warm-prefix break threshold: 256 KiB of reclaimed payload.
+fn default_prune_warm_break_bytes() -> usize {
+    256 * 1024
+}
+
+/// Default warm-prefix pressure threshold, matching the compaction trigger.
+fn default_prune_warm_break_pressure() -> f32 {
+    0.8
 }
 
 /// Runtime feature toggles

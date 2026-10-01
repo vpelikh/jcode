@@ -127,21 +127,37 @@ impl Agent {
             // once. Both the image and tool-result caps run on every step: a
             // consumed oversized node from a prior turn must be reclaimed even
             // on pure-text follow-ups, or it lingers in every subsequent prompt.
-            let pruned = self.session.prune_consumed_transcript(
-                &crate::compaction::prune::PrunePolicy::node_caps_with(
-                    crate::config::config().compaction.prune_tool_result_max_bytes,
-                    crate::config::config().compaction.prune_image_max_bytes,
-                ),
-            );
-            if !pruned.is_empty() {
-                self.note_prune_applied();
+            //
+            // Cache-aware gate: rewriting the consumed prefix forces the provider
+            // to re-ingest it, which costs far more than a small trim saves. When
+            // the prefix is warm and context pressure is low, defer trims that
+            // would reclaim an immaterial amount so the cache is preserved.
+            let prune_pressure = self.context_pressure_estimate();
+            if self.per_step_prune_worth_warm_prefix_break(
+                self.estimated_consumed_prune_reclaim(),
+                prune_pressure,
+            ) {
+                let pruned = self.session.prune_consumed_transcript(
+                    &crate::compaction::prune::PrunePolicy::node_caps_with(
+                        crate::config::config().compaction.prune_tool_result_max_bytes,
+                        crate::config::config().compaction.prune_image_max_bytes,
+                    ),
+                );
+                if !pruned.is_empty() {
+                    self.note_prune_applied(&pruned);
+                    crate::logging::info(&format!(
+                        "[prune] per-step shrink for session {}: {} image(s), {} tool result(s)",
+                        self.session.id,
+                        pruned.images_stripped,
+                        pruned.tool_results_truncated,
+                    ));
+                    self.session.save()?;
+                }
+            } else if trace_enabled() {
                 crate::logging::info(&format!(
-                    "[prune] per-step shrink for session {}: {} image(s), {} tool result(s)",
-                    self.session.id,
-                    pruned.images_stripped,
-                    pruned.tool_results_truncated,
+                    "[prune] deferred per-step shrink for session {} to preserve warm prefix cache",
+                    self.session.id
                 ));
-                self.session.save()?;
             }
 
             // Model-degradation mitigation checkpoint (Slice 3): if the route
@@ -284,11 +300,16 @@ impl Agent {
             let model_at_request_start = provider.model().to_string();
             let resume_session_id = self.provider_session_id.clone();
             self.last_status_detail = None;
+            // Attribute any documented prefix rewrite (per-step prune, repair,
+            // payload recovery) that happened before this request, then clear it
+            // so it is not reported again on the next, unrelated request.
+            let documented_invalidation = self.pending_kv_cache_rewrite.take();
             let _ = event_tx.send(kv_cache_request_event(
                 &cache_signature_messages,
                 &tools,
                 &split_prompt.static_part,
                 &ephemeral_signature_messages,
+                documented_invalidation,
             ));
             // These vectors are only needed to build the cache telemetry event.
             // Explicitly release their deeply cloned transcript strings before
@@ -1050,6 +1071,16 @@ impl Agent {
                 cache_read_input_tokens: usage_cache_read,
                 cache_creation_input_tokens: usage_cache_creation,
             };
+            // Track whether the provider is holding the consumed prefix in its
+            // prompt cache. A positive cache read means the prefix is warm, so
+            // the per-step prune must not rewrite it for an immaterial gain. A
+            // zero read (cold) re-arms unconditional pruning.
+            if usage_cache_read.unwrap_or(0) > 0 {
+                self.cache_warm_read_streak = self.cache_warm_read_streak.saturating_add(1);
+                self.last_cache_read_at = Some(Instant::now());
+            } else {
+                self.reset_warm_prefix_signal();
+            }
 
             // Detect a transparent mid-request model switch (e.g. Anthropic's
             // retired `claude-fable-5` falling back to `claude-opus-4-8`). The

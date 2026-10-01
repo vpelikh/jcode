@@ -3797,6 +3797,13 @@ pub(super) fn handle_config_command(app: &mut App, trimmed: &str) -> bool {
                 crate::config::config().compaction.prune_image_max_bytes,
             ));
         if !report.is_empty() {
+            crate::cache_invalidation::record(
+                "prune command",
+                format!(
+                    "{} image(s) replaced, {} tool result(s) truncated",
+                    report.images_stripped, report.tool_results_truncated
+                ),
+            );
             app.messages.clear();
             app.reseed_compaction_from_provider_messages();
             app.provider_session_id = None;

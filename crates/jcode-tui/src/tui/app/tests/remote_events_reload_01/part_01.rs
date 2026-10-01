@@ -1261,6 +1261,7 @@ fn test_handle_server_event_kv_cache_request_resets_tps_output_watermark_for_nex
             ephemeral_hash: None,
             ephemeral_chars: 0,
             ephemeral_message_count: 0,
+            documented_invalidation: None,
         },
         &mut remote,
     );
