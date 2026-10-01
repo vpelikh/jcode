@@ -3698,6 +3698,222 @@ fn test_current_compaction_ignores_open_bracket_and_keeps_last_completed() {
     assert!(back.orphaned_compaction().is_some());
 }
 
+/// f1: `push_event` (the trusting, non-validating append used by
+/// `fork_up_to_boundary` and journal replay) must keep the projection cache
+/// current exactly like `append_event`, since it runs the same incremental
+/// branch. A fork builds a *fresh* map and replays its prefix through
+/// `push_event`, so the fork's cache must be at head and its projection must
+/// match `derive_messages` — the production fork/review path.
+#[test]
+fn projection_cache_tracks_push_event_fork_path() {
+    let msg = |id: &str| StoredMessage {
+        id: id.to_string(),
+        role: Role::User,
+        content: vec![text_block(id)],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    };
+    let mut map = SessionEventMap::default();
+    for i in 0..4 {
+        map.append_event(SessionEvent {
+            timestamp: Utc::now(),
+            event_id: format!("e{i}").into(),
+            op: SessionEventOp::AppendMessage {
+                message_id: format!("m{i}").into(),
+                message: msg(&format!("m{i}")),
+            },
+            parent_id: None,
+            version: 1,
+        });
+    }
+
+    let mut fork = map.fork_up_to_boundary(2);
+    // push_event kept the fork's cache at head throughout the replay.
+    assert_eq!(fork.projection_folded_len(), fork.events.len());
+    assert_eq!(fork.events.len(), 3);
+    // And the projection matches the derived transcript exactly.
+    assert_eq!(
+        serde_json::to_vec(&fork.projected_messages()).unwrap(),
+        serde_json::to_vec(&fork.derive_messages()).unwrap(),
+    );
+}
+
+/// f1: `append_stored_message` can have its event *rejected* by validation (a
+/// message with no content blocks), in which case it falls back to
+/// `rebuild_event_map` — a wholesale log rebuild that swaps in a fresh
+/// `SessionEventMap`. The projection cache must stay consistent across that
+/// path: the rebuilt map's cache is empty, so the next read refolds the new log
+/// and agrees with `derive_messages`. This covers the rejection/rebuild branch
+/// (the append seam's `!recorded` fallback), which the append differential does
+/// not reach because the `Session` API never emits an invalid message.
+#[test]
+fn projection_cache_tracks_rejected_append_rebuild_path() {
+    let mk = |id: &str, body: &str| StoredMessage {
+        id: id.to_string(),
+        role: Role::User,
+        content: vec![text_block(body)],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    };
+    // No content blocks -> `validate_message` rejects the event.
+    let empty = |id: &str| StoredMessage {
+        id: id.to_string(),
+        role: Role::User,
+        content: vec![],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    };
+
+    let mut session = Session::create_with_id("proj_reject_rebuild".to_string(), None, None);
+    let assert_matches = |session: &mut Session, ctx: &str| {
+        let projected = session.projected_messages();
+        assert_eq!(
+            session.event_map.projection_folded_len(),
+            session.event_map.events.len(),
+            "projection cache must be at the log head ({ctx})"
+        );
+        assert_eq!(
+            serde_json::to_vec(&projected).unwrap(),
+            serde_json::to_vec(&session.derive_messages()).unwrap(),
+            "projection must mirror derived after the rebuild ({ctx})"
+        );
+    };
+
+    session.append_stored_message(mk("a0", "A0"));
+    assert_matches(&mut session, "append a0");
+    // This append is rejected and triggers `rebuild_event_map`; the legacy vector
+    // still receives the (empty) message, so the rebuilt log must derive it too.
+    session.append_stored_message(empty("bad"));
+    assert_matches(&mut session, "rejected append -> rebuild");
+    assert_eq!(session.messages.len(), session.derive_messages().len());
+    // And the cache keeps tracking appends through the rebuilt log.
+    session.append_stored_message(mk("a1", "A1"));
+    assert_matches(&mut session, "append after rebuild");
+    assert_eq!(session.messages.len(), session.derive_messages().len());
+
+    // `insert_message` shares the same fallback: an empty-content message is
+    // rejected by validation, so it too rebuilds the log from the legacy vector.
+    session.insert_message(1, empty("bad-insert"));
+    assert_matches(&mut session, "rejected insert -> rebuild");
+    assert_eq!(session.messages.len(), session.derive_messages().len());
+    // A valid insert after the rebuild keeps the cache tracking.
+    session.insert_message(1, mk("i1", "I1"));
+    assert_matches(&mut session, "insert after rebuild");
+    assert_eq!(session.messages.len(), session.derive_messages().len());
+}
+
+#[test]
+fn projection_cache_starts_empty_after_deserialize() {
+    // The projection cache is `#[serde(skip)]`, so a deserialized map must start
+    // with nothing folded (`folded_len == 0`) and refold lazily from `events` —
+    // never carry a persisted/stale watermark that could shadow the log.
+    let msg = |id: &str| StoredMessage {
+        id: id.to_string(),
+        role: Role::User,
+        content: vec![text_block("body")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    };
+    let ev = |id: &str| SessionEvent {
+        timestamp: Utc::now(),
+        event_id: id.to_string().into(),
+        op: SessionEventOp::AppendMessage {
+            message_id: id.to_string().into(),
+            message: msg(id),
+        },
+        parent_id: None,
+        version: 1,
+    };
+    let mut map = SessionEventMap::default();
+    map.append_event(ev("e1"));
+    map.append_event(ev("e2"));
+    // Fold the cache in-memory first so the round-trip proves it is dropped.
+    let in_memory = map.projected_messages();
+    assert_eq!(map.projection_folded_len(), map.events.len());
+
+    let json = serde_json::to_string(&map).unwrap();
+    let mut back: SessionEventMap = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        back.projection_folded_len(),
+        0,
+        "deserialized cache must start empty (serde-skipped)"
+    );
+    // First read refolds to the identical transcript.
+    assert_eq!(ids(&back.projected_messages()), ids(&in_memory));
+    assert_eq!(back.projection_folded_len(), back.events.len());
+}
+
+#[test]
+fn session_event_map_stays_send_and_sync() {
+    // Compile-time guard for a documented invariant: the in-memory caches
+    // (`cached_compaction`, `projection_cache`) are deliberately plain owned
+    // fields (no `Rc`/`RefCell`/interior mutability) precisely so `SessionEventMap`
+    // stays `Send + Sync` and can cross app-core's async task boundaries. A future
+    // field choice that broke this would compile fine in `jcode-base` and only
+    // fail far away in `jcode-app-core`; this asserts it right here.
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<SessionEventMap>();
+}
+
+#[test]
+fn projection_cache_is_not_serialized_to_disk() {
+    // Format lock: the projection cache is `#[serde(skip)]`, so adding it must not
+    // change the on-disk JSON shape of `SessionEventMap` at all. A snapshot/resume
+    // written before this field existed must deserialize identically, and a
+    // snapshot written now must contain no cache key (so a persisted cache can
+    // never become a second authoritative state).
+    let msg = |id: &str| StoredMessage {
+        id: id.to_string(),
+        role: Role::User,
+        content: vec![text_block("body")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    };
+    let mut map = SessionEventMap::default();
+    map.append_event(SessionEvent {
+        timestamp: Utc::now(),
+        event_id: "e1".to_string().into(),
+        op: SessionEventOp::AppendMessage {
+            message_id: "e1".to_string().into(),
+            message: msg("e1"),
+        },
+        parent_id: None,
+        version: 1,
+    });
+
+    let json = serde_json::to_string(&map).expect("serialize");
+    // No cache field name leaks into the wire form (the whole point of serde(skip)).
+    assert!(
+        !json.contains("projection_cache") && !json.contains("folded"),
+        "the projection cache must not appear in serialized JSON; got: {json}"
+    );
+
+    // Because the cache is skipped, the serialized form is byte-for-byte the same
+    // shape a pre-cache build wrote. Load those bytes as a would-be legacy file:
+    // it must deserialize with an empty cache and refold lazily.
+    let mut back: SessionEventMap =
+        serde_json::from_str(&json).expect("a cache-free (legacy-shaped) snapshot must load");
+    assert_eq!(back.projection_folded_len(), 0);
+    assert_eq!(back.projected_messages().len(), 1);
+    // And re-serializing stays cache-free and shape-stable.
+    let json2 = serde_json::to_string(&back).expect("re-serialize");
+    assert_eq!(json2, json, "the wire shape must be stable across a round trip");
+}
+
+fn ids(messages: &[jcode_session_types::StoredMessage]) -> Vec<String> {
+    messages.iter().map(|m| m.id.clone()).collect()
+}
+
 /// The in-memory `cached_compaction` cache and the post-deserialization
 /// reverse-scan fallback must always return the SAME `current_compaction`. The
 /// cache is `#[serde(skip)]`, so after a JSON round trip it is gone and the
@@ -4615,14 +4831,322 @@ fn projected_messages_matches_derive_messages() {
         token_usage: None,
     });
 
-    // The projected transcript matches derive_messages exactly (compare ids:
-    // StoredMessage is not PartialEq). projected_messages is infallible.
+    // The projected transcript matches derive_messages exactly. Compare the full
+    // serialized form (not just ids): StoredMessage is not PartialEq, and a
+    // payload/role divergence would slip past an ids-only check.
     let projected = session.projected_messages();
     let derived = session.derive_messages();
     assert_eq!(
-        projected.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
-        derived.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+        serde_json::to_vec(&projected).unwrap(),
+        serde_json::to_vec(&derived).unwrap(),
         "projected_messages must mirror derive_messages"
     );
     assert_eq!(projected.len(), 3);
+}
+
+#[test]
+fn projected_messages_cache_tracks_all_mutation_paths() {
+    // f1: `projected_messages` now reads the append-seam incremental cache, so it
+    // must stay identical to `derive_messages` across every transcript mutation
+    // route (append, insert, replace, clear), and after a persist + reload
+    // (where the cache starts cold and must refold).
+    use std::io::Write;
+
+    let dir = std::env::temp_dir().join(format!("jcode_proj_cache_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("session.json");
+
+    let mut session = Session::create_with_id("proj_cache".to_string(), None, None);
+    let mk = |id: &str, body: &str| StoredMessage {
+        id: id.to_string(),
+        role: Role::User,
+        content: vec![text_block(body)],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    };
+    let assert_projection_matches = |session: &mut Session, ctx: &str| {
+        // Query the clone-free length FIRST, while the cache may be cold, so the
+        // accessor itself is exercised (the app-core watermark path does this on
+        // a freshly loaded session). Then the cloned projection, then the refold.
+        let len = session.projected_messages_len();
+        let projected = session.projected_messages();
+        let derived = session.derive_messages();
+        // The clone-free length accessor must agree with both the cloned
+        // projection and the on-demand refold.
+        assert_eq!(
+            len,
+            projected.len(),
+            "projected_messages_len must equal the projection ({ctx})"
+        );
+        assert_eq!(
+            len,
+            derived.len(),
+            "projected_messages_len must equal derive_messages ({ctx})"
+        );
+        assert_eq!(
+            serde_json::to_vec(&projected).expect("serialize projected"),
+            serde_json::to_vec(&derived).expect("serialize derived"),
+            "projection must mirror derived ({ctx})"
+        );
+        // The append seam keeps the cache at the log head, so `projected_messages`
+        // never refolds a prefix after a live mutation.
+        assert_eq!(
+            session.event_map.projection_folded_len(),
+            session.event_map.events.len(),
+            "projection cache must track the log head ({ctx})"
+        );
+    };
+
+    assert_projection_matches(&mut session, "empty");
+    session.append_stored_message(mk("a", "A"));
+    assert_projection_matches(&mut session, "append a");
+    session.append_stored_message(mk("b", "B"));
+    assert_projection_matches(&mut session, "append b");
+    session.insert_message(1, mk("i", "I"));
+    assert_projection_matches(&mut session, "insert middle");
+    session.replace_messages(vec![mk("r1", "R1"), mk("r2", "R2")]);
+    assert_projection_matches(&mut session, "replace");
+    session.clear_messages();
+    assert_projection_matches(&mut session, "clear");
+    session.append_stored_message(mk("post", "P"));
+    assert_projection_matches(&mut session, "post-clear append");
+
+    // Persist and reload: the cache starts cold, so the first read refolds and
+    // must agree with derive_messages.
+    let json = serde_json::to_string(&session).expect("serialize");
+    let mut f = std::fs::File::create(&path).unwrap();
+    f.write_all(json.as_bytes()).unwrap();
+    drop(f);
+
+    let mut loaded = Session::load_from_path(&path).expect("load_from_path");
+    assert_projection_matches(&mut loaded, "after reload");
+    assert_eq!(loaded.derive_messages().len(), 1);
+
+    // Append a live message after the reload and confirm the cache still tracks.
+    loaded.append_stored_message(mk("post-reload", "PR"));
+    assert_projection_matches(&mut loaded, "append after reload");
+    assert_eq!(loaded.derive_messages().len(), 2);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// f3: quantify the incremental projection cache against the on-demand refold
+/// on a long session. `#[ignore]`d so it never runs in the normal suite; run
+/// with `cargo test -p jcode-base --lib -- --ignored --nocapture
+/// bench_projected_vs_derive_messages`.
+///
+/// The point: `derive_messages` re-walks the whole log on every call (O(events),
+/// cloning each message), while `projected_messages` keeps a cache current at the
+/// append seam and returns a clone of only the folded transcript. On a long
+/// session the per-read work should clearly favor the projection. This test
+/// prints the ratio rather than asserting a hard bound (timing hardware varies);
+/// when run it fails only if the projection is outright *slower*.
+///
+/// It is `#[ignore]`d because it is a measurement, not a correctness check: it
+/// costs ~14 s (500 reads through the un-cached `derive_messages` on a
+/// 20,505-event log) and asserts on wall-clock time, so it does not belong in the
+/// gating suite. Byte-identity is already guarded deterministically by
+/// `ProjectionMatchesDerived` / `ProjectionCacheMatchesDerived` and the randomized
+/// differential; this benchmark only quantifies the speedup.
+#[test]
+#[ignore = "perf benchmark; run explicitly with --ignored --nocapture"]
+fn bench_projected_vs_derive_messages() {
+    use std::time::Instant;
+
+    // Build a long session: a mix of appends, inserts, and full replacements so
+    // the log is larger than the live transcript (the realistic worst case for
+    // the incremental fold, which still avoids re-walking the prefix per read).
+    let mut session = Session::create_with_id("bench_proj".to_string(), None, None);
+    let mk = |id: String| StoredMessage {
+        id,
+        role: Role::User,
+        content: vec![text_block("some tool output text that is not trivial in size")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    };
+    for i in 0..20_000 {
+        session.append_stored_message(mk(format!("m{i}")));
+    }
+    for i in 0..500 {
+        session.insert_message(0, mk(format!("pre{i}")));
+    }
+    // A few full replacements so the cache's splice path is exercised too.
+    for round in 0..5 {
+        let snapshot: Vec<StoredMessage> = (0..2_000)
+            .map(|i| mk(format!("r{round}_{i}")))
+            .collect();
+        session.replace_messages(snapshot);
+    }
+
+    let log_len = session.event_map.events.len();
+    let live_len = session.messages.len();
+
+    // Warm the cache so the first read's full fold is not charged to the loop.
+    let warm = session.projected_messages();
+    assert_eq!(warm.len(), session.derive_messages().len());
+
+    const READS: usize = 500;
+
+    let start = Instant::now();
+    let mut sink = 0usize;
+    for _ in 0..READS {
+        sink += session.projected_messages().len();
+    }
+    let projected = start.elapsed();
+
+    let start = Instant::now();
+    for _ in 0..READS {
+        sink += session.derive_messages().len();
+    }
+    let derived = start.elapsed();
+    std::hint::black_box(sink);
+
+    let projected_us = projected.as_micros().max(1);
+    let derived_us = derived.as_micros().max(1);
+    let ratio = derived_us as f64 / projected_us as f64;
+    eprintln!(
+        "f3 projection benchmark: log_events={log_len} live_messages={live_len} reads={READS}\n\
+         \tprojected_messages: {projected:?} ({:.2} us/read)\n\
+         \tderive_messages:    {derived:?} ({:.2} us/read)\n\
+         \tderive/projected ratio: {ratio:.2}x",
+        projected_us as f64 / READS as f64,
+        derived_us as f64 / READS as f64,
+    );
+
+    // A cached read must not be *slower* than a full refold; anything else is a
+    // regression in the append seam. (Equality is tolerated for tiny logs.)
+    assert!(
+        projected <= derived,
+        "projected_messages ({projected:?}) must not be slower than derive_messages ({derived:?})"
+    );
+}
+
+/// f1: a randomized differential test that drives the *incremental* projection
+/// cache through the real append seam (the code path `projected_messages()`
+/// actually takes in production) and asserts it never diverges from the
+/// on-demand `derive_messages()` refold. This is the safety backstop the
+/// takeaway calls for: rather than trusting the append-seam bookkeeping, every
+/// step is cross-checked against the full fold.
+///
+/// A deterministic LCG drives a long mix of append / insert / replace / clear
+/// ops through the `Session` API, plus raw events appended straight to
+/// `event_map` with deliberately malformed bounds (out-of-range and reversed
+/// `ReplaceMessages` spans, out-of-range insert indices) — the corruption-
+/// tolerant shapes the `Session` API never emits but a torn log can carry.
+/// A `Session::projected_messages()` read follows each op so the cache advances
+/// incrementally through the real append seam and can be caught diverging at
+/// the exact op that broke it.
+#[test]
+fn projected_messages_incremental_cache_matches_derived_randomized() {
+    fn next(state: &mut u64) -> u64 {
+        // Numerical Recipes LCG; deterministic, no external rand dependency.
+        *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        *state
+    }
+
+    let mut session = Session::create_with_id("proj_diff".to_string(), None, None);
+    // Content and role both vary with the id, so an ids-only comparison would
+    // miss a divergence that swaps a payload or a role — compare the full
+    // serialized transcript instead.
+    let mk = |id: String, role: Role| StoredMessage {
+        id: id.clone(),
+        role,
+        content: vec![text_block(&format!("body-{id}"))],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    };
+    let wire = |messages: &[StoredMessage]| -> Vec<u8> {
+        serde_json::to_vec(messages).expect("StoredMessage is serializable")
+    };
+
+    let mut rng = 0x1234_5678_9abc_def0u64;
+    for step in 0..3_000 {
+        let op = next(&mut rng) % 100;
+        match op {
+            0..=49 => {
+                let i = next(&mut rng);
+                session.append_stored_message(mk(format!("a{i}"), Role::User));
+            }
+            50..=74 => {
+                let i = next(&mut rng);
+                // Insert at an arbitrary index; the Session clamps to len.
+                let idx = (next(&mut rng) % 50) as usize;
+                session.insert_message(idx, mk(format!("i{i}"), Role::Assistant));
+            }
+            75..=89 => {
+                // Full replacement with a short random-length transcript.
+                let n = (next(&mut rng) % 8) as usize;
+                let batch: Vec<StoredMessage> = (0..n)
+                    .map(|k| mk(format!("r{step}_{k}"), Role::User))
+                    .collect();
+                session.replace_messages(batch);
+            }
+            90..=94 => {
+                // Raw malformed event straight into the log (the shapes the
+                // `Session` API never emits): a reversed / out-of-range
+                // `ReplaceMessages` span or an out-of-range insert index. The
+                // append seam folds it incrementally; the check below proves the
+                // cache still agrees with a full `derive_messages` refold.
+                let op = next(&mut rng) % 3;
+                let event = match op {
+                    0 => SessionEvent {
+                        timestamp: Utc::now(),
+                        event_id: format!("rawrev{step}").into(),
+                        op: SessionEventOp::ReplaceMessages {
+                            start_index: (next(&mut rng) % 40) as usize,
+                            end_index: (next(&mut rng) % 3) as usize, // often start > end
+                            messages: vec![mk(format!("raw{step}"), Role::Assistant)],
+                        },
+                        parent_id: None,
+                        version: 1,
+                    },
+                    1 => SessionEvent {
+                        timestamp: Utc::now(),
+                        event_id: format!("rawoob{step}").into(),
+                        op: SessionEventOp::ReplaceMessages {
+                            start_index: 10_000,
+                            end_index: usize::MAX,
+                            messages: vec![mk(format!("rawoob{step}"), Role::User)],
+                        },
+                        parent_id: None,
+                        version: 1,
+                    },
+                    _ => SessionEvent {
+                        timestamp: Utc::now(),
+                        event_id: format!("rawins{step}").into(),
+                        op: SessionEventOp::InsertMessage {
+                            index: 10_000,
+                            message: mk(format!("rawins{step}"), Role::Assistant),
+                        },
+                        parent_id: None,
+                        version: 1,
+                    },
+                };
+                session.event_map.append_event(event);
+            }
+            _ => session.clear_messages(),
+        }
+
+        // Cross-check at every step (this is where the cache advances
+        // incrementally, per the append seam). Compare the full serialized
+        // transcript, so a role or payload divergence is caught too.
+        let projected = wire(&session.projected_messages());
+        let derived = wire(&session.derive_messages());
+        assert_eq!(
+            projected, derived,
+            "incremental cache diverged from derive_messages at step {step} (op bucket {op})"
+        );
+        // The append seam keeps the cache at the log head.
+        assert_eq!(
+            session.event_map.projection_folded_len(),
+            session.event_map.events.len(),
+            "projection cache fell behind the log head at step {step}"
+        );
+    }
 }

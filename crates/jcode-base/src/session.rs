@@ -42,9 +42,9 @@ pub use branded::{
 };
 pub use invariants::{
     CompactionBracket, InvariantLog, InvariantRegistry, InvariantViolation, LiveTranscriptProjection,
-    LogInvariant, LogProjection, MessageCountProjection, ProjectionMatchesDerived, ProjectionResults,
-    ProjectionRegistry, RoleCounts, RoleCountsProjection, RoleCountsState, fold_projection,
-    project_map,
+    LogInvariant, LogProjection, MessageCountProjection, ProjectionCache, ProjectionCacheMatchesDerived,
+    ProjectionMatchesDerived, ProjectionResults, ProjectionRegistry, RoleCounts, RoleCountsProjection,
+    RoleCountsState, fold_projection, project_map,
 };
 mod crash;
 mod invariants;
@@ -1981,26 +1981,28 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
     ///
     /// Returns the same transcript as [`derive_messages`](Self::derive_messages)
     /// — the `LiveTranscriptProjection` fold matches `derive_messages` exactly
-    /// (proven by the `ProjectionMatchesDerived` invariant) — but through the
-    /// projection seam, so consumers get a typed projection stating their intent
-    /// to read *derived* state rather than scan the raw stream. This is the
-    /// accessor future hot paths adopt on their way off `derive_messages`.
+    /// (the cached path is guarded by the `ProjectionCacheMatchesDerived`
+    /// invariant; `ProjectionMatchesDerived` separately proves the shared fold) —
+    /// but through the append-seam **incremental projection cache** (follow-up f1):
+    /// the log is folded once and then kept current as events are appended, so a
+    /// read after a plain append is a clone of the cached derived state instead of
+    /// a full refold. This is what makes the seam actually *cheaper* than the
+    /// on-demand `derive_messages` it replaces, and it is the accessor hot paths
+    /// adopt on their way off `derive_messages`.
     ///
-    /// Infallible: `LiveTranscriptProjection` defines no failing validation, so
-    /// `project_map` always succeeds — a failure here would be an internal bug and
-    /// panics (failing loudly rather than silently falling back and masking a
-    /// divergence). The `ProjectionMatchesDerived` invariant (not this method) is
-    /// the guard that proves the projection never diverges from `derive_messages`.
-    ///
-    /// This single-projection accessor folds only the transcript via `project_map`.
-    /// Readers that also want other derived domains (message count, per-role
-    /// counts) should use the `ProjectionRegistry` directly for a single fold
-    /// feeding many projections.
-    pub fn projected_messages(&self) -> Vec<StoredMessage> {
-        project_map::<LiveTranscriptProjection>(&self.event_map).expect(
-            "LiveTranscriptProjection fold is infallible (no failing validate); a failure here \
-             is an internal bug that should be surfaced, not silently masked by a fallback",
-        )
+    /// Takes `&mut self` because the cache folds lazily on first read / after a
+    /// non-append mutation. The cached state is byte-identical to a full fold;
+    /// `derive_messages` remains the refold backstop the invariant compares
+    /// against.
+    pub fn projected_messages(&mut self) -> Vec<StoredMessage> {
+        self.event_map.projected_messages()
+    }
+
+    /// The live transcript length via the incremental projection cache, without
+    /// cloning the transcript. Equivalent to `projected_messages().len()` but
+    /// clone-free; use it where only the count is needed (indexes/watermarks).
+    pub fn projected_messages_len(&mut self) -> usize {
+        self.event_map.projected_messages_len()
     }
 
     /// Get current compaction from event log (derives pure state)

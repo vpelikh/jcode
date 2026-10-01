@@ -176,10 +176,19 @@ impl ProjectionUnit {
 /// - **Incremental**: after the initial fold, [`apply`](Self::apply) keeps the
 ///   running states current by folding only newly-appended events, so the registry
 ///   never refolds the whole log per append. The current folded states are read
-///   back via [`current`](Self::current).
+///   back via [`current`](Self::current) or the allocation-free
+///   [`get`](Self::get).
 #[derive(Default)]
 pub struct ProjectionRegistry {
     units: Vec<ProjectionUnit>,
+}
+
+impl std::fmt::Debug for ProjectionRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProjectionRegistry")
+            .field("names", &self.names())
+            .finish()
+    }
 }
 
 impl ProjectionRegistry {
@@ -259,6 +268,21 @@ impl ProjectionRegistry {
         }
     }
 
+    /// Allocation-free typed access to a single projection's running state,
+    /// bypassing the [`ProjectionResults`] entry vector that
+    /// [`current`](Self::current) builds. This is the hot-path accessor for
+    /// consumers that read one derived state per call (e.g.
+    /// [`Session::projected_messages`](crate::session::Session::projected_messages)
+    /// reading `LiveTranscriptProjection`). Returns `None` if `P` was not
+    /// registered, so consumers that *require* the projection should
+    /// expect/unwrap (mirroring dsh's "no silent default" contract).
+    pub fn get<P: LogProjection>(&self) -> Option<&P::State> {
+        self.units
+            .iter()
+            .find(|u| u.name == P::name())
+            .and_then(|u| u.state.downcast_ref::<P::State>())
+    }
+
     /// Incremental seam: apply a single new event to every registered projection
     /// so a running registry can stay current without refolding the log.
     /// Cost per event is projection-specific: O(1) for counters that track
@@ -278,6 +302,211 @@ impl ProjectionRegistry {
             .iter()
             .filter_map(|u| (u.validate)(&*u.state).err())
             .collect()
+    }
+}
+
+/// The append-seam **incremental projection cache** (follow-up f1).
+///
+/// dsh keeps projection units incrementally current at the log append seam so a
+/// reader no longer refolds the whole log per read. The folding cost moves to the
+/// append seam (one event per plain append; a splice folds its span), and a read
+/// against a current cache folds nothing — it still pays whatever its own
+/// accessor costs, e.g. cloning the transcript. jcode's [`ProjectionRegistry`] is
+/// that fold; this wrapper is the *bookkeeping* that makes it an append-seam
+/// cache rather than a one-shot fold:
+///
+/// - `registry`: the running [`ProjectionRegistry`] holding every projection's
+///   derived state, kept current by [`apply_event`](Self::apply_event).
+/// - `folded_len`: how many of the owning log's *leading* events have already
+///   been folded into `registry`. Events are only ever appended (the log is
+///   append-only) or wholesale replaced (deserialize / rebuild). A plain append
+///   of event `n+1` is `n → n+1`; any reset drops it to `0` so the next read
+///   folds from scratch. `folded_len` is always `<= events.len()`. **When the
+///   log is only ever appended through [`apply_event`](Self::apply_event), or
+///   wholesale replaced by a fresh map, equality means the registry's derived
+///   state is identical to a full fold of `events`.** The one deliberate
+///   exception is an in-place mutation of the `pub` `events` field that bypasses
+///   both: the `folded_head_id` fingerprint catches a
+///   shrink or a changed fold-boundary id, but not an interior edit that keeps
+///   the boundary id. That residue is out of scope for O(1) healing (sound
+///   detection would need an O(prefix) re-hash per read, defeating the cache);
+///   it is *not* detected at runtime: no in-crate path mutates `events` in place
+///   behind the append seam, so the residue is prevented by convention (route
+///   every mutation through [`SessionEventMap::append_event`] or call
+///   [`reset`](Self::reset)). The load-path `ProjectionCacheMatchesDerived`
+///   invariant separately guards the cache wrapper's *apply semantics* against
+///   `derive_messages` (it is rebuilt fresh on load, so it cannot observe a stale
+///   live cache).
+///
+/// The cache is deliberately **not persisted**: `events` is the single
+/// authoritative record. A persisted cache would be a second authoritative
+/// state that could silently diverge — exactly the dual-source hazard this
+/// event log exists to avoid. On load the cache starts empty (`folded_len == 0`)
+/// and the first read folds (or a catch-up folds the new suffix).
+pub struct ProjectionCache {
+    /// Running derived state for every builtin projection.
+    registry: ProjectionRegistry,
+    /// Number of leading events already folded into `registry`.
+    folded_len: usize,
+    /// `event_id` of the last folded event (`events[folded_len - 1]`), or `None`
+    /// when nothing is folded. This is an O(1)-memory fingerprint of the folded
+    /// prefix boundary: if `events[folded_len - 1]` no longer carries this id, the
+    /// prefix was replaced in place behind the append seam (the `events` field is
+    /// `pub`), so [`ensure_folded`](Self::ensure_folded) refolds instead of
+    /// trusting a stale prefix. Catches a replacement/truncation whose boundary
+    /// event differs — which a shrink-length check alone misses.
+    folded_head_id: Option<crate::session::EventId>,
+}
+
+impl Default for ProjectionCache {
+    /// A cache holding the builtin projection set with nothing folded yet.
+    /// `Default` matches [`builtin`](Self::builtin) so every path that
+    /// constructs a `SessionEventMap` (derive `Default`, deserialize, literal)
+    /// gets a usable cache that folds correctly on first read.
+    fn default() -> Self {
+        Self {
+            registry: ProjectionRegistry::builtin(),
+            folded_len: 0,
+            folded_head_id: None,
+        }
+    }
+}
+
+impl Clone for ProjectionCache {
+    /// A clone is deliberately **empty** (nothing folded). The cache is pure
+    /// derived state, so a cloned `Session`'s cache is recomputed lazily from
+    /// its own `events` on first read — correct and O(1)-to-clone, instead of
+    /// deep-copying the folded transcript (which would make every one of the
+    /// many `Session::clone()` sites — fork, review, transfer, overnight, video
+    /// export — pay an O(transcript) copy for data it usually never reads).
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl std::fmt::Debug for ProjectionCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProjectionCache")
+            .field("folded_len", &self.folded_len)
+            .field("folded_head_id", &self.folded_head_id)
+            .field("registry", &self.registry)
+            .finish()
+    }
+}
+
+impl ProjectionCache {
+    /// The builtin projection set, nothing folded yet. Identical to
+    /// [`default`](Self::default); named for call-site readability.
+    pub fn builtin() -> Self {
+        Self::default()
+    }
+
+    /// How many leading events are currently folded into the registry.
+    pub fn folded_len(&self) -> usize {
+        self.folded_len
+    }
+
+    /// Borrow the running registry (typed access via [`ProjectionRegistry::get`]).
+    pub fn registry(&self) -> &ProjectionRegistry {
+        &self.registry
+    }
+
+    /// The live transcript length from the cache, folding lazily first but
+    /// **without cloning** the transcript. Consumers that only need the count
+    /// (e.g. an index watermark) use this instead of
+    /// [`projected_messages`](crate::session::SessionEventMap::projected_messages)
+    /// so a length query does not pay for a full `Vec<StoredMessage>` clone.
+    pub fn transcript_len(&mut self, events: &[SessionEvent]) -> usize {
+        self.ensure_folded(events);
+        self.registry
+            .get::<LiveTranscriptProjection>()
+            .expect("builtin projection registry must contain LiveTranscriptProjection")
+            .len()
+    }
+
+    /// Fold every event up to `events.len()` into the registry, catching up only
+    /// the unfolded suffix. Idempotent: calling it repeatedly with no appended
+    /// events is a no-op.
+    ///
+    /// On first use (`folded_len == 0`) this is a full fold from the empty
+    /// default. Afterwards it applies only `events[folded_len..]`, so a read
+    /// that follows one append folds one event.
+    ///
+    /// Self-healing: if `events` shrank below the watermark (`folded_len >
+    /// events.len()`) OR the folded prefix boundary no longer matches the event
+    /// now at that position, the log was replaced/truncated in place behind the
+    /// append seam, so the folded state no longer corresponds to `events`. Rather
+    /// than read a stale prefix, this resets and refolds from scratch. Callers
+    /// that replace the whole vector directly should prefer [`reset`](Self::reset);
+    /// this is the defensive backstop for the case they forget.
+    ///
+    /// The boundary check is exact for any in-place replacement whose event at the
+    /// fold boundary differs from what was folded (the normal case). A pathological
+    /// replacement that reuses the *same* `event_id` at every boundary position with
+    /// different content would still evade it (event ids are not content hashes);
+    /// no in-crate path produces that, so the residue is prevented by convention
+    /// rather than detected at runtime (route every mutation through
+    /// [`append_event`](crate::session::SessionEventMap::append_event) or call
+    /// [`reset`](Self::reset)).
+    ///
+    /// Postcondition: `folded_len == events.len()` and the registry's derived
+    /// state equals a full fold of `events`.
+    pub fn ensure_folded(&mut self, events: &[SessionEvent]) {
+        // Detect an in-place mutation of the vector behind the append seam: either
+        // the log shrank below the watermark, or the event now sitting at the fold
+        // boundary is no longer the one we folded (its id changed). Both mean the
+        // folded prefix is stale, so refold from empty.
+        let prefix_stale = self.folded_len > events.len()
+            || (self.folded_len > 0
+                && self.folded_head_id.as_ref() != Some(&events[self.folded_len - 1].event_id));
+        if prefix_stale {
+            self.registry = ProjectionRegistry::builtin();
+            self.folded_len = 0;
+            self.folded_head_id = None;
+        }
+        // Fold only the unfolded suffix. When nothing is new the cache is already
+        // at the head and this is the idempotent no-op read, so guard the whole
+        // update: re-cloning the head `event_id` on every no-op read would make the
+        // documented "clone-free" `transcript_len`/`projected_messages_len` path
+        // allocate a `String` per call for no state change.
+        if self.folded_len < events.len() {
+            for event in &events[self.folded_len..] {
+                self.registry.apply(event);
+            }
+            self.folded_len = events.len();
+            self.folded_head_id = events.last().map(|e| e.event_id.clone());
+        }
+    }
+
+    /// Apply one just-appended event incrementally and advance `folded_len`.
+    ///
+    /// Callers must only invoke this for the event being appended to the log tail,
+    /// at the moment the cache is exactly at the current head
+    /// (`folded_len == events.len()`, i.e. the new event is `events[folded_len]`).
+    /// [`SessionEventMap::append_event`](crate::session::SessionEventMap::append_event)
+    /// and `push_event` satisfy this by calling it *before* pushing the event,
+    /// guarded on that equality. If the invariant does not hold (e.g. the cache is
+    /// stale or behind), call [`ensure_folded`](Self::ensure_folded) instead.
+    pub fn apply_event(&mut self, event: &SessionEvent) {
+        self.registry.apply(event);
+        self.folded_len += 1;
+        self.folded_head_id = Some(event.event_id.clone());
+    }
+
+    /// Drop the cache's folded state and refold the whole log.
+    ///
+    /// The normal append seam keeps the cache current, and every wholesale
+    /// replacement in this crate (`rebuild_event_map`, `fork_event_log`)
+    /// constructs a *fresh* `SessionEventMap` whose cache is already empty — so
+    /// today this is a defensive primitive rather than a hot-path call. It exists
+    /// for callers that mutate `events` in place (the field is `pub`) and is the
+    /// explicit counterpart to the self-healing branch in
+    /// [`ensure_folded`](Self::ensure_folded).
+    pub fn reset(&mut self, events: &[SessionEvent]) {
+        self.registry = ProjectionRegistry::builtin();
+        self.folded_len = 0;
+        self.folded_head_id = None;
+        self.ensure_folded(events);
     }
 }
 
@@ -538,6 +767,61 @@ impl LogInvariant for ProjectionMatchesDerived {
     }
 }
 
+/// The incremental **append-seam cache** must agree byte-for-byte with the
+/// on-demand fold, *when the cache is current* (`folded_len == events.len()`).
+///
+/// [`ProjectionMatchesDerived`] re-folds from scratch via `project_map`, so it
+/// proves the shared `apply` semantics but never reads the cache's running state
+/// — the path `Session::projected_messages()` actually takes in production. This
+/// check closes that gap: it compares the cache's *cached* transcript against
+/// `derive_messages()`, catching a `folded_len` bookkeeping bug (e.g. a stale
+/// prefix after an in-place log mutation) that a fresh fold would mask.
+///
+/// A cache that is merely behind (not yet caught up) is not a violation — it
+/// legitimately refolds on the next read — so the check passes when the cache is
+/// not at the head.
+pub struct ProjectionCacheMatchesDerived;
+
+impl LogInvariant for ProjectionCacheMatchesDerived {
+    fn name(&self) -> &'static str {
+        "session.projection_cache_matches_derived"
+    }
+
+    fn check(&self, map: &SessionEventMap) -> Result<(), InvariantViolation> {
+        let Some(cached) = map.cached_transcript_at_head() else {
+            // Cache is behind the log head (or empty); it will refold on the next
+            // read, so there is nothing to compare yet.
+            return Ok(());
+        };
+        let derived = map.derive_messages();
+        // `StoredMessage` is deliberately not `PartialEq`; compare canonical
+        // serialized forms (identical transcripts is the property that matters).
+        let a = serde_json::to_vec(cached).map_err(|e| {
+            InvariantViolation::new(
+                "session.projection_cache_matches_derived",
+                format!("cached transcript failed to serialize: {e}"),
+            )
+        })?;
+        let b = serde_json::to_vec(&derived).map_err(|e| {
+            InvariantViolation::new(
+                "session.projection_cache_matches_derived",
+                format!("derived transcript failed to serialize: {e}"),
+            )
+        })?;
+        if a != b {
+            return Err(InvariantViolation::new(
+                "session.projection_cache_matches_derived",
+                format!(
+                    "incremental cache ({len} msgs) diverged from derive_messages ({len2} msgs) at log head",
+                    len = cached.len(),
+                    len2 = derived.len(),
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Compaction brackets must be well-formed (takeaway #5's orphan-detection
 /// consumer of takeaway #3). Every `CompactionStart` must be closed by a later
 /// `CompactionEnd`, and a `CompactionEnd` must never appear without a preceding
@@ -599,6 +883,7 @@ impl InvariantRegistry {
         r.add(ToolPairingBalanced);
         r.add(ReplayDeterminism);
         r.add(ProjectionMatchesDerived);
+        r.add(ProjectionCacheMatchesDerived);
         r.add(CompactionBracket);
         r
     }
@@ -1351,6 +1636,82 @@ mod tests {
     }
 
     #[test]
+    fn cache_invariant_passes_at_head_and_skips_when_behind() {
+        // The incremental-cache invariant must pass when the cache is current,
+        // and must NOT flag a merely-lagging cache (it refolds lazily).
+        //
+        // Seed the log *without* the append seam so the cache is genuinely behind
+        // (`folded_len == 0 < 2`) — going through `append` would keep it at head
+        // and never exercise the skip branch.
+        let mut map = SessionEventMap::default();
+        for (i, id) in ["e1", "e2"].iter().enumerate() {
+            map.events.push(SessionEvent {
+                timestamp: chrono::Utc::now(),
+                event_id: (*id).to_string().into(),
+                op: SessionEventOp::AppendMessage {
+                    message_id: (*id).to_string().into(),
+                    message: text_msg(&format!("m{i}")),
+                },
+                parent_id: None,
+                version: 1,
+            });
+        }
+        assert_eq!(map.projection_folded_len(), 0);
+        assert_eq!(map.events.len(), 2);
+
+        let check = ProjectionCacheMatchesDerived;
+        // Behind (folded_len == 0 < 2) → skipped (Ok), not a violation.
+        assert!(check.check(&map).is_ok());
+
+        // Advance the cache to the head via the real read path.
+        let _ = map.projected_messages();
+        assert_eq!(map.projection_folded_len(), map.events.len());
+        assert!(
+            check.check(&map).is_ok(),
+            "cache invariant must pass when the cache is at the log head"
+        );
+    }
+
+    /// The linchpin guard must actually *detect* divergence, not just pass. Drive
+    /// the cache to the log head, then mutate an event's payload in place while
+    /// keeping the length — and the fold-boundary id — identical, which is the
+    /// exact residue the `folded_head_id` fingerprint cannot heal. `cached_*`
+    /// still reports the *stale* transcript at the head, so the invariant must
+    /// fail loudly. This proves the guard compares real content (a non-vacuous
+    /// check), so a green result at the load seam means something.
+    #[test]
+    fn cache_invariant_flags_a_stale_prefix_at_the_head() {
+        let mut map = SessionEventMap::default();
+        append(&mut map, "e0", text_msg("m0"));
+        append(&mut map, "e1", text_msg("m1"));
+        let _ = map.projected_messages();
+        assert_eq!(map.projection_folded_len(), map.events.len());
+
+        let check = ProjectionCacheMatchesDerived;
+        assert!(check.check(&map).is_ok(), "must be green before the in-place edit");
+
+        // Swap the FIRST event's message but keep every event_id (so the boundary
+        // id "e1" is unchanged): only the interior content differs.
+        map.events[0] = SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: "e0".into(),
+            op: SessionEventOp::AppendMessage {
+                message_id: "m0".into(),
+                message: text_msg("m0-CHANGED"),
+            },
+            parent_id: None,
+            version: 1,
+        };
+        // Length is unchanged, so `folded_len` still equals `events.len()` and the
+        // guard compares (and must observe the divergence).
+        assert_eq!(map.projection_folded_len(), map.events.len());
+        assert!(
+            check.check(&map).is_err(),
+            "the cache invariant must flag a stale cached transcript at the head"
+        );
+    }
+
+    #[test]
     fn one_fold_serves_transcript_and_role_domains() {
         // Takeaway #4's "one fold, many readers": a single fold over the log
         // must produce the full transcript AND a distinct per-role breakdown,
@@ -1394,6 +1755,9 @@ mod tests {
         assert_eq!(empty.len(), 0);
         assert!(empty.is_empty());
         assert!(empty.names().is_empty());
+        // The documented None contract: an unregistered projection yields None
+        // (no silent default), so a consumer that requires it must expect/unwrap.
+        assert!(empty.get::<LiveTranscriptProjection>().is_none());
 
         let mut reg = ProjectionRegistry::builtin();
         assert_eq!(reg.len(), 3);
@@ -1525,4 +1889,342 @@ mod tests {
         assert_eq!(rc.counts, RoleCounts { user: u, assistant: a });
         assert_eq!(rc.counts.total(), derived.len());
     }
+
+    /// f1: the append-seam cache folds lazily and stays identical to a full fold
+    /// of the log, catching up only the unfolded suffix.
+    #[test]
+    fn projection_cache_folds_lazily_and_catches_up() {
+        let mut map = SessionEventMap::default();
+        let mut cache = ProjectionCache::builtin();
+
+        // Empty log: nothing folded, first read is a no-op fold.
+        assert_eq!(cache.folded_len(), 0);
+        cache.ensure_folded(&map.events);
+        assert_eq!(cache.folded_len(), 0);
+
+        // Append through the real seam, then a read catches up.
+        for i in 0..4 {
+            append(&mut map, &format!("e{i}"), text_msg(&format!("m{i}")));
+            // The standalone cache is not wired to `map`, so it lags until read.
+            cache.ensure_folded(&map.events);
+            assert_eq!(cache.folded_len(), map.events.len());
+        }
+
+        // The cached transcript equals the full on-demand fold.
+        let cached = cache
+            .registry()
+            .get::<LiveTranscriptProjection>()
+            .expect("present")
+            .clone();
+        assert_eq!(ids(&cached), ids(&map.derive_messages()));
+    }
+
+    /// f1: at the append seam (`folded_len == events.len()`), a single new event
+    /// is folded incrementally by `apply_event` and the length advances by one.
+    #[test]
+    fn projection_cache_applies_incrementally_at_head() {
+        let mut map = SessionEventMap::default();
+        let mut cache = ProjectionCache::builtin();
+        append(&mut map, "e0", text_msg("a"));
+        cache.ensure_folded(&map.events);
+        assert_eq!(cache.folded_len(), 1);
+
+        // Append one more; the map would call `apply_event` at this seam.
+        let msg = text_msg("b");
+        let event = SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: "e1".to_string().into(),
+            op: SessionEventOp::AppendMessage {
+                message_id: msg.id.clone().into(),
+                message: msg,
+            },
+            parent_id: None,
+            version: 1,
+        };
+        assert_eq!(cache.folded_len(), map.events.len());
+        cache.apply_event(&event);
+        map.events.push(event);
+        assert_eq!(cache.folded_len(), map.events.len());
+
+        let cached = cache
+            .registry()
+            .get::<LiveTranscriptProjection>()
+            .expect("present")
+            .clone();
+        assert_eq!(ids(&cached), ids(&map.derive_messages()));
+    }
+
+    /// f1: the append seam must NOT fold an event onto a cache that is *behind*
+    /// the head (`folded_len != events.len()`) — doing so would advance the
+    /// watermark past unfolded events and silently drop them. The guard skips the
+    /// incremental apply, and the next read must fold the whole log and still
+    /// agree with `derive_messages`.
+    #[test]
+    fn projection_cache_skips_incremental_apply_when_behind() {
+        let mut map = SessionEventMap::default();
+        // Put two events in the log WITHOUT going through the append seam, so the
+        // cache stays folded_len == 0 while events.len() == 2 (a behind cache —
+        // e.g. a freshly deserialized map whose cache is empty, then mutated).
+        for (i, id) in ["e0", "e1"].iter().enumerate() {
+            map.events.push(SessionEvent {
+                timestamp: chrono::Utc::now(),
+                event_id: (*id).to_string().into(),
+                op: SessionEventOp::AppendMessage {
+                    message_id: (*id).to_string().into(),
+                    message: text_msg(&format!("m{i}")),
+                },
+                parent_id: None,
+                version: 1,
+            });
+        }
+        assert_eq!(map.projection_folded_len(), 0);
+        assert_eq!(map.events.len(), 2);
+
+        // Append a third through the real seam; the guard must skip the
+        // incremental apply (cache is not at the head). Folding `e2` onto the
+        // empty cache here would set folded_len = 1, so the next read would fold
+        // only `events[1..]` — losing `e0` and duplicating `e2`. The guard keeps
+        // folded_len at 0 so the next read refolds the whole log.
+        append(&mut map, "e2", text_msg("c"));
+        assert_eq!(
+            map.projection_folded_len(),
+            0,
+            "append must not advance a behind cache's watermark"
+        );
+
+        // The next read folds the whole log and matches the derived transcript.
+        let cached = map.projected_messages();
+        assert_eq!(map.projection_folded_len(), map.events.len());
+        assert_eq!(ids(&cached), ids(&map.derive_messages()));
+    }
+
+    /// f1: a wholesale log replacement (deserialize / rebuild / fork) produces a
+    /// *fresh* `SessionEventMap` whose cache starts empty (`folded_len == 0`), so it
+    /// can never shadow a different event vector — the next read folds the new log.
+    #[test]
+    fn projection_cache_starts_empty_after_replacement() {
+        // The property under test: a fresh map's cache starts empty.
+        let fresh = SessionEventMap::default();
+        assert_eq!(fresh.projection_folded_len(), 0);
+        assert!(fresh.events.is_empty());
+
+        // Fold a map to the head, then replace it wholesale with a fresh map
+        // carrying a *different* log (exactly what rebuild/fork do). The new map
+        // starts empty and folds its own events — it cannot inherit the other
+        // map's watermark and shadow the new log.
+        let mut original = SessionEventMap::default();
+        for i in 0..3 {
+            append(&mut original, &format!("e{i}"), text_msg(&format!("m{i}")));
+        }
+        assert_eq!(original.projection_folded_len(), 3);
+
+        let mut replaced = SessionEventMap::default();
+        assert_eq!(replaced.projection_folded_len(), 0);
+        append(&mut replaced, "only", text_msg("only"));
+        assert_eq!(ids(&replaced.projected_messages()), vec!["only".to_string()]);
+    }
+
+    /// f1: `reset` drops the folded state and refolds the (new) log, so a caller
+    /// that mutated `events` in place can rebuild the cache explicitly.
+    #[test]
+    fn projection_cache_reset_refolds_in_place_replacement() {
+        let mut map = SessionEventMap::default();
+        for i in 0..3 {
+            append(&mut map, &format!("e{i}"), text_msg(&format!("m{i}")));
+        }
+        let mut cache = ProjectionCache::builtin();
+        cache.ensure_folded(&map.events);
+        assert_eq!(cache.folded_len(), 3);
+
+        // In-place replacement with an equal-length log that REUSES the same
+        // boundary event id ("e2") but changes the messages. The folded-prefix
+        // fingerprint cannot catch this (it only compares the boundary event id),
+        // so `ensure_folded` would trust the stale prefix — only an explicit
+        // `reset` rebuilds it. This is exactly the residue `reset` exists for.
+        let replace = |id: &str, msg_id: &str| SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: id.into(),
+            op: SessionEventOp::AppendMessage {
+                message_id: msg_id.into(),
+                message: text_msg(msg_id),
+            },
+            parent_id: None,
+            version: 1,
+        };
+        map.events = vec![
+            replace("e0", "n0"),
+            replace("e1", "n1"),
+            replace("e2", "n2"),
+        ];
+        cache.reset(&map.events);
+        assert_eq!(cache.folded_len(), 3);
+        let cached = cache
+            .registry()
+            .get::<LiveTranscriptProjection>()
+            .expect("present")
+            .clone();
+        assert_eq!(ids(&cached), ids(&map.derive_messages()));
+        // Prove the reset really refolded to the NEW messages (not a no-op): ids
+        // changed from m*/e* to n*, so a stale cache would still show the old ids.
+        assert_eq!(ids(&cached), vec!["n0".to_string(), "n1".to_string(), "n2".to_string()]);
+    }
+
+    /// f1: the folded-prefix fingerprint makes `ensure_folded` self-heal even on an
+    /// **equal-length** in-place replacement of `events` (which the shrink check
+    /// alone cannot detect) — the caller need not remember to call `reset`.
+    #[test]
+    fn projection_cache_ensure_folded_self_heals_on_equal_length_replacement() {
+        let mut map = SessionEventMap::default();
+        for i in 0..3 {
+            append(&mut map, &format!("e{i}"), text_msg(&format!("m{i}")));
+        }
+        let mut cache = ProjectionCache::builtin();
+        cache.ensure_folded(&map.events);
+        assert_eq!(cache.folded_len(), 3);
+
+        // Replace all three events in place, keeping the same length. The boundary
+        // event id changes ("e2" -> "n2"), so the fingerprint detects the swap.
+        map.events = (0..3)
+            .map(|i| SessionEvent {
+                timestamp: chrono::Utc::now(),
+                event_id: format!("n{i}").into(),
+                op: SessionEventOp::AppendMessage {
+                    message_id: format!("n{i}").into(),
+                    message: text_msg(&format!("n{i}")),
+                },
+                parent_id: None,
+                version: 1,
+            })
+            .collect();
+
+        // No reset: the next fold must self-heal and return the NEW transcript.
+        cache.ensure_folded(&map.events);
+        assert_eq!(cache.folded_len(), 3);
+        let healed = cache
+            .registry()
+            .get::<LiveTranscriptProjection>()
+            .expect("present")
+            .clone();
+        assert_eq!(ids(&healed), ids(&map.derive_messages()));
+    }
+
+    /// f1: `ensure_folded` self-heals when the log shrinks behind the append seam
+    /// (an in-place replacement the caller forgot to `reset`): instead of reading a
+    /// stale prefix (or panicking), it refolds from empty.
+    #[test]
+    fn projection_cache_ensure_folded_self_heals_on_shrink() {
+        let mut map = SessionEventMap::default();
+        for i in 0..5 {
+            append(&mut map, &format!("e{i}"), text_msg(&format!("m{i}")));
+        }
+        let mut cache = ProjectionCache::builtin();
+        cache.ensure_folded(&map.events);
+        assert_eq!(cache.folded_len(), 5);
+
+        // Shrink the log in place without reset; the next fold must self-heal.
+        map.events.truncate(2);
+        assert_eq!(cache.transcript_len(&map.events), 2);
+        assert_eq!(cache.folded_len(), map.events.len());
+        let cached = cache
+            .registry()
+            .get::<LiveTranscriptProjection>()
+            .expect("present")
+            .clone();
+        assert_eq!(ids(&cached), ids(&map.derive_messages()));
+    }
+
+    /// f1: `ensure_folded` is idempotent — calling it twice with no change must
+    /// not double-apply events (which would duplicate the transcript).
+    #[test]
+    fn projection_cache_ensure_folded_is_idempotent() {
+        let mut map = SessionEventMap::default();
+        append(&mut map, "e0", text_msg("a"));
+        append(&mut map, "e1", text_msg("b"));
+        let mut cache = ProjectionCache::builtin();
+        cache.ensure_folded(&map.events);
+        cache.ensure_folded(&map.events);
+        cache.ensure_folded(&map.events);
+        let cached = cache
+            .registry()
+            .get::<LiveTranscriptProjection>()
+            .expect("present")
+            .clone();
+        assert_eq!(ids(&cached), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// f1: a cloned cache is deliberately *empty* (the cache is pure derived state,
+    /// so it refolds lazily from the clone's own events). This keeps `Session::clone`
+    /// — used widely by fork/review/transfer/overnight paths — from deep-copying the
+    /// folded transcript, while still yielding the same derived state on first read.
+    #[test]
+    fn projection_cache_clone_is_empty_and_refolds() {
+        let mut map = SessionEventMap::default();
+        append(&mut map, "e0", text_msg("a"));
+        append(&mut map, "e1", text_msg("b"));
+        let mut cache = ProjectionCache::builtin();
+        cache.ensure_folded(&map.events);
+        assert_eq!(cache.folded_len(), 2);
+
+        let mut cloned = cache.clone();
+        // Empty on clone (no transcript deep-copy)...
+        assert_eq!(cloned.folded_len(), 0);
+
+        // ...but refolds to the same transcript on first read.
+        cloned.ensure_folded(&map.events);
+        assert_eq!(cloned.folded_len(), 2);
+        let cached = cloned
+            .registry()
+            .get::<LiveTranscriptProjection>()
+            .expect("present");
+        assert_eq!(ids(cached), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// f1: `transcript_len` folds lazily and returns the same count as the full
+    /// fold, without cloning the transcript.
+    #[test]
+    fn projection_cache_transcript_len_matches_fold() {
+        let mut map = SessionEventMap::default();
+        let mut cache = ProjectionCache::builtin();
+        assert_eq!(cache.transcript_len(&map.events), 0);
+        for i in 0..5 {
+            append(&mut map, &format!("e{i}"), text_msg(&format!("m{i}")));
+        }
+        assert_eq!(cache.transcript_len(&map.events), map.derive_messages().len());
+        assert_eq!(cache.folded_len(), map.events.len());
+    }
+
+    fn ids(messages: &[StoredMessage]) -> Vec<String> {
+        messages.iter().map(|m| m.id.clone()).collect()
+    }
+    /// f1: a raw tail append to the `pub` `events` field (bypassing the seam)
+    /// after the cache is already at head is caught up by the next read: the
+    /// folded prefix is still valid, so `ensure_folded` folds only the new suffix.
+    /// This is the documented backstop for a caller that appends to `events`
+    /// directly instead of through `append_event`.
+    #[test]
+    fn projection_cache_catches_up_after_raw_tail_push() {
+        let mut map = SessionEventMap::default();
+        for i in 0..3 {
+            append(&mut map, &format!("e{i}"), text_msg(&format!("m{i}")));
+        }
+        // Fold to head so the cache is current before the raw mutation.
+        let _ = map.projected_messages();
+        assert_eq!(map.projection_folded_len(), 3);
+
+        map.events.push(SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: "raw".to_string().into(),
+            op: SessionEventOp::AppendMessage {
+                message_id: "mraw".to_string().into(),
+                message: text_msg("mraw"),
+            },
+            parent_id: None,
+            version: 1,
+        });
+
+        let cached = map.projected_messages();
+        assert_eq!(cached.len(), 4, "the raw tail append must be folded");
+        assert_eq!(ids(&cached), ids(&map.derive_messages()));
+    }
+
 }

@@ -545,7 +545,8 @@ impl Agent {
         // Read the event-sourced log once; on resume this is hydrated from disk
         // in Session::load_from_path so it reflects the full transcript. Use the
         // projection seam (takeaway #4): it matches derive_messages exactly
-        // (proven by ProjectionMatchesDerived) and states our intent to read
+        // (guarded by ProjectionMatchesDerived and, for this cached path,
+        // ProjectionCacheMatchesDerived) and states our intent to read
         // derived state.
         let messages = self.session.projected_messages();
         logging::info(&format!(
@@ -933,7 +934,8 @@ impl Agent {
 
     fn repair_missing_tool_outputs(&mut self) -> usize {
         // Read the live transcript through the projection seam (takeaway #4),
-        // which matches derive_messages exactly (proven by ProjectionMatchesDerived).
+        // which matches derive_messages exactly (guarded by
+        // ProjectionCacheMatchesDerived for this cached path).
         let messages = self.session.projected_messages();
         
         if self.tool_output_scan_index > messages.len() {
@@ -1021,7 +1023,9 @@ impl Agent {
             inserted += missing_for_message.len();
         }
 
-        self.tool_output_scan_index = self.session.projected_messages().len();
+        // Only the transcript length is needed here, so read it via the
+        // clone-free projection length rather than cloning the whole transcript.
+        self.tool_output_scan_index = self.session.projected_messages_len();
 
         if repaired > 0 {
             self.persist_session_best_effort("missing tool-output repair");

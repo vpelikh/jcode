@@ -1,3 +1,4 @@
+use crate::session::invariants::{LiveTranscriptProjection, ProjectionCache};
 use crate::session::model::StoredReplayEvent;
 use crate::session::{CompactionId, EventId, MessageId};
 use chrono::{DateTime, Utc};
@@ -437,6 +438,17 @@ pub struct SessionEventMap {
     /// boundaries).
     #[serde(skip)]
     cached_compaction: Option<StoredCompactionState>,
+    /// Append-seam incremental projection cache (takeaway #4, follow-up f1).
+    ///
+    /// Keeps a running [`ProjectionRegistry`](crate::session::ProjectionRegistry)
+    /// current by folding each event as it is appended, so
+    /// [`projected_messages`](Self::projected_messages) reads cached derived
+    /// state instead of refolding the whole log per read. `serde(skip)` for the
+    /// same reason as `cached_compaction`: `events` is the sole authority and a
+    /// persisted cache is a divergence hazard. On load the cache starts empty
+    /// (`folded_len == 0`) and the first read catches up.
+    #[serde(skip)]
+    projection_cache: ProjectionCache,
 }
 
 impl SessionEventMap {
@@ -478,13 +490,84 @@ impl SessionEventMap {
             return;
         }
         self.update_caches(&event);
+        // Keep the projection cache current incrementally: `events` grows by one
+        // and no prior event changed, so fold only the new tail event. Guard on
+        // `folded_len == events.len()` so an unadvanced/empty cache (a fresh or
+        // freshly-reset map) stays untouched and the next read folds from
+        // scratch — never advancing `folded_len` past unfolded events.
+        if self.projection_cache.folded_len() == self.events.len() {
+            self.projection_cache.apply_event(&event);
+        }
         self.events.push(event);
     }
 
     /// Append without validation — used for rehydration from trusted legacy vectors.
     pub(crate) fn push_event(&mut self, event: SessionEvent) {
         self.update_caches(&event);
+        if self.projection_cache.folded_len() == self.events.len() {
+            self.projection_cache.apply_event(&event);
+        }
         self.events.push(event);
+    }
+
+    /// Number of leading events currently folded into the incremental projection
+    /// cache. Equals `events.len()` whenever the cache is at the log head (the
+    /// append seam keeps it there during live mutation; a fresh or reloaded map
+    /// starts at `0` and catches up on first read). Exposed for tests and
+    /// observability so a caller can assert the cache is not lagging.
+    pub fn projection_folded_len(&self) -> usize {
+        self.projection_cache.folded_len()
+    }
+
+    /// Read the live transcript through the incremental projection cache.
+    ///
+    /// Returns exactly what [`derive_messages`](Self::derive_messages) returns
+    /// (`LiveTranscriptProjection` mirrors the splice semantics byte-for-byte),
+    /// but reads the append-seam cache instead of refolding the whole log per
+    /// call. The cache path is guarded by `ProjectionCacheMatchesDerived` (the
+    /// cached transcript vs a full fold, at the log head); `ProjectionMatchesDerived`
+    /// separately proves the shared fold semantics. On the first read (or after
+    /// any non-append mutation) the cache folds once; every subsequent read after
+    /// a plain append is a clone of the cached derived state rather than a full
+    /// refold.
+    ///
+    /// Infallible by construction: the builtin registry always contains
+    /// `LiveTranscriptProjection`, and it defines no failing validation. An
+    /// absent projection would be an internal wiring bug, so this expects (fails
+    /// loudly) rather than silently falling back and masking a divergence.
+    pub fn projected_messages(&mut self) -> Vec<StoredMessage> {
+        self.projection_cache.ensure_folded(&self.events);
+        self.projection_cache
+            .registry()
+            .get::<LiveTranscriptProjection>()
+            .expect("builtin projection registry must contain LiveTranscriptProjection")
+            .clone()
+    }
+
+    /// The live transcript length via the incremental projection cache, without
+    /// cloning the transcript. Equivalent to `projected_messages().len()` but
+    /// O(1) after the cache is current (a clone-free length query for
+    /// watermarks/indexes). See [`ProjectionCache::transcript_len`].
+    pub fn projected_messages_len(&mut self) -> usize {
+        self.projection_cache.transcript_len(&self.events)
+    }
+
+    /// The cache's current transcript, but only when the cache is exactly at the
+    /// log head (`folded_len == events.len()`). Returns `None` when the cache is
+    /// behind, so a caller can compare only when a comparison is meaningful.
+    ///
+    /// This is the accessor the `ProjectionCacheMatchesDerived` invariant uses to
+    /// verify the **incremental** append-seam state — the path a fresh-fold
+    /// invariant (`ProjectionMatchesDerived`) cannot reach, since it re-folds
+    /// from scratch and never reads the cache.
+    pub(crate) fn cached_transcript_at_head(&self) -> Option<&[StoredMessage]> {
+        if self.projection_cache.folded_len() != self.events.len() {
+            return None;
+        }
+        self.projection_cache
+            .registry()
+            .get::<LiveTranscriptProjection>()
+            .map(|messages| messages.as_slice())
     }
     
     /// Derive current messages from events

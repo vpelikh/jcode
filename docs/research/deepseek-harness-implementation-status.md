@@ -46,7 +46,7 @@ policy and report so every consumer stays in lockstep.
   and escalation order now live in exactly one place.
 - **`/prune` slash command.** `jcode-tui` `commands.rs` + `input_help.rs`: runs
   the model-free node-caps pass on demand (policy built from the configurable
-  caps), reports `PruneReport`, and is discoverable via `/help prune`. 2 dispatch tests.
+  caps), reports `PruneReport`, and is discoverable via `/help prune`, with dispatch tests.
 - **Scheduled per-step prune.** Wired at the top of both agent loops
   (`agent/turn_streaming_mpsc.rs`, `agent/turn_loops.rs`), before each next API
   call, over the prefix preceding the latest assistant response. Fresh tool
@@ -192,8 +192,8 @@ recommendation.
 
 Fully implemented, tested, and committed.
 
-- **repeat-tool reminder guard.** New pure `crates/jcode-app-core/src/agent/guard.rs`: canonical (order-insensitive recursive JSON-key) tool-call signature, consecutive-identical-tail detector, `repeat_reminder_from_transcript`. Wired into the streaming loop's Injection Point D and the headless `run_turn`. 9 unit tests. Model-free, no API cost.
-- **opt-in per-call tool timeout.** `jcode-tool-core::Tool::execution_timeout()` (default `None`), `execute_with_deadline()` mapping a hung call to a readable `"timed out after Ns"` error. Wired at the single `Registry::execute` choke point in `jcode-app-core/src/tool/mod.rs` (no per-construction-site bloat). tokio `time` feature. 4 unit tests incl. model-visible timeout.
+- **repeat-tool reminder guard.** New pure `crates/jcode-app-core/src/agent/guard.rs`: canonical (order-insensitive recursive JSON-key) tool-call signature, consecutive-identical-tail detector, `repeat_reminder_from_transcript`. Wired into the streaming loop's Injection Point D and the headless `run_turn`. Unit-tested and model-free, no API cost.
+- **opt-in per-call tool timeout.** `jcode-tool-core::Tool::execution_timeout()` (default `None`), `execute_with_deadline()` mapping a hung call to a readable `"timed out after Ns"` error. Wired at the single `Registry::execute` choke point in `jcode-app-core/src/tool/mod.rs` (no per-construction-site bloat). tokio `time` feature. Unit-tested, including the model-visible timeout.
 
   **Review note (updated 2026-09-09):** the per-call timeout *capability* is
   delivered, tested, and wired. It was previously **dormant** — no tool
@@ -222,7 +222,7 @@ offsets and corrupt reload/background accounting.
 
 So the migration adds a **non-message-rewriting bracket seam**:
 
-- `Session::set_compaction_with_bracket(id, state)`: records the state write inside a balanced `CompactionStart → SetCompaction → CompactionEnd`. Crash-safe (orphan detectable via `orphaned_compaction`), replayable, touches no messages. Falls back to a plain validating `set_compaction` on an invalid state; completes an existing orphan on retry. 3 new tests in `session_events_test.rs`. Wires `sync_session_compaction_state_from_manager` to use it.
+- `Session::set_compaction_with_bracket(id, state)`: records the state write inside a balanced `CompactionStart → SetCompaction → CompactionEnd`. Crash-safe (orphan detectable via `orphaned_compaction`), replayable, touches no messages. Falls back to a plain validating `set_compaction` on an invalid state; completes an existing orphan on retry. Covered in `session_events_test.rs`. Wires `sync_session_compaction_state_from_manager` to use it.
 - `apply_openai_native_compaction` also writes through the bracket for consistency.
 - jcode-tui's mirror writers (`sync_session_compaction_state_from_manager`, `apply_openai_native_compaction`) use the bracket too.
 
@@ -251,7 +251,7 @@ wanted, is a separate, documented follow-up with its own accounting design
 
 ## Verification
 
-- `jcode-base` full lib: 1555 passed, 0 failed (session_events_test: 91).
+- `jcode-base` full lib green.
 - `jcode-app-core`: compaction (+ native-compaction, 413-recovery) green.
 - `jcode-tui` type-checks clean.
 - Under full parallel-suite load, `jcode-app-core` shows 3 timing-flaky tests
@@ -275,7 +275,7 @@ at log-inspection time.
   `SessionEventError::InvalidEventId`/`InvalidMessageContent` now carry the
   branded types too. Wired through the `SessionEventMap` producers (`session.rs`,
   `event_types.rs`), the app-core `SetCompaction` site (`agent.rs`), and every
-  test/`invariant`s construction site. 4 new unit tests.
+  test/`invariant`s construction site, all covered by unit tests.
 - **Wire-format + journal regression locks.** A literal pre-branding
   `SessionEventOp`/`SessionEvent` JSON payload (raw-string ids) deserializes and
   re-serializes with the same semantic payload. The real `Session::load` path
@@ -334,11 +334,11 @@ These are explicitly open and are tracked as follow-ups, not delivered work:
   them unchanged:
 
   - **infra** — `jcode-id-types` hosts `branded_id!` + `EventId`, `MessageId`,
-    `CompactionId`, `SessionId`, `ToolCallId`, `JobId`; 4 unit tests.
+    `CompactionId`, `SessionId`, `ToolCallId`, `JobId`.
   - **SessionId** — `StreamEvent::SessionId` now carries `SessionId`; all
-    provider producers and app-core/TUI consumers updated; 2 message-types tests.
+    provider producers and app-core/TUI consumers updated; message-types tests cover it.
   - **JobId** — `DebugJob.id` and the shared `HashMap<JobId, DebugJob>` jobs map
-    are branded; 1 app-core test.
+    are branded; covered by an app-core test.
   - **ToolCallId** — `ToolCall.id`, `StreamEvent::ToolUseStart.id`,
     `StreamEvent::ToolResult.tool_use_id`, and the persisted
     `ContentBlock::ToolUse.id` / `ContentBlock::ToolResult.tool_use_id` all carry
@@ -349,15 +349,15 @@ These are explicitly open and are tracked as follow-ups, not delivered work:
     `Default` impl (empty string) so `#[serde(default)]`-backed ids still
     deserialize an omitted field exactly as the prior `String` default did. A
     `ToolCall::test()` fixture helper and a `compile_fail` doctest lock the
-    cross-type rejection. message-types + id-types tests cover the branding.
+    cross-type rejection. message-types and id-types tests cover the branding.
 
   Every wrapper is `#[serde(transparent)]`, so the on-wire/on-disk format is the
   same bare string and persisted data round-trips unchanged (the legacy raw-string
   journal loads verbatim through real persistence). `cargo check --all-targets
   --all-features` and `cargo test --workspace --no-run` are both green;
-  `jcode-base` (1554 lib tests, incl. wire-format legacy-load), `jcode-app-core`
-  (1446 lib tests; the only failures are the documented pre-existing timing
-  flakes), and the provider/compaction suites all pass.
+  `jcode-base` (including wire-format legacy-load), `jcode-app-core`, and the
+  provider/compaction suites all pass (the only failures are the documented
+  pre-existing timing flakes).
 - **F5 — postmortem culture (P3 #18).** ✅ **Delivered.** Added a
   `docs/postmortem/` archive following dsh's structure (executive summary, exact
   root-cause chain, safety nets that failed in order, guardrails added with a
@@ -401,10 +401,95 @@ These are explicitly open and are tracked as follow-ups, not delivered work:
   manager + `TuiState::info_widget_data`: a spawned live task surfaces as the
   focused session's `background_info.running_count`, does not leak into a
   different session either direction, and an idle session shows no background
-  indicator. `jcode-base` background suite: 21 passed, 0 failed. This bounds
+  indicator. `jcode-base` background suite green. This bounds
   #10 to the background-running projection the takeaway names; a *unified
   multi-executor `jobs` registry* spanning bash `&` + terminal + subagent
   remains broad follow-up, tracked under F2's remaining items.
+
+## F9 — projection seam f1: incremental append-seam cache ✅ **Delivered**
+
+The projection seam (takeaway #4) previously read through `project_map` on every
+`Session::projected_messages()` call, so the seam was a correctness/anchoring
+win but not a performance one — it refolded the whole log per read. Follow-up
+**f1** from `deepseek-harness-takeaways.md` closes that gap.
+
+- **`ProjectionCache`** (`crates/jcode-base/src/session/invariants.rs`): a running
+  `ProjectionRegistry` plus a `folded_len` watermark (how many *leading* events
+  are already folded). `ensure_folded` catches up only the unfolded suffix (and
+  self-heals on an in-place mutation of `events` — a shrink, or a replacement
+  whose fold-boundary event id changed, detected by an O(1) `folded_head_id`
+  fingerprint — by refolding from empty); `apply_event` folds one just-appended
+  event and advances the watermark. A wholesale replacement in-crate
+  (deserialize/rebuild/fork) builds a *fresh* map whose cache is empty; `reset`
+  is the explicit primitive for callers that mutate `events` in place.
+- **Append-seam integration** (`crates/jcode-base/src/session/event_types.rs`):
+  `SessionEventMap` carries the cache (`serde(skip)`, like `cached_compaction` —
+  `events` stays the sole authority). `append_event`/`push_event` fold only the
+  new tail event when the cache is at the log head, so a read after a plain
+  append is a clone of cached derived state instead of a full refold.
+  `SessionEventMap` keeps its `Default`/`Clone`/`Debug` derives: all fields
+  implement them, and the derived `Clone` still routes through
+  `ProjectionCache`'s custom impl (below). `ProjectionCache::clone` is
+  deliberately *empty* (the cache is pure derived state, recomputed lazily from
+  the clone's own events), so the many `Session::clone()` sites (fork, review,
+  transfer, overnight, video export) do not deep-copy the folded transcript.
+- **Clone-free length.** `ProjectionCache::transcript_len` /
+  `SessionEventMap::projected_messages_len` / `Session::projected_messages_len`
+  return the transcript count from the cache without cloning it; the
+  tool-output-repair watermark (which did `projected_messages().len()`) now uses
+  it, so a length query no longer pays for a full transcript clone.
+- **Read path** (`crates/jcode-base/src/session.rs`):
+  `Session::projected_messages()` now takes `&mut self` (the cache folds lazily)
+  and routes through the cache. `derive_messages` stays the refold backstop.
+  Byte-identity is guarded on both paths: `ProjectionMatchesDerived` re-folds
+  from scratch (shared `apply` semantics) and the new
+  `ProjectionCacheMatchesDerived` compares the cache's *cached* transcript at the
+  log head — the incremental path the fresh-fold invariant cannot reach.
+- **Trade-offs.** (1) The cache holds a second in-memory copy of the transcript
+  (`Vec<StoredMessage>`) while hot; it is `serde(skip)` and dropped on clone, but
+  a live long session pays it. (2) `ensure_folded` self-heals on an in-place
+  `events` mutation whose fold-boundary event id changed or whose length shrank
+  (via an O(1) `folded_head_id` fingerprint — one `event_id` clone only when the
+  cache actually advances, i.e. per `apply_event` call or a non-empty
+  `ensure_folded` catch-up; a no-op `ensure_folded` read allocates nothing). The
+  residue it cannot heal is an in-place
+  *interior* edit that keeps both the length and the fold-boundary id (e.g.
+  rewriting an earlier event's payload while its `event_id` is unchanged); sound
+  O(1) detection of that is impossible, so it is not detected at runtime and is
+  instead prevented by convention: no in-crate path mutates `events` in place
+  behind the append seam (every mutation routes through `append_event`, or calls
+  `reset`), so this is a latent hardening boundary, not a live bug. The
+  `ProjectionCacheMatchesDerived` invariant separately guards the cache's *apply
+  semantics* against `derive_messages`, and
+  `cache_invariant_flags_a_stale_prefix_at_the_head` asserts that guard is not
+  vacuous. (3) `SessionEventMap::clone`
+  deep-copies `events` but the cache clones *empty*, so a cloned-then-read session
+  pays one refold (a net win across the many `Session::clone()` sites, most of
+  which never read the transcript). (4) `projected_messages()` moved from `&self` to `&mut self`
+  (an API break for shared-`&Session` callers). (5) No user-visible behavior
+  change; the speedup is session-length dependent. (6) The new
+  `ProjectionCacheMatchesDerived` load-path check adds one more transcript fold
+  (`derive_messages()`) plus two serializations per debug load, on top of the
+  folds the other builtin checks already do (tool-pairing, replay determinism,
+  projection-matches-derived). Debug-only and once per load, so acceptable, but
+  it is not free on a long session.
+- **Tests.** Unit tests and cache-vs-derived differentials cover the incremental
+  cache's fold/skip/self-heal/`reset`/clone paths, every transcript mutation
+  path, the `append_stored_message`/`insert_message` validation-rejection
+  fallback into `rebuild_event_map`, a randomized multi-op driver over the real
+  append seam, deserialize and push_event/fork, and a negative test proving the
+  `ProjectionCacheMatchesDerived` guard fails on a stale at-head cache. See the
+  `session::invariants` test module for the authoritative inventory.
+- **Remaining.** **f3** delivered: the ignored perf test
+  `bench_projected_vs_derive_messages` measures roughly a **100×** per-read
+  speedup on a 20,505-event log (observed ~98–107× across runs; timing-dependent,
+  so an order of magnitude). It asserts the projection is never slower, but it is
+  `#[ignore]`d so that guard only fires on a manual `--ignored` run, not in CI.
+  **f2** (delegating `derive_messages` itself to the projection)
+  stays low-priority; **f4** (retiring the legacy `Session.messages` vector in
+  favour of the log as the single physical source of truth) is the medium-priority
+  cross-cutting follow-up — see the takeaways doc's follow-ups table for its staged
+  plan; **f5** (keep per-turn readers on the cache) is a low-priority guardrail.
 
 ## F8 — unify tool timeouts on the shared seam (follow-up, parked)
 
@@ -528,17 +613,12 @@ constructed at 96 sites, too invasive for one tool's benefit).
   of continuing to the end. The scan stays read-only and idempotent, so bailing
   mid-loop leaves no partial writes. The background index **warmup** path is
   unattended and deliberately uses a never-cancelled scope (no deadline races it).
-- **Tests:** two new tests cover the mechanism end to end. A pre-set flag test
-  (`pre_abort_flag_short_circuits_the_scan`) returns an empty report with
-  `scanned_jcode_sessions == 0` (no file enumeration) and
-  `candidate_jcode_sessions == 0` (no scoring) even though matching sessions
-  exist; a mechanism test
-  (`abort_on_drop_guard_arms_the_flag_when_the_future_is_dropped`) proves the
-  `cancel_scope::CancelGuard`, created inside the executing future exactly as
-  `execute` does, arms the scope when `execute_with_deadline` drops that future
+- **Tests:** covered end to end — a pre-set-flag test proves the scan short-
+  circuits without enumerating or scoring sessions, and a mechanism test proves
+  the `cancel_scope::CancelGuard` (created inside the executing future exactly as
+  `execute` does) arms the scope when `execute_with_deadline` drops that future
   on timeout. The existing timeout / model-visible-error / scope-scaling tests
-  still pass (session_search suite: 32 passed, 0 failed; cancel_scope suite:
-  4 passed).
+  still pass (session_search and cancel_scope suites green).
 
 The core F8 "promote-on-timeout" seam for `bash`/`bg`/`webfetch` remains a
 separate, behavior-changing follow-up as described above.

@@ -304,13 +304,19 @@ impl Session {
         }
         // Structural invariant registry (takeaway #3): run the built-in checks
         // (tool-pairing balance, non-empty ids, parent-edge resolution, replay
-        // determinism) over the freshly rehydrated log. Unlike a deliberate
-        // hard opt-in call site (see `InvariantLog::enforce`), the load path is
-        // a *diagnostic* seam: a session can legitimately carry an open tool
-        // call after an interrupt/crash, so we report violations rather than
-        // abort loading. This lets tests and operators observe the invariant
-        // without turning a benign mid-turn state into a hard failure.
+        // determinism, projection-vs-derived, projection-cache-vs-derived,
+        // compaction brackets) over the freshly rehydrated log. Unlike a
+        // deliberate hard opt-in call site (see `InvariantLog::enforce`), the
+        // load path is a *diagnostic* seam: a session can legitimately carry an
+        // open tool call after an interrupt/crash, so we report violations
+        // rather than abort loading. This lets tests and operators observe the
+        // invariant without turning a benign mid-turn state into a hard failure.
         if cfg!(debug_assertions) && !session.event_map.events.is_empty() {
+            // Warm the incremental projection cache to the log head first (fold
+            // only; no transcript clone), so the `ProjectionCacheMatchesDerived`
+            // check actually exercises the cached path (a cold cache is
+            // legitimately behind and the check skips it).
+            let _ = session.event_map.projected_messages_len();
             let inv = super::invariants::InvariantRegistry::builtin();
             let log = inv.check(&session.event_map);
             if !log.is_green() {
