@@ -1593,6 +1593,12 @@ fn clear_test_render_state_locked() {
     });
     set_visible_copy_targets(Vec::new());
     clear_copy_viewport_snapshot();
+    // Image payloads are keyed by content hash and live in a process-global
+    // registry shared across every test in this binary. Tests that seed the
+    // same tiny PNG otherwise inherit a sibling's staged payload, which makes
+    // a click report "· Image copied" where the test expects a bare size
+    // notice. Reset the registry on the same boundary as the render state.
+    inline_image_ui::clear_staged_payloads_for_tests();
 
     TEST_PROMPT_VIEWPORT_STATE.with(|state| {
         *state.borrow_mut() = PromptViewportState::default();

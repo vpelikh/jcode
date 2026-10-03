@@ -277,6 +277,24 @@ fn clear_staged_payloads() {
     }
 }
 
+/// Test-only: drop every staged payload and pending restage marker.
+///
+/// Several tests seed the *same* tiny PNG so its content-hash id collides
+/// across tests. A payload staged by one test then stays resident in this
+/// process-global registry, so a later test that clicks the same id sees a
+/// payload, appends a "· Image copied" suffix, and fails an assertion about
+/// the bare "Image size: large" notice. Suite-wide isolation is not available
+/// inside one test binary, so render-state resets call this.
+#[cfg(test)]
+pub(crate) fn clear_staged_payloads_for_tests() {
+    clear_staged_payloads();
+    if let Ok(mut ids) = PAYLOAD_RESTAGE_IDS.lock() {
+        ids.clear();
+    }
+    PAYLOAD_RESTAGE_PENDING.store(false, Ordering::Release);
+    PAYLOAD_RESTAGE_ALL.store(false, Ordering::Release);
+}
+
 fn request_payload_restage(id: u64) {
     let mut newly_requested = false;
     if let Ok(mut requested) = PAYLOAD_RESTAGE_IDS.lock() {
