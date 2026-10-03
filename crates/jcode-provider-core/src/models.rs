@@ -336,7 +336,11 @@ pub fn open_weight_family_context_limit(model: &str) -> Option<usize> {
     // for a route no provider has published evidence for. Live/disk catalog
     // metadata and user overrides are checked before this classifier, so an
     // explicit selection with real evidence still resolves.
-    if m == "nemotron-3-ultra-together" {
+    // Compare on the id tail so a provider-namespaced spelling
+    // (`together/nemotron-3-ultra-together`) is caught too; other families in
+    // this classifier already match namespaced ids by substring.
+    let bare = m.rsplit('/').next().unwrap_or(m);
+    if bare == "nemotron-3-ultra-together" {
         return None;
     }
 
@@ -619,6 +623,23 @@ mod tests {
     #[test]
     fn celeris_family_resolves_to_131k_context() {
         assert_eq!(open_weight_family_context_limit("celeris-1"), Some(131_072));
+    }
+
+    #[test]
+    fn nemotron_together_route_has_no_evidence_backed_window() {
+        // Bare id and provider-namespaced spelling must both resolve to None,
+        // even though the broad `nemotron-3` family match would otherwise claim
+        // a window for an unpublished Together route (#1274).
+        assert_eq!(open_weight_family_context_limit("nemotron-3-ultra-together"), None);
+        assert_eq!(
+            open_weight_family_context_limit("together/nemotron-3-ultra-together"),
+            None
+        );
+        // The verified DeepInfra route keeps the family window.
+        assert_eq!(
+            open_weight_family_context_limit("nemotron-3-ultra"),
+            Some(256_000)
+        );
     }
 
     #[test]

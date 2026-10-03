@@ -268,9 +268,16 @@ mod macos {
         // not proof of a `read(0)`. Multi-threaded runtimes (tokio, libdispatch,
         // Node, and even the `cargo test` harness) park worker threads in that
         // state while doing nothing with stdin, which would otherwise be misread
-        // as "reading stdin". A stdin-blocked CLI/shell (`cat`, an interactive
-        // prompt) is effectively single-threaded, so require that before
-        // reporting `Reading`; anything else is inconclusive, not a positive.
+        // as "reading stdin". Treat a multi-threaded process as inconclusive:
+        // reporting a false `Reading` would forward agent input into a program
+        // that never asked for it, which is worse than the known cost here.
+        //
+        // Known limitation: a legitimately stdin-blocked *multi-threaded* program
+        // (a Node/Python/Go REPL, or any event loop that then reads stdin) is
+        // reported `Unknown` and will not receive forwarded input. Single-threaded
+        // readers (`cat`, a shell prompt) still resolve to `Reading`. Distinguishing
+        // them needs the waiting thread's wait reason, which macOS does not expose
+        // cheaply.
         if thread_count(pid as i32) > 1 {
             return StdinState::Unknown;
         }

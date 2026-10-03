@@ -86,6 +86,48 @@ pub use jcode_tool_core::{StdinInputRequest, Tool, ToolContext, ToolExecutionMod
 pub use jcode_tool_types::{ToolImage, ToolOutput};
 pub(crate) use session_search::spawn_recent_index_warmup;
 
+/// Product separation for the self-development tools.
+///
+/// Shared by [`crate::agent::Agent::validate_tool_allowed`] and
+/// [`Registry::execute`] so the two cannot drift: batch/subcalls dispatch
+/// through the registry without the agent-level check
+/// (`crate::tool::batch` calls `registry.execute` directly), so both paths must
+/// enforce identical rules. Desktop self-development is selected by the working
+/// directory being a Jcode Desktop checkout; CLI self-development is the
+/// canary/self-dev session flag.
+///
+/// Returns the rejection error when `name` must not run in this mode.
+pub(crate) fn product_separation_error(
+    name: &str,
+    is_canary: bool,
+    is_desktop: bool,
+) -> Option<anyhow::Error> {
+    if is_desktop && matches!(name, "selfdev" | "debug_socket") {
+        return Some(anyhow::anyhow!(
+            "Tool '{name}' targets Jcode CLI, not Desktop. Use 'desktop_selfdev' in Desktop self-development mode."
+        ));
+    }
+    if !is_desktop && name == "desktop_selfdev" {
+        return Some(anyhow::anyhow!(
+            "Tool 'desktop_selfdev' is only available in a Jcode Desktop source checkout."
+        ));
+    }
+    if (is_canary || is_desktop) && name == "jcode_docs" {
+        // Preserve both established wordings: the Desktop path is checked by a
+        // test asserting "Desktop", the CLI canary path by one asserting
+        // "disabled in self-development mode".
+        let mode = if is_desktop {
+            "Desktop self-development"
+        } else {
+            "self-development"
+        };
+        return Some(anyhow::anyhow!(
+            "Tool 'jcode_docs' is disabled in {mode} mode. Read the working tree documentation instead."
+        ));
+    }
+    None
+}
+
 #[derive(Clone, Debug, Default)]
 struct SessionToolPolicy {
     allowed_tools: Option<HashSet<String>>,
@@ -851,10 +893,12 @@ impl Registry {
         // `compass_enforcement::prefer_compass_query_for` (see its doc).
         let resolved_name = Self::resolve_tool_name(name);
         // Enforce product separation here too: batch/subcalls dispatch through
-        // the registry without going through Agent::validate_tool_allowed. Keep
-        // this in lockstep with `Agent::validate_tool_allowed`. Desktop
-        // self-development is selected purely by the working directory being a
-        // Jcode Desktop checkout.
+        // the registry without going through `Agent::validate_tool_allowed`, so
+        // both paths call the same helper to stay in lockstep. Desktop
+        // self-development is selected by the working directory being a Jcode
+        // Desktop checkout; CLI self-development by the session's canary flag.
+        // Only the four self-dev names reach this branch, so the session load is
+        // off the hot path.
         if matches!(
             resolved_name,
             "selfdev" | "debug_socket" | "desktop_selfdev" | "jcode_docs"
@@ -863,21 +907,11 @@ impl Registry {
                 .working_dir
                 .as_deref()
                 .is_some_and(|dir| jcode_selfdev_types::desktop_repo_root(dir).is_some());
-            if desktop && resolved_name == "jcode_docs" {
-                return Err(anyhow::anyhow!(
-                    "Tool 'jcode_docs' is disabled in Desktop self-development mode. Read the working tree documentation instead."
-                ));
-            }
-            if desktop && matches!(resolved_name, "selfdev" | "debug_socket") {
-                return Err(anyhow::anyhow!(
-                    "Tool '{}' targets Jcode CLI, not Desktop. Use 'desktop_selfdev' in Desktop self-development mode.",
-                    resolved_name
-                ));
-            }
-            if !desktop && resolved_name == "desktop_selfdev" {
-                return Err(anyhow::anyhow!(
-                    "Tool 'desktop_selfdev' is only available in a Jcode Desktop source checkout."
-                ));
+            let is_canary = crate::session::Session::load(&ctx.session_id)
+                .map(|session| session.is_canary)
+                .unwrap_or(false);
+            if let Some(error) = product_separation_error(resolved_name, is_canary, desktop) {
+                return Err(error);
             }
         }
         let prefer_compass_query = compass_enforcement::prefer_compass_query_for(resolved_name);

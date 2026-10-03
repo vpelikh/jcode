@@ -712,21 +712,12 @@ self.append_user_context_message_with_display_role(
 
     pub(super) fn validate_tool_allowed(&self, name: &str) -> Result<()> {
         let is_desktop = self.is_desktop_selfdev();
-        if is_desktop && matches!(name, "selfdev" | "debug_socket") {
-            return Err(anyhow::anyhow!(
-                "Tool '{}' targets Jcode CLI, not Desktop. Use 'desktop_selfdev' in Desktop self-development mode.",
-                name
-            ));
-        }
-        if !is_desktop && name == "desktop_selfdev" {
-            return Err(anyhow::anyhow!(
-                "Tool 'desktop_selfdev' is only available in a Jcode Desktop source checkout."
-            ));
-        }
-        if (self.session.is_canary || is_desktop) && name == "jcode_docs" {
-            return Err(anyhow::anyhow!(
-                "Tool 'jcode_docs' is disabled in self-development mode. Read the working tree documentation instead."
-            ));
+        // Shared with `Registry::execute` so the agent-level check and the
+        // registry-level check (which batch subcalls hit directly) cannot drift.
+        if let Some(error) =
+            crate::tool::product_separation_error(name, self.session.is_canary, is_desktop)
+        {
+            return Err(error);
         }
         if let Some(allowed) = self.allowed_tools.as_ref()
             && !self.registry.tool_is_allowed(allowed, name)

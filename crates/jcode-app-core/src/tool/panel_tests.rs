@@ -58,7 +58,9 @@ async fn panel_registered_lifecycle_and_validation() {
     // The bus is process-global, so a concurrently running test can publish its
     // own event between our `subscribe` and here. Drain until we find the
     // SidePanelUpdated this call published rather than assuming it is the very
-    // next event; bail on an empty/lagged receiver so a genuine miss still fails.
+    // next event. `Lagged` means we fell behind a busy shared bus; keep draining
+    // (newer events are still readable) and only stop on an empty receiver, so a
+    // genuine miss still fails.
     let mut saw_first_snapshot = false;
     for _ in 0..128 {
         match events.try_recv() {
@@ -67,6 +69,7 @@ async fn panel_registered_lifecycle_and_validation() {
                 break;
             }
             Ok(_) => continue,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
             Err(_) => break,
         }
     }

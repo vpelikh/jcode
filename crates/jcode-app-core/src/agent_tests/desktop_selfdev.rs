@@ -162,3 +162,76 @@ async fn desktop_selfdev_is_automatic_separate_and_restored() {
             .contains("selfdev build target=tui")
     );
 }
+
+/// A CLI canary/self-dev session must not run `jcode_docs` *through the
+/// registry*: batch subcalls dispatch via `Registry::execute` and never pass
+/// through `Agent::validate_tool_allowed`. Without the registry-level check a
+/// `batch{tool_calls:[{tool:"jcode_docs"}]}` call would bypass the canary
+/// restriction that direct calls enforce.
+#[tokio::test]
+async fn canary_session_cannot_execute_jcode_docs_through_registry() {
+    let _lock = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().unwrap();
+    let _env = TestEnvironment::new(home.path());
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    // A working dir that is NOT a Desktop checkout, so only the canary flag can
+    // trigger the jcode_docs block.
+    let cwd = home.path().join("ordinary-project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut agent =
+        Agent::new_with_initial_working_dir(provider.clone(), registry.clone(), cwd.to_str());
+    assert!(!agent.is_desktop_selfdev());
+
+    // The agent-level path rejects it in a canary session.
+    agent.set_canary("cli-regression");
+    agent.session.save().unwrap();
+    let session_id = agent.session_id().to_string();
+    assert!(agent.validate_tool_allowed("jcode_docs").is_err());
+
+    // The registry-level path (what batch subcalls hit) must reject it too. The
+    // guard reads the persisted session, so `set_canary` + save above must have
+    // landed on disk.
+    let result = registry
+        .execute(
+            "jcode_docs",
+            serde_json::json!({"action": "list"}),
+            ToolContext {
+                session_id: session_id.clone(),
+                message_id: "test".into(),
+                tool_call_id: "docs-via-registry".into(),
+                working_dir: Some(cwd.clone()),
+                stdin_request_tx: None,
+                graceful_shutdown_signal: None,
+                execution_mode: ToolExecutionMode::Direct,
+            },
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "canary session must not execute jcode_docs through the registry"
+    );
+
+    // A non-canary session with the same working dir still may.
+    agent.session.clear_canary();
+    agent.session.save().unwrap();
+    let allowed = registry
+        .execute(
+            "jcode_docs",
+            serde_json::json!({"action": "list"}),
+            ToolContext {
+                session_id,
+                message_id: "test".into(),
+                tool_call_id: "docs-ok".into(),
+                working_dir: Some(cwd),
+                stdin_request_tx: None,
+                graceful_shutdown_signal: None,
+                execution_mode: ToolExecutionMode::Direct,
+            },
+        )
+        .await;
+    assert!(
+        allowed.is_ok(),
+        "a regular session must still resolve jcode_docs: {allowed:?}"
+    );
+}
