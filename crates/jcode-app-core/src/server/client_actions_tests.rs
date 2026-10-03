@@ -1893,7 +1893,9 @@ async fn handle_handoff_resume_by_id_clears_and_arms_atomically() -> Result<()> 
 /// handle_handoff_save explicitly captures a snapshot for the current live
 /// session, on demand, while the session stays open. The captured snapshot is
 /// written with the "saved" disposition and becomes the project's live handoff.
-/// A session with no open todos replies with no id (nothing to save).
+/// When no open work remains, a recorded plan intention is derived as the
+/// continuation task; only a session with neither work nor intent replies with
+/// no id (nothing to save).
 #[tokio::test]
 async fn handle_handoff_save_captures_live_session_and_reports_nothing_to_save() -> Result<()> {
     let _guard = crate::storage::lock_test_env();
@@ -1962,8 +1964,9 @@ async fn handle_handoff_save_captures_live_session_and_reports_nothing_to_save()
         Some(session_id.as_str())
     );
 
-    // With all todos terminal, a second save reports nothing to save and does
-    // not synthesize a snapshot.
+    // With all todos terminal but a plan intention still recorded, an explicit
+    // save derives the continuation task from that intention rather than
+    // dead-ending: the user asked to hand the work off and the plan names it.
     crate::todo::save_todos(&session_id, &[]).unwrap();
     let (tx2, mut rx2) = mpsc::unbounded_channel();
     handle_handoff_save(72, None, &agent, &tx2).await;
@@ -1973,15 +1976,54 @@ async fn handle_handoff_save_captures_live_session_and_reports_nothing_to_save()
     match event2 {
         ServerEvent::HandoffSaved {
             id,
-            session_id,
+            session_id: saved,
             summary,
         } => {
             assert_eq!(id, 72);
-            assert!(session_id.is_none(), "no open work => no captured id");
+            assert_eq!(saved.as_deref(), Some(session_id.as_str()));
+            assert_eq!(summary.as_deref(), Some("live checkpoint"));
+        }
+        other => panic!("expected HandoffSaved, got {other:?}"),
+    }
+    let derived = crate::handoff::load_snapshot(&session_id).expect("derived snapshot");
+    assert!(derived.open_todos.is_empty());
+    assert_eq!(
+        derived.continuation_prompt.as_deref(),
+        Some("live checkpoint")
+    );
+
+    // A fresh session with neither open work nor a recorded intention reports
+    // nothing to save and does not synthesize a snapshot. (A fresh session is
+    // required because the carry-forward rule above keeps the earlier prompt.)
+    let bare_provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let bare_registry = Registry::new(bare_provider.clone()).await;
+    let bare_agent = Arc::new(Mutex::new(Agent::new(bare_provider, bare_registry)));
+    let bare_session_id = {
+        let mut guard = bare_agent.lock().await;
+        guard.set_working_dir(wd.to_str().expect("utf8"));
+        guard.session_id().to_string()
+    };
+    let (_tx3, mut rx3) = mpsc::unbounded_channel();
+    handle_handoff_save(73, None, &bare_agent, &_tx3).await;
+    let event3 = timeout(Duration::from_secs(2), rx3.recv())
+        .await?
+        .expect("event");
+    match event3 {
+        ServerEvent::HandoffSaved {
+            id,
+            session_id,
+            summary,
+        } => {
+            assert_eq!(id, 73);
+            assert!(session_id.is_none(), "no work and no intent => no captured id");
             assert!(summary.is_none());
         }
         other => panic!("expected HandoffSaved, got {other:?}"),
     }
+    assert!(
+        crate::handoff::load_snapshot(&bare_session_id).is_none(),
+        "a workless, intentless save must not write a snapshot"
+    );
 
     if let Some(prev_home) = prev_home {
         crate::env::set_var("JCODE_HOME", prev_home);

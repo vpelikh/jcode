@@ -180,9 +180,21 @@ summary when one is set, otherwise its intent) when a snapshot was written, or n
 id when there is nothing to save. The client
 does not claim success optimistically: it records the in-flight request id and
 surfaces the server's actual outcome (a written snapshot, or an honest "nothing
-to save" for a session with no open work). A session with no open todos is left
+to save" when there is no open work, no plan intent to derive a task from, and
+no prompt). A session with no open todos is left
 untouched — unlike `capture`, a manual save never retires the existing live
 handoff, because it is purely additive.
+
+**Derived task on a bare save.** When an explicit save names no task and the
+session has no open todos, `save_now` derives the continuation task from the
+session's plan `user_intention` (when it is non-empty) instead of dead-ending.
+This makes the common natural-language phrasing ("save handoff") succeed for a
+session whose todos are all done but whose plan still states the goal. The
+derivation is deliberately scoped to the explicit save path: automatic
+disconnect `capture` stays conservative and never synthesizes a task from a
+completed plan, so a finished session is not resurrected as a live handoff. When
+the task is derived from the plan intention, the boot block renders it once as
+`Continue with this task: ...` and omits the now-redundant `Intent:` line.
 
 ### Continuation prompt
 
@@ -223,7 +235,9 @@ not added to the system prompt. Subsequent messages do not perform a handoff
 lookup or repeat the context.
 
 The block contains the intent, open work, optional assistant text, and linked
-initiative. Rendering is capped at 8192 bytes, with a notice when the overall
+initiative. When the continuation task was derived from the intent they are the
+same string, so the `Intent:` line is omitted to avoid repeating the task.
+Rendering is capped at 8192 bytes, with a notice when the overall
 block is truncated. Individual fields and the number of rendered todos are also
 bounded. The original user text and image blocks are preserved.
 

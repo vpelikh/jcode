@@ -3101,7 +3101,7 @@ pub(in crate::tui::app) fn handle_server_event(
                     }
                     None => {
                         app.push_display_message(DisplayMessage::system(
-                            "Nothing to save: the session has no open todos (or no resolvable project). Add a continuation prompt (e.g. /handoffsave review this branch) to hand off an explicit task."
+                            "Nothing to save: the session has no open todos, no plan intent, and no continuation prompt (or the project could not be resolved). Add a continuation prompt (e.g. /handoffsave review this branch) to hand off an explicit task."
                                 .to_string(),
                         ));
                         app.set_status_notice("Handoff: nothing to save");

@@ -272,6 +272,163 @@ fn save_now_with_prompt_handles_task_without_open_work_and_renders_it() {
     );
 }
 
+/// A bare explicit save (no prompt) for a session whose todos are all done but
+/// whose plan still records an intention derives the continuation task from
+/// that intention and renders it, instead of dead-ending on "nothing to save".
+#[test]
+fn save_now_derives_task_from_plan_intent_when_no_open_work() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let home = &env._home;
+    let cwd = home.path().join("project");
+    std::fs::create_dir_all(&cwd).ok();
+
+    // All work completed, but the plan states the goal.
+    crate::todo::save_todos(
+        "s-intent",
+        &[TodoItem {
+            id: "t1".into(),
+            content: "done".into(),
+            status: "completed".into(),
+            ..Default::default()
+        }],
+    )
+    .expect("save todos");
+    crate::todo::save_plan(
+        "s-intent",
+        &crate::todo::TodoPlan {
+            user_intention: Some("Deliver issue #14's benchmark suite end-to-end".into()),
+            ..Default::default()
+        },
+    )
+    .expect("save plan");
+
+    let snap = save_now("s-intent", Some(&cwd), None)
+        .expect("a bare save with a plan intent should not dead-end");
+    assert_eq!(snap.disposition, "saved");
+    assert!(snap.open_todos.is_empty());
+    assert_eq!(
+        snap.continuation_prompt.as_deref(),
+        Some("Deliver issue #14's benchmark suite end-to-end")
+    );
+
+    // The boot block leads with the task and does not repeat it as an Intent line.
+    let rendered = render_handoff("s-intent").expect("renders");
+    assert!(
+        rendered
+            .contains("Continue with this task: Deliver issue #14's benchmark suite end-to-end"),
+        "derived task should lead the boot block, got: {rendered}"
+    );
+    assert!(
+        !rendered.contains("Intent:"),
+        "the intent must not be repeated once it is the task, got: {rendered}"
+    );
+
+    // With open work present, the intent stays a plain historical `Intent:` line
+    // and no task is derived: the open work is the handoff.
+    crate::todo::save_todos(
+        "s-intent-work",
+        &[TodoItem {
+            id: "t2".into(),
+            content: "still open".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            ..Default::default()
+        }],
+    )
+    .expect("save todos");
+    crate::todo::save_plan(
+        "s-intent-work",
+        &crate::todo::TodoPlan {
+            user_intention: Some("keep going".into()),
+            ..Default::default()
+        },
+    )
+    .expect("save plan");
+    let snap = save_now("s-intent-work", Some(&cwd), None).expect("save with open work");
+    assert!(
+        snap.continuation_prompt.is_none(),
+        "open work is the handoff; the intent must not become a task"
+    );
+    assert_eq!(snap.open_todos.len(), 1);
+
+    // No work and no intent still yields nothing to save.
+    assert!(
+        save_now("s-intent-empty", Some(&cwd), None).is_none(),
+        "no work and no intent must still refuse a bare save"
+    );
+
+    // A plan intention longer than the prompt cap is normalized (truncated) when
+    // derived as the task; the boot block must still not duplicate it as an
+    // `Intent:` line, so the dedup is compared against the normalized task.
+    crate::todo::save_todos("s-intent-long", &[]).expect("save todos");
+    let long_intent = "z".repeat(5000);
+    crate::todo::save_plan(
+        "s-intent-long",
+        &crate::todo::TodoPlan {
+            user_intention: Some(long_intent.clone()),
+            ..Default::default()
+        },
+    )
+    .expect("save plan");
+    let snap = save_now("s-intent-long", Some(&cwd), None).expect("long intent save");
+    let stored = snap.continuation_prompt.clone().expect("derived task");
+    assert!(
+        stored.contains("continuation prompt truncated"),
+        "an over-cap derived task must carry its truncation marker"
+    );
+    let rendered = render_handoff("s-intent-long").expect("renders");
+    assert_eq!(
+        rendered.matches("Continue with this task:").count(),
+        1,
+        "the derived task must render exactly once, got: {rendered}"
+    );
+    assert!(
+        !rendered.contains("Intent:"),
+        "an over-cap derived intention must not be duplicated as an Intent line"
+    );
+}
+
+/// An automatic disconnect capture stays conservative: it must not derive a
+/// task from the plan intention, or a completed session would be resurrected
+/// as a live handoff on every later disconnect.
+#[test]
+fn capture_does_not_derive_task_from_plan_intent() {
+    let _guard = crate::storage::lock_test_env();
+    let env = HandoffTestEnv::new();
+    let home = &env._home;
+    let cwd = home.path().join("project");
+    std::fs::create_dir_all(&cwd).ok();
+
+    crate::todo::save_todos(
+        "s-cap-intent",
+        &[TodoItem {
+            id: "t1".into(),
+            content: "done".into(),
+            status: "completed".into(),
+            ..Default::default()
+        }],
+    )
+    .expect("save todos");
+    crate::todo::save_plan(
+        "s-cap-intent",
+        &crate::todo::TodoPlan {
+            user_intention: Some("all finished".into()),
+            ..Default::default()
+        },
+    )
+    .expect("save plan");
+
+    assert!(
+        capture("s-cap-intent", Some(&cwd), "closed", None).is_none(),
+        "disconnect capture must not synthesize a task from a completed plan"
+    );
+    assert!(
+        crate::handoff::latest_handoff_for_project(Some(&cwd)).is_none(),
+        "a completed session must not become the project's live handoff"
+    );
+}
+
 /// A continuation prompt written by an explicit save is a user instruction for
 /// the next session; a later disconnect capture for the same session must carry
 /// it forward rather than dropping it (which would silently lose the task when

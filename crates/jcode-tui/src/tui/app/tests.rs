@@ -2113,7 +2113,8 @@ fn remote_handoff_saved_reports_outcome_only_for_awaited_request() {
         "awaited save should report the id and summary, got: {saved_msg}"
     );
 
-    // A second awaited request with no open work reports "nothing to save".
+    // A second awaited request with no open work, plan intent, or prompt reports
+    // "nothing to save".
     app.set_pending_remote_handoff_save(8);
     app.handle_server_event(
         crate::protocol::ServerEvent::HandoffSaved {

@@ -455,7 +455,7 @@ pub(super) struct PendingRemoteHandoffList {
 
 /// An in-flight `handoff_save` request to the connected server. The `/handoffsave`
 /// command must not claim success until the server confirms it wrote a snapshot
-/// (or reports there was no open work), so the request id is recorded here and
+/// (or reports there was nothing to save), so the request id is recorded here and
 /// resolved when `ServerEvent::HandoffSaved` arrives.
 #[derive(Clone, Debug)]
 pub(super) struct PendingRemoteHandoffSave {
@@ -1760,7 +1760,7 @@ pub struct App {
     /// overlay over SSH, where the client's local store is the wrong host).
     pending_remote_handoff_list: Option<PendingRemoteHandoffList>,
     /// In-flight `handoff_save` so `/handoffsave` reports the server's actual
-    /// outcome (written snapshot vs. no open work) instead of optimistically.
+    /// outcome (written snapshot vs. nothing to save) instead of optimistically.
     pending_remote_handoff_save: Option<PendingRemoteHandoffSave>,
     /// In-flight `handoff_task_clear` so `/handofftask clear` reports whether a
     /// task was actually cleared.

@@ -198,6 +198,31 @@ fn build_snapshot_with_prompt(
     })
 }
 
+/// Derive a continuation task from the session's plan intention for an explicit
+/// save that named no task.
+///
+/// Returns `Some(intent)` only when the session has **no open todos** (so the
+/// snapshot would otherwise not be written) and the plan carries a non-empty
+/// `user_intention`. Resuming such a session with that intention as the task is
+/// strictly better than refusing to save: the user asked to hand the work off,
+/// and the plan already states what the work is. When open work exists it is
+/// already the handoff, so no derivation is needed and the intent stays a plain
+/// `Intent:` line.
+fn derive_continuation_prompt_from_plan(session_id: &str) -> Option<String> {
+    let has_open_work = load_todos(session_id)
+        .unwrap_or_default()
+        .iter()
+        .any(|t| t.status != "completed" && t.status != "cancelled");
+    if has_open_work {
+        return None;
+    }
+    load_plan(session_id)
+        .ok()
+        .and_then(|plan| plan.user_intention)
+        .map(|intent| intent.trim().to_string())
+        .filter(|intent| !intent.is_empty())
+}
+
 /// Persist a handoff snapshot for a closing session.
 ///
 /// Writes a per-session file and bumps a per-project index. Returns `None` when
@@ -275,10 +300,10 @@ pub fn capture(
 ///
 /// Unlike [`capture`], a session with no open work is **not** retired: a manual
 /// save is purely additive and must never clear an existing index entry. Returns
-/// `None` when there is nothing to save (no open todos and no prompt, new or
-/// previously saved) or when the project identity cannot be resolved. A prompt
-/// already saved for this session is carried forward (see
-/// [`save_now_with_prompt`]).
+/// `None` only when there is nothing at all to save: no open todos, no plan
+/// intention to derive a task from, and no prompt (new or previously saved), or
+/// when the project identity cannot be resolved. A prompt already saved for this
+/// session is carried forward (see [`save_now_with_prompt`]).
 pub fn save_now(
     session_id: &str,
     working_dir: Option<&Path>,
@@ -322,7 +347,19 @@ pub fn save_now_with_prompt(
     } else {
         load_snapshot(session_id).and_then(|s| s.continuation_prompt)
     };
-    let prompt = incoming.or(carried_prompt.as_deref());
+    // When the user asks to save a handoff but names no task and the session
+    // already cleared all its todos, the plan's stated intention is the task to
+    // hand forward. Without this, a bare "save handoff" dead-ends on
+    // "nothing to save" even though the session has a perfectly good task goal.
+    // This derivation is deliberately scoped to the *explicit* save path: an
+    // automatic disconnect capture stays conservative and does not resurrect a
+    // completed session as a live handoff.
+    let derived = if incoming.is_none() && carried_prompt.is_none() {
+        derive_continuation_prompt_from_plan(session_id)
+    } else {
+        None
+    };
+    let prompt = incoming.or(carried_prompt.as_deref()).or(derived.as_deref());
     let snapshot = build_snapshot_with_prompt(
         session_id,
         working_dir,
@@ -995,7 +1032,22 @@ fn render_snapshot(snapshot: &HandoffSnapshot) -> Option<String> {
         }
     }
     if let Some(intent) = &snapshot.intent {
-        out.push_str(&format!("\nIntent: {}", truncate(intent, 2048)));
+        // When the continuation task was derived from the plan intention (a bare
+        // explicit save with no open work), the two describe the same task;
+        // rendering the intent again as historical context would just repeat it.
+        // Compare against the *normalized* intention, since the stored prompt is
+        // normalized (and possibly truncated) before it is rendered above.
+        let intent = intent.trim();
+        let duplicates_task = snapshot
+            .continuation_prompt
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|prompt| {
+                !prompt.is_empty() && prompt == normalize_continuation_prompt(intent)
+            });
+        if !intent.is_empty() && !duplicates_task {
+            out.push_str(&format!("\nIntent: {}", truncate(intent, 2048)));
+        }
     }
     if !snapshot.open_todos.is_empty() {
         out.push_str("\nOpen work:");

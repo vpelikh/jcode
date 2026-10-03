@@ -367,12 +367,15 @@ pub enum Request {
     /// lets a client checkpoint the session's open work without ending it. The
     /// server reads the session's todo plan/list and writes a snapshot with the
     /// "saved" disposition, replying [`ServerEvent::HandoffSaved`] with the
-    /// captured id (or `None` when there was neither open work nor a prompt).
+    /// captured id (or `None` when there was no open work, no plan intent to
+    /// derive a task from, and no prompt).
     ///
     /// An optional `prompt` records an explicit continuation task for the
     /// resumed session (e.g. "review this branch's changes"). When present, a
     /// snapshot is captured even for a session with no open todos, because the
-    /// task itself is the work being handed forward.
+    /// task itself is the work being handed forward. A bare save with no open
+    /// work derives the task from the session's plan intention instead of
+    /// failing.
     #[serde(rename = "handoff_save")]
     HandoffSave {
         id: u64,
@@ -1795,7 +1798,7 @@ pub enum ServerEvent {
         /// Echoes the request id.
         id: u64,
         /// The captured session id when a snapshot was written (`Some`), or
-        /// `None` when there was neither open work nor a prompt to save.
+        /// `None` when there was no open work, plan intent, or prompt to save.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
         /// The captured snapshot's headline for a client confirmation: its

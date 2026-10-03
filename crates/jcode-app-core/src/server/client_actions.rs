@@ -691,10 +691,12 @@ pub(super) async fn handle_set_handoff_resume(
 /// the session's todo state and writes a snapshot with the "saved" disposition
 /// while the session stays open. An optional `prompt` records an explicit
 /// continuation task so the resumed session boots ready to perform it; when a
-/// prompt is present a snapshot is written even with no open work. With neither
-/// open work nor a prompt, no snapshot is written and the reply carries `None`
-/// so the client can render an honest "nothing to save" message instead of a
-/// false success.
+/// prompt is present a snapshot is written even with no open work. A bare save
+/// with no open work derives the task from the session's plan intention (see
+/// `handoff::save_now_with_prompt`). Only when there is no open work, no plan
+/// intent, and no prompt is no snapshot written, and the reply then carries
+/// `None` so the client can render an honest "nothing to save" message instead
+/// of a false success.
 pub(super) async fn handle_handoff_save(
     id: u64,
     prompt: Option<String>,
@@ -745,7 +747,7 @@ pub(super) async fn handle_handoff_save(
             });
         }
         Ok(None) => {
-            // No open work (and no explicit prompt): nothing to save.
+            // No open work, plan intent, or explicit prompt: nothing to save.
             let _ = client_event_tx.send(ServerEvent::HandoffSaved {
                 id,
                 session_id: None,

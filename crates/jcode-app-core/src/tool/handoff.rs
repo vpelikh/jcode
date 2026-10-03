@@ -62,7 +62,7 @@ impl Tool for HandoffTool {
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "Optional continuation task for the resumed session, e.g. review this branch's changes."
+                    "description": "Continuation task the next session should perform, e.g. review this branch's changes."
                 }
             }
         })
@@ -134,7 +134,7 @@ impl Tool for HandoffTool {
                     })))
             }
             None => Ok(ToolOutput::new(
-                "Nothing to save: the session has no open todos and no continuation prompt was given, or its project could not be resolved (no working directory). Provide a `prompt` to hand off an explicit task, or track open work with the `todo` tool first.",
+                "Nothing to save: the session has no open todos, no saved plan intent, and no continuation prompt was given, or its project could not be resolved (no working directory). If the user did ask to save a handoff, call `handoff` again with a `prompt` stating the task the next session should pick up (or track the work with the `todo` tool first).",
             )
             .with_title("Handoff: nothing to save")),
         }

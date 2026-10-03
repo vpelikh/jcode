@@ -57,8 +57,70 @@ async fn handoff_tool_saves_continuation_prompt_and_boot_renders_it() {
     }
 }
 
-/// Without open todos and without a prompt, the tool reports nothing to save
-/// rather than writing a useless empty snapshot.
+/// A bare `save` (the model's response to "save handoff") with no open todos
+/// but a recorded plan intention derives the task from that intent, so the
+/// common natural-language phrasing succeeds instead of reporting nothing.
+#[tokio::test]
+async fn handoff_tool_bare_save_derives_task_from_plan_intent() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let project = temp.path().join("repo");
+    std::fs::create_dir_all(&project).expect("project dir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    crate::todo::save_plan(
+        "ses_handoff_bare",
+        &crate::todo::TodoPlan {
+            user_intention: Some("Finish the migration and verify it".into()),
+            ..Default::default()
+        },
+    )
+    .expect("save plan");
+
+    let tool = HandoffTool::new();
+    let ctx = ToolContext {
+        session_id: "ses_handoff_bare".to_string(),
+        message_id: "msg1".to_string(),
+        tool_call_id: "tool1".to_string(),
+        working_dir: Some(project.clone()),
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: crate::tool::ToolExecutionMode::AgentTurn,
+    };
+
+    let out = tool
+        .execute(json!({"action": "save"}), ctx)
+        .await
+        .expect("handoff tool runs");
+    assert!(
+        out.output.contains("Saved handoff"),
+        "a bare save with a plan intent should succeed, got: {}",
+        out.output
+    );
+    assert!(out.output.contains("Finish the migration and verify it"));
+
+    let snapshot = crate::handoff::load_snapshot("ses_handoff_bare").expect("snapshot saved");
+    assert_eq!(
+        snapshot.continuation_prompt.as_deref(),
+        Some("Finish the migration and verify it")
+    );
+
+    // A later session in the same project boots with the derived task.
+    let boot = crate::handoff::render_boot_context(Some(&project)).expect("boot context");
+    assert!(
+        boot.contains("Continue with this task: Finish the migration and verify it"),
+        "boot context should carry the derived task, got: {boot}"
+    );
+
+    match prev_home {
+        Some(prev) => crate::env::set_var("JCODE_HOME", prev),
+        None => crate::env::remove_var("JCODE_HOME"),
+    }
+}
+
+/// Without open todos, a plan intent, or a prompt, the tool reports nothing to
+/// save rather than writing a useless empty snapshot.
 #[tokio::test]
 async fn handoff_tool_reports_nothing_to_save_without_work_or_prompt() {
     let _guard = crate::storage::lock_test_env();

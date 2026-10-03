@@ -17,6 +17,25 @@ fn test_default_system_prompt_no_claude_code_identity() {
 }
 
 #[test]
+fn default_system_prompt_maps_save_handoff_to_the_tool() {
+    // A bare "save handoff" was misread as writing a repo doc / searching for a
+    // convention instead of calling the `handoff` tool. The prompt must name the
+    // tool and the `action` values so the intent maps to the tool.
+    assert!(
+        DEFAULT_SYSTEM_PROMPT.contains("## Handoff"),
+        "system prompt should have a Handoff section"
+    );
+    assert!(
+        DEFAULT_SYSTEM_PROMPT.contains("`handoff` tool"),
+        "the Handoff section must name the `handoff` tool"
+    );
+    assert!(
+        DEFAULT_SYSTEM_PROMPT.contains("action: \"save\""),
+        "the Handoff section must name the save action"
+    );
+}
+
+#[test]
 fn mermaid_prompt_module_follows_capability() {
     let (enabled, _) = build_system_prompt_split_with_capabilities(
         None,
