@@ -901,20 +901,24 @@ impl Registry {
         // Only the four self-dev names reach this branch, and the probe does
         // blocking FS work (`desktop_repo_root` canonicalizes/reads Cargo.toml;
         // `Session::load` reads the snapshot and replays the journal), so it
-        // runs on the blocking pool rather than stalling a runtime worker.
+        // runs on the blocking pool rather than stalling a runtime worker. Only
+        // `jcode_docs` depends on the canary flag, so the session load is
+        // skipped for the other three names.
         if matches!(
             resolved_name,
             "selfdev" | "debug_socket" | "desktop_selfdev" | "jcode_docs"
         ) {
+            let needs_canary = resolved_name == "jcode_docs";
             let working_dir = ctx.working_dir.clone();
             let session_id = ctx.session_id.clone();
             let (desktop, is_canary) = tokio::task::spawn_blocking(move || {
                 let desktop = working_dir
                     .as_deref()
                     .is_some_and(|dir| jcode_selfdev_types::desktop_repo_root(dir).is_some());
-                let is_canary = crate::session::Session::load(&session_id)
-                    .map(|session| session.is_canary)
-                    .unwrap_or(false);
+                let is_canary = needs_canary
+                    && crate::session::Session::load(&session_id)
+                        .map(|session| session.is_canary)
+                        .unwrap_or(false);
                 (desktop, is_canary)
             })
             .await
