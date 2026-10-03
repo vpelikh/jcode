@@ -288,11 +288,15 @@ fn clear_staged_payloads() {
 #[cfg(test)]
 pub(crate) fn clear_staged_payloads_for_tests() {
     clear_staged_payloads();
+    // Reset the ids set and its derived flags under the same lock
+    // `request_payload_restage` uses, so a concurrent restage request (which
+    // inserts an id and sets PENDING while holding this lock) cannot leave
+    // PENDING/ALL disagreeing with the id set.
     if let Ok(mut ids) = PAYLOAD_RESTAGE_IDS.lock() {
         ids.clear();
+        PAYLOAD_RESTAGE_PENDING.store(false, Ordering::Release);
+        PAYLOAD_RESTAGE_ALL.store(false, Ordering::Release);
     }
-    PAYLOAD_RESTAGE_PENDING.store(false, Ordering::Release);
-    PAYLOAD_RESTAGE_ALL.store(false, Ordering::Release);
 }
 
 fn request_payload_restage(id: u64) {
