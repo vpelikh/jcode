@@ -136,8 +136,8 @@ fn browser_unusable_here() -> bool {
 }
 
 /// True when the current process is a Rust test binary (`cargo test` /
-/// `cargo nextest`). Test binaries always run from `target/**/deps/`, a
-/// location no installed or self-dev jcode binary ever runs from.
+/// `cargo nextest`). Test binaries always run from a `deps/` directory under a
+/// cargo target dir, a location no installed jcode binary ever runs from.
 ///
 /// Used to keep tests from opening real browser windows (OAuth login pages,
 /// files) on the developer's desktop: many login/onboarding flows are
@@ -154,7 +154,13 @@ pub fn running_in_test_harness() -> bool {
             .ok()
             .map(|exe| {
                 let path = exe.to_string_lossy().replace('\\', "/");
-                path.contains("/target/") && path.contains("/deps/")
+                // A test binary is always a direct child of a `.../deps/`
+                // directory under a cargo target dir. Check for `target` as a
+                // substring rather than the exact `target` component so
+                // self-dev's shared `.../shared-target/debug/deps/...` layout
+                // (and any `target-*` variant) is covered too. No installed or
+                // self-dev jcode binary runs from a `deps` directory.
+                path.contains("/deps/") && path.contains("target")
             })
             .unwrap_or(false)
     })

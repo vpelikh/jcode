@@ -329,6 +329,17 @@ pub fn context_limit_for_model_with_provider_and_cache(
 pub fn open_weight_family_context_limit(model: &str) -> Option<usize> {
     let m = model;
 
+    // `nemotron-3-ultra-together` is deliberately *not* advertised anywhere: it
+    // is absent from the Conifer catalog, and only the DeepInfra-routed
+    // `nemotron-3-ultra` is verified (issue #1274, docs/CONIFER_PROVIDER.md).
+    // The broad `nemotron-3` family match below would otherwise claim a window
+    // for a route no provider has published evidence for. Live/disk catalog
+    // metadata and user overrides are checked before this classifier, so an
+    // explicit selection with real evidence still resolves.
+    if m == "nemotron-3-ultra-together" {
+        return None;
+    }
+
     // --- Z.AI GLM family ---
     if m.contains("glm") {
         // GLM-5.2: first GLM with a truly usable 1M-token context window.

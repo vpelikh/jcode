@@ -47,8 +47,46 @@ async fn persistent_terminal_public_case(
                 _ => break,
             }
         }
-        let (tcp, _) = listener.accept().await.unwrap();
-        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        // A background model-catalog refresh (`GET /v1/models`) may interleave
+        // with the websocket reconnect, so accept until we get the websocket
+        // upgrade rather than assuming the very next connection is the replay.
+        let mut ws = loop {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut probe = tcp;
+            // Peek (without consuming) until the request headers end so we can
+            // tell a websocket upgrade from a plain HTTP catalog request.
+            let mut buf = Vec::new();
+            loop {
+                use tokio::io::AsyncReadExt;
+                let mut chunk = [0u8; 512];
+                let n = probe.peek(&mut chunk).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf = chunk[..n].to_vec();
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() >= 512 {
+                    break;
+                }
+            }
+            let head = String::from_utf8_lossy(&buf).to_ascii_lowercase();
+            if head.contains("upgrade: websocket") {
+                break tokio_tungstenite::accept_async(probe).await.unwrap();
+            }
+            // Plain HTTP (e.g. the model-catalog probe): answer minimally and
+            // move on. `peek` left the request in the socket, so read it out
+            // first, then write a valid HTTP response and close.
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut drain = [0u8; 4096];
+            let _ = probe.read(&mut drain).await;
+            let body = b"{\"data\":[]}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = probe.write_all(response.as_bytes()).await;
+            let _ = probe.write_all(body).await;
+            let _ = probe.flush().await;
+        };
         let fresh: Value =
             serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
         assert!(fresh.get("previous_response_id").is_none(), "{fresh}");

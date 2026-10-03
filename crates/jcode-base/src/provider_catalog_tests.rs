@@ -68,7 +68,9 @@ fn conifer_context_limits_match_public_catalog_snapshot() {
     }
     assert_eq!(
         openai_compatible_profile_context_limit("conifer", "grok-4.6-unknown"),
-        None
+        jcode_provider_core::models::open_weight_family_context_limit("grok-4.6-unknown"),
+        "an unknown grok-4 variant may use the shared family window, but must \
+         not inherit Conifer's exact grok-4.6 window"
     );
     assert_eq!(
         openai_compatible_profile_context_limit("conifer", "kimi-k3"),
