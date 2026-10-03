@@ -55,18 +55,27 @@ async fn persistent_terminal_public_case(
             let mut probe = tcp;
             // Peek (without consuming) until the request headers end so we can
             // tell a websocket upgrade from a plain HTTP catalog request.
+            // `peek` is non-consuming, so each iteration re-reads from the same
+            // offset; overwriting `buf` is correct (accumulating would append
+            // the same bytes repeatedly).
             let mut buf = Vec::new();
+            let mut closed = false;
             loop {
-                use tokio::io::AsyncReadExt;
                 let mut chunk = [0u8; 512];
                 let n = probe.peek(&mut chunk).await.unwrap_or(0);
                 if n == 0 {
+                    // Peer closed without sending a full request: skip it rather
+                    // than writing a response to a dead socket.
+                    closed = true;
                     break;
                 }
                 buf = chunk[..n].to_vec();
                 if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() >= 512 {
                     break;
                 }
+            }
+            if closed {
+                continue;
             }
             let head = String::from_utf8_lossy(&buf).to_ascii_lowercase();
             if head.contains("upgrade: websocket") {
