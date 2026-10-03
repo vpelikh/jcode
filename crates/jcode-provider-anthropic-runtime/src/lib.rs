@@ -2337,8 +2337,29 @@ fn anthropic_recommended_model_from_error(error_str: &str) -> Option<String> {
         .split("please use")
         .nth(1)
         .or_else(|| error_str.split("use ").nth(1))?;
-    // Take up to the next sentence boundary.
-    let hint = hint.split(['.', '!', '\n']).next().unwrap_or(hint).trim();
+    // Take up to the next sentence boundary. `.` only ends the sentence when it
+    // is NOT a decimal point between digits: the model version is written with a
+    // dot ("Opus 4.8"), so splitting on a bare '.' would truncate the hint to
+    // "opus 4" and drop the minor version that disambiguates 4.8 from 4.5.
+    let mut end = hint.len();
+    for (idx, ch) in hint.char_indices() {
+        if ch == '!' || ch == '\n' {
+            end = idx;
+            break;
+        }
+        if ch == '.' {
+            let prev_digit = hint[..idx].chars().next_back().is_some_and(|c| c.is_ascii_digit());
+            let next_digit = hint[idx + ch.len_utf8()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit());
+            if !(prev_digit && next_digit) {
+                end = idx;
+                break;
+            }
+        }
+    }
+    let hint = hint[..end].trim();
     if hint.is_empty() {
         return None;
     }
