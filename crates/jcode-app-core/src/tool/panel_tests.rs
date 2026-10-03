@@ -55,8 +55,24 @@ async fn panel_registered_lifecycle_and_validation() {
     assert!(first.output.contains(&format!(
         "panel_id: {id}\nidentity: side-panel://panel-test/{id}"
     )));
+    // The bus is process-global, so a concurrently running test can publish its
+    // own event between our `subscribe` and here. Drain until we find the
+    // SidePanelUpdated this call published rather than assuming it is the very
+    // next event; bail on an empty/lagged receiver so a genuine miss still fails.
+    let mut saw_first_snapshot = false;
+    for _ in 0..128 {
+        match events.try_recv() {
+            Ok(crate::bus::BusEvent::SidePanelUpdated(update)) if update.snapshot == first_state => {
+                saw_first_snapshot = true;
+                break;
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
     assert!(
-        matches!(events.try_recv().unwrap(), crate::bus::BusEvent::SidePanelUpdated(update) if update.snapshot == first_state)
+        saw_first_snapshot,
+        "expected a SidePanelUpdated carrying the first snapshot"
     );
     let second = registry
         .execute(

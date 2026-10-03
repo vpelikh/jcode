@@ -337,12 +337,24 @@ async fn test_reload_persistable_bash_continues_in_background() {
             .expect("status_file should be present"),
     );
 
-    tokio::time::sleep(std::time::Duration::from_millis(1400)).await;
-
-    let status = crate::background::global()
-        .status(&task_id)
-        .await
-        .expect("status should exist");
+    // Wait for the promoted command to finish on its own. Poll rather than
+    // sleeping a fixed 1400ms: the command is `sleep 1`, but under parallel
+    // cargo test execution the promotion (spawn + reader task) can add enough
+    // scheduling latency that a wall-clock sleep races the real completion and
+    // flakes. Bounded so a genuine hang still fails fast.
+    let mut final_status = None;
+    for _ in 0..100 {
+        let status = crate::background::global()
+            .status(&task_id)
+            .await
+            .expect("status should exist");
+        if status.status != BackgroundTaskStatus::Running {
+            final_status = Some(status);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let status = final_status.expect("promoted background task should finish");
     assert_eq!(status.status, BackgroundTaskStatus::Completed);
     let output = crate::background::global()
         .output(&task_id)
