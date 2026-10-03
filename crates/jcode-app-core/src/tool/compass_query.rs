@@ -78,6 +78,20 @@ const AST_CACHE_DIR: &str = ".ast-cache";
 /// Name of the non-git (workspace) output dir inside a project root.
 const WORKSPACE_DIR: &str = "workspace";
 
+/// Subdirectory of an output dir where Compass stores its SQLite code-query
+/// index, one keyed child per `(graph identity, program digest, schema)`.
+const CODE_QUERY_DIR: &str = "code-query";
+
+/// Compass's cross-process index-build lock file name. Compass creates it with
+/// `create_new` and removes it only after a *successful* build, so a build that
+/// is killed or panics leaves it behind and permanently wedges every later
+/// `open()` for that same index key with `query_index_lock_timeout`.
+const CODE_QUERY_LOCK_FILE: &str = "index.lock";
+
+/// Prefix of the temporary SQLite file Compass writes before atomically
+/// renaming it to the final index; a crashed build leaves these orphans too.
+const CODE_QUERY_TMP_PREFIX: &str = "index.tmp-";
+
 /// How long a per-SHA output dir is retained before it is eligible for GC, if
 /// its SHA is no longer reachable from the repo. Older, unreachable per-commit
 /// graphs are pruned so `~/.jcode/compass/<project>/` does not grow unbounded
@@ -1171,6 +1185,12 @@ fn ensure_fresh_engine(
     let graph_path = &cache.graph_path;
     let output_dir = &cache.output_dir;
     with_build_lock(&cache.build_lock_dir, || {
+        // Clear any orphaned code-query build lock/temp from a previously killed
+        // or panicked build before opening. Compass's `open()` cannot recover
+        // from its own left-behind `index.lock` and would otherwise wedge with
+        // `query_index_lock_timeout` forever; holding the project flock here
+        // guarantees no live build owns it.
+        recover_orphaned_code_query_builds(output_dir);
         // Decide freshness without opening the engine: `index_is_fresh` uses the
         // git SHA sidecar and a throttled mtime walk, so opening a stale index
         // first would pay the (large) open only to discard it and rebuild.
@@ -1250,6 +1270,70 @@ fn index_is_fresh(cache: &CompassCachePaths, working_dir: &Path) -> bool {
         record_scan(&cache.output_dir);
     }
     fresh
+}
+
+/// Recover from an interrupted Compass code-query index build.
+///
+/// Compass's own cross-process lock (`<key>/index.lock`, created with
+/// `create_new`) is removed only on the *success* path of `build_with_lock`; if
+/// the build is killed or panics, the lock file is left behind. Because that
+/// lock lives inside the per-key `code-query/<key>/` dir and Compass retries it
+/// for ~5s before failing, every later `open()` for the same project wedges
+/// with `query_index_lock_timeout` — so `compass_query` reports "not available
+/// for this project yet" forever, and the agent falls back to `agentgrep`.
+///
+/// This clears such orphans. It is only safe because callers hold the project's
+/// `.compass-build.lock` flock (`with_build_lock`) for the whole ensure/open
+/// sequence: no other jcode process/thread can be mid-build for this project
+/// (each `with_build_lock` opens its own fd, so the flocks are mutually
+/// exclusive even within one process), so any lock file observed here cannot
+/// belong to a live jcode build — it is a leftover from a crashed one.
+///
+/// Clearing unconditionally (rather than only when the final index is absent)
+/// is deliberate: a *present but corrupt* `index.sqlite3` also forces a rebuild
+/// that needs the lock, so skipping it when an index file merely exists would
+/// leave that case wedged. Removing the lock cannot disturb a healthy index —
+/// `open()` never consults the lock once a valid index is present — so there is
+/// no safe case the removal can break. The final `index.sqlite3` itself is left
+/// untouched; only the lock and the partial `index.tmp-*` scratch files (often
+/// hundreds of MB from the crashed build) are reclaimed.
+fn recover_orphaned_code_query_builds(output_dir: &Path) {
+    let code_query_root = output_dir.join(CODE_QUERY_DIR);
+    let Ok(entries) = std::fs::read_dir(&code_query_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let key_dir = entry.path();
+        if !key_dir.is_dir() {
+            continue;
+        }
+
+        let lock_path = key_dir.join(CODE_QUERY_LOCK_FILE);
+        let lock_existed = lock_path.exists();
+        let _ = std::fs::remove_file(&lock_path);
+        let mut removed_tmp = 0usize;
+        if let Ok(files) = std::fs::read_dir(&key_dir) {
+            for file in files.flatten() {
+                let name = file.file_name();
+                if name.to_string_lossy().starts_with(CODE_QUERY_TMP_PREFIX)
+                    && std::fs::remove_file(file.path()).is_ok()
+                {
+                    removed_tmp += 1;
+                }
+            }
+        }
+        if lock_existed || removed_tmp > 0 {
+            crate::logging::event_info(
+                "COMPASS_INDEX_RECOVERY",
+                vec![
+                    ("phase", "cleared_orphaned_build".to_string()),
+                    ("key_dir", key_dir.display().to_string()),
+                    ("removed_lock", lock_existed.to_string()),
+                    ("removed_tmp_files", removed_tmp.to_string()),
+                ],
+            );
+        }
+    }
 }
 
 /// Discard a stale/unusable output before a rebuild, preserving the shared-cache
@@ -4831,6 +4915,179 @@ mod tests {
             graph.nodes().any(|(_, n)| n.label().contains("authenticate")),
             "the rebuilt graph must contain the real symbols"
         );
+    }
+
+    // A leftover code-query `index.lock` (Compass removes it only on a
+    // successful build) must not wedge `compass_query` forever. This is the
+    // exact production failure: a killed/panicked build leaves the lock, and
+    // every later `open()` fails with `query_index_lock_timeout`, so the tool
+    // reports "not available for this project yet" and the agent falls back to
+    // agentgrep.
+    #[test]
+    fn recover_orphaned_code_query_builds_clears_dead_lock_and_temp() {
+        let (_home, root) = HomeGuard::set();
+        let root = root.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("main.rs"), "fn authenticate() {}\n").unwrap();
+        let edge = resolve_compass_cache(&root);
+
+        // Simulate a crashed build: a key dir with a lock and a partial index,
+        // but no completed `index.sqlite3`.
+        let key_dir = edge.output_dir.join(CODE_QUERY_DIR).join("deadbeefkey");
+        std::fs::create_dir_all(&key_dir).unwrap();
+        std::fs::write(key_dir.join(CODE_QUERY_LOCK_FILE), b"").unwrap();
+        std::fs::write(key_dir.join("index.tmp-123-456"), b"partial").unwrap();
+        std::fs::write(key_dir.join("index.tmp-123-456-journal"), b"j").unwrap();
+
+        recover_orphaned_code_query_builds(&edge.output_dir);
+
+        assert!(
+            !key_dir.join(CODE_QUERY_LOCK_FILE).exists(),
+            "the orphaned lock must be removed"
+        );
+        assert!(
+            !key_dir.join("index.tmp-123-456").exists(),
+            "the orphaned temp index must be reclaimed"
+        );
+        assert!(
+            !key_dir.join("index.tmp-123-456-journal").exists(),
+            "the orphaned temp journal must be reclaimed"
+        );
+    }
+
+    // Recovery must also clear a lock that sits beside a *present but corrupt*
+    // final index, not only when the index file is absent. A corrupt index
+    // forces a rebuild that needs the lock, so skipping recovery when an index
+    // merely exists would leave this exact case wedged.
+    #[test]
+    fn recover_orphaned_code_query_builds_clears_lock_beside_corrupt_index() {
+        let (_home, root) = HomeGuard::set();
+        let root = root.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("main.rs"), "fn authenticate() {}\n").unwrap();
+        let edge = resolve_compass_cache(&root);
+
+        let key_dir = edge.output_dir.join(CODE_QUERY_DIR).join("corruptkey");
+        std::fs::create_dir_all(&key_dir).unwrap();
+        // Present but not a valid index; only its presence matters to the old
+        // (unsound) guard.
+        std::fs::write(key_dir.join("index.sqlite3"), b"{ not a database").unwrap();
+        std::fs::write(key_dir.join(CODE_QUERY_LOCK_FILE), b"").unwrap();
+
+        recover_orphaned_code_query_builds(&edge.output_dir);
+
+        assert!(
+            !key_dir.join(CODE_QUERY_LOCK_FILE).exists(),
+            "the lock must be cleared even when a (corrupt) index file is present"
+        );
+    }
+
+    // A key dir that already holds a final index must never have that index
+    // file removed, even though the lock is reclaimed unconditionally. Removing
+    // the lock cannot disturb a healthy index (open() never consults the lock
+    // once a valid index is present), so this guards the one thing that must
+    // survive.
+    #[test]
+    fn recover_orphaned_code_query_builds_preserves_a_healthy_index() {
+        let (_home, root) = HomeGuard::set();
+        let root = root.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("main.rs"), "fn authenticate() {}\n").unwrap();
+        let edge = resolve_compass_cache(&root);
+
+        let key_dir = edge.output_dir.join(CODE_QUERY_DIR).join("healthkey");
+        std::fs::create_dir_all(&key_dir).unwrap();
+        std::fs::write(key_dir.join("index.sqlite3"), b"a-real-index").unwrap();
+        std::fs::write(key_dir.join(CODE_QUERY_LOCK_FILE), b"").unwrap();
+
+        recover_orphaned_code_query_builds(&edge.output_dir);
+
+        assert!(
+            key_dir.join("index.sqlite3").exists(),
+            "a healthy final index must never be removed"
+        );
+        assert!(
+            !key_dir.join(CODE_QUERY_LOCK_FILE).exists(),
+            "the orphaned lock is reclaimed even alongside a present index"
+        );
+    }
+
+    // End-to-end: `ensure_fresh_engine` must recover from a leftover lock and
+    // return a working engine rather than the "not available" failure.
+    //
+    // Uses a git repo so the cache is the *shared* (per-SHA) one. That is the
+    // production failure mode: `discard_stale_output` is a no-op for a shared
+    // cache, so the orphaned lock survives a rebuild attempt and `open()` wedges
+    // on it. (A non-git cache is fully removed on discard, so it would not
+    // reproduce the wedge.) Skips when git is unavailable.
+    #[test]
+    fn ensure_fresh_engine_recovers_from_an_orphaned_code_query_lock() {
+        let (_home, home) = HomeGuard::set();
+        let root = home.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+
+        if !std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return; // git not available.
+        }
+        for (k, v) in [("user.email", "test@example.com"), ("user.name", "Test")] {
+            std::process::Command::new("git")
+                .args(["config", k, v])
+                .current_dir(&root)
+                .status()
+                .ok();
+        }
+        std::fs::write(root.join("main.rs"), "fn authenticate() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .status()
+            .ok();
+        if !std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&root)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        let edge = resolve_compass_cache(&root);
+        assert!(
+            edge.is_shared,
+            "a git repo must use the shared per-SHA cache"
+        );
+
+        // Build once so the graph exists and the engine knows its code-query key.
+        ensure_fresh_engine(&edge, &root).expect("first build must succeed");
+
+        // Simulate the crashed-build state for that key: drop the final index so
+        // `open()` must rebuild, and leave a lock plus a partial temp, exactly as
+        // a killed build does. A naive `open()` spins on the lock and fails with
+        // `query_index_lock_timeout`.
+        let code_query_root = edge.output_dir.join(CODE_QUERY_DIR);
+        let mut armed = false;
+        for entry in std::fs::read_dir(&code_query_root).unwrap().flatten() {
+            let key_dir = entry.path();
+            if !key_dir.is_dir() {
+                continue;
+            }
+            let _ = std::fs::remove_file(key_dir.join("index.sqlite3"));
+            std::fs::write(key_dir.join(CODE_QUERY_LOCK_FILE), b"").unwrap();
+            std::fs::write(key_dir.join("index.tmp-999-1"), b"partial").unwrap();
+            armed = true;
+        }
+        assert!(armed, "fixture must have armed an orphaned lock");
+
+        let engine = ensure_fresh_engine(&edge, &root)
+            .expect("an orphaned lock must be recovered, not surfaced as a failure");
+        drop(engine);
     }
 
     // An explicit `depth: 0` must be honored (Compass treats it as "no traversal")
