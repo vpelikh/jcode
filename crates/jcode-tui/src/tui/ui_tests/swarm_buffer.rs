@@ -143,6 +143,11 @@ fn right_fact_stack_uses_neutral_gray_except_for_context_usage() {
     use unicode_width::UnicodeWidthStr;
 
     let _lock = viewport_snapshot_test_lock();
+    // The assertion matches an exact truecolor value (`Color::Rgb`), so the
+    // frame must be rendered in truecolor. On a 256-color host `rgb(140,140,150)`
+    // quantizes to an `Indexed` cell and never equals the expected `Rgb`, so pin
+    // the capability rather than depend on the host's terminal env.
+    jcode_tui_style::color::pin_truecolor_for_tests();
     clear_flicker_frame_history_for_tests();
     let state = fact_test_state(String::new(), true);
     let backend = TestBackend::new(120, 18);
