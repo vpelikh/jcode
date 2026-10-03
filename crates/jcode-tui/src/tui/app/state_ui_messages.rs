@@ -136,6 +136,12 @@ impl App {
         messages.retain(|message| !is_background_task_lifecycle_message(&message.content));
         compact_display_messages_for_storage(&mut messages);
         self.display_messages = messages;
+        // The KV-cache notice aggregates track display-message indices, which are
+        // meaningless once the transcript is replaced wholesale (remote rewind /
+        // re-apply, startup history restore). The fold's drift guard already
+        // prevents a miswrite; dropping the tracking here removes the stale state
+        // at its source, matching `clear_display_messages`.
+        self.kv_cache.kv_cache_notices.clear();
         self.attempt_committed_assistant_messages = 0;
         self.sync_compacted_history_lazy_from_display_messages();
         self.bump_display_messages_version();
@@ -515,6 +521,9 @@ impl App {
         // block started so a stale offset can't slice the new stream.
         self.reasoning_block_start = None;
         self.turn_reasoning_traces.clear();
+        // The KV-cache notice aggregates track display-message indices; those
+        // indices are meaningless once the transcript is gone.
+        self.kv_cache.kv_cache_notices.clear();
         if !self.display_messages.is_empty() {
             self.display_messages.clear();
             self.bump_display_messages_version();
@@ -587,6 +596,11 @@ impl App {
     ) {
         compact_display_messages_for_storage(&mut messages);
         self.display_messages = messages;
+        // Loading older history prepends messages, which shifts every existing
+        // index. The KV-cache notice aggregates store such indices, so drop them
+        // here too: a later notice in the same turn simply prints a fresh line
+        // rather than folding into an index that now points somewhere else.
+        self.kv_cache.kv_cache_notices.clear();
         self.remote_side_pane_images = images;
         self.invalidate_side_pane_images_signature();
         self.compacted_history_lazy = CompactedHistoryLazyState {

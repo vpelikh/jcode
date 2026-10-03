@@ -419,6 +419,61 @@ fn harness_caused_kv_cache_miss_pushes_in_chat_alarm() {
     assert!(alarm.content.contains("50K"), "{alarm:?}");
 }
 
+#[test]
+fn kv_cache_notice_is_honest_when_provider_reports_no_cache_telemetry() {
+    let _invalidation_guard = crate::storage::lock_test_env();
+    // Some OpenAI-compatible gateways return only {prompt_tokens, completion_tokens,
+    // total_tokens} with no cache fields at all (observed on the DeepSeek gateway
+    // used during investigation). With no read and no creation report we cannot
+    // measure a resend, so the notice must not claim "tokens resent"; it should
+    // say the provider reports no telemetry.
+    let mut app = create_test_app();
+    crate::provider::anthropic::set_cache_ttl_1h(true);
+    crate::cache_invalidation::clear_for_tests();
+
+    let messages = vec![
+        Message::user("first prompt"),
+        Message::assistant_text("first answer"),
+        Message::user("second prompt"),
+    ];
+    let baseline_signature = App::kv_cache_request_signature(&messages, &[], "system PROMPT A", "");
+    let session_id = app.kv_cache_session_id();
+    app.kv_cache.kv_cache_baseline = Some(KvCacheBaseline {
+        session_id,
+        cache_generation: app.kv_cache.cache_generation,
+        input_tokens: 50_000,
+        completed_at: Instant::now(),
+        provider: app.kv_cache_provider_name(),
+        model: app.kv_cache_provider_model(),
+        upstream_provider: None,
+        signature: Some(baseline_signature),
+    });
+
+    app.begin_kv_cache_request(&messages, &[], "system PROMPT B", "");
+    app.streaming.streaming_input_tokens = 50_000;
+    // No cache telemetry in either direction.
+    app.streaming.streaming_cache_read_tokens = None;
+    app.streaming.streaming_cache_creation_tokens = None;
+    app.kv_cache.current_api_usage_recorded = false;
+    app.record_completed_stream_cache_usage();
+
+    let notice = app
+        .display_messages()
+        .iter()
+        .find(|message| message.role == "system" && message.content.contains("KV cache miss"))
+        .expect("harness-caused miss should still surface a notice");
+    assert!(
+        notice
+            .content
+            .contains("provider reports no cache telemetry"),
+        "notice must not assert an unmeasured resend: {notice:?}"
+    );
+    assert!(
+        !notice.content.contains("tokens resent"),
+        "notice must not claim resent tokens without telemetry: {notice:?}"
+    );
+}
+
 /// End-to-end acceptance through the real alarm pipeline
 /// (`begin_kv_cache_request` -> `record_completed_stream_cache_usage` ->
 /// `classify_kv_cache_miss_reason` -> `maybe_push_kv_cache_miss_notice`).
@@ -758,6 +813,493 @@ fn server_documented_rewrite_on_kv_request_attributed_not_alarmed() {
     );
 
     crate::cache_invalidation::clear_for_tests();
+}
+
+#[test]
+fn repeated_documented_rewrite_in_one_turn_pushes_single_notice() {
+    let _invalidation_guard = crate::storage::lock_test_env();
+    // A turn can issue many provider steps (tool-call loop), and the scheduled
+    // per-step prune can rewrite the consumed prefix on each step. Every step
+    // reports the same turn number, so without dedupe the user saw the same
+    // "KV cache refresh [...] turn N" line once per step. One notice per turn
+    // (per source) is the intended signal.
+    crate::provider::anthropic::set_cache_ttl_1h(true);
+    crate::cache_invalidation::clear_for_tests();
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    app.is_remote = true;
+    app.remote_provider_name = Some("OpenAI".to_string());
+    app.remote_provider_model = Some("gpt-5.5".to_string());
+    app.display_messages.push(DisplayMessage::user("live prompt"));
+
+    let documented = || crate::protocol::DocumentedCacheInvalidation {
+        source: "per-step prune".to_string(),
+        detail: "1 tool result(s) truncated".to_string(),
+    };
+
+    // Step 1 of the turn: establish the baseline, then complete with telemetry.
+    app.handle_server_event(
+        crate::protocol::ServerEvent::KvCacheRequest {
+            system_static_hash: 1,
+            tools_hash: 2,
+            messages_hash: 3,
+            message_hashes: vec![11, 22],
+            message_count: 2,
+            tool_count: 33,
+            system_static_chars: 11155,
+            tools_json_chars: 35228,
+            messages_json_chars: 198612,
+            ephemeral_hash: None,
+            ephemeral_chars: 0,
+            ephemeral_message_count: 0,
+            documented_invalidation: None,
+        },
+        &mut remote,
+    );
+    app.streaming.streaming_input_tokens = 50_000;
+    app.streaming.streaming_cache_read_tokens = Some(0);
+    app.streaming.streaming_cache_creation_tokens = None;
+    app.kv_cache.current_api_usage_recorded = false;
+    app.record_completed_stream_cache_usage();
+
+    // Three more steps in the SAME turn, each with a documented per-step prune.
+    // Input sizes are deliberately non-monotonic (50K -> 90K -> 30K -> 30K) so
+    // the largest miss lands on a *middle* step (the 90K baseline is resent on
+    // the following 30K step). The aggregated line must report that peak (90K),
+    // not the last step's figure (30K).
+    for (step, input) in [90_000u64, 30_000, 30_000].into_iter().enumerate() {
+        app.handle_server_event(
+            crate::protocol::ServerEvent::KvCacheRequest {
+                system_static_hash: 1,
+                tools_hash: 2,
+                messages_hash: 4 + step as u64,
+                message_hashes: vec![11, 99 + step as u64],
+                message_count: 2,
+                tool_count: 33,
+                system_static_chars: 11155,
+                tools_json_chars: 35228,
+                messages_json_chars: 198612,
+                ephemeral_hash: None,
+                ephemeral_chars: 0,
+                ephemeral_message_count: 0,
+                documented_invalidation: Some(documented()),
+            },
+            &mut remote,
+        );
+        app.streaming.streaming_input_tokens = input;
+        app.streaming.streaming_cache_read_tokens = Some(0);
+        app.streaming.streaming_cache_creation_tokens = None;
+        app.kv_cache.current_api_usage_recorded = false;
+        app.record_completed_stream_cache_usage();
+    }
+
+    let notices: Vec<&DisplayMessage> = app
+        .display_messages()
+        .iter()
+        .filter(|message| message.role == "system" && message.content.contains("KV cache refresh"))
+        .collect();
+    assert_eq!(
+        notices.len(),
+        1,
+        "separate steps of one turn must collapse to a single refresh notice, got {notices:#?}"
+    );
+    assert!(
+        notices[0].content.contains("turn 1"),
+        "{:?}",
+        notices[0].content
+    );
+    // The per-step detail is preserved as a count, not dropped: three notices in
+    // the turn (the first print plus two folds) render as `[×3]`.
+    assert!(
+        notices[0].content.contains("[×3]"),
+        "aggregated notice must carry the repeat count: {:?}",
+        notices[0].content
+    );
+    // The aggregated line must report the peak step, not the last one.
+    assert!(
+        notices[0].content.contains("90K"),
+        "aggregated notice must report the largest resend: {:?}",
+        notices[0].content
+    );
+    assert!(
+        !notices[0].content.contains("30K"),
+        "aggregated notice must not report only the last (smaller) step: {:?}",
+        notices[0].content
+    );
+
+    crate::cache_invalidation::clear_for_tests();
+}
+
+#[test]
+fn interleaved_rewrite_causes_in_one_turn_each_keep_one_line() {
+    // Causes can interleave within one turn (e.g. a per-step prune, then a
+    // tool-output repair, then another per-step prune). Each distinct cause must
+    // keep its own single aggregated line, so a later occurrence folds into the
+    // line for *its* cause instead of either repeating or overwriting the other
+    // cause's line. This drives the aggregation directly with distinct sources,
+    // which the server path collapses into one generic label before it reaches
+    // here.
+    let _invalidation_guard = crate::storage::lock_test_env();
+    let mut app = create_test_app();
+    app.display_messages
+        .push(DisplayMessage::user("live prompt"));
+
+    // prune (turn 1), repair (turn 1), prune again (turn 1)
+    app.emit_kv_cache_notice(
+        1,
+        "per-step prune",
+        50_000,
+        "an earlier message was modified",
+        false,
+        true,
+    );
+    app.emit_kv_cache_notice(
+        1,
+        "tool-output repair",
+        50_000,
+        "an earlier message was modified",
+        false,
+        true,
+    );
+    app.emit_kv_cache_notice(
+        1,
+        "per-step prune",
+        80_000,
+        "an earlier message was modified",
+        false,
+        true,
+    );
+
+    let notices: Vec<&DisplayMessage> = app
+        .display_messages()
+        .iter()
+        .filter(|message| message.role == "system" && message.content.contains("KV cache refresh"))
+        .collect();
+    assert_eq!(
+        notices.len(),
+        2,
+        "two distinct causes must yield two lines, got {notices:#?}"
+    );
+    let prune = notices
+        .iter()
+        .find(|message| message.content.contains("per-step prune"))
+        .expect("per-step prune line present");
+    assert!(
+        prune.content.contains("[×2]"),
+        "the repeated prune cause must fold into one line with a count: {prune:?}"
+    );
+    assert!(
+        prune.content.contains("80K"),
+        "the folded line must report the peak resend: {prune:?}"
+    );
+    assert!(
+        notices
+            .iter()
+            .any(|message| message.content.contains("tool-output repair")),
+        "the interleaved repair cause must keep its own line: {notices:#?}"
+    );
+
+    // A new turn drops the prior turn's aggregates and prints fresh lines.
+    app.display_messages
+        .push(DisplayMessage::user("second prompt"));
+    app.emit_kv_cache_notice(
+        2,
+        "per-step prune",
+        10_000,
+        "an earlier message was modified",
+        false,
+        true,
+    );
+    let turn_two: Vec<&DisplayMessage> = app
+        .display_messages()
+        .iter()
+        .filter(|message| {
+            message.role == "system"
+                && message.content.contains("KV cache refresh")
+                && message.content.contains("turn 2")
+        })
+        .collect();
+    assert_eq!(
+        turn_two.len(),
+        1,
+        "a new turn must start a fresh aggregate: {turn_two:#?}"
+    );
+    assert!(
+        !turn_two[0].content.contains("[×"),
+        "a fresh turn line must not carry a prior turn's count: {turn_two:?}"
+    );
+}
+
+#[test]
+fn a_new_turn_drops_stale_notice_aggregates() {
+    // `emit_kv_cache_notice` retains only the current turn's aggregates at entry.
+    // Without that retain, the tracking Vec would grow by one entry per notice
+    // for the whole session (the `matches` turn check prevents cross-turn folding
+    // but does not bound the Vec), and a stale index could linger pointing at a
+    // long-gone message. Assert the prior turn's aggregate is actually dropped.
+    let _invalidation_guard = crate::storage::lock_test_env();
+    let mut app = create_test_app();
+    app.display_messages
+        .push(DisplayMessage::user("live prompt"));
+
+    app.emit_kv_cache_notice(
+        1,
+        "per-step prune",
+        50_000,
+        "an earlier message was modified",
+        false,
+        true,
+    );
+    assert_eq!(
+        app.kv_cache.kv_cache_notices.len(),
+        1,
+        "the first turn's notice must be tracked"
+    );
+
+    // A notice for a later turn must evict the previous turn's aggregate.
+    app.display_messages
+        .push(DisplayMessage::user("second prompt"));
+    app.emit_kv_cache_notice(
+        2,
+        "per-step prune",
+        50_000,
+        "an earlier message was modified",
+        false,
+        true,
+    );
+    assert_eq!(
+        app.kv_cache.kv_cache_notices.len(),
+        1,
+        "a new turn must evict the prior turn's aggregates, not accumulate them"
+    );
+    assert_eq!(
+        app.kv_cache.kv_cache_notices[0].turn_number, 2,
+        "only the current turn's aggregate must remain"
+    );
+}
+
+#[test]
+fn notice_fold_does_not_overwrite_a_replaced_message() {
+    // The fold guards on the tracked index still holding the exact text we last
+    // wrote. If a rewind/replace swaps that line for unrelated content, the next
+    // same-cause notice must print a fresh line rather than overwrite it (and
+    // overwriting would be data loss: the replaced message is not ours).
+    let _invalidation_guard = crate::storage::lock_test_env();
+    let mut app = create_test_app();
+    app.display_messages
+        .push(DisplayMessage::user("live prompt"));
+
+    app.emit_kv_cache_notice(
+        1,
+        "per-step prune",
+        50_000,
+        "an earlier message was modified",
+        false,
+        true,
+    );
+    let notice_index = app
+        .display_messages
+        .iter()
+        .rposition(|message| {
+            message.role == "system" && message.content.contains("KV cache refresh")
+        })
+        .expect("first notice line present");
+    assert!(!app.display_messages[notice_index].content.contains("[×"));
+
+    // Simulate a rewind/rollback replacing the tracked line with unrelated text.
+    app.display_messages[notice_index].content = "unrelated restored message".to_string();
+
+    // Same cause again: the stale tracking must not overwrite the unrelated line.
+    app.emit_kv_cache_notice(
+        1,
+        "per-step prune",
+        70_000,
+        "an earlier message was modified",
+        false,
+        true,
+    );
+
+    assert_eq!(
+        app.display_messages[notice_index].content, "unrelated restored message",
+        "a replaced message must never be overwritten by a notice fold"
+    );
+    let notices: Vec<&DisplayMessage> = app
+        .display_messages()
+        .iter()
+        .filter(|message| message.role == "system" && message.content.contains("KV cache refresh"))
+        .collect();
+    assert_eq!(
+        notices.len(),
+        1,
+        "a fresh notice must be printed when the tracked line drifted: {notices:#?}"
+    );
+    assert!(
+        notices[0].content.contains("70K"),
+        "the fresh line must carry the current step's figure: {notices:?}"
+    );
+}
+
+#[test]
+fn clearing_the_transcript_drops_notice_aggregates() {
+    // Notice aggregates store display-message indices. Discarding the transcript
+    // (via the shared `clear_display_messages` seam used by /clear, /cls, Ctrl+R
+    // recovery, and session switches) must drop them, so a later notice can never
+    // fold into an index that now points at a different message.
+    let _invalidation_guard = crate::storage::lock_test_env();
+    let mut app = create_test_app();
+    app.display_messages
+        .push(DisplayMessage::user("live prompt"));
+
+    app.emit_kv_cache_notice(
+        1,
+        "per-step prune",
+        50_000,
+        "an earlier message was modified",
+        false,
+        true,
+    );
+    assert!(
+        !app.kv_cache.kv_cache_notices.is_empty(),
+        "an emitted notice must be tracked for folding"
+    );
+
+    app.clear_display_messages();
+    assert!(
+        app.kv_cache.kv_cache_notices.is_empty(),
+        "discarding the transcript must drop the notice aggregates"
+    );
+
+    // A notice after the clear starts a fresh aggregate (no stale count).
+    app.emit_kv_cache_notice(
+        1,
+        "per-step prune",
+        90_000,
+        "an earlier message was modified",
+        false,
+        true,
+    );
+    let notices: Vec<&DisplayMessage> = app
+        .display_messages()
+        .iter()
+        .filter(|message| message.role == "system" && message.content.contains("KV cache refresh"))
+        .collect();
+    assert_eq!(notices.len(), 1, "{notices:#?}");
+    assert!(
+        !notices[0].content.contains("[×"),
+        "a fresh aggregate must not inherit a prior count: {notices:?}"
+    );
+    assert!(
+        notices[0].content.contains("90K"),
+        "the fresh line must carry the current figure: {notices:?}"
+    );
+}
+
+#[test]
+fn replacing_the_transcript_drops_notice_aggregates() {
+    // The other transcript-replacement seam is `replace_display_messages`, used
+    // by remote rewind/re-apply and startup history restore. Like
+    // `clear_display_messages`, it swaps the whole `display_messages` vector, so
+    // the index-based notice aggregates must be dropped with it. Without this,
+    // an aggregate could survive with an index that now points at a different
+    // (restored) message.
+    let _invalidation_guard = crate::storage::lock_test_env();
+    let mut app = create_test_app();
+    app.display_messages
+        .push(DisplayMessage::user("live prompt"));
+
+    app.emit_kv_cache_notice(
+        1,
+        "per-step prune",
+        50_000,
+        "an earlier message was modified",
+        false,
+        true,
+    );
+    assert!(
+        !app.kv_cache.kv_cache_notices.is_empty(),
+        "an emitted notice must be tracked for folding"
+    );
+
+    // Replace the transcript wholesale, as a rewind/re-apply does.
+    app.replace_display_messages(vec![
+        DisplayMessage::user("live prompt"),
+        DisplayMessage::system("restored history"),
+    ]);
+    assert!(
+        app.kv_cache.kv_cache_notices.is_empty(),
+        "replacing the transcript must drop the notice aggregates"
+    );
+
+    // A notice after the replacement starts a fresh aggregate (no stale count).
+    app.emit_kv_cache_notice(
+        1,
+        "per-step prune",
+        90_000,
+        "an earlier message was modified",
+        false,
+        true,
+    );
+    let notices: Vec<&DisplayMessage> = app
+        .display_messages()
+        .iter()
+        .filter(|message| message.role == "system" && message.content.contains("KV cache refresh"))
+        .collect();
+    assert_eq!(notices.len(), 1, "{notices:#?}");
+    assert!(
+        !notices[0].content.contains("[×"),
+        "a fresh aggregate must not inherit a prior count: {notices:?}"
+    );
+    assert!(
+        notices[0].content.contains("90K"),
+        "the fresh line must carry the current figure: {notices:?}"
+    );
+}
+
+#[test]
+fn loading_compacted_history_drops_notice_aggregates() {
+    // The third transcript-rebuilding seam is `apply_compacted_history_window`
+    // (remote compacted-history load, and local scroll-back past the window).
+    // Loading older history prepends messages, shifting every existing index, so
+    // the index-based aggregates must be dropped rather than left to fold into a
+    // message that has moved.
+    let _invalidation_guard = crate::storage::lock_test_env();
+    let mut app = create_test_app();
+    app.display_messages
+        .push(DisplayMessage::user("live prompt"));
+
+    app.emit_kv_cache_notice(
+        1,
+        "per-step prune",
+        50_000,
+        "an earlier message was modified",
+        false,
+        true,
+    );
+    assert!(
+        !app.kv_cache.kv_cache_notices.is_empty(),
+        "an emitted notice must be tracked for folding"
+    );
+
+    // Prepend older history, exactly as a compacted-history load does.
+    app.apply_compacted_history_window(
+        vec![
+            DisplayMessage::system("Earlier conversation compacted"),
+            DisplayMessage::user("older prompt"),
+            DisplayMessage::assistant("older answer"),
+        ],
+        vec![],
+        3,
+        3,
+        0,
+        0,
+    );
+    assert!(
+        app.kv_cache.kv_cache_notices.is_empty(),
+        "loading older history must drop the notice aggregates"
+    );
 }
 
 #[test]

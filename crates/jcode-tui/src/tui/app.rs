@@ -810,6 +810,40 @@ struct KvCacheState {
     /// for the same cold period. A newly completed call refreshes the
     /// baseline's `completed_at`, which re-arms the warning automatically.
     cold_cache_warned_baseline_completed_at: Option<Instant>,
+    /// In-chat KV-cache notices for the current turn, one per distinct cause.
+    ///
+    /// A single user turn runs many provider steps (the tool-call loop), and the
+    /// scheduled per-step prune can rewrite the consumed prefix on each step. The
+    /// notice is keyed by *turn*, so all steps of one turn share the same number:
+    /// without this guard the same turn would print a refresh line once per step.
+    /// Each distinct cause (source/detail/refresh-vs-alarm/telemetry state) keeps
+    /// exactly one line for the turn, updated in place with an `[×N]` count, so
+    /// interleaved causes (a per-step prune, then a tool-output repair, then a
+    /// prune again) each fold into their own line instead of repeating.
+    kv_cache_notices: Vec<KvCacheNoticeAggregate>,
+}
+
+/// Aggregated in-chat KV-cache notice for one cause within one turn.
+///
+/// Holds the index of the single display message so a later step in the same turn
+/// can update it in place (bumping the `[×N]` count and reporting the worst token
+/// figure) instead of appending another line.
+#[derive(Clone, Debug)]
+struct KvCacheNoticeAggregate {
+    turn_number: usize,
+    source: &'static str,
+    message_index: usize,
+    count: u32,
+    /// Largest missed-token figure seen this turn for this cause, so the single
+    /// aggregated line reports the peak resend rather than whichever step ran last.
+    max_missed_tokens: u64,
+    /// Exact text currently stored at `message_index`. The next fold only updates
+    /// the line when it still matches this verbatim, so a rewind/replace can never
+    /// have us overwrite an unrelated message.
+    rendered: String,
+    detail: &'static str,
+    telemetry_absent: bool,
+    is_refresh: bool,
 }
 
 /// Where a cold-cache warning is being surfaced from, so the copy can say
@@ -2484,6 +2518,47 @@ impl App {
             _ => return,
         };
 
+        // Documented invalidation between the baseline and now: expected resend,
+        // attribute instead of alarm. Otherwise raise the harness alarm. The
+        // source is the primary classification key, so distinct causes in one turn
+        // (a per-step prune, then a config reload) stay separate lines rather than
+        // being folded together.
+        let documented = crate::cache_invalidation::most_recent_since(baseline_completed_at);
+        let source: &'static str = documented
+            .as_ref()
+            .map(|cause| cause.source)
+            .unwrap_or_else(|| reason.label());
+        // A provider that reports no cache telemetry at all (neither a read nor a
+        // creation count) gives no read figure, so `missed_tokens` is the whole
+        // prompt: an upper bound, not a measured resend. Say so instead of
+        // asserting a resend we cannot observe (issue seen on gateways that return
+        // only prompt/completion/total). Providers that do report a read keep the
+        // precise "tokens resent" wording.
+        let telemetry_absent = self.streaming.streaming_cache_read_tokens.is_none()
+            && self.streaming.streaming_cache_creation_tokens.is_none();
+        self.emit_kv_cache_notice(
+            turn_number,
+            source,
+            missed_tokens,
+            detail,
+            telemetry_absent,
+            documented.is_some(),
+        );
+    }
+
+    /// Render one notice line for the given cause and peak missed-token figure.
+    ///
+    /// `telemetry_absent` selects the honest "provider reports no cache
+    /// telemetry" phrasing (an upper bound, not a measured resend) over the
+    /// precise "tokens resent" wording.
+    fn format_kv_cache_notice(
+        is_refresh: bool,
+        source: &str,
+        turn_number: usize,
+        missed_tokens: u64,
+        detail: &str,
+        telemetry_absent: bool,
+    ) -> String {
         let token_label = if missed_tokens >= 1_000_000 {
             format!("{:.1}M", missed_tokens as f64 / 1_000_000.0)
         } else if missed_tokens >= 1_000 {
@@ -2491,24 +2566,133 @@ impl App {
         } else {
             missed_tokens.to_string()
         };
+        let tokens_phrase = if telemetry_absent {
+            format!(
+                "~{} prompt tokens (provider reports no cache telemetry)",
+                token_label
+            )
+        } else {
+            format!("~{} tokens resent", token_label)
+        };
+        if is_refresh {
+            format!(
+                "ℹ️ KV cache refresh [{}] turn {}: {} ({}).",
+                source, turn_number, tokens_phrase, detail,
+            )
+        } else {
+            format!(
+                "⚠️ KV cache miss [{}] turn {}: {} ({}). See KV_CACHE_USAGE in logs.",
+                source, turn_number, tokens_phrase, detail,
+            )
+        }
+    }
 
-        // Documented invalidation between the baseline and now: expected
-        // resend, attribute instead of alarm.
-        if let Some(cause) = crate::cache_invalidation::most_recent_since(baseline_completed_at) {
-            self.push_display_message(DisplayMessage::system(format!(
-                "ℹ️ KV cache refresh [{}] turn {}: ~{} tokens resent ({}).",
-                cause.source, turn_number, token_label, detail,
-            )));
-            return;
+    /// Push or fold a KV-cache notice for the current turn.
+    ///
+    /// The first notice for a given cause prints a line; a later step in the *same*
+    /// turn with the same cause updates that line in place, bumping a trailing
+    /// `[×N]` count, so a multi-step turn shows one line carrying the number of
+    /// rewrites instead of repeating the message. The largest token figure seen
+    /// this turn for the cause is kept, so the line reports the peak resend rather
+    /// than whichever step ran last. A different cause (a distinct source, detail,
+    /// refresh-vs-alarm state, or telemetry state) keeps its own line, so a
+    /// per-step prune interleaved with a tool-output repair stays visible as two
+    /// lines rather than one overwriting the other. A new turn drops the prior
+    /// turn's aggregation.
+    fn emit_kv_cache_notice(
+        &mut self,
+        turn_number: usize,
+        source: &'static str,
+        missed_tokens: u64,
+        detail: &'static str,
+        telemetry_absent: bool,
+        is_refresh: bool,
+    ) {
+        // A new turn invalidates every per-turn aggregate: the tracked message
+        // indices describe lines that must not be folded across turns.
+        self.kv_cache
+            .kv_cache_notices
+            .retain(|agg| agg.turn_number == turn_number);
+        let matches = |agg: &KvCacheNoticeAggregate| {
+            agg.turn_number == turn_number
+                && agg.source == source
+                && agg.detail == detail
+                && agg.telemetry_absent == telemetry_absent
+                && agg.is_refresh == is_refresh
+        };
+        // Fold into the tracked line only while its index still holds the exact
+        // text we last wrote. A rewind/rollback can remove or replace messages;
+        // on drift we drop the stale entry and print fresh rather than overwrite
+        // an unrelated message.
+        if let Some(pos) = self.kv_cache.kv_cache_notices.iter().position(matches) {
+            let agg = self.kv_cache.kv_cache_notices[pos].clone();
+            if self
+                .display_messages
+                .get(agg.message_index)
+                .is_some_and(|message| message.role == "system" && message.content == agg.rendered)
+            {
+                // Report the peak (worst) resend seen this turn, not the last
+                // step's, so the single aggregated line never understates the turn.
+                let peak = agg.max_missed_tokens.max(missed_tokens);
+                let count = agg.count.saturating_add(1);
+                let rendered = format!(
+                    "{} [×{count}]",
+                    Self::format_kv_cache_notice(
+                        is_refresh,
+                        source,
+                        turn_number,
+                        peak,
+                        detail,
+                        telemetry_absent,
+                    )
+                );
+                self.display_messages[agg.message_index].content = rendered.clone();
+                self.kv_cache.kv_cache_notices[pos] = KvCacheNoticeAggregate {
+                    count,
+                    max_missed_tokens: peak,
+                    rendered,
+                    ..agg
+                };
+                // Only a system message's content changed, which affects neither
+                // the user-message nor the edit-tool counter, so skip the O(M)
+                // transcript rescan and use the incremental bump (same rationale
+                // as the append fast path in `push_display_message`).
+                self.bump_display_messages_version_no_stats();
+                return;
+            }
+            self.kv_cache.kv_cache_notices.remove(pos);
         }
 
-        self.push_display_message(DisplayMessage::system(format!(
-            "⚠️ KV cache miss [{}] turn {}: ~{} tokens resent ({}). See KV_CACHE_USAGE in logs.",
-            reason.label(),
+        let content = Self::format_kv_cache_notice(
+            is_refresh,
+            source,
             turn_number,
-            token_label,
+            missed_tokens,
             detail,
-        )));
+            telemetry_absent,
+        );
+        self.push_display_message(DisplayMessage::system(content.clone()));
+        // `push_display_message` can coalesce or drop the message; only track an
+        // index when the notice is actually the message we just appended.
+        let Some(message_index) = self
+            .display_messages
+            .len()
+            .checked_sub(1)
+            .filter(|&i| self.display_messages[i].content == content)
+        else {
+            return;
+        };
+        self.kv_cache.kv_cache_notices.push(KvCacheNoticeAggregate {
+            turn_number,
+            source,
+            message_index,
+            count: 1,
+            max_missed_tokens: missed_tokens,
+            rendered: content,
+            detail,
+            telemetry_absent,
+            is_refresh,
+        });
     }
 
     fn classify_kv_cache_miss_reason(

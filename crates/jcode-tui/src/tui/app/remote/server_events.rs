@@ -1825,6 +1825,7 @@ pub(in crate::tui::app) fn handle_server_event(
                 app.kv_cache.kv_cache_turn_number = None;
                 app.kv_cache.kv_cache_turn_call_index = 0;
                 app.kv_cache.kv_cache_miss_samples.clear();
+                app.kv_cache.kv_cache_notices.clear();
                 if !preserve_startup_send {
                     app.processing_started = None;
                     app.clear_visible_turn_started();

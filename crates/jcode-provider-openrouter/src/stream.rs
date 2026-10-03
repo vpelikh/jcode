@@ -430,6 +430,8 @@ impl OpenRouterStream {
                 // - "cached_tokens" (OpenRouter's unified field)
                 // - "prompt_tokens_details.cached_tokens" (OpenAI-style)
                 // - "cache_read_input_tokens" (Anthropic-style, passed through)
+                // - "prompt_cache_hit_tokens" (DeepSeek's native field; also surfaced
+                //   verbatim by OpenAI-compatible DeepSeek endpoints)
                 let cache_read_input_tokens = usage
                     .get("cached_tokens")
                     .and_then(|t| t.as_u64())
@@ -442,6 +444,11 @@ impl OpenRouterStream {
                     .or_else(|| {
                         usage
                             .get("cache_read_input_tokens")
+                            .and_then(|t| t.as_u64())
+                    })
+                    .or_else(|| {
+                        usage
+                            .get("prompt_cache_hit_tokens")
                             .and_then(|t| t.as_u64())
                     });
 
@@ -929,5 +936,43 @@ mod tests {
         let second_turn_id = parse_id();
 
         assert_ne!(first_turn_id, second_turn_id);
+    }
+
+    #[test]
+    fn usage_reads_deepseek_prompt_cache_hit_tokens() {
+        // DeepSeek reports cached input as `prompt_cache_hit_tokens` (not the
+        // OpenAI `prompt_tokens_details.cached_tokens`). Missing this field made
+        // every DeepSeek request look like a zero cache read, which disabled the
+        // warm-prefix prune gate and let the per-step prune rewrite the prefix on
+        // every step.
+        let mut stream = test_stream();
+        let chunk = serde_json::json!({
+            "choices": [{"delta": {}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 20000,
+                "completion_tokens": 42,
+                "prompt_cache_hit_tokens": 19456,
+                "prompt_cache_miss_tokens": 544
+            }
+        });
+        stream.buffer = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+
+        let mut usage = None;
+        while let Some(event) = stream.parse_next_event() {
+            if let StreamEvent::TokenUsage {
+                input_tokens,
+                cache_read_input_tokens,
+                ..
+            } = event
+            {
+                usage = Some((input_tokens, cache_read_input_tokens));
+            }
+        }
+
+        assert_eq!(
+            usage,
+            Some((Some(20_000), Some(19_456))),
+            "DeepSeek prompt_cache_hit_tokens must populate cache_read_input_tokens"
+        );
     }
 }
