@@ -897,19 +897,28 @@ impl Registry {
         // both paths call the same helper to stay in lockstep. Desktop
         // self-development is selected by the working directory being a Jcode
         // Desktop checkout; CLI self-development by the session's canary flag.
-        // Only the four self-dev names reach this branch, so the session load is
-        // off the hot path.
+        //
+        // Only the four self-dev names reach this branch, and the probe does
+        // blocking FS work (`desktop_repo_root` canonicalizes/reads Cargo.toml;
+        // `Session::load` reads the snapshot and replays the journal), so it
+        // runs on the blocking pool rather than stalling a runtime worker.
         if matches!(
             resolved_name,
             "selfdev" | "debug_socket" | "desktop_selfdev" | "jcode_docs"
         ) {
-            let desktop = ctx
-                .working_dir
-                .as_deref()
-                .is_some_and(|dir| jcode_selfdev_types::desktop_repo_root(dir).is_some());
-            let is_canary = crate::session::Session::load(&ctx.session_id)
-                .map(|session| session.is_canary)
-                .unwrap_or(false);
+            let working_dir = ctx.working_dir.clone();
+            let session_id = ctx.session_id.clone();
+            let (desktop, is_canary) = tokio::task::spawn_blocking(move || {
+                let desktop = working_dir
+                    .as_deref()
+                    .is_some_and(|dir| jcode_selfdev_types::desktop_repo_root(dir).is_some());
+                let is_canary = crate::session::Session::load(&session_id)
+                    .map(|session| session.is_canary)
+                    .unwrap_or(false);
+                (desktop, is_canary)
+            })
+            .await
+            .unwrap_or((false, false));
             if let Some(error) = product_separation_error(resolved_name, is_canary, desktop) {
                 return Err(error);
             }
