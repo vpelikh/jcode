@@ -338,9 +338,11 @@ pub fn open_weight_family_context_limit(model: &str) -> Option<usize> {
     // explicit selection with real evidence still resolves.
     // Compare on the id tail so a provider-namespaced spelling
     // (`together/nemotron-3-ultra-together`) is caught too; other families in
-    // this classifier already match namespaced ids by substring.
+    // this classifier already match namespaced ids by substring. Use a prefix
+    // match so a decorated variant (`...-together:free`) is also carved out;
+    // nothing legitimate starts with this unadvertised id.
     let bare = m.rsplit('/').next().unwrap_or(m);
-    if bare == "nemotron-3-ultra-together" {
+    if bare.starts_with("nemotron-3-ultra-together") {
         return None;
     }
 
@@ -633,6 +635,10 @@ mod tests {
         assert_eq!(open_weight_family_context_limit("nemotron-3-ultra-together"), None);
         assert_eq!(
             open_weight_family_context_limit("together/nemotron-3-ultra-together"),
+            None
+        );
+        assert_eq!(
+            open_weight_family_context_limit("nemotron-3-ultra-together:free"),
             None
         );
         // The verified DeepInfra route keeps the family window.
