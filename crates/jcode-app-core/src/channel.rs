@@ -3121,20 +3121,30 @@ mod tests {
         let keyboard = picker["reply_markup"]["inline_keyboard"]
             .as_array()
             .expect("inline_keyboard array");
+        // Locate the seeded session's button rather than assuming it is the
+        // only row. A concurrently running test that writes into this test's
+        // shared JCODE_HOME (create_test_app does not always take the env lock)
+        // can add sessions to the same index, so an exact one-row assertion is
+        // racy. The regression under test is the fallback label for a titleless
+        // session, which is checked on the seeded button below.
+        let rows: Vec<&Vec<serde_json::Value>> =
+            keyboard.iter().filter_map(|row| row.as_array()).collect();
+        let (fox_row, fox_button) = rows
+            .iter()
+            .find_map(|row| {
+                row.iter()
+                    .find(|button| button["callback_data"] == "session_fox_1_aabbccddeeff0011")
+                    .map(|button| (*row, button))
+            })
+            .expect("the seeded session must render a menu button");
+        assert_eq!(fox_row.len(), 1, "one button per row: {fox_row:?}");
         assert_eq!(
-            keyboard.len(),
-            1,
-            "one seeded session -> one menu button row: {keyboard:?}"
-        );
-        let row = keyboard[0].as_array().expect("button row");
-        assert_eq!(row.len(), 1, "one button per row");
-        assert_eq!(
-            row[0]["text"], "fox",
+            fox_button["text"], "fox",
             "with no title the fallback name equals the short id, so the menu \
              button must render a single 'fox' (not a redundant 'fox (fox)')"
         );
         assert_eq!(
-            row[0]["callback_data"], "session_fox_1_aabbccddeeff0011",
+            fox_button["callback_data"], "session_fox_1_aabbccddeeff0011",
             "button data must carry the selectable session id"
         );
 
