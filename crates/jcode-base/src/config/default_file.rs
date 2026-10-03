@@ -703,6 +703,12 @@ route_fallback_enabled = false
 # keep route fallback disabled even if route_fallback_enabled is true.
 # fallback_model = ""
 
+[loop_guard]
+# Model-free in-turn guardrails. No LLM call, no added latency.
+# How many *consecutive identical* tool calls trip the repeat-tool reminder
+# telling the model to change approach or finish. (default: 4, 0 disables)
+repeat_tool_threshold = 4
+
 [safety]
 # Notification settings for ambient mode events
 

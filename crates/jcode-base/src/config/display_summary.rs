@@ -76,6 +76,7 @@ impl Config {
 - Persist memory injections: {}
 - KV cache miss notices: {}
 - Update channel: {}
+- Repeat-tool threshold: {} (0 disables)
 
 **Tools:**
 - Profile: {}
@@ -234,6 +235,7 @@ impl Config {
             self.features.persist_memory_injections,
             self.features.kv_cache_miss_notices,
             self.features.update_channel,
+            self.loop_guard.repeat_tool_threshold,
             if self.tools.profile.trim().is_empty() {
                 "full"
             } else {

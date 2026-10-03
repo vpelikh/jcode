@@ -901,6 +901,10 @@ mod env_overrides;
 mod tests;
 
 #[cfg(test)]
+#[path = "config_loop_guard_tests.rs"]
+mod loop_guard_tests;
+
+#[cfg(test)]
 #[path = "config_color_tests.rs"]
 mod color_tests;
 
