@@ -26,8 +26,8 @@ pub fn color_capability() -> ColorCapability {
 }
 
 /// Pin the process-global color capability to truecolor for the rest of the
-/// process. Test-only; production never calls this.
-#[cfg(any(test, feature = "test-support"))]
+/// process. Tests that assert on rendered RGB values call this so the frame
+/// does not depend on the host terminal; production never calls it.
 pub fn pin_truecolor_for_tests() {
     CAPABILITY_OVERRIDE.store(1, std::sync::atomic::Ordering::Relaxed);
 }
