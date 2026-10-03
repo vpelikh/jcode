@@ -864,10 +864,16 @@ impl Agent {
                         });
                     }
                     StreamEvent::SessionId(sid) => {
+                        // This is the *provider's* session id (Gemini/Claude
+                        // CLI/Grok resume handle). It must never be forwarded
+                        // as `ServerEvent::SessionId`: the client treats that
+                        // event as the jcode session id and rebinds
+                        // `remote_session_id` to it, so the next reload or
+                        // reconnect resumes a session that does not exist and
+                        // the user lands in an empty new session while the
+                        // real transcript sits untouched on disk.
                         self.provider_session_id = Some(sid.clone().to_string());
                         self.session.provider_session_id = Some(sid.clone().to_string());
-                        let _ =
-                            event_tx.send(ServerEvent::SessionId { session_id: sid.to_string() });
                     }
                     StreamEvent::OpenAIReasoning {
                         id,
