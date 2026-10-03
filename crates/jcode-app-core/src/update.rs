@@ -173,6 +173,250 @@ pub fn run_git_pull_ff_only(repo_dir: &Path, quiet: bool) -> Result<()> {
     }
 }
 
+/// Run a git command in `repo_dir`, returning trimmed stdout on success.
+fn git_stdout(repo_dir: &Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(repo_dir)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// The configured upstream of the current branch (`@{u}`), e.g.
+/// `origin/master`, or `None` when the branch has no tracking branch.
+pub fn configured_upstream(repo_dir: &Path) -> Option<String> {
+    git_stdout(
+        repo_dir,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )
+    .filter(|name| !name.is_empty())
+}
+
+/// The remote that the current branch tracks, or `None` when it has no
+/// upstream or tracks a *local* branch instead of a remote.
+///
+/// `git config branch.<name>.remote` is the authoritative discriminator: it is
+/// `.` for a local-branch upstream. Reading it directly avoids ambiguity from
+/// splitting `@{u}` on `/`, since both remote names and branch names may
+/// contain slashes.
+fn configured_tracking_remote(repo_dir: &Path) -> Option<String> {
+    let branch = head_branch(repo_dir)?;
+    let remote = git_stdout(
+        repo_dir,
+        &["config", "--get", &format!("branch.{branch}.remote")],
+    )?;
+    let remote = remote.trim();
+    (!remote.is_empty() && remote != ".").then(|| remote.to_string())
+}
+
+/// The current branch name, or `None` when HEAD is detached.
+fn head_branch(repo_dir: &Path) -> Option<String> {
+    git_stdout(repo_dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]).filter(|b| !b.is_empty())
+}
+
+/// The default branch of `remote`, as recorded in `refs/remotes/<remote>/HEAD`.
+///
+/// `git fetch`/`clone` normally create that symbolic ref, but it may be absent
+/// (older git, or a manually configured remote), so fall back to the remote's
+/// conventional default branch names. The fallback only inspects already
+/// fetched local refs, so it never touches the network.
+fn remote_head_ref(repo_dir: &Path, remote: &str) -> Option<String> {
+    let symbolic = format!("refs/remotes/{remote}/HEAD");
+    if let Some(name) = git_stdout(repo_dir, &["symbolic-ref", "--quiet", "--short", &symbolic])
+        && !name.is_empty()
+        && git_stdout(
+            repo_dir,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{name}^{{commit}}"),
+            ],
+        )
+        .is_some()
+    {
+        // The symbolic ref can be stale (it may point at a deleted branch), so
+        // only trust it when it still resolves to a commit.
+        return Some(name);
+    }
+    for candidate in ["main", "master"] {
+        let reference = format!("{remote}/{candidate}");
+        if git_stdout(
+            repo_dir,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/remotes/{reference}"),
+            ],
+        )
+        .is_some()
+        {
+            return Some(reference);
+        }
+    }
+    None
+}
+
+/// Resolve the remote-tracking ref to compare the checkout against, without
+/// requiring the current branch to have a configured upstream.
+///
+/// Preference order:
+/// 1. The branch's own upstream (`@{u}`), which may track a remote branch or a
+///    local branch.
+/// 2. A same-named remote-tracking branch (`<remote>/<branch>`), which is the
+///    branch's actual counterpart when it exists.
+/// 3. Each remote's default branch (`<remote>/HEAD`, resolved from local refs).
+///
+/// Worktree checkouts frequently have no per-branch tracking branch even though
+/// they share the repository's remote-tracking refs; without this resolution
+/// every launch from such a checkout logged a spurious "unable to compare the
+/// source checkout with its upstream" error.
+///
+/// Returns `(remote, ref)`, e.g. `("origin", "origin/master")`. `remote` is
+/// empty when the upstream is a local branch (there is no remote to pull from),
+/// and the ref is still a valid comparison target. Returns `None` only when
+/// nothing is available.
+pub fn source_update_baseline(repo_dir: &Path) -> Option<(String, String)> {
+    if let Some(name) = configured_upstream(repo_dir) {
+        let remote = configured_tracking_remote(repo_dir).unwrap_or_default();
+        return Some((remote, name));
+    }
+
+    let branch = head_branch(repo_dir);
+    let remotes = git_stdout(repo_dir, &["remote"])?;
+    let mut ordered: Vec<&str> = remotes
+        .lines()
+        .map(str::trim)
+        .filter(|remote| !remote.is_empty())
+        .collect();
+    // Prefer "origin" as the conventional default remote.
+    ordered.sort_by_key(|remote| u8::from(*remote != "origin"));
+
+    // Same-named counterpart of the current branch, when it exists.
+    if let Some(branch) = branch.as_deref() {
+        for remote in &ordered {
+            let reference = format!("{remote}/{branch}");
+            if git_stdout(
+                repo_dir,
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/remotes/{reference}"),
+                ],
+            )
+            .is_some()
+            {
+                return Some(((*remote).to_string(), reference));
+            }
+        }
+    }
+
+    for remote in ordered {
+        if let Some(reference) = remote_head_ref(repo_dir, remote) {
+            return Some((remote.to_string(), reference));
+        }
+    }
+    None
+}
+
+/// Fast-forward the current branch to `reference` (`<remote>/<branch>`),
+/// naming the remote and branch explicitly.
+///
+/// Unlike a bare `git pull`, this fast-forwards a branch that has no configured
+/// upstream, so worktree checkouts can update too.
+fn run_git_pull_ff_only_to(
+    repo_dir: &Path,
+    remote: &str,
+    reference: &str,
+    quiet: bool,
+) -> Result<()> {
+    // Strip the remote prefix exactly, rather than splitting on the first `/`:
+    // branch names can contain `/` (and so can remote names), so only the known
+    // remote prefix is removed.
+    let branch = reference
+        .strip_prefix(remote)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .unwrap_or(reference);
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("pull").arg("--ff-only");
+    if quiet {
+        cmd.arg("-q");
+    }
+    cmd.arg(remote).arg(branch);
+    let output = cmd
+        .current_dir(repo_dir)
+        .output()
+        .context("Failed to run git pull")?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("{}", summarize_git_pull_failure(&output.stderr));
+    }
+}
+
+/// The `(remote, ref)` to fast-forward `HEAD` onto for a source update, or
+/// `None` when only a comparison (not an update) is available.
+///
+/// A configured remote-tracking upstream is always a safe fast-forward target,
+/// even when its branch name differs from the local branch (for example a local
+/// `master` tracking `origin/main`). Otherwise the baseline must be the current
+/// branch's same-named counterpart (`<remote>/<branch>`); a mismatched baseline
+/// (for example the remote default branch on a feature checkout with no
+/// counterpart) is only useful for *reporting* that the checkout is behind,
+/// because fast-forwarding `HEAD` onto it would move the branch onto unrelated
+/// history.
+pub fn source_auto_update_target(repo_dir: &Path) -> Option<(String, String)> {
+    let (remote, reference) = source_update_baseline(repo_dir)?;
+    if remote.is_empty() {
+        return None;
+    }
+    if configured_upstream(repo_dir).as_deref() == Some(reference.as_str()) {
+        return Some((remote, reference));
+    }
+    let branch = head_branch(repo_dir)?;
+    (reference == format!("{remote}/{branch}")).then_some((remote, reference))
+}
+
+/// Whether a source auto-update can be attempted for the checkout.
+///
+/// True when there is an explicit fast-forward target (the branch's upstream or
+/// a same-named remote branch) or a configured upstream that git can resolve
+/// itself. This mirrors the cases in which [`run_git_pull_ff_only_resolved`]
+/// attempts a pull instead of refusing, so callers can gate on it without
+/// duplicating the logic.
+pub fn source_can_auto_update(repo_dir: &Path) -> bool {
+    source_auto_update_target(repo_dir).is_some() || configured_upstream(repo_dir).is_some()
+}
+
+/// Fast-forward the current branch to its resolved source baseline, handling a
+/// worktree checkout that has no configured upstream.
+///
+/// Prefers an explicit fast-forward of the resolved counterpart (the branch's
+/// upstream or a same-named remote branch), which also works without tracking
+/// setup. A local-branch upstream is left to git's own resolution; a checkout
+/// whose only baseline is unrelated is rejected so the caller reports it rather
+/// than moving `HEAD` onto unrelated history.
+pub fn run_git_pull_ff_only_resolved(repo_dir: &Path, quiet: bool) -> Result<()> {
+    if let Some((remote, reference)) = source_auto_update_target(repo_dir) {
+        return run_git_pull_ff_only_to(repo_dir, &remote, &reference, quiet);
+    }
+    // A local-branch upstream has no remote to name; git resolves it itself.
+    if configured_upstream(repo_dir).is_some() {
+        return run_git_pull_ff_only(repo_dir, quiet);
+    }
+    if source_update_baseline(repo_dir).is_some() {
+        anyhow::bail!("no matching upstream branch to fast-forward to");
+    }
+    run_git_pull_ff_only(repo_dir, quiet)
+}
+
 fn is_inside_git_repo(path: &std::path::Path) -> bool {
     let mut dir = if path.is_dir() {
         Some(path)
@@ -657,10 +901,9 @@ fn check_for_main_update_blocking() -> Result<Option<GitHubRelease>> {
             .assets
             .iter()
             .any(|a| a.name.starts_with(asset_name));
-        if has_asset
-            && release_is_update(&release)? {
-                return Ok(Some(release));
-            }
+        if has_asset && release_is_update(&release)? {
+            return Ok(Some(release));
+        }
     }
 
     Ok(None)
@@ -1776,5 +2019,156 @@ mod github_auth_tests {
     fn live_fetch_latest_release_uses_auth() {
         let release = fetch_latest_release_blocking().expect("release fetch should succeed");
         assert!(!release.tag_name.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod pull_resolution_tests {
+    use super::*;
+    use std::process::Command;
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .args([
+                "-c",
+                "user.name=Update Test",
+                "-c",
+                "user.email=update-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("run git fixture command");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn init_repo(path: &std::path::Path, branch: &str) {
+        std::fs::create_dir_all(path).unwrap();
+        git(path, &["init", "-q", "-b", branch]);
+        git(path, &["commit", "-q", "--allow-empty", "-m", "initial"]);
+    }
+
+    fn init_bare(path: &std::path::Path, branch: &str) {
+        std::fs::create_dir_all(path).unwrap();
+        git(path, &["init", "-q", "--bare", "-b", branch]);
+    }
+
+    /// The rebuild path must fast-forward a worktree checkout that is behind its
+    /// own remote counterpart and has no configured upstream, which a plain
+    /// `git pull` cannot do.
+    #[test]
+    fn resolved_pull_fast_forwards_counterpart_branch() {
+        let root = tempfile::tempdir().unwrap();
+        let remote = root.path().join("origin.git");
+        let work = root.path().join("work");
+        let other = root.path().join("other");
+
+        std::fs::create_dir_all(&remote).unwrap();
+        git(&remote, &["init", "-q", "--bare", "-b", "master"]);
+        std::fs::create_dir_all(&work).unwrap();
+        git(&work, &["init", "-q", "-b", "master"]);
+        git(&work, &["commit", "-q", "--allow-empty", "-m", "initial"]);
+        git(
+            &work,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&work, &["push", "-q", "-u", "origin", "master"]);
+        // A counterpart branch exists on the remote.
+        git(&work, &["checkout", "-q", "-b", "feature"]);
+        git(&work, &["push", "-q", "origin", "feature"]);
+        git(&work, &["checkout", "-q", "master"]);
+
+        git(
+            root.path(),
+            &[
+                "clone",
+                "-q",
+                remote.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        );
+        git(
+            &other,
+            &["checkout", "-q", "-b", "feature", "origin/feature"],
+        );
+        git(&other, &["commit", "-q", "--allow-empty", "-m", "advance"]);
+        git(&other, &["push", "-q", "origin", "feature"]);
+
+        git(&work, &["fetch", "-q", "origin"]);
+        git(&work, &["checkout", "-q", "feature"]);
+        assert_eq!(configured_upstream(&work), None);
+        assert_eq!(
+            source_update_baseline(&work),
+            Some(("origin".to_string(), "origin/feature".to_string()))
+        );
+
+        run_git_pull_ff_only_resolved(&work, true).expect("resolved fast-forward pull");
+        assert_eq!(
+            git(&work, &["rev-parse", "HEAD"]),
+            git(&work, &["rev-parse", "origin/feature"])
+        );
+    }
+
+    /// A branch name containing `/` (or a slashed remote name) must not have
+    /// its prefix truncated when the pull command is built.
+    #[test]
+    fn resolved_pull_handles_slashed_branch_name() {
+        let root = tempfile::tempdir().unwrap();
+        let remote = root.path().join("origin.git");
+        let work = root.path().join("work");
+        let other = root.path().join("other");
+        init_bare(&remote, "master");
+        init_repo(&work, "master");
+        git(
+            &work,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&work, &["push", "-q", "-u", "origin", "master"]);
+        git(&work, &["checkout", "-q", "-b", "feature/x"]);
+        git(&work, &["push", "-q", "origin", "feature/x"]);
+        git(&work, &["checkout", "-q", "master"]);
+
+        git(
+            root.path(),
+            &[
+                "clone",
+                "-q",
+                remote.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        );
+        git(
+            &other,
+            &["checkout", "-q", "-b", "feature/x", "origin/feature/x"],
+        );
+        git(&other, &["commit", "-q", "--allow-empty", "-m", "advance"]);
+        git(&other, &["push", "-q", "origin", "feature/x"]);
+
+        git(&work, &["fetch", "-q", "origin"]);
+        git(&work, &["checkout", "-q", "feature/x"]);
+        assert_eq!(
+            source_update_baseline(&work),
+            Some(("origin".to_string(), "origin/feature/x".to_string()))
+        );
+
+        run_git_pull_ff_only_resolved(&work, true).expect("resolved fast-forward pull");
+        assert_eq!(
+            git(&work, &["rev-parse", "HEAD"]),
+            git(&work, &["rev-parse", "origin/feature/x"])
+        );
     }
 }

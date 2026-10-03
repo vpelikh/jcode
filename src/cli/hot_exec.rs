@@ -268,9 +268,28 @@ pub fn check_for_updates() -> Option<bool> {
     source_update_available(&repo_dir)
 }
 
+/// Resolve the remote-tracking baseline to compare the checkout against.
+/// See [`update::source_update_baseline`] for the resolution order.
+fn source_update_baseline(repo_dir: &std::path::Path) -> Option<(String, String)> {
+    update::source_update_baseline(repo_dir)
+}
+
+/// Whether the source checkout can be auto-updated: an explicit counterpart
+/// baseline exists, or the branch has a configured upstream git can resolve.
+///
+/// Returns `false` for a detached HEAD and for a checkout whose only baseline
+/// is an unrelated ref (for example the remote default branch on a branch with
+/// no counterpart), which must be reported for a manual pull instead.
+pub fn can_auto_update_source() -> bool {
+    get_repo_dir()
+        .as_deref()
+        .is_some_and(update::source_can_auto_update)
+}
+
 pub(super) fn source_update_available(repo_dir: &std::path::Path) -> Option<bool> {
+    let (_, reference) = source_update_baseline(repo_dir)?;
     let behind = ProcessCommand::new("git")
-        .args(["rev-list", "--count", "HEAD..@{u}"])
+        .args(["rev-list", "--count", &format!("HEAD..{reference}")])
         .current_dir(repo_dir)
         .output()
         .ok()?;
@@ -291,8 +310,9 @@ pub(super) fn source_update_available(repo_dir: &std::path::Path) -> Option<bool
 /// `None` when the repo or upstream cannot be inspected.
 pub fn local_commits_ahead_of_upstream() -> Option<bool> {
     let repo_dir = get_repo_dir()?;
+    let (_, reference) = source_update_baseline(&repo_dir)?;
     let ahead = ProcessCommand::new("git")
-        .args(["rev-list", "--count", "@{u}..HEAD"])
+        .args(["rev-list", "--count", &format!("{reference}..HEAD")])
         .current_dir(&repo_dir)
         .output()
         .ok()?;
@@ -312,7 +332,7 @@ pub fn run_auto_update() -> Result<()> {
     let repo_dir =
         get_repo_dir().ok_or_else(|| anyhow::anyhow!("Could not find jcode repository"))?;
 
-    update::run_git_pull_ff_only(&repo_dir, true)?;
+    update::run_git_pull_ff_only_resolved(&repo_dir, true)?;
 
     crate::logging::info("Building updated source version...");
     let build_output = ProcessCommand::new("cargo")
@@ -486,5 +506,303 @@ fn reload_server_after_update(reason: &str) {
                 reason, exe, error
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git(repo: &std::path::Path, args: &[&str]) -> String {
+        let output = ProcessCommand::new("git")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .args([
+                "-c",
+                "user.name=Update Test",
+                "-c",
+                "user.email=update-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("run git fixture command");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn init_repo(path: &std::path::Path, branch: &str) {
+        std::fs::create_dir_all(path).unwrap();
+        git(path, &["init", "-q", "-b", branch]);
+        git(path, &["commit", "-q", "--allow-empty", "-m", "initial"]);
+    }
+
+    fn init_bare(path: &std::path::Path, branch: &str) {
+        std::fs::create_dir_all(path).unwrap();
+        git(path, &["init", "-q", "--bare", "-b", branch]);
+    }
+
+    /// A same-named remote-tracking branch is preferred over the remote's
+    /// default branch, so a feature checkout compares against its own
+    /// counterpart.
+    #[test]
+    fn baseline_prefers_same_named_remote_branch() {
+        let root = tempfile::tempdir().unwrap();
+        let remote = root.path().join("origin.git");
+        let work = root.path().join("work");
+        init_bare(&remote, "master");
+        init_repo(&work, "feature");
+        git(
+            &work,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&work, &["push", "-q", "origin", "feature"]);
+        // `push` records origin/feature but leaves the branch untracked.
+        assert_eq!(update::configured_upstream(&work), None);
+        let baseline = source_update_baseline(&work).expect("resolve baseline");
+        assert_eq!(
+            baseline,
+            ("origin".to_string(), "origin/feature".to_string())
+        );
+    }
+
+    /// A worktree-style checkout with no configured upstream, but sharing a
+    /// non-`origin` remote's tracking refs, resolves that remote's default
+    /// branch from its local refs when `<remote>/HEAD` is missing. Because that
+    /// ref is not a counterpart of the current branch, it is comparison-only.
+    #[test]
+    fn baseline_falls_back_to_non_origin_remote_head() {
+        let root = tempfile::tempdir().unwrap();
+        let remote = root.path().join("remote.git");
+        let work = root.path().join("work");
+        init_bare(&remote, "main");
+        init_repo(&work, "work");
+        git(
+            &work,
+            &["remote", "add", "upstream", remote.to_str().unwrap()],
+        );
+        git(&work, &["push", "-q", "upstream", "work:main"]);
+
+        // A bare remote created manually has no fetched `<remote>/HEAD`.
+        let baseline = source_update_baseline(&work).expect("resolve upstream baseline");
+        assert_eq!(
+            baseline,
+            ("upstream".to_string(), "upstream/main".to_string())
+        );
+        // `work` is not the remote default branch, so it is not auto-updatable.
+        assert!(update::source_auto_update_target(&work).is_none());
+    }
+
+    /// A stale `<remote>/HEAD` pointing at a deleted branch must not be used as
+    /// the baseline, which would resurrect the original comparison error.
+    #[test]
+    fn baseline_ignores_stale_remote_head() {
+        let root = tempfile::tempdir().unwrap();
+        let remote = root.path().join("origin.git");
+        let work = root.path().join("work");
+        init_bare(&remote, "master");
+        init_repo(&work, "master");
+        git(
+            &work,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&work, &["push", "-q", "-u", "origin", "master"]);
+        git(&work, &["fetch", "-q", "origin"]);
+        // Point origin/HEAD at a branch that does not exist.
+        git(
+            &work,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/gone",
+            ],
+        );
+
+        // Falls back to the existing origin/master rather than the dangling ref.
+        let baseline = source_update_baseline(&work).expect("resolve baseline");
+        assert_eq!(
+            baseline,
+            ("origin".to_string(), "origin/master".to_string())
+        );
+        assert_eq!(source_update_available(&work), Some(false));
+    }
+
+    /// A branch behind its own remote counterpart (no tracking config) is
+    /// fast-forwarded by the resolved pull.
+    #[test]
+    fn resolved_pull_fast_forwards_counterpart_branch() {
+        let root = tempfile::tempdir().unwrap();
+        let remote = root.path().join("origin.git");
+        let work = root.path().join("work");
+        let other = root.path().join("other");
+        init_bare(&remote, "master");
+        init_repo(&work, "master");
+        git(
+            &work,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&work, &["push", "-q", "-u", "origin", "master"]);
+        // A counterpart branch exists on the remote.
+        git(&work, &["checkout", "-q", "-b", "feature"]);
+        git(&work, &["push", "-q", "origin", "feature"]);
+        git(&work, &["checkout", "-q", "master"]);
+
+        // Advance origin/feature from a second clone.
+        git(
+            root.path(),
+            &[
+                "clone",
+                "-q",
+                remote.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        );
+        git(
+            &other,
+            &["checkout", "-q", "-b", "feature", "origin/feature"],
+        );
+        git(&other, &["commit", "-q", "--allow-empty", "-m", "advance"]);
+        git(&other, &["push", "-q", "origin", "feature"]);
+
+        // Untracked local `feature` strictly behind origin/feature.
+        git(&work, &["fetch", "-q", "origin"]);
+        git(&work, &["checkout", "-q", "feature"]);
+        assert_eq!(update::configured_upstream(&work), None);
+        assert_eq!(source_update_available(&work), Some(true));
+        assert!(update::source_can_auto_update(&work));
+        assert_eq!(
+            update::source_auto_update_target(&work),
+            Some(("origin".to_string(), "origin/feature".to_string()))
+        );
+
+        update::run_git_pull_ff_only_resolved(&work, true).expect("resolved fast-forward pull");
+        assert_eq!(
+            git(&work, &["rev-parse", "HEAD"]),
+            git(&work, &["rev-parse", "origin/feature"])
+        );
+        assert_eq!(source_update_available(&work), Some(false));
+    }
+
+    /// A branch whose only baseline is the remote default branch (no
+    /// counterpart) is reported for a manual pull, never auto-fast-forwarded
+    /// onto unrelated history.
+    #[test]
+    fn auto_update_skips_unrelated_default_branch() {
+        let root = tempfile::tempdir().unwrap();
+        let remote = root.path().join("origin.git");
+        let work = root.path().join("work");
+        init_bare(&remote, "master");
+        init_repo(&work, "master");
+        git(
+            &work,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&work, &["push", "-q", "-u", "origin", "master"]);
+        git(&work, &["fetch", "-q", "origin"]);
+        git(&work, &["checkout", "-q", "-b", "feature"]);
+
+        // `feature` has no origin/feature, so the baseline is origin/master,
+        // which is comparison-only.
+        assert_eq!(source_update_baseline(&work).unwrap().1, "origin/master");
+        assert!(update::source_auto_update_target(&work).is_none());
+        assert!(!update::source_can_auto_update(&work));
+        assert!(update::run_git_pull_ff_only_resolved(&work, true).is_err());
+    }
+
+    /// A detached HEAD can be compared but not fast-forwarded by `git pull`.
+    #[test]
+    fn detached_head_cannot_auto_update() {
+        let root = tempfile::tempdir().unwrap();
+        let remote = root.path().join("origin.git");
+        let work = root.path().join("work");
+        init_bare(&remote, "master");
+        init_repo(&work, "master");
+        git(
+            &work,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&work, &["push", "-q", "-u", "origin", "master"]);
+        git(&work, &["fetch", "-q", "origin"]);
+        git(&work, &["checkout", "-q", "--detach"]);
+
+        assert!(source_update_baseline(&work).is_some());
+        assert!(update::source_auto_update_target(&work).is_none());
+        assert!(!update::source_can_auto_update(&work));
+    }
+
+    /// A branch tracking a *local* branch has no explicit remote target, but git
+    /// can still resolve the tracking pull, so it remains auto-updatable.
+    #[test]
+    fn local_branch_upstream_is_auto_updatable() {
+        let root = tempfile::tempdir().unwrap();
+        let work = root.path().join("work");
+        init_repo(&work, "source");
+        git(&work, &["branch", "upstream"]);
+        git(&work, &["branch", "--set-upstream-to=upstream", "source"]);
+
+        assert_eq!(
+            source_update_baseline(&work),
+            Some((String::new(), "upstream".to_string()))
+        );
+        // No remote to name explicitly, but the tracking pull still works.
+        assert!(update::source_auto_update_target(&work).is_none());
+        assert!(update::source_can_auto_update(&work));
+    }
+
+    /// A branch whose configured upstream has a *different* name (local
+    /// `master` tracking `origin/main`) is still a valid fast-forward target.
+    #[test]
+    fn differently_named_upstream_is_auto_updatable() {
+        let root = tempfile::tempdir().unwrap();
+        let remote = root.path().join("origin.git");
+        let work = root.path().join("work");
+        let other = root.path().join("other");
+        init_bare(&remote, "main");
+        init_repo(&work, "master");
+        git(
+            &work,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&work, &["push", "-q", "origin", "master:main"]);
+        git(
+            &work,
+            &["branch", "--set-upstream-to=origin/main", "master"],
+        );
+
+        // Advance origin/main from a second clone.
+        git(
+            root.path(),
+            &[
+                "clone",
+                "-q",
+                remote.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        );
+        git(&other, &["commit", "-q", "--allow-empty", "-m", "advance"]);
+        git(&other, &["push", "-q", "origin", "main"]);
+        git(&work, &["fetch", "-q", "origin"]);
+
+        assert_eq!(source_update_available(&work), Some(true));
+        assert_eq!(
+            update::source_auto_update_target(&work),
+            Some(("origin".to_string(), "origin/main".to_string()))
+        );
+        update::run_git_pull_ff_only_resolved(&work, true).expect("fast-forward");
+        assert_eq!(
+            git(&work, &["rev-parse", "HEAD"]),
+            git(&work, &["rev-parse", "origin/main"])
+        );
     }
 }

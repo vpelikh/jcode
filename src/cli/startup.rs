@@ -422,6 +422,15 @@ fn spawn_background_update_check(args: &Args) {
                          Merge or rebase manually when ready.",
                     );
                     Bus::global().publish(BusEvent::UpdateStatus(UpdateStatus::UpToDate));
+                } else if !hot_exec::can_auto_update_source() {
+                    // Detached HEAD (or a checkout with no resolvable baseline)
+                    // cannot be fast-forwarded; report the update and let the
+                    // user pull manually.
+                    logging::info(
+                        "Update available but the checkout cannot be fast-forwarded automatically; \
+                         pull manually to update.",
+                    );
+                    Bus::global().publish(BusEvent::UpdateStatus(status));
                 } else {
                     Bus::global().publish(BusEvent::UpdateStatus(status));
                     if auto_update {
@@ -567,6 +576,11 @@ mod tests {
                     "-c",
                     "core.hooksPath=/dev/null",
                 ])
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env(
+                    "GIT_CONFIG_GLOBAL",
+                    if cfg!(windows) { "NUL" } else { "/dev/null" },
+                )
                 .args(args)
                 .current_dir(repo.path())
                 .output()
@@ -580,7 +594,8 @@ mod tests {
         git(&["init", "-b", "source"]);
         git(&["commit", "--allow-empty", "-m", "initial"]);
 
-        // A valid checkout without a tracking branch cannot be compared.
+        // A valid checkout with neither a tracking branch nor an
+        // `origin/HEAD` remote cannot be compared.
         let result = hot_exec::source_update_available(repo.path());
         assert_eq!(result, None);
         assert!(matches!(
@@ -602,6 +617,86 @@ mod tests {
         git(&["commit", "--allow-empty", "-m", "upstream update"]);
         git(&["checkout", "source"]);
         let result = hot_exec::source_update_available(repo.path());
+        assert_eq!(result, Some(true));
+        assert!(matches!(
+            source_update_check_status(result),
+            crate::bus::UpdateStatus::Available { .. }
+        ));
+    }
+
+    #[test]
+    fn source_update_falls_back_to_origin_head_for_untracked_branch() {
+        let root = tempfile::tempdir().expect("temporary source checkout");
+        let remote = root.path().join("origin.git");
+        let repo = root.path().join("work");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git_at = |dir: &std::path::Path, args: &[&str]| {
+            let output = ProcessCommand::new("git")
+                .args([
+                    "-c",
+                    "user.name=Update Test",
+                    "-c",
+                    "user.email=update-test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env(
+                    "GIT_CONFIG_GLOBAL",
+                    if cfg!(windows) { "NUL" } else { "/dev/null" },
+                )
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("run git fixture command");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        std::fs::create_dir_all(&remote).unwrap();
+        git_at(&remote, &["init", "-q", "--bare", "-b", "master"]);
+        git_at(&repo, &["init", "-q", "-b", "master"]);
+        git_at(&repo, &["commit", "-q", "--allow-empty", "-m", "initial"]);
+        git_at(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git_at(&repo, &["push", "-q", "-u", "origin", "master"]);
+        // An untracked branch sharing the remote-tracking refs: the exact shape
+        // of a worktree checkout.
+        git_at(&repo, &["fetch", "-q", "origin"]);
+        git_at(&repo, &["checkout", "-q", "-b", "feature"]);
+
+        // No configured upstream, but origin/HEAD makes the comparison work.
+        let result = hot_exec::source_update_available(&repo);
+        assert_eq!(result, Some(false));
+        assert!(matches!(
+            source_update_check_status(result),
+            crate::bus::UpdateStatus::UpToDate
+        ));
+
+        // An advance on the remote's default branch makes the untracked branch
+        // behind, and reporting it as available must not require a tracking
+        // branch.
+        let other = root.path().join("other");
+        git_at(
+            root.path(),
+            &[
+                "clone",
+                "-q",
+                remote.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        );
+        git_at(&other, &["commit", "-q", "--allow-empty", "-m", "advance"]);
+        git_at(&other, &["push", "-q", "origin", "master"]);
+        git_at(&repo, &["fetch", "-q", "origin"]);
+
+        let result = hot_exec::source_update_available(&repo);
         assert_eq!(result, Some(true));
         assert!(matches!(
             source_update_check_status(result),
