@@ -264,14 +264,39 @@ mod macos {
         if !stdin_is_interactive(pid as i32) {
             return StdinState::NotReading;
         }
-
-        // Check thread states - if any thread is in WAITING state,
-        // the process might be blocked on I/O
+        // macOS exposes no per-thread syscall, so a `TH_STATE_WAITING` thread is
+        // not proof of a `read(0)`. Multi-threaded runtimes (tokio, libdispatch,
+        // Node, and even the `cargo test` harness) park worker threads in that
+        // state while doing nothing with stdin, which would otherwise be misread
+        // as "reading stdin". A stdin-blocked CLI/shell (`cat`, an interactive
+        // prompt) is effectively single-threaded, so require that before
+        // reporting `Reading`; anything else is inconclusive, not a positive.
+        if thread_count(pid as i32) > 1 {
+            return StdinState::Unknown;
+        }
         if is_thread_waiting(pid as i32) {
             return StdinState::Reading;
         }
-
         StdinState::NotReading
+    }
+
+    /// Number of threads the process currently has, or 0 when unavailable.
+    fn thread_count(pid: i32) -> usize {
+        let mut thread_ids = vec![0u64; 256];
+        let ret = unsafe {
+            proc_pidinfo(
+                pid,
+                PROC_PIDLISTTHREADS,
+                0,
+                thread_ids.as_mut_ptr() as *mut libc::c_void,
+                (thread_ids.len() * mem::size_of::<u64>()) as i32,
+            )
+        };
+        if ret <= 0 {
+            0
+        } else {
+            ret as usize / mem::size_of::<u64>()
+        }
     }
 
     fn stdin_is_interactive(pid: i32) -> bool {
