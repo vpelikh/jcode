@@ -261,6 +261,10 @@ mod tests {
 
     #[test]
     fn render_workspace_map_colors_completed_tiles_green() {
+        // The assertion looks for a green `Color::Rgb`, which `rgb(...)`
+        // quantizes to `Indexed` on a 256-color host, so pin truecolor to test
+        // the tile colors rather than the host terminal.
+        crate::color_support::pin_truecolor_for_tests();
         let rows = vec![row(
             0,
             true,

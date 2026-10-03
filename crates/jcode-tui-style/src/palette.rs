@@ -770,6 +770,10 @@ mod light_theme_interaction {
             }
         }
         let _restore = Restore;
+        // The assertion reads back a concrete `Color::Rgb` after the pipeline
+        // runs `rgb(...)`, which quantizes to `Indexed` on a 256-color host, so
+        // pin truecolor to measure the pipeline rather than the host terminal.
+        crate::color::pin_truecolor_for_tests();
         // `match_target` reads the global theme mode, so set it to match the
         // buffer pass being exercised.
         crate::theme_mode::set_theme_mode(ThemeMode::Light);

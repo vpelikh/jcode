@@ -1568,6 +1568,11 @@ mod tests {
         let _guard = lock_test_env();
         let temp = tempfile::tempdir().unwrap();
         let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", temp.path().as_os_str());
+        // `app_config_dir` (and thus the env-file lookup) prefers `JCODE_HOME`.
+        // macOS `dirs::config_dir()` ignores `XDG_CONFIG_HOME`, so without this
+        // the test reads the developer's real `~/Library/Application
+        // Support/jcode/bedrock.env` and `has_credentials()` is non-empty.
+        let _home = EnvVarGuard::set("JCODE_HOME", temp.path().as_os_str());
         let _removed = [
             "JCODE_BEDROCK_ENABLE",
             API_KEY_ENV,
@@ -1601,6 +1606,10 @@ mod tests {
         let _guard = lock_test_env();
         let temp = tempfile::tempdir().unwrap();
         let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", temp.path().as_os_str());
+        // See `detects_env_credentials_requires_region_and_credential_hint`:
+        // `JCODE_HOME` is what `app_config_dir` honors, so isolate it too or the
+        // developer's real `bedrock.env` leaks in on macOS.
+        let _home = EnvVarGuard::set("JCODE_HOME", temp.path().as_os_str());
         for key in [
             "JCODE_BEDROCK_ENABLE",
             API_KEY_ENV,

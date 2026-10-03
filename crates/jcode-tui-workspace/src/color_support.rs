@@ -12,8 +12,24 @@ pub enum ColorCapability {
 
 static CAPABILITY: OnceLock<ColorCapability> = OnceLock::new();
 
+/// Test-only override for [`color_capability`], mirroring
+/// `jcode_tui_style::color::pin_truecolor_for_tests`. Tests that assert on
+/// rendered RGB must not depend on the host terminal: a 256-color host
+/// quantizes `rgb(...)` to `Indexed`, which breaks exact-RGB assertions.
+static CAPABILITY_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 pub fn color_capability() -> ColorCapability {
+    if CAPABILITY_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+        return ColorCapability::TrueColor;
+    }
     *CAPABILITY.get_or_init(detect_color_capability)
+}
+
+/// Pin the process-global color capability to truecolor for the rest of the
+/// process. Test-only; production never calls this.
+#[cfg(any(test, feature = "test-support"))]
+pub fn pin_truecolor_for_tests() {
+    CAPABILITY_OVERRIDE.store(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Terminals whose GPU glyph atlas corrupts under heavy per-cell *truecolor*

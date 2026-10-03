@@ -32,6 +32,10 @@ fn first_three_launches_can_include_hotkey_notice_too() {
     let state = SetupHintsState {
         launch_count: 2,
         hotkey_configured: true,
+        // `startup_spawn_hint_dismissed` defaults to `true` (the system-wide
+        // spawn notice is opt-in), so a test that asserts the notice renders
+        // must explicitly opt back in.
+        startup_spawn_hint_dismissed: false,
         ..SetupHintsState::default()
     };
 
