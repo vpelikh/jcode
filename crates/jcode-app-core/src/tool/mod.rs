@@ -850,6 +850,36 @@ impl Registry {
         // The `resolved_name == "agentgrep"` gate and the config read live in
         // `compass_enforcement::prefer_compass_query_for` (see its doc).
         let resolved_name = Self::resolve_tool_name(name);
+        // Enforce product separation here too: batch/subcalls dispatch through
+        // the registry without going through Agent::validate_tool_allowed. Keep
+        // this in lockstep with `Agent::validate_tool_allowed`. Desktop
+        // self-development is selected purely by the working directory being a
+        // Jcode Desktop checkout.
+        if matches!(
+            resolved_name,
+            "selfdev" | "debug_socket" | "desktop_selfdev" | "jcode_docs"
+        ) {
+            let desktop = ctx
+                .working_dir
+                .as_deref()
+                .is_some_and(|dir| jcode_selfdev_types::desktop_repo_root(dir).is_some());
+            if desktop && resolved_name == "jcode_docs" {
+                return Err(anyhow::anyhow!(
+                    "Tool 'jcode_docs' is disabled in Desktop self-development mode. Read the working tree documentation instead."
+                ));
+            }
+            if desktop && matches!(resolved_name, "selfdev" | "debug_socket") {
+                return Err(anyhow::anyhow!(
+                    "Tool '{}' targets Jcode CLI, not Desktop. Use 'desktop_selfdev' in Desktop self-development mode.",
+                    resolved_name
+                ));
+            }
+            if !desktop && resolved_name == "desktop_selfdev" {
+                return Err(anyhow::anyhow!(
+                    "Tool 'desktop_selfdev' is only available in a Jcode Desktop source checkout."
+                ));
+            }
+        }
         let prefer_compass_query = compass_enforcement::prefer_compass_query_for(resolved_name);
         let tools = self.tools.read().await;
         if let Some(policy) = session_tool_policy(&ctx.session_id) {
