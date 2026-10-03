@@ -892,7 +892,14 @@ fn test_background_task_markdown_is_suppressed_even_if_role_was_lost() {
     let mut terminal = ratatui::Terminal::new(backend).expect("failed to create test terminal");
     let text = render_and_snap(&app, &mut terminal);
 
-    assert!(!text.contains("╭") && !text.contains("594967sj63"));
+    // Assert on the background card's own, unique markers. A bare
+    // `!text.contains("╭")` is unreliable: the info-widget overlays draw their
+    // own rounded borders with the same glyph, so a populated widget (whose
+    // presence depends on test ordering and global config) produced a false
+    // failure even though no card rendered. The task id and the card title are
+    // unique to this message, so their absence proves it was suppressed.
+    assert!(!text.contains("594967sj63"), "card must not render: {text}");
+    assert!(!text.contains("✗ bg"), "card title must not render: {text}");
     assert!(app.display_messages().is_empty());
     assert_eq!(app.display_user_message_count(), 0);
 }
