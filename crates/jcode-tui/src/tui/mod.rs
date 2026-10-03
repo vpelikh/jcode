@@ -130,7 +130,17 @@ fn keyboard_enhancement_flags() -> crossterm::event::KeyboardEnhancementFlags {
 ///
 /// Returns whether the requests were written, not whether the terminal supports them.
 pub fn enable_keyboard_enhancement() -> bool {
-    let result = enable_keyboard_enhancement_to(&mut std::io::stdout(), inside_tmux()).is_ok();
+    // Build the escape bytes and hand them to the non-blocking writer when the
+    // TUI is live. This runs on the render thread when returning from an
+    // interactive editor, where a pty that is not draining (backgrounded tab,
+    // frozen terminal) would otherwise park the render thread in `write(2)` and
+    // freeze the UI. Before a live writer is registered (startup, session
+    // picker) `write_modes_serialized` falls back to stdout, which is safe there.
+    let mut buf = Vec::new();
+    let result = match enable_keyboard_enhancement_to(&mut buf, inside_tmux()) {
+        Ok(()) => crate::tui::terminal_writer::write_modes_serialized(&buf),
+        Err(_) => false,
+    };
     crate::logging::info(&format!(
         "Keyboard enhancement request: {}",
         if result { "sent" } else { "FAILED" }
@@ -221,12 +231,25 @@ pub(crate) fn reapply_terminal_modes_to(
 
 pub(crate) fn reapply_configured_terminal_modes_after_focus() {
     let policy = crate::perf::tui_policy();
+    // Build the mode bytes into a buffer and hand them to the non-blocking
+    // terminal writer instead of writing `stdout()` directly on the render
+    // thread. A focus event can arrive while the pty's output buffer is full
+    // (a backgrounded tab, a frozen terminal, a `SIGSTOP`'d emulator); a direct
+    // `write(2)` there parks in the kernel forever and freezes the whole TUI,
+    // exactly like a frame flush would. `write_modes_serialized` keeps the
+    // re-assertion off the render path: it is applied on the next drain if the
+    // pty is wedged, and re-asserted on the next focus/redraw as a backstop.
+    let mut buf = Vec::new();
     if let Err(error) = reapply_terminal_modes_after_focus_to(
-        &mut std::io::stdout(),
+        &mut buf,
         policy.enable_mouse_capture,
         policy.enable_keyboard_enhancement,
     ) {
         crate::logging::warn(&format!("failed to reapply terminal modes: {error}"));
+        return;
+    }
+    if !crate::tui::terminal_writer::write_modes_serialized(&buf) {
+        crate::logging::warn("failed to reapply terminal modes: output dropped");
     }
 }
 

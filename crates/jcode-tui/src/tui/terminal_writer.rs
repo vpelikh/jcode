@@ -84,8 +84,8 @@ pub fn resync_pending() -> bool {
 
 /// A registered live terminal writer that auxiliary output can enqueue into.
 ///
-/// Auxiliary output (window titles, OSC-52 clipboard, turn notifications,
-/// terminal-mode re-apply) must be serialized with the render writer thread's
+/// Auxiliary output (window titles, OSC-52 clipboard, turn notifications) must
+/// be serialized with the render writer thread's
 /// frame bytes, otherwise its multi-byte escape sequences interleave with a
 /// frame's cell writes on the same terminal and corrupt the stream — the real
 /// screen then shows stray glyphs that a later full repaint clears. Routing
@@ -174,8 +174,9 @@ pub(crate) fn write_auxiliary(bytes: &[u8]) -> AuxWriteResult {
 /// Write auxiliary terminal-output bytes, serialized with the render writer
 /// when a live writer is registered, else directly to stdout.
 ///
-/// This is the single entry point for non-frame terminal output (window titles,
-/// OSC-52 clipboard, turn notifications, mode re-apply). Using it guarantees
+/// This is the single entry point for droppable non-frame terminal output
+/// (window titles, OSC-52 clipboard, turn notifications); mode re-apply uses
+/// [`write_modes_serialized`]. Using it guarantees
 /// these escape sequences never interleave with frame bytes on the same
 /// terminal. When no writer is live (startup, session picker, teardown) it
 /// falls back to `io::stdout()`, where there is no concurrent renderer to race.
@@ -195,14 +196,96 @@ pub(crate) fn write_serialized(bytes: &[u8]) -> bool {
     }
 }
 
+/// Enqueue a terminal-mode re-assertion so it survives a wedged pty.
+///
+/// Unlike [`write_auxiliary`], these bytes are never dropped: if the channel
+/// backlog is saturated they are stashed in the live writer and applied the
+/// instant the pty drains. Returns `true` when a live writer took the bytes
+/// (immediately, or by stashing them for a later drain). Returns `false` when
+/// there is no live writer, so the caller should fall back to `io::stdout()`.
+///
+/// These bytes are deliberately *not* counted in the frame-backlog counter:
+/// they are small, low-frequency, and idempotent, so they neither need
+/// backpressure accounting nor should they perturb the frame drop math.
+pub(crate) fn request_modes_reassert(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return true;
+    }
+    let (tx, inner) = {
+        let guard = LIVE_WRITER.lock().unwrap();
+        let Some(live) = guard.as_ref() else {
+            return false;
+        };
+        (live.tx.clone(), Arc::clone(&live.inner))
+    };
+    // Once the backlog is saturated we cannot rely on the channel draining
+    // soon, so keep a single coalesced stash instead of enqueuing more.
+    if inner.buffered.load(Ordering::Relaxed) >= QUEUE_CAPACITY_BYTES {
+        return stash_modes(&inner, bytes.to_vec().into_boxed_slice());
+    }
+    match tx.send(Chunk::Modes(bytes.to_vec().into_boxed_slice())) {
+        Ok(()) => {
+            // The just-enqueued re-assert supersedes any older stash, so drop
+            // it: otherwise the writer could apply the stale bytes *after* this
+            // newer chunk and leave the wrong modes active.
+            let _ = inner.modes.lock().unwrap().take();
+            true
+        }
+        // Writer exited between registration and send; keep the bytes in the
+        // stash so a later writer can still apply them.
+        Err(_) => stash_modes(&inner, bytes.to_vec().into_boxed_slice()),
+    }
+}
+
+/// Stash a mode re-assertion to apply on the next drain. Replaces any prior
+/// stash (mode re-assertions are idempotent, so only the newest matters).
+/// Always returns `true`: the bytes are held, not lost.
+fn stash_modes(inner: &WriterInner, bytes: Box<[u8]>) -> bool {
+    if !bytes.is_empty() {
+        *inner.modes.lock().unwrap() = Some(bytes);
+    }
+    true
+}
+
+/// Write a terminal-mode re-assertion reliably: through the live writer when one
+/// is registered (stashed and applied on the next drain if the pty is wedged),
+/// else directly to `io::stdout()` when no renderer is running.
+///
+/// Returns whether the bytes were accepted: `true` when a live writer took them,
+/// or when the stdout fallback write succeeded. On a wedged pty the bytes are
+/// held rather than dropped, so they are applied as soon as the pty drains. The
+/// one exception is teardown: if the writer thread exits with the re-assert
+/// still stashed it cannot be applied, but the next focus/redraw re-asserts the
+/// modes once a writer exists. This is still strictly better than
+/// [`write_serialized`], which drops the bytes outright on a wedged pty.
+pub(crate) fn write_modes_serialized(bytes: &[u8]) -> bool {
+    if request_modes_reassert(bytes) {
+        return true;
+    }
+    let mut out = io::stdout();
+    out.write_all(bytes).is_ok() && out.flush().is_ok()
+}
+
 enum Chunk {
     Data(Box<[u8]>),
+    /// A terminal-mode re-assertion. Unlike `Data` it is never dropped: if the
+    /// writer cannot send it immediately (backlog saturated), it is stashed in
+    /// `WriterInner::modes` and applied once the channel drains. Not counted in
+    /// `buffered` (see `request_modes_reassert`).
+    Modes(Box<[u8]>),
     Shutdown,
 }
 
 struct WriterInner {
     /// Bytes currently queued (sent to the channel but not yet drained).
     buffered: AtomicUsize,
+    /// A single deferred terminal-mode re-assertion waiting for the pty to
+    /// drain. A mode re-assertion (focus regained, editor resume) must be
+    /// applied even if the pty was wedged when it fired, but it is also
+    /// idempotent, so only the *latest* one needs to be kept. The writer thread
+    /// applies it the next time it observes a drain, giving it priority over
+    /// backlogged frames. `None` means nothing is pending.
+    modes: Mutex<Option<Box<[u8]>>>,
     /// Fires once the writer thread has fully drained and flushed (or exited).
     done: Mutex<Option<Receiver<()>>>,
     /// Thread handle, taken on shutdown so the last writer can join.
@@ -236,6 +319,7 @@ impl TerminalWriter {
         let (done_tx, done_rx): (Sender<()>, Receiver<()>) = mpsc::channel();
         let inner = Arc::new(WriterInner {
             buffered: AtomicUsize::new(0),
+            modes: Mutex::new(None),
             done: Mutex::new(Some(done_rx)),
             handle: Mutex::new(None),
         });
@@ -405,12 +489,27 @@ impl Write for TerminalWriter {
 }
 
 /// Drains `rx`, writes each chunk to `writer`, and maintains the byte counter.
+///
+/// After each drained chunk the thread applies any deferred mode re-assertion
+/// (`WriterInner::modes`). A mode re-assert that could not be enqueued while the
+/// pty was wedged is stashed rather than dropped; applying it here the moment
+/// the channel drains gives it priority over backlogged frames and guarantees it
+/// is eventually applied even on a pty that only briefly recovers.
 fn run_writer<W: Write>(
     mut writer: W,
     rx: Receiver<Chunk>,
     done_tx: Sender<()>,
     inner: &WriterInner,
 ) {
+    let apply_pending_modes = |writer: &mut W, inner: &WriterInner| {
+        let pending = inner.modes.lock().unwrap().take();
+        if let Some(bytes) = pending {
+            // Not counted in `buffered` (see `request_modes_reassert`), so no
+            // counter adjustment here.
+            let _ = writer.write_all(&bytes);
+            let _ = writer.flush();
+        }
+    };
     while let Ok(chunk) = rx.recv() {
         match chunk {
             Chunk::Shutdown => break,
@@ -419,8 +518,20 @@ fn run_writer<W: Write>(
                 let _ = writer.flush();
                 inner.buffered.fetch_sub(chunk.len(), Ordering::Relaxed);
             }
+            Chunk::Modes(chunk) => {
+                // Not counted in `buffered` (see `request_modes_reassert`).
+                let _ = writer.write_all(&chunk);
+                let _ = writer.flush();
+            }
         }
+        // The pty just drained a chunk, so it is accepting output; deliver any
+        // mode re-assert that was stashed while it was wedged.
+        apply_pending_modes(&mut writer, inner);
     }
+    // The writer is exiting; a still-stashed mode re-assert cannot be applied
+    // (the pty is wedged or the writer is shutting down). Dropping it here is
+    // correct: the next focus/redraw re-asserts the modes once a writer exists.
+    let _ = inner.modes.lock().unwrap().take();
     // Final best-effort flush so teardown output stays coherent.
     let _ = writer.flush();
     let _ = done_tx.send(());
@@ -927,8 +1038,8 @@ mod tests {
     /// Auxiliary output (`write_auxiliary`) must be serialized with frame writes
     /// through the *same* writer thread channel, arriving in enqueue order as
     /// atomic chunks. This is the contract that prevents escape sequences written
-    /// from the event loop (window title, OSC-52 clipboard, turn notification,
-    /// mode re-apply) from interleaving with render frame bytes on the terminal.
+    /// from the event loop (window title, OSC-52 clipboard, turn notification)
+    /// from interleaving with render frame bytes on the terminal.
     #[test]
     fn auxiliary_writes_are_serialized_in_order_with_frames() {
         let _guard = live_writer_test_guard();
@@ -1075,6 +1186,138 @@ mod tests {
 
         // Release the wedged writer so the test leaves no leaked thread.
         drop(release);
+        drop(writer);
+    }
+
+    /// The focus-event mode re-assertion must be serialized through the live
+    /// writer, not written straight to `io::stdout()` on the render thread.
+    /// Writing stdout directly there is what let a focus event that arrives while
+    /// the pty is wedged park the single render thread in `write(2)` forever and
+    /// freeze the whole TUI. Here the mode bytes must reach the live writer's
+    /// downstream (captured channel); before the fix they bypassed it entirely.
+    #[test]
+    fn focus_mode_reapply_is_serialized_through_the_live_writer() {
+        let _guard = live_writer_test_guard();
+        let (t, wrx) = mpsc::channel::<Vec<u8>>();
+        let writer = TerminalWriter::new(ChannelWriter { tx: t });
+        writer.register_as_live();
+
+        crate::tui::reapply_configured_terminal_modes_after_focus();
+
+        let mut got: Vec<u8> = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            match wrx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(chunk) => {
+                    got.extend_from_slice(&chunk);
+                    if got.windows(8).any(|w| w == b"\x1b[?2004h") {
+                        break;
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+        let got = String::from_utf8_lossy(&got);
+        assert!(
+            got.contains("\x1b[?2004h"),
+            "focus mode reapply must route through the live writer; got {got:?}"
+        );
+
+        drop(writer);
+    }
+
+    /// A mode re-assert that fires while the pty is wedged must not be lost: it
+    /// is stashed and applied as soon as the pty drains, ahead of the backlog.
+    /// This is the "reliable on drain" guarantee that makes a focus re-assert
+    /// safe to route off the render thread even though it must not be dropped.
+    #[test]
+    fn wedged_mode_reapply_is_stashed_and_applied_on_drain() {
+        /// Blocks on its first write (simulating a wedged pty) until released,
+        /// then forwards every write to a channel for inspection.
+        struct GatedForwardWriter {
+            gate: Receiver<()>,
+            tx: Sender<Vec<u8>>,
+        }
+        impl Write for GatedForwardWriter {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                // Blocks until released the first time; once the sender is
+                // dropped subsequent recv() returns immediately, so the backlog
+                // then drains freely.
+                let _ = self.gate.recv();
+                let _ = self.tx.send(b.to_vec());
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let _guard = live_writer_test_guard();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let (t, wrx) = mpsc::channel::<Vec<u8>>();
+        let mut writer = TerminalWriter::new(GatedForwardWriter { gate: gate_rx, tx: t });
+        writer.register_as_live();
+
+        // Saturate the wedged-pty backlog so the live writer cannot accept the
+        // mode re-assert immediately (it has to stash it).
+        for i in 0..(QUEUE_CAPACITY_BYTES / 1024 + 2) {
+            let data = vec![b'x'; 1024];
+            assert!(writer.write_all(&data).is_ok(), "write {i} failed");
+            let _ = writer.flush();
+        }
+        crate::tui::reapply_configured_terminal_modes_after_focus();
+
+        // Release the pty; the backlog drains and the stashed re-assert lands.
+        // Drop the writer to shut the thread down and drain the channel fully
+        // before inspecting results, so the counter assertion below is stable.
+        let inner = Arc::clone(&writer.inner);
+        drop(gate_tx);
+        drop(writer);
+
+        let mut got: Vec<u8> = Vec::new();
+        // Downstream disconnects (writer thread exited) once everything has
+        // been delivered; recv then errors and ends the loop.
+        while let Ok(chunk) = wrx.recv_timeout(std::time::Duration::from_millis(200)) {
+            got.extend_from_slice(&chunk);
+        }
+        let got = String::from_utf8_lossy(&got);
+        assert!(
+            got.contains("\x1b[?2004h"),
+            "stashed mode reapply must be applied on drain; got {got:?}"
+        );
+
+        // Mode bytes are not counted in the backlog, so once the backlog has
+        // drained the counter must be exactly zero. A non-zero value here would
+        // mean a mode re-assert reserved (or released) counter bytes it should
+        // not have, which corrupts frame backpressure.
+        assert_eq!(
+            inner.buffered.load(Ordering::Relaxed),
+            0,
+            "backlog counter must be zero after drain (mode bytes must not be counted)"
+        );
+    }
+
+    /// A newer re-assert that takes the direct channel path must cancel any
+    /// older stashed re-assert. Otherwise the writer could apply the stale
+    /// bytes *after* the newer chunk and leave the wrong terminal modes active.
+    #[test]
+    fn direct_mode_enqueue_supersedes_an_older_stash() {
+        let _guard = live_writer_test_guard();
+        let (t, _wrx) = mpsc::channel::<Vec<u8>>();
+        let writer = TerminalWriter::new(ChannelWriter { tx: t });
+        writer.register_as_live();
+
+        // Pretend an older re-assert is stashed (as if it fired while wedged).
+        *writer.inner.modes.lock().unwrap() = Some(b"OLD".to_vec().into_boxed_slice());
+
+        // A newer re-assert takes the direct (unsaturated) channel path and must
+        // clear the older stash.
+        assert!(request_modes_reassert(b"NEW"));
+        assert!(
+            writer.inner.modes.lock().unwrap().is_none(),
+            "a directly-enqueued re-assert must clear an older stash"
+        );
+
         drop(writer);
     }
 
