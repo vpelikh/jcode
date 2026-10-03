@@ -96,6 +96,10 @@ fn test_new_message_after_restore_reenables_compaction() {
 
 #[test]
 fn test_token_estimate() {
+    // `CompactionManager::new` reads the global `[compaction] max_context_tokens`
+    // cap; a sibling test that lowers it would drop the system-overhead term and
+    // break the expected range. Serialize with the config mutators.
+    let _lock = crate::storage::lock_test_env();
     let manager = CompactionManager::new();
     // 100 chars = ~25 tokens (plus 18k overhead for full budget)
     let messages = vec![make_text_message(Role::User, &"x".repeat(100))];
@@ -938,6 +942,11 @@ fn test_persisted_state_round_trip_preserves_compacted_view() {
 
 #[test]
 fn test_context_usage_with_both_estimate_and_observed() {
+    // `with_budget` reads the process-global `[compaction] max_context_tokens`
+    // cap, which sibling tests mutate (e.g. a 50_000 cap). Without the env lock
+    // this test can observe that cap and its 200_000 budget silently becomes
+    // 50_000, tripling the usage ratio. Serialize with the config mutators.
+    let _lock = crate::storage::lock_test_env();
     let mut manager = CompactionManager::new().with_budget(200_000);
     // Build messages totalling ~50k chars = ~12.5k token estimate
     let mut messages = Vec::new();
