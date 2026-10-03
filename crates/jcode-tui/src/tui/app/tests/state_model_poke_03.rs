@@ -556,6 +556,11 @@ fn test_subagent_model_large_catalog_uses_cached_searchable_picker() {
 
 #[test]
 fn test_model_picker_reuses_cached_entries_until_invalidated() {
+    // The picker reads the process-global model catalog and the shared test
+    // JCODE_HOME/config, both mutated by sibling tests. Serialize and reset so
+    // a concurrently running test cannot clear the cache or swap the routes.
+    let _env_lock = crate::storage::lock_test_env();
+    crate::provider::models::reset_model_catalog_services_for_tests();
     ensure_test_jcode_home_if_unset();
     clear_persisted_test_ui_state();
     crate::tui::ui::clear_test_render_state_for_tests();
@@ -1222,6 +1227,8 @@ fn test_tui_openai_compatible_local_refresh_failure_is_pending_not_final_failure
 
 #[test]
 fn test_model_picker_opens_simplified_state_before_async_routes_complete() {
+    let _env_lock = crate::storage::lock_test_env();
+    crate::provider::models::reset_model_catalog_services_for_tests();
     ensure_test_jcode_home_if_unset();
     clear_persisted_test_ui_state();
     crate::tui::ui::clear_test_render_state_for_tests();
@@ -1264,6 +1271,8 @@ fn test_model_picker_opens_simplified_state_before_async_routes_complete() {
 
 #[test]
 fn test_model_picker_state_space_preserves_provider_labels_after_route_hydration() {
+    let _env_lock = crate::storage::lock_test_env();
+    crate::provider::models::reset_model_catalog_services_for_tests();
     ensure_test_jcode_home_if_unset();
     clear_persisted_test_ui_state();
     crate::tui::ui::clear_test_render_state_for_tests();
@@ -1438,6 +1447,8 @@ fn test_login_completed_spawns_auth_refresh_when_runtime_is_available() {
 
 #[test]
 fn test_model_picker_waits_for_async_post_login_catalog_activation() {
+    let _env_lock = crate::storage::lock_test_env();
+    crate::provider::models::reset_model_catalog_services_for_tests();
     ensure_test_jcode_home_if_unset();
     clear_persisted_test_ui_state();
     crate::tui::ui::clear_test_render_state_for_tests();
