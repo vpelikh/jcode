@@ -1,33 +1,42 @@
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Map provider-side tool names to internal display names.
-/// Mirrors Registry::resolve_tool_name so TUI surfaces show friendly names.
+///
+/// This is the canonical resolution plus the one display-only alias the
+/// registry does not model: `file_glob` (the registry's `resolve_tool_name`
+/// folds `file_grep` into `agentgrep` but has no `file_glob` entry, while the
+/// transcript shows a dedicated `glob` row). Delegating keeps the friendly
+/// label in lockstep with the alias set used for classification.
 pub fn resolve_display_tool_name(name: &str) -> &str {
-    match name {
-        "communicate" => "swarm",
-        "discover_tools" => "integration_tools",
-        "task" | "task_runner" => "subagent",
-        "shell_exec" => "bash",
-        "file_read" => "read",
-        "file_write" => "write",
-        "file_edit" => "edit",
+    let bare = name.strip_prefix("functions.").unwrap_or(name);
+    match bare {
         "file_glob" => "glob",
-        "file_grep" => "grep",
-        "todo_read" | "todo_write" | "todoread" | "todowrite" => "todo",
-        other => other,
+        other => canonical_tool_name(other),
     }
 }
 
+/// Resolve a provider-side tool name to its canonical internal name.
+///
+/// This delegates to [`jcode_tool_types::resolve_tool_name`], the single source
+/// of truth shared with the execution registry, so provider aliases such as
+/// `file_edit`/`edit_file`/`write_file` and the `functions.` namespace cannot
+/// silently stop being recognized on the display side. A tool name that fails
+/// to resolve here is treated as "not an edit tool", which drops the diff
+/// gutter entirely, so the alias set must stay in lockstep with the registry.
+///
+/// Two deliberate TUI-only divergences are layered on top:
+/// - `grep`/`file_grep` stay distinct from their `agentgrep` identity so the
+///   grep-specific summary arm (which reads `pattern`) still applies.
+/// - The PascalCase patch-family names `MultiEdit`/`Patch`/`ApplyPatch` are not
+///   part of the registry alias set but are emitted by some providers.
 pub fn canonical_tool_name(name: &str) -> &str {
-    match name {
-        "communicate" => "swarm",
-        "discover_tools" => "integration_tools",
-        "Write" => "write",
-        "Edit" => "edit",
+    let bare = name.strip_prefix("functions.").unwrap_or(name);
+    match bare {
         "MultiEdit" => "multiedit",
         "Patch" => "patch",
         "ApplyPatch" => "apply_patch",
-        other => other,
+        "grep" | "file_grep" | "Grep" => "grep",
+        other => jcode_tool_types::resolve_tool_name(other),
     }
 }
 
@@ -325,6 +334,54 @@ mod tests {
         assert_eq!(canonical_tool_name("ApplyPatch"), "apply_patch");
         assert!(is_edit_tool_name("MultiEdit"));
         assert!(!is_edit_tool_name("read"));
+    }
+
+    #[test]
+    fn display_name_covers_provider_aliases() {
+        // The row label must show the friendly name for every alias the
+        // canonical resolver recognizes, or aliased calls render as raw
+        // provider names (`edit_file`, `write_file`, `functions.read`).
+        assert_eq!(resolve_display_tool_name("edit_file"), "edit");
+        assert_eq!(resolve_display_tool_name("file_edit"), "edit");
+        assert_eq!(resolve_display_tool_name("write_file"), "write");
+        assert_eq!(resolve_display_tool_name("file_write"), "write");
+        assert_eq!(resolve_display_tool_name("read_file"), "read");
+        assert_eq!(resolve_display_tool_name("file_read"), "read");
+        assert_eq!(resolve_display_tool_name("shell"), "bash");
+        assert_eq!(resolve_display_tool_name("functions.Edit"), "edit");
+    }
+
+    #[test]
+    fn canonicalizes_provider_aliases_for_edit_tools() {
+        // Provider aliases must resolve to the edit family so the diff gutter
+        // renders even when the model emits `file_edit`/`edit_file`/`write_file`.
+        assert_eq!(canonical_tool_name("file_edit"), "edit");
+        assert_eq!(canonical_tool_name("edit_file"), "edit");
+        assert_eq!(canonical_tool_name("file_write"), "write");
+        assert_eq!(canonical_tool_name("write_file"), "write");
+        assert!(is_edit_tool_name("file_edit"));
+        assert!(is_edit_tool_name("edit_file"));
+        assert!(is_edit_tool_name("write_file"));
+        // The `functions.` transport namespace is stripped first.
+        assert_eq!(canonical_tool_name("functions.Edit"), "edit");
+        assert_eq!(canonical_tool_name("functions.file_write"), "write");
+        // PascalCase OAuth names, including the patch family, resolve.
+        assert_eq!(canonical_tool_name("Write"), "write");
+        assert_eq!(canonical_tool_name("Edit"), "edit");
+        assert!(is_edit_tool_name("Patch"));
+        assert!(is_edit_tool_name("ApplyPatch"));
+    }
+
+    #[test]
+    fn grep_aliases_keep_their_grep_identity() {
+        // `grep`/`file_grep` must not collapse to `agentgrep` on the display
+        // side, because the summary arm keys off the `grep` identity (and reads
+        // `pattern`), while `agentgrep` reads `query`.
+        assert_eq!(canonical_tool_name("grep"), "grep");
+        assert_eq!(canonical_tool_name("file_grep"), "grep");
+        assert_eq!(canonical_tool_name("Grep"), "grep");
+        assert_eq!(canonical_tool_name("functions.file_grep"), "grep");
+        assert_eq!(canonical_tool_name("agentgrep"), "agentgrep");
     }
 
     #[test]

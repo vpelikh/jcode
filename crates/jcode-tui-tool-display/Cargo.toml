@@ -6,3 +6,4 @@ publish = false
 
 [dependencies]
 unicode-width = "0.2"
+jcode-tool-types = { path = "../jcode-tool-types" }

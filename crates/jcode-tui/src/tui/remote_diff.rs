@@ -3,6 +3,8 @@ use similar::TextDiff;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use super::ui::tools_ui;
+
 /// Tracks a pending file edit for diff generation.
 pub(crate) struct PendingFileDiff {
     pub(crate) file_path: String,
@@ -34,14 +36,11 @@ impl RemoteDiffTracker {
 
     pub(crate) fn handle_tool_exec(&mut self, id: &str, name: &str) {
         if show_diffs_enabled()
-            && matches!(
-                crate::tui::ui::tools_ui::canonical_tool_name(name),
-                "edit" | "write" | "multiedit"
-            )
+            && tools_ui::is_edit_tool_name(name)
             && let Ok(input) = serde_json::from_str::<Value>(&self.current_tool_input)
-            && let Some(file_path) = input.get("file_path").and_then(|v| v.as_str())
+            && let Some(file_path) = edit_tool_file_path(name, &input)
         {
-            let resolved = resolve_diff_path(file_path);
+            let resolved = resolve_diff_path(&file_path);
             let original = std::fs::read_to_string(&resolved).unwrap_or_default();
             self.pending_diffs.insert(
                 id.to_string(),
@@ -75,6 +74,28 @@ impl RemoteDiffTracker {
         self.current_tool_id = None;
         self.current_tool_name = None;
         self.current_tool_input.clear();
+    }
+}
+
+/// Resolve the target file for an edit-family tool call.
+///
+/// `edit`/`write`/`multiedit` carry `file_path` directly. `patch` and
+/// `apply_patch` carry only `patch_text`, so their primary path is extracted
+/// instead of silently producing no diff.
+fn edit_tool_file_path(name: &str, input: &Value) -> Option<String> {
+    if let Some(path) = input
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .filter(|p| !p.trim().is_empty())
+    {
+        return Some(path.to_string());
+    }
+
+    let patch_text = input.get("patch_text").and_then(|v| v.as_str())?;
+    match tools_ui::canonical_tool_name(name) {
+        "apply_patch" => tools_ui::extract_apply_patch_primary_file(patch_text),
+        "patch" => tools_ui::extract_unified_patch_primary_file(patch_text),
+        _ => None,
     }
 }
 
@@ -118,4 +139,88 @@ pub(crate) fn generate_unified_diff(old: &str, new: &str, file_path: &str) -> St
     }
 
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RemoteDiffTracker, edit_tool_file_path};
+    use serde_json::json;
+
+    #[test]
+    fn remote_tracker_captures_diff_for_aliased_edit_tool() {
+        // Drive the real public interface: start -> input -> exec -> finish.
+        // An aliased edit tool must still produce a unified diff for the file,
+        // exercising is_edit_tool_name and the path resolver end to end.
+        let dir = std::env::temp_dir().join(format!("jcode-rdiff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("demo.txt");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let path_str = path.to_string_lossy().to_string();
+
+        let mut tracker = RemoteDiffTracker::default();
+        tracker.handle_tool_start("t1", "file_edit");
+        tracker.handle_tool_input(&json!({ "file_path": path_str }).to_string());
+        tracker.handle_tool_exec("t1", "file_edit");
+
+        // The tool would rewrite the file; emulate the post-edit content.
+        std::fs::write(&path, "one\nTWO\n").unwrap();
+        let rendered = tracker.finish_tool("t1", "file_edit", "done");
+
+        assert!(
+            rendered.contains("-two") && rendered.contains("+TWO"),
+            "aliased remote edit did not produce a diff: {rendered:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolves_file_path_for_direct_edit_tools() {
+        let input = json!({ "file_path": "src/lib.rs" });
+        assert_eq!(
+            edit_tool_file_path("edit", &input).as_deref(),
+            Some("src/lib.rs")
+        );
+        // Aliases resolve to the same direct-path behavior.
+        assert_eq!(
+            edit_tool_file_path("file_edit", &input).as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            edit_tool_file_path("write_file", &input).as_deref(),
+            Some("src/lib.rs")
+        );
+    }
+
+    #[test]
+    fn resolves_patch_text_primary_file_for_patch_tools() {
+        let apply = json!({
+            "patch_text": "*** Begin Patch\n*** Update File: crates/a/src/lib.rs\n@@\n-old\n+new\n*** End Patch\n"
+        });
+        assert_eq!(
+            edit_tool_file_path("apply_patch", &apply).as_deref(),
+            Some("crates/a/src/lib.rs")
+        );
+
+        let unified = json!({ "patch_text": "--- a/src/f.rs\n+++ b/src/f.rs\n@@\n-old\n+new\n" });
+        assert_eq!(
+            edit_tool_file_path("patch", &unified).as_deref(),
+            Some("src/f.rs")
+        );
+    }
+
+    #[test]
+    fn returns_none_without_a_resolvable_path() {
+        assert_eq!(edit_tool_file_path("edit", &json!({})), None);
+        assert_eq!(edit_tool_file_path("apply_patch", &json!({})), None);
+        assert_eq!(
+            edit_tool_file_path("patch", &json!({ "patch_text": "no headers here" })),
+            None
+        );
+        // A blank file_path must not shadow the patch_text fallback.
+        assert_eq!(
+            edit_tool_file_path("edit", &json!({ "file_path": "  " })),
+            None
+        );
+    }
 }

@@ -4349,6 +4349,45 @@ fn render_edit_inline_shows_line_number_gutters_from_embedded_diff() {
 }
 
 #[test]
+fn render_edit_inline_shows_gutters_for_provider_aliased_edit_tool() {
+    // Regression: a provider can name the edit tool `file_edit`/`edit_file`.
+    // These aliases must canonicalize to `edit` so the inline diff gutter still
+    // renders; otherwise the whole numbered diff silently disappears.
+    for alias in ["file_edit", "edit_file", "Edit", "functions.Edit"] {
+        let msg = DisplayMessage {
+            role: "tool".to_string(),
+            content: "Edited demo.txt\n2- two\n2+ TWO".to_string(),
+            tool_calls: Vec::new(),
+            duration_secs: None,
+            title: Some("demo.txt".to_string()),
+            tool_data: Some(crate::message::ToolCall {
+                id: format!("call_edit_alias_{alias}").into(),
+                name: alias.to_string(),
+                input: serde_json::json!({ "file_path": "demo.txt" }),
+                intent: None,
+                thought_signature: None,
+            }),
+        };
+
+        let lines = render_tool_message(&msg, 100, crate::config::DiffDisplayMode::Inline);
+        let plain = lines
+            .iter()
+            .map(extract_line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let has_del = lines
+            .iter()
+            .any(|l| extract_line_text(l).contains("2- two"));
+        let has_add = lines
+            .iter()
+            .any(|l| extract_line_text(l).contains("2+ TWO"));
+        assert!(has_del, "no deletion gutter: {alias} {plain}");
+        assert!(has_add, "no addition gutter: {alias} {plain}");
+    }
+}
+
+#[test]
 fn render_edit_inline_strips_config_notice_bullets() {
     // Editing ~/.jcode/config.toml appends a config-change notice whose
     // markdown bullets ("- `key`: old -> new") must not leak into the diff as

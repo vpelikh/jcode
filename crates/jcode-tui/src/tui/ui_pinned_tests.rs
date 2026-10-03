@@ -997,3 +997,32 @@ fn render_side_panel_linked_file_missing_file_falls_back_to_snapshot_content() {
         text
     );
 }
+
+#[test]
+fn pinned_diff_collected_for_provider_aliased_edit_tool() {
+    // The pinned (side-pane) diff list is gated on the same edit-tool
+    // classification as the inline gutter. A provider alias such as
+    // `file_edit`/`edit_file` must still produce a pinned Diff entry, otherwise
+    // the alias silently drops the diff from the side pane too.
+    let msg_with = |name: &str| {
+        crate::tui::DisplayMessage::tool(
+            "Edited demo.txt\n2- two\n2+ TWO".to_string(),
+            crate::message::ToolCall {
+                id: format!("call_pinned_{name}").into(),
+                name: name.to_string(),
+                input: serde_json::json!({ "file_path": "demo.txt" }),
+                intent: None,
+                thought_signature: None,
+            },
+        )
+    };
+
+    for alias in ["edit", "file_edit", "edit_file", "functions.Edit"] {
+        let messages = vec![msg_with(alias)];
+        let entries = collect_pinned_content(&messages, &[], true, false);
+        let has_diff = entries
+            .iter()
+            .any(|e| matches!(e, PinnedContentEntry::Diff { .. }));
+        assert!(has_diff, "alias {alias} dropped the pinned diff");
+    }
+}

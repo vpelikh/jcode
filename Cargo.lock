@@ -5712,6 +5712,7 @@ dependencies = [
 name = "jcode-tui-tool-display"
 version = "0.1.0"
 dependencies = [
+ "jcode-tool-types",
  "unicode-width",
 ]
 
