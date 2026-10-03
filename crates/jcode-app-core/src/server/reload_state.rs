@@ -682,7 +682,22 @@ pub(super) fn reload_signal() -> &'static ReloadSignalChannel {
 #[cfg(test)]
 pub(crate) fn subscribe_reload_signal_for_tests()
 -> tokio::sync::watch::Receiver<Option<ReloadSignal>> {
+    // The signal and ack channels are process globals that are never reset in
+    // production. Across tests in one binary a prior test can leave a signal
+    // value behind; a test that acknowledges whatever it reads would then ack
+    // that stale signal and never see its own. Clear both so a subscriber
+    // always starts from a clean channel. (`send_replace` works with no live
+    // receivers, unlike `send`.)
+    reset_reload_channels_for_tests();
     reload_signal().1.clone()
+}
+
+/// Test-only: clear the global reload signal and ack channels so subscribers
+/// start from a clean state.
+#[cfg(test)]
+pub(crate) fn reset_reload_channels_for_tests() {
+    reload_signal().0.send_replace(None);
+    reload_ack().0.send_replace(None);
 }
 
 pub(super) fn reload_ack() -> &'static ReloadAckChannel {
