@@ -1887,6 +1887,48 @@ fn anthropic_fallback_honors_server_recommendation() {
 }
 
 #[test]
+fn anthropic_recommendation_sentence_boundary_keeps_minor_version() {
+    // The model version is written with a dot ("Opus 4.8"), so the scan must
+    // only treat a '.' as a sentence end when it is not a decimal between
+    // digits. A trailing period after the version still ends the message.
+    let _guard = jcode_base::storage::lock_test_env();
+    jcode_base::provider::models::reset_model_catalog_services_for_tests();
+
+    // Trailing period right after the version: the version survives.
+    let trailing = "claude fable 5 is not available. please use opus 4.8.";
+    assert_eq!(
+        anthropic_recommended_model_from_error(trailing)
+            .map(|m| AnthropicProvider::normalized_model_key(&m)),
+        Some("claude-opus-4-8".to_string()),
+        "a trailing sentence period must not truncate the version"
+    );
+
+    // Mid-message decimal followed by a real boundary and extra prose.
+    let prose = "please use opus 4.8. learn more at docs";
+    assert_eq!(
+        anthropic_recommended_model_from_error(prose)
+            .map(|m| AnthropicProvider::normalized_model_key(&m)),
+        Some("claude-opus-4-8".to_string()),
+        "the decimal is not a boundary; the following period is"
+    );
+
+    // A hard boundary (!) and a newline also terminate the hint.
+    assert_eq!(
+        anthropic_recommended_model_from_error("please use opus 4.8! extra")
+            .map(|m| AnthropicProvider::normalized_model_key(&m)),
+        Some("claude-opus-4-8".to_string())
+    );
+    assert_eq!(
+        anthropic_recommended_model_from_error("please use opus 4.8\nignored")
+            .map(|m| AnthropicProvider::normalized_model_key(&m)),
+        Some("claude-opus-4-8".to_string())
+    );
+
+    // Empty hint after the phrase -> None, not a panic.
+    assert!(anthropic_recommended_model_from_error("please use ").is_none());
+}
+
+#[test]
 fn anthropic_quality_rank_orders_opus_before_haiku_and_retired_last() {
     let opus = anthropic_model_quality_rank("claude-opus-4-8");
     let sonnet = anthropic_model_quality_rank("claude-sonnet-4-6");
