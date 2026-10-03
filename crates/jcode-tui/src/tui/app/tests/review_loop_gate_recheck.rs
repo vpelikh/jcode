@@ -1195,10 +1195,28 @@ fn idle_self_drive_debounces_rapid_repeats() {
     with_temp_jcode_home(|| {
         let mut app = create_test_app();
 
-        // A live loop with a reviewer still pending (no verdict yet).
+        // A live loop with a reviewer session that exists but has not emitted a
+        // verdict yet. It must be a real saved session: a nonexistent id makes
+        // `poll_loop_reviewer` report the reviewer as Gone, which finalizes the
+        // loop (respawn count exhausted) and returns false instead of stepping
+        // it as pending.
+        let mut reviewer = crate::session::Session::create(None, None);
+        let reviewer_id = reviewer.id.clone();
+        // A real transcript line is required: `save()` lazily skips a session
+        // with no state and no non-placeholder message, so a bare fresh session
+        // never reaches disk and would load as Gone.
+        reviewer.add_message_with_display_role(
+            crate::message::Role::User,
+            vec![crate::message::ContentBlock::Text {
+                text: "Reviewing the current lens (no verdict yet).".to_string(),
+                cache_control: None,
+            }],
+            None,
+        );
+        reviewer.save().expect("save pending reviewer session");
         let mut state = jcode_session_types::ReviewLoopState::new();
         super::review_loop::enter_review_loop(&mut state);
-        state.active_reviewer_id = Some("session_reviewer_pending".to_string());
+        state.active_reviewer_id = Some(reviewer_id.clone());
         app.session.review_loop = Some(state);
         app.is_processing = false;
         app.pending_queued_dispatch = false;
@@ -1214,10 +1232,21 @@ fn idle_self_drive_debounces_rapid_repeats() {
         assert!(!second, "second idle poll within the debounce window must be suppressed");
 
         // A fresh App (its own debounce clock) polls immediately.
+        let mut reviewer2 = crate::session::Session::create(None, None);
+        let reviewer2_id = reviewer2.id.clone();
+        reviewer2.add_message_with_display_role(
+            crate::message::Role::User,
+            vec![crate::message::ContentBlock::Text {
+                text: "Reviewing the current lens (no verdict yet).".to_string(),
+                cache_control: None,
+            }],
+            None,
+        );
+        reviewer2.save().expect("save pending reviewer session");
         let mut app2 = create_test_app();
         let mut state2 = jcode_session_types::ReviewLoopState::new();
         super::review_loop::enter_review_loop(&mut state2);
-        state2.active_reviewer_id = Some("creator_reviewer_pending".to_string());
+        state2.active_reviewer_id = Some(reviewer2_id);
         app2.session.review_loop = Some(state2);
         app2.is_processing = false;
         app2.pending_queued_dispatch = false;
