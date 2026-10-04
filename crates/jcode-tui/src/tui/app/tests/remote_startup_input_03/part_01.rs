@@ -863,6 +863,25 @@ fn test_startup_update_up_to_date_removes_transient_card() {
 }
 
 #[test]
+fn test_startup_update_skipped_stays_quiet() {
+    let mut app = create_test_app();
+
+    app.handle_update_status(UpdateStatus::Checking);
+    // The exact value the update check publishes for a comparison-only baseline.
+    app.handle_update_status(UpdateStatus::skipped_manual_pull_source_update());
+
+    assert!(
+        app.display_messages()
+            .iter()
+            .all(|message| message.title.as_deref() != Some("Update")),
+        "a skipped source check must not surface an update card"
+    );
+    assert!(app.status_notice().is_none());
+    assert!(app.background_client_action.is_none());
+    assert!(app.pending_background_client_reload.is_none());
+}
+
+#[test]
 fn test_startup_update_diverged_offers_merge_without_failure_card() {
     let mut app = create_test_app();
 

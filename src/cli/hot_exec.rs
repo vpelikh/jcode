@@ -286,6 +286,13 @@ pub fn can_auto_update_source() -> bool {
         .is_some_and(update::source_can_auto_update)
 }
 
+/// [`can_auto_update_source`] for an explicit checkout, so the check can be
+/// exercised against git fixtures.
+#[cfg(test)]
+pub(super) fn can_auto_update_source_at(repo_dir: &std::path::Path) -> bool {
+    update::source_can_auto_update(repo_dir)
+}
+
 pub(super) fn source_update_available(repo_dir: &std::path::Path) -> Option<bool> {
     let (_, reference) = source_update_baseline(repo_dir)?;
     let behind = ProcessCommand::new("git")
@@ -309,11 +316,16 @@ pub(super) fn source_update_available(repo_dir: &std::path::Path) -> Option<bool
 /// fast-forward pull (and therefore auto-update) can never succeed. Returns
 /// `None` when the repo or upstream cannot be inspected.
 pub fn local_commits_ahead_of_upstream() -> Option<bool> {
-    let repo_dir = get_repo_dir()?;
-    let (_, reference) = source_update_baseline(&repo_dir)?;
+    local_commits_ahead_of(&get_repo_dir()?)
+}
+
+/// [`local_commits_ahead_of_upstream`] for an explicit checkout, so the
+/// comparison can be exercised against git fixtures.
+pub(super) fn local_commits_ahead_of(repo_dir: &std::path::Path) -> Option<bool> {
+    let (_, reference) = source_update_baseline(repo_dir)?;
     let ahead = ProcessCommand::new("git")
         .args(["rev-list", "--count", &format!("{reference}..HEAD")])
-        .current_dir(&repo_dir)
+        .current_dir(repo_dir)
         .output()
         .ok()?;
     if !ahead.status.success() {

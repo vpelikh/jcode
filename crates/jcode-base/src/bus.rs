@@ -364,7 +364,28 @@ pub enum UpdateStatus {
         version: String,
     },
     UpToDate,
+    /// Automatic checks are not applicable to this checkout, e.g. a branch whose
+    /// only baseline is an unrelated ref or a detached HEAD. Reported for a
+    /// manual pull rather than as an installable update, since `/update` cannot
+    /// fast-forward it.
+    Skipped {
+        reason: String,
+    },
     Error(String),
+}
+
+impl UpdateStatus {
+    /// The [`UpdateStatus::Skipped`] surface for a source checkout whose only
+    /// comparison baseline is unrelated to `HEAD` (or a detached HEAD), so
+    /// `/update` cannot fast-forward it.
+    ///
+    /// This is the single production constructor for that case, so the UI can be
+    /// tested against the exact value the update check publishes.
+    pub fn skipped_manual_pull_source_update() -> Self {
+        Self::Skipped {
+            reason: "checkout cannot be fast-forwarded; pull manually".to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

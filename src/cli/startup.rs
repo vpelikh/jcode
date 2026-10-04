@@ -411,51 +411,78 @@ fn spawn_background_update_check(args: &Args) {
             Bus::global().publish(BusEvent::UpdateStatus(UpdateStatus::Checking));
             let status = source_update_check_status(hot_exec::check_for_updates());
             if matches!(status, UpdateStatus::Available { .. }) {
-                // A checkout with local commits can never fast-forward, so the
-                // pull below would always fail and surface a noisy "Update
-                // diverged. Press Ctrl+Y..." card in every new session.
-                // Developers with local work expect divergence; log it once
-                // and stay quiet in the UI (no Available/Error cards).
-                if hot_exec::local_commits_ahead_of_upstream() == Some(true) {
-                    logging::info(
-                        "Auto-update skipped: local commits are ahead of upstream (diverged). \
-                         Merge or rebase manually when ready.",
-                    );
-                    Bus::global().publish(BusEvent::UpdateStatus(UpdateStatus::UpToDate));
-                } else if !hot_exec::can_auto_update_source() {
-                    // Detached HEAD (or a checkout with no resolvable baseline)
-                    // cannot be fast-forwarded; report the update and let the
-                    // user pull manually.
-                    logging::info(
-                        "Update available but the checkout cannot be fast-forwarded automatically; \
-                         pull manually to update.",
-                    );
-                    Bus::global().publish(BusEvent::UpdateStatus(status));
-                } else {
-                    Bus::global().publish(BusEvent::UpdateStatus(status));
-                    if auto_update {
-                        logging::info("Update available - auto-updating...");
-                        Bus::global().publish(BusEvent::UpdateStatus(UpdateStatus::Installing {
-                            version: "latest source".to_string(),
-                        }));
-                        if let Err(e) = hot_exec::run_auto_update() {
-                            Bus::global().publish(BusEvent::UpdateStatus(UpdateStatus::Error(
-                                e.to_string(),
-                            )));
-                            logging::error(&format!(
-                                "Auto-update failed: {}. Continuing with current version.",
-                                e
-                            ));
-                        }
-                    } else {
+                let action = source_update_action(
+                    hot_exec::can_auto_update_source(),
+                    hot_exec::local_commits_ahead_of_upstream(),
+                );
+                // The user-visible surface for the decision; computed by the
+                // same function the UI-facing test pins.
+                let published = source_update_publish_status(action, &status);
+                match action {
+                    // Detached HEAD, or a checkout whose only baseline is an
+                    // unrelated ref (for example the remote default branch on a
+                    // branch with no counterpart), cannot be fast-forwarded;
+                    // report the update and let the user pull manually. This
+                    // must be checked before divergence: an auto-updatable
+                    // branch is the only kind whose divergence is meaningful,
+                    // and a comparison-only baseline would otherwise swallow
+                    // the report as a false "diverged".
+                    SourceUpdateAction::ManualPull => {
+                        // The comparison baseline is only useful for reporting:
+                        // `/update` cannot fast-forward this checkout, so do not
+                        // publish `Available` (it offers an install that would
+                        // fail). Report it as a skipped check and stay quiet.
                         logging::info(
-                            "Update available! Run `jcode update` or `/reload` to update.",
+                            "Source update check skipped: the checkout cannot be fast-forwarded \
+                             automatically; pull manually to update.",
                         );
+                        Bus::global().publish(BusEvent::UpdateStatus(published));
+                    }
+                    // A checkout with local commits can never fast-forward, so
+                    // the pull below would always fail and surface a noisy
+                    // "Update diverged. Press Ctrl+Y..." card in every new
+                    // session. Developers with local work expect divergence; log
+                    // it once and stay quiet in the UI (no Available/Error
+                    // cards).
+                    SourceUpdateAction::Diverged => {
+                        logging::info(
+                            "Auto-update skipped: local commits are ahead of upstream (diverged). \
+                             Merge or rebase manually when ready.",
+                        );
+                        Bus::global().publish(BusEvent::UpdateStatus(published));
+                    }
+                    SourceUpdateAction::Update => {
+                        Bus::global().publish(BusEvent::UpdateStatus(published));
+                        if auto_update {
+                            logging::info("Update available - auto-updating...");
+                            Bus::global().publish(BusEvent::UpdateStatus(
+                                UpdateStatus::Installing {
+                                    version: "latest source".to_string(),
+                                },
+                            ));
+                            if let Err(e) = hot_exec::run_auto_update() {
+                                Bus::global().publish(BusEvent::UpdateStatus(UpdateStatus::Error(
+                                    e.to_string(),
+                                )));
+                                logging::error(&format!(
+                                    "Auto-update failed: {}. Continuing with current version.",
+                                    e
+                                ));
+                            }
+                        } else {
+                            logging::info(
+                                "Update available! Run `jcode update` or `/reload` to update.",
+                            );
+                        }
                     }
                 }
             } else {
-                if let UpdateStatus::Error(message) = &status {
-                    logging::info(message);
+                match &status {
+                    UpdateStatus::Error(message) => logging::info(message),
+                    UpdateStatus::Skipped { reason } => {
+                        logging::info(&format!("Source update check skipped: {reason}"));
+                    }
+                    _ => {}
                 }
                 Bus::global().publish(BusEvent::UpdateStatus(status));
             }
@@ -465,6 +492,70 @@ fn spawn_background_update_check(args: &Args) {
                 start.elapsed().as_millis()
             ));
         });
+    }
+}
+
+/// What to do when a source update is available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceUpdateAction {
+    /// A fast-forward target exists and the branch is not diverged: report the
+    /// update (and auto-install it when requested).
+    Update,
+    /// The checkout cannot be fast-forwarded (detached HEAD, or a
+    /// comparison-only baseline such as the remote default branch on a branch
+    /// with no counterpart). Report it as a skipped check so the user can pull
+    /// manually, rather than as an installable update.
+    ManualPull,
+    /// The checkout can be fast-forwarded but has local commits ahead of its
+    /// upstream, so any pull would fail. Stay quiet in the UI.
+    Diverged,
+}
+
+/// Decide how to handle an available source update.
+///
+/// `can_auto_update` and `local_commits_ahead` come from
+/// [`hot_exec::can_auto_update_source`] and
+/// [`hot_exec::local_commits_ahead_of_upstream`] respectively.
+///
+/// The manual-pull case is checked first: a checkout with no fast-forward
+/// target has no meaningful relationship to its comparison baseline, so
+/// treating its local commits as "diverged" would silently swallow a real
+/// update. Divergence only suppresses the UI when a fast-forward was actually
+/// possible.
+fn source_update_action(
+    can_auto_update: bool,
+    local_commits_ahead: Option<bool>,
+) -> SourceUpdateAction {
+    if !can_auto_update {
+        SourceUpdateAction::ManualPull
+    } else if local_commits_ahead == Some(true) {
+        SourceUpdateAction::Diverged
+    } else {
+        SourceUpdateAction::Update
+    }
+}
+
+/// The status published to the UI for a decided update [`SourceUpdateAction`].
+///
+/// This is the single production mapping from the internal decision to the
+/// user-visible surface, so the UI-facing contract can be pinned by a test:
+///
+/// - `Update` publishes the original `Available` (or install when auto-update).
+/// - `Diverged` publishes `UpToDate`: the pull would fail, so stay quiet.
+/// - `ManualPull` publishes `Skipped`: `/update` cannot fast-forward a
+///   comparison-only baseline, so offering `Available` would promise an install
+///   that is guaranteed to fail. The UI renders `Skipped` as quietly as
+///   `UpToDate`.
+fn source_update_publish_status(
+    action: SourceUpdateAction,
+    available: &crate::bus::UpdateStatus,
+) -> crate::bus::UpdateStatus {
+    use crate::bus::UpdateStatus;
+
+    match action {
+        SourceUpdateAction::Update => available.clone(),
+        SourceUpdateAction::Diverged => UpdateStatus::UpToDate,
+        SourceUpdateAction::ManualPull => UpdateStatus::skipped_manual_pull_source_update(),
     }
 }
 
@@ -540,6 +631,177 @@ mod tests {
         };
         assert!(message.contains("unable to compare the source checkout with its upstream"));
         assert!(message.contains("git fetch may have failed"));
+    }
+
+    /// A comparison-only baseline (no fast-forward target) reports for a manual
+    /// pull even when the checkout has local commits; divergence must not
+    /// swallow the report.
+    #[test]
+    fn comparison_only_baseline_reports_manual_pull_even_when_ahead() {
+        assert_eq!(
+            source_update_action(false, Some(true)),
+            SourceUpdateAction::ManualPull
+        );
+        assert_eq!(
+            source_update_action(false, Some(false)),
+            SourceUpdateAction::ManualPull
+        );
+        assert_eq!(
+            source_update_action(false, None),
+            SourceUpdateAction::ManualPull
+        );
+    }
+
+    /// A comparison-only baseline must be reported as a skipped check, never as
+    /// an installable `Available` (which `/update` cannot actually apply).
+    #[test]
+    fn manual_pull_reports_skipped_not_available() {
+        let available = source_update_check_status(Some(true));
+        assert!(matches!(available, crate::bus::UpdateStatus::Available { .. }));
+
+        let status = source_update_publish_status(SourceUpdateAction::ManualPull, &available);
+        let crate::bus::UpdateStatus::Skipped { reason } = &status else {
+            panic!("comparison-only baseline must not offer an install: {status:?}");
+        };
+        assert_eq!(
+            reason.as_str(),
+            match crate::bus::UpdateStatus::skipped_manual_pull_source_update() {
+                crate::bus::UpdateStatus::Skipped { reason } => reason,
+                _ => unreachable!(),
+            }
+            .as_str()
+        );
+        assert!(
+            !matches!(status, crate::bus::UpdateStatus::Available { .. }),
+            "a checkout that cannot fast-forward must not be reported as available"
+        );
+
+        // The other decisions keep their expected surfaces.
+        assert!(matches!(
+            source_update_publish_status(SourceUpdateAction::Diverged, &available),
+            crate::bus::UpdateStatus::UpToDate
+        ));
+        assert!(matches!(
+            source_update_publish_status(SourceUpdateAction::Update, &available),
+            crate::bus::UpdateStatus::Available { .. }
+        ));
+    }
+
+    #[test]
+    fn auto_updatable_checkout_with_local_commits_is_diverged() {
+        assert_eq!(
+            source_update_action(true, Some(true)),
+            SourceUpdateAction::Diverged
+        );
+    }
+
+    #[test]
+    fn auto_updatable_checkout_without_local_commits_updates() {
+        assert_eq!(
+            source_update_action(true, Some(false)),
+            SourceUpdateAction::Update
+        );
+        // An indeterminate ahead-count must not block a fast-forwardable update.
+        assert_eq!(source_update_action(true, None), SourceUpdateAction::Update);
+    }
+
+    /// Regression: a worktree-style checkout whose only baseline is the remote
+    /// default branch (no counterpart) with local commits must report for a
+    /// manual pull, not be swallowed as "diverged".
+    #[test]
+    fn worktree_branch_with_local_commits_reports_manual_pull() {
+        let root = tempfile::tempdir().expect("temporary source checkout");
+        let remote = root.path().join("origin.git");
+        let work = root.path().join("work");
+        let git_at = |dir: &std::path::Path, args: &[&str]| {
+            let output = ProcessCommand::new("git")
+                .args([
+                    "-c",
+                    "user.name=Update Test",
+                    "-c",
+                    "user.email=update-test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env(
+                    "GIT_CONFIG_GLOBAL",
+                    if cfg!(windows) { "NUL" } else { "/dev/null" },
+                )
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("run git fixture command");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        std::fs::create_dir_all(&remote).unwrap();
+        git_at(&remote, &["init", "--bare", "-b", "master"]);
+        std::fs::create_dir_all(&work).unwrap();
+        git_at(&work, &["init", "-b", "master"]);
+        git_at(&work, &["commit", "--allow-empty", "-m", "initial"]);
+        git_at(
+            &work,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git_at(&work, &["push", "-q", "-u", "origin", "master"]);
+        git_at(&work, &["fetch", "-q", "origin"]);
+        // Branch with no counterpart: its baseline is origin/master only.
+        git_at(&work, &["checkout", "-q", "-b", "feature"]);
+        git_at(&work, &["commit", "--allow-empty", "-m", "local work"]);
+
+        assert!(!crate::cli::hot_exec::can_auto_update_source_at(&work));
+        assert_eq!(
+            crate::cli::hot_exec::local_commits_ahead_of(&work),
+            Some(true)
+        );
+        assert_eq!(
+            source_update_action(
+                crate::cli::hot_exec::can_auto_update_source_at(&work),
+                crate::cli::hot_exec::local_commits_ahead_of(&work),
+            ),
+            SourceUpdateAction::ManualPull
+        );
+        // The reported surface must be a quiet skip, not an `Available` install
+        // that `/update` cannot apply to this comparison-only baseline.
+        // Advance the unrelated baseline so the check genuinely detects an
+        // update it cannot fast-forward (the reviewer's scenario).
+        let other = root.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        git_at(
+            root.path(),
+            &[
+                "clone",
+                "-q",
+                remote.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        );
+        git_at(&other, &["commit", "-q", "--allow-empty", "-m", "advance"]);
+        git_at(&other, &["push", "-q", "origin", "master"]);
+        git_at(&work, &["fetch", "-q", "origin"]);
+        let available =
+            source_update_check_status(crate::cli::hot_exec::source_update_available(&work));
+        assert!(
+            matches!(available, crate::bus::UpdateStatus::Available { .. }),
+            "the comparison detects that the unrelated baseline advanced"
+        );
+        assert!(!crate::cli::hot_exec::can_auto_update_source_at(&work));
+        // The production decision for this real checkout yields ManualPull, whose
+        // published surface is a quiet skip rather than an installable Available.
+        let action = source_update_action(
+            crate::cli::hot_exec::can_auto_update_source_at(&work),
+            crate::cli::hot_exec::local_commits_ahead_of(&work),
+        );
+        assert!(matches!(
+            source_update_publish_status(action, &available),
+            crate::bus::UpdateStatus::Skipped { .. }
+        ));
     }
 
     #[test]
