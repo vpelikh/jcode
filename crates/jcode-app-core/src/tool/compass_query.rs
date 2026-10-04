@@ -116,8 +116,10 @@ const SHA_INDEX_MAX_KEPT: usize = 3;
 /// * `graph_path` — the `graph.json` inside `<output_dir>/compass-out/`.
 /// * `ast_cache_root` — the branch-agnostic AST-fact digest cache shared across
 ///   all SHAs of the same repo/project, so branch switches rebuild incrementally.
-/// * `build_lock_dir` — the directory used for the flock that serializes builds
-///   sharing the same `output_dir`.
+/// * `build_lock_dir` — the directory for the flock that serializes builds
+///   sharing the same `output_dir`. Must never be `output_dir` or live inside
+///   it: [`discard_stale_output`] removes `output_dir` outright, which would
+///   unlink a held lock file and let a second build race in.
 /// * `is_shared` — true when this is a git-backed per-SHA cache that must decide
 ///   staleness purely by commit SHA (see `index_is_stale`).
 #[derive(Clone)]
@@ -479,14 +481,16 @@ impl Tool for CompassQueryTool {
             None
         } else {
             let cache_edge = cache.clone();
-            let engine_res: std::result::Result<compass_query::CodeQueryEngine, (String, String)> =
-                tokio::task::spawn_blocking({
-                    let edge = cache_edge.clone();
-                    let working_dir = working_dir.clone();
-                    move || ensure_fresh_engine(&edge, &working_dir)
-                })
-                .await
-                .expect("compass index task panicked");
+            let engine_res: std::result::Result<
+                Arc<Mutex<compass_query::CodeQueryEngine>>,
+                (String, String),
+            > = tokio::task::spawn_blocking({
+                let edge = cache_edge.clone();
+                let working_dir = working_dir.clone();
+                move || acquire_fresh_engine(&edge, &working_dir)
+            })
+            .await
+            .expect("compass index task panicked");
             match engine_res {
                 Ok(engine) => Some(engine),
                 Err((open_err, build_err)) => {
@@ -496,9 +500,25 @@ impl Tool for CompassQueryTool {
                 }
             }
         };
+        // Hold the engine's lock across the query so a concurrent query on the
+        // same project cannot use the engine's single SQLite connection at the
+        // same time (`Connection` is `Send` but not `Sync`).
+        //
+        // Deliberate trade-off: `execute_query` is synchronous, so this holds a
+        // `std::sync::Mutex` (not a tokio lock) across it on the caller's task.
+        // No `.await` is held across the guard, so there is no deadlock, and the
+        // guard is recovered from poison (see `lock_engine`). The consequence is
+        // that a slow query serializes *same-project* queries and briefly occupies
+        // one async worker; that is accepted because (a) the whole point of the
+        // engine cache is to make a warm query cheap, and (b) the pre-cache code
+        // paid a full `open()` (per-open `integrity_check` + materialization,
+        // measured ~5s on a 596MB index) per query under the project flock, so the
+        // serialized critical section is strictly shorter than before. Distinct
+        // projects use distinct engines and do not contend here.
+        let engine_guard = engine.as_ref().map(|e| lock_engine(e));
 
         let result = execute_query(
-            engine.as_ref(),
+            engine_guard.as_deref(),
             mode,
             &params,
             effective_limit,
@@ -563,9 +583,13 @@ fn resolve_compass_cache(working_dir: &Path) -> CompassCachePaths {
         // inside the working dir so the tool still functions.
         let output_dir = working_dir.join(".jcode/cache/compass");
         let graph_path = output_dir.join("compass-out/graph.json");
+        // Lock in the parent (`.../.jcode/cache`), not inside `output_dir`:
+        // `discard_stale_output` removes `output_dir` outright, which would
+        // unlink a lock file living inside it and let a waiting thread lock a
+        // fresh inode concurrently.
         return CompassCachePaths {
             ast_cache_root: output_dir.join(AST_CACHE_DIR),
-            build_lock_dir: output_dir.clone(),
+            build_lock_dir: working_dir.join(".jcode/cache"),
             output_dir,
             graph_path,
             is_shared: false,
@@ -598,9 +622,16 @@ fn resolve_compass_cache(working_dir: &Path) -> CompassCachePaths {
         // folder), single graph, branch-agnostic AST cache.
         let output_dir = project_root.join("workspace");
         let graph_path = output_dir.join("compass-out/graph.json");
+        // Lock at the *project root*, not `output_dir`: a stale rebuild calls
+        // `discard_stale_output`, which `remove_dir_all`s `output_dir`. If the
+        // flock file lived inside it, that removal would unlink the lock file
+        // while a thread still holds the flock, letting the next thread create a
+        // fresh lock file (new inode) and enter the build critical section
+        // concurrently. The git layout already locks at `project_root` for the
+        // same reason.
         CompassCachePaths {
+            build_lock_dir: project_root.clone(),
             ast_cache_root,
-            build_lock_dir: output_dir.clone(),
             output_dir,
             graph_path,
             is_shared: false,
@@ -801,6 +832,11 @@ where
         use std::os::fd::AsRawFd;
 
         let lock_path = cache_dir.join(".compass-build.lock");
+        // The lock file lives beside (not inside) the per-SHA/workspace output
+        // dir, so `cache_dir` may not exist yet on a cold build. Create it so
+        // the flock is actually taken; a failed open would silently run `f`
+        // unguarded and reintroduce the concurrent-build race.
+        let _ = std::fs::create_dir_all(cache_dir);
         if let Ok(file) = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -1084,7 +1120,7 @@ fn git_repo_identity(working_dir: &Path) -> Option<String> {
 /// the walk descends through them.
 ///
 /// Callers should gate this behind `recently_scanned`/`record_scan` so the walk
-/// does not run on every query (see `ensure_fresh_engine`): within
+/// does not run on every query (see `ensure_engine_under_lock`): within
 /// `STALE_RESCAN_TTL` of a verified-fresh scan we reuse the index without re-walking.
 ///
 /// `shared` selects shared-cache semantics. A shared index is keyed strictly by
@@ -1169,61 +1205,267 @@ fn index_is_stale(
     false
 }
 
-/// Open the Compass engine for `graph_path`, building (or rebuilding) it under a
-/// project flock when it is missing, corrupt, stale, or on a different branch.
-/// Returns the engine, or `(open_err, build_err)` describing why neither an open
-/// nor a build succeeded.
+/// Test-only convenience: open (or build) the engine straight from the project
+/// flock without the process engine cache. Production goes through
+/// [`acquire_fresh_engine`], which adds the cross-query engine cache.
 ///
 /// Staleness is checked *before* an opened engine is trusted: a valid-but-old
-/// index must not be served. Both the open probe and any rebuild run inside
+/// index must not be served. The open probe and any rebuild run inside
 /// `with_build_lock`, which serializes concurrent/stale rebuilds so two parallel
 /// calls can't write `graph.json` at once.
+#[cfg(test)]
 fn ensure_fresh_engine(
+    cache: &CompassCachePaths,
+    working_dir: &Path,
+) -> std::result::Result<compass_query::CodeQueryEngine, (String, String)> {
+    with_build_lock(&cache.build_lock_dir, || {
+        ensure_engine_under_lock(cache, working_dir)
+    })
+}
+
+/// Open (or build) the engine for `cache`. Callers must already hold the
+/// project's `.compass-build.lock` flock (via [`with_build_lock`]); this helper
+/// exists so [`acquire_fresh_engine`] can re-check its process cache while
+/// holding that lock without nesting `with_build_lock` (which would deadlock on
+/// the same project flock).
+fn ensure_engine_under_lock(
     cache: &CompassCachePaths,
     working_dir: &Path,
 ) -> std::result::Result<compass_query::CodeQueryEngine, (String, String)> {
     let graph_path = &cache.graph_path;
     let output_dir = &cache.output_dir;
+    // Clear any orphaned code-query build lock/temp from a previously killed
+    // or panicked build before opening. Compass's `open()` cannot recover
+    // from its own left-behind `index.lock` and would otherwise wedge with
+    // `query_index_lock_timeout` forever; holding the project flock here
+    // guarantees no live build owns it.
+    recover_orphaned_code_query_builds(output_dir);
+    // Decide freshness without opening the engine: `index_is_fresh` uses the
+    // git SHA sidecar and a throttled mtime walk, so opening a stale index
+    // first would pay the (large) open only to discard it and rebuild.
+    // Gate on the graph existing because `index_is_fresh` reports "fresh"
+    // for a missing index.
+    if graph_path.is_file() && index_is_fresh(cache, working_dir) {
+        // Fresh on disk: open and return. A fresh-but-unopenable index is a
+        // corrupt artifact, so fall through to rebuild rather than erroring.
+        if let Ok(engine) = compass_query::open(graph_path, None, output_dir) {
+            return Ok(engine);
+        }
+    }
+    // Missing, corrupt, or stale.
+    discard_stale_output(cache);
+    rebuild_stale_index(cache, working_dir)?;
+    compass_query::open(graph_path, None, output_dir).map_err(|e| {
+        (
+            "existing index missing or stale".to_string(),
+            format!("Index was built but could not be opened: {e}"),
+        )
+    })
+}
+
+/// A process-global cache of opened Compass query engines, keyed by the cache
+/// `output_dir` together with the `graph.json` mtime it was opened from.
+///
+/// Opening a `CodeQueryEngine` is expensive even when the index is already
+/// fresh: Compass runs `PRAGMA integrity_check` on the (often hundreds-of-MB)
+/// code-query SQLite index (measured ~5s on a 596 MB index) and materializes
+/// its adjacency/lookup indexes. This happens at least once per query and, for
+/// the JSON backend, twice. Reusing the opened engine across queries in the
+/// daemon removes that per-query cost, which is what made a warm `compass_query`
+/// block for tens of seconds and pin the shared server at ~100% CPU.
+///
+/// Keying on the `graph.json` mtime means a rebuilt index transparently misses
+/// and re-opens; an unchanged graph reuses the engine even if the code-query
+/// SQLite file was touched by an unrelated read.
+///
+/// The engine is held behind its own `Mutex` because its `rusqlite::Connection`
+/// is `Send` but not `Sync`; the lock also serializes concurrent queries for one
+/// project (each query is fast, and this matches the prior per-query open cost).
+///
+/// The cache is bounded to [`ENGINE_CACHE_MAX`] projects, evicting the
+/// least-recently-used entry. A materialized engine retains the full graph in
+/// memory (hundreds of MB on a large repo), so unbounded retention in a
+/// long-lived daemon that visits many projects would be a leak.
+type EngineCacheKey = (PathBuf, GraphFingerprint);
+static ENGINE_CACHE: OnceLock<Mutex<HashMap<EngineCacheKey, CachedEngine>>> = OnceLock::new();
+
+/// Identity of the on-disk `graph.json` an engine was opened from.
+///
+/// `(mtime, size)` rather than mtime alone: the warm fast path never opens the
+/// index, so a rebuild that rewrote `graph.json` within the same filesystem
+/// mtime tick would otherwise reuse the prior engine and serve a stale graph.
+/// The size component makes that coincidence vanishingly unlikely (a rebuild
+/// almost never preserves the exact byte length) without hashing a file that can
+/// be hundreds of MB. This is strictly stronger than the sibling `GRAPH_CACHE`,
+/// which keys on mtime only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct GraphFingerprint {
+    mtime: SystemTime,
+    size: u64,
+}
+
+/// Read the fingerprint of `graph_path`, or `None` if it cannot be stat'd (e.g.
+/// it does not exist yet). Uses the same metadata call for both fields so a
+/// concurrent rewrite cannot yield a torn `(mtime, size)` pair.
+fn graph_fingerprint(graph_path: &Path) -> Option<GraphFingerprint> {
+    let meta = std::fs::metadata(graph_path).ok()?;
+    let mtime = meta.modified().ok()?;
+    Some(GraphFingerprint {
+        mtime,
+        size: meta.len(),
+    })
+}
+
+struct CachedEngine {
+    handle: Arc<Mutex<compass_query::CodeQueryEngine>>,
+    /// Monotonic access stamp; the minimum is evicted first (LRU).
+    last_used: u64,
+}
+
+/// Distinct projects whose opened engines are retained at once. Each entry can
+/// hold a large materialized graph, so this is intentionally small; a session
+/// typically queries one or two projects.
+const ENGINE_CACHE_MAX: usize = 4;
+
+/// Monotonic counter feeding `CachedEngine::last_used`. Never reset, so ordering
+/// is stable even as entries are inserted and evicted.
+static ENGINE_ACCESS_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_engine_access() -> u64 {
+    ENGINE_ACCESS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// Pick the least-recently-used key: the one with the smallest access stamp.
+///
+/// Pure so the eviction policy can be unit-tested deterministically without
+/// touching the process-global engine cache (which other tests populate
+/// concurrently).
+fn lru_victim<K>(entries: impl Iterator<Item = (K, u64)>) -> Option<K> {
+    entries.min_by_key(|(_, stamp)| *stamp).map(|(key, _)| key)
+}
+
+fn lock_engine(
+    engine: &Mutex<compass_query::CodeQueryEngine>,
+) -> std::sync::MutexGuard<'_, compass_query::CodeQueryEngine> {
+    // A poisoned lock means a prior query panicked; recover the guard (the
+    // engine state is still usable) rather than breaking the tool process-wide.
+    engine.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+fn engine_cache_reusable(
+    output_dir: &Path,
+    fingerprint: GraphFingerprint,
+) -> Option<Arc<Mutex<compass_query::CodeQueryEngine>>> {
+    let key = (output_dir.to_path_buf(), fingerprint);
+    let mut cache = lock_cached(ENGINE_CACHE.get_or_init(|| Mutex::new(HashMap::new())));
+    let stamp = next_engine_access();
+    cache.get_mut(&key).map(|entry| {
+        entry.last_used = stamp;
+        entry.handle.clone()
+    })
+}
+
+/// Number of engines currently retained. Test-only: verifies the LRU bound.
+#[cfg(test)]
+fn engine_cache_len() -> usize {
+    lock_cached(ENGINE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))).len()
+}
+
+fn cache_engine(
+    output_dir: &Path,
+    fingerprint: GraphFingerprint,
+    handle: Arc<Mutex<compass_query::CodeQueryEngine>>,
+) {
+    let mut cache = lock_cached(ENGINE_CACHE.get_or_init(|| Mutex::new(HashMap::new())));
+    // One engine per output dir: a rebuild supersedes the previous engine, so
+    // retaining historical entries would leak memory in a long-lived daemon.
+    cache.retain(|(path, _), _| path != output_dir);
+    cache.insert(
+        (output_dir.to_path_buf(), fingerprint),
+        CachedEngine {
+            handle,
+            last_used: next_engine_access(),
+        },
+    );
+    // Bound total retention across projects by evicting the least-recently-used
+    // entry. The one just inserted has the newest stamp, so it is never the
+    // victim.
+    while cache.len() > ENGINE_CACHE_MAX {
+        let Some(victim) = lru_victim(
+            cache.iter().map(|(key, entry)| (key.clone(), entry.last_used)),
+        ) else {
+            break;
+        };
+        cache.remove(&victim);
+    }
+}
+
+/// Return a fresh engine for `cache`, reusing a previously opened one when the
+/// on-disk graph is unchanged.
+///
+/// On a cache miss it opens (or rebuilds) the engine via
+/// [`ensure_engine_under_lock`] and stores the result so later queries in this
+/// process skip Compass's per-open `integrity_check` + materialization. The stat
+/// of `graph.json` is deliberately done *before* taking the build flock: a warm
+/// hit then pays no locking at all, which is the common case.
+fn acquire_fresh_engine(
+    cache: &CompassCachePaths,
+    working_dir: &Path,
+) -> std::result::Result<Arc<Mutex<compass_query::CodeQueryEngine>>, (String, String)> {
+    // Fast path: an unchanged graph and a cached engine need no locking. This is
+    // the common case for a busy session and the whole point of the cache.
+    //
+    // A *shared* (git per-SHA) cache is immutable for a commit, so a cached
+    // engine keyed on the full graph mtime is always safe to reuse. A non-shared
+    // (`workspace`) cache mutates in place as source edits land while `graph.json`
+    // itself keeps its mtime, so it must still pass the throttled staleness check
+    // before the cached engine is trusted; otherwise a self-dev session would
+    // serve an engine built against older source.
+    if let Some(fingerprint) = graph_fingerprint(&cache.graph_path)
+        && let Some(handle) = engine_cache_reusable(&cache.output_dir, fingerprint)
+        && (cache.is_shared || index_is_fresh(cache, working_dir))
+    {
+        return Ok(handle);
+    }
+
+    // Slow path: hold the project flock across the cache re-check + open so two
+    // concurrent queries do not each open (and integrity-check) the index.
     with_build_lock(&cache.build_lock_dir, || {
-        // Clear any orphaned code-query build lock/temp from a previously killed
-        // or panicked build before opening. Compass's `open()` cannot recover
-        // from its own left-behind `index.lock` and would otherwise wedge with
-        // `query_index_lock_timeout` forever; holding the project flock here
-        // guarantees no live build owns it.
-        recover_orphaned_code_query_builds(output_dir);
-        // Decide freshness without opening the engine: `index_is_fresh` uses the
-        // git SHA sidecar and a throttled mtime walk, so opening a stale index
-        // first would pay the (large) open only to discard it and rebuild.
-        // Gate on the graph existing because `index_is_fresh` reports "fresh"
-        // for a missing index.
-        if graph_path.is_file() && index_is_fresh(cache, working_dir) {
-            // Fresh on disk: open and return. A fresh-but-unopenable index is a
-            // corrupt artifact, so fall through to rebuild rather than erroring.
-            if let Ok(engine) = compass_query::open(graph_path, None, output_dir) {
-                return Ok(engine);
+        let fingerprint = graph_fingerprint(&cache.graph_path);
+        if let Some(fingerprint) = fingerprint
+            && let Some(handle) = engine_cache_reusable(&cache.output_dir, fingerprint)
+            && (cache.is_shared || index_is_fresh(cache, working_dir))
+        {
+            return Ok(handle);
+        }
+
+        let engine = ensure_engine_under_lock(cache, working_dir)?;
+        // Re-stat after the open so a concurrent rebuild cannot store a stale
+        // engine under a fresh key.
+        match graph_fingerprint(&cache.graph_path) {
+            Some(fingerprint) => {
+                let handle = Arc::new(Mutex::new(engine));
+                cache_engine(&cache.output_dir, fingerprint, handle.clone());
+                Ok(handle)
+            }
+            None => {
+                // No graph on disk (should not happen after a successful open);
+                // serve without caching rather than wedging.
+                Ok(Arc::new(Mutex::new(engine)))
             }
         }
-        // Missing, corrupt, or stale.
-        discard_stale_output(cache);
-        rebuild_stale_index(cache, working_dir)?;
-        compass_query::open(graph_path, None, output_dir).map_err(|e| {
-            (
-                "existing index missing or stale".to_string(),
-                format!("Index was built but could not be opened: {e}"),
-            )
-        })
     })
 }
 
 /// Ensure the project's Compass index exists and is fresh, returning the loaded
-/// raw graph. This is the engine-free counterpart of [`ensure_fresh_engine`],
+/// raw graph. This is the engine-free counterpart of [`ensure_engine_under_lock`],
 /// used by the graph-only modes (`affected`/`orientation`).
 ///
 /// Those modes never touch `CodeQueryEngine`, and opening it on a large repo is
 /// prohibitively slow (measured ~58s on a 240MB graph, dominating the whole
 /// call), so this checks freshness by loading the compact affected projection
 /// instead — which the mode needs anyway and which [`load_graph_cached`] then
-/// reuses. The staleness logic is otherwise identical to [`ensure_fresh_engine`]:
+/// reuses. The staleness logic is otherwise identical to the engine path:
 /// the same `index_is_stale` test, the same throttled scan, and the same rebuild
 /// under the project flock.
 fn ensure_fresh_graph(
@@ -1242,7 +1484,7 @@ fn ensure_fresh_graph(
         if graph_path.is_file() && index_is_fresh(cache, working_dir) {
             // Fresh on disk: load and return. A fresh-but-unloadable graph is a
             // corrupt artifact, so fall through to rebuild rather than erroring
-            // (matching `ensure_fresh_engine`).
+            // (matching `ensure_engine_under_lock`).
             if let Ok(graph) = load_graph_cached(graph_path) {
                 return Ok(graph);
             }
@@ -1255,7 +1497,7 @@ fn ensure_fresh_graph(
 }
 
 /// True when the index at `cache` is fresh for `working_dir`. Shared by
-/// [`ensure_fresh_engine`] and [`ensure_fresh_graph`] so both paths agree on
+/// [`ensure_engine_under_lock`] and [`ensure_fresh_graph`] so both paths agree on
 /// staleness. Records the scan timestamp for non-shared caches.
 fn index_is_fresh(cache: &CompassCachePaths, working_dir: &Path) -> bool {
     let current_sha = current_git_sha_cached(working_dir);
@@ -1344,10 +1586,11 @@ fn recover_orphaned_code_query_builds(output_dir: &Path) {
 /// engine/graph first.
 fn discard_stale_output(cache: &CompassCachePaths) {
     if !cache.is_shared {
+        // `output_dir` holds the graph and the `.git-sha` sidecar, so removing it
+        // clears both. The build lock lives in `build_lock_dir`, which is
+        // deliberately outside `output_dir` (see `CompassCachePaths`), so this
+        // removal never unlinks a lock file another thread holds.
         let _ = std::fs::remove_dir_all(&cache.output_dir);
-        // Don't remove .compass-build.lock here - it's safe to leave and removing
-        // it while holding the lock could block other worktrees.
-        let _ = std::fs::remove_file(cache.output_dir.join(GIT_SHA_FILE));
     }
 }
 
@@ -1608,7 +1851,7 @@ pub(crate) fn prewarm_compass_index(working_dir: &Path) -> bool {
             };
             // Serialize against any on-query build AND other pre-warm threads
             // sharing this project's `.ast-cache` via the same per-project flock
-            // that `ensure_fresh_engine` uses. A bare `build_compass_index`
+            // that `ensure_engine_under_lock` uses. A bare `build_compass_index`
             // here (without the lock) could otherwise run `build_graph_with_layers`
             // concurrently with a query-triggered rebuild against the same
             // output dir and shared AST cache — the exact corruption the lock
@@ -3764,13 +4007,30 @@ mod tests {
         if !git(&["commit", "-qm", "init"], &main) {
             return;
         }
+        // Capture the init-default branch name (main/master/...) so the test is
+        // not tied to a hardcoded name: a checkout of a nonexistent branch fails
+        // silently, which would leave both worktrees on the same SHA and only one
+        // index built, defeating the race this test exists to exercise.
+        let default_branch = std::process::Command::new("git")
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .current_dir(&main)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty());
+        let Some(default_branch) = default_branch else {
+            return;
+        };
         // Create a second commit on a different branch so the worktrees are on
         // DIFFERENT SHAs.
         git(&["checkout", "-qb", "other"], &main);
         std::fs::write(main.join("main.rs"), "fn b() {}\n").unwrap();
         git(&["commit", "-aqm", "other"], &main);
         // Two linked worktrees, one per branch/commit.
-        git(&["checkout", "-q", "master"], &main);
+        if !git(&["checkout", "-q", &default_branch], &main) {
+            return;
+        }
         if !std::process::Command::new("git")
             .args(["worktree", "add", "-qb", "wother", wt.to_str().unwrap(), "other"])
             .current_dir(&main)
@@ -5088,6 +5348,290 @@ mod tests {
         let engine = ensure_fresh_engine(&edge, &root)
             .expect("an orphaned lock must be recovered, not surfaced as a failure");
         drop(engine);
+    }
+
+    // A warm, unchanged index must be opened at most once per process: the
+    // second `acquire_fresh_engine` for the same graph reuses the cached engine
+    // instead of re-running Compass's per-open `integrity_check` (measured ~5s
+    // on a 596 MB index) and adjacency/lookup materialization. Without the cache
+    // every warm `compass_query` paid that cost under the project flock, which
+    // contributes to the shared server's high CPU under a busy session.
+    #[test]
+    fn acquire_fresh_engine_reuses_the_cached_engine_for_an_unchanged_graph() {
+        let (_home, _root) = HomeGuard::set();
+        let root = _root.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("main.rs"), "fn authenticate() {}\n").unwrap();
+        let edge = resolve_compass_cache(&root);
+
+        // Cold: builds and caches the first engine.
+        let first = acquire_fresh_engine(&edge, &root).expect("cold open must succeed");
+        // Warm: must be the exact same cached handle (Arc pointer equality), not
+        // a freshly opened engine.
+        let second = acquire_fresh_engine(&edge, &root).expect("warm open must succeed");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "an unchanged graph must reuse the cached engine, not re-open it"
+        );
+
+        // A changed graph (rewritten graph.json, new mtime) must invalidate the
+        // cache and produce a distinct engine.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let graph_path = edge.graph_path.clone();
+        let bytes = std::fs::read(&graph_path).unwrap();
+        // Rewrite the same bytes so the mtime advances without changing the
+        // graph's identity or content.
+        std::fs::write(&graph_path, &bytes).unwrap();
+        let third = acquire_fresh_engine(&edge, &root).expect("post-touch open must succeed");
+        assert!(
+            !Arc::ptr_eq(&first, &third),
+            "a rebuilt/rewritten graph must produce a freshly opened engine"
+        );
+    }
+
+    // The cache's headline production case: a git-backed *shared* (per-SHA)
+    // cache. A commit's index is immutable, so a second query for the same
+    // commit must reuse the already-open engine and must NOT re-index: the
+    // per-SHA output dir is untouched. This is the acceptance check for the
+    // per-query engine cache on the shared path (the non-shared reuse test above
+    // covers the workspace path). Skips when git is unavailable.
+    #[test]
+    fn fresh_shared_cache_is_reused_without_reindexing() {
+        let (_home, home) = HomeGuard::set();
+        let root = home.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+
+        if !std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return; // git not available.
+        }
+        for (k, v) in [("user.email", "test@example.com"), ("user.name", "Test")] {
+            std::process::Command::new("git")
+                .args(["config", k, v])
+                .current_dir(&root)
+                .status()
+                .ok();
+        }
+        std::fs::write(root.join("main.rs"), "fn authenticate() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .status()
+            .ok();
+        if !std::process::Command::new("git")
+            .args(["commit", "-q", "-m", "init"])
+            .current_dir(&root)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return; // git could not commit (no identity etc.).
+        }
+
+        let edge = resolve_compass_cache(&root);
+        assert!(
+            edge.is_shared,
+            "a git repo must use the shared per-SHA cache"
+        );
+
+        // Cold: builds the per-SHA index and caches the engine.
+        let first = acquire_fresh_engine(&edge, &root).expect("cold open must succeed");
+        // Record the per-SHA output dir mtime; a re-index would recreate/rewrite
+        // it and advance this.
+        let dir_before = std::fs::metadata(&edge.output_dir)
+            .expect("per-SHA dir exists")
+            .modified()
+            .expect("dir mtime");
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        // Warm: same commit, unchanged graph -> same engine, no re-index.
+        let second = acquire_fresh_engine(&edge, &root).expect("warm open must succeed");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a valid per-SHA cache must reuse the cached engine, not re-open it"
+        );
+
+        let dir_after = std::fs::metadata(&edge.output_dir)
+            .expect("per-SHA dir still exists")
+            .modified()
+            .expect("dir mtime after");
+        assert_eq!(
+            dir_before, dir_after,
+            "a valid per-SHA cache must not be re-indexed on a warm query"
+        );
+    }
+
+    // End-to-end at the user-facing surface: run the actual `compass_query` tool
+    // twice against a git-backed project and assert the per-SHA index is not
+    // rebuilt on the warm second call. This complements the `acquire_fresh_engine`
+    // unit test by driving `CompassQueryTool::execute` (what the model invokes),
+    // so the whole path -- resolve cache, warm-hit, execute -- is covered, not
+    // just the helper. Skips when git is unavailable.
+    #[tokio::test]
+    async fn warm_compass_query_does_not_reindex_a_shared_per_sha_cache() {
+        let (_home, home) = HomeGuard::set();
+        let root = home.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+
+        if !std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return; // git not available.
+        }
+        for (k, v) in [("user.email", "test@example.com"), ("user.name", "Test")] {
+            std::process::Command::new("git")
+                .args(["config", k, v])
+                .current_dir(&root)
+                .status()
+                .ok();
+        }
+        std::fs::write(
+            root.join("main.rs"),
+            "fn authenticate(user: &str) { let _ = user; }\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .status()
+            .ok();
+        if !std::process::Command::new("git")
+            .args(["commit", "-q", "-m", "init"])
+            .current_dir(&root)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return; // git could not commit.
+        }
+
+        let edge = resolve_compass_cache(&root);
+        assert!(
+            edge.is_shared,
+            "a git repo must use the shared per-SHA cache"
+        );
+
+        let ctx = || ToolContext {
+            session_id: "s".into(),
+            message_id: "m".into(),
+            tool_call_id: "t".into(),
+            working_dir: Some(root.clone()),
+            stdin_request_tx: None,
+            graceful_shutdown_signal: None,
+            execution_mode: ToolExecutionMode::Direct,
+        };
+
+        // Cold call: builds the per-SHA index and caches the engine.
+        let out = CompassQueryTool::new()
+            .execute(serde_json::json!({ "query": "authenticate" }), ctx())
+            .await
+            .expect("cold execute");
+        assert!(
+            !out.output.contains("is not available for this project yet"),
+            "cold query should build and succeed: {}",
+            out.output
+        );
+
+        // Record the per-SHA output dir mtime; a re-index would recreate/rewrite
+        // it and advance this.
+        let dir_before = std::fs::metadata(&edge.output_dir)
+            .expect("per-SHA dir exists")
+            .modified()
+            .expect("dir mtime");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        // Warm call: same commit, unchanged graph -> no re-index.
+        let out2 = CompassQueryTool::new()
+            .execute(serde_json::json!({ "query": "authenticate" }), ctx())
+            .await
+            .expect("warm execute");
+        assert!(
+            !out2
+                .output
+                .contains("is not available for this project yet"),
+            "warm query should be served from the cached engine: {}",
+            out2.output
+        );
+
+        let dir_after = std::fs::metadata(&edge.output_dir)
+            .expect("per-SHA dir still exists")
+            .modified()
+            .expect("dir mtime after");
+        assert_eq!(
+            dir_before, dir_after,
+            "a warm compass_query on a valid per-SHA cache must not re-index it"
+        );
+    }
+
+    // The LRU eviction policy itself: the smallest access stamp wins. Pure, so
+    // it is deterministic regardless of the process-global cache other tests use.
+    #[test]
+    fn lru_victim_picks_the_least_recently_used_entry() {
+        let entries = vec![("a", 30u64), ("b", 10), ("c", 20)];
+        assert_eq!(
+            lru_victim(entries.into_iter()),
+            Some("b"),
+            "the entry with the smallest access stamp is evicted first"
+        );
+        assert_eq!(lru_victim(std::iter::empty::<(&str, u64)>()), None::<&str>);
+    }
+
+    // The engine cache keys on the graph's `(mtime, size)` fingerprint, not mtime
+    // alone: the warm fast path never opens the index, so a rebuild that landed
+    // within the same mtime tick must still invalidate a cached engine. A changed
+    // size alone has to change the key.
+    #[test]
+    fn graph_fingerprint_distinguishes_a_size_change_at_the_same_mtime() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("graph.json");
+        std::fs::write(&path, b"1234").unwrap();
+        let first = graph_fingerprint(&path).expect("fingerprint");
+
+        // Same path, different byte length. Rewrite and pin the mtime back to the
+        // original so only the size differs.
+        std::fs::write(&path, b"12345678").unwrap();
+        let mtime = filetime::FileTime::from_system_time(first.mtime);
+        filetime::set_file_mtime(&path, mtime).expect("restore mtime");
+        let second = graph_fingerprint(&path).expect("fingerprint");
+
+        assert_eq!(first.mtime, second.mtime, "mtime must be unchanged");
+        assert_ne!(
+            first, second,
+            "a size change at the same mtime must change the fingerprint"
+        );
+
+        // A missing graph has no fingerprint.
+        assert!(graph_fingerprint(&tmp.path().join("absent.json")).is_none());
+    }
+
+    // Opening many distinct projects must keep the engine cache bounded. Reads
+    // only the cache length, so it is robust to other tests populating it.
+    #[test]
+    fn engine_cache_stays_bounded_across_many_projects() {
+        let (_home, root) = HomeGuard::set();
+        for i in 0..(ENGINE_CACHE_MAX * 2) {
+            let proj = root.join(format!("proj-{i}"));
+            std::fs::create_dir_all(&proj).unwrap();
+            std::fs::write(proj.join("main.rs"), format!("fn f{i}() {{}}\n")).unwrap();
+            let edge = resolve_compass_cache(&proj);
+            acquire_fresh_engine(&edge, &proj).expect("open must succeed");
+            assert!(
+                engine_cache_len() <= ENGINE_CACHE_MAX,
+                "engine cache must stay within {} entries, got {}",
+                ENGINE_CACHE_MAX,
+                engine_cache_len()
+            );
+        }
     }
 
     // An explicit `depth: 0` must be honored (Compass treats it as "no traversal")
@@ -6714,6 +7258,13 @@ mod tests {
             cache.output_dir.display()
         );
         assert!(cache.graph_path.ends_with("compass-out/graph.json"));
+        assert!(
+            !cache.build_lock_dir.starts_with(&cache.output_dir),
+            "build lock must not live inside output_dir, which discard_stale_output removes: \
+             lock={} output={}",
+            cache.build_lock_dir.display(),
+            cache.output_dir.display()
+        );
     }
 
     #[test]
@@ -6730,6 +7281,13 @@ mod tests {
         );
         assert!(!cache.output_dir.starts_with(&root), "cache must not be inside the project dir");
         assert!(cache.graph_path.ends_with("compass-out/graph.json"));
+        assert!(
+            !cache.build_lock_dir.starts_with(&cache.output_dir),
+            "build lock must not live inside output_dir, which discard_stale_output removes: \
+             lock={} output={}",
+            cache.build_lock_dir.display(),
+            cache.output_dir.display()
+        );
     }
     #[test]
     fn stale_index_cleanup_removes_sidecar_and_lock() {
