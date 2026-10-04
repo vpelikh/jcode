@@ -36,6 +36,27 @@ fn optional_total_tokens(totals: TokenUsageTotals) -> Option<(u64, u64)> {
 static LAST_ATTACH_MODEL_PREFETCH: LazyLock<StdMutex<HashMap<String, Instant>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
+/// Load a persisted session snapshot for remote startup **off the async
+/// runtime**.
+///
+/// A large or image-heavy session file can take seconds to deserialize; doing
+/// that inline on a Tokio worker stalls every other connection the server is
+/// serving (observed: session restores during a reload storm froze attached
+/// clients). `Session` is `Send`, so move the blocking parse to the blocking
+/// pool, falling back to the lightweight startup stub when the full load fails.
+///
+/// Every persisted-startup load on an async path must go through this helper;
+/// an inline `Session::load_for_remote_startup` here reintroduces the stall.
+pub(super) async fn load_persisted_session_for_startup(session_id: &str) -> Result<Session> {
+    let session_id_owned = session_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        Session::load_for_remote_startup(&session_id_owned)
+            .or_else(|_| Session::load_startup_stub(&session_id_owned))
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("persisted session load task panicked: {error}"))?
+}
+
 fn should_debounce_attach_model_prefetch(provider_name: &str) -> bool {
     let Ok(mut guard) = LAST_ATTACH_MODEL_PREFETCH.lock() else {
         return false;
@@ -249,9 +270,7 @@ pub(super) async fn handle_get_model_catalog(
                     "handle_get_model_catalog: session {} busy, using provider/persisted fallback",
                     session_id
                 ));
-                let persisted = Session::load_for_remote_startup(session_id)
-                    .or_else(|_| Session::load_startup_stub(session_id))
-                    .ok();
+                let persisted = load_persisted_session_for_startup(session_id).await.ok();
                 let persisted_model = persisted.as_ref().and_then(|session| session.model.clone());
                 let mut model_routes = provider.model_routes();
                 crate::model_usage::enrich_routes(&mut model_routes);
@@ -352,8 +371,7 @@ pub(super) async fn handle_get_compacted_history(
             (messages, images, info, "live")
         }
         Err(_) => {
-            let session = crate::session::Session::load_for_remote_startup(session_id)
-                .or_else(|_| crate::session::Session::load_startup_stub(session_id))?;
+            let session = load_persisted_session_for_startup(session_id).await?;
             let (rendered_messages, images, info) =
                 crate::session::render_messages_and_images_with_compacted_history(
                     &session,
@@ -418,7 +436,7 @@ fn rendered_to_history_message(msg: crate::session::RenderedMessage) -> HistoryM
     }
 }
 
-fn history_reload_recovery_snapshot(
+async fn history_reload_recovery_snapshot(
     session_id: &str,
     was_interrupted: Option<bool>,
 ) -> Option<crate::protocol::ReloadRecoverySnapshot> {
@@ -440,8 +458,10 @@ fn history_reload_recovery_snapshot(
     let reload_ctx = crate::tool::selfdev::ReloadContext::peek_for_session(session_id)
         .ok()
         .flatten();
-    let inferred_interrupted = was_interrupted
-        .unwrap_or_else(|| infer_persisted_session_interrupted_by_reload(session_id));
+    let inferred_interrupted = match was_interrupted {
+        Some(explicit) => explicit,
+        None => infer_persisted_session_interrupted_by_reload(session_id).await,
+    };
     let directive = crate::tool::selfdev::ReloadContext::recovery_directive_for_session(
         session_id,
         reload_ctx.as_ref(),
@@ -480,10 +500,8 @@ fn persisted_session_has_reload_interruption_marker(session: &Session) -> bool {
     })
 }
 
-fn infer_persisted_session_interrupted_by_reload(session_id: &str) -> bool {
-    let session = match Session::load_for_remote_startup(session_id)
-        .or_else(|_| Session::load_startup_stub(session_id))
-    {
+async fn infer_persisted_session_interrupted_by_reload(session_id: &str) -> bool {
+    let session = match load_persisted_session_for_startup(session_id).await {
         Ok(session) => session,
         Err(err) => {
             crate::logging::warn(&format!(
@@ -534,8 +552,7 @@ async fn send_history_from_persisted_session(
     activity: Option<SessionActivitySnapshot>,
     supports_pdf_panels: bool,
 ) -> Result<()> {
-    let session = crate::session::Session::load_for_remote_startup(session_id)
-        .or_else(|_| crate::session::Session::load_startup_stub(session_id))?;
+    let session = load_persisted_session_for_startup(session_id).await?;
     let token_usage_totals = session.token_usage_totals();
     let (rendered_messages, images) = crate::session::render_messages_and_images(&session);
     // Extract the small metadata fields we need, then drop the full Session
@@ -595,7 +612,7 @@ async fn send_history_from_persisted_session(
         server_icon: Some(server_icon.to_string()),
         server_has_update: Some(server_has_newer_binary()),
         was_interrupted,
-        reload_recovery: history_reload_recovery_snapshot(session_id, was_interrupted),
+        reload_recovery: history_reload_recovery_snapshot(session_id, was_interrupted).await,
         connection_type: None,
         status_detail: None,
         upstream_provider: None,
@@ -814,7 +831,7 @@ pub(super) async fn send_history(
         server_icon: Some(server_icon.to_string()),
         server_has_update: Some(server_has_newer_binary()),
         was_interrupted,
-        reload_recovery: history_reload_recovery_snapshot(session_id, was_interrupted),
+        reload_recovery: history_reload_recovery_snapshot(session_id, was_interrupted).await,
         connection_type,
         status_detail,
         upstream_provider,

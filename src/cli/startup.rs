@@ -52,6 +52,13 @@ pub async fn run() -> Result<()> {
         .name("jcode-session-bak-prune".to_string())
         .spawn(crate::session::prune_old_session_backups)
         .ok();
+    // Best-effort shrink of abandoned oversized session files left behind by the
+    // historical event-log duplication (hundreds of MB-GB, slow to load). Runs
+    // once per day, skips live/recent sessions, and never deletes anything.
+    std::thread::Builder::new()
+        .name("jcode-session-shrink".to_string())
+        .spawn(crate::session::shrink_oversized_sessions)
+        .ok();
     logging::info("jcode starting");
 
     // Wire config-reload reactions without making config depend on auth/bus:

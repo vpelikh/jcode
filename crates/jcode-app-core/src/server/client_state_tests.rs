@@ -449,8 +449,9 @@ fn write_pending_user_session(
     session.save()
 }
 
-#[test]
-fn history_reload_recovery_infers_pending_active_user_turn_during_reload() -> Result<()> {
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
+async fn history_reload_recovery_infers_pending_active_user_turn_during_reload() -> Result<()> {
     let _lock = crate::storage::lock_test_env();
     let home = tempfile::TempDir::new()?;
     let runtime = tempfile::TempDir::new()?;
@@ -464,7 +465,7 @@ fn history_reload_recovery_infers_pending_active_user_turn_during_reload() -> Re
         Some(session_id.to_string()),
     );
 
-    let snapshot = super::history_reload_recovery_snapshot(session_id, None);
+    let snapshot = super::history_reload_recovery_snapshot(session_id, None).await;
     assert!(
         snapshot.is_some(),
         "pending user turn during reload should get recovery directive"
@@ -481,8 +482,10 @@ fn history_reload_recovery_infers_pending_active_user_turn_during_reload() -> Re
     Ok(())
 }
 
-#[test]
-fn history_reload_recovery_does_not_infer_pending_user_turn_without_reload_marker() -> Result<()> {
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
+async fn history_reload_recovery_does_not_infer_pending_user_turn_without_reload_marker()
+-> Result<()> {
     let _lock = crate::storage::lock_test_env();
     let home = tempfile::TempDir::new()?;
     let runtime = tempfile::TempDir::new()?;
@@ -490,12 +493,18 @@ fn history_reload_recovery_does_not_infer_pending_user_turn_without_reload_marke
     let session_id = "session_history_no_reload_fallback";
     write_pending_user_session(session_id, crate::session::SessionStatus::Active)?;
 
-    assert!(super::history_reload_recovery_snapshot(session_id, None).is_none());
+    assert!(
+        super::history_reload_recovery_snapshot(session_id, None)
+            .await
+            .is_none()
+    );
     Ok(())
 }
 
-#[test]
-fn history_reload_recovery_does_not_mark_delivered_until_continuation_is_accepted() -> Result<()> {
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // lock_test_env() guard deliberately serializes env-mutating tests across awaits.
+async fn history_reload_recovery_does_not_mark_delivered_until_continuation_is_accepted()
+-> Result<()> {
     let _lock = crate::storage::lock_test_env();
     let home = tempfile::TempDir::new()?;
     let runtime = tempfile::TempDir::new()?;
@@ -512,7 +521,7 @@ fn history_reload_recovery_does_not_mark_delivered_until_continuation_is_accepte
         "test store intent",
     )?;
 
-    let Some(snapshot) = super::history_reload_recovery_snapshot(session_id, None) else {
+    let Some(snapshot) = super::history_reload_recovery_snapshot(session_id, None).await else {
         anyhow::bail!("server-owned recovery intent should be used");
     };
     assert_eq!(snapshot.continuation_message, "stored continuation");
@@ -521,7 +530,8 @@ fn history_reload_recovery_does_not_mark_delivered_until_continuation_is_accepte
         "building a History payload must not consume the intent; the client may disconnect before queuing it"
     );
 
-    let Some(snapshot_again) = super::history_reload_recovery_snapshot(session_id, None) else {
+    let Some(snapshot_again) = super::history_reload_recovery_snapshot(session_id, None).await
+    else {
         anyhow::bail!("pending server-owned recovery intent should be re-emitted until accepted");
     };
     assert_eq!(snapshot_again.continuation_message, "stored continuation");
@@ -551,7 +561,9 @@ fn history_reload_recovery_does_not_mark_delivered_until_continuation_is_accepte
         "accepted continuation should consume the durable pending intent"
     );
     assert!(
-        super::history_reload_recovery_snapshot(session_id, None).is_none(),
+        super::history_reload_recovery_snapshot(session_id, None)
+            .await
+            .is_none(),
         "delivered server-owned recovery intent should no longer be emitted"
     );
     Ok(())

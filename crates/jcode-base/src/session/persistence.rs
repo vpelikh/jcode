@@ -477,6 +477,21 @@ impl Session {
 
     pub fn save(&mut self) -> Result<()> {
         self.updated_at = Utc::now();
+        self.save_inner(true)
+    }
+
+    /// Save without treating it as user activity: `updated_at` is left as-is and
+    /// the recent-session index is not re-stamped.
+    ///
+    /// Used by background maintenance (the oversized-session sweep) that rewrites
+    /// a session file for storage hygiene, not because the session was used.
+    /// Bumping `updated_at` here would make an abandoned session surface as the
+    /// most-recent session in the picker, which is exactly wrong.
+    pub(crate) fn save_preserving_activity(&mut self) -> Result<()> {
+        self.save_inner(false)
+    }
+
+    fn save_inner(&mut self, mark_activity: bool) -> Result<()> {
         let path = session_path(&self.id)?;
         let journal_path = session_journal_path_from_snapshot(&path);
 
@@ -748,7 +763,10 @@ impl Session {
             fields.push(("error", crate::util::format_error_chain(error)));
             crate::logging::event_warn("SESSION_PERSISTENCE", fields);
         } else {
-            if let Err(error) = crate::recent_session_index::upsert_session(self) {
+            // Only user-driven saves refresh the recent-session index; a
+            // maintenance save (sweep) must not re-stamp an abandoned session as
+            // recent.
+            if mark_activity && let Err(error) = crate::recent_session_index::upsert_session(self) {
                 crate::logging::warn(&format!(
                     "Failed to update recent-session metadata for {}: {error}",
                     self.id
@@ -853,5 +871,63 @@ mod tests {
         );
         assert_eq!(std::fs::read(&snapshot_path).unwrap(), original);
         assert!(pre_wipe_backups(dir.path()).is_empty());
+    }
+
+    /// `save` stamps `updated_at` (activity); `save_preserving_activity` must
+    /// leave it untouched so a background maintenance rewrite does not make an
+    /// abandoned session look recently used.
+    #[test]
+    fn save_preserving_activity_does_not_bump_updated_at() {
+        let _env_lock = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("JCODE_HOME", home.path().as_os_str());
+
+        let mut session = Session::create_with_id("session_activity".into(), None, None);
+        session.add_message(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "hi".to_string(),
+                cache_control: None,
+            }],
+        );
+        // A clearly old activity clock.
+        session.updated_at = chrono::Utc::now() - chrono::Duration::days(5);
+        let before = session.updated_at;
+
+        session.save_preserving_activity().unwrap();
+        assert_eq!(
+            session.updated_at, before,
+            "maintenance save must not bump updated_at"
+        );
+
+        session.save().unwrap();
+        assert!(
+            session.updated_at > before,
+            "a normal save must bump updated_at"
+        );
+    }
+
+    /// Sets an env var for the duration of a test and restores it on drop.
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prev = std::env::var_os(key);
+            crate::env::set_var(key, value);
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(prev) = &self.prev {
+                crate::env::set_var(self.key, prev);
+            } else {
+                crate::env::remove_var(self.key);
+            }
+        }
     }
 }

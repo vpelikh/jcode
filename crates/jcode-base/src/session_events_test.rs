@@ -5488,3 +5488,366 @@ fn test_compaction_preserves_plugin_and_bracket_events() {
     assert!(plugin_survived, "plugin Unknown event must survive compaction");
     session.rederive_all_checked().unwrap();
 }
+
+/// `rebuild_event_map` must preserve each message's original `AppendMessage`
+/// event id (reusing an id at most once), instead of churning every id to a
+/// synthetic `rehydrate_<i>`, so pruning/compaction does not break consumers
+/// that key on durable event ids.
+#[test]
+fn test_rebuild_event_map_preserves_message_event_ids() {
+    let mut session = Session::create_with_id("rebuild_ids".to_string(), None, None);
+    for i in 0..6 {
+        session.append_stored_message(StoredMessage {
+            id: format!("m{i}"),
+            role: Role::User,
+            content: vec![text_block(&format!("body {i}"))],
+            display_role: None,
+            timestamp: Some(Utc::now()),
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+    let ids_before: Vec<String> = session
+        .event_map
+        .events
+        .iter()
+        .filter_map(|e| match &e.op {
+            SessionEventOp::AppendMessage { .. } => Some(e.event_id.as_str().to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids_before.len(), 6);
+
+    session.rebuild_event_map();
+
+    let ids_after: Vec<String> = session
+        .event_map
+        .events
+        .iter()
+        .filter_map(|e| match &e.op {
+            SessionEventOp::AppendMessage { .. } => Some(e.event_id.as_str().to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ids_after, ids_before,
+        "rebuild must preserve the original AppendMessage event ids"
+    );
+}
+
+/// A rebuild must keep **every** event id unique, even when a single
+/// `AppendMessage` id has to serve two messages and the log already holds a
+/// synthetic `rehydrate_<i>` id that matches the fallback the loop would pick.
+/// Previously the fallback was `rehydrate_<i>` unconditionally and was never
+/// registered, so index 1 would emit a second `rehydrate_1`, duplicating a
+/// durable event id.
+#[test]
+fn test_rebuild_event_map_keeps_ids_unique_with_duplicate_messages() {
+    let mut session = Session::create_with_id("rebuild_dup_ids".to_string(), None, None);
+    // Two messages deliberately share one id; a third has no log event at all.
+    for (i, id) in ["dup", "dup", "other"].iter().enumerate() {
+        session.append_stored_message(StoredMessage {
+            id: id.to_string(),
+            role: Role::User,
+            content: vec![text_block(&format!("body {i}"))],
+            display_role: None,
+            timestamp: Some(Utc::now()),
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+
+    // Simulate a log left by the old buggy path: drop the real events and install
+    // a single `AppendMessage` for the shared id whose id is exactly the fallback
+    // (`rehydrate_1`) index 1 would synthesize.
+    session
+        .event_map
+        .events
+        .retain(|e| !matches!(e.op, SessionEventOp::AppendMessage { .. }));
+    session.event_map.push_event(SessionEvent {
+        event_id: "rehydrate_1".into(),
+        timestamp: Utc::now(),
+        op: SessionEventOp::AppendMessage {
+            message_id: "dup".into(),
+            message: session.messages[0].clone(),
+        },
+        parent_id: None,
+        version: 1,
+    });
+
+    session.rebuild_event_map();
+
+    let ids: Vec<String> = session
+        .event_map
+        .events
+        .iter()
+        .filter_map(|e| match &e.op {
+            SessionEventOp::AppendMessage { .. } => Some(e.event_id.as_str().to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids.len(), 3, "one event per message");
+    let mut unique = ids.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        ids.len(),
+        "every rebuilt AppendMessage event id must be unique, got {ids:?}"
+    );
+}
+
+/// A synthesized fallback id at an early index must not steal the id a *later*
+/// message still wants to reuse as its original. Here message 0 has no log
+/// event (fallback would probe `rehydrate_0`), while message 1 owns the original
+/// event id `rehydrate_0`. The rebuild must keep `rehydrate_0` for message 1 and
+/// give message 0 a different id.
+#[test]
+fn test_rebuild_event_map_fallback_does_not_shadow_later_original_id() {
+    let mut session = Session::create_with_id("rebuild_shadow".to_string(), None, None);
+    for (i, id) in ["no_event", "owns_rehydrate"].iter().enumerate() {
+        session.append_stored_message(StoredMessage {
+            id: id.to_string(),
+            role: Role::User,
+            content: vec![text_block(&format!("body {i}"))],
+            display_role: None,
+            timestamp: Some(Utc::now()),
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+
+    // Only message index 1 keeps a log event, and its id is exactly the fallback
+    // index 0 would pick (`rehydrate_0`).
+    session
+        .event_map
+        .events
+        .retain(|e| !matches!(e.op, SessionEventOp::AppendMessage { .. }));
+    session.event_map.push_event(SessionEvent {
+        event_id: "rehydrate_0".into(),
+        timestamp: Utc::now(),
+        op: SessionEventOp::AppendMessage {
+            message_id: "owns_rehydrate".into(),
+            message: session.messages[1].clone(),
+        },
+        parent_id: None,
+        version: 1,
+    });
+
+    session.rebuild_event_map();
+
+    let ids: Vec<String> = session
+        .event_map
+        .events
+        .iter()
+        .filter_map(|e| match &e.op {
+            SessionEventOp::AppendMessage { .. } => Some(e.event_id.as_str().to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids.len(), 2, "one event per message");
+    assert!(
+        ids.contains(&"rehydrate_0".to_string()),
+        "the later message's original id must be preserved, got {ids:?}"
+    );
+    let mut unique = ids.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), ids.len(), "ids must stay unique, got {ids:?}");
+}
+
+/// A preserved log-only event (plugin `Unknown`) can carry an id that matches a
+/// synthetic id the rebuild would otherwise mint unconditionally (e.g.
+/// `rehydrate_mem_0`). The rebuild must keep every id unique, so the synthetic
+/// memory-injection id must be nudged off the preserved one.
+#[test]
+fn test_rebuild_event_map_synthetic_ids_avoid_preserved_plugin_id() {
+    let mut session =
+        Session::create_with_id("rebuild_synthetic_vs_plugin".to_string(), None, None);
+    session.memory_injections.push(StoredMemoryInjection {
+        summary: "recalled".to_string(),
+        content: "body".to_string(),
+        count: 1,
+        memory_ids: vec!["mem_1".to_string()],
+        age_ms: None,
+        before_message: None,
+        timestamp: Utc::now(),
+    });
+    // Preserve an `Unknown` event whose id is exactly the memory-injection
+    // synthetic id the rebuild would pick.
+    session.event_map.append_event(SessionEvent {
+        timestamp: Utc::now(),
+        event_id: "rehydrate_mem_0".to_string().into(),
+        op: SessionEventOp::Unknown {
+            event_type: "plugin/savepoint".to_string(),
+            data: json!({ "keep": true }),
+        },
+        parent_id: None,
+        version: 1,
+    });
+
+    session.rebuild_event_map();
+
+    let ids: Vec<String> = session
+        .event_map
+        .events
+        .iter()
+        .map(|e| e.event_id.as_str().to_string())
+        .collect();
+    let mut unique = ids.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        ids.len(),
+        "all ids must be unique, got {ids:?}"
+    );
+    assert!(
+        ids.iter().any(|id| id.starts_with("rehydrate_mem")),
+        "the memory injection must still be represented, got {ids:?}"
+    );
+}
+
+/// A message's *reused original* event id must not duplicate a preserved
+/// log-only event's id either. Here the message's original `AppendMessage` id is
+/// the same string as a preserved plugin `Unknown` id, so the rebuild must
+/// re-id one of them rather than emit two events sharing one durable id.
+#[test]
+fn test_rebuild_event_map_original_id_does_not_collide_with_preserved_id() {
+    let mut session =
+        Session::create_with_id("rebuild_original_vs_preserved".to_string(), None, None);
+    session.append_stored_message(StoredMessage {
+        id: "m0".to_string(),
+        role: Role::User,
+        content: vec![text_block("body")],
+        display_role: None,
+        timestamp: Some(Utc::now()),
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    // The single message's original AppendMessage event currently has some id;
+    // give a preserved plugin event that exact id.
+    let message_event_id = session
+        .event_map
+        .events
+        .iter()
+        .find_map(|e| match &e.op {
+            SessionEventOp::AppendMessage { .. } => Some(e.event_id.as_str().to_string()),
+            _ => None,
+        })
+        .expect("message event id");
+    session.event_map.append_event(SessionEvent {
+        timestamp: Utc::now(),
+        event_id: message_event_id.clone().into(),
+        op: SessionEventOp::Unknown {
+            event_type: "plugin/pin".to_string(),
+            data: json!({ "keep": true }),
+        },
+        parent_id: None,
+        version: 1,
+    });
+
+    session.rebuild_event_map();
+
+    let ids: Vec<String> = session
+        .event_map
+        .events
+        .iter()
+        .map(|e| e.event_id.as_str().to_string())
+        .collect();
+    let mut unique = ids.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        ids.len(),
+        "all ids must be unique, got {ids:?}"
+    );
+    // The preserved plugin event must survive the rebuild.
+    assert!(
+        session
+            .event_map
+            .events
+            .iter()
+            .any(|e| matches!(e.op, SessionEventOp::Unknown { .. })),
+        "preserved plugin event must survive, got {ids:?}"
+    );
+}
+
+/// If a plugin `Unknown` event sits inside a preserved matched bracket run, a
+/// rebuild must not re-append it TWICE (once as part of the bracket run, once as
+/// a preserved unknown). Two events sharing one id would be a durable-id
+/// corruption.
+#[test]
+fn test_rebuild_event_map_bracket_unknown_not_double_appended() {
+    let mut session = Session::create_with_id("rebuild_bracket_unknown".to_string(), None, None);
+    session.append_stored_message(StoredMessage {
+        id: "m1".to_string(),
+        role: Role::User,
+        content: vec![text_block("hello")],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    let comp = StoredCompactionState {
+        summary_text: "brief".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 1,
+        physically_consolidated: false,
+    };
+    session.compact_transcript_with_bracket("run", session.messages.clone(), comp.clone(), 1);
+    // Insert a plugin Unknown event whose position makes it part of the bracket
+    // run: append it, then force it to sit inside the run by re-appending the
+    // bracket around it is awkward — instead append the Unknown and then a
+    // second balanced bracket whose run includes it is not how the log is built.
+    // Simpler: the run is [Start, replace, End]; place the Unknown between Start
+    // and End directly.
+    let events = session.event_map.events.clone();
+    let start_idx = events
+        .iter()
+        .position(|e| matches!(e.op, SessionEventOp::CompactionStart { .. }))
+        .expect("start");
+    let end_idx = events
+        .iter()
+        .position(|e| matches!(e.op, SessionEventOp::CompactionEnd { .. }))
+        .expect("end");
+    assert!(start_idx < end_idx);
+    // Rebuild a map by hand with the Unknown sandwiched inside the bracket.
+    let mut map = crate::session::event_types::SessionEventMap::default();
+    for (i, e) in events.iter().enumerate() {
+        map.push_event(e.clone());
+        if i == start_idx {
+            map.push_event(SessionEvent {
+                timestamp: Utc::now(),
+                event_id: "unknown_inside".to_string().into(),
+                op: SessionEventOp::Unknown {
+                    event_type: "plugin/inner".to_string(),
+                    data: json!({ "x": 1 }),
+                },
+                parent_id: None,
+                version: 1,
+            });
+        }
+    }
+    session.event_map = map;
+
+    session.rebuild_event_map();
+
+    let ids: Vec<String> = session
+        .event_map
+        .events
+        .iter()
+        .map(|e| e.event_id.as_str().to_string())
+        .collect();
+    let mut unique = ids.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        ids.len(),
+        "no event id may be duplicated after rebuild, got {ids:?}"
+    );
+}

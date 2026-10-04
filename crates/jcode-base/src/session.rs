@@ -73,7 +73,7 @@ pub use jcode_session_types::{
 pub use event_types::{SessionEvent, SessionEventError, SessionEventMap, SessionEventOp};
 use jcode_message_types::Role;
 use journal::{PersistVectorMode, SessionJournalMeta, SessionPersistState};
-pub use maintenance::prune_old_session_backups;
+pub use maintenance::{prune_old_session_backups, shrink_oversized_sessions};
 pub use memory_profile::SessionMemoryProfileSnapshot;
 use memory_profile::{
     ContentBlockMemoryStats, SessionMemoryProfileCache, summarize_blocks, summarize_message_content,
@@ -2890,10 +2890,75 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
             pairs
         };
 
+        // Preserve each message's original `AppendMessage` event id when the log
+        // still has one, so a rebuild/compaction does not churn durable event
+        // ids that downstream consumers may key on. Reuse an id at most once
+        // (a caller can append the same message id twice) and fall back to a
+        // synthetic `rehydrate_<i>` id otherwise, keeping one id per event.
+        let message_event_ids: std::collections::HashMap<&str, &EventId> = self
+            .event_map
+            .events
+            .iter()
+            .filter_map(|e| match &e.op {
+                SessionEventOp::AppendMessage { message_id, .. } => {
+                    Some((message_id.as_str(), &e.event_id))
+                }
+                _ => None,
+            })
+            .collect();
+
+        let mut used_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Reserve every id a message could reuse as an original, plus all
+        // preserved-event ids, so a synthesized id can never take an id that a
+        // (possibly later) message still wants to reuse, nor collide with a
+        // preserved original id (a legacy log that already persisted
+        // `rehydrate_<i>` ids). Reserved ids are only a floor for synthesized
+        // ids; `used_ids` tracks what has actually been emitted.
+        let mut reserved_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for id in message_event_ids.values() {
+            reserved_ids.insert(id.as_str().to_string());
+        }
+        // Preserved events are re-appended verbatim at the tail: reserve their
+        // ids (so no synthetic id takes one) and seed the emitted set with them
+        // (so a message's reused original id cannot duplicate a preserved id).
+        for event in preserved_bracket_pairs
+            .iter()
+            .chain(preserved_orphan_starts.iter())
+            .chain(preserved_unknown.iter())
+        {
+            let id = event.event_id.as_str().to_string();
+            reserved_ids.insert(id.clone());
+            used_ids.insert(id);
+        }
+        // Every synthesized id (message fallback, memory injection, replay event,
+        // compaction) goes through this so the rebuilt log keeps exactly one id
+        // per event; an unconditional id could collide with a preserved id or a
+        // message's reused original id.
+        fn unique_synthetic_id(
+            used: &mut std::collections::HashSet<String>,
+            reserved: &std::collections::HashSet<String>,
+            base: String,
+        ) -> String {
+            let mut candidate = base.clone();
+            let mut suffix = 0u32;
+            while used.contains(&candidate) || reserved.contains(&candidate) {
+                suffix += 1;
+                candidate = format!("{base}_{suffix}");
+            }
+            used.insert(candidate.clone());
+            candidate
+        }
         for (i, message) in self.messages.iter().enumerate() {
+            let event_id: EventId = match message_event_ids.get(message.id.as_str()) {
+                Some(id) if used_ids.insert(id.as_str().to_string()) => (*id).clone(),
+                // No reusable original id, or it was already claimed by an
+                // earlier duplicate message: synthesize a unique one.
+                _ => unique_synthetic_id(&mut used_ids, &reserved_ids, format!("rehydrate_{i}"))
+                    .into(),
+            };
             map.push_event(SessionEvent {
                 timestamp: message.timestamp.unwrap_or(now),
-                event_id: format!("rehydrate_{}", i).into(),
+                event_id,
                 op: SessionEventOp::AppendMessage {
                     message_id: message.id.clone().into(),
                     message: message.clone(),
@@ -2906,7 +2971,12 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         for (j, injection) in self.memory_injections.iter().enumerate() {
             map.push_event(SessionEvent {
                 timestamp: injection.timestamp,
-                event_id: format!("rehydrate_mem_{}", j).into(),
+                event_id: unique_synthetic_id(
+                    &mut used_ids,
+                    &reserved_ids,
+                    format!("rehydrate_mem_{j}"),
+                )
+                .into(),
                 op: SessionEventOp::MemoryInjection {
                     memory_injection: injection.clone(),
                 },
@@ -2918,7 +2988,12 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         for (k, replay) in self.replay_events.iter().enumerate() {
             map.push_event(SessionEvent {
                 timestamp: replay.timestamp,
-                event_id: format!("rehydrate_replay_{}", k).into(),
+                event_id: unique_synthetic_id(
+                    &mut used_ids,
+                    &reserved_ids,
+                    format!("rehydrate_replay_{k}"),
+                )
+                .into(),
                 op: SessionEventOp::ReplayEvent {
                     replay_event: replay.clone(),
                 },
@@ -2930,7 +3005,12 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         if let Some(compaction) = &self.compaction {
             map.push_event(SessionEvent {
                 timestamp: now,
-                event_id: "rehydrate_compaction".to_string().into(),
+                event_id: unique_synthetic_id(
+                    &mut used_ids,
+                    &reserved_ids,
+                    "rehydrate_compaction".to_string(),
+                )
+                .into(),
                 op: SessionEventOp::SetCompaction {
                     compaction: compaction.clone(),
                 },
@@ -2947,17 +3027,28 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         // append-only narrative for any downstream reader). Matched pairs come
         // first so their `CompactionEnd` remains the last persisting compaction
         // op (agreeing with the reconstructed `SetCompaction` and `self.compaction`).
-        for event in preserved_bracket_pairs {
-            map.push_event(event);
-        }
-        for event in preserved_orphan_starts {
-            map.push_event(event);
-        }
-        for event in preserved_unknown {
-            map.push_event(event);
+        //
+        // The three sets can overlap: a plugin `Unknown` (or a nested orphan
+        // `CompactionStart`) that sits *inside* a matched bracket run appears both
+        // in that run's slice and in its own collected list. Re-appending it once
+        // per list would emit two events sharing one durable id, so dedup by
+        // event id here and keep the first occurrence.
+        let mut appended_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for event in preserved_bracket_pairs
+            .into_iter()
+            .chain(preserved_orphan_starts)
+            .chain(preserved_unknown)
+        {
+            if appended_ids.insert(event.event_id.as_str().to_string()) {
+                map.push_event(event);
+            }
         }
 
         self.event_map = map;
+        // The event log changed shape, so the cached memory profile (which
+        // reports `event_log_count`/`event_log_json_bytes` and the derived
+        // `total_json_bytes`) is now stale; rebuild it on next read.
+        self.mark_memory_profile_dirty();
         // The log was reconstructed, not appended to — a tail-delta journal
         // entry could not capture it, so force a full snapshot on the next save.
         self.mark_events_full_dirty();
