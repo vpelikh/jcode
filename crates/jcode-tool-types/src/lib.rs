@@ -106,6 +106,7 @@ pub fn resolve_tool_name(name: &str) -> &str {
         "Edit" => "edit",
         "Grep" => "agentgrep",
         "Agent" => "subagent",
+        "Todo" | "TodoWrite" | "TodoRead" => "todo",
         "ScheduleWakeup" => "schedule",
         other => other,
     }
@@ -142,6 +143,11 @@ mod tests {
         assert_eq!(resolve_tool_name("Agent"), "subagent");
         assert_eq!(resolve_tool_name("ScheduleWakeup"), "schedule");
         assert_eq!(resolve_tool_name("Skill"), "skill_manage");
+        assert_eq!(resolve_tool_name("Todo"), "todo");
+        assert_eq!(resolve_tool_name("TodoWrite"), "todo");
+        assert_eq!(resolve_tool_name("TodoRead"), "todo");
+        assert_eq!(resolve_tool_name("todos"), "todo");
+        assert_eq!(resolve_tool_name("functions.todo"), "todo");
         assert_eq!(resolve_tool_name("functions.Read"), "read");
     }
 }

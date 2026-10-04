@@ -17,6 +17,9 @@ mod concurrency_construction;
 #[path = "agent_tests/desktop_selfdev.rs"]
 mod desktop_selfdev;
 
+#[path = "agent_tests/todo_guard.rs"]
+mod todo_guard;
+
 struct DelayedProvider {
     open_delay: Duration,
     first_event_delay: Duration,

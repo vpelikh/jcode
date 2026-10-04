@@ -708,6 +708,10 @@ route_fallback_enabled = false
 # How many *consecutive identical* tool calls trip the repeat-tool reminder
 # telling the model to change approach or finish. (default: 4, 0 disables)
 repeat_tool_threshold = 4
+# How many tool calls may pass without touching the todo list before a hidden
+# reminder asks the model to plan or refresh it, so progress stays visible
+# instead of every todo being updated at the end. (default: 5, 0 disables)
+todo_stale_threshold = 5
 
 [safety]
 # Notification settings for ambient mode events

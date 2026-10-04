@@ -77,6 +77,7 @@ impl Config {
 - KV cache miss notices: {}
 - Update channel: {}
 - Repeat-tool threshold: {} (0 disables)
+- Todo-stale threshold: {} (0 disables)
 
 **Tools:**
 - Profile: {}
@@ -236,6 +237,7 @@ impl Config {
             self.features.kv_cache_miss_notices,
             self.features.update_channel,
             self.loop_guard.repeat_tool_threshold,
+            self.loop_guard.todo_stale_threshold,
             if self.tools.profile.trim().is_empty() {
                 "full"
             } else {

@@ -767,6 +767,10 @@ impl Tool for TodoTool {
         // deliberately handwritten. Never generate it from gate constants or
         // interpolate private thresholds, because that would teach the model
         // how to target the evaluator instead of reporting an honest assessment.
+        //
+        // The top-level description is capped at ~20 estimated tokens
+        // (`tool::tests::tool_descriptions_stay_under_token_cap`), so behavioral
+        // guidance lives in the parameter descriptions below instead.
         "Read or update structured todo items and optional goal-level assessments."
     }
 
@@ -789,7 +793,7 @@ impl Tool for TodoTool {
                             "status": {
                                 "type": "string",
                                 "enum": ["pending", "in_progress", "completed", "cancelled"],
-                                "description": "Status. Use completed when the task is done."
+                                "description": "Status. Use completed the moment a task is done; do not batch completions to the end."
                             },
                             "priority": {
                                 "type": "string",

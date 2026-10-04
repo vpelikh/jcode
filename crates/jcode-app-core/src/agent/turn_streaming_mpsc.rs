@@ -100,6 +100,7 @@ impl Agent {
         let mut empty_post_tool_continuations = 0u32;
         let mut fable_guardrail_reconsiderations = 0u32;
         let mut stalled_promise_continuations = 0u32;
+        let mut stale_todo_reminders = 0usize;
 
         loop {
             // Never open a new provider request after a cancel. Several paths
@@ -1733,11 +1734,70 @@ impl Agent {
                     point: "D".to_string(),
                     tools_skipped: None,
                 });
-                let _ = self.add_message(Role::User, reminder.content);
+                self.add_message(Role::User, reminder.content);
                 crate::logging::info(&format!(
                     "[guard] repeat-tool reminder injected for session {}",
                     self.session.id
                 ));
+            }
+
+            // Stale-todo guard: if the model has made several tool calls without
+            // touching the todo list while work is still incomplete, inject a
+            // hidden reminder so progress stays visible instead of every todo
+            // being stamped at the very end. Runs after all results are
+            // committed, like the repeat-tool guard above.
+            let todo_threshold = super::guard::stale_todo_threshold();
+            if todo_threshold > 0
+                && super::guard::todo_guard_applies(&self.session.id)
+                && stale_todo_reminders < super::guard::MAX_STALE_TODO_REMINDERS_PER_TURN
+                && super::guard::tool_calls_since_todo_touch(&self.session.messages)
+                    >= todo_threshold
+            {
+                // Only run the guard when the todo state loaded cleanly. A read
+                // failure must not be mistaken for "no todos", which would
+                // inject a spurious "create a plan" reminder, and must not
+                // abort the turn.
+                match crate::todo::load_todos(&self.session.id) {
+                    Ok(todos) => {
+                        if let Some(reminder) = super::guard::stale_todo_reminder_from_transcript(
+                            &self.session.messages,
+                            &todos,
+                            todo_threshold,
+                            super::guard::MAX_STALE_TODO_REMINDERS_PER_TURN - stale_todo_reminders,
+                        ) {
+                            stale_todo_reminders += 1;
+                            // Send a clean, tag-free notice to the client. The
+                            // stored reminder is a hidden <system-reminder> for
+                            // the model; forwarding its text would print the raw
+                            // XML wrapper and internal instructions in the UI.
+                            let text =
+                                super::guard::reminder_display_summary(&reminder).to_string();
+                            let _ = event_tx.send(ServerEvent::SoftInterruptInjected {
+                                content: text.clone(),
+                                display_role: Some("system".to_string()),
+                                point: "D".to_string(),
+                                tools_skipped: None,
+                            });
+                            self.add_message(Role::User, reminder.content);
+                            if let Err(err) = self.session.save() {
+                                logging::warn(&format!(
+                                    "Failed to persist stale-todo reminder for session {}: {}",
+                                    self.session.id, err
+                                ));
+                            }
+                            crate::logging::info(&format!(
+                                "[guard] stale-todo reminder injected for session {}",
+                                self.session.id
+                            ));
+                        }
+                    }
+                    Err(err) => {
+                        logging::warn(&format!(
+                            "Skipping stale-todo guard after todo read failure (session {}): {}",
+                            self.session.id, err
+                        ));
+                    }
+                }
             }
         }
 

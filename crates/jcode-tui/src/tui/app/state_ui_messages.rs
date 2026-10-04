@@ -20,6 +20,12 @@ fn display_message_from_stored_message(
     if is_background_task_lifecycle_message(&text) {
         return None;
     }
+    // Internal system reminders (boot context, guard nudges, memory injections)
+    // are model-facing only and must never render as a user prompt when history
+    // is reconstructed from stored messages.
+    if message.display_role.is_none() && text.trim_start().starts_with("<system-reminder>") {
+        return None;
+    }
     match message.display_role {
         Some(crate::session::StoredDisplayRole::System) => Some(DisplayMessage::system(text)),
         Some(crate::session::StoredDisplayRole::BackgroundTask) => None,
@@ -860,4 +866,45 @@ fn parse_leading_usize(text: &str) -> Option<(usize, &str)> {
         .last()?;
     let value = text[..end].parse().ok()?;
     Some((value, &text[end..]))
+}
+
+#[cfg(test)]
+mod reminder_display_tests {
+    use super::*;
+    use crate::message::{ContentBlock, Role};
+
+    fn user_text(text: &str) -> crate::session::StoredMessage {
+        crate::session::StoredMessage {
+            id: "m".to_string(),
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+                cache_control: None,
+            }],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        }
+    }
+
+    #[test]
+    fn internal_system_reminder_is_not_shown_as_user_prompt() {
+        let reminder = user_text(
+            "<system-reminder>You have made many tool calls without updating the todo list.</system-reminder>",
+        );
+        assert!(
+            display_message_from_stored_message(&reminder).is_none(),
+            "an internal system reminder must not render as a user prompt on reload"
+        );
+    }
+
+    #[test]
+    fn genuine_user_prompt_still_renders() {
+        let prompt = user_text("please fix the flaky test");
+        assert!(
+            display_message_from_stored_message(&prompt).is_some(),
+            "a real user prompt must still render"
+        );
+    }
 }

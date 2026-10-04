@@ -360,12 +360,23 @@ pub struct LoopGuardConfig {
     /// many times in a row without progress. Defaults to 4. Set to a larger value
     /// to be less aggressive, or to 0 to disable the guard entirely.
     pub repeat_tool_threshold: usize,
+
+    /// How many tool rounds may pass without a `todo` call while the session
+    /// still has incomplete todos before the in-turn stale-todo reminder fires.
+    ///
+    /// The model-free guard (see `jcode-app-core`'s stale-todo reminder) injects a
+    /// hidden `<system-reminder>` when the model keeps working without touching
+    /// the todo list, so a long task does not end up with every todo updated at
+    /// the very end. Defaults to 5. Set to a larger value to be less aggressive,
+    /// or to 0 to disable the guard entirely.
+    pub todo_stale_threshold: usize,
 }
 
 impl Default for LoopGuardConfig {
     fn default() -> Self {
         Self {
             repeat_tool_threshold: 4,
+            todo_stale_threshold: 5,
         }
     }
 }
