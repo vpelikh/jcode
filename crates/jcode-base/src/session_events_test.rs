@@ -4657,6 +4657,85 @@ fn branded_id_fields_deserialize_legacy_raw_string_wire_format_verbatim() {
 }
 
 #[test]
+fn test_in_place_mutation_records_minimal_replacement_span() {
+    // Regression: an in-place mutation on a long transcript must not store the
+    // entire transcript in its `ReplaceMessages` event. The scheduled per-step
+    // prune fires on every provider step, so full-transcript events grew a real
+    // session's event log as O(n^2) (147 MB across 1,733 events, multi-second
+    // loads). The emitted event should span only the changed message.
+    let mut session =
+        Session::create_with_id("minimal_span".to_string(), None, None);
+    for i in 0..40 {
+        let content = vec![ContentBlock::ToolResult {
+            tool_use_id: format!("tool{i}").into(),
+            // One result exceeds the node cap; the rest are similar-sized so a
+            // minimal-span event is a small fraction of the whole transcript.
+            content: if i == 20 {
+                "z".repeat(50_000)
+            } else {
+                format!("small result {i}").repeat(120)
+            },
+            is_error: None,
+        }];
+        session.append_stored_message(StoredMessage {
+            id: format!("msg{i}"),
+            role: Role::User,
+            content,
+            display_role: None,
+            timestamp: Some(Utc::now()),
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+    let before_events = session.event_map.events.len();
+    let report =
+        session.prune_transcript(&crate::compaction::prune::PrunePolicy::node_caps());
+    assert_eq!(
+        report.tool_results_truncated, 1,
+        "only the oversized result must be truncated"
+    );
+    assert_eq!(session.event_map.events.len(), before_events + 1);
+
+    let last = session.event_map.events.last().expect("event appended");
+    match &last.op {
+        SessionEventOp::ReplaceMessages {
+            start_index,
+            end_index,
+            messages,
+        } => {
+            assert_eq!(*start_index, 20, "span starts at the changed message");
+            assert_eq!(*end_index, 21, "span covers exactly one message");
+            assert_eq!(messages.len(), 1, "only the changed message is stored");
+        }
+        other => panic!("expected ReplaceMessages event, got {other:?}"),
+    }
+
+    // The minimal span must still reconstruct the full transcript exactly.
+    session
+        .rederive_all_checked()
+        .expect("event log must agree with legacy vector after a minimal-span replace");
+    let derived = session.derive_messages();
+    assert_eq!(derived.len(), 40);
+    let changed = &derived[20].content[0];
+    assert!(matches!(changed, ContentBlock::ToolResult { .. }));
+
+    // Outcome-level check: the emitted event must stay small. A full-transcript
+    // replacement would serialize all 40 messages; the actual persisted cost is
+    // what made real session files balloon, so assert on the serialized size
+    // rather than only on the span fields.
+    let event_bytes = serde_json::to_vec(last).expect("event serializes").len();
+    let transcript_bytes = session
+        .messages
+        .iter()
+        .map(|m| serde_json::to_vec(m).expect("message serializes").len())
+        .sum::<usize>();
+    assert!(
+        event_bytes < transcript_bytes / 10,
+        "minimal-span event ({event_bytes}B) must be far smaller than the full transcript ({transcript_bytes}B)"
+    );
+}
+
+#[test]
 fn test_prune_transcript_uses_policy_and_keeps_event_log_consistent() {
     use crate::compaction::prune;
 
@@ -5149,4 +5228,263 @@ fn projected_messages_incremental_cache_matches_derived_randomized() {
             "projection cache fell behind the log head at step {step}"
         );
     }
+}
+
+
+#[test]
+fn test_load_compacts_bloated_full_replacement_log() {
+    // Simulate a pre-fix session: each in-place mutation stored a full-transcript
+    // ReplaceMessages. Loading must collapse the redundant snapshots while
+    // preserving the derived transcript exactly.
+    let mut session = Session::create_with_id("bloated".to_string(), None, None);
+    for i in 0..20 {
+        session.append_stored_message(StoredMessage {
+            id: format!("m{i}"),
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: format!("message {i}"), cache_control: None }],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+    // Emit 50 redundant full-transcript replacements (each supersedes the last),
+    // mimicking the old per-step prune behavior.
+    let full = session.messages.clone();
+    for _ in 0..50 {
+        session.replace_messages(full.clone());
+    }
+    let before_events = session.event_map.events.len();
+    let expected = session.derive_messages();
+    assert!(before_events >= 50);
+
+    // Load-time reconciliation must compact the redundant replacements.
+    let preserved = session.reconcile_event_map_after_load();
+    assert!(preserved, "log agrees with vectors, so it is preserved");
+    assert!(
+        session.event_map.events.len() < before_events,
+        "bloated log must shrink (before={before_events}, after={})",
+        session.event_map.events.len()
+    );
+    // Exactly one full replacement per run survives; with one contiguous run of
+    // 50, at most one remains beyond the original appends.
+    let full_left = session
+        .event_map
+        .events
+        .iter()
+        .filter(|e| matches!(&e.op, SessionEventOp::ReplaceMessages { start_index: 0, end_index: usize::MAX, .. }))
+        .count();
+    assert_eq!(full_left, 1, "only the last full replacement of the run survives");
+    // The transcript must be byte-identical after compaction.
+    session
+        .rederive_all_checked()
+        .expect("compacted log must agree with the legacy transcript");
+    assert_eq!(session.derive_messages(), expected);
+}
+
+#[test]
+fn test_compaction_preserves_compaction_state_and_skips_small_reclaim() {
+    // (1) The collapse must preserve derived compaction state, not just messages.
+    let mut session = Session::create_with_id("compact_state".into(), None, None);
+    for i in 0..20 {
+        session.append_stored_message(StoredMessage {
+            id: format!("m{i}"),
+            role: Role::User,
+            content: vec![text_block(&format!("m{i}"))],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+    // Set a compaction, then a run of full replacements after it. The SetCompaction
+    // event must survive the collapse.
+    let compaction = StoredCompactionState {
+        summary_text: "summary".into(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 5,
+        compacted_count: 1,
+        physically_consolidated: false,
+    };
+    session.set_compaction(compaction.clone());
+    let full = session.messages.clone();
+    for _ in 0..30 {
+        session.replace_messages(full.clone());
+    }
+    let expected_compaction = session.derive_compaction();
+    let expected_messages = session.derive_messages();
+    assert!(session.reconcile_event_map_after_load());
+    assert_eq!(session.derive_messages(), expected_messages);
+    assert_eq!(
+        session.derive_compaction(),
+        expected_compaction,
+        "compaction state must survive the log collapse"
+    );
+
+    // (2) A session with no full replacement at all must be left untouched:
+    // few appends are not worth rewriting.
+    let mut small = Session::create_with_id("small_reclaim".into(), None, None);
+    for i in 0..4 {
+        small.append_stored_message(StoredMessage {
+            id: format!("s{i}"),
+            role: Role::User,
+            content: vec![text_block(&format!("s{i}"))],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+    let before = small.event_map.events.len();
+    let _ = small.reconcile_event_map_after_load();
+    assert_eq!(
+        small.event_map.events.len(),
+        before,
+        "a log with no full replacement must not be rewritten"
+    );
+
+    // (3) A single superseded full replacement is itself worth reclaiming,
+    // even though the event count is low: it is a whole-transcript snapshot.
+    let mut one = Session::create_with_id("one_replacement".into(), None, None);
+    for i in 0..4 {
+        one.append_stored_message(StoredMessage {
+            id: format!("o{i}"),
+            role: Role::User,
+            content: vec![text_block(&format!("o{i}"))],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+    one.replace_messages(one.messages.clone());
+    one.replace_messages(one.messages.clone());
+    let before_one = one.event_map.events.len();
+    let _ = one.reconcile_event_map_after_load();
+    assert!(
+        one.event_map.events.len() < before_one,
+        "a superseded full replacement must be reclaimed regardless of count"
+    );
+}
+
+#[test]
+fn test_minimal_span_for_first_message_edit() {
+    // A change to the FIRST message must yield a span at 0..1 (not a full
+    // replacement tied to the tail), and must not corrupt later messages.
+    use crate::compaction::prune::PrunePolicy;
+    let mut session = Session::create_with_id("span_first".into(), None, None);
+    for i in 0..10 {
+        let content = vec![ContentBlock::ToolResult {
+            tool_use_id: format!("t{i}").into(),
+            content: if i == 0 { "z".repeat(50_000) } else { format!("body {i}").repeat(80) },
+            is_error: None,
+        }];
+        session.append_stored_message(StoredMessage {
+            id: format!("m{i}"),
+            role: Role::User,
+            content,
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+    let report = session.prune_transcript(&PrunePolicy::node_caps());
+    assert_eq!(report.tool_results_truncated, 1);
+    let last = session.event_map.events.last().unwrap();
+    match &last.op {
+        SessionEventOp::ReplaceMessages { start_index, end_index, messages } => {
+            assert_eq!((*start_index, *end_index), (0, 1), "changed first message -> span 0..1");
+            assert_eq!(messages.len(), 1);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    session.rederive_all_checked().unwrap();
+    assert_eq!(session.derive_messages().len(), 10);
+}
+
+#[test]
+fn test_minimal_span_after_cold_cache_load() {
+    // After deserialization the projection cache is cold (serde(skip)). The first
+    // in-place mutation must fold on demand via `folded_transcript` and still
+    // emit a minimal span, not fall back to a full replacement.
+    use crate::compaction::prune::PrunePolicy;
+    let mut session = Session::create_with_id("cold_cache".into(), None, None);
+    for i in 0..20 {
+        let content = vec![ContentBlock::ToolResult {
+            tool_use_id: format!("t{i}").into(),
+            content: if i == 7 { "z".repeat(50_000) } else { format!("x{i}").repeat(80) },
+            is_error: None,
+        }];
+        session.append_stored_message(StoredMessage {
+            id: format!("m{i}"),
+            role: Role::User,
+            content,
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+    // Simulate a cold cache by round-tripping through serde (drops the cache).
+    let json = serde_json::to_string(&session.event_map).unwrap();
+    session.event_map = serde_json::from_str(&json).unwrap();
+    assert_eq!(session.event_map.projection_folded_len(), 0, "cache must be cold");
+
+    let report = session.prune_transcript(&PrunePolicy::node_caps());
+    assert_eq!(report.tool_results_truncated, 1);
+    let last = session.event_map.events.last().unwrap();
+    match &last.op {
+        SessionEventOp::ReplaceMessages { start_index, end_index, messages } => {
+            assert_eq!((*start_index, *end_index), (7, 8), "cold cache still yields a minimal span");
+            assert_eq!(messages.len(), 1);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    session.rederive_all_checked().unwrap();
+}
+
+#[test]
+fn test_compaction_preserves_plugin_and_bracket_events() {
+    // Compaction must keep every non-message event: plugin `Unknown` and
+    // compaction brackets, even when they sit before the last full replacement.
+    use crate::session::event_types::{SessionEvent, SessionEventOp};
+    let mut session = Session::create_with_id("preserve_logonly".into(), None, None);
+    for i in 0..20 {
+        session.append_stored_message(StoredMessage {
+            id: format!("m{i}"),
+            role: Role::User,
+            content: vec![text_block(&format!("m{i}"))],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+    // A plugin event before the bloat.
+    session.event_map.append_event(SessionEvent {
+        timestamp: Utc::now(),
+        event_id: "plugin_evt".into(),
+        op: SessionEventOp::Unknown {
+            event_type: "plugin/x".into(),
+            data: serde_json::json!({ "n": 1 }),
+        },
+        parent_id: None,
+        version: 1,
+    });
+    // Bloat: 30 full replacements.
+    let full = session.messages.clone();
+    for _ in 0..30 {
+        session.replace_messages(full.clone());
+    }
+    let before = session.event_map.events.len();
+    assert!(session.reconcile_event_map_after_load());
+    assert!(session.event_map.events.len() < before, "bloat must shrink");
+    // The plugin event must survive the collapse.
+    let plugin_survived = session.event_map.events.iter().any(|e| {
+        matches!(&e.op, SessionEventOp::Unknown { event_type, .. } if event_type == "plugin/x")
+    });
+    assert!(plugin_survived, "plugin Unknown event must survive compaction");
+    session.rederive_all_checked().unwrap();
 }

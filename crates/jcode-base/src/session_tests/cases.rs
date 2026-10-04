@@ -3088,7 +3088,7 @@ fn test_journal_append_reload_keeps_sources_consistent() -> Result<()> {
     live.save()?;
     assert!(journal_path.exists(), "second save must be a journal append");
 
-    let reloaded = Session::load(id)?;
+    let reloaded = Session::load(&id)?;
     assert_eq!(
         reloaded.messages.len(),
         2,
@@ -3190,7 +3190,7 @@ fn test_orphaned_compaction_bracket_survives_journal_reload() -> Result<()> {
     live.save()?;
     assert!(journal_path.exists(), "second save must be a journal append");
 
-    let reloaded = Session::load(id)?;
+    let reloaded = Session::load(&id)?;
     assert_eq!(
         reloaded.messages.len(),
         2,
@@ -3294,7 +3294,7 @@ fn event_sourced_log_survives_public_api_session_lifecycle() -> Result<()> {
     }
 
     // Reload 1: pure snapshot.
-    let reloaded = Session::load(id)?;
+    let reloaded = Session::load(&id)?;
     assert_eq!(reloaded.messages.len(), 2);
     assert_invariants_green(&reloaded, "after snapshot reload");
 
@@ -3377,7 +3377,7 @@ fn unknown_plugin_event_survives_public_api_journal_append_reload() -> Result<()
 
     // Reload through the public API: both the journal message and the plugin
     // event must survive, and the event log must stay consistent.
-    let reloaded = Session::load(id)?;
+    let reloaded = Session::load(&id)?;
     assert_eq!(reloaded.messages.len(), 2);
     assert!(
         reloaded.event_map.events.iter().any(|e| matches!(
@@ -3527,7 +3527,7 @@ fn log_only_plugin_event_forces_persistence_without_message() -> Result<()> {
     );
 
     // Reload: the plugin marker must survive.
-    let reloaded = Session::load(id)?;
+    let reloaded = Session::load(&id)?;
     assert!(
         reloaded
             .event_map
@@ -3786,7 +3786,7 @@ fn clear_messages_persists_via_event_consistent_checkpoint() -> Result<()> {
     // The clear must persist; if the shrink-guard blocks it, this errors.
     session.save()?;
 
-    let reloaded = Session::load(id)?;
+    let reloaded = Session::load(&id)?;
     assert!(
         reloaded.messages.is_empty(),
         "cleared session must reload empty (the ClearAll is the durable record)"
@@ -3845,7 +3845,7 @@ fn compaction_via_public_api_survives_journal_append_reload() -> Result<()> {
     assert!(journal_path.exists(), "second save must be a journal append");
 
     // Reload: compaction and the SetCompaction event must both survive.
-    let reloaded = Session::load(id)?;
+    let reloaded = Session::load(&id)?;
     assert_eq!(
         reloaded.compaction.as_ref().map(|c| &c.summary_text),
         Some(&"compacted".to_string()),
@@ -3902,7 +3902,7 @@ fn divergent_load_rebuilds_then_persists_and_stays_consistent() -> Result<()> {
 
     // Load: the empty vectors vs. the (now-removed) event log must reconcile by
     // rebuilding; the log must agree with the now-empty transcript.
-    let mut loaded = Session::load(id)?;
+    let mut loaded = Session::load(&id)?;
     assert!(loaded.messages.is_empty());
     loaded
         .rederive_all_checked()
@@ -3911,7 +3911,7 @@ fn divergent_load_rebuilds_then_persists_and_stays_consistent() -> Result<()> {
     // The next save must persist the rebuilt log (snapshot), and a reload must
     // not need to rebuild again — it reloads empty and consistent.
     loaded.save()?;
-    let reloaded = Session::load(id)?;
+    let reloaded = Session::load(&id)?;
     assert!(reloaded.messages.is_empty());
     reloaded
         .rederive_all_checked()
@@ -4035,7 +4035,7 @@ fn route_api_method_survives_journal_append_reload() -> Result<()> {
     session.save()?;
     assert!(journal_path.exists(), "second save must be a journal append");
 
-    let reloaded = Session::load(id)?;
+    let reloaded = Session::load(&id)?;
     assert_eq!(
         reloaded.route_api_method.as_deref(),
         Some("POST"),
@@ -4074,7 +4074,7 @@ fn empty_replace_messages_persists_via_event_consistent_checkpoint() -> Result<(
     assert!(session.messages.is_empty());
     session.save()?;
 
-    let reloaded = Session::load(id)?;
+    let reloaded = Session::load(&id)?;
     assert!(
         reloaded.messages.is_empty(),
         "empty full-replacement must persist as an intentional clear"
@@ -4220,7 +4220,7 @@ fn compaction_across_multiple_journal_appends_replays_last_wins() -> Result<()> 
     });
     session.save()?; // pure event-append: journals only append_events
 
-    let reloaded = Session::load(id)?;
+    let reloaded = Session::load(&id)?;
     assert_eq!(
         reloaded.compaction.as_ref().map(|c| &c.summary_text),
         Some(&"compacted_b".to_string()),
@@ -4342,7 +4342,7 @@ fn clear_with_existing_snapshot_and_journal_checkpoints_cleanly() -> Result<()> 
         "clear-then-save must checkpoint and delete the journal"
     );
 
-    let reloaded = Session::load(id)?;
+    let reloaded = Session::load(&id)?;
     assert!(
         reloaded.messages.is_empty(),
         "cleared (snapshot+journal) session must reload empty"
@@ -4598,4 +4598,119 @@ fn rendered_image_history_boundary_is_backward_compatible() {
         serde_json::from_value::<RenderedImage>(encoded).unwrap(),
         image
     );
+}
+
+/// End-to-end: a bloated log (pre-fix full-transcript replacements) must be
+/// written back compacted on the first load+save, so the on-disk file shrinks
+/// while the transcript is preserved. This is the acceptance behavior for the
+/// retroactive cleanup.
+#[test]
+fn load_compacts_bloated_log_and_shrinks_persisted_file() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-compact-roundtrip-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let session_id = "session_bloated_roundtrip";
+    let mut session = Session::create_with_id(session_id.to_string(), None, None);
+    for i in 0..30 {
+        session.append_stored_message(StoredMessage {
+            id: format!("m{i}"),
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: format!("t{i}").into(),
+                content: "x".repeat(20_000),
+                is_error: None,
+            }],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+    // 60 redundant full-transcript replacements, as the old per-step prune wrote.
+    let full = session.messages.clone();
+    for _ in 0..60 {
+        session.replace_messages(full.clone());
+    }
+    session.save()?;
+
+    let path = crate::session::storage_paths::session_path(session_id)?;
+    let bloat_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let expected_messages = session.derive_messages();
+
+    // Load (triggers compaction on the preserved path) then save again.
+    let mut loaded = Session::load(session_id)?;
+    assert_eq!(
+        loaded.derive_messages().len(),
+        expected_messages.len(),
+        "compaction must preserve the transcript"
+    );
+    loaded.save()?;
+
+    let compacted_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    assert!(
+        compacted_bytes * 2 < bloat_bytes,
+        "persisted file must shrink materially (before={bloat_bytes}, after={compacted_bytes})"
+    );
+
+    // A third load must still see the same transcript.
+    let reloaded = Session::load(session_id)?;
+    assert_eq!(reloaded.derive_messages().len(), expected_messages.len());
+    Ok(())
+}
+
+/// Acceptance against a REAL bloated session on disk: load it, confirm the
+/// event log compacts and the derived transcript is preserved, then confirm a
+/// second load is consistent. Uses a copied fixture so it never mutates real
+/// session data.
+///
+/// Ignored by default (depends on a local fixture). Run with:
+/// `JCODE_ACCEPTANCE_SESSION=/path/to/session_x.json \
+///   cargo test -p jcode-base --lib acceptance_real_bloated_session -- --ignored --nocapture`
+#[test]
+#[ignore = "requires JCODE_ACCEPTANCE_SESSION pointing at a real bloated session"]
+fn acceptance_real_bloated_session_compacts_on_load() -> Result<()> {
+    let src = std::env::var("JCODE_ACCEPTANCE_SESSION")
+        .map_err(|_| anyhow!("set JCODE_ACCEPTANCE_SESSION to a session json path"))?;
+    if !std::path::Path::new(&src).exists() {
+        return Err(anyhow!("JCODE_ACCEPTANCE_SESSION path does not exist: {src}"));
+    }
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-acceptance-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+    let sessions = temp_home.path().join("sessions");
+    std::fs::create_dir_all(&sessions)?;
+    // Keep the real session id in the filename so `save()` targets the same
+    // path (it writes by the session's internal id, not the requested one).
+    let id = std::path::Path::new(&src)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow!("bad fixture name"))?;
+    let dst = sessions.join(format!("{id}.json"));
+    std::fs::copy(&src, &dst)?;
+    let before_bytes = std::fs::metadata(&dst)?.len();
+
+    let started = std::time::Instant::now();
+    let mut loaded = Session::load(&id)?;
+    let load_ms = started.elapsed().as_millis();
+    let msgs = loaded.messages.len();
+    assert!(msgs > 0, "fixture should have messages");
+    loaded.save()?;
+    let after_bytes = std::fs::metadata(&dst)?.len();
+    eprintln!("[acceptance] load_ms={load_ms} msgs={msgs} bytes {before_bytes} -> {after_bytes}");
+    assert!(
+        after_bytes * 3 < before_bytes,
+        "real bloated session must shrink materially ({before_bytes} -> {after_bytes})"
+    );
+    // Re-load preserves the transcript.
+    let reloaded = Session::load(&id)?;
+    assert_eq!(reloaded.messages.len(), msgs);
+    Ok(())
 }

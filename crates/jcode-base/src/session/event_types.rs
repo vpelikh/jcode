@@ -569,6 +569,24 @@ impl SessionEventMap {
             .get::<LiveTranscriptProjection>()
             .map(|messages| messages.as_slice())
     }
+
+    /// Fold the log to the head and **borrow** the projected transcript.
+    ///
+    /// Unlike [`projected_messages`](Self::projected_messages), this does not
+    /// clone the transcript: it returns a slice into the incremental projection
+    /// cache. Used by in-place mutation paths that need to diff the pre-mutation
+    /// transcript against the mutated one without paying an O(transcript) copy.
+    ///
+    /// The returned slice borrows `self`, so a caller must finish with it before
+    /// mutating the map; derive from it first if the mutation needs the data.
+    pub(crate) fn folded_transcript(&mut self) -> &[StoredMessage] {
+        self.projection_cache.ensure_folded(&self.events);
+        self.projection_cache
+            .registry()
+            .get::<LiveTranscriptProjection>()
+            .expect("builtin projection registry must contain LiveTranscriptProjection")
+            .as_slice()
+    }
     
     /// Derive current messages from events
     pub fn derive_messages(&self) -> Vec<StoredMessage> {

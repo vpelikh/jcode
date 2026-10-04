@@ -1503,28 +1503,95 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
         }
     }
 
-    /// Emit a `ReplaceMessages` event capturing the full current transcript.
+    /// Emit a `ReplaceMessages` event recording the minimal span that an
+    /// in-place transcript mutation actually changed.
     ///
     /// Used by in-place transcript mutations (`strip_oversized_images`,
     /// `emergency_truncate_tool_results`, `remove_tool_use_blocks`, and
     /// `refresh_initial_session_context_message`) that modify `self.messages`
     /// directly without re-entering an event-emitting append/insert/replace
-    /// path. Emitting a full replacement keeps the event log the single source
-    /// of truth and stays robust regardless of where in the log the mutation
-    /// lands.
+    /// path.
+    ///
+    /// These mutations are node-local (image/tool-result caps) or single-message
+    /// edits, but the transcript can hold thousands of messages and the scheduled
+    /// per-step prune fires on every provider step. Emitting a full replacement
+    /// each time stored the *entire* transcript per step, so a tool-heavy session
+    /// grew its event log as O(n^2) — a real session reached 147 MB of event
+    /// payloads across 1,733 `ReplaceMessages` events, turning session loads into
+    /// multi-second stalls. Instead we diff against the log's current projection
+    /// (the pre-mutation transcript) and emit only the changed span.
+    ///
+    /// The event log remains the single source of truth: the emitted span,
+    /// folded with the existing policy semantics, reproduces `self.messages`
+    /// exactly. The diff is exhaustive (a common prefix/suffix trim), so it
+    /// always yields a valid single splice; a full replacement is emitted only
+    /// when the transcript is empty (nothing to diff).
     fn record_transcript_replacement(&mut self) {
-        let event = SessionEvent {
-            timestamp: chrono::Utc::now(),
-            event_id: crate::id::new_id("transcript_mutation").into(),
-            op: SessionEventOp::ReplaceMessages {
+        let op = self
+            .minimal_replacement_span()
+            .map(|(start, end, messages)| SessionEventOp::ReplaceMessages {
+                start_index: start,
+                end_index: end,
+                messages,
+            })
+            .unwrap_or_else(|| SessionEventOp::ReplaceMessages {
                 start_index: 0,
                 end_index: usize::MAX,
                 messages: self.messages.clone(),
-            },
+            });
+        let event = SessionEvent {
+            timestamp: chrono::Utc::now(),
+            event_id: crate::id::new_id("transcript_mutation").into(),
+            op,
             parent_id: None,
             version: 1,
         };
         self.event_map.append_event(event);
+    }
+
+    /// Compute the smallest `(start_index, end_index, messages)` splice that
+    /// transforms the log's current projected transcript into `self.messages`.
+    ///
+    /// The mutations that call [`record_transcript_replacement`](Self::record_transcript_replacement)
+    /// rewrite content *in place*: they usually keep the message count and the
+    /// message ids, editing only a few payloads (an oversized image or tool
+    /// result becomes a short marker). The common prefix and suffix are found by
+    /// equality comparison; the changed middle is emitted as one splice.
+    ///
+    /// The middle is only trimmed to a *single* message when the diff itself
+    /// spans one message; a diff spread across several messages stores those
+    /// messages. Either way the stored payload is the changed region, never the
+    /// whole transcript.
+    ///
+    /// Returns `None` only when both transcripts are empty (nothing to record).
+    fn minimal_replacement_span(&mut self) -> Option<(usize, usize, Vec<StoredMessage>)> {
+        // Fold the event log to the pre-mutation transcript and *borrow* it
+        // (no O(transcript) clone). Compute the splice bounds and copy only the
+        // changed span, so an in-place mutation no longer clones or persists the
+        // whole transcript.
+        let prev = self.event_map.folded_transcript();
+        let new = self.messages.as_slice();
+        if prev.is_empty() && new.is_empty() {
+            return None;
+        }
+
+        let n = prev.len().min(new.len());
+        let mut front = 0;
+        while front < n && prev[front] == new[front] {
+            front += 1;
+        }
+        let mut back = 0;
+        while back < n - front && prev[prev.len() - 1 - back] == new[new.len() - 1 - back] {
+            back += 1;
+        }
+
+        // A single `ReplaceMessages` covers every case: it replaces
+        // `prev[front..front + prev_mid]` with `new[front..front + new_mid]`,
+        // which can add, remove, or rewrite messages.
+        let prev_mid = prev.len() - front - back;
+        let new_mid = new.len() - front - back;
+
+        Some((front, front + prev_mid, new[front..front + new_mid].to_vec()))
     }
 
     pub fn append_stored_message(&mut self, message: StoredMessage) {
@@ -2586,12 +2653,141 @@ tools all follow it. Do not assume the previous directory still applies.\n</syst
             return true;
         }
         match self.rederive_all_checked() {
-            Ok(_) => true,
+            Ok(_) => {
+                // The persisted log agrees with the legacy vectors, so it is
+                // preserved. It may still be *bloated*: sessions written before
+                // the minimal-span fix stored a full-transcript `ReplaceMessages`
+                // on every in-place mutation, so a long session's log can hold
+                // hundreds of full-transcript snapshots. Loading one then wastes
+                // seconds parsing and megabytes of memory for redundant payload.
+                // Compacting here rewrites only that redundant history (same
+                // derived transcript), so a stale session is reclaimed the first
+                // time it is loaded.
+                self.compact_bloated_event_log();
+                true
+            }
             Err(_) => {
                 self.rebuild_event_map();
                 false
             }
         }
+    }
+
+    /// Rewrite a preserved event log down to its minimal equivalent form when it
+    /// carries redundant in-place-mutation snapshots.
+    ///
+    /// Before the minimal-span fix, every in-place mutation emitted a
+    /// `ReplaceMessages { start_index: 0, end_index: usize::MAX }` (or a
+    /// `ClearAll`) carrying the *whole* transcript. Because such a full
+    /// replacement discards all prior message state, every message-mutating
+    /// event that appears **before the last full replacement** is superseded: it
+    /// can be dropped without changing the derived transcript, which is exactly
+    /// what the last full replacement plus any later events produce.
+    ///
+    /// So: find the last full replacement / clear, drop all
+    /// `AppendMessage`/`InsertMessage`/`ReplaceMessages` events before it, and
+    /// keep every non-message event (compaction brackets, memory injections,
+    /// replay, plugin `Unknown`) and everything from the last full replacement
+    /// onward. This is only committed after the collapsed log is shown to derive
+    /// the transcript exactly; otherwise the original log is left untouched.
+    ///
+    /// Metadata and log-order semantics are preserved: only superseded message
+    /// payloads are removed, never a compaction bracket or a plugin event.
+    fn compact_bloated_event_log(&mut self) {
+        let is_message_event = |e: &SessionEvent| {
+            matches!(
+                e.op,
+                SessionEventOp::AppendMessage { .. }
+                    | SessionEventOp::InsertMessage { .. }
+                    | SessionEventOp::ReplaceMessages { .. }
+                    | SessionEventOp::ClearAll
+            )
+        };
+        let is_full_replace = |e: &SessionEvent| {
+            matches!(
+                e.op,
+                SessionEventOp::ClearAll
+                    | SessionEventOp::ReplaceMessages {
+                        start_index: 0,
+                        end_index: usize::MAX,
+                        ..
+                    }
+            )
+        };
+
+        let Some(last_full) = self
+            .event_map
+            .events
+            .iter()
+            .rposition(is_full_replace)
+        else {
+            return;
+        };
+
+        // Gate BEFORE materializing anything, so a session with a full
+        // replacement but nothing material to reclaim does not pay an O(log)
+        // clone on every load. Bloat is really *bytes*: a superseded full
+        // replacement is by definition a whole-transcript snapshot, so even one
+        // of them is worth reclaiming regardless of count. Otherwise require
+        // several superseded events.
+        const MIN_REMOVED: usize = 16;
+        let removed = self.event_map.events[..last_full]
+            .iter()
+            .filter(|e| is_message_event(e))
+            .count();
+        let superseded_full_replacements = self.event_map.events[..last_full]
+            .iter()
+            .filter(|e| is_full_replace(e))
+            .count();
+        if superseded_full_replacements == 0 && removed < MIN_REMOVED {
+            return;
+        }
+
+        // Drop superseded message events: every message event strictly before the
+        // last full replacement. Non-message events are always kept.
+        let mut candidate = Vec::with_capacity(self.event_map.events.len() - removed);
+        for (i, event) in self.event_map.events.iter().enumerate() {
+            if i < last_full && is_message_event(event) {
+                continue;
+            }
+            candidate.push(event.clone());
+        }
+
+        // Prove the collapsed log derives the same state before committing. All
+        // message events dropped here are strictly before the last full
+        // replacement, and compaction state only ever changes via
+        // `SetCompaction`/`CompactionEnd` (kept) or `ClearAll` (the boundary
+        // itself), so the collapsed log should reproduce both. Verify the whole
+        // derivable surface, not just messages, before trusting the rewrite.
+        let (original_messages, original_compaction) = self.rederive_all();
+        let mut candidate_map = SessionEventMap::default();
+        for event in candidate {
+            candidate_map.push_event(event);
+        }
+        let (candidate_messages, candidate_compaction) = candidate_map.rederive_all();
+        if candidate_messages != original_messages || candidate_compaction != original_compaction {
+            // Unexpected divergence; leave the original log authoritative.
+            crate::logging::warn(&format!(
+                "session {}: event log compaction skipped (collapsed log did not reproduce the derived state)",
+                self.id
+            ));
+            return;
+        }
+
+        self.event_map = candidate_map;
+        // The log was rewritten in place, not appended to, so a tail-delta
+        // journal entry cannot capture it: force a full snapshot on next save.
+        self.mark_events_full_dirty();
+        // The memory profile derives `event_log_count`/`event_log_json_bytes`
+        // straight from `event_map.events`, so it must be recomputed after the
+        // log shrinks.
+        self.mark_memory_profile_dirty();
+        crate::logging::info(&format!(
+            "session {}: compacted bloated event log ({} superseded message events removed, {} events remain)",
+            self.id,
+            removed,
+            self.event_map.events.len()
+        ));
     }
 
     /// Rebuild the event log from the legacy session vectors.

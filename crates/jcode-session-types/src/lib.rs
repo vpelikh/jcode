@@ -263,7 +263,7 @@ pub struct StoredMemoryInjection {
     pub timestamp: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StoredMessage {
     pub id: String,
     pub role: Role,
@@ -285,7 +285,7 @@ pub enum StoredDisplayRole {
     BackgroundTask,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StoredTokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,

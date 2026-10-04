@@ -93,7 +93,7 @@ pub struct Message {
 }
 
 /// Cache control metadata for prompt caching
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CacheControl {
     #[serde(rename = "type")]
     pub kind: String,
@@ -111,7 +111,7 @@ impl CacheControl {
 }
 
 /// Content block within a message
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     Text {
