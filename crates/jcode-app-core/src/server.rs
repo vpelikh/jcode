@@ -110,8 +110,76 @@ pub(super) type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
 pub(super) type ChannelSubscriptions =
     Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
 
-fn idle_monitor_should_start(client_count: usize, has_live_headless_worker: bool) -> bool {
-    client_count == 0 && !has_live_headless_worker
+/// Whether the idle-exit timer may run this tick.
+///
+/// A reload in progress (`reload_active`) suppresses the timer even with zero
+/// clients: the server transiently drops to zero connections mid-handoff while it
+/// still owns the reload marker, and exiting then would race the replacement
+/// server and strand the clients parked on the handoff. This is bounded by the
+/// marker's hard max age (see `reload_suppresses_idle_shutdown`), so a hung
+/// reload cannot suppress idle-exit forever.
+fn idle_monitor_should_start(
+    client_count: usize,
+    has_live_headless_worker: bool,
+    reload_active: bool,
+) -> bool {
+    client_count == 0 && !has_live_headless_worker && !reload_active
+}
+
+/// The idle monitor's per-tick decision.
+///
+/// This is the whole decision the two idle loops make each tick, including the
+/// reload-marker read, extracted so a test can drive the exact code path (with a
+/// real on-disk marker) instead of only the pure `idle_monitor_should_start`
+/// bool. Both the shared and temporary monitors call this; `Timeout` is the
+/// branch that shuts the server down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdleTick {
+    /// Clients/headless workers present, or a reload is mid-handoff: stay alive
+    /// and clear any accumulated idle time.
+    KeepAlive,
+    /// Idle, but the timeout has not elapsed yet: keep accumulating.
+    Accumulate,
+    /// Idle past the timeout: shut down.
+    Timeout,
+}
+
+fn idle_tick(
+    client_count: usize,
+    has_live_headless_worker: bool,
+    reload_active: bool,
+    idle_elapsed: Option<std::time::Duration>,
+    timeout: std::time::Duration,
+) -> IdleTick {
+    if !idle_monitor_should_start(client_count, has_live_headless_worker, reload_active) {
+        return IdleTick::KeepAlive;
+    }
+    match idle_elapsed {
+        Some(elapsed) if elapsed >= timeout => IdleTick::Timeout,
+        _ => IdleTick::Accumulate,
+    }
+}
+
+/// Read the reload marker and decide the idle monitor's action this tick.
+///
+/// Separate from [`idle_tick`] only so the marker read (the wiring the reviewer
+/// asked to cover) lives in one place both loops share; the decision is
+/// otherwise identical. `idle_elapsed` is the monitor's accumulated idle time
+/// (already computed from its `Instant`), so a test can supply any elapsed
+/// duration without reconstructing a boot-relative `Instant`.
+fn idle_tick_now(
+    client_count: usize,
+    has_live_headless_worker: bool,
+    idle_elapsed: Option<std::time::Duration>,
+    timeout: std::time::Duration,
+) -> IdleTick {
+    idle_tick(
+        client_count,
+        has_live_headless_worker,
+        reload_state::reload_suppresses_idle_shutdown(),
+        idle_elapsed,
+        timeout,
+    )
 }
 
 async fn has_live_headless_worker(sessions: &SessionAgents, swarm_state: &SwarmState) -> bool {
@@ -717,22 +785,131 @@ const EMBEDDING_IDLE_CHECK_SECS: u64 = 10;
 
 #[cfg(test)]
 mod idle_monitor_tests {
-    use super::idle_monitor_should_start;
+    use super::{
+        IdleTick, ReloadPhase, clear_reload_marker, idle_monitor_should_start, idle_tick,
+        idle_tick_now, write_reload_state,
+    };
 
     #[test]
     fn shared_idle_monitor_preserves_live_headless_worker() {
-        assert!(!idle_monitor_should_start(0, true));
+        assert!(!idle_monitor_should_start(0, true, false));
     }
 
     #[test]
     fn temporary_idle_monitor_preserves_live_headless_worker() {
-        assert!(!idle_monitor_should_start(0, true));
+        assert!(!idle_monitor_should_start(0, true, false));
     }
 
     #[test]
     fn idle_monitor_starts_only_without_clients_or_headless_workers() {
-        assert!(idle_monitor_should_start(0, false));
-        assert!(!idle_monitor_should_start(1, false));
+        assert!(idle_monitor_should_start(0, false, false));
+        assert!(!idle_monitor_should_start(1, false, false));
+    }
+
+    /// An in-progress reload suppresses the idle timer even with zero clients:
+    /// without this, the shared server would exit mid-handoff and race the
+    /// replacement server, stranding clients parked on the reload wait.
+    #[test]
+    fn idle_monitor_suppressed_while_a_reload_is_active() {
+        assert!(!idle_monitor_should_start(0, false, true));
+        // A live headless worker and an active reload both suppress it.
+        assert!(!idle_monitor_should_start(0, true, true));
+    }
+
+    /// The suppression is bounded: once the marker is no longer active (see
+    /// `reload_suppresses_idle_shutdown`'s hard cap) idle-exit resumes.
+    #[test]
+    fn idle_monitor_resumes_after_reload_marker_expires() {
+        assert!(idle_monitor_should_start(0, false, false));
+    }
+
+    /// The full per-tick decision: an active reload turns a would-be `Timeout`
+    /// into `KeepAlive`, so the exit branch is never reached. This is the
+    /// decision both loops make every tick.
+    #[test]
+    fn idle_tick_never_times_out_while_a_reload_is_active() {
+        let timeout = std::time::Duration::from_secs(300);
+        let long_idle = Some(std::time::Duration::from_secs(10_000));
+        // Idle past the timeout, but a reload is active -> survive.
+        assert_eq!(
+            idle_tick(0, false, true, long_idle, timeout),
+            IdleTick::KeepAlive
+        );
+        // Same elapsed time without a reload -> shut down.
+        assert_eq!(
+            idle_tick(0, false, false, long_idle, timeout),
+            IdleTick::Timeout
+        );
+        // Accumulating: idle, no reload, not yet past the timeout.
+        assert_eq!(
+            idle_tick(
+                0,
+                false,
+                false,
+                Some(std::time::Duration::from_secs(1)),
+                timeout
+            ),
+            IdleTick::Accumulate
+        );
+        assert_eq!(
+            idle_tick(0, false, false, None, timeout),
+            IdleTick::Accumulate
+        );
+        // A connected client always keeps the server alive.
+        assert_eq!(
+            idle_tick(1, false, false, long_idle, timeout),
+            IdleTick::KeepAlive
+        );
+    }
+
+    /// The wiring the reviewer asked to cover: with a real `Starting` marker on
+    /// disk, `idle_tick_now` (which reads the marker itself) reports `KeepAlive`
+    /// even when the monitor has been idle far past its timeout. After the marker
+    /// clears, the same elapsed idle time reaches `Timeout`. This exercises the
+    /// monitor's actual marker read, not just the pure bool.
+    #[test]
+    fn idle_tick_now_reads_the_marker_and_never_times_out_mid_reload() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let prev_runtime = std::env::var_os("JCODE_RUNTIME_DIR");
+        crate::env::set_var("JCODE_RUNTIME_DIR", temp.path());
+
+        let timeout = std::time::Duration::from_secs(300);
+        // Pretend the monitor has been idle for 10_000s (well past the timeout).
+        // Supplied as an elapsed duration, not a reconstructed `Instant`: the
+        // latter is boot-relative (CLOCK_MONOTONIC / mach_absolute_time), so
+        // `Instant::now().checked_sub(10_000s)` is None on a freshly booted host
+        // and would panic. `idle_tick_now` only needs the accumulated elapsed time.
+        let idle_elapsed = Some(std::time::Duration::from_secs(10_000));
+
+        // No marker: the accumulated idle would time out.
+        assert_eq!(
+            idle_tick_now(0, false, idle_elapsed, timeout),
+            IdleTick::Timeout,
+            "without a marker the elapsed idle must reach the exit branch"
+        );
+
+        // A Starting marker (a reload mid-handoff) suppresses the exit.
+        write_reload_state("req-tick", "hash-tick", ReloadPhase::Starting, None);
+        assert_eq!(
+            idle_tick_now(0, false, idle_elapsed, timeout),
+            IdleTick::KeepAlive,
+            "a live Starting marker must keep the monitor from timing out"
+        );
+
+        // Clearing it restores the timeout.
+        clear_reload_marker();
+        assert_eq!(
+            idle_tick_now(0, false, idle_elapsed, timeout),
+            IdleTick::Timeout,
+            "clearing the marker must restore the exit branch"
+        );
+
+        if let Some(prev_runtime) = prev_runtime {
+            crate::env::set_var("JCODE_RUNTIME_DIR", prev_runtime);
+        } else {
+            crate::env::remove_var("JCODE_RUNTIME_DIR");
+        }
     }
 }
 
@@ -1843,20 +2020,42 @@ impl Server {
                     let count = *idle_client_count.read().await;
                     let has_live_headless_worker =
                         has_live_headless_worker(&idle_sessions, &idle_swarm_state).await;
-
-                    if idle_monitor_should_start(count, has_live_headless_worker) {
-                        // No clients connected
-                        if idle_since.is_none() {
-                            idle_since = Some(std::time::Instant::now());
-                            crate::logging::info(&format!(
-                                "No clients connected. Server will exit after {} minutes of idle.",
-                                IDLE_TIMEOUT_SECS / 60
-                            ));
+                    // `idle_tick_now` reads the reload marker and returns the
+                    // full decision, so a test can assert the monitor sees
+                    // `reload_active=true` for a `Starting` marker and never
+                    // reaches the exit branch.
+                    match idle_tick_now(
+                        count,
+                        has_live_headless_worker,
+                        idle_since.map(|since| since.elapsed()),
+                        std::time::Duration::from_secs(IDLE_TIMEOUT_SECS),
+                    ) {
+                        IdleTick::KeepAlive => {
+                            // Clients/headless workers present, or a reload is
+                            // mid-handoff (which suppresses the timer with zero
+                            // clients), so stay alive and reset the idle timer.
+                            // The message is deliberately cause-neutral: a reload
+                            // reaches this branch with no client connected, so
+                            // "client connected" would be misleading.
+                            if idle_since.is_some() {
+                                crate::logging::info(
+                                    "Idle timer reset (client activity or reload in progress).",
+                                );
+                            }
+                            idle_since = None;
                         }
-
-                        if let Some(since) = idle_since {
-                            let idle_duration = since.elapsed().as_secs();
-                            if idle_duration >= IDLE_TIMEOUT_SECS {
+                        IdleTick::Accumulate => {
+                            if idle_since.is_none() {
+                                idle_since = Some(std::time::Instant::now());
+                                crate::logging::info(&format!(
+                                    "No clients connected. Server will exit after {} minutes of idle.",
+                                    IDLE_TIMEOUT_SECS / 60
+                                ));
+                            }
+                        }
+                        IdleTick::Timeout => {
+                            if let Some(since) = idle_since {
+                                let idle_duration = since.elapsed().as_secs();
                                 crate::logging::info(&format!(
                                     "Server idle for {} minutes with no clients. Shutting down.",
                                     idle_duration / 60
@@ -1869,12 +2068,6 @@ impl Server {
                                 std::process::exit(EXIT_IDLE_TIMEOUT);
                             }
                         }
-                    } else {
-                        // Clients connected - reset idle timer
-                        if idle_since.is_some() {
-                            crate::logging::info("Client connected. Idle timer cancelled.");
-                        }
-                        idle_since = None;
                     }
                 }
             });

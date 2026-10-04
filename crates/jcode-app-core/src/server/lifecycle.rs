@@ -171,37 +171,48 @@ pub(crate) fn spawn_temporary_lifecycle_monitor(
             let count = *client_count.read().await;
             let has_live_headless_worker =
                 super::has_live_headless_worker(&sessions, &swarm_state).await;
-            if super::idle_monitor_should_start(count, has_live_headless_worker) {
-                if idle_since.is_none() {
-                    idle_since = Some(Instant::now());
-                    crate::logging::info(&format!(
-                        "Temporary server has no clients. It will exit after {} seconds idle.",
-                        policy.idle_timeout_secs
-                    ));
+            // `idle_tick_now` reads the reload marker and returns the full
+            // decision, suppressing idle-exit while a reload is mid-handoff.
+            match super::idle_tick_now(
+                count,
+                has_live_headless_worker,
+                idle_since.map(|since| since.elapsed()),
+                Duration::from_secs(policy.idle_timeout_secs),
+            ) {
+                super::IdleTick::KeepAlive => {
+                    if idle_since.is_some() {
+                        // Cause-neutral: a reload in progress reaches this branch
+                        // with zero clients, so "client connected" would mislead.
+                        crate::logging::info(
+                            "Temporary server idle timer reset (client activity or reload in progress).",
+                        );
+                    }
+                    idle_since = None;
                 }
-
-                if let Some(since) = idle_since
-                    && since.elapsed().as_secs() >= policy.idle_timeout_secs
-                {
-                    crate::logging::info(&format!(
-                        "Temporary server idle for {} seconds. Shutting down.",
-                        since.elapsed().as_secs()
-                    ));
-                    shutdown_temporary_server(
-                        &server_name,
-                        &socket_path,
-                        &debug_socket_path,
-                        Arc::clone(&sessions),
-                    )
-                    .await;
+                super::IdleTick::Accumulate => {
+                    if idle_since.is_none() {
+                        idle_since = Some(Instant::now());
+                        crate::logging::info(&format!(
+                            "Temporary server has no clients. It will exit after {} seconds idle.",
+                            policy.idle_timeout_secs
+                        ));
+                    }
                 }
-            } else {
-                if idle_since.is_some() {
-                    crate::logging::info(
-                        "Temporary server client connected. Idle timer cancelled.",
-                    );
+                super::IdleTick::Timeout => {
+                    if let Some(since) = idle_since {
+                        crate::logging::info(&format!(
+                            "Temporary server idle for {} seconds. Shutting down.",
+                            since.elapsed().as_secs()
+                        ));
+                        shutdown_temporary_server(
+                            &server_name,
+                            &socket_path,
+                            &debug_socket_path,
+                            Arc::clone(&sessions),
+                        )
+                        .await;
+                    }
                 }
-                idle_since = None;
             }
         }
     });
