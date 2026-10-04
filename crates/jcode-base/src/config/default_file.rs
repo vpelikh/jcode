@@ -586,9 +586,12 @@ swarm_max_concurrent_agents = 32
 # ntfy/email/channel notifications.
 #
 # Notify when an agent turn finishes. Fires only for long turns and, by
-# default, only while the terminal window is unfocused. The notification is a
-# compact summary: session name, duration, todo progress, and a snippet of the
-# final assistant message.
+# default, only while the terminal window is unfocused. The notification shows
+# session name, duration and todo progress, and carries the FULL final
+# assistant message as its body. Durable surfaces keep the whole body
+# (Notification Center stores it for expansion/search; Telegram/Discord render
+# it in full, chunking at each backend's message limit); the OS banner fallback
+# is bounded to a transport-safe length.
 # turn_complete = true
 # Minimum turn duration (seconds) before notifying (default: 120)
 # turn_complete_min_secs = 120

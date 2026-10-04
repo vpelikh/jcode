@@ -2,22 +2,29 @@
 //!
 //! When a turn finishes after a configurable duration (lower threshold when
 //! the session has todos, since those indicate task-style work), the user gets
-//! a compact desktop notification: session name + duration in the title, todo
-//! progress and a short snippet of the final assistant text in the body. By
-//! default it fires only while the terminal window is unfocused.
+//! a desktop notification: session name + duration in the title, todo progress
+//! as the subtitle, and the **full** final assistant message in the body.
+//! Nothing is truncated for the durable surfaces: Notification Center
+//! stores the whole body (so it survives expansion and search) and the chat
+//! channels render it in full (chunked per backend). Two in-bubble transports
+//! are bounded because they cannot carry an unbounded payload: the
+//! terminal-native escape sequence (kitty OSC 99 / iTerm2 OSC 9) and the
+//! `osascript` / `notify-send` banner fallback, which passes the text as a
+//! process argument. By default it fires only while the terminal window is
+//! unfocused.
 
 use super::App;
 use crate::todo::TodoItem;
 #[cfg(any(target_os = "macos", test))]
 use base64::Engine as _;
 
-/// Maximum characters of assistant text shown in the notification body.
-/// Notification banners truncate aggressively; keep the payload tight.
-const SNIPPET_MAX_CHARS: usize = 120;
-
-/// Per-todo title clip length for the notification body. Banners are narrow and
-/// we may show two todos, so keep each tight.
-const TODO_MAX_CHARS: usize = 48;
+/// Character budget for a terminal-native notification payload (kitty OSC 99,
+/// iTerm2 OSC 9). These carry the body inline in a single escape sequence, so a
+/// multi-megabyte reply would emit a huge terminal write and may exceed the
+/// terminal's own notification limit. The full text still goes to Notification
+/// Center and the chat channels; only the in-terminal bubble is bounded.
+#[cfg(any(target_os = "macos", test))]
+const TERMINAL_NOTIFICATION_MAX_CHARS: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct TurnNotification {
@@ -84,6 +91,10 @@ impl App {
         // (desktop, Telegram/Discord channels, ntfy, email). This makes the
         // Telegram control chat a notification center for all sessions: the
         // local OS banner fires as before, and remote channels mirror it.
+        //
+        // The detailed body carries the full assistant reply. Because ntfy
+        // topics can be public, ntfy gets a short, non-sensitive safe body
+        // instead of the reply text.
         {
             let session_id = self.active_client_session_id().unwrap_or("unknown");
             let dispatcher = crate::notifications::NotificationDispatcher::new();
@@ -93,8 +104,13 @@ impl App {
                 body.push('\n');
             }
             body.push_str(&notification.body);
-            dispatcher.dispatch(
+            let safe_body = notification
+                .subtitle
+                .as_deref()
+                .unwrap_or("An agent turn finished. Open jcode for details.");
+            dispatcher.dispatch_rich(
                 &notification.title,
+                safe_body,
                 &body,
                 crate::notifications::Priority::Default,
                 Some(session_id),
@@ -106,7 +122,7 @@ impl App {
         matches!(self.runtime_mode(), super::AppRuntimeMode::RemoteClient) && !self.is_replay
     }
 
-    /// Final assistant text of the turn, used for the notification snippet.
+    /// Final assistant text of the turn, used as the notification body.
     fn last_assistant_text_for_notification(&self) -> Option<String> {
         self.display_messages
             .iter()
@@ -176,15 +192,39 @@ fn send_originating_terminal_notification(
 
 #[cfg(any(target_os = "macos", test))]
 fn notification_text(notification: &TurnNotification) -> String {
-    match notification.subtitle.as_deref() {
+    let full = match notification.subtitle.as_deref() {
         Some(subtitle) => format!("{}\n{}", subtitle, notification.body),
         None => notification.body.clone(),
+    };
+    // Terminal-native notifications (kitty OSC 99, iTerm2 OSC 9) render plain
+    // text, so strip Markdown markers for display, then bound the payload: the
+    // full body is preserved for Notification Center and the chat channels, but
+    // the in-terminal bubble must not emit an unbounded escape sequence.
+    terminal_payload_text(&crate::notifications::markdown_to_plain_text(&full))
+}
+
+/// Bound a terminal-native notification payload to a transport-safe size.
+#[cfg(any(target_os = "macos", test))]
+fn terminal_payload_text(text: &str) -> String {
+    if text.chars().count() <= TERMINAL_NOTIFICATION_MAX_CHARS {
+        return text.to_string();
     }
+    let mut out: String = text
+        .chars()
+        .take(TERMINAL_NOTIFICATION_MAX_CHARS.saturating_sub(1))
+        .collect();
+    out.push('…');
+    out
 }
 
 #[cfg(any(target_os = "macos", test))]
 fn osc_safe(text: &str) -> String {
-    text.chars().filter(|ch| !ch.is_control()).collect()
+    // Drop control characters that would terminate/corrupt the OSC payload, but
+    // keep newlines so a multi-line body stays readable instead of collapsing
+    // into one run when the body is no longer capped to a single line.
+    text.chars()
+        .filter(|ch| *ch == '\n' || !ch.is_control())
+        .collect()
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -233,14 +273,17 @@ fn load_session_todos(session_id: &str) -> Vec<TodoItem> {
     crate::todo::load_todos(session_id).unwrap_or_default()
 }
 
-/// Build the compact notification. Kept free of `App` for testability.
+/// Build the notification. Kept free of `App` for testability.
 ///
 /// Layout (macOS):
 ///   title:    jcode · <session> · done in <dur>
 ///   subtitle: <todo progress, e.g. "3/5 todos · 1 blocked">
-///   body:     names the work — "✓ <just done> · → <in progress>" or a
-///             blocker ("⊘ <todo> needs <dep>"), falling back to the
-///             assistant snippet when there are no todos.
+///   body:     the todo work line ("✓ <just done> · → <in progress>" or a
+///             blocker "⊘ <todo> needs <dep>") when todos exist, followed by
+///             the **full** final assistant message. Nothing is trimmed: the
+///             whole reply is delivered so Notification Center keeps it for
+///             expansion/search and Telegram/Discord render it in full
+///             (Telegram chunks at its own 4096-char limit when sending).
 pub(super) fn build_turn_notification(
     session_name: Option<&str>,
     duration_secs: f32,
@@ -257,17 +300,23 @@ pub(super) fn build_turn_notification(
 
     let subtitle = todo_progress_line(todos);
 
-    // Prefer naming the actual work; fall back to the assistant snippet.
+    // Name the actual work when todos exist, then append the full assistant
+    // message. Neither is truncated: the notification is a window onto the
+    // real reply, not a one-line digest of it.
     let work_line = todo_work_line(todos);
-    let snippet = last_assistant_text
-        .map(summary_snippet)
+    let full_text = last_assistant_text
+        .map(full_assistant_text)
         .filter(|s| !s.is_empty());
 
     let mut body = String::new();
     if let Some(work) = work_line {
         body.push_str(&work);
-    } else if let Some(snippet) = snippet {
-        body.push_str(&snippet);
+    }
+    if let Some(text) = full_text {
+        if !body.is_empty() {
+            body.push_str("\n\n");
+        }
+        body.push_str(&text);
     }
     if body.is_empty() {
         body.push_str("Turn finished");
@@ -304,7 +353,7 @@ fn todo_progress_line(todos: &[TodoItem]) -> Option<String> {
 
 /// Names the salient todo work for the body: a blocker if one is the reason the
 /// turn stopped, otherwise the most recently completed item and what's next.
-/// Returns None when there are no todos (caller falls back to the snippet).
+/// Returns None when there are no todos (caller then uses only the assistant text).
 fn todo_work_line(todos: &[TodoItem]) -> Option<String> {
     if todos.is_empty() {
         return None;
@@ -322,8 +371,8 @@ fn todo_work_line(todos: &[TodoItem]) -> Option<String> {
             .unwrap_or_else(|| blocked.blocked_by.join(", "));
         return Some(format!(
             "⊘ {} needs {}",
-            clip_todo(&blocked.content),
-            clip_todo(&dep)
+            todo_label(&blocked.content),
+            todo_label(&dep)
         ));
     }
 
@@ -334,7 +383,7 @@ fn todo_work_line(todos: &[TodoItem]) -> Option<String> {
 
     let mut parts = Vec::new();
     if let Some(done) = last_done {
-        let mut seg = format!("✓ {}", clip_todo(&done.content));
+        let mut seg = format!("✓ {}", todo_label(&done.content));
         if let Some(conf) = done.completion_confidence
             && conf == crate::todo::ConfidenceState::Speculative
         {
@@ -343,11 +392,11 @@ fn todo_work_line(todos: &[TodoItem]) -> Option<String> {
         parts.push(seg);
     }
     if let Some(next) = in_progress {
-        parts.push(format!("→ {}", clip_todo(&next.content)));
+        parts.push(format!("→ {}", todo_label(&next.content)));
     } else if last_done.is_none() {
         // Nothing completed and nothing in progress: name the next pending item.
         if let Some(pending) = todos.iter().find(|t| t.status == "pending") {
-            parts.push(format!("→ {}", clip_todo(&pending.content)));
+            parts.push(format!("→ {}", todo_label(&pending.content)));
         }
     }
 
@@ -362,23 +411,17 @@ fn resolve_todo_title(todos: &[TodoItem], id: &str) -> Option<String> {
     todos.iter().find(|t| t.id == id).map(|t| t.content.clone())
 }
 
-/// Clip a single todo title for inline display in the notification body.
-fn clip_todo(s: &str) -> String {
-    let cleaned = strip_markdown_inline(s.trim());
-    truncate_chars(cleaned.trim(), TODO_MAX_CHARS)
+/// A todo title for inline display in the notification body. Inline markdown
+/// noise (list markers, `**`, backticks) is stripped for readability, but the
+/// text itself is never truncated.
+fn todo_label(s: &str) -> String {
+    strip_markdown_inline(s.trim())
 }
 
-/// First meaningful line of the assistant text, markdown-stripped and clipped.
-fn summary_snippet(text: &str) -> String {
-    let line = text
-        .lines()
-        .map(str::trim)
-        .find(|l| {
-            !l.is_empty() && !l.starts_with("```") && !l.starts_with('|') && !l.starts_with("---")
-        })
-        .unwrap_or("");
-    let cleaned = strip_markdown_inline(line);
-    truncate_chars(cleaned.trim(), SNIPPET_MAX_CHARS)
+/// The full final assistant message, with only surrounding whitespace removed.
+/// The whole reply is preserved so nothing is lost to a banner-sized cap.
+fn full_assistant_text(text: &str) -> String {
+    text.trim().to_string()
 }
 
 fn strip_markdown_inline(line: &str) -> String {
@@ -390,15 +433,6 @@ fn strip_markdown_inline(line: &str) -> String {
         .or_else(|| line.strip_prefix("> "))
         .unwrap_or(line);
     line.replace("**", "").replace('`', "")
-}
-
-fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
 }
 
 fn format_duration_compact(secs: f32) -> String {
@@ -476,8 +510,11 @@ mod tests {
         let n = build_turn_notification(None, 200.0, &todos, Some("Fixed the parser bug."));
         assert_eq!(n.title, "jcode · done in 3m 20s");
         assert_eq!(n.subtitle.as_deref(), Some("1/2 todos"));
-        // Names actual todo work, not the prose snippet.
-        assert_eq!(n.body, "✓ wire up parser · → handle reconnect");
+        // Names the todo work first, then carries the full assistant reply.
+        assert_eq!(
+            n.body,
+            "✓ wire up parser · → handle reconnect\n\nFixed the parser bug."
+        );
     }
 
     #[test]
@@ -512,24 +549,32 @@ mod tests {
     }
 
     #[test]
-    fn snippet_used_when_no_todos() {
+    fn full_assistant_text_used_when_no_todos() {
         let n = build_turn_notification(None, 200.0, &[], Some("Fixed the parser bug."));
         assert_eq!(n.subtitle, None);
         assert_eq!(n.body, "Fixed the parser bug.");
     }
 
     #[test]
-    fn snippet_skips_markdown_noise_and_truncates() {
-        let text = "```rust\ncode\n```\n\n## **Results** are `good`\nmore detail";
-        assert_eq!(summary_snippet(text), "code");
+    fn body_keeps_the_full_reply_untrimmed() {
+        // A multi-line reply well past the old 120-char snippet cap must survive
+        // verbatim; only the surrounding whitespace is trimmed.
+        let long: String = (0..40)
+            .map(|i| format!("line {i} of a longer answer"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = format!("\n\n{long}\n\n");
+        let n = build_turn_notification(None, 200.0, &[], Some(&text));
+        assert_eq!(n.body, long);
+        assert!(n.body.chars().count() > 120, "body must not be capped");
+    }
 
-        let text = "\n\n- **Fixed** the `frobnicator`\nrest";
-        assert_eq!(summary_snippet(text), "Fixed the frobnicator");
-
-        let long = "a".repeat(300);
-        let s = summary_snippet(&long);
-        assert_eq!(s.chars().count(), SNIPPET_MAX_CHARS);
-        assert!(s.ends_with('…'));
+    #[test]
+    fn todo_labels_are_not_truncated() {
+        let long_title = "x".repeat(200);
+        let todos = vec![todo_named(&long_title, "in_progress", &[])];
+        let n = build_turn_notification(None, 200.0, &todos, None);
+        assert_eq!(n.body, format!("→ {long_title}"));
     }
 
     #[test]
@@ -578,5 +623,33 @@ mod tests {
         let sequence = iterm_notification_sequence(&n);
         assert_eq!(sequence.matches('\x07').count(), 1);
         assert!(!sequence.contains("\x1b] title"));
+    }
+
+    #[test]
+    fn notification_text_bounds_a_long_terminal_payload() {
+        let body = "a".repeat(5000);
+        let n = TurnNotification {
+            title: "jcode · fox".to_string(),
+            subtitle: None,
+            body: body.clone(),
+        };
+        // `notification_text` feeds the terminal escape sequence only; verify the
+        // payload is bounded (the durable/desktop body stays full elsewhere).
+        let text = notification_text(&n);
+        assert_eq!(text.chars().count(), TERMINAL_NOTIFICATION_MAX_CHARS);
+        assert!(text.ends_with('…'));
+    }
+
+    #[test]
+    fn build_path_keeps_full_body_while_terminal_payload_bounds() {
+        let long = "x".repeat(TERMINAL_NOTIFICATION_MAX_CHARS + 500);
+        assert_eq!(
+            terminal_payload_text(&long).chars().count(),
+            TERMINAL_NOTIFICATION_MAX_CHARS
+        );
+        // The build path keeps the full body; bounding happens only at the
+        // transport sinks (terminal escape sequence, OS banner argv).
+        let n = build_turn_notification(None, 200.0, &[], Some(&long));
+        assert_eq!(n.body, long);
     }
 }

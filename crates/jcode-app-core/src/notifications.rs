@@ -176,9 +176,12 @@ impl NotificationDispatcher {
     /// detailed body for desktop/email/channels. Pass a body that is safe to send
     /// over a potentially public channel (ntfy) — i.e. no ambient secrets.
     ///
-    /// This is the general entry point for per-session notifications (e.g. a
-    /// completed turn) so they fan out the same way ambient notifications do.
-    /// A backend that is disabled in config simply does not fire.
+    /// This is the general entry point for per-session notifications so they fan
+    /// out the same way ambient notifications do. When the body must differ
+    /// between ntfy and the private backends (e.g. a full assistant reply that
+    /// should not reach a public ntfy topic), use
+    /// [`dispatch_rich`](Self::dispatch_rich). A backend that is disabled in
+    /// config simply does not fire.
     ///
     /// `session_id` is passed through to the fan-out for reply tracking / tracing.
     pub fn dispatch(
@@ -189,6 +192,24 @@ impl NotificationDispatcher {
         session_id: Option<&str>,
     ) {
         self.send_all(title, body, body, priority, session_id);
+    }
+
+    /// Like [`dispatch`](Self::dispatch), but keeps the ntfy body separate from
+    /// the detailed body.
+    ///
+    /// Use this when the detailed body carries private content (e.g. a full
+    /// assistant reply) that must not be pushed to a potentially public ntfy
+    /// topic. `safe_body` goes to ntfy; `detailed_body` goes to desktop, email,
+    /// and the message channels.
+    pub fn dispatch_rich(
+        &self,
+        title: &str,
+        safe_body: &str,
+        detailed_body: &str,
+        priority: Priority,
+        session_id: Option<&str>,
+    ) {
+        self.send_all(title, safe_body, detailed_body, priority, session_id);
     }
 
     /// Send through all configured channels (fire-and-forget).
@@ -462,6 +483,37 @@ pub fn macos_notification_inbox_dir() -> Option<std::path::PathBuf> {
     })
 }
 
+/// Build a broker envelope with banner-appropriate text: Notification Center
+/// renders plain text, so a raw Markdown body would show literal
+/// `#`/`**`/backticks/fences. The conversion happens here (this is the display
+/// sink); callers keep the original full body for other backends.
+///
+/// `notification_id` is supplied by the caller so this stays free of the
+/// macOS-only id generator and remains unit-testable on any platform.
+#[cfg(any(target_os = "macos", test))]
+fn macos_turn_envelope(
+    notification_id: String,
+    title: &str,
+    subtitle: Option<&str>,
+    body: &str,
+    sound: Option<&str>,
+    origin: MacosNotificationOrigin,
+) -> MacosNotificationEnvelope {
+    MacosNotificationEnvelope {
+        schema_version: MACOS_NOTIFICATION_SCHEMA_VERSION,
+        notification_id,
+        title: title.to_string(),
+        subtitle: subtitle
+            .filter(|value| !value.trim().is_empty())
+            .map(markdown_to_plain_text),
+        body: markdown_to_plain_text(body),
+        sound: sound
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string),
+        origin,
+    }
+}
+
 /// Queue a turn notification for the bundled LSUIElement broker and wake it.
 /// Returns false when the helper is unavailable so the caller can use its
 /// terminal-native or `osascript` fallback.
@@ -490,20 +542,14 @@ pub fn send_macos_turn_notification(
             return false;
         }
 
-        let id = next_macos_notification_id();
-        let envelope = MacosNotificationEnvelope {
-            schema_version: MACOS_NOTIFICATION_SCHEMA_VERSION,
-            notification_id: id.clone(),
-            title: title.to_string(),
-            subtitle: subtitle
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_string),
-            body: body.to_string(),
-            sound: sound
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_string),
-            origin: MacosNotificationOrigin::detect(),
-        };
+        let envelope = macos_turn_envelope(
+            next_macos_notification_id(),
+            title,
+            subtitle,
+            body,
+            sound,
+            MacosNotificationOrigin::detect(),
+        );
         let queued_path = match enqueue_macos_notification(&envelope) {
             Ok(path) => path,
             Err(error) => {
@@ -726,6 +772,35 @@ pub fn send_desktop_notification(title: &str, body: &str) {
     send_desktop_notification_rich(title, None, body, None);
 }
 
+/// Character budget for a notification body handed to a banner transport that
+/// passes the text as a process argument (`osascript` / `notify-send`).
+///
+/// Those fallbacks are bounded by the OS `execve` argv limit, so a full
+/// assistant reply (now that turn notifications carry the whole message) can
+/// make `Command::spawn` fail with `E2BIG`; the spawn error is best-effort and
+/// ignored, which would drop the banner silently. Banner daemons truncate long
+/// bodies visually anyway, so bound here. The durable surfaces (the macOS
+/// broker file inbox, email, and the chat channels) still receive the
+/// unbounded body.
+pub const DESKTOP_BANNER_MAX_CHARS: usize = 4096;
+
+/// Bound banner text to a transport-safe size, appending an ellipsis when cut
+/// so the rendered banner signals that more text exists.
+///
+/// Shared with the macOS notification broker, whose `osascript` fallback passes
+/// the envelope body as a process argument and so has the same argv limit.
+pub fn bound_banner_text(text: &str) -> String {
+    if text.chars().count() <= DESKTOP_BANNER_MAX_CHARS {
+        return text.to_string();
+    }
+    let mut out: String = text
+        .chars()
+        .take(DESKTOP_BANNER_MAX_CHARS.saturating_sub(1))
+        .collect();
+    out.push('…');
+    out
+}
+
 /// Send a local desktop notification with optional macOS subtitle and sound.
 ///
 /// `subtitle` renders as a second bold line on macOS (ignored elsewhere).
@@ -737,6 +812,14 @@ pub fn send_desktop_notification_rich(
     body: &str,
     sound: Option<&str>,
 ) {
+    // Desktop banners render plain text: a raw Markdown body would show literal
+    // `#`, `**`, backticks, and fence markers. Convert to plain text for display
+    // while the stored/original body stays intact for other backends, then bound
+    // it: the `osascript` / `notify-send` paths below pass the text as a process
+    // argument, which has a hard OS limit (see `DESKTOP_BANNER_MAX_CHARS`).
+    let body = bound_banner_text(&markdown_to_plain_text(body));
+    let subtitle = subtitle.map(|s| bound_banner_text(&markdown_to_plain_text(s)));
+    let subtitle = subtitle.as_deref();
     #[cfg(target_os = "macos")]
     {
         fn applescript_escape(s: &str) -> String {
@@ -754,7 +837,7 @@ pub fn send_desktop_notification_rich(
         }
         let mut script = format!(
             "display notification \"{}\" with title \"{}\"",
-            applescript_escape(body),
+            applescript_escape(&body),
             applescript_escape(title)
         );
         if let Some(subtitle) = subtitle.filter(|s| !s.trim().is_empty()) {
@@ -780,7 +863,7 @@ pub fn send_desktop_notification_rich(
         if let Ok(child) = std::process::Command::new("notify-send")
             .arg("--app-name=jcode")
             .arg(title)
-            .arg(body)
+            .arg(&body)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -808,12 +891,16 @@ fn send_desktop(title: &str, body: &str, urgency: &str) {
     }
     #[cfg(not(target_os = "macos"))]
     {
+        // notify-send renders plain text, so strip Markdown markers here too;
+        // the callers pass the detailed (Markdown) body. Bound it: `notify-send`
+        // receives the text as a process argument, which has a hard OS limit.
+        let body = bound_banner_text(&markdown_to_plain_text(body));
         let result = std::process::Command::new("notify-send")
             .arg("--app-name=jcode")
             .arg(format!("--urgency={}", urgency))
             .arg("--icon=dialog-information")
             .arg(title)
-            .arg(body)
+            .arg(&body)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
@@ -933,6 +1020,135 @@ pub async fn imap_reply_loop(config: SafetyConfig) {
 // ---------------------------------------------------------------------------
 // Formatting helpers
 // ---------------------------------------------------------------------------
+
+/// Best-effort Markdown to plain text for banner surfaces (macOS Notification
+/// Center, Linux `notify-send`, terminal-native notifications) that cannot
+/// render Markdown.
+///
+/// This deliberately does not aim for full Markdown fidelity; it removes the
+/// noise that would otherwise show up literally: ATX heading markers, emphasis
+/// and inline-code markers, link syntax (keeping the label), and code-fence
+/// delimiters. Content is otherwise preserved (including line breaks).
+pub fn markdown_to_plain_text(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_fence = false;
+    for raw_line in input.split('\n') {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        let trimmed = raw_line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            // Drop fence delimiters entirely; keep the code lines between them.
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            out.push_str(raw_line);
+            continue;
+        }
+        out.push_str(&strip_inline_markdown(raw_line));
+    }
+    out
+}
+
+/// Upper bound on how far the link lookahead scans for a `]` / `)`. A real
+/// Markdown link label or URL is far shorter than this; bounding the scan keeps
+/// bracket-heavy text linear (`markdown_to_plain_text` runs over the full,
+/// unbounded assistant reply on the TUI thread).
+const MAX_LINK_LABEL_SCAN: usize = 512;
+const MAX_LINK_URL_SCAN: usize = 2048;
+
+/// Strip block/inline Markdown markers from a single line.
+fn strip_inline_markdown(line: &str) -> String {
+    // Leading ATX heading markers: "### Title" -> "Title".
+    let mut s = line.trim_start();
+    let hashes = s.len() - s.trim_start_matches('#').len();
+    if hashes > 0 && s[hashes..].starts_with(' ') {
+        s = s[hashes..].trim_start();
+    }
+    // Blockquote and list markers at the start of the line.
+    for marker in ["> ", "- ", "* ", "+ "] {
+        if let Some(rest) = s.strip_prefix(marker) {
+            s = rest;
+            break;
+        }
+    }
+    let chars: Vec<char> = s.chars().collect();
+    // A marker is only formatting when it hugs a word: opening markers are
+    // preceded by a boundary and followed by an alphanumeric; closing markers
+    // are the reverse. This preserves literal markers in content such as
+    // `2*3`, `snake_case`, or `a|b` while still dropping real `**bold**`.
+    let boundary = |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric());
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        if matches!(ch, '*' | '_' | '`') {
+            // Consume the whole run of the same marker (e.g. `**`).
+            let start = i;
+            while i < chars.len() && chars[i] == ch {
+                i += 1;
+            }
+            let prev = if start == 0 {
+                None
+            } else {
+                Some(chars[start - 1])
+            };
+            let next = chars.get(i).copied();
+            let opening = boundary(prev) && next.is_some_and(|c| c.is_alphanumeric());
+            let closing = prev.is_some_and(|c| c.is_alphanumeric()) && boundary(next);
+            if !(opening || closing) {
+                // Not formatting in this context: keep the literal run.
+                for _ in start..i {
+                    out.push(ch);
+                }
+            }
+            continue;
+        }
+        if ch == '[' {
+            // A link keeps its label and drops the URL: "[label](url)" -> "label".
+            // The lookahead is bounded (and stops at a newline) so a reply made
+            // of many `[` cannot scan to the end of the string on every bracket
+            // and go quadratic: `markdown_to_plain_text` runs over the full,
+            // unbounded assistant reply on the TUI thread.
+            let label_start = i + 1;
+            let label_scan_end = label_start.saturating_add(MAX_LINK_LABEL_SCAN).min(chars.len());
+            let mut j = label_start;
+            while j < label_scan_end && chars[j] != ']' && chars[j] != '\n' {
+                j += 1;
+            }
+            let closed = j < chars.len() && chars[j] == ']';
+            if closed && chars.get(j + 1) == Some(&'(') {
+                let url_start = j + 2;
+                let url_scan_end = url_start.saturating_add(MAX_LINK_URL_SCAN).min(chars.len());
+                let mut k = url_start;
+                while k < url_scan_end && chars[k] != ')' && chars[k] != '\n' {
+                    k += 1;
+                }
+                let closed_url = k < chars.len() && chars[k] == ')';
+                // Mirror the old behavior: an image keeps only its alt text and
+                // a `(` with no closing `)` drops the remainder.
+                if closed_url || k >= chars.len() {
+                    // Image syntax `![alt](url)` reads best as just the alt text:
+                    // drop a leading `!` we already emitted for it.
+                    if out.ends_with('!') {
+                        out.pop();
+                    }
+                    out.extend(chars[label_start..j].iter());
+                    i = if closed_url { k + 1 } else { chars.len() };
+                    continue;
+                }
+            }
+            // Not a link: emit a literal '['.
+            out.push('[');
+            i += 1;
+            continue;
+        }
+        out.push(ch);
+        i += 1;
+    }
+    out
+}
 
 /// Sanitized body for potentially public channels (ntfy.sh).
 /// Only includes counts and status — no model-generated text.
@@ -1083,6 +1299,129 @@ mod tests {
 
         let detailed = format_cycle_body_detailed(&transcript);
         assert!(detailed.contains("2 permission request(s) pending"));
+    }
+
+    #[test]
+    fn markdown_to_plain_text_strips_banner_noise() {
+        let md = "# Title\n\n**bold** and `code`\n\n- item\n> quote\n[link](https://x)\n\n```rust\nlet a = 1;\n```";
+        let plain = markdown_to_plain_text(md);
+        assert!(plain.contains("Title"));
+        assert!(plain.contains("bold and code"));
+        assert!(!plain.contains("- item"), "list marker stripped");
+        assert!(plain.contains("item"));
+        assert!(plain.contains("quote"));
+        assert!(plain.contains("link"), "keeps link label");
+        assert!(!plain.contains("https://x"), "drops link URL");
+        assert!(!plain.contains("**") && !plain.contains('`'));
+        assert!(!plain.contains("```"));
+        assert!(plain.contains("let a = 1;"), "keeps fenced code content");
+    }
+
+    #[test]
+    fn markdown_to_plain_text_keeps_literal_markers_in_content() {
+        // Markers that are not formatting (no hugging alphanumerics) must be
+        // preserved so formulas, identifiers, and citations are not corrupted.
+        assert_eq!(markdown_to_plain_text("2*3 = 6"), "2*3 = 6");
+        assert_eq!(markdown_to_plain_text("snake_case_name"), "snake_case_name");
+        assert_eq!(markdown_to_plain_text("see [1] and [2]"), "see [1] and [2]");
+        assert_eq!(markdown_to_plain_text("a ` b"), "a ` b");
+        // Real formatting is still stripped.
+        assert_eq!(markdown_to_plain_text("**bold**"), "bold");
+        assert_eq!(markdown_to_plain_text("`code`"), "code");
+        assert_eq!(markdown_to_plain_text("_italic_"), "italic");
+        // Links keep their label; images show their alt text without the `![`.
+        assert_eq!(markdown_to_plain_text("see [docs](https://x)"), "see docs");
+        assert_eq!(markdown_to_plain_text("![diagram](https://y)"), "diagram");
+    }
+
+    #[test]
+    fn markdown_to_plain_text_stays_linear_on_bracket_heavy_reply() {
+        // A reply that is wall-to-wall `[` (or `](`) must not make the link
+        // lookahead quadratic. This guards the TUI-thread stall regression: a
+        // large reply is converted for the banner/terminal sinks in one call.
+        let huge = "[".repeat(200_000);
+        let start = std::time::Instant::now();
+        let plain = markdown_to_plain_text(&huge);
+        assert_eq!(plain, huge);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "bracket-heavy strip took {:?}, expected linear time",
+            start.elapsed()
+        );
+
+        // `](`-heavy input exercises the URL lookahead the same way.
+        let huge = "[a](".repeat(50_000);
+        let start = std::time::Instant::now();
+        let _ = markdown_to_plain_text(&huge);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "url-heavy strip took {:?}, expected linear time",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn markdown_to_plain_text_preserves_plain_text() {
+        let plain = "Just a normal reply.\nSecond line.";
+        assert_eq!(markdown_to_plain_text(plain), plain);
+    }
+
+    #[test]
+    fn macos_envelope_converts_body_to_plain_text() {
+        let envelope = macos_turn_envelope(
+            "jcode-turn-test-id".to_string(),
+            "jcode · done",
+            Some("2/2 todos"),
+            "# Result\n\n**Bold** and `code` here",
+            None,
+            MacosNotificationOrigin {
+                terminal: MacosTerminalKind::Unknown,
+                bundle_id: None,
+                tty: None,
+                session_id: None,
+            },
+        );
+        assert!(!envelope.body.contains('#'), "heading marker stripped");
+        assert!(!envelope.body.contains('*'), "emphasis marker stripped");
+        assert!(!envelope.body.contains('`'), "code marker stripped");
+        assert!(envelope.body.contains("Result"));
+        assert!(envelope.body.contains("Bold and code here"));
+        assert_eq!(envelope.subtitle.as_deref(), Some("2/2 todos"));
+    }
+
+    #[test]
+    fn dispatch_rich_keeps_safe_and_detailed_bodies_separate() {
+        // Structural check: the rich entry point exists and delegates with two
+        // distinct bodies. Actual delivery is exercised via the channel tests.
+        let cfg = SafetyConfig::default();
+        let dispatcher = NotificationDispatcher::from_config(cfg);
+        // No runtime + no backends configured: must not panic.
+        dispatcher.dispatch_rich(
+            "title",
+            "safe body",
+            "detailed body",
+            Priority::Default,
+            Some("session"),
+        );
+    }
+
+    #[test]
+    fn bound_banner_text_caps_argv_transport() {
+        // A short body is unchanged.
+        assert_eq!(bound_banner_text("hello"), "hello");
+        // A body at the limit is unchanged; one over is cut with an ellipsis,
+        // so the execve argv passed to osascript/notify-send stays bounded.
+        let at_limit = "x".repeat(DESKTOP_BANNER_MAX_CHARS);
+        assert_eq!(bound_banner_text(&at_limit), at_limit);
+        let over = "x".repeat(DESKTOP_BANNER_MAX_CHARS + 500);
+        let bounded = bound_banner_text(&over);
+        assert_eq!(bounded.chars().count(), DESKTOP_BANNER_MAX_CHARS);
+        assert!(bounded.ends_with('…'));
+        // Multibyte text must not be split mid-char.
+        let unicode = "é😀中".repeat(DESKTOP_BANNER_MAX_CHARS);
+        let bounded = bound_banner_text(&unicode);
+        assert_eq!(bounded.chars().count(), DESKTOP_BANNER_MAX_CHARS);
+        assert!(bounded.ends_with('…'));
     }
 
     #[test]

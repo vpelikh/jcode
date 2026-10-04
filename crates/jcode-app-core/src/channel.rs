@@ -7,6 +7,16 @@ use crate::telegram::InlineKeyboardRow;
 use async_trait::async_trait;
 use std::sync::Arc;
 
+/// Gentle spacing between consecutive messages of one multi-chunk notification
+/// send. This is not enough on its own to stay under tighter per-channel limits
+/// (Discord's is roughly 5 messages / 5s); it only avoids an instantaneous
+/// burst, and a 429 is honored via `retry_after` as the real backstop.
+const INTER_CHUNK_SEND_DELAY_MS: u64 = 250;
+
+/// How many times to honor a Discord 429 `retry_after` before giving up on a
+/// single message.
+const DISCORD_SEND_RETRIES: u32 = 3;
+
 #[async_trait]
 pub trait MessageChannel: Send + Sync {
     fn name(&self) -> &str;
@@ -1767,12 +1777,114 @@ fn clip_to_telegram_max(text: String) -> String {
     out
 }
 
+/// Number of characters a single char occupies after MarkdownV2 escaping.
+/// `escape_markdown_v2` escapes each reserved char independently, so this is
+/// exact and lets us split the *raw* reply while guaranteeing the *escaped*
+/// chunk fits the budget.
+fn mdv2_len(ch: char) -> usize {
+    if matches!(
+        ch,
+        '_' | '*'
+            | '['
+            | ']'
+            | '('
+            | ')'
+            | '~'
+            | '`'
+            | '>'
+            | '#'
+            | '+'
+            | '-'
+            | '='
+            | '|'
+            | '{'
+            | '}'
+            | '.'
+            | '!'
+            | '\\'
+    ) {
+        2
+    } else {
+        1
+    }
+}
+
+fn mdv2_len_of(s: &str) -> usize {
+    s.chars().map(mdv2_len).sum()
+}
+
+/// Split a raw assistant reply into MarkdownV2-escaped chunks that each fit
+/// `budget` characters after escaping, so a long answer can be delivered in
+/// full across follow-up messages instead of being clipped.
+///
+/// The split is performed on the *raw* text (never the escaped text), so no
+/// character is ever dropped at a boundary and no chunk can end mid-escape:
+/// escaping only widens each char, it never looks across chunk boundaries.
+/// Chunks break on `\n` when possible; a single over-long line is hard-split.
+///
+/// One pass over the input: `current` accumulates the current raw chunk while
+/// `width` tracks its escaped width, so a very long reply is split in O(n).
+fn split_mdv2_chunks(raw: &str, budget: usize) -> Vec<String> {
+    let budget = budget.max(1);
+    let mut raw_chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut width = 0usize;
+    // Break a raw slice into hard-split pieces that each fit the budget,
+    // pushing all but the last and returning the remainder to keep as `current`.
+    let hard_split = |raw_chunks: &mut Vec<String>, piece: &str, width: &mut usize| {
+        let mut start = 0usize;
+        let mut w = 0usize;
+        for (idx, ch) in piece.char_indices() {
+            let cw = mdv2_len(ch);
+            if w + cw > budget {
+                // Only emit a non-empty piece: if a single char already exceeds
+                // the budget, `start == idx` and pushing would send an empty
+                // chunk (which Telegram rejects).
+                if idx > start {
+                    raw_chunks.push(piece[start..idx].to_string());
+                }
+                start = idx;
+                w = 0;
+            }
+            w += cw;
+        }
+        *width = w;
+        piece[start..].to_string()
+    };
+    for line in raw.split_inclusive('\n') {
+        // Case 1: a single line (incl. its newline) is itself over budget.
+        if mdv2_len_of(line) > budget {
+            // Flush whatever is pending, then hard-split this line; the tail
+            // becomes the new `current`.
+            if !current.is_empty() {
+                raw_chunks.push(std::mem::take(&mut current));
+            }
+            current = hard_split(&mut raw_chunks, line, &mut width);
+            continue;
+        }
+        // Case 2: appending this line would overflow the current chunk.
+        if width > 0 && width + mdv2_len_of(line) > budget {
+            raw_chunks.push(std::mem::take(&mut current));
+            width = 0;
+        }
+        current.push_str(line);
+        width += mdv2_len_of(line);
+    }
+    if !current.is_empty() {
+        raw_chunks.push(current);
+    }
+    raw_chunks
+        .into_iter()
+        .map(|c| escape_markdown_v2(&c))
+        .collect()
+}
+
 impl TelegramChannel {
     /// Run a prompt against `session_id` and stream partial assistant text into a
-/// single Telegram message (so the user sees live progress), then leave the
-/// final reply in place. Sends a placeholder first, then edits it as tokens
-/// arrive. If the turn fails, reports the error.
-async fn stream_reply_to_session(
+    /// single Telegram message (so the user sees live progress), then leave the
+    /// final reply in place. Sends a placeholder first, then edits it as tokens
+    /// arrive. If the turn fails, reports the error.
+    async fn stream_reply_to_session(
     &self,
     reply_to: Option<i64>,
     session_id: &str,
@@ -1904,40 +2016,41 @@ async fn stream_reply_to_session(
         }
         Ok(reply) => {
             // Normal completion. The on_progress closure streamed a clipped
-            // version of the reply into the message (aligned to Telegram's 4096
-            // limit) and Stop was cleared above. If the full reply was clipped,
-            // mark it so the user knows the live preview is not the whole
-            // answer and can open `/history` for the rest.
-            let full = format!(
-                "💬 {} {}",
-                mdv2_bracketed_id(&short_id(session_id)),
-                escape_markdown_v2(&reply)
-            );
-            if full.chars().count() > crate::telegram::MAX_MESSAGE_CHARS {
-                let note = "\n\n✂️ _clipped — /history shows the full reply_";
-                let budget = crate::telegram::MAX_MESSAGE_CHARS
-                    .saturating_sub(note.chars().count());
-                let mut clipped_body_text = escape_markdown_v2(&reply)
-                    .chars()
-                    .take(budget)
-                    .collect::<String>();
-                if clipped_body_text.ends_with('\\') {
-                    clipped_body_text.pop();
-                }
-                let clipped_body = format!(
-                    "💬 {} {}{note}",
-                    mdv2_bracketed_id(&short_id(session_id)),
-                    clipped_body_text
-                );
+            // version of the reply into the message (the live preview is capped
+            // at Telegram's 4096 limit so edits keep succeeding) and Stop was
+            // cleared above. Never trim the answer: if the full reply exceeds the
+            // limit, replace the preview with the first chunk and post the
+            // remainder as follow-up messages so the whole reply arrives.
+            let prefix = format!("💬 {} ", mdv2_bracketed_id(&short_id(session_id)));
+            let budget =
+                crate::telegram::MAX_MESSAGE_CHARS.saturating_sub(prefix.chars().count());
+            let chunks = split_mdv2_chunks(&reply, budget);
+            if chunks.len() > 1 {
+                let first = format!("{prefix}{}", chunks[0]);
                 let _ = crate::telegram::edit_message_text(
                     &client,
                     &self.token,
                     self.chat_id.parse::<i64>().unwrap_or(0),
                     sent_id,
-                    &clipped_body,
+                    &first,
                     self.api_base.as_deref(),
                 )
                 .await;
+                for chunk in &chunks[1..] {
+                    // Pace the follow-up messages: a very long reply can span
+                    // many chunks, and Telegram rate-limits sends to one chat.
+                    tokio::time::sleep(std::time::Duration::from_millis(INTER_CHUNK_SEND_DELAY_MS))
+                        .await;
+                    let _ = crate::telegram::send_message_with_base(
+                        &client,
+                        &self.token,
+                        &self.chat_id,
+                        chunk,
+                        self.api_base.as_deref(),
+                        None,
+                    )
+                    .await;
+                }
             }
         }
     }
@@ -2182,6 +2295,92 @@ impl MessageChannel for TelegramChannel {
 // Discord channel
 // ---------------------------------------------------------------------------
 
+/// Discord rejects any single message whose `content` exceeds this many
+/// characters with a 400. Notification bodies can carry a full assistant reply,
+/// so long text is split on this limit instead of being dropped.
+///
+/// The count is in UTF-16 code units (Discord mirrors JavaScript `.length`), so
+/// this is deliberately *not* the Telegram chunker: that counts Unicode scalars
+/// and would let an astral run (e.g. 2000 emoji = 4000 UTF-16 units) overflow
+/// the limit and be rejected.
+pub const DISCORD_MAX_MESSAGE_CHARS: usize = 2000;
+
+/// Length of `s` in UTF-16 code units, the unit Discord's 2000-char cap uses.
+fn utf16_len(s: &str) -> usize {
+    s.chars().map(|c| c.len_utf16()).sum()
+}
+
+/// Split a notification body for Discord's per-message limit, measured in
+/// UTF-16 code units. Newline-first with a hard split for an over-long line so
+/// a long reply is delivered whole instead of rejected.
+fn discord_message_chunks(text: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_len = 0usize;
+    for line in text.split_inclusive('\n') {
+        let mut rest = line;
+        let mut rest_len = utf16_len(rest);
+        // A single logical line can exceed the cap (e.g. a long code line or a
+        // paragraph of emoji). Hard-split it on char boundaries so no chunk
+        // overflows the UTF-16 budget; `rest_len` is decremented per piece so
+        // this stays linear even for one enormous line.
+        while rest_len > DISCORD_MAX_MESSAGE_CHARS {
+            if !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+                current_len = 0;
+            }
+            let mut take = String::new();
+            let mut take_len = 0usize;
+            let mut consumed_bytes = 0usize;
+            for ch in rest.chars() {
+                let cw = ch.len_utf16();
+                if take_len + cw > DISCORD_MAX_MESSAGE_CHARS && !take.is_empty() {
+                    break;
+                }
+                take.push(ch);
+                take_len += cw;
+                consumed_bytes += ch.len_utf8();
+            }
+            chunks.push(take);
+            rest = &rest[consumed_bytes..];
+            rest_len -= take_len;
+        }
+        if current_len > 0 && current_len + rest_len > DISCORD_MAX_MESSAGE_CHARS {
+            chunks.push(std::mem::take(&mut current));
+            current_len = 0;
+        }
+        current.push_str(rest);
+        current_len += rest_len;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+/// Seconds to wait after a Discord 429, from the `Retry-After` header
+/// (seconds). Discord also documents a JSON `retry_after` field; see
+/// [`discord_retry_after_from_body`] for the fallback. Non-finite values are
+/// rejected because a malformed header (e.g. `NaN`) would otherwise reach
+/// `Duration::from_secs_f64` and panic.
+fn discord_retry_after_from_header(headers: &reqwest::header::HeaderMap) -> Option<f64> {
+    headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|secs| secs.is_finite())
+}
+
+/// Parse a Discord 429 JSON body for `retry_after` (seconds). Split out so it
+/// is unit-testable without a live response. Non-finite values are rejected.
+fn discord_retry_after_from_body(body: &str) -> Option<f64> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("retry_after")?
+        .as_f64()
+        .filter(|secs| secs.is_finite())
+}
+
 pub struct DiscordChannel {
     token: String,
     channel_id: String,
@@ -2274,18 +2473,57 @@ impl MessageChannel for DiscordChannel {
             "https://discord.com/api/v10/channels/{}/messages",
             self.channel_id
         );
-        let resp = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bot {}", self.token))
-            .json(&serde_json::json!({ "content": text }))
-            .send()
-            .await?;
+        let chunks = discord_message_chunks(text);
+        for (i, chunk) in chunks.iter().enumerate() {
+            // Discord rate-limits message creation per channel (~5 per 5s) and
+            // returns 429 with a `retry_after` when exceeded. A long
+            // notification can now span several messages, so honor that rather
+            // than failing partway.
+            let mut attempts: u32 = 0;
+            loop {
+                attempts += 1;
+                let resp = self
+                    .client
+                    .post(&url)
+                    .header("Authorization", format!("Bot {}", self.token))
+                    .json(&serde_json::json!({ "content": chunk }))
+                    .send()
+                    .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Discord API error ({}): {}", status, body);
+                if resp.status().as_u16() == 429 {
+                    if attempts > DISCORD_SEND_RETRIES {
+                        anyhow::bail!("Discord rate limited too many times");
+                    }
+                    // Prefer the Retry-After header; fall back to the
+                    // `retry_after` field in the JSON body.
+                    let header_wait = discord_retry_after_from_header(resp.headers());
+                    let wait = match header_wait {
+                        Some(secs) => secs,
+                        None => {
+                            let body = resp.text().await.unwrap_or_default();
+                            discord_retry_after_from_body(&body).unwrap_or(1.0)
+                        }
+                    }
+                    .clamp(0.1, 60.0);
+                    logging::warn(&format!(
+                        "Discord rate limited, waiting {wait:.1}s (attempt {attempts})"
+                    ));
+                    tokio::time::sleep(std::time::Duration::from_secs_f64(wait)).await;
+                    continue;
+                }
+
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    anyhow::bail!("Discord API error ({}): {}", status, body);
+                }
+                break;
+            }
+            // Gentle spacing between messages even when not throttled.
+            if i + 1 < chunks.len() {
+                tokio::time::sleep(std::time::Duration::from_millis(INTER_CHUNK_SEND_DELAY_MS))
+                    .await;
+            }
         }
 
         logging::info("Discord notification sent");
@@ -2559,7 +2797,17 @@ impl MessageChannel for JadeRelayChannel {
     async fn send(&self, text: &str) -> anyhow::Result<()> {
         // Cloud notifications (e.g. ambient cycle summaries) are posted as a
         // response event with request_seq=0 (not tied to a specific prompt).
-        self.post_response(text, 0).await
+        // Notification bodies can now carry a full assistant reply, so split on
+        // a conservative size bound and post each chunk as its own response
+        // event. The relay API's exact limit is unspecified, but 4000 chars is
+        // a safe framing reusing the Telegram chunker (newline-first, then a
+        // hard split) so a long reply is delivered whole instead of rejected.
+        const JADE_RELAY_MAX_CHARS: usize = 4000;
+        let chunks = crate::telegram::chunk_message(text, JADE_RELAY_MAX_CHARS);
+        for chunk in &chunks {
+            self.post_response(chunk, 0).await?;
+        }
+        Ok(())
     }
 
     async fn reply_loop(self: Arc<Self>, runner: Option<AmbientRunnerHandle>) {
@@ -3363,6 +3611,122 @@ mod tests {
     }
 
     #[test]
+    fn test_discord_chunks_respect_limit_and_are_lossless() {
+        // Short text is a single chunk.
+        assert_eq!(discord_message_chunks("hi"), vec!["hi".to_string()]);
+
+        // Discord measures length in UTF-16 code units, so assert on that (not
+        // `chars().count()`): a long multi-line reply splits into chunks that
+        // each fit the 2000-unit limit, and concatenation reproduces the
+        // original exactly (no text dropped, which is the regression guarded).
+        let long = "line of a very long answer\n".repeat(500);
+        let chunks = discord_message_chunks(&long);
+        assert!(chunks.len() > 1, "expected multiple chunks");
+        for c in &chunks {
+            assert!(
+                utf16_len(c) <= DISCORD_MAX_MESSAGE_CHARS,
+                "chunk exceeds Discord limit: {} utf-16 units",
+                utf16_len(c)
+            );
+        }
+        assert_eq!(chunks.concat(), long);
+
+        // An over-long single line is hard-split rather than rejected.
+        let line = "x".repeat(DISCORD_MAX_MESSAGE_CHARS * 2 + 7);
+        let chunks = discord_message_chunks(&line);
+        assert_eq!(chunks.concat(), line);
+        assert!(chunks.iter().all(|c| utf16_len(c) <= DISCORD_MAX_MESSAGE_CHARS));
+
+        // Astral text (emoji) counts as 2 UTF-16 units each: 3000 emoji is 6000
+        // units, so it must split below the cap even though it is only 3000
+        // `chars`. This is the bug the plain `chunk_message` reuse had.
+        let emoji = "😀".repeat(3000);
+        assert!(emoji.chars().count() > DISCORD_MAX_MESSAGE_CHARS);
+        let chunks = discord_message_chunks(&emoji);
+        assert!(chunks.len() > 1, "emoji run must split");
+        for c in &chunks {
+            assert!(
+                utf16_len(c) <= DISCORD_MAX_MESSAGE_CHARS,
+                "emoji chunk exceeds Discord limit: {} utf-16 units",
+                utf16_len(c)
+            );
+        }
+        assert_eq!(chunks.concat(), emoji);
+    }
+
+    #[test]
+    fn test_discord_retry_after_parsing() {
+        // Header form (seconds).
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after", "2.5".parse().unwrap());
+        assert_eq!(discord_retry_after_from_header(&headers), Some(2.5));
+        assert_eq!(
+            discord_retry_after_from_header(&reqwest::header::HeaderMap::new()),
+            None
+        );
+
+        // JSON body form.
+        assert_eq!(
+            discord_retry_after_from_body(r#"{"message":"rate limited","retry_after":3.25}"#),
+            Some(3.25)
+        );
+        assert_eq!(discord_retry_after_from_body("not json"), None);
+        assert_eq!(discord_retry_after_from_body("{}"), None);
+
+        // Non-finite values must be rejected: they would otherwise panic in
+        // `Duration::from_secs_f64`.
+        let mut nan_headers = reqwest::header::HeaderMap::new();
+        nan_headers.insert("retry-after", "NaN".parse().unwrap());
+        assert_eq!(discord_retry_after_from_header(&nan_headers), None);
+        let mut inf_headers = reqwest::header::HeaderMap::new();
+        inf_headers.insert("retry-after", "inf".parse().unwrap());
+        assert_eq!(discord_retry_after_from_header(&inf_headers), None);
+        assert_eq!(
+            discord_retry_after_from_body(r#"{"retry_after":"NaN"}"#),
+            None
+        );
+        // A numeric JSON string is not accepted as a number either.
+        assert_eq!(
+            discord_retry_after_from_body(r#"{"retry_after":"5"}"#),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_telegram_send_delivers_long_notification_whole() {
+        // Acceptance: a chat notification whose body exceeds one Telegram
+        // message is delivered as multiple messages via the real
+        // `MessageChannel::send` path (not dropped, not truncated).
+        let mock = MockTelegram::start().await;
+        let ch = TelegramChannel::with_connectivity(
+            "tok".into(),
+            "77".into(),
+            true,
+            Some(mock.base()),
+            None,
+            None,
+            None,
+        );
+        let long = "notification body line\n".repeat(600);
+        ch.send(&long).await.expect("send long notification");
+
+        let bodies = mock.bodies().await;
+        assert!(
+            bodies.len() > 1,
+            "expected the long body to split into multiple messages, got {}",
+            bodies.len()
+        );
+        let joined: String = bodies
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect();
+        assert_eq!(
+            joined, long,
+            "the delivered messages must reproduce the full body exactly"
+        );
+    }
+
+    #[test]
     fn test_relay_events_parse() {
         let json = r#"{
             "events": [
@@ -3715,5 +4079,98 @@ mod tests {
         // A cap that would end in an escape is trimmed so no lone backslash.
         assert!(!clip_to_telegram_max("abc\\".to_string()).ends_with('\\'));
         assert_eq!(clip_to_telegram_max("abc\\".to_string()), "abc");
+    }
+
+    #[test]
+    fn test_split_mdv2_chunks_delivers_full_reply_without_trimming() {
+        use crate::telegram::escape_markdown_v2;
+        let max = crate::telegram::MAX_MESSAGE_CHARS;
+
+        // Short text stays in one chunk (unescaped as-is).
+        assert_eq!(split_mdv2_chunks("hello", 100), vec!["hello".to_string()]);
+
+        // A long multi-line reply splits into chunks whose escaped form each fit
+        // the limit, and unescaping the concatenation reproduces the original
+        // exactly (no character dropped at a boundary).
+        let long = "a line of the answer\n".repeat(500);
+        let chunks = split_mdv2_chunks(&long, max);
+        assert!(chunks.len() > 1, "expected multiple chunks");
+        assert!(chunks.iter().all(|c| c.chars().count() <= max));
+        let joined_escaped: String = chunks.concat();
+        assert_eq!(joined_escaped, escape_markdown_v2(&long));
+
+        // A single over-long line is hard-split, still lossless.
+        let line = "x".repeat(max * 2 + 3);
+        let chunks = split_mdv2_chunks(&line, max);
+        assert_eq!(chunks.concat(), line);
+        assert!(chunks.iter().all(|c| c.chars().count() <= max));
+
+        // Reserved characters expand under escaping (each becomes 2 chars), so
+        // every emitted chunk must respect the budget *after* escaping, and no
+        // chunk may end on a dangling escape backslash.
+        let tricky = "a.b*c[d]e(f)g~h`i>j#k+l-m=n|o{p}q!r\\s".repeat(300);
+        // The per-char width model must match the real escaper for every
+        // character, so the budget accounting can never drift from
+        // `escape_markdown_v2`.
+        for c in 0u32..=0xFFFF {
+            if let Some(ch) = char::from_u32(c) {
+                assert_eq!(
+                    mdv2_len(ch),
+                    escape_markdown_v2(&ch.to_string()).chars().count(),
+                    "width model mismatch for U+{c:04X}"
+                );
+            }
+        }
+        assert_eq!(
+            mdv2_len_of(&tricky),
+            escape_markdown_v2(&tricky).chars().count()
+        );
+        let chunks = split_mdv2_chunks(&tricky, 100);
+        assert!(chunks.len() > 1);
+        for c in &chunks {
+            assert!(c.chars().count() <= 100, "escaped chunk exceeds budget");
+            let trailing_backslashes = c.chars().rev().take_while(|ch| *ch == '\\').count();
+            assert_eq!(
+                trailing_backslashes % 2,
+                0,
+                "lone trailing backslash: {c:?}"
+            );
+        }
+        assert_eq!(chunks.concat(), escape_markdown_v2(&tricky));
+
+        // Multibyte text must split on char boundaries without panicking.
+        let unicode = "é😀中.文*字".repeat(400);
+        let chunks = split_mdv2_chunks(&unicode, 50);
+        assert_eq!(chunks.concat(), escape_markdown_v2(&unicode));
+        assert!(chunks.iter().all(|c| c.chars().count() <= 50));
+
+        // A very large single line (no newlines) exercises the hard-split path
+        // at scale and must remain lossless and in-limit.
+        let huge = "y.é".repeat(200_000);
+        let chunks = split_mdv2_chunks(&huge, crate::telegram::MAX_MESSAGE_CHARS);
+        assert!(chunks.len() > 1);
+        assert!(
+            chunks
+                .iter()
+                .all(|c| c.chars().count() <= crate::telegram::MAX_MESSAGE_CHARS)
+        );
+        assert_eq!(chunks.concat(), escape_markdown_v2(&huge));
+        assert_eq!(
+            mdv2_len_of(&unicode),
+            escape_markdown_v2(&unicode).chars().count()
+        );
+
+        // Degenerate budget where a single reserved char already exceeds it:
+        // no chunk may be empty (Telegram rejects empty messages), and the
+        // content must still be preserved.
+        for budget in 1..=3 {
+            let src = "a.b*c".repeat(50);
+            let chunks = split_mdv2_chunks(&src, budget);
+            assert!(
+                chunks.iter().all(|c| !c.is_empty()),
+                "empty chunk at budget {budget}: {chunks:?}"
+            );
+            assert_eq!(chunks.concat(), escape_markdown_v2(&src));
+        }
     }
 }

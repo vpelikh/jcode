@@ -348,7 +348,7 @@ mod platform {
 
         let mut script = format!(
             "display notification \"{}\" with title \"{}\"",
-            applescript_escape(&envelope.body),
+            applescript_escape(&crate::notifications::bound_banner_text(&envelope.body)),
             applescript_escape(&envelope.title)
         );
         if let Some(subtitle) = envelope
@@ -356,7 +356,10 @@ mod platform {
             .as_deref()
             .filter(|s| !s.trim().is_empty())
         {
-            script.push_str(&format!(" subtitle \"{}\"", applescript_escape(subtitle)));
+            script.push_str(&format!(
+                " subtitle \"{}\"",
+                applescript_escape(&crate::notifications::bound_banner_text(subtitle))
+            ));
         }
         if let Some(sound) = envelope
             .sound
