@@ -1185,7 +1185,15 @@ fn test_real_draw_click_on_body_anchored_image_label_cycles_level() {
         "clicking the rendered image label must cycle Fit -> Large \
          (this is the exact path the user reported as broken)"
     );
-    assert_eq!(app.status_notice(), Some("Image size: large".to_string()));
+    // The click also copies the image if its payload is still staged, which
+    // depends on whether this draw has already materialized (and released) it.
+    // The cycle is what this test verifies, so assert the size prefix rather
+    // than the exact notice, which is racy across materialization timing.
+    let notice = app.status_notice().unwrap_or_default();
+    assert!(
+        notice.starts_with("Image size: large"),
+        "clicking the label must report the new size, got: {notice}"
+    );
 }
 
 /// The inline-image placeholder marker row must never reach the terminal as
