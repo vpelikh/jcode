@@ -2360,6 +2360,78 @@ fn render_tool_message_keeps_error_summary_when_details_hidden() {
     );
 }
 
+/// The exact shape the remote client produces for a failed tool: the TUI wraps
+/// the `[<tool>] `-labeled output in `Error: ` (label *after* the marker).
+/// The row must still recover the concise summary, not echo the raw label.
+#[test]
+fn render_tool_message_recovers_error_summary_from_remote_wrapped_error() {
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "Error: [bash] missing field `command`".to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_remote_err".to_string().into(),
+            name: "bash".to_string(),
+            input: serde_json::json!({ "intent": "Run it" }),
+            intent: Some("Run it".to_string()),
+            thought_signature: None,
+        }),
+    };
+
+    let rendered = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        rendered.contains("invalid input: missing command"),
+        "remote-wrapped error must yield the concise summary: {rendered}"
+    );
+    assert!(
+        !rendered.contains("[bash]"),
+        "the transport label must not leak into the row: {rendered}"
+    );
+}
+
+/// A real error whose message opens with a multi-word bracket (Python's
+/// `[Errno 2]`) must keep that detail: only a single-token transport label is
+/// peeled after the `Error: ` marker.
+#[test]
+fn render_tool_message_keeps_multiword_bracket_after_error_marker() {
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "[bash] Error: [Errno 2] No such file or directory".to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_errno".to_string().into(),
+            name: "bash".to_string(),
+            input: serde_json::json!({ "intent": "Run it" }),
+            intent: Some("Run it".to_string()),
+            thought_signature: None,
+        }),
+    };
+
+    let rendered = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        rendered.contains("[Errno 2]"),
+        "the errno detail must survive in the row: {rendered}"
+    );
+    assert!(
+        !rendered.contains("[bash]"),
+        "the transport label must not leak into the row: {rendered}"
+    );
+}
+
 #[test]
 fn render_tool_message_shows_token_badge() {
     let msg = DisplayMessage {
@@ -2454,6 +2526,181 @@ fn render_tool_message_shows_bash_output_when_enabled() {
         "last output line should be shown: {rendered:?}"
     );
     crate::tui::ui::tools_ui::tests_show_bash_output_override::set(false);
+}
+
+/// A remote client prefixes bash output with `[bash] `; that transport header
+/// must not render as if it were command output.
+#[test]
+fn render_tool_message_bash_output_strips_remote_tool_name_prefix() {
+    crate::tui::ui::tools_ui::tests_show_bash_output_override::set(true);
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "[bash] On branch master\nnothing to commit\n\nWorking directory: /repo\n\nExecution time: 3ms\n\nExit code: 0".to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_bash_prefix".to_string().into(),
+            name: "bash".to_string(),
+            input: serde_json::json!({"command": "git status"}),
+            intent: None,
+            thought_signature: None,
+        }),
+    };
+
+    let rendered = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        !rendered.contains("[bash]"),
+        "bash transport prefix must be stripped: {rendered}"
+    );
+    assert!(
+        rendered.contains("On branch master"),
+        "real command output must still render: {rendered}"
+    );
+    crate::tui::ui::tools_ui::tests_show_bash_output_override::set(false);
+}
+
+#[test]
+fn render_agentgrep_output_body_strips_remote_tool_name_prefix() {
+    let content = "[agentgrep] src/main.rs:10:fn main()";
+    let rendered = super::render_agentgrep_output_body(content, 120)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        !rendered.contains("[agentgrep]"),
+        "agentgrep transport prefix must be stripped: {rendered}"
+    );
+    assert!(
+        rendered.contains("src/main.rs:10:fn main()"),
+        "real search result must still render: {rendered}"
+    );
+}
+
+/// The remote `[bash] ` prefix must not defeat the clean-no-op sentinel: a
+/// prefixed `Command completed successfully (no output)` must still collapse,
+/// not render as if it were real command output.
+#[test]
+fn render_tool_message_bash_noop_sentinel_survives_remote_prefix() {
+    crate::tui::ui::tools_ui::tests_show_bash_output_override::set(true);
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "[bash] Command completed successfully (no output)".to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_bash_noop_prefix".to_string().into(),
+            name: "bash".to_string(),
+            input: serde_json::json!({"command": "true"}),
+            intent: None,
+            thought_signature: None,
+        }),
+    };
+
+    let rendered = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        !rendered.contains("Command completed successfully"),
+        "the no-op sentinel must not render as output: {rendered}"
+    );
+    assert!(
+        !rendered.contains("Output:"),
+        "a collapsed no-op must not get an Output block: {rendered}"
+    );
+    crate::tui::ui::tools_ui::tests_show_bash_output_override::set(false);
+}
+
+/// Only the single transport prefix is removed: a command whose real output
+/// happens to begin with `[bash] ` keeps that genuine line.
+#[test]
+fn render_tool_message_bash_keeps_genuine_repeated_prefix_content() {
+    let content = "[bash] [bash] still mine\n\nExit code: 0";
+    let stripped = super::strip_tool_result_transport_headers(content, "bash");
+    assert_eq!(
+        stripped, "[bash] still mine\n\nExit code: 0",
+        "only one transport prefix should be peeled"
+    );
+}
+
+/// A remote `[memory] ` prefix must not hide the recall entries: with it, the
+/// first `- [category] content` line would otherwise be dropped.
+#[test]
+fn render_memory_recall_strips_remote_tool_name_prefix() {
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "[memory] - [fact] first remembered thing\n- [fact] second remembered thing"
+            .to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_memory_recall_prefix".to_string().into(),
+            name: "memory".to_string(),
+            input: serde_json::json!({"action": "recall", "query": "thing"}),
+            intent: None,
+            thought_signature: None,
+        }),
+    };
+
+    let rendered = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        !rendered.contains("[memory]"),
+        "memory transport prefix must be stripped: {rendered}"
+    );
+    assert!(
+        rendered.contains("recalled 2 memories"),
+        "both recall entries must be counted (first not swallowed by the prefix): {rendered}"
+    );
+}
+
+/// A remote `[integration_tools] ` prefix must not swallow the first listing
+/// entry before the discovery card parses it.
+#[test]
+fn render_discovery_card_strips_remote_tool_name_prefix() {
+    let tool = crate::message::ToolCall {
+        id: "call_discovery_prefix".to_string().into(),
+        name: "integration_tools".to_string(),
+        input: serde_json::json!({"action": "browse"}),
+        intent: None,
+        thought_signature: None,
+    };
+    let output = "[integration_tools] - stripe: payments\n- linear: issues";
+    let lines = super::render_discovery_card(&tool, output, false, 96)
+        .expect("browse action renders a card");
+    let rendered = lines
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Without stripping, the first line's bracket prefix would swallow
+    // `stripe`, leaving only one parsed entry (rendered by name); with the fix
+    // both parse and the compact line reports the count.
+    assert!(
+        rendered.contains("2 integrations"),
+        "both listing entries must survive the prefix: {rendered}"
+    );
+    assert!(
+        !rendered.contains("[integration_tools]"),
+        "transport prefix must not render: {rendered}"
+    );
 }
 
 #[test]
@@ -3874,6 +4121,69 @@ fn render_compass_query_output_body_renders_markdown() {
     assert!(
         rendered.contains("crates/jcode-app-core/src/tool/mod.rs"),
         "rendered={rendered}"
+    );
+}
+
+/// A remote client prefixes the body with `[compass_query] `; that transport
+/// header must not leak into the rendered markdown, where it would turn the
+/// leading `# Compass query:` heading into a literal `[compass_query] # ...`.
+#[test]
+fn render_compass_query_output_body_strips_remote_tool_name_prefix() {
+    let content =
+        "[compass_query] # Compass query: fn config\n\n**Found 1 result(s)**\n\n## 1. cfg::load\n";
+    let rendered = super::render_compass_query_output_body(content, 120)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        !rendered.contains("[compass_query]"),
+        "transport prefix must be stripped: {rendered}"
+    );
+    assert!(
+        rendered.contains("Compass query: fn config"),
+        "heading must render as a heading, not literal text: {rendered}"
+    );
+    assert!(
+        !rendered.contains("# Compass query"),
+        "the heading marker must be consumed by the markdown pipeline: {rendered}"
+    );
+}
+
+/// Restored history may carry a `[tool timing: ...]` header; it must not show.
+#[test]
+fn render_compass_query_output_body_strips_timing_header() {
+    let content = "[tool timing: start=2026-01-01T00:00:00.000Z finish=2026-01-01T00:00:03.000Z duration=3s] # Compass query: fn config\n\n**Found 1 result(s)**\n";
+    let rendered = super::render_compass_query_output_body(content, 120)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        !rendered.contains("[tool timing:"),
+        "timing header must be stripped: {rendered}"
+    );
+    assert!(
+        rendered.contains("Compass query: fn config"),
+        "heading must still render: {rendered}"
+    );
+}
+
+/// A leading bracket that names a *different* tool is genuine content and must
+/// survive; only the compass transport prefix is removed.
+#[test]
+fn render_compass_query_output_body_keeps_foreign_bracket_prefix() {
+    let content = "[other_tool] # Compass query: fn config\n";
+    let rendered = super::render_compass_query_output_body(content, 120)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("[other_tool]"),
+        "an unrelated bracket prefix is content, not transport: {rendered}"
     );
 }
 

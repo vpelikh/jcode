@@ -126,19 +126,133 @@ fn normalize_backticked_identifier(text: &str) -> String {
     text.replace('`', "").trim().to_string()
 }
 
+/// Peel a single leading remote-client transport label (`[<tool>] `), returning
+/// the remainder. A label is any non-empty, single-line bracket token
+/// immediately followed by `] `; this intentionally mirrors the long-standing
+/// normalization in failure detection, so a first line that happens to open
+/// with a bracketed token is treated as a label too.
+fn peel_leading_tool_label(content: &str) -> Option<&str> {
+    let after_open = content.strip_prefix('[')?;
+    let (label, rest) = after_open.split_once("] ")?;
+    (!label.is_empty() && !label.contains(['\n', '\r'])).then_some(rest)
+}
+
+/// Peel a leading harness timestamp header: either `[tool timing: ...]` or a
+/// plain `[<rfc3339>]` tag (both are prepended to a tool result by
+/// `jcode_message_types::Message::with_timestamps`).
+fn peel_leading_tool_timestamp_header(content: &str) -> Option<&str> {
+    let after_open = content.strip_prefix('[')?;
+    let header_end = after_open.find(']')?;
+    let header = &after_open[..header_end];
+    (header.starts_with("tool timing:") || is_rfc3339_timestamp_tag(header))
+        .then(|| after_open[header_end + 1..].trim_start())
+}
+
+/// Whether `tag` is the output of `Message::format_timestamp`:
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ` (chrono `to_rfc3339_opts(Millis, true)`).
+/// Mirrors `jcode_message_types::is_rfc3339_timestamp_tag` so this crate need
+/// not depend on chrono.
+fn is_rfc3339_timestamp_tag(tag: &str) -> bool {
+    const SHAPE: &[u8] = b"0000-00-00T00:00:00.000Z";
+    let bytes = tag.as_bytes();
+    if bytes.len() != SHAPE.len() {
+        return false;
+    }
+    SHAPE.iter().enumerate().all(|(i, &expected)| {
+        if expected == b'0' {
+            bytes[i].is_ascii_digit()
+        } else {
+            bytes[i] == expected
+        }
+    })
+}
+
+/// Strip the leading transport decorations a tool result may carry before its
+/// real first line: the remote client's `[<tool>] ` label and the harness's
+/// `[tool timing: ...]` / `[<rfc3339>]` timestamp header. They may appear in
+/// either order, so at most one of each is peeled (in whichever order they
+/// lead). Each is removed once, so content that genuinely repeats a bracket
+/// (e.g. a command echoing `[bash] `) is not eaten past the transport decoration.
+fn strip_leading_transport(content: &str) -> &str {
+    let mut content = content.trim_start();
+    let mut stripped_label = false;
+    let mut stripped_timestamp = false;
+    loop {
+        // Check the timestamp header first: it may contain an interior space
+        // (`[tool timing: ...]`), which the looser label peel would otherwise
+        // swallow as a label.
+        if !stripped_timestamp && let Some(rest) = peel_leading_tool_timestamp_header(content) {
+            content = rest;
+            stripped_timestamp = true;
+            continue;
+        }
+        if !stripped_label && let Some(rest) = peel_leading_tool_label(content) {
+            content = rest;
+            stripped_label = true;
+            continue;
+        }
+        break;
+    }
+    content
+}
+
+/// Strip a transport label that sits *after* an error marker, e.g. the `[bash]`
+/// in `Error: [bash] <msg>`.
+///
+/// Unlike [`strip_leading_transport`] this only peels a *single-token* label
+/// (no interior whitespace). A remote label is always one token
+/// (`[bash]`, `[compass_query]`, `[mcp__server__tool]`), whereas a genuine
+/// bracket that opens an error message is usually multi-word
+/// (`Error: [Errno 2] No such file or directory`). Requiring one token lets the
+/// real detail survive untouched.
+fn strip_error_marker_tool_label(content: &str) -> &str {
+    let trimmed = content.trim();
+    trimmed
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once("] "))
+        .filter(|(label, _)| {
+            !label.is_empty()
+                && !label.contains(['\n', '\r'])
+                && !label.contains(char::is_whitespace)
+        })
+        .map(|(_, rest)| rest)
+        .unwrap_or(trimmed)
+}
+
 pub fn concise_tool_error_summary(content: &str) -> Option<String> {
-    for raw_line in content.lines() {
+    for raw_line in strip_leading_transport(content).lines() {
         let line = raw_line.trim();
         if line.is_empty() {
             continue;
         }
 
-        let detail = line
-            .strip_prefix("Error:")
-            .or_else(|| line.strip_prefix("error:"))
-            .or_else(|| line.strip_prefix("Failed:"))
-            .map(str::trim);
-        if let Some(detail) = detail {
+        // Peel an error marker, then a transport label that may sit *after* it,
+        // then another marker (the remote client wraps the already-labeled output
+        // in `Error: `, so the real shape is `Error: [<tool>] <msg>` and a
+        // tool-level `Error:` yields `Error: [<tool>] Error: <msg>`). Loop so any
+        // wrapping order resolves to the innermost detail.
+        let mut rest = line;
+        let mut marked = false;
+        loop {
+            let detail = rest
+                .strip_prefix("Error:")
+                .or_else(|| rest.strip_prefix("error:"))
+                .or_else(|| rest.strip_prefix("Failed:"))
+                .map(str::trim);
+            let Some(detail) = detail else {
+                break;
+            };
+            marked = true;
+            let after_label = strip_error_marker_tool_label(detail);
+            if after_label.len() < detail.len() {
+                rest = after_label;
+                continue;
+            }
+            rest = detail;
+            break;
+        }
+        if marked {
+            let detail = rest;
             if let Some(field) = detail.strip_prefix("missing field ") {
                 return Some(format!(
                     "invalid input: missing {}",
@@ -192,11 +306,7 @@ pub fn parse_bash_exit_code(content: &str) -> Option<i32> {
     for raw_line in content.lines().rev() {
         let line = raw_line.trim();
         if let Some(rest) = line.strip_prefix("Exit code:") {
-            return rest
-                .trim()
-                .parse::<i32>()
-                .ok()
-                .filter(|_| !line.is_empty());
+            return rest.trim().parse::<i32>().ok().filter(|_| !line.is_empty());
         }
         if let Some(rest) = line.strip_prefix("--- Command finished with exit code:") {
             let code = rest.trim().trim_end_matches('-').trim();
@@ -247,10 +357,16 @@ pub fn parse_bash_execution_time(content: &str) -> Option<String> {
 /// Returns the humanized duration (e.g. `120ms`, `1.5s`, `2m`) when available.
 pub fn parse_bash_timing_duration(content: &str) -> Option<String> {
     let trimmed = content.trim_start();
-    // Search anywhere in the leading header so a trimmed/mirrored transcript
-    // still finds it even if the header is not the very first token.
-    let searchable = &trimmed[..trimmed.len().min(160)];
-    let after_open = searchable.strip_prefix('[')?;
+    // The timing header is normally the first token, but a remote client may
+    // prepend its own `[<tool>] ` label first (`[bash] [tool timing: ...]`), and
+    // either decoration may be trimmed off a mirrored transcript. The header is
+    // always single-line, so search only the first line: this tolerates a
+    // leading label without matching a `[tool timing:` that appears later inside
+    // the command's own output.
+    let first_line_end = trimmed.find('\n').unwrap_or(trimmed.len());
+    let searchable = &trimmed[..first_line_end.min(200)];
+    let header_start = searchable.find("[tool timing:")?;
+    let after_open = &searchable[header_start + 1..];
     let header_end = after_open.find(']')?;
     let header = &after_open[..header_end];
     let header = header.strip_prefix("tool timing:")?;
@@ -301,12 +417,7 @@ pub fn tool_output_looks_failed(content: &str) -> bool {
     if trimmed.is_empty() {
         return false;
     }
-    let normalized = trimmed
-        .strip_prefix('[')
-        .and_then(|rest| rest.split_once("] "))
-        .filter(|(label, _)| !label.is_empty() && !label.contains(['\n', '\r']))
-        .map(|(_, rest)| rest)
-        .unwrap_or(trimmed);
+    let normalized = strip_leading_transport(content);
     let lower = normalized.to_ascii_lowercase();
     if concise_tool_error_summary(normalized).is_some()
         || lower.starts_with("error:")
@@ -394,6 +505,123 @@ mod tests {
             concise_tool_error_summary("--- Command finished with exit code: 2 ---").as_deref(),
             Some("exit 2")
         );
+        // A remote `[<tool>] ` prefix must not hide the error summary.
+        assert_eq!(
+            concise_tool_error_summary("[bash] Error: missing field `command`").as_deref(),
+            Some("invalid input: missing command")
+        );
+        // The real remote shape wraps the labeled output in `Error: ` (the
+        // label sits *after* the marker): `Error: [<tool>] <msg>`.
+        assert_eq!(
+            concise_tool_error_summary("Error: [bash] missing field `command`").as_deref(),
+            Some("invalid input: missing command")
+        );
+        // A doubly-wrapped error (tool already prefixed `Error:`, remote added
+        // the label and another `Error:`) must still classify.
+        assert_eq!(
+            concise_tool_error_summary("Error: [bash] Error: missing field `command`").as_deref(),
+            Some("invalid input: missing command")
+        );
+        // A genuine bracketed payload must not be mistaken for a transport label.
+        assert_eq!(concise_tool_error_summary("[1, 2] ok"), None);
+        // A single-token bracket after the marker is a transport label and is
+        // peeled, even for a non-builtin tool name.
+        assert_eq!(
+            concise_tool_error_summary("Error: [mcp__server__tool] boom").as_deref(),
+            Some("error: boom")
+        );
+        // A multi-word bracket after the marker is real error detail (e.g.
+        // Python's `[Errno 2]`), so it must be preserved.
+        assert_eq!(
+            concise_tool_error_summary("Error: [Errno 2] No such file or directory").as_deref(),
+            Some("error: [Errno 2] No such file or directory")
+        );
+        // The label and the harness `[tool timing: ...]` header may appear in
+        // either order (the body renderers strip both); the error summary must
+        // see through both orders too.
+        assert_eq!(
+            concise_tool_error_summary(
+                "[bash] [tool timing: start=2026-01-01T00:00:00.000Z finish=2026-01-01T00:00:03.000Z duration=3s] Error: missing field `command`"
+            )
+            .as_deref(),
+            Some("invalid input: missing command")
+        );
+        assert_eq!(
+            concise_tool_error_summary(
+                "[tool timing: start=2026-01-01T00:00:00.000Z finish=2026-01-01T00:00:03.000Z duration=3s] [bash] Error: missing field `command`"
+            )
+            .as_deref(),
+            Some("invalid input: missing command")
+        );
+        // A plain `[<rfc3339>]` header (no duration) is also transport, alone or
+        // with a label in either order.
+        assert_eq!(
+            concise_tool_error_summary("[2026-01-01T00:00:00.000Z] Error: missing field `command`")
+                .as_deref(),
+            Some("invalid input: missing command")
+        );
+        assert_eq!(
+            concise_tool_error_summary(
+                "[2026-01-01T00:00:00.000Z] [bash] Error: missing field `command`"
+            )
+            .as_deref(),
+            Some("invalid input: missing command")
+        );
+        assert_eq!(
+            concise_tool_error_summary(
+                "[bash] [2026-01-01T00:00:00.000Z] Error: missing field `command`"
+            )
+            .as_deref(),
+            Some("invalid input: missing command")
+        );
+        // Each decoration is peeled at most once, so a genuinely repeated label is
+        // left as content and no longer opens with a marker (nothing to classify).
+        assert_eq!(
+            concise_tool_error_summary("[bash] [bash] Error: missing field `command`"),
+            None
+        );
+    }
+
+    #[test]
+    fn strips_leading_transport_in_either_order() {
+        assert_eq!(strip_leading_transport("[bash] Error: x"), "Error: x");
+        assert_eq!(
+            strip_leading_transport("[tool timing: duration=3s] Error: x"),
+            "Error: x"
+        );
+        assert_eq!(
+            strip_leading_transport("[bash] [tool timing: duration=3s] Error: x"),
+            "Error: x"
+        );
+        assert_eq!(
+            strip_leading_transport("[tool timing: duration=3s] [bash] Error: x"),
+            "Error: x"
+        );
+        // A plain `[<rfc3339>]` timestamp header (the form `with_timestamps`
+        // emits when there is no duration) is also transport, alone or with a
+        // label in either order.
+        assert_eq!(
+            strip_leading_transport("[2026-01-01T00:00:00.000Z] Error: x"),
+            "Error: x"
+        );
+        assert_eq!(
+            strip_leading_transport("[2026-01-01T00:00:00.000Z] [bash] Error: x"),
+            "Error: x"
+        );
+        assert_eq!(
+            strip_leading_transport("[bash] [2026-01-01T00:00:00.000Z] Error: x"),
+            "Error: x"
+        );
+        // The rfc3339 shape must match exactly: a non-timestamp bracket is not
+        // treated as a timestamp header.
+        assert!(!is_rfc3339_timestamp_tag("2026-01-01"));
+        assert!(!is_rfc3339_timestamp_tag("tool timing: duration=3s"));
+        assert!(is_rfc3339_timestamp_tag("2026-01-01T00:00:00.000Z"));
+        // The leading peel is intentionally loose (any bracket token counts as a
+        // label, matching long-standing failure detection); the post-marker peel
+        // is the strict one that preserves `[Errno 2]`.
+        assert_eq!(strip_leading_transport("[Errno 2] boom"), "boom");
+        assert_eq!(strip_leading_transport("plain output"), "plain output");
     }
 
     #[test]
@@ -443,7 +671,22 @@ mod tests {
             parse_bash_timing_duration("[tool timing: duration=90s] echo").as_deref(),
             Some("1m 30s")
         );
+        // A remote `[<tool>] ` label may precede the timing header
+        // (`[bash] [tool timing: ...]`); the header must still be found.
+        assert_eq!(
+            parse_bash_timing_duration(
+                "[bash] [tool timing: start=2026-01-01T00:00:00.000Z finish=2026-01-01T00:00:03.000Z duration=3s] git status"
+            )
+            .as_deref(),
+            Some("3.0s")
+        );
         assert_eq!(parse_bash_timing_duration("no timing header"), None);
+        // A `[tool timing:` that appears on a later output line (not as the
+        // prepended single-line header) must not be mistaken for the header.
+        assert_eq!(
+            parse_bash_timing_duration("some output\nthen [tool timing: duration=9s] later"),
+            None
+        );
     }
 
     #[test]
@@ -462,10 +705,8 @@ mod tests {
     #[test]
     fn parses_bash_working_directory_footer() {
         assert_eq!(
-            parse_bash_working_dir(
-                "On branch main\n\nWorking directory: /home/user/project"
-            )
-            .as_deref(),
+            parse_bash_working_dir("On branch main\n\nWorking directory: /home/user/project")
+                .as_deref(),
             Some("/home/user/project")
         );
         assert_eq!(

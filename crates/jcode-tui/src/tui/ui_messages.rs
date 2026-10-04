@@ -523,6 +523,9 @@ fn render_plaintext_lines(content: &str, wrap_width: usize) -> Vec<Line<'static>
 /// as a nested block. Long lines are hard-split to the available width and the
 /// block is capped so a giant search result cannot flood the transcript.
 fn render_agentgrep_output_body(content: &str, row_width: usize) -> Vec<Line<'static>> {
+    // Drop the `[agentgrep] ` / `[tool timing: ...]` transport prefixes a remote
+    // client or restored history may add, so only the real search result shows.
+    let content = strip_tool_result_transport_headers(content, "agentgrep");
     let border = "    │ ";
     let border_width = UnicodeWidthStr::width(border);
     let avail = row_width.saturating_sub(border_width).max(1);
@@ -580,6 +583,12 @@ fn render_agentgrep_output_body(content: &str, row_width: usize) -> Vec<Line<'st
 /// keep the search results scannable. The output is capped so a very large
 /// result set cannot balloon a single transcript row.
 fn render_compass_query_output_body(content: &str, row_width: usize) -> Vec<Line<'static>> {
+    // A remote client prefixes the body with `[compass_query] ` and restored
+    // history may carry a `[tool timing: ...]` header. Neither is part of the
+    // markdown report, and the prefix would otherwise turn the leading
+    // `# Compass query:` heading into a literal `[compass_query] # ...` line, so
+    // strip both before rendering.
+    let content = strip_tool_result_transport_headers(content, "compass_query");
     // Single newlines inside compass output separate fields on one result and
     // should be kept as hard breaks rather than reflowed into one paragraph.
     let preserved = preserve_hard_line_breaks_for_markdown(content);
@@ -1105,30 +1114,56 @@ fn parse_todo_tool_output(content: &str) -> Option<ParsedTodoToolOutput> {
 }
 
 fn strip_todo_tool_output_headers(content: &str) -> &str {
+    strip_tool_result_transport_headers(content, "todo")
+}
+
+/// Strip transport decorations that a tool result may carry before it reaches
+/// the transcript renderer, so a structured body (todo JSON, compass markdown)
+/// is parsed from the raw payload alone.
+///
+/// Two decorations are recognized: a leading `[<tool>] ` prefix added by the
+/// remote client (`remote_diff::finish_tool`), and the harness's
+/// `[tool timing: ...]` / `[<rfc3339>]` timestamp header. They may appear in
+/// either order, so at most one of each is peeled, in whichever order they
+/// lead.
+///
+/// The `[<tool>] ` prefix is only removed when its bracket content canonicalizes
+/// to `expected_tool`, so a result whose genuine content begins with some other
+/// bracketed token is left untouched. Each header is removed at most once, so
+/// content that genuinely repeats (e.g. a command echoing `[bash] `) is not
+/// eaten past the transport decoration.
+fn strip_tool_result_transport_headers<'a>(content: &'a str, expected_tool: &str) -> &'a str {
     let mut content = content.trim_start();
-    // Remote clients prefix outputs with the tool name, while restored history
-    // may independently prefix timing metadata. Accept either order without
-    // weakening the JSON shape that follows.
-    for _ in 0..3 {
-        if let Some(rest) = strip_todo_tool_name_header(content) {
+    let mut stripped_name = false;
+    let mut stripped_timing = false;
+    loop {
+        if !stripped_name
+            && let Some(rest) = strip_tool_name_header(content, expected_tool)
+        {
             content = rest;
+            stripped_name = true;
             continue;
         }
-        let rest = strip_tool_result_timestamp_header(content);
-        if rest.len() < content.len() {
-            content = rest;
-            continue;
+        if !stripped_timing {
+            let rest = strip_tool_result_timestamp_header(content);
+            if rest.len() < content.len() {
+                content = rest;
+                stripped_timing = true;
+                continue;
+            }
         }
         break;
     }
     content
 }
 
-fn strip_todo_tool_name_header(content: &str) -> Option<&str> {
+/// Peel a leading `[<tool>] ` transport prefix. Returns the remainder (leading
+/// whitespace trimmed) when the bracket content canonicalizes to `expected_tool`.
+fn strip_tool_name_header<'a>(content: &'a str, expected_tool: &str) -> Option<&'a str> {
     let after_open = content.strip_prefix('[')?;
     let header_end = after_open.find(']')?;
     let name = after_open[..header_end].trim();
-    (tools_ui::canonical_tool_name(name) == "todo")
+    (tools_ui::canonical_tool_name(name) == tools_ui::canonical_tool_name(expected_tool))
         .then(|| after_open[header_end + 1..].trim_start())
 }
 
@@ -3563,6 +3598,11 @@ fn render_gmail_draft_card(
         return None;
     }
 
+    // A remote client prefixes the body with `[gmail] `; strip it so the
+    // `Draft created successfully.` / `Draft ID:` matchers below see the real
+    // first line.
+    let tool_output = strip_tool_result_transport_headers(tool_output, "gmail");
+
     let max_box_width = available_width.min(88);
     if max_box_width < 10 {
         return None;
@@ -3785,6 +3825,10 @@ fn render_discovery_card(
     if tools_ui::canonical_tool_name(&tool.name) != "integration_tools" {
         return None;
     }
+    // A remote client prefixes the body with `[integration_tools] `; strip it so
+    // the listing/detail parsers below match on the real first line instead of
+    // swallowing it as the prefix.
+    let tool_output = strip_tool_result_transport_headers(tool_output, "integration_tools");
     let block_width = available_width.min(96);
     if block_width < 12 {
         return None;
@@ -4060,8 +4104,18 @@ pub(crate) fn render_tool_message(
     };
 
     let is_bash = tools_ui::canonical_tool_name(&tc.name) == "bash";
+    // The command output body may carry the remote client's `[bash] ` prefix
+    // and/or a `[tool timing: ...]` header. Strip them once here so the no-op
+    // sentinel comparison and the output block read the real command result.
+    // (The exit-code / cwd / duration footers are matched from the raw content,
+    // since the prefix never precedes them and `duration` reads the timing
+    // header itself.)
+    let bash_content = strip_tool_result_transport_headers(&msg.content, "bash");
+    // Likewise for the `memory` cards: a remote `[memory] ` prefix would
+    // otherwise swallow the first `- [category] content` recall entry.
+    let memory_content = strip_tool_result_transport_headers(&msg.content, "memory");
 
-    if tools_ui::is_memory_store_tool(tc) && !msg.content.starts_with("Error:") {
+    if tools_ui::is_memory_store_tool(tc) && !memory_content.starts_with("Error:") {
         let content = tc
             .input
             .get("content")
@@ -4099,12 +4153,12 @@ pub(crate) fn render_tool_message(
         return lines;
     }
 
-    if tools_ui::is_memory_recall_tool(tc) && !msg.content.starts_with("Error:") {
+    if tools_ui::is_memory_recall_tool(tc) && !memory_content.starts_with("Error:") {
         let border_style = Style::default().fg(rgb(150, 180, 255));
         let text_style = Style::default().fg(dim_color());
 
         let mut entries: Vec<(String, String)> = Vec::new();
-        for line in msg.content.lines() {
+        for line in memory_content.lines() {
             let trimmed = line.trim();
             if trimmed.starts_with("- [")
                 && let Some(rest) = trimmed.strip_prefix("- [")
@@ -4460,16 +4514,15 @@ pub(crate) fn render_tool_message(
     // The command's full output, rendered untrimmed underneath the tool row when
     // `display.show_bash_output` is enabled. This is the single owner of bash
     // output; `tool_call_details` handles the command metadata alone. The
-    // `[tool timing: ...]` header and the
-    // Working directory / Execution time / Exit code footers are harness
+    // `[bash] ` prefix a remote client adds, the `[tool timing: ...]` header, and
+    // the Working directory / Execution time / Exit code footers are harness
     // metadata, not command output, so they are stripped before surfacing the
-    // real command result.
-    if tools_ui::canonical_tool_name(&tc.name) == "bash"
+    // real command result. `bash_content` is already transport-stripped above.
+    if is_bash
         && tools_ui::show_bash_output()
-        && msg.content.trim() != "Command completed successfully (no output)"
+        && bash_content.trim() != "Command completed successfully (no output)"
     {
-        let detail_content = strip_tool_result_timestamp_header(&msg.content);
-        let output_lines = detail_content.lines().filter(|line| {
+        let output_lines = bash_content.lines().filter(|line| {
             let t = line.trim();
             !t.is_empty()
                 && !t.starts_with("Working directory:")

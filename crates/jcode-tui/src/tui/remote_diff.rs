@@ -56,6 +56,20 @@ impl RemoteDiffTracker {
         self.current_tool_input.clear();
     }
 
+    /// Finalize a remote tool result into its display content.
+    ///
+    /// The returned string leads with a `[<tool>] ` label. That label is
+    /// transport framing for the TUI's own row rendering, not part of the tool's
+    /// real result, so every consumer that parses this content (body renderers,
+    /// error summaries) must strip it first — see
+    /// `ui_messages::strip_tool_result_transport_headers` and
+    /// `jcode-tui-tool-display`'s `strip_leading_transport`.
+    ///
+    /// Do not strip the label here instead: the label is not the only transport
+    /// decoration, and some parsers (`parse_bash_timing_duration`,
+    /// `parse_bash_working_dir`) need the raw `[tool timing: ...]` header and
+    /// trailing footers that a blanket normalization would also remove. Each
+    /// consumer therefore strips exactly the decorations it owns.
     pub(crate) fn finish_tool(&mut self, id: &str, name: &str, output: &str) -> String {
         if let Some(pending) = self.pending_diffs.remove(id) {
             let new_content = std::fs::read_to_string(&pending.file_path).unwrap_or_default();
