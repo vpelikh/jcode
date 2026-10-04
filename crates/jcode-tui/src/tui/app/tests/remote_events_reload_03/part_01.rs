@@ -122,6 +122,122 @@ fn test_reload_handoff_active_when_socket_ready_marker_present() {
     }
 }
 
+/// Batch-attributable acceptance check for "clients don't hit reconnect_attempts
+/// spikes during a reload": drives the real reconnect entry point
+/// (`connect_with_retry`) with an on-disk reload marker and asserts it parks on
+/// the handoff (returns `Retry`) without incrementing `reconnect_attempts`.
+/// `connect_with_retry` short-circuits on `reload_handoff_active` before any
+/// connect attempt, so a preset nonzero counter must be left untouched. Before
+/// the batch's marker-liveness change, the marker expired at the 30s client TTL
+/// mid-reload, so this path fell through to a connect attempt (and the counter
+/// climbed).
+#[test]
+fn test_connect_with_retry_parks_on_active_reload_marker_without_incrementing_attempts() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().expect("create temp dir");
+    let prev_runtime = std::env::var_os("JCODE_RUNTIME_DIR");
+    crate::env::set_var("JCODE_RUNTIME_DIR", temp.path());
+
+    // A reload is mid-handoff: a `Starting` marker owned by this process that
+    // has ALREADY outlived the client's 30s marker TTL (`RELOAD_MARKER_MAX_AGE`)
+    // but is still within the hard cap. This is the exact regression window: the
+    // pre-change code treated a live-but-over-TTL Starting marker as expired, so
+    // `reload_handoff_active` went false and this path fell through to a real
+    // connect attempt (incrementing the counter). The batch's marker-liveness
+    // change keeps it active, so the client parks.
+    crate::server::write_reload_state(
+        "reload-marker-test",
+        "test-hash",
+        crate::server::ReloadPhase::Starting,
+        None,
+    );
+    let backdated = std::time::SystemTime::now() - Duration::from_secs(120);
+    let marker = crate::server::reload_marker_path();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&marker)
+        .expect("open reload marker to backdate")
+        .set_modified(backdated)
+        .expect("backdate reload marker past the client TTL");
+
+    let mut app = create_test_app();
+    let writer = crate::tui::terminal_writer::TerminalWriter::new(std::io::sink());
+    let backend = ratatui::backend::CrosstermBackend::new(writer);
+    let mut terminal = ratatui::Terminal::with_options(
+        backend,
+        ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 80, 24)),
+        },
+    )
+    .expect("fixed-viewport terminal");
+    // A never-ready event source: the handoff wait only polls it inside a
+    // `select!`, and the `Waiting` branch wakes via the real handoff event, so a
+    // permanently-pending stream keeps the client parked without a TTY.
+    let mut event_stream = futures::stream::pending::<std::io::Result<crossterm::event::Event>>();
+
+    // Preset a nonzero counter: parking must leave it untouched (the regression
+    // was the counter climbing while the reload was in progress).
+    let mut state = remote::RemoteRunState {
+        reconnect_attempts: 2,
+        ..Default::default()
+    };
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    // The handoff wait blocks until the marker changes (or the handoff event
+    // fires). Poll for the parked state with a deadline so the test cannot hang.
+    let parked = rt.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            remote::connect_with_retry(
+                &mut app,
+                &mut terminal,
+                &mut event_stream,
+                &mut state,
+                None,
+                None,
+            ),
+        )
+        .await
+    });
+
+    // Either it returned `Retry` (parked and re-looped once) or the timeout fired
+    // while parked on the handoff event (still parked). In both cases the counter
+    // must not have moved.
+    if let Ok(Ok(outcome)) = &parked {
+        assert!(
+            matches!(outcome, remote::ConnectOutcome::Retry),
+            "an active reload marker must park the client on the handoff, not connect"
+        );
+    }
+    assert_eq!(
+        state.reconnect_attempts, 2,
+        "parking on the reload handoff must not increment reconnect_attempts"
+    );
+
+    // Control: with the marker gone there is no handoff, so the same call falls
+    // through to a real connect attempt and the counter moves. This proves the
+    // assertion above is not vacuous (the counter is actually wired to this path).
+    crate::server::clear_reload_marker();
+    let _ = rt.block_on(remote::connect_with_retry(
+        &mut app,
+        &mut terminal,
+        &mut event_stream,
+        &mut state,
+        None,
+        None,
+    ));
+    assert!(
+        state.reconnect_attempts > 2,
+        "without a marker the reconnect path must run and count the attempt"
+    );
+
+    if let Some(prev_runtime) = prev_runtime {
+        crate::env::set_var("JCODE_RUNTIME_DIR", prev_runtime);
+    } else {
+        crate::env::remove_var("JCODE_RUNTIME_DIR");
+    }
+}
+
 #[test]
 fn test_handle_server_event_history_with_interruption_queues_continuation() {
     let mut app = create_test_app();

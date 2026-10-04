@@ -661,6 +661,8 @@ pub use self::await_members_state::{
 use self::reload_state::clear_reload_marker_if_stale_for_pid;
 #[cfg(test)]
 pub(crate) use self::reload_state::subscribe_reload_signal_for_tests;
+#[cfg(test)]
+pub use self::reload_state::write_reload_state_with_pid;
 pub use self::reload_state::{
     ReloadAck, ReloadPhase, ReloadSignal, ReloadState, ReloadWaitStatus, acknowledge_reload_signal,
     await_reload_handoff, clear_reload_marker, inspect_reload_wait_status,

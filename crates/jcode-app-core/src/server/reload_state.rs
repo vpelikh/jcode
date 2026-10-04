@@ -47,25 +47,166 @@ pub fn reload_marker_active(max_age: Duration) -> bool {
     )
 }
 
+/// Whether process liveness is actually observable on this platform.
+///
+/// `reload_process_alive` can only distinguish a live owner from a dead one on
+/// unix. Elsewhere it reports every nonzero pid as alive, so a `Starting` marker
+/// whose owner died before publishing `SocketReady`/`Failed` would look
+/// perpetually live and must NOT be extended past `max_age`: doing so would pin
+/// clients in `Waiting` (and keep `server_reload_starting()` true, rejecting new
+/// turns) for the full `RELOAD_MARKER_HARD_MAX_AGE` on a failed reload. On unix
+/// liveness is real, so a genuinely live owner may legitimately hold the handoff
+/// open past `max_age`.
+const RELOAD_OWNER_LIVENESS_OBSERVABLE: bool = cfg!(unix);
+
 pub fn recent_reload_state(max_age: Duration) -> Option<ReloadState> {
+    match observe_reload_marker(max_age) {
+        ReloadMarkerObservation::Usable(state) => Some(state),
+        ReloadMarkerObservation::HungLiveOwner | ReloadMarkerObservation::Stale => None,
+    }
+}
+
+/// Classification of the on-disk reload marker for a given `max_age`, produced
+/// from a *single* read+parse so callers never re-read the marker file.
+enum ReloadMarkerObservation {
+    /// A usable marker: fresh, or (on unix) a live owner still within the hard
+    /// cap.
+    Usable(ReloadState),
+    /// A live `Starting` owner that outlived `RELOAD_MARKER_HARD_MAX_AGE`.
+    /// Waiting clients must stop, but the file is deliberately kept (not
+    /// deleted) so a genuinely slow owner can still publish `SocketReady` and
+    /// finish the handoff.
+    HungLiveOwner,
+    /// Absent, unreadable, or stale. The file is cleared when present.
+    Stale,
+}
+
+/// Pure staleness verdict for a marker, decided from values the caller has
+/// already read. Kept separate from file I/O and platform liveness so the
+/// decision — including the non-unix "liveness is unobservable" branch — can be
+/// checked on every platform, independent of the host's `cfg(unix)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MarkerVerdict {
+    /// Within `max_age`: use the marker.
+    Fresh,
+    /// Past `max_age` but a live owner (liveness observable) is within the hard
+    /// cap: keep honoring the marker.
+    Extended,
+    /// Past the hard cap with a live observable owner: stop waiting but keep the
+    /// file.
+    HungLiveOwner,
+    /// Stale: clear the file and treat as no marker.
+    Stale,
+}
+
+/// Decide a marker's staleness from already-read values.
+///
+/// `liveness_observable` mirrors [`RELOAD_OWNER_LIVENESS_OBSERVABLE`] (only unix
+/// can tell a live owner from a dead one). When it is false the live-owner
+/// extension is skipped entirely, so a failed reload whose owner died cannot pin
+/// clients in `Waiting` for the full cap — the exact non-unix regression this
+/// guards.
+fn classify_marker(
+    phase: ReloadPhase,
+    elapsed: Duration,
+    max_age: Duration,
+    liveness_observable: bool,
+    owner_alive: bool,
+) -> MarkerVerdict {
+    if elapsed <= max_age {
+        return MarkerVerdict::Fresh;
+    }
+    // The max-age is only a fallback guard for stale markers. While the reload
+    // process that owns the marker is still alive (and that is observable), the
+    // handoff is genuinely in progress and the marker must NOT be cleared or
+    // treated as stale: a reload that checkpoints and flushes many sessions can
+    // hold the `Starting` phase well past `max_age` (observed ~39s vs a 30s TTL).
+    // Expiring the marker mid-reload makes every waiting client abandon the
+    // handoff, and the replacement server then boots unable to publish a
+    // socket-ready state (its `publish_reload_socket_ready` finds "no reload
+    // marker").
+    //
+    // A live owner only extends the marker up to `RELOAD_MARKER_HARD_MAX_AGE`.
+    // Past that the owner is presumed hung/deadlocked (a healthy reload finishes
+    // in well under a minute), so we stop pinning clients on a stuck handoff and
+    // let the normal reconnect path take over.
+    if liveness_observable && phase == ReloadPhase::Starting && owner_alive {
+        if elapsed <= RELOAD_MARKER_HARD_MAX_AGE {
+            return MarkerVerdict::Extended;
+        }
+        // Alive but past the cap: stop waiting WITHOUT deleting the marker.
+        return MarkerVerdict::HungLiveOwner;
+    }
+    MarkerVerdict::Stale
+}
+
+/// Read the marker once and classify it, clearing the file only when it is
+/// genuinely stale. Shared by [`recent_reload_state`] and
+/// [`inspect_reload_wait_status`] so the marker is read and parsed at most once
+/// per call (the wait-status path also needs the hung-owner verdict).
+fn observe_reload_marker(max_age: Duration) -> ReloadMarkerObservation {
     let path = reload_marker_path();
-    let state = ReloadState::load()?;
+    let Some(state) = ReloadState::load() else {
+        return ReloadMarkerObservation::Stale;
+    };
     let Ok(metadata) = std::fs::metadata(&path) else {
-        return None;
+        return ReloadMarkerObservation::Stale;
     };
     let Ok(modified) = metadata.modified() else {
         let _ = std::fs::remove_file(&path);
-        return None;
+        return ReloadMarkerObservation::Stale;
     };
     let Ok(elapsed) = modified.elapsed() else {
-        return Some(state);
+        // Clock skew or an unreadable mtime: treat as fresh rather than guessing.
+        return ReloadMarkerObservation::Usable(state);
     };
-    if elapsed <= max_age {
-        Some(state)
-    } else {
-        let _ = std::fs::remove_file(&path);
-        None
+    match classify_marker(
+        state.phase,
+        elapsed,
+        max_age,
+        RELOAD_OWNER_LIVENESS_OBSERVABLE,
+        reload_process_alive(state.pid),
+    ) {
+        MarkerVerdict::Fresh | MarkerVerdict::Extended => ReloadMarkerObservation::Usable(state),
+        MarkerVerdict::HungLiveOwner => ReloadMarkerObservation::HungLiveOwner,
+        MarkerVerdict::Stale => {
+            let _ = std::fs::remove_file(&path);
+            ReloadMarkerObservation::Stale
+        }
     }
+}
+
+/// Upper bound on how long a live owner's in-progress `Starting` marker is
+/// honored beyond the caller's `max_age`. A reload that has not published
+/// `SocketReady`/`Failed` within this window is treated as hung so waiting
+/// clients fall back to a normal reconnect instead of waiting forever.
+pub const RELOAD_MARKER_HARD_MAX_AGE: Duration = Duration::from_secs(10 * 60);
+
+/// Whether an in-progress reload should suppress the server idle-exit timer.
+///
+/// During a reload the server can transiently have zero connected clients while
+/// it still owns the marker and is shutting sessions down; the idle monitor must
+/// not exit mid-reload or it races the replacement server (and strands waiting
+/// clients that are still parked on the handoff). Only a `Starting` marker means
+/// a reload is genuinely in progress, so idle-exit is suppressed.
+///
+/// A `SocketReady` marker is deliberately *not* considered here: it means the
+/// handoff already succeeded (the replacement server is accepting connections).
+/// Since reload is exec-based it preserves the pid, and nothing clears that
+/// marker in normal operation, so honoring `SocketReady` here would suppress
+/// idle-exit for up to `RELOAD_MARKER_HARD_MAX_AGE` after every completed reload
+/// — a regression that keeps an otherwise-idle server alive. Once the replacement
+/// server is up its own fresh idle timer governs, exactly as before a reload.
+///
+/// Bounded by [`RELOAD_MARKER_HARD_MAX_AGE`] (10 min): a `Starting` marker whose
+/// owner is hung past the cap stops counting as active (`recent_reload_state`
+/// hides the hung-live-owner verdict), so a stuck reload cannot suppress
+/// idle-exit forever.
+pub fn reload_suppresses_idle_shutdown() -> bool {
+    matches!(
+        recent_reload_state(RELOAD_MARKER_HARD_MAX_AGE),
+        Some(state) if state.phase == ReloadPhase::Starting
+    )
 }
 
 pub fn write_reload_state(
@@ -79,6 +220,27 @@ pub fn write_reload_state(
         hash: hash.to_string(),
         phase,
         pid: std::process::id(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        detail,
+    }
+    .write();
+}
+
+/// Like [`write_reload_state`] but with an explicit `pid`. Test-only: lets tests
+/// simulate a marker owned by a process that is no longer alive.
+#[cfg(test)]
+pub fn write_reload_state_with_pid(
+    request_id: &str,
+    hash: &str,
+    phase: ReloadPhase,
+    detail: Option<String>,
+    pid: u32,
+) {
+    ReloadState {
+        request_id: request_id.to_string(),
+        hash: hash.to_string(),
+        phase,
+        pid,
         timestamp: chrono::Utc::now().to_rfc3339(),
         detail,
     }
@@ -162,32 +324,40 @@ pub async fn inspect_reload_wait_status(
     max_age: Duration,
     last_known_pid: Option<u32>,
 ) -> ReloadWaitStatus {
-    if let Some(state) = recent_reload_state(max_age) {
-        let status = match state.phase {
-            ReloadPhase::SocketReady => ReloadWaitStatus::Ready,
-            ReloadPhase::Failed => ReloadWaitStatus::Failed(state.detail),
-            ReloadPhase::Starting => {
-                if reload_process_alive(state.pid) {
-                    ReloadWaitStatus::Waiting {
-                        pid: Some(state.pid),
+    // Read+classify the marker exactly once for the whole status decision, so
+    // the pid-fallback below never re-reads/re-parses the file.
+    let hung_live_owner = match observe_reload_marker(max_age) {
+        ReloadMarkerObservation::Usable(state) => {
+            let status = match state.phase {
+                ReloadPhase::SocketReady => ReloadWaitStatus::Ready,
+                ReloadPhase::Failed => ReloadWaitStatus::Failed(state.detail),
+                ReloadPhase::Starting => {
+                    if reload_process_alive(state.pid) {
+                        ReloadWaitStatus::Waiting {
+                            pid: Some(state.pid),
+                        }
+                    } else {
+                        ReloadWaitStatus::Failed(Some(format!(
+                            "reload process {} exited before becoming ready",
+                            state.pid
+                        )))
                     }
-                } else {
-                    ReloadWaitStatus::Failed(Some(format!(
-                        "reload process {} exited before becoming ready",
-                        state.pid
-                    )))
                 }
-            }
-        };
-        crate::logging::info(&format!(
-            "inspect_reload_wait_status: socket {} marker-driven status={:?} (last_known_pid={:?}, state={})",
-            socket_path.display(),
-            status,
-            last_known_pid,
-            reload_state_summary(max_age)
-        ));
-        return status;
-    }
+            };
+            crate::logging::info(&format!(
+                "inspect_reload_wait_status: socket {} marker-driven status={:?} (last_known_pid={:?}, state={})",
+                socket_path.display(),
+                status,
+                last_known_pid,
+                reload_state_summary(max_age)
+            ));
+            return status;
+        }
+        // `recent_reload_state` hides a hung live owner's marker; remember that
+        // verdict so the pid-fallback does not resurrect `Waiting` for it.
+        ReloadMarkerObservation::HungLiveOwner => true,
+        ReloadMarkerObservation::Stale => false,
+    };
 
     if is_server_ready(socket_path).await || has_live_listener(socket_path).await {
         if last_known_pid.is_some() {
@@ -203,18 +373,31 @@ pub async fn inspect_reload_wait_status(
 
     if let Some(pid) = last_known_pid {
         if reload_process_alive(pid) {
-            crate::logging::info(&format!(
-                "inspect_reload_wait_status: socket {} waiting on last known pid {} without marker",
+            // Do not resurrect `Waiting` for an owner whose `Starting` marker has
+            // outlived the hard cap (verdict captured above from the single marker
+            // read): pinning clients here would defeat the hard cap and hang them
+            // forever. Fall through to Idle so the client reconnects.
+            if hung_live_owner {
+                crate::logging::warn(&format!(
+                    "inspect_reload_wait_status: socket {} last known pid {} is alive but its reload marker exceeded the hard cap; not waiting",
+                    socket_path.display(),
+                    pid
+                ));
+            } else {
+                crate::logging::info(&format!(
+                    "inspect_reload_wait_status: socket {} waiting on last known pid {} without marker",
+                    socket_path.display(),
+                    pid
+                ));
+                return ReloadWaitStatus::Waiting { pid: Some(pid) };
+            }
+        } else {
+            crate::logging::warn(&format!(
+                "inspect_reload_wait_status: socket {} last known pid {} is no longer alive and no reload marker remains",
                 socket_path.display(),
                 pid
             ));
-            return ReloadWaitStatus::Waiting { pid: Some(pid) };
         }
-        crate::logging::warn(&format!(
-            "inspect_reload_wait_status: socket {} last known pid {} is no longer alive and no reload marker remains",
-            socket_path.display(),
-            pid
-        ));
     }
 
     if last_known_pid.is_some() {
@@ -421,7 +604,7 @@ pub struct ReloadAck {
     pub request_id: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReloadPhase {
     Starting,
@@ -620,6 +803,87 @@ mod tests {
                 crate::env::remove_var(self.key);
             }
         }
+    }
+
+    /// A fresh `Starting` marker must make the marker→idle integration helper
+    /// true, so the idle monitor is actually suppressed on disk state (not just
+    /// in the pure `idle_monitor_should_start` unit test). This is the concrete
+    /// link the requirement "server doesn't idle-exit mid-reload" depends on.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn reload_suppresses_idle_shutdown_tracks_the_on_disk_marker() {
+        let _lock = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvGuard::set_runtime_dir(temp.path());
+
+        // No marker: idle-exit is allowed.
+        assert!(
+            !reload_suppresses_idle_shutdown(),
+            "without a marker the idle monitor must be free to run"
+        );
+
+        // A fresh Starting marker (this process owns it) suppresses idle-exit.
+        write_reload_state("req-idle", "hash-idle", ReloadPhase::Starting, None);
+        assert!(
+            reload_suppresses_idle_shutdown(),
+            "a fresh Starting marker must suppress idle-exit mid-reload"
+        );
+
+        // SocketReady means the handoff COMPLETED (the replacement server is up
+        // and accepting connections). It must NOT suppress idle-exit: the marker
+        // is never cleared in normal operation, so honoring it would keep an
+        // otherwise-idle server alive for the full hard cap after every reload.
+        write_reload_state("req-idle", "hash-idle", ReloadPhase::SocketReady, None);
+        assert!(
+            !reload_suppresses_idle_shutdown(),
+            "a completed (SocketReady) reload must not suppress idle-exit"
+        );
+
+        // A Failed marker likewise does not suppress idle-exit.
+        write_reload_state("req-idle", "hash-idle", ReloadPhase::Failed, None);
+        assert!(
+            !reload_suppresses_idle_shutdown(),
+            "a failed reload must not suppress idle-exit"
+        );
+
+        clear_reload_marker();
+        assert!(
+            !reload_suppresses_idle_shutdown(),
+            "clearing the marker must re-enable idle-exit"
+        );
+    }
+
+    /// The idle suppression is bounded: an over-age marker past the hard cap must
+    /// stop suppressing idle-exit, so a hung reload cannot keep the server alive
+    /// (and unkillable) forever.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn reload_suppresses_idle_shutdown_expires_past_the_hard_cap() {
+        let _lock = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvGuard::set_runtime_dir(temp.path());
+
+        ReloadState {
+            request_id: "req-idle-hung".to_string(),
+            hash: "hash-idle-hung".to_string(),
+            phase: ReloadPhase::Starting,
+            pid: std::process::id(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            detail: None,
+        }
+        .write();
+        let old =
+            std::time::SystemTime::now() - (RELOAD_MARKER_HARD_MAX_AGE + Duration::from_secs(60));
+        filetime::set_file_mtime(
+            reload_marker_path(),
+            filetime::FileTime::from_system_time(old),
+        )
+        .expect("backdate marker");
+
+        assert!(
+            !reload_suppresses_idle_shutdown(),
+            "an over-age marker past the hard cap must no longer suppress idle-exit"
+        );
     }
 
     #[tokio::test]
@@ -928,6 +1192,253 @@ mod tests {
         assert!(
             reload_process_alive(std::process::id()),
             "the current process must be reported alive"
+        );
+    }
+
+    /// A reload whose shutdown outlives the nominal marker max-age must still be
+    /// treated as in-progress while its process is alive. Otherwise clients
+    /// abandon the handoff mid-reload and the replacement server cannot publish a
+    /// socket-ready state (it finds "no reload marker"), leaving every session to
+    /// reconnect from scratch.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn recent_reload_state_keeps_a_live_starting_marker_past_max_age() {
+        let _lock = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvGuard::set_runtime_dir(temp.path());
+
+        // A `Starting` marker owned by this (live) process, backdated so it is
+        // well past the max-age window.
+        ReloadState {
+            request_id: "req-aging".to_string(),
+            hash: "hash-aging".to_string(),
+            phase: ReloadPhase::Starting,
+            pid: std::process::id(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            detail: None,
+        }
+        .write();
+        let old = std::time::SystemTime::now() - Duration::from_secs(120);
+        filetime::set_file_mtime(
+            reload_marker_path(),
+            filetime::FileTime::from_system_time(old),
+        )
+        .expect("backdate marker");
+
+        assert!(
+            recent_reload_state(Duration::from_secs(2)).is_some(),
+            "a live Starting marker must survive max-age expiry"
+        );
+        assert!(
+            reload_marker_exists(),
+            "the live marker file must not be deleted"
+        );
+
+        // The client-visible consequence: a waiting client must still see the
+        // reload as in-progress (Waiting), not Idle/Failed. This is the exact
+        // field scenario where a ~39s shutdown outlived the 30s client TTL and
+        // clients abandoned the handoff.
+        assert_eq!(
+            inspect_reload_wait_status(
+                &temp.path().join("missing.sock"),
+                Duration::from_secs(2),
+                None,
+            )
+            .await,
+            ReloadWaitStatus::Waiting {
+                pid: Some(std::process::id())
+            },
+            "an over-age marker with a live owner must keep clients waiting"
+        );
+    }
+
+    /// The marker staleness decision, checked purely (no file I/O, no platform
+    /// liveness) so every branch — including the off-unix "liveness is
+    /// unobservable" case — executes on every platform, including the Linux and
+    /// macOS CI jobs that actually run this module's tests.
+    ///
+    /// This is the regression guard for the off-unix fix: with
+    /// `liveness_observable = false`, an over-age `Starting` marker with a live pid
+    /// must be `Stale` (expire at `max_age`), NOT `Extended` (pinned to the hard
+    /// cap). `reload_process_alive` reports every nonzero pid as alive off-unix, so
+    /// before the gate a failed reload would keep clients in `Waiting` (and
+    /// `server_reload_starting()` true) for up to 10 minutes.
+    #[test]
+    fn classify_marker_expires_where_liveness_is_unobservable() {
+        let max_age = Duration::from_secs(30);
+        let over_age = Duration::from_secs(120);
+        let past_hard_cap = RELOAD_MARKER_HARD_MAX_AGE + Duration::from_secs(60);
+
+        // Liveness unobservable (the off-unix path): a live-looking over-age marker
+        // must expire at max_age rather than being extended to the hard cap.
+        assert_eq!(
+            classify_marker(ReloadPhase::Starting, over_age, max_age, false, true),
+            MarkerVerdict::Stale,
+            "without observable liveness an over-age Starting marker must expire"
+        );
+        assert_eq!(
+            classify_marker(ReloadPhase::Starting, past_hard_cap, max_age, false, true),
+            MarkerVerdict::Stale,
+            "unobservable liveness must never reach the hung/hard-cap branches"
+        );
+
+        // A marker within max_age is fresh regardless of liveness observability.
+        assert_eq!(
+            classify_marker(
+                ReloadPhase::Starting,
+                Duration::from_secs(5),
+                max_age,
+                false,
+                true
+            ),
+            MarkerVerdict::Fresh
+        );
+
+        // Liveness observable (the unix path): the live-owner extension applies.
+        assert_eq!(
+            classify_marker(ReloadPhase::Starting, over_age, max_age, true, true),
+            MarkerVerdict::Extended,
+            "with observable liveness a live owner extends past max_age"
+        );
+        assert_eq!(
+            classify_marker(ReloadPhase::Starting, past_hard_cap, max_age, true, true),
+            MarkerVerdict::HungLiveOwner,
+            "a live owner past the hard cap is hung"
+        );
+        // A dead owner is stale regardless of the cap window.
+        assert_eq!(
+            classify_marker(ReloadPhase::Starting, over_age, max_age, true, false),
+            MarkerVerdict::Stale,
+            "a dead owner's over-age marker is stale"
+        );
+        // Only the Starting phase gets the live-owner extension.
+        assert_eq!(
+            classify_marker(ReloadPhase::SocketReady, over_age, max_age, true, true),
+            MarkerVerdict::Stale,
+            "phase must be Starting to extend"
+        );
+    }
+
+    /// Once the owning process is gone, an over-age `Starting` marker is stale
+    /// and must be reclaimed as before.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn recent_reload_state_expires_a_starting_marker_when_owner_is_dead() {
+        let _lock = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvGuard::set_runtime_dir(temp.path());
+
+        let dead_pid = spawn_and_reap_dead_pid();
+        ReloadState {
+            request_id: "req-dead".to_string(),
+            hash: "hash-dead".to_string(),
+            phase: ReloadPhase::Starting,
+            pid: dead_pid,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            detail: None,
+        }
+        .write();
+        let old = std::time::SystemTime::now() - Duration::from_secs(120);
+        filetime::set_file_mtime(
+            reload_marker_path(),
+            filetime::FileTime::from_system_time(old),
+        )
+        .expect("backdate marker");
+
+        assert!(
+            recent_reload_state(Duration::from_secs(2)).is_none(),
+            "a dead owner's over-age marker must be cleared"
+        );
+    }
+
+    /// A live owner only extends an in-progress marker up to
+    /// `RELOAD_MARKER_HARD_MAX_AGE`; past that the owner is presumed hung so
+    /// waiting clients are not pinned forever on a stuck handoff.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn recent_reload_state_expires_a_live_starting_marker_past_the_hard_cap() {
+        let _lock = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvGuard::set_runtime_dir(temp.path());
+
+        ReloadState {
+            request_id: "req-hung".to_string(),
+            hash: "hash-hung".to_string(),
+            phase: ReloadPhase::Starting,
+            pid: std::process::id(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            detail: None,
+        }
+        .write();
+        let old =
+            std::time::SystemTime::now() - (RELOAD_MARKER_HARD_MAX_AGE + Duration::from_secs(60));
+        filetime::set_file_mtime(
+            reload_marker_path(),
+            filetime::FileTime::from_system_time(old),
+        )
+        .expect("backdate marker");
+
+        assert!(
+            recent_reload_state(Duration::from_secs(2)).is_none(),
+            "a live owner beyond the hard cap must be treated as hung, not honored forever"
+        );
+        // The marker is kept (not deleted) so a genuinely slow owner that later
+        // publishes socket-ready can still complete the handoff.
+        assert!(
+            reload_marker_exists(),
+            "the over-cap marker must be retained for a late socket-ready publish"
+        );
+    }
+
+    /// The pid-fallback path must not resurrect `Waiting` for a hung owner.
+    /// Without this, a client that passes the live owner pid would keep waiting
+    /// forever even though `recent_reload_state` hid the over-cap marker.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn inspect_reload_wait_status_does_not_wait_on_a_hung_owner() {
+        let _lock = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvGuard::set_runtime_dir(temp.path());
+
+        ReloadState {
+            request_id: "req-hung".to_string(),
+            hash: "hash-hung".to_string(),
+            phase: ReloadPhase::Starting,
+            pid: std::process::id(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            detail: None,
+        }
+        .write();
+        let old =
+            std::time::SystemTime::now() - (RELOAD_MARKER_HARD_MAX_AGE + Duration::from_secs(60));
+        filetime::set_file_mtime(
+            reload_marker_path(),
+            filetime::FileTime::from_system_time(old),
+        )
+        .expect("backdate marker");
+
+        assert!(
+            matches!(
+                observe_reload_marker(Duration::from_secs(2)),
+                ReloadMarkerObservation::HungLiveOwner
+            ),
+            "fixture must classify as a hung live owner"
+        );
+        let socket_path = temp.path().join("missing.sock");
+        let status = inspect_reload_wait_status(
+            &socket_path,
+            Duration::from_secs(2),
+            Some(std::process::id()),
+        )
+        .await;
+        assert_eq!(
+            status,
+            ReloadWaitStatus::Idle,
+            "a hung owner must not keep clients waiting via the pid fallback"
         );
     }
 }

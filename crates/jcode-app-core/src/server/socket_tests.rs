@@ -9,6 +9,7 @@ use super::{
     ReloadPhase, ReloadState, ReloadWaitStatus, await_reload_handoff, cleanup_socket_pair,
     clear_reload_marker, inspect_reload_wait_status, publish_reload_socket_ready,
     reload_marker_active, reload_marker_path, reload_process_alive, write_reload_state,
+    write_reload_state_with_pid,
 };
 #[cfg(unix)]
 use super::{connect_socket, reap_stale_socket_if_dead};
@@ -223,8 +224,60 @@ fn reload_marker_active_expires_stale_marker() {
     write_reload_state("test-request", "test-hash", ReloadPhase::Starting, None);
     assert!(reload_marker_active(Duration::from_secs(30)));
     std::thread::sleep(Duration::from_millis(5));
-    assert!(!reload_marker_active(Duration::ZERO));
-    assert!(!marker.exists(), "stale reload marker should be cleaned up");
+    // A `Starting` marker whose owning process is still alive genuinely
+    // represents an in-progress reload, so it is NOT treated as stale even when
+    // it outlives the nominal max-age (a reload that flushes many sessions can
+    // exceed it). It only becomes stale once the owning process is gone.
+    assert!(
+        reload_marker_active(Duration::ZERO),
+        "a live owner's marker must not expire mid-reload"
+    );
+    assert!(
+        marker.exists(),
+        "a live owner's marker must not be cleaned up"
+    );
+
+    // Simulate the owner having gone away: rewrite the marker with a dead pid
+    // and confirm the over-age marker is reclaimed.
+    //
+    // Unix-only: `reload_process_alive` reports any nonzero pid as alive on
+    // non-unix platforms, so a "dead owner" cannot be represented there, and
+    // spawning a helper relies on a POSIX shell. The live-owner assertions above
+    // still run everywhere.
+    #[cfg(unix)]
+    {
+        let dead_pid = {
+            // Retry so a pid the kernel immediately recycles for another process
+            // cannot make the "dead owner" assertion flaky.
+            let mut dead = None;
+            for _ in 0..16 {
+                let mut child = std::process::Command::new("/bin/sh")
+                    .arg("-c")
+                    .arg("exit 0")
+                    .spawn()
+                    .expect("spawn short-lived child");
+                let pid = child.id();
+                let _ = child.wait();
+                if !reload_process_alive(pid) {
+                    dead = Some(pid);
+                    break;
+                }
+            }
+            dead.expect("could not obtain a reliably-dead pid")
+        };
+        write_reload_state_with_pid(
+            "test-request",
+            "test-hash",
+            ReloadPhase::Starting,
+            None,
+            dead_pid,
+        );
+        assert!(
+            !reload_marker_active(Duration::ZERO),
+            "a dead owner's over-age marker must expire"
+        );
+        assert!(!marker.exists(), "stale reload marker should be cleaned up");
+    }
 
     if let Some(prev_runtime) = prev_runtime {
         crate::env::set_var("JCODE_RUNTIME_DIR", prev_runtime);
@@ -421,8 +474,12 @@ async fn inspect_reload_wait_status_uses_last_known_pid_when_marker_missing() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn inspect_reload_wait_status_reports_failed_when_reload_pid_is_dead() {
+    // Unix-only: on non-unix `reload_process_alive` reports every nonzero pid as
+    // alive, so a "definitely-dead pid" cannot be constructed and the test would
+    // assert an outcome the platform cannot produce.
     let _guard = crate::storage::lock_test_env();
     let temp = tempfile::tempdir().expect("tempdir");
     let prev_runtime = std::env::var_os("JCODE_RUNTIME_DIR");
@@ -433,15 +490,13 @@ async fn inspect_reload_wait_status_reports_failed_when_reload_pid_is_dead() {
         "test requires a definitely-dead pid"
     );
 
-    ReloadState {
-        request_id: "test-request".to_string(),
-        hash: "test-hash".to_string(),
-        phase: ReloadPhase::Starting,
-        pid: dead_pid,
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        detail: None,
-    }
-    .write();
+    write_reload_state_with_pid(
+        "test-request",
+        "test-hash",
+        ReloadPhase::Starting,
+        None,
+        dead_pid,
+    );
 
     let socket_path = temp.path().join("missing.sock");
     let status = inspect_reload_wait_status(&socket_path, Duration::from_secs(30), None).await;

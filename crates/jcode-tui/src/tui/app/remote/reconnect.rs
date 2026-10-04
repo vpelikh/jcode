@@ -5,10 +5,9 @@ use super::{
 use crate::tool::selfdev::ReloadContext;
 use crate::tui::app::PendingReloadReconnectStatus;
 use crate::tui::backend::{RemoteConnection, RemoteDisconnectReason};
-use anyhow::Result;
-use crossterm::event::EventStream;
-use futures::StreamExt;
 use crate::tui::terminal_writer::AppTerminal;
+use anyhow::Result;
+use futures::StreamExt;
 use std::time::{Duration, Instant};
 use tokio::time::MissedTickBehavior;
 
@@ -220,12 +219,15 @@ pub(in crate::tui::app) fn should_use_same_session_fast_path(
         && has_display_messages
 }
 
-async fn wait_for_reload_handoff_before_reconnect(
+pub(in crate::tui::app) async fn wait_for_reload_handoff_before_reconnect<S>(
     app: &mut App,
     terminal: &mut AppTerminal,
-    event_stream: &mut EventStream,
+    event_stream: &mut S,
     state: &mut RemoteRunState,
-) -> Result<Option<ConnectOutcome>> {
+) -> Result<Option<ConnectOutcome>>
+where
+    S: futures::Stream<Item = std::io::Result<crossterm::event::Event>> + Unpin,
+{
     if !reload_handoff_active(state) {
         return Ok(None);
     }
@@ -369,14 +371,17 @@ async fn recover_reloading_server(
     }
 }
 
-pub(in crate::tui::app) async fn connect_with_retry(
+pub(in crate::tui::app) async fn connect_with_retry<S>(
     app: &mut App,
     terminal: &mut AppTerminal,
-    event_stream: &mut EventStream,
+    event_stream: &mut S,
     state: &mut RemoteRunState,
     session_to_resume: Option<&str>,
     remote_working_dir: Option<&str>,
-) -> Result<ConnectOutcome> {
+) -> Result<ConnectOutcome>
+where
+    S: futures::Stream<Item = std::io::Result<crossterm::event::Event>> + Unpin,
+{
     if let Some(outcome) =
         wait_for_reload_handoff_before_reconnect(app, terminal, event_stream, state).await?
     {
