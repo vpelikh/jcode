@@ -142,13 +142,16 @@ async fn mpsc_preserves_signatures_and_never_rebinds_to_provider_session_id() {
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         agent.run_turn_streaming_mpsc(tx).await.unwrap();
+        // The loop must never broadcast the provider's resume handle as a
+        // jcode `ServerEvent::SessionId`: the client stores that event as
+        // `remote_session_id` and a later reload would `--resume` the provider
+        // id (an empty session). Assert the *absence* of any such event, since
+        // a conditional check would silently pass if the forward regressed.
         while let Ok(event) = rx.try_recv() {
-            if let ServerEvent::SessionId { session_id } = event {
-                assert_eq!(
-                    session_id, jcode_id,
-                    "provider handle must not replace jcode identity"
-                );
-            }
+            assert!(
+                !matches!(event, ServerEvent::SessionId { .. }),
+                "provider handle must not be forwarded as a jcode session id"
+            );
         }
     }
     assert_eq!(agent.session_id(), jcode_id);
