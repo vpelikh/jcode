@@ -266,12 +266,50 @@ review loop, so there is no gates↔review ping-pong.
 
 - `enabled` (existing; default changed to `true` so review runs by default)
 - `model` (existing)
-- `loop_mode` (new, default true, autoreview-only)
+- `loop_mode` (new, default true, autoreview-only; env override
+  `JCODE_AUTOREVIEW_LOOP_MODE=true|false`)
 - `max_stalled_turns` (new, default 3, 0 = unlimited)
 - `stale_reviewer_timeout_secs` (new, default 1800 = 30 min, 0 = disabled): how
   long a no-verdict reviewer may be silent before its process is assumed dead and
   the lens is respawned (recovers from a reviewer whose process died but whose
   session file persists; a generous window avoids misclassifying a slow reviewer)
+
+## Observability
+
+The loop logs to `~/.jcode/logs/jcode-*.log` at every decision point (all at
+INFO): the resolved `autoreview` config at client startup (so the effective
+`loop_mode` is visible without waiting for a turn), every lens dispatch (lens +
+phase + round), the accepted verdict with the resulting action, the fix-turn
+finding count, and — via one shared `log_review_loop_finished` helper — every
+terminal finish reason with a consistent `session=` id and a record summary
+(rounds / findings / files touched).
+
+In the TUI, progress is durable on the status line: while a loop is active the
+status bar renders `⟳ review <progress>` via `TuiState::review_loop_status`
+(using `review_loop::progress_line`, e.g.
+`lens 2/6 · Edges/Errors · review pass · 3 round(s)`, with `· applying fix`
+while a fix turn is queued). Unlike the transient status notice (which
+auto-expires after ~3s and would leave the line blank between minute-apart
+dispatches), this segment has no expiry and stays until the loop finishes. Each
+lens verdict is also pushed to the transcript as a one-line system message
+(`🔎 Review · <lens>: clean|N finding(s)`), and `/review-loop status` prints the
+same progress line plus the stall count while active, or the persisted digest
+once finished.
+
+Declined entries ("Review loop not entered: ...") are logged at DEBUG, because
+`maybe_enter_review_loop` runs on every turn-end followup and an INFO line there
+would spam one line per turn for any session that never enters the loop. Debug
+lines appear only under `JCODE_TRACE=1`.
+
+A `loop_mode = false` config otherwise disables review rounds silently, with no
+log evidence that anything was skipped; the startup line surfaces that decision
+once, and `JCODE_TRACE=1` shows the per-turn decline reason.
+
+Considered alternative: emit the same information as structured `event_*`
+telemetry. Rejected because it would not appear in the local log the user
+inspects and would couple a debugging aid to the telemetry pipeline; plain
+`logging::info` costs a handful of lines per loop (once per lens, not per tick)
+and is visible with no extra tooling.
 
 ## Cost
 

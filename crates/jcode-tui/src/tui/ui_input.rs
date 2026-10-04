@@ -59,6 +59,19 @@ fn normalize_repaint_sensitive_notice_text(text: &str) -> String {
     text.replace("⚠️", "⚠")
 }
 
+/// Owned variant for the status-line render path: most notice text contains no
+/// `⚠️`, so return the input unchanged (moved) instead of `replace`-allocating a
+/// second String every frame. Callers pass the owned String from a
+/// `TuiState` accessor, which must stay `'static` for `Span`, so a borrowed
+/// fast path is not possible here.
+fn normalize_repaint_sensitive_notice_text_owned(text: String) -> String {
+    if text.contains("⚠️") {
+        text.replace("⚠️", "⚠")
+    } else {
+        text
+    }
+}
+
 fn command_suggestion_window_start(selected: usize, suggestion_count: usize) -> usize {
     if suggestion_count <= app::COMMAND_SUGGESTION_VISIBLE_LIMIT {
         0
@@ -1726,6 +1739,17 @@ mod tests {
             "all clear"
         );
     }
+
+    #[test]
+    fn owned_normalizer_matches_the_borrowing_one() {
+        for input in ["⚠️ File activity", "all clear", "⟳ review lens 1/6"] {
+            assert_eq!(
+                normalize_repaint_sensitive_notice_text_owned(input.to_string()),
+                normalize_repaint_sensitive_notice_text(input),
+                "owned fast path must match for {input:?}"
+            );
+        }
+    }
 }
 
 /// Build the spans for the notification line. Returns empty vec when there is nothing to show.
@@ -1825,8 +1849,19 @@ pub(super) fn build_notification_spans(app: &dyn TuiState) -> Vec<Span<'static>>
     if let Some(notice) = app.status_notice() {
         push_sep(&mut spans);
         spans.push(Span::styled(
-            normalize_repaint_sensitive_notice_text(&notice),
+            normalize_repaint_sensitive_notice_text_owned(notice),
             Style::default().fg(accent_color()),
+        ));
+    }
+
+    // Durable review-loop progress: unlike the transient status notice above,
+    // this stays on the status line for the whole review wait (lens dispatches
+    // are minutes apart), so a running loop is always legible.
+    if let Some(review) = app.review_loop_status() {
+        push_sep(&mut spans);
+        spans.push(Span::styled(
+            normalize_repaint_sensitive_notice_text_owned(review),
+            Style::default().fg(rgb(140, 180, 255)),
         ));
     }
 

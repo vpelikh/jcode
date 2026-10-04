@@ -966,6 +966,43 @@ impl crate::tui::TuiState for App {
         })
     }
 
+    fn has_review_loop_status(&self) -> bool {
+        // Cheap, allocation-free gate used by the notification-row reservation
+        // and redraw cadence (called several times per frame).
+        if self.is_replay {
+            return false;
+        }
+        self.session
+            .review_loop
+            .as_ref()
+            .is_some_and(|s| !s.finished)
+    }
+
+    fn review_loop_status(&self) -> Option<String> {
+        // Replay and video-export build the App via `new_for_replay*`, which
+        // restores `review_loop` from the saved session but never runs the loop.
+        // Rendering the segment there would show a permanent fake
+        // "⟳ review lens N/6" and reserve the notification row for the whole
+        // playback, so bail exactly like the other review surfaces.
+        if !self.has_review_loop_status() {
+            return None;
+        }
+        // Durable (no expiry): a lens dispatch happens minutes apart, so a
+        // 3s-transient notice would leave the status line blank for the whole
+        // review wait. Keep loop progress visible until the loop finishes.
+        let state = self.session.review_loop.as_ref()?;
+        let phase_name = if state.phase_is_confirmation() {
+            "confirmation"
+        } else {
+            "review"
+        };
+        // Build "⟳ review <progress>" in a single allocation by appending into
+        // one buffer instead of formatting progress into a temp String first.
+        let mut out = String::from("⟳ review ");
+        review_loop::write_progress_line(&mut out, state, phase_name);
+        Some(out)
+    }
+
     fn learn_hint(&self) -> Option<String> {
         self.learn_hint.as_ref().and_then(|(text, at)| {
             // Learn-hints linger a little longer than status notices so the user

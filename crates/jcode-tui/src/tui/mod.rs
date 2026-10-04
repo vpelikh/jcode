@@ -627,6 +627,23 @@ pub trait TuiState {
     fn connected_clients(&self) -> Option<usize>;
     /// Short-lived notice shown in the status line (e.g., model switch, toggle diff)
     fn status_notice(&self) -> Option<String>;
+    /// Durable review-loop progress shown in the status line while a loop is
+    /// active (e.g. "⟳ review lens 2/6 · Edges/Errors · review pass · 3 round(s)").
+    /// Unlike [`status_notice`], which auto-expires after ~3s, this stays visible
+    /// for the whole review wait (lens dispatches are minutes apart) so the user
+    /// can always tell the loop is running and how far it has gotten. `None`
+    /// when no loop is active.
+    fn review_loop_status(&self) -> Option<String> {
+        None
+    }
+    /// Cheap gate for [`review_loop_status`]: whether a durable review segment
+    /// would render. Callers that only need a boolean (notification-row
+    /// reservation, redraw cadence) must use this instead of formatting the
+    /// status String, which they would otherwise allocate several times per
+    /// frame.
+    fn has_review_loop_status(&self) -> bool {
+        false
+    }
     /// How long since the user last pressed a key, scrolled, or pasted, or
     /// `None` when they have not interacted yet.
     ///
@@ -887,6 +904,16 @@ pub trait TuiState {
     fn cache_ttl_status(&self) -> Option<CacheTtlInfo>;
     /// Whether the notification line has content to show
     fn has_notification(&self) -> bool {
+        // Cheap allocation-free check first: while a review loop is active this
+        // short-circuits the transient chain below, which reaches
+        // `info_widget_data()` (todo/goal gathering + context snapshot).
+        self.has_review_loop_status() || self.has_transient_notification()
+    }
+    /// Notification content other than the durable review-loop segment. Split
+    /// out so the redraw scheduler can give the (static, no-expiry) review
+    /// segment a slower cadence than a transient notice without defeating the
+    /// general "something is on the notification row" gate.
+    fn has_transient_notification(&self) -> bool {
         if self.copy_selection_status().is_some() {
             return true;
         }

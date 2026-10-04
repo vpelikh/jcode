@@ -1579,6 +1579,9 @@ pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteC
                         // Correlate the eventual result to this request so a
                         // stale/late HeadlessReviewResult is not mis-applied.
                         app.active_headless_request_id = Some(request_id);
+                        crate::logging::info(&format!(
+                            "Review loop: sent headless review request id={request_id} lens={lens_label}"
+                        ));
                         // Persist the dispatch time so a reloaded client (whose
                         // in-memory request id reset to None) can still recover
                         // via the stale timeout instead of waiting forever. The

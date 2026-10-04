@@ -527,7 +527,20 @@ pub(crate) fn redraw_interval_with_policy_and_animation(
     // animation cadence. Keep this below the animated branches above so live
     // output still wins.
     if static_text_chrome_active(state) {
-        return REDRAW_IDLE;
+        // A transient notice/chrome retires after a few seconds, so the 250ms
+        // idle cadence is appropriate. The durable review-loop segment is
+        // static and can live on screen for minutes; pacing it at 250ms would
+        // pin the loop out of deep-idle (~20x the wakeups) just to repaint
+        // identical glyphs.
+        //
+        // `has_transient_notification` covers `status_notice`/`learn_hint` (the
+        // other two disjuncts of `static_text_chrome_active`) plus everything in
+        // `has_notification` except the review segment, so reaching here without
+        // a transient bit means the durable review segment is the only chrome.
+        if state.has_transient_notification() {
+            return REDRAW_IDLE;
+        }
+        return REDRAW_DEEP_IDLE;
     }
 
     if state.remote_startup_phase_active() {

@@ -203,9 +203,94 @@ fn review_loop_status_reports_active_and_no_loop() {
     app.submit_input();
     let msg = app.display_messages().last().expect("status response");
     assert!(
-        msg.content.contains("Review loop active at lens: Correctness"),
-        "active status must show the lens, got {:?}",
+        msg.content.contains("Review loop active: lens 1/6 · Correctness · review pass"),
+        "active status must show the lens progress, got {:?}",
         msg.content
+    );
+}
+
+// The durable status line must expose loop progress while a loop is active
+// (not only a 3s-transient notice) and clear once it finishes, so the user can
+// always tell the loop is running and how far it has gotten. This asserts the
+// *rendered* notification row, so it would catch the segment being present in
+// the data but gated out of the row by `has_notification`.
+#[test]
+fn review_loop_status_is_exposed_durably_while_active() {
+    use crate::tui::TuiState;
+
+    let mut app = create_test_app();
+
+    // No loop: no durable status segment, and no notification row reserved.
+    assert!(
+        TuiState::review_loop_status(&app).is_none(),
+        "no active loop must expose no status"
+    );
+    assert!(
+        !TuiState::has_notification(&app),
+        "no active loop must not reserve the notification row"
+    );
+
+    // Start a loop: the durable status shows the first lens progress AND the
+    // row is reserved/rendered.
+    app.input = "/review-loop start".to_string();
+    app.submit_input();
+    // Drop the transient "started" notice so this test exercises the *durable*
+    // segment alone (the notice alone would reserve the row for its first 3s
+    // and mask whether the durable path is wired).
+    app.status_notice = None;
+    let status = TuiState::review_loop_status(&app).expect("active loop status");
+    assert!(
+        status.contains("lens 1/6 · Correctness · review pass"),
+        "durable status must show progress, got {status:?}"
+    );
+    assert!(
+        TuiState::status_notice(&app).is_none(),
+        "the transient notice must be gone for this assertion to be meaningful"
+    );
+    assert!(
+        TuiState::has_notification(&app),
+        "an active loop alone must reserve the notification row"
+    );
+    let rendered = crate::tui::ui::notification_row_text_for_tests(&app);
+    assert!(
+        rendered.contains("review") && rendered.contains("lens 1/6"),
+        "the rendered notification row must contain the progress segment, got {rendered:?}"
+    );
+
+    // Finished loop: the durable status clears and the row is freed.
+    app.session.review_loop.as_mut().unwrap().finish_with("converged");
+    assert!(
+        TuiState::review_loop_status(&app).is_none(),
+        "a finished loop must not keep the status segment"
+    );
+}
+
+// Replay and video-export restore a saved session's `review_loop` (possibly
+// unfinished) but never run the loop, so the durable segment must not render a
+// fake "reviewing" status for the whole playback.
+#[test]
+fn review_loop_status_is_suppressed_in_replay() {
+    use crate::tui::TuiState;
+
+    let mut app = create_test_app();
+    let mut state = jcode_session_types::ReviewLoopState::new();
+    super::review_loop::enter_review_loop(&mut state);
+    app.session.review_loop = Some(state);
+
+    // Sanity: it renders while not replaying.
+    assert!(
+        TuiState::review_loop_status(&app).is_some(),
+        "an unfinished loop must render a status when not replaying"
+    );
+
+    app.is_replay = true;
+    assert!(
+        TuiState::review_loop_status(&app).is_none(),
+        "replay must not render the durable review segment"
+    );
+    assert!(
+        !TuiState::has_notification(&app),
+        "replay must not reserve the notification row for a restored loop"
     );
 }
 
@@ -316,6 +401,16 @@ fn review_loop_manual_start_clears_stale_reviewer() {
 fn review_loop_auto_seed_respects_defaults_and_guards() {
     use super::AppRuntimeMode;
 
+    // This test asserts loop_mode is ON, which lives in the process-global
+    // config. Pin it explicitly (and serialize with other config-mutating
+    // tests) so an ambient/temporary `loop_mode = false` from another test
+    // cannot make this spuriously fail.
+    let _guard = crate::storage::lock_test_env();
+    // RAII restore: a panic mid-test must not leave the override set for
+    // sibling tests sharing this process.
+    let _loop_mode = EnvGuard::set("JCODE_AUTOREVIEW_LOOP_MODE", "true");
+    crate::config::invalidate_config_cache();
+
     let fresh = || {
         let mut app = create_test_app();
         // Non-harness product path (the loop runs for local sessions).
@@ -380,5 +475,63 @@ fn review_loop_auto_seed_respects_defaults_and_guards() {
     assert!(
         app.session.review_loop.is_none(),
         "replay session must not auto-seed"
+    );
+}
+
+// Acceptance: the real config file is the source of truth. A `[autoreview]
+// loop_mode = false` on disk must prevent auto-seeding (this is the exact state
+// that produced the user's report of "review rounds never run and I see no
+// logs"), and adding an env override in the same process must flip it back on.
+// Exercised through `maybe_enter_review_loop`, the product entry point.
+#[test]
+fn review_loop_auto_seed_is_gated_by_the_config_file_loop_mode() {
+    use super::AppRuntimeMode;
+
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    // RAII restore for both globals: a panic mid-test must not leak a
+    // JCODE_HOME pointing at a deleted tempdir or a loop-mode override into
+    // sibling tests sharing this process. Drop order (reverse of declaration)
+    // restores env before `temp` is removed.
+    let _home = EnvGuard::set("JCODE_HOME", temp.path());
+    let _loop_mode = EnvGuard::remove("JCODE_AUTOREVIEW_LOOP_MODE");
+    crate::config::invalidate_config_cache();
+
+    let config_path = crate::config::Config::path().expect("config path");
+    std::fs::create_dir_all(config_path.parent().expect("config parent"))
+        .expect("create config parent");
+    std::fs::write(&config_path, "[autoreview]\nloop_mode = false\n")
+        .expect("write config with loop_mode disabled");
+    // The fingerprint only re-stats on a 500ms throttle; sleep past it so the
+    // disabled value is definitely observed.
+    std::thread::sleep(std::time::Duration::from_millis(600));
+
+    let product_app = || {
+        let mut app = create_test_app();
+        app.runtime_mode = AppRuntimeMode::RemoteClient;
+        app.is_remote = false;
+        app.is_replay = false;
+        app.autoreview_enabled = true;
+        app.pending_queued_dispatch = false;
+        app.improve_mode = None;
+        app.session.review_loop = None;
+        app
+    };
+
+    // (1) loop_mode=false on disk: the loop must NOT seed.
+    let mut app = product_app();
+    super::commands::maybe_enter_review_loop(&mut app);
+    assert!(
+        app.session.review_loop.is_none(),
+        "loop_mode=false in config.toml must prevent auto-seeding"
+    );
+
+    // (2) The env override beats the file: seeding now runs.
+    crate::env::set_var("JCODE_AUTOREVIEW_LOOP_MODE", "true");
+    let mut app = product_app();
+    super::commands::maybe_enter_review_loop(&mut app);
+    assert!(
+        app.session.review_loop.as_ref().is_some_and(|s| !s.finished),
+        "JCODE_AUTOREVIEW_LOOP_MODE=true must re-enable auto-seeding despite the file"
     );
 }

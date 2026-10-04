@@ -801,6 +801,31 @@ fn remote_tick_self_drives_review_loop_advance() {
     });
 }
 
+// Each lens verdict must be surfaced in the transcript (not only in the log),
+// so the user can see what the loop concluded per lens.
+#[test]
+fn headless_clean_verdict_surfaces_a_transcript_message() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        app.is_remote = true;
+
+        let mut state = jcode_session_types::ReviewLoopState::new();
+        super::review_loop::enter_review_loop(&mut state);
+        state.awaiting_headless = true;
+        app.session.review_loop = Some(state);
+        app.active_headless_request_id = Some(7);
+
+        super::commands::apply_headless_review_result(&mut app, 7, "clean", Vec::new(), String::new());
+
+        assert!(
+            app.display_messages()
+                .iter()
+                .any(|m| m.content.contains("Review · Correctness: clean")),
+            "a clean lens verdict must be surfaced in the transcript"
+        );
+    });
+}
+
 fn step_review_loop_from_idle(app: &mut crate::tui::app::App) -> bool {
     crate::tui::app::commands::maybe_poll_review_loop_from_idle(app)
 }

@@ -586,6 +586,11 @@ impl Config {
                 Some(trimmed.to_string())
             };
         }
+        if let Ok(v) = std::env::var("JCODE_AUTOREVIEW_LOOP_MODE") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.autoreview.loop_mode = parsed;
+            }
+        }
 
         // Autojudge
         if let Ok(v) = std::env::var("JCODE_AUTOJUDGE_ENABLED") {

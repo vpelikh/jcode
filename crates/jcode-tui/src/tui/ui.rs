@@ -2320,6 +2320,17 @@ pub(crate) fn input_pane_line_text(abs_line: usize) -> Option<String> {
     copy_pane_line_text(crate::tui::CopySelectionPane::Input, abs_line)
 }
 
+/// Plain text of the notification row, as the renderer would draw it. Exposed
+/// so tests can assert that a durable status segment (e.g. review-loop
+/// progress) actually reaches the rendered row, not just its data accessor.
+#[cfg(test)]
+pub(crate) fn notification_row_text_for_tests(app: &dyn crate::tui::TuiState) -> String {
+    input_ui::build_notification_spans(app)
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>()
+}
+
 fn copy_pane_line_count(pane: crate::tui::CopySelectionPane) -> Option<usize> {
     Some(copy_snapshot_for_pane(pane)?.wrapped_plain_line_count())
 }

@@ -294,13 +294,21 @@ pub fn truncate_for_log(value: &str, max_chars: usize) -> String {
     format!("{}… [{} chars total]", truncated, value.chars().count())
 }
 
+/// Whether debug logging is on, so callers can avoid building an expensive
+/// message argument when nothing would be written. Cached: `JCODE_TRACE` is
+/// read once per process (it is set before launch, never toggled at runtime).
+pub fn debug_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("JCODE_TRACE").is_ok())
+}
+
 /// Log a debug message (only if JCODE_TRACE is set)
 #[expect(
     clippy::collapsible_if,
     reason = "Debug logging keeps env gating and logger access explicit"
 )]
 pub fn debug(message: &str) {
-    if std::env::var("JCODE_TRACE").is_ok() {
+    if debug_enabled() {
         if let Ok(mut guard) = LOGGER.lock() {
             if let Some(logger) = guard.as_mut() {
                 logger.write("DEBUG", message);

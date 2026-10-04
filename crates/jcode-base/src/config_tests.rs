@@ -14,6 +14,30 @@ fn restore_env_var(key: &str, previous: Option<OsString>) {
     }
 }
 
+/// Restore an environment variable on drop, even if the test panics mid-way.
+///
+/// A test that sets `JCODE_*` must not rely on an inline restore after its last
+/// assertion: a failing `assert!`/`expect` unwinds past it and leaks the value
+/// into sibling tests sharing this process. RAII `Drop` runs on unwind.
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        crate::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        restore_env_var(self.key, self.previous.take());
+    }
+}
+
 struct GeminiConfigEnv {
     _home: tempfile::TempDir,
     previous: Vec<(&'static str, Option<OsString>)>,
@@ -1729,6 +1753,62 @@ fn test_autoreview_loop_mode_stall_tolerates_missing_fields() {
 
     assert!(cfg.autoreview.loop_mode);
     assert_eq!(cfg.autoreview.max_stalled_turns, 3);
+}
+
+#[test]
+fn test_autoreview_loop_mode_env_override() {
+    // `JCODE_AUTOREVIEW_LOOP_MODE` lets review rounds be toggled without editing
+    // config, and it must beat the file/default value.
+    let _guard = crate::storage::lock_test_env();
+    // The first `set` captures the prior value; the guard restores it on drop
+    // (including on a panic), so a failing assertion cannot leak the override.
+    let _env = EnvVarGuard::set("JCODE_AUTOREVIEW_LOOP_MODE", "false");
+
+    let mut cfg = Config::default();
+    cfg.apply_env_overrides();
+    assert!(!cfg.autoreview.loop_mode, "env must force loop_mode off");
+
+    crate::env::set_var("JCODE_AUTOREVIEW_LOOP_MODE", "true");
+    let mut cfg = Config::default();
+    cfg.apply_env_overrides();
+    assert!(cfg.autoreview.loop_mode, "env must force loop_mode on");
+
+    // The override beats a config-file value that says the opposite.
+    let mut cfg: Config = toml::from_str(
+        r#"
+        [autoreview]
+        loop_mode = false
+        "#,
+    )
+    .expect("config deserializes");
+    cfg.apply_env_overrides();
+    assert!(
+        cfg.autoreview.loop_mode,
+        "env true must override a file that sets loop_mode=false"
+    );
+
+    // Partial / fuzzy spellings follow the shared bool parser (like the other
+    // JCODE_* flags): "off" is false, "on" is true, and an unparseable value is
+    // ignored rather than silently disabling the loop.
+    crate::env::set_var("JCODE_AUTOREVIEW_LOOP_MODE", "off");
+    let mut cfg = Config::default();
+    cfg.apply_env_overrides();
+    assert!(!cfg.autoreview.loop_mode, "\"off\" must parse as false");
+
+    crate::env::set_var("JCODE_AUTOREVIEW_LOOP_MODE", "on");
+    let mut cfg = Config::default();
+    cfg.apply_env_overrides();
+    assert!(cfg.autoreview.loop_mode, "\"on\" must parse as true");
+
+    // A junk value is ignored; the default (true) stands rather than the loop
+    // being silently turned off.
+    crate::env::set_var("JCODE_AUTOREVIEW_LOOP_MODE", "maybe");
+    let mut cfg = Config::default();
+    cfg.apply_env_overrides();
+    assert!(
+        cfg.autoreview.loop_mode,
+        "an unparseable value must be ignored, not disable the loop"
+    );
 }
 
 #[test]

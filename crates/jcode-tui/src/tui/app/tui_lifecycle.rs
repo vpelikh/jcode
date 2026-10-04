@@ -2,6 +2,21 @@ use super::state_ui::RestoredReloadInput;
 use super::*;
 use crate::tui::{backend, keybind};
 
+/// Log the resolved autoreview configuration once at client startup, so the
+/// effective `loop_mode` is visible without waiting for a turn (the loop is
+/// otherwise silent when disabled). Shared by both App constructors, which
+/// resolve the same fields from config.
+fn log_autoreview_config(autoreview_enabled: bool, session_override: Option<bool>) {
+    crate::logging::info(&format!(
+        "autoreview config: enabled={} loop_mode={} max_stalled_turns={} stale_reviewer_timeout_secs={} (session_override={:?})",
+        autoreview_enabled,
+        config().autoreview.loop_mode,
+        config().autoreview.max_stalled_turns,
+        config().autoreview.stale_reviewer_timeout_secs,
+        session_override,
+    ));
+}
+
 impl App {
     pub(super) fn apply_restored_reload_input(&mut self, restored: RestoredReloadInput) {
         self.input = restored.input;
@@ -428,6 +443,7 @@ impl App {
         let autojudge_enabled = session
             .autojudge_enabled
             .unwrap_or(config().autojudge.enabled);
+        log_autoreview_config(autoreview_enabled, session.autoreview_enabled);
         let context_limit = provider.context_window() as u64;
         let mut runtime_memory_log = if crate::runtime_memory_log::client_logging_enabled() {
             Some(crate::runtime_memory_log::RuntimeMemoryLogController::new(
@@ -860,6 +876,7 @@ impl App {
         let autojudge_enabled = session
             .autojudge_enabled
             .unwrap_or(config().autojudge.enabled);
+        log_autoreview_config(autoreview_enabled, session.autoreview_enabled);
         let context_limit = provider.context_window() as u64;
         let mut runtime_memory_log = if crate::runtime_memory_log::client_logging_enabled() {
             Some(crate::runtime_memory_log::RuntimeMemoryLogController::new(

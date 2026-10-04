@@ -176,6 +176,42 @@ impl Provider for OpenRouterSpecCaptureProvider {
     }
 }
 
+/// Restore an environment variable to its process-global value on drop.
+///
+/// Tests that mutate `JCODE_HOME` / `JCODE_AUTOREVIEW_LOOP_MODE` must restore
+/// them even when an assertion panics mid-test, or the leaked value cascades
+/// into sibling tests sharing this process. RAII `Drop` runs on unwind, so the
+/// restore is panic-safe; the env lock (`lock_test_env`) only serializes, it
+/// does not restore values.
+pub(crate) struct EnvGuard {
+    key: &'static str,
+    prev: Option<std::ffi::OsString>,
+}
+
+impl EnvGuard {
+    pub(crate) fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let prev = std::env::var_os(key);
+        crate::env::set_var(key, value);
+        Self { key, prev }
+    }
+
+    pub(crate) fn remove(key: &'static str) -> Self {
+        let prev = std::env::var_os(key);
+        crate::env::remove_var(key);
+        Self { key, prev }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        if let Some(prev) = self.prev.take() {
+            crate::env::set_var(self.key, prev);
+        } else {
+            crate::env::remove_var(self.key);
+        }
+    }
+}
+
 pub(crate) fn create_test_app() -> App {
     ensure_test_jcode_home_if_unset();
     clear_persisted_test_ui_state();

@@ -63,6 +63,54 @@ pub fn enter_review_loop(state: &mut ReviewLoopState) {
     }
 }
 
+/// Human-readable progress line for the active loop, e.g.
+/// `lens 2/6 · Edges/Errors · review pass · 3 round(s)`.
+///
+/// `phase_name` is "review" for the first pass or "confirmation" for the final
+/// pass. When a lens is mid-fix (`awaiting_postfix_recheck`), the label notes
+/// the fix so the user knows why the loop is between reviewers rather than
+/// stalled. Used by the `/review-loop status` command; the durable status-bar
+/// segment uses [`write_progress_line`] to build the same text in one
+/// allocation.
+pub fn progress_line(state: &ReviewLoopState, phase_name: &str) -> String {
+    let mut out = String::new();
+    write_progress_line(&mut out, state, phase_name);
+    out
+}
+
+/// Append the progress text to `out` without allocating an intermediate String.
+/// `progress_line` wraps this; the status-bar renderer uses it to build
+/// `"⟳ review <progress>"` in a single allocation.
+pub fn write_progress_line(out: &mut String, state: &ReviewLoopState, phase_name: &str) {
+    use std::fmt::Write;
+    let total = ReviewLens::ALL.len();
+    let (idx, lens_label) = match state.current_lens {
+        Some(lens) => {
+            let idx = ReviewLens::ALL
+                .iter()
+                .position(|l| *l == lens)
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            (idx, lens.label())
+        }
+        None => (0, "unset"),
+    };
+    let rounds = state
+        .record
+        .as_ref()
+        .map(|r| r.rounds.len())
+        .unwrap_or(0);
+    let fix = if state.awaiting_postfix_recheck {
+        " · applying fix"
+    } else {
+        ""
+    };
+    let _ = write!(
+        out,
+        "lens {idx}/{total} · {lens_label} · {phase_name} pass · {rounds} round(s){fix}"
+    );
+}
+
 /// Decide the next harness action when there is no in-flight reviewer for the
 /// current lens. Call this from turn-end followups when `state.active_reviewer_id`
 /// is `None` (the persisted source of truth for the in-flight reviewer).
@@ -329,6 +377,39 @@ mod review_loop_tests {
     }
 
     #[test]
+    fn progress_line_reports_lens_index_phase_and_rounds() {
+        // The in-TUI status line must let a user see where the loop is without
+        // reading the log: lens N/6, the lens label, the pass, and the round
+        // count. A clean Correctness verdict advances to lens 2/6.
+        let mut s = clean_state();
+        assert_eq!(
+            progress_line(&s, "review"),
+            "lens 1/6 · Correctness · review pass · 0 round(s)"
+        );
+        apply_verdict(&mut s, &ReviewReport::Clean, 3);
+        assert_eq!(
+            progress_line(&s, "review"),
+            "lens 2/6 · Edges/Errors · review pass · 1 round(s)"
+        );
+    }
+
+    #[test]
+    fn progress_line_marks_a_pending_fix_and_confirmation_pass() {
+        let mut s = clean_state();
+        // A FINDINGS verdict queues a fix and marks the lens as mid-fix; the
+        // label should say so rather than look stalled between reviewers.
+        apply_verdict(&mut s, &ReviewReport::Findings(vec![Finding::new("HIGH", "a.rs", "x")]), 3);
+        assert!(s.awaiting_postfix_recheck);
+        assert!(
+            progress_line(&s, "review").ends_with("· applying fix"),
+            "a queued fix must be visible: {}",
+            progress_line(&s, "review")
+        );
+        // The confirmation pass is labelled distinctly.
+        assert!(progress_line(&s, "confirmation").contains("confirmation pass"));
+    }
+
+    #[test]
     fn enter_restarts_after_finished() {
         // A finished loop must be re-seedable: a manual `/review-loop start`
         // (or a fresh auto entry) after convergence should clear finished and
@@ -379,6 +460,31 @@ mod review_loop_tests {
         }
         assert!(s.finished);
         assert_eq!(s.finish_reason.as_deref(), Some("converged"));
+    }
+
+    // Regression: `apply_verdict` mutates `current_lens`/`phase` when it advances
+    // on a CLEAN report, so any caller that logs "which lens did we just review"
+    // must read the lens BEFORE calling it. This pins the exact trap that made
+    // the applied-verdict log misattribute a clean Correctness verdict to the
+    // next lens: after the call, `current_lens` is already the NEXT lens while
+    // the round just pushed onto the record still names the reviewed one.
+    #[test]
+    fn clean_verdict_advances_current_lens_so_reviewed_lens_must_be_captured_first() {
+        let mut s = clean_state();
+        assert_eq!(s.current_lens, Some(ReviewLens::Correctness));
+
+        // Read before, as the logging caller must.
+        let reviewed_lens = s.current_lens;
+        apply_verdict(&mut s, &ReviewReport::Clean, 3);
+
+        // Post-call, current_lens has advanced. A log that read it now would
+        // report EdgesErrors for a Correctness review.
+        assert_eq!(s.current_lens, Some(ReviewLens::ALL[1]));
+        assert_ne!(s.current_lens, reviewed_lens);
+
+        // The record is the reliable post-hoc source of the reviewed lens.
+        let last = s.record.as_ref().unwrap().rounds.last().unwrap();
+        assert_eq!(Some(last.lens), reviewed_lens);
     }
 
     #[test]

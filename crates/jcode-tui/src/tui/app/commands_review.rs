@@ -1343,7 +1343,18 @@ pub(super) fn maybe_enter_review_loop(app: &mut App) {
     // `is_remote`), matching the manual `/review-loop` command, which already
     // works there via the same per-lens headless server dispatch. Replay
     // sessions are excluded (deterministic playback, never reviews live work).
+    // Decline reasons are logged at debug, not info: this runs on every
+    // turn-end followup, and the resolved config (loop_mode/enabled) is
+    // already reported once at startup. Info here would spam one line per turn
+    // for any session that never enters the loop (autoreview off, an active
+    // improve loop, etc.). Set JCODE_TRACE to see why a given turn declined.
     if app.is_replay || !app.autoreview_enabled {
+        if crate::logging::debug_enabled() {
+            crate::logging::debug(&format!(
+                "Review loop not entered: replay={} autoreview_enabled={}",
+                app.is_replay, app.autoreview_enabled
+            ));
+        }
         return;
     }
     // Skip auto-seeding under the unit-test harness: the loop drives
@@ -1355,6 +1366,10 @@ pub(super) fn maybe_enter_review_loop(app: &mut App) {
         return;
     }
     if !crate::config::config().autoreview.loop_mode {
+        crate::logging::debug(
+            "Review loop not entered: autoreview.loop_mode is false \
+             (set `loop_mode = true` under [autoreview] to enable review rounds)",
+        );
         return;
     }
     // The completion gates (ownership / confidence) may still be running a
@@ -1362,12 +1377,14 @@ pub(super) fn maybe_enter_review_loop(app: &mut App) {
     // once the gates have passed; don't seed it on the same turn the gate is
     // still nudging the model for more work.
     if app.pending_queued_dispatch {
+        crate::logging::debug("Review loop not entered: a queued continuation is pending dispatch");
         return;
     }
     // Mutual exclusion: do not auto-enter a review loop while an improve/refactor
     // loop is active. (Going the other way, starting improve clears the review
     // loop via clear_review_loop_on_improve().)
     if app.improve_mode.is_some() {
+        crate::logging::debug("Review loop not entered: an improve/refactor loop is active");
         return;
     }
     // Auto-entry seeds the loop only once per session: only when no review-loop
@@ -1384,6 +1401,8 @@ pub(super) fn maybe_enter_review_loop(app: &mut App) {
         .get_or_insert_with(crate::session::ReviewLoopState::new);
     review_loop::enter_review_loop(state);
     state.active_reviewer_id = None;
+    let phase = state.phase;
+    let lens = state.current_lens;
     // A fresh loop must not inherit the idle-poll debounce clock from a previous
     // (just-finished) loop; otherwise the first tick would treat it as a recent
     // poll and delay the first reviewer spawn by up to the debounce interval.
@@ -1393,6 +1412,12 @@ pub(super) fn maybe_enter_review_loop(app: &mut App) {
         "🔁 Review loop started: reviewing the finished work across 6 lenses.".to_string(),
     ));
     app.set_status_notice("Review loop: started");
+    crate::logging::info(&format!(
+        "Review loop entered: session={} phase={:?} lens={:?}",
+        active_session_id(app),
+        phase,
+        lens
+    ));
 }
 
 /// Poll the in-flight reviewer child session for a `VERDICT`.
@@ -1527,6 +1552,11 @@ fn maybe_recover_stalled_headless(
             "Review loop stopped: the headless reviewer was repeatedly lost.".to_string(),
         ));
         app.set_status_notice("Review loop: headless reviewer lost");
+        log_review_loop_finished(
+            &active_session_id(app),
+            state,
+            &format!(" lens={} respawns={}", lens.name(), REVIEW_LOOP_MAX_REVIEWER_RESPAWNS),
+        );
         // Persist the finalized loop. `maybe_recover_stalled_headless` returns
         // true so the caller parks a *finished* loop (no further dispatch).
         app.session.review_loop = Some(state.clone());
@@ -1556,7 +1586,10 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
     // Take the state out so we can mutate `app` freely while driving the loop.
     let mut state = match app.session.review_loop.take() {
         Some(s) if !s.finished => s,
-        _ => return false,
+        _ => {
+            crate::logging::debug("Review loop step: skipped (no active/unfinished loop)");
+            return false;
+        }
     };
 
     // Headless mode: the lens review is running server-side and the loop waits
@@ -1619,6 +1652,13 @@ pub(super) fn step_review_loop(app: &mut App) -> bool {
                     app.session.review_loop = Some(state);
                     let _ = app.session.save();
                     app.set_status_notice("Review loop: reviewer gone");
+                    if let Some(state) = app.session.review_loop.as_ref() {
+                        log_review_loop_finished(
+                            &active_session_id(app),
+                            state,
+                            &format!(" respawns={REVIEW_LOOP_MAX_REVIEWER_RESPAWNS}"),
+                        );
+                    }
                     false
                 }
             }
@@ -1742,6 +1782,33 @@ pub(super) fn finish_review_loop(
     app.push_display_message(DisplayMessage::system(digest));
     app.session.review_loop = Some(state.clone());
     let _ = app.session.save();
+    log_review_loop_finished(&active_session_id(app), state, "");
+}
+
+/// Log the terminal "Review loop finished" line with a consistent session id and
+/// record summary (rounds / findings / files touched) across **every** finish
+/// path, so no terminal reason stops the log mid-loop without an explanation.
+/// `extra` appends path-specific fields (lens, respawns, kind) when useful.
+fn log_review_loop_finished(
+    session_id: &str,
+    state: &jcode_session_types::ReviewLoopState,
+    extra: &str,
+) {
+    let (rounds, findings, files_touched) = state
+        .record
+        .as_ref()
+        .map(|r| {
+            (
+                r.rounds.len(),
+                r.rounds.iter().map(|rd| rd.findings.len()).sum::<usize>(),
+                r.files_touched.len(),
+            )
+        })
+        .unwrap_or((0, 0, 0));
+    crate::logging::info(&format!(
+        "Review loop finished: session={session_id} reason={} rounds={rounds} findings={findings} files_touched={files_touched}{extra}",
+        state.finish_reason.as_deref().unwrap_or("unknown"),
+    ));
 }
 
 /// Apply a completed reviewer verdict for the current lens to the loop: update
@@ -1778,10 +1845,51 @@ fn apply_review_report(
                 review_loop::record_fix_files(state, files);
             }
     }
+    // Capture the lens/phase **being reviewed** before `apply_verdict`: on a
+    // CLEAN report it advances `current_lens` (and, at first-pass end, flips
+    // `phase` to Confirmation), so reading them afterwards would log the NEXT
+    // lens/phase and misreport which lens this verdict was for.
+    let reviewed_lens = state.current_lens;
+    let reviewed_phase = state.phase;
     let action = review_loop::apply_verdict(state, report, max_stalled);
+    // Surface each lens's conclusion so the user can see what the loop found,
+    // not just that the index advanced. Kept as a one-line system message so it
+    // is durable in the transcript (the status line is transient/brief).
+    {
+        let lens_label = reviewed_lens.map(|l| l.label()).unwrap_or("?");
+        let verdict = match report {
+            jcode_session_types::ReviewReport::Clean => "clean".to_string(),
+            jcode_session_types::ReviewReport::Findings(fs) => {
+                format!("{} finding(s)", fs.len())
+            }
+        };
+        app.push_display_message(DisplayMessage::system(format!(
+            "🔎 Review · {lens_label}: {verdict}"
+        )));
+    }
+    crate::logging::info(&format!(
+        "Review loop: applied verdict lens={:?} report={} action={:?} phase={:?} stall_turns={} rounds={}",
+        reviewed_lens,
+        match report {
+            jcode_session_types::ReviewReport::Clean => "clean",
+            jcode_session_types::ReviewReport::Findings(_) => "findings",
+        },
+        action,
+        reviewed_phase,
+        state.stall_turns,
+        state
+            .record
+            .as_ref()
+            .map(|r| r.rounds.len())
+            .unwrap_or(0)
+    ));
     match action {
         review_loop::ReviewLoopAction::QueueFixTurn(findings) => {
             app.session.review_loop = Some(state.clone());
+            crate::logging::info(&format!(
+                "Review loop: queued fix turn with {} finding(s)",
+                findings.len()
+            ));
             let summary = findings
                 .iter()
                 .map(|f| format!("[{}] {}: {}", f.severity, f.path, f.text))
@@ -1965,6 +2073,13 @@ pub(super) fn apply_headless_review_result(
             // from a prior retry so a later drain cannot dispatch a lens against
             // a stopped loop.
             app.pending_headless_review = None;
+            if let Some(state) = app.session.review_loop.as_ref() {
+                log_review_loop_finished(
+                    &active_session_id(app),
+                    state,
+                    &format!(" lens={lens_desc} kind={kind}"),
+                );
+            }
             false
         }
     }
@@ -2006,6 +2121,13 @@ fn spawn_review_loop_reviewer(
             "Review loop requires server mode; skipped review.".to_string(),
         ));
         app.set_status_notice("Review loop: requires server mode");
+        if let Some(state) = app.session.review_loop.as_ref() {
+            log_review_loop_finished(
+                &active_session_id(app),
+                state,
+                " (client is not a remote server-client)",
+            );
+        }
         return false;
     }
 
@@ -2030,7 +2152,15 @@ fn spawn_review_loop_reviewer(
     // the same way to rebuild the lens prompt. Passing the human label here
     // would make every `from_name` return None and silently skip every lens.
     app.pending_headless_review = Some(lens.name().to_string());
-    app.set_status_notice(format!("Review loop: reviewing {} (headless)", lens.label()));
+    // No transient status notice here: the durable `review_loop_status`
+    // segment already renders the same progress line for the whole review
+    // wait, and a notice would duplicate the identical text for ~3s.
+    crate::logging::info(&format!(
+        "Review loop: dispatching headless reviewer lens={} phase={:?} round={}",
+        lens.name(),
+        state.phase,
+        state.record.as_ref().map(|r| r.rounds.len()).unwrap_or(0)
+    ));
     true
 }
 
@@ -2108,6 +2238,10 @@ pub(super) fn handle_review_loop_command_local(app: &mut App, trimmed: &str) -> 
                     "Review loop stopped.\n\n{digest}"
                 )));
                 app.set_status_notice("Review loop: stopped");
+                let session_id = active_session_id(app);
+                if let Some(state) = app.session.review_loop.as_ref() {
+                    log_review_loop_finished(&session_id, state, "");
+                }
             } else {
                 app.push_display_message(DisplayMessage::system(
                     "No active review loop to stop.".to_string(),
@@ -2131,13 +2265,15 @@ pub(super) fn handle_review_loop_command_local(app: &mut App, trimmed: &str) -> 
                     }
                 }
                 Some(state) => {
-                    let lens = state
-                        .current_lens
-                        .map(|l| l.label().to_string())
-                        .unwrap_or_else(|| "unset".to_string());
+                    let phase_name = if state.phase_is_confirmation() {
+                        "confirmation"
+                    } else {
+                        "review"
+                    };
                     format!(
-                        "Review loop active at lens: {lens} (phase: {:?}, stall turns: {}).",
-                        state.phase, state.stall_turns
+                        "Review loop active: {} (stall turns: {}).",
+                        review_loop::progress_line(state, phase_name),
+                        state.stall_turns
                     )
                 }
             };

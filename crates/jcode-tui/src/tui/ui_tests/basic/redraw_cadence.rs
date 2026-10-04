@@ -103,6 +103,42 @@ fn a_status_notice_still_requires_periodic_frames() {
     );
 }
 
+/// The durable review-loop segment can stay on screen for minutes, so it must
+/// not pin the redraw loop out of deep-idle (a ~20x wakeup increase) just to
+/// repaint identical glyphs. It still needs the row reserved/rendered.
+#[test]
+fn durable_review_segment_uses_the_slow_idle_cadence() {
+    let policy = full_tier_policy();
+    let mut state = static_chrome_state(None);
+    state.review_loop_status = Some("⟳ review lens 2/6 · Correctness · review pass · 1 round(s)".into());
+
+    // The row must be reserved so the segment renders.
+    assert!(
+        crate::tui::TuiState::has_notification(&state),
+        "an active durable review segment must reserve the notification row"
+    );
+    assert!(
+        crate::tui::periodic_redraw_required(&state),
+        "the durable segment must still get frames so it renders"
+    );
+    // But at the slow deep-idle cadence, not the 250ms idle cadence.
+    let interval = crate::tui::redraw_interval_with_policy(&state, &policy);
+    assert_eq!(
+        interval,
+        crate::tui::REDRAW_DEEP_IDLE,
+        "a lone durable review segment must not defeat deep-idle throttling"
+    );
+
+    // When a transient notice is also present, the fast idle cadence returns
+    // (the notice must retire promptly).
+    state.status_notice = Some("Model switched".into());
+    assert_eq!(
+        crate::tui::redraw_interval_with_policy(&state, &policy),
+        crate::tui::REDRAW_IDLE,
+        "a transient notice on top of the review segment must use the idle cadence"
+    );
+}
+
 /// A fresh empty session shows the decorative donut and legitimately animates,
 /// not at the idle cadence; there is no input to be responsive about yet.
 ///
