@@ -77,6 +77,7 @@ mod inline_interactive;
 mod input;
 mod input_help;
 mod intent;
+mod live_tool_output;
 mod local;
 mod misc_ui;
 mod model_context;
@@ -1018,6 +1019,8 @@ pub struct App {
     subagent_status: Option<String>,
     // Batch progress (shown during batch tool execution)
     batch_progress: Option<crate::bus::BatchProgress>,
+    // Live output tail from a still-running tool call (e.g. bash stdout/stderr)
+    live_tool_output: Option<crate::tui::LiveToolOutputView>,
     processing_started: Option<Instant>,
     // User-visible turn timer. Preserved across synthetic auto-poke follow-ups so elapsed time
     // reflects the original user turn rather than only the latest poke resend.

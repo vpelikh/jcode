@@ -731,3 +731,49 @@ fn test_session_working_dir_changed_event_roundtrip() -> Result<()> {
     assert_eq!(working_dir, "/worktrees/feat-panel");
     Ok(())
 }
+
+#[test]
+fn test_tool_output_roundtrip_and_defaults() -> Result<()> {
+    let event = ServerEvent::ToolOutput {
+        id: "call-1".to_string(),
+        name: "bash".to_string(),
+        text: "line one\nline two".to_string(),
+        stderr: true,
+        done: false,
+    };
+    let json = serde_json::to_string(&event)?;
+    assert!(json.contains("\"tool_output\""));
+    let decoded: ServerEvent = serde_json::from_str(&json)?;
+    match decoded {
+        ServerEvent::ToolOutput {
+            id,
+            name,
+            text,
+            stderr,
+            done,
+        } => {
+            assert_eq!(id, "call-1");
+            assert_eq!(name, "bash");
+            assert_eq!(text, "line one\nline two");
+            assert!(stderr);
+            assert!(!done);
+        }
+        other => panic!("expected ToolOutput, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[test]
+fn test_tool_output_defaults_when_stream_flags_absent() -> Result<()> {
+    // Older senders may omit the boolean flags; they must default to false.
+    let json = r#"{"type":"tool_output","id":"c","name":"bash","text":"x"}"#;
+    let decoded: ServerEvent = serde_json::from_str(json)?;
+    match decoded {
+        ServerEvent::ToolOutput { stderr, done, .. } => {
+            assert!(!stderr);
+            assert!(!done);
+        }
+        other => panic!("expected ToolOutput, got {other:?}"),
+    }
+    Ok(())
+}

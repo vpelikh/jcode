@@ -180,6 +180,23 @@ pub(super) fn handle_bus_event(
     bus_event: std::result::Result<BusEvent, RecvError>,
 ) -> bool {
     match bus_event {
+        Ok(BusEvent::ToolOutputChunk(chunk)) => {
+            // Only surface live output for the session this client is viewing.
+            if app
+                .active_client_session_id()
+                .is_some_and(|id| id == chunk.session_id)
+            {
+                app.apply_tool_output_chunk(
+                    &chunk.tool_call_id,
+                    &chunk.tool_name,
+                    &chunk.text,
+                    chunk.stderr,
+                    chunk.done,
+                )
+            } else {
+                false
+            }
+        }
         Ok(BusEvent::BackgroundTaskCompleted(task)) => {
             handle_background_task_completed(app, task);
             true

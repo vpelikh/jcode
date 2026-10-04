@@ -126,6 +126,28 @@ pub struct SwarmOutputTail {
     pub tail: String,
 }
 
+/// A chunk of live output produced by a still-running tool call.
+///
+/// Published while a tool (notably `bash`) streams its stdout/stderr, so the
+/// TUI can show what the command is actually doing instead of only a one-line
+/// "running tool" status. The producer batches lines and throttles publishes to
+/// avoid flooding the bus; consumers keep a rolling tail of the most recent
+/// lines per tool call.
+#[derive(Clone, Debug)]
+pub struct ToolOutputChunk {
+    pub session_id: String,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    /// Newline-separated batch of newly produced output lines (no trailing
+    /// newline). Empty on the terminal sentinel.
+    pub text: String,
+    /// Whether this chunk came from the process's stderr stream.
+    pub stderr: bool,
+    /// Terminal sentinel: the live output for this tool call is complete and
+    /// any live view should be cleared.
+    pub done: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct LoginCompleted {
     pub provider: String,
@@ -402,6 +424,8 @@ pub enum BusEvent {
     FileTouch(FileTouch),
     /// Streaming output tail from a swarm worker, for inline gallery viewports.
     SwarmOutputTail(SwarmOutputTail),
+    /// Live output from a still-running tool call (e.g. bash stdout/stderr).
+    ToolOutputChunk(ToolOutputChunk),
     /// Background task completed
     BackgroundTaskCompleted(BackgroundTaskCompleted),
     /// Background task reported progress

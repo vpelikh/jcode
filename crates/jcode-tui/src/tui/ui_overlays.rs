@@ -729,16 +729,28 @@ pub(super) fn draw_debug_overlay(
     placements: &[WidgetPlacement],
     chunks: &[Rect],
 ) {
-    if chunks.len() < 5 {
+    // Labels mirror the chunk indices in `ui::draw_inner`:
+    // 0 messages, 1 queued, 2 swarm strip, 3 status, 4 live tool output,
+    // 5 notification, 6 inline UI, 7 inline gap, 8 input, 9 overscroll, 10 donut.
+    if chunks.len() < 4 {
         return;
     }
     render_overlay_box(frame, chunks[0], "messages", Color::Red);
     render_overlay_box(frame, chunks[1], "queued", Color::Yellow);
-    render_overlay_box(frame, chunks[2], "status", Color::Cyan);
-    render_overlay_box(frame, chunks[3], "picker", Color::Magenta);
-    render_overlay_box(frame, chunks[4], "input", Color::Green);
-    if chunks.len() > 5 && chunks[5].height > 0 {
-        render_overlay_box(frame, chunks[5], "donut", Color::Blue);
+    if chunks[2].height > 0 {
+        render_overlay_box(frame, chunks[2], "swarm_strip", Color::Cyan);
+    }
+    render_overlay_box(frame, chunks[3], "status", Color::Magenta);
+    if let Some(chunk) = chunks.get(4).filter(|c| c.height > 0) {
+        render_overlay_box(frame, *chunk, "live_output", Color::Green);
+    }
+    for (idx, label, color) in [
+        (8usize, "input", Color::Blue),
+        (10, "donut", Color::LightBlue),
+    ] {
+        if let Some(chunk) = chunks.get(idx).filter(|c| c.height > 0) {
+            render_overlay_box(frame, *chunk, label, color);
+        }
     }
 
     for placement in placements {

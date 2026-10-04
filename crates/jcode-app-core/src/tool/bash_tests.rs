@@ -1226,3 +1226,435 @@ async fn test_detached_promoted_command_reports_intermediate_progress() {
     let _ = tokio::fs::remove_file(output_file).await;
     let _ = tokio::fs::remove_file(status_file).await;
 }
+
+/// Live output: a foreground agent-turn command with an stdin channel publishes
+/// throttled `ToolOutputChunk` bus events, plus a terminal `done` sentinel.
+#[tokio::test]
+async fn foreground_agent_command_publishes_live_output_chunks() {
+    let tool = BashTool::new();
+    let (stdin_tx, _stdin_rx) = mpsc::unbounded_channel();
+    // Agent-turn + stdin channel: the interactive foreground path, which is the
+    // only one that publishes live output.
+    let ctx = ToolContext {
+        session_id: "test-session".to_string(),
+        message_id: "test-msg".to_string(),
+        tool_call_id: "test-call".to_string(),
+        working_dir: Some(std::path::PathBuf::from("/tmp")),
+        stdin_request_tx: Some(stdin_tx),
+        graceful_shutdown_signal: Some(jcode_agent_runtime::InterruptSignal::new()),
+        execution_mode: crate::tool::ToolExecutionMode::AgentTurn,
+    };
+
+    let mut rx = crate::bus::Bus::global().subscribe();
+    let result = tool
+        .execute(json!({"command": "printf 'alpha\nbeta\n'"}), ctx)
+        .await
+        .expect("command should succeed");
+    assert!(result.output.contains("alpha"));
+
+    let mut saw_chunk = false;
+    let mut saw_done = false;
+    while let Ok(event) = rx.try_recv() {
+        if let crate::bus::BusEvent::ToolOutputChunk(chunk) = event
+            && chunk.tool_call_id == "test-call"
+        {
+            if chunk.done {
+                saw_done = true;
+            } else if chunk.text.contains("alpha") || chunk.text.contains("beta") {
+                saw_chunk = true;
+            }
+        }
+    }
+    assert!(saw_chunk, "expected a live output chunk for the running command");
+    assert!(saw_done, "expected a terminal done sentinel");
+}
+
+/// The live-output publisher must coalesce a rapid burst instead of publishing
+/// one event per line, since a chatty command can emit thousands of lines a
+/// second and would otherwise flood the bus.
+#[tokio::test]
+async fn live_output_coalesces_rapid_lines() {
+    let live = ToolLiveOutput::for_test("coalesce-session", "coalesce-call");
+
+    let mut rx = crate::bus::Bus::global().subscribe();
+    // Three lines pushed back-to-back well within LIVE_OUTPUT_INTERVAL. The
+    // first publish fires immediately; the next two are buffered; flush drains
+    // them. So we expect two events, not three.
+    live.push("alpha", false).await;
+    live.push("beta", false).await;
+    live.push("gamma", false).await;
+    live.flush(false).await;
+
+    let mut texts = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let crate::bus::BusEvent::ToolOutputChunk(chunk) = event
+            && chunk.tool_call_id == "coalesce-call"
+            && !chunk.done
+        {
+            texts.push(chunk.text);
+        }
+    }
+    assert_eq!(
+        texts.len(),
+        2,
+        "rapid lines should coalesce into two publishes (initial + flush), got {texts:?}"
+    );
+    assert_eq!(texts[0], "alpha");
+    assert_eq!(texts[1], "beta\ngamma");
+    // No content may be lost by coalescing.
+    assert_eq!(texts.concat().replace("\n", ""), "alphabetagamma");
+}
+
+/// stdout and stderr are buffered separately so a chunk is never mislabeled.
+#[tokio::test]
+async fn live_output_keeps_streams_separate() {
+    let live = ToolLiveOutput::for_test("streams-session", "streams-call");
+    let mut rx = crate::bus::Bus::global().subscribe();
+    live.push("out-1", false).await;
+    live.push("err-1", true).await;
+    live.flush(false).await;
+    live.flush(true).await;
+
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let crate::bus::BusEvent::ToolOutputChunk(chunk) = event
+            && chunk.tool_call_id == "streams-call"
+        {
+            if chunk.stderr {
+                err.push(chunk.text);
+            } else {
+                out.push(chunk.text);
+            }
+        }
+    }
+    assert!(out.iter().any(|t| t == "out-1"), "stdout chunk missing: {out:?}");
+    assert!(err.iter().any(|t| t == "err-1"), "stderr chunk missing: {err:?}");
+    assert!(!out.iter().any(|t| t.contains("err-1")), "stderr leaked into stdout");
+    assert!(!err.iter().any(|t| t.contains("out-1")), "stdout leaked into stderr");
+}
+
+/// The terminal sentinel is published exactly once and is empty + done.
+#[tokio::test]
+async fn live_output_finish_publishes_empty_done_sentinel() {
+    let live = ToolLiveOutput::for_test("finish-session", "finish-call");
+    let mut rx = crate::bus::Bus::global().subscribe();
+    live.finish().await;
+
+    let mut done_events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let crate::bus::BusEvent::ToolOutputChunk(chunk) = event
+            && chunk.tool_call_id == "finish-call"
+        {
+            done_events.push(chunk);
+        }
+    }
+    assert_eq!(done_events.len(), 1, "exactly one terminal sentinel expected");
+    assert!(done_events[0].done);
+    assert!(done_events[0].text.is_empty());
+}
+
+/// A single pathological line must not produce an oversized publish: the chunk
+/// is capped and marked with an ellipsis.
+#[tokio::test]
+async fn live_output_caps_an_oversized_single_line() {
+    let live = ToolLiveOutput::for_test("big-session", "big-call");
+    let mut rx = crate::bus::Bus::global().subscribe();
+    let giant = "x".repeat(LIVE_OUTPUT_MAX_CHARS * 4);
+    live.push(&giant, false).await;
+    live.flush(false).await;
+
+    let mut chunks = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let crate::bus::BusEvent::ToolOutputChunk(chunk) = event
+            && chunk.tool_call_id == "big-call"
+            && !chunk.done
+        {
+            chunks.push(chunk.text);
+        }
+    }
+    assert!(
+        chunks.iter().all(|c| c.len() <= LIVE_OUTPUT_MAX_CHARS + 4),
+        "no publish may exceed the chunk budget, got lengths {:?}",
+        chunks.iter().map(|c| c.len()).collect::<Vec<_>>()
+    );
+    assert!(
+        chunks.iter().any(|c| c.contains('\u{2026}')),
+        "an oversized line should be marked as truncated"
+    );
+}
+
+/// After finish(), a chunk from a collector still draining must be ignored, so
+/// a late chunk cannot resurrect the region after the sentinel.
+#[tokio::test]
+async fn live_output_ignores_chunks_after_finish() {
+    let live = ToolLiveOutput::for_test("stopped-session", "stopped-call");
+    live.finish().await;
+
+    let mut rx = crate::bus::Bus::global().subscribe();
+    live.push("late chunk", false).await;
+    live.flush(false).await;
+
+    let mut non_done = 0;
+    while let Ok(event) = rx.try_recv() {
+        if let crate::bus::BusEvent::ToolOutputChunk(chunk) = event
+            && chunk.tool_call_id == "stopped-call"
+            && !chunk.done
+        {
+            non_done += 1;
+        }
+    }
+    assert_eq!(
+        non_done, 0,
+        "no output chunk may be published after the terminal sentinel"
+    );
+}
+
+/// The chunk splitter must prefer line boundaries, cut only on char boundaries,
+/// and lose nothing (a mid-char cut would panic; a dropped byte would corrupt
+/// streamed output).
+#[test]
+fn split_at_line_boundary_is_multibyte_safe_and_lossless() {
+    // No newline within budget and multibyte chars: must fall back to a
+    // char-safe cut so `..max` never panics mid-char, and reconstruct exactly.
+    let text = "日本語テスト".repeat(400);
+    let (head, tail) = split_at_line_boundary(&text, LIVE_OUTPUT_MAX_CHARS);
+    assert!(head.len() <= LIVE_OUTPUT_MAX_CHARS);
+    assert!(head.is_char_boundary(head.len()));
+    assert_eq!(format!("{head}{tail}"), text);
+
+    // With newlines inside the budget, the head ends exactly on a line boundary
+    // (no partial trailing line) and the pieces rejoin to the input.
+    let mut multi = String::new();
+    // Enough lines to exceed the chunk budget (each line is ~10 bytes).
+    for i in 0..1000 {
+        multi.push_str(&format!("line-{i:04}\n"));
+    }
+    let (head, tail) = split_at_line_boundary(&multi, LIVE_OUTPUT_MAX_CHARS);
+    assert!(head.len() <= LIVE_OUTPUT_MAX_CHARS);
+    assert!(!head.ends_with('\n'), "head must not end on the separator");
+    assert_eq!(format!("{head}\n{tail}"), multi);
+    // Every line in the head is complete (no partial line at the cut).
+    assert!(head.split('\n').all(|l| l.is_empty() || l.starts_with("line-")));
+
+    // Short and empty inputs are returned whole.
+    let (whole, rest) = split_at_line_boundary("abc", LIVE_OUTPUT_MAX_CHARS);
+    assert_eq!(whole, "abc");
+    assert!(rest.is_empty());
+    let (all, none) = split_at_line_boundary("", LIVE_OUTPUT_MAX_CHARS);
+    assert!(all.is_empty() && none.is_empty());
+}
+
+/// A large buffered flush must stop mid-way once `finish()` latches, so no
+/// chunk is published after the terminal sentinel.
+#[tokio::test]
+async fn live_output_flush_stops_after_finish_between_pieces() {
+    let live = ToolLiveOutput::for_test("flush-stop-session", "flush-stop-call");
+    let mut rx = crate::bus::Bus::global().subscribe();
+    // Buffer several budget-sized pieces so flush would need multiple publishes.
+    // (push publishes its first piece immediately; drain that before finishing.)
+    let line = "z".repeat(LIVE_OUTPUT_MAX_CHARS * 3);
+    live.push(&line, false).await;
+    while rx.try_recv().is_ok() {}
+
+    // Latch before flushing: flush must publish nothing, only the sentinel.
+    live.finish().await;
+    live.flush(false).await;
+
+    let mut non_done = 0;
+    let mut done = 0;
+    while let Ok(event) = rx.try_recv() {
+        if let crate::bus::BusEvent::ToolOutputChunk(chunk) = event
+            && chunk.tool_call_id == "flush-stop-call"
+        {
+            if chunk.done {
+                done += 1;
+            } else {
+                non_done += 1;
+            }
+        }
+    }
+    assert_eq!(non_done, 0, "flush must publish nothing after finish()");
+    assert_eq!(done, 1, "exactly one terminal sentinel");
+}
+
+/// The sentinel must be the LAST event for a call even when a collector pushes
+/// concurrently with finish() (the timeout-promotion handoff). Publication and
+/// the latch share one lock, so no chunk may be observed after the sentinel.
+#[tokio::test]
+async fn live_output_never_publishes_a_chunk_after_the_sentinel() {
+    let live = std::sync::Arc::new(ToolLiveOutput::for_test("order-session", "order-call"));
+    let mut rx = crate::bus::Bus::global().subscribe();
+
+    // Race a burst of pushes against finish().
+    let pusher = {
+        let live = std::sync::Arc::clone(&live);
+        tokio::spawn(async move {
+            for i in 0..200 {
+                live.push(&format!("line-{i}"), false).await;
+            }
+        })
+    };
+    live.finish().await;
+    pusher.await.expect("pusher task");
+
+    // Reconstruct the event order for this call.
+    let mut saw_sentinel = false;
+    let mut chunk_after_sentinel = false;
+    while let Ok(event) = rx.try_recv() {
+        if let crate::bus::BusEvent::ToolOutputChunk(chunk) = event
+            && chunk.tool_call_id == "order-call"
+        {
+            if chunk.done {
+                saw_sentinel = true;
+            } else if saw_sentinel {
+                chunk_after_sentinel = true;
+            }
+        }
+    }
+    assert!(saw_sentinel, "the terminal sentinel must be published");
+    assert!(
+        !chunk_after_sentinel,
+        "no output chunk may be published after the terminal sentinel"
+    );
+}
+
+/// A single oversized line must reach the app as ONE line. If the publisher
+/// splits the truncated line into head + ellipsis as two chunks, the app (which
+/// splits each chunk on '\n') renders the ellipsis on its own spurious row.
+#[tokio::test]
+async fn oversized_line_reaches_app_as_one_line() {
+    let live = ToolLiveOutput::for_test("oneline-session", "oneline-call");
+    let mut rx = crate::bus::Bus::global().subscribe();
+    let giant = "x".repeat(LIVE_OUTPUT_MAX_CHARS * 3);
+    live.push(&giant, false).await;
+    live.flush(false).await;
+
+    let mut line_count = 0usize;
+    while let Ok(event) = rx.try_recv() {
+        if let crate::bus::BusEvent::ToolOutputChunk(chunk) = event
+            && chunk.tool_call_id == "oneline-call"
+            && !chunk.done
+        {
+            // Each publish is a chunk of newline-joined lines; count lines the
+            // way the consumer would.
+            line_count += chunk.text.split('\n').count();
+        }
+    }
+    assert_eq!(
+        line_count, 1,
+        "an oversized single line must stay a single line across chunks"
+    );
+}
+
+/// A budget-length line followed by another must not leave a leading newline in
+/// the tail: the consumer splits each chunk on '\n', so a leading separator
+/// would render a spurious blank row.
+#[test]
+fn split_at_line_boundary_never_leaves_a_leading_newline() {
+    // First line exactly fills the budget, then a second line follows.
+    let first = "x".repeat(LIVE_OUTPUT_MAX_CHARS - 3) + "\u{2026}"; // == MAX bytes
+    assert_eq!(first.len(), LIVE_OUTPUT_MAX_CHARS);
+    let text = format!("{first}\nsecond");
+    let (head, tail) = split_at_line_boundary(&text, LIVE_OUTPUT_MAX_CHARS);
+    assert!(
+        !tail.starts_with('\n'),
+        "tail must not start with a separator (would render a blank row): {tail:?}"
+    );
+    assert_eq!(format!("{head}\n{tail}"), text, "no content may be lost");
+}
+
+/// A burst of output followed by a quiet command must surface the burst's tail
+/// *while the command is still running*. `push` publishes only when the
+/// throttle interval has elapsed, so without a periodic flush the tail would
+/// stay buffered until the next line or end of stream, leaving the live view
+/// stuck on the first line for the whole quiet stretch.
+#[tokio::test]
+async fn live_output_surfaces_burst_tail_while_command_is_still_running() {
+    let tool = BashTool::new();
+    let (stdin_tx, _stdin_rx) = mpsc::unbounded_channel();
+    // Agent-turn + stdin channel: the interactive foreground path that streams
+    // live output.
+    let ctx = ToolContext {
+        session_id: "test-session".to_string(),
+        message_id: "test-msg".to_string(),
+        tool_call_id: "burst-tail-call".to_string(),
+        working_dir: Some(std::path::PathBuf::from("/tmp")),
+        stdin_request_tx: Some(stdin_tx),
+        graceful_shutdown_signal: Some(jcode_agent_runtime::InterruptSignal::new()),
+        execution_mode: crate::tool::ToolExecutionMode::AgentTurn,
+    };
+    let mut rx = crate::bus::Bus::global().subscribe();
+
+    // Print a burst, then stay quiet for several throttle intervals before the
+    // command exits, so a periodic flush must fire while it is still running.
+    let handle = tokio::spawn(async move {
+        tool.execute(
+            json!({
+                "command": "printf 'alpha\\nbeta\\ngamma\\n'; sleep 1.2",
+                "timeout": 20000,
+            }),
+            ctx,
+        )
+        .await
+    });
+
+    // Observe only during the quiet window, before EOF flush can mask the bug.
+    let mut observed = String::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(900);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Ok(crate::bus::BusEvent::ToolOutputChunk(chunk))) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+            && chunk.tool_call_id == "burst-tail-call"
+            && !chunk.done
+        {
+            observed.push_str(&chunk.text);
+            observed.push('\n');
+        }
+        if observed.contains("beta") && observed.contains("gamma") {
+            break;
+        }
+    }
+
+    assert!(
+        observed.contains("beta") && observed.contains("gamma"),
+        "the burst tail must appear while the command is still running, not only \
+         at end of stream; observed during the quiet window: {observed:?}"
+    );
+
+    // Let the command finish so the task does not leak.
+    let _ = handle.await;
+}
+
+/// The live-output flush ticker is held in an `AbortOnDrop` guard so that
+/// aborting the owning work task (a cancelled timeout-promoted background
+/// command) stops it. Dropping a bare `JoinHandle` would only detach the task,
+/// leaving the ticker looping forever.
+#[tokio::test]
+async fn abort_on_drop_stops_its_task() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let ran = Arc::new(AtomicBool::new(false));
+    let ran_inner = ran.clone();
+    let guard = AbortOnDrop::new(tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            ran_inner.store(true, Ordering::SeqCst);
+        }
+    }));
+
+    // Let the task start, then drop the guard.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(ran.load(Ordering::SeqCst), "task should have run before the abort");
+    drop(guard);
+
+    // Give the abort a moment to take effect, then confirm the task stopped.
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    ran.store(false, Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    assert!(
+        !ran.load(Ordering::SeqCst),
+        "an aborted ticker must stop running after the guard is dropped"
+    );
+}

@@ -925,6 +925,17 @@ pub(super) async fn handle_client(
                             let _ = client_event_tx.send(ServerEvent::BatchProgress { progress });
                         }
                     }
+                    Ok(BusEvent::ToolOutputChunk(chunk)) => {
+                        if chunk.session_id == client_session_id {
+                            let _ = client_event_tx.send(ServerEvent::ToolOutput {
+                                id: chunk.tool_call_id,
+                                name: chunk.tool_name,
+                                text: chunk.text,
+                                stderr: chunk.stderr,
+                                done: chunk.done,
+                            });
+                        }
+                    }
                     Ok(BusEvent::SidePanelUpdated(update)) => {
                         if update.session_id == client_session_id {
                             let _ = client_event_tx.send(ServerEvent::SidePanelState {

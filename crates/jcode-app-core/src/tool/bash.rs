@@ -18,7 +18,6 @@ use std::process::Command as StdCommand;
 use std::process::Stdio;
 use std::sync::LazyLock;
 use std::time::Duration;
-#[cfg(unix)]
 use std::time::Instant;
 #[cfg(unix)]
 use tokio::io::AsyncReadExt;
@@ -498,6 +497,30 @@ async fn apply_progress_update(task_id: &str, update: ProgressLineUpdate) {
     };
 }
 
+/// Aborts a spawned task when dropped.
+///
+/// Used for the live-output flush ticker: dropping a bare `JoinHandle` only
+/// *detaches* the task, so when the owning work future is aborted (a
+/// timeout-promoted background task being cancelled) the ticker would keep
+/// looping forever. This guard propagates the drop into an abort.
+struct AbortOnDrop {
+    handle: tokio::task::AbortHandle,
+}
+
+impl AbortOnDrop {
+    fn new<T>(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self {
+            handle: handle.abort_handle(),
+        }
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 /// Progress state for a foreground command that may be promoted to a
 /// background task if it exceeds the foreground timeout.
 ///
@@ -544,6 +567,8 @@ impl PromotedCommandProgress {
 async fn collect_output_reporting_progress<R>(
     reader: Option<R>,
     progress: std::sync::Arc<PromotedCommandProgress>,
+    live: Option<std::sync::Arc<ToolLiveOutput>>,
+    stderr: bool,
 ) -> String
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -557,10 +582,255 @@ where
         if let Ok(Some(update)) = parse_progress_line(&line) {
             progress.record(update).await;
         }
+        if let Some(ref live) = live {
+            live.push(&line, stderr).await;
+        }
         buf.push_str(&line);
         buf.push('\n');
     }
+    if let Some(ref live) = live {
+        live.flush(stderr).await;
+    }
     buf
+}
+
+/// Throttled publisher of a running command's output to the global bus.
+///
+/// A chatty command can emit thousands of lines per second; publishing an event
+/// per line would flood the broadcast bus (and every render) for no benefit,
+/// since the live view only shows the tail. This coalesces output into
+/// line-batched chunks and publishes at most every [`LIVE_OUTPUT_INTERVAL`],
+/// with a character cap per chunk so a single publish stays bounded.
+///
+/// Only foreground `AgentTurn` bash calls publish (see
+/// [`should_publish_tool_output`]), so CLI/programmatic runs pay nothing, and a
+/// tool call whose output is never rendered still costs only a few events.
+struct ToolLiveOutput {
+    session_id: String,
+    tool_call_id: String,
+    tool_name: String,
+    /// Buffered output and the terminal latch, guarded by one async mutex.
+    ///
+    /// Publication (both chunks and the terminal sentinel) happens while
+    /// holding this lock, so ordering is total: no chunk can be observed after
+    /// the sentinel even if a collector task is still draining the pipe
+    /// (timeout-promotion hands the collector off mid-stream).
+    state: tokio::sync::Mutex<LiveState>,
+}
+
+#[derive(Default)]
+struct LiveState {
+    stdout: String,
+    stderr: String,
+    last_publish: Option<Instant>,
+    /// Latched by `finish`; once set, no further chunks are published.
+    stopped: bool,
+}
+
+/// Split `text` into `(head, tail)` so that `head` is at most `max` bytes and,
+/// when possible, ends on a line boundary.
+///
+/// Chunks are consumed as newline-separated lines (the app splits each chunk on
+/// `\n`), so a split that lands mid-line would render one logical line as
+/// several rows. Prefer the last newline at or before `max`; only split at a
+/// bare char boundary when the buffer is a single line longer than `max` (which
+/// caller-side line truncation normally prevents).
+fn split_at_line_boundary(text: &str, max: usize) -> (&str, &str) {
+    if text.len() <= max {
+        return (text, "");
+    }
+    if let Some(pos) = text.as_bytes()[..max].iter().rposition(|b| *b == b'\n')
+        && pos > 0
+    {
+        // Split ON the newline: the head excludes it (so the consumer's
+        // `split('\n')` yields exactly the whole lines) and the tail starts at
+        // the next line.
+        return (&text[..pos], &text[pos + 1..]);
+    }
+    // No line boundary within budget; fall back to a char-safe cut.
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    // If the cut happens to land exactly on a newline, consume it so the tail
+    // does not begin with a separator (the consumer splits on '\n' and would
+    // otherwise render a spurious blank row).
+    if text.as_bytes().get(end) == Some(&b'\n') {
+        return (&text[..end], &text[end + 1..]);
+    }
+    text.split_at(end)
+}
+
+/// Minimum spacing between live-output publishes for one stream.
+const LIVE_OUTPUT_INTERVAL: Duration = Duration::from_millis(150);
+/// Cap the characters carried by one publish; excess waits for the next tick.
+const LIVE_OUTPUT_MAX_CHARS: usize = 4096;
+
+impl ToolLiveOutput {
+    /// Test-only constructor with explicit identity.
+    #[cfg(test)]
+    fn for_test(session_id: &str, tool_call_id: &str) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            tool_call_id: tool_call_id.to_string(),
+            tool_name: "bash".to_string(),
+            state: tokio::sync::Mutex::new(LiveState::default()),
+        }
+    }
+
+    fn new(ctx: &ToolContext) -> Self {
+        Self {
+            session_id: ctx.session_id.clone(),
+            tool_call_id: ctx.tool_call_id.clone(),
+            tool_name: "bash".to_string(),
+            state: tokio::sync::Mutex::new(LiveState::default()),
+        }
+    }
+
+    async fn push(&self, line: &str, stderr: bool) {
+        let mut state = self.state.lock().await;
+        if state.stopped {
+            return;
+        }
+        {
+            let bucket = if stderr {
+                &mut state.stderr
+            } else {
+                &mut state.stdout
+            };
+            if !bucket.is_empty() {
+                bucket.push('\n');
+            }
+            // A single pathological line (a minified file, a one-line log
+            // record) can dwarf the chunk budget on its own. Truncate it here so
+            // one publish is always bounded by LIVE_OUTPUT_MAX_CHARS, regardless
+            // of line length.
+            if line.len() > LIVE_OUTPUT_MAX_CHARS {
+                // Reserve room for the ellipsis so the truncated line still fits
+                // the chunk budget and is never split into multiple rows.
+                let keep = LIVE_OUTPUT_MAX_CHARS - '\u{2026}'.len_utf8();
+                bucket.push_str(truncate_str(line, keep));
+                bucket.push('\u{2026}');
+            } else {
+                bucket.push_str(line);
+            }
+        }
+        let bucket_len = if stderr {
+            state.stderr.len()
+        } else {
+            state.stdout.len()
+        };
+
+        let due = state
+            .last_publish
+            .is_none_or(|last| last.elapsed() >= LIVE_OUTPUT_INTERVAL);
+        if due || bucket_len >= LIVE_OUTPUT_MAX_CHARS {
+            state.last_publish = Some(Instant::now());
+            let text = take_bucket(&mut state, stderr);
+            // Split so a single publish is always bounded by the chunk budget,
+            // even when several lines accumulated past it; the remainder stays
+            // buffered for the next publish rather than being dropped.
+            let (head, tail) = split_at_line_boundary(&text, LIVE_OUTPUT_MAX_CHARS);
+            *bucket_mut(&mut state, stderr) = tail.to_string();
+            // Publish while still holding the lock so a concurrent `finish`
+            // cannot interleave its sentinel before this chunk.
+            self.publish(head.to_string(), stderr, false);
+        }
+    }
+
+    /// Flush any buffered output. Called at end of stream so nothing is lost.
+    ///
+    /// Emits in bounded pieces so a large final buffer does not become one
+    /// oversized publish.
+    async fn flush(&self, stderr: bool) {
+        loop {
+            let mut state = self.state.lock().await;
+            // Checked under the lock: a concurrent `finish()` (e.g. on
+            // timeout-promotion) must stop a large flush from publishing chunks
+            // after the terminal sentinel.
+            if state.stopped {
+                return;
+            }
+            if bucket_mut(&mut state, stderr).is_empty() {
+                return;
+            }
+            state.last_publish = Some(Instant::now());
+            let text = take_bucket(&mut state, stderr);
+            let (head, tail) = split_at_line_boundary(&text, LIVE_OUTPUT_MAX_CHARS);
+            let head = head.to_string();
+            let tail = tail.to_string();
+            let done = tail.is_empty();
+            *bucket_mut(&mut state, stderr) = tail;
+            self.publish(head, stderr, false);
+            if done {
+                return;
+            }
+        }
+    }
+
+    /// Drain both buffered streams once, so the ticker publishes tail lines that
+    /// arrived in a burst and were then followed by silence.
+    ///
+    /// `push` only publishes when the interval has elapsed or the buffer is
+    /// full, so a burst's remainder would otherwise sit unpublished until the
+    /// next line or end of stream. The ticker bounds that latency.
+    async fn flush_pending(&self) {
+        self.flush(false).await;
+        self.flush(true).await;
+    }
+
+    fn publish(&self, text: String, stderr: bool, done: bool) {
+        crate::bus::Bus::global().publish(crate::bus::BusEvent::ToolOutputChunk(
+            crate::bus::ToolOutputChunk {
+                session_id: self.session_id.clone(),
+                tool_call_id: self.tool_call_id.clone(),
+                tool_name: self.tool_name.clone(),
+                text,
+                stderr,
+                done,
+            },
+        ));
+    }
+
+    /// End the live tap and publish the terminal sentinel, so any live view for
+    /// this call is cleared even when the command produced no output. Idempotent,
+    /// and — because the latch is set under the publication lock — ordered after
+    /// every chunk: no chunk can be observed after the sentinel even if a
+    /// collector task is still draining the pipe.
+    async fn finish(&self) {
+        let mut state = self.state.lock().await;
+        if state.stopped {
+            return;
+        }
+        state.stopped = true;
+        self.publish(String::new(), false, true);
+    }
+}
+
+/// Borrow the stdout or stderr buffer.
+fn bucket_mut(state: &mut LiveState, stderr: bool) -> &mut String {
+    if stderr {
+        &mut state.stderr
+    } else {
+        &mut state.stdout
+    }
+}
+
+/// Take (leaving empty) the stdout or stderr buffer.
+fn take_bucket(state: &mut LiveState, stderr: bool) -> String {
+    std::mem::take(bucket_mut(state, stderr))
+}
+
+/// Whether a running tool call should stream its output to the bus.
+///
+/// Restricted to foreground agent-turn bash so direct/CLI executions stay silent
+/// (no subscriber) and background/reload-persisted commands keep using their
+/// existing progress-file path.
+fn should_publish_tool_output(ctx: &ToolContext) -> bool {
+    matches!(
+        ctx.execution_mode,
+        crate::tool::ToolExecutionMode::AgentTurn
+    )
 }
 
 /// Tail a detached background task's output file and translate progress lines
@@ -1070,6 +1340,18 @@ impl BashTool {
         let stdout_progress = std::sync::Arc::clone(&promoted_progress);
         let stderr_progress = std::sync::Arc::clone(&promoted_progress);
 
+        // Live output tap: publish throttled stdout/stderr chunks so the TUI can
+        // show what the command is doing while it runs. Only foreground agent-turn
+        // executions publish; CLI/direct runs stay silent.
+        let live_output = should_publish_tool_output(ctx)
+            .then(|| std::sync::Arc::new(ToolLiveOutput::new(ctx)));
+        let stdout_live = live_output.clone();
+        let stderr_live = live_output.clone();
+        // A separate handle for the periodic flush ticker, which lives inside
+        // the command's work task (see below). Cloned here so `live_output`
+        // stays available for the completion `finish()` calls.
+        let ticker_live = live_output.clone();
+
         // Run the command (read stdout/stderr, service stdin, wait for exit) in a
         // dedicated task so that, if it exceeds the foreground timeout, we can hand
         // the still-running task off to the background manager instead of killing it.
@@ -1078,12 +1360,41 @@ impl BashTool {
                 let stdout_task = tokio::spawn(collect_output_reporting_progress(
                     stdout_handle,
                     stdout_progress,
+                    stdout_live,
+                    false,
                 ));
 
                 let stderr_task = tokio::spawn(collect_output_reporting_progress(
                     stderr_handle,
                     stderr_progress,
+                    stderr_live,
+                    true,
                 ));
+
+                // Periodic flush so a burst of output followed by a quiet
+                // command still surfaces its tail: `push` only publishes when
+                // the throttle interval has elapsed, so without this the tail
+                // of a burst would wait for the next line or end of stream.
+                //
+                // Held in an abort-on-drop guard rather than a bare JoinHandle:
+                // this task is aborted (not completed) when a timeout-promoted
+                // background task is cancelled, and dropping a JoinHandle only
+                // detaches the task. The guard aborts the ticker on drop so it
+                // cannot loop forever after the command is gone.
+                let flush_live = ticker_live.clone();
+                let flush_ticker = flush_live.map(|live| {
+                    AbortOnDrop::new(tokio::spawn(async move {
+                        let mut tick = tokio::time::interval(LIVE_OUTPUT_INTERVAL);
+                        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                        // The first tick fires immediately; skip it so the
+                        // first flush waits one interval.
+                        tick.tick().await;
+                        loop {
+                            tick.tick().await;
+                            live.flush_pending().await;
+                        }
+                    }))
+                });
 
                 let stdin_task = if has_stdin_channel {
                     Some(tokio::spawn(async move {
@@ -1161,6 +1472,9 @@ impl BashTool {
                 if let Some(task) = stdin_task {
                     task.abort();
                 }
+                // Dropping the guard aborts the ticker (it would otherwise keep
+                // firing until the process exits).
+                drop(flush_ticker);
 
                 let stdout = stdout_task.await.unwrap_or_default();
                 let stderr = stderr_task.await.unwrap_or_default();
@@ -1186,14 +1500,34 @@ impl BashTool {
 
         match tokio::time::timeout(timeout_duration, &mut work_handle).await {
             Ok(join_result) => match join_result {
-                Ok(Ok(output)) => Ok(output),
-                Ok(Err(e)) => Err(anyhow::anyhow!("Command failed: {}", e)),
-                Err(join_err) => Err(anyhow::anyhow!("Command task panicked: {}", join_err)),
+                Ok(Ok(output)) => {
+                    if let Some(ref live) = live_output {
+                        live.finish().await;
+                    }
+                    Ok(output)
+                }
+                Ok(Err(e)) => {
+                    if let Some(ref live) = live_output {
+                        live.finish().await;
+                    }
+                    Err(anyhow::anyhow!("Command failed: {}", e))
+                }
+                Err(join_err) => {
+                    if let Some(ref live) = live_output {
+                        live.finish().await;
+                    }
+                    Err(anyhow::anyhow!("Command task panicked: {}", join_err))
+                }
             },
             Err(_) => {
                 // Timed out, but the command is still running. Instead of killing
                 // it, promote it to a background task so it keeps running, renders
                 // as a background-task card, and the agent is told where to find it.
+                // Stop the live tap: the promoted task surfaces via its own
+                // background card/progress path, not the foreground live view.
+                if let Some(ref live) = live_output {
+                    live.finish().await;
+                }
                 let display_name =
                     summarize_background_command(params.intent.as_deref(), &params.command);
                 let info = crate::background::global()

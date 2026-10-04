@@ -96,6 +96,11 @@ pub(super) fn status_spinner_only_symbol(app: &App) -> Option<&'static str> {
         || app.centered_mode()
         || app.has_pending_mouse_scroll_animation()
         || app.remote_startup_phase_active()
+        // The live tool-output region changes beneath the status line; the
+        // one-cell fast path only repaints the status cell, so fall back to a
+        // full redraw while the region is actually visible (respecting
+        // `display.show_bash_output`, which can suppress it entirely).
+        || crate::tui::ui::input_ui::live_tool_output_height(app) > 0
     {
         return None;
     }

@@ -569,6 +569,7 @@ pub(in crate::tui::app) fn handle_server_event(
                 | ServerEvent::ToolStart { .. }
                 | ServerEvent::ToolInput { .. }
                 | ServerEvent::ToolExec { .. }
+                | ServerEvent::ToolOutput { .. }
                 | ServerEvent::ToolDone { .. }
                 | ServerEvent::BatchProgress { .. }
                 | ServerEvent::ConnectionPhase { .. }
@@ -594,6 +595,7 @@ pub(in crate::tui::app) fn handle_server_event(
             | ServerEvent::ToolStart { .. }
             | ServerEvent::ToolInput { .. }
             | ServerEvent::ToolExec { .. }
+            | ServerEvent::ToolOutput { .. }
             | ServerEvent::ToolDone { .. }
             | ServerEvent::SidePaneImages { .. }
             | ServerEvent::GeneratedImage { .. }
@@ -745,6 +747,13 @@ pub(in crate::tui::app) fn handle_server_event(
             output,
             error,
         } => super::server_event_handlers::handle_tool_done(app, remote, id, name, output, error),
+        ServerEvent::ToolOutput {
+            id,
+            name,
+            text,
+            stderr,
+            done,
+        } => app.apply_tool_output_chunk(&id, &name, &text, stderr, done),
         ServerEvent::GeneratedImage {
             id,
             path,

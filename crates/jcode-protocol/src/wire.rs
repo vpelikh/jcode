@@ -1039,6 +1039,24 @@ pub enum ServerEvent {
     #[serde(rename = "tool_exec")]
     ToolExec { id: String, name: String },
 
+    /// Live output chunk from a still-running tool call.
+    ///
+    /// Emitted while a tool (notably bash) streams stdout/stderr so the client
+    /// can render what the command is doing instead of only a one-line status.
+    /// `text` may contain multiple newline-separated lines; `stderr` marks the
+    /// stream. `done` is a terminal sentinel that clears the live view for this
+    /// call even when no output was produced (it carries empty `text`).
+    #[serde(rename = "tool_output")]
+    ToolOutput {
+        id: String,
+        name: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        stderr: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        done: bool,
+    },
+
     /// Tool execution completed
     #[serde(rename = "tool_done")]
     ToolDone {

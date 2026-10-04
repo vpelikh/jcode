@@ -1226,6 +1226,7 @@ impl App {
                     };
                     let _ = self.replace_latest_tool_display_message(&tc.id.to_string(), None, display_output);
 
+                    self.clear_live_tool_output_for(&tc.id.to_string());
                     self.observe_tool_result(&tc, &sdk_content, sdk_is_error, None);
                     self.note_tool_completed(&tc, sdk_is_error);
                     self.note_todo_gate_result(&tc, &sdk_content, sdk_is_error);
@@ -1456,6 +1457,7 @@ impl App {
                     }],
                     Some(tool_duration_ms),
                 );
+                self.clear_live_tool_output_for(&tc.id.to_string());
                 self.observe_tool_result(&tc, &output, is_error, tool_title.as_deref());
                 self.note_tool_completed(&tc, is_error);
                 self.note_todo_gate_result(&tc, &output, is_error);

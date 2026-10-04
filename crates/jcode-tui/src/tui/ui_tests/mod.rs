@@ -121,6 +121,7 @@ struct TestState {
     messages_version: u64,
     streaming_text: String,
     batch_progress: Option<crate::bus::BatchProgress>,
+    live_tool_output: Option<crate::tui::LiveToolOutputView>,
     queued_messages: Vec<String>,
     pending_soft_interrupts: Vec<String>,
     interleave_message: Option<String>,
@@ -264,6 +265,9 @@ impl crate::tui::TuiState for TestState {
     }
     fn batch_progress(&self) -> Option<crate::bus::BatchProgress> {
         self.batch_progress.clone()
+    }
+    fn live_tool_output(&self) -> Option<crate::tui::LiveToolOutputView> {
+        self.live_tool_output.clone()
     }
     fn time_since_activity(&self) -> Option<Duration> {
         self.time_since_activity
@@ -526,6 +530,8 @@ mod basic;
 mod diagrams;
 #[path = "inline_picker.rs"]
 mod inline_picker;
+#[path = "live_tool_output.rs"]
+mod live_tool_output;
 #[path = "onboarding.rs"]
 mod onboarding;
 #[path = "palette_topology.rs"]

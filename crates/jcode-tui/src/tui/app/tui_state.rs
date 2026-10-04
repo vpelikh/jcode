@@ -812,6 +812,10 @@ impl crate::tui::TuiState for App {
         self.batch_progress.clone()
     }
 
+    fn live_tool_output(&self) -> Option<crate::tui::LiveToolOutputView> {
+        self.live_tool_output.clone()
+    }
+
     fn time_since_activity(&self) -> Option<std::time::Duration> {
         if let Some(last_activity) = self.last_stream_activity {
             return Some(last_activity.elapsed());

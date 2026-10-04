@@ -6,7 +6,7 @@ use super::{
     ProcessingStatus, TuiState, accent_color, ai_color, asap_color, dim_color, pending_color,
     queued_color, rainbow_prompt_color, user_color,
 };
-use crate::message::ConnectionPhase;
+use crate::message::{ConnectionPhase, strip_ansi_escape_sequences};
 use crate::tui::app;
 use crate::tui::color_support::rgb;
 use crate::tui::detect_kv_cache_problem;
@@ -1961,6 +1961,176 @@ pub(super) fn build_notification_spans(app: &dyn TuiState) -> Vec<Span<'static>>
     }
 
     spans
+}
+
+/// Maximum rows the live tool-output region may occupy (header + body).
+const LIVE_OUTPUT_REGION_MAX_ROWS: usize = 8;
+
+/// How the live region divides its rows, given the lines it will show.
+///
+/// A single source of truth shared by the height reservation and the draw path
+/// so the two can never disagree about how many rows the region uses (which
+/// would leave a blank row or clip the newest line).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LiveRegionLayout {
+    /// Total rows the region occupies.
+    pub(crate) total: usize,
+    /// Rows spent on the "… N earlier lines" indicator (0 or 1).
+    pub(crate) indicator: usize,
+    /// Lines actually rendered.
+    pub(crate) body: usize,
+    /// Lines elided before the first rendered one (tail cap + render fit).
+    pub(crate) elided: usize,
+}
+
+/// Compute the live-region row layout for `line_count` retained lines (of which
+/// `truncated` were already dropped by the app tail cap), given a row `budget`.
+///
+/// Both the height reservation and the draw path call this with the SAME budget
+/// (the layout's reserved rows), so the reserved height and the drawn rows can
+/// never disagree — including when the renderer hands the region fewer rows than
+/// requested, which is why the budget is a parameter rather than an implicit
+/// `min` against a constant.
+fn live_region_layout(line_count: usize, truncated: usize, budget: usize) -> LiveRegionLayout {
+    let budget = budget.min(LIVE_OUTPUT_REGION_MAX_ROWS);
+    if line_count == 0 || budget == 0 {
+        // No lines to show, or no rows to show them in.
+        return LiveRegionLayout {
+            total: 0,
+            indicator: 0,
+            body: 0,
+            elided: truncated,
+        };
+    }
+    // Header + up to the retained tail, capped by the budget.
+    let total = (1 + line_count).min(budget);
+    let max_body = total - 1; // header takes one row
+    // An indicator only earns a row when at least one line still renders beside
+    // it; otherwise prefer showing the newest line(s) and skip the indicator.
+    let elided_would_occur = truncated > 0 || line_count > max_body;
+    let use_indicator = elided_would_occur && max_body >= 2;
+    let body = if use_indicator {
+        max_body - 1
+    } else {
+        line_count.min(max_body)
+    };
+    let indicator = usize::from(use_indicator);
+    let elided = truncated + (line_count - body);
+    LiveRegionLayout {
+        total: 1 + indicator + body,
+        indicator,
+        body,
+        elided,
+    }
+}
+
+/// The region's self-chosen row budget (header + up to the retained tail).
+fn live_region_budget(line_count: usize) -> usize {
+    if line_count == 0 {
+        return 0;
+    }
+    (1 + line_count).min(LIVE_OUTPUT_REGION_MAX_ROWS)
+}
+
+/// Test accessor for the shared region layout.
+#[cfg(test)]
+pub(crate) fn live_region_layout_for_tests(line_count: usize, truncated: usize) -> LiveRegionLayout {
+    live_region_layout(line_count, truncated, live_region_budget(line_count))
+}
+
+/// Test accessor for the layout at an explicit row budget.
+#[cfg(test)]
+pub(crate) fn live_region_layout_at_budget_for_tests(
+    line_count: usize,
+    truncated: usize,
+    budget: usize,
+) -> LiveRegionLayout {
+    live_region_layout(line_count, truncated, budget)
+}
+
+/// Height, in rows, of the live tool-output region. Zero when no tool is
+/// streaming output, so the region costs nothing in the common idle case, and
+/// zero when bash output display is disabled.
+pub(crate) fn live_tool_output_height(app: &dyn TuiState) -> u16 {
+    // `display.show_bash_output` is documented as the sole owner of bash output:
+    // when it is false, no bash output is shown at all. The live region is bash
+    // output, so it must honor that setting rather than appear anyway.
+    if !super::tools_ui::show_bash_output() {
+        return 0;
+    }
+    let Some(view) = app.live_tool_output() else {
+        return 0;
+    };
+    let budget = live_region_budget(view.lines.len());
+    live_region_layout(view.lines.len(), view.truncated, budget).total as u16
+}
+
+/// Render the live output tail of a running tool call.
+pub(crate) fn draw_live_tool_output(frame: &mut Frame, app: &dyn TuiState, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    if !super::tools_ui::show_bash_output() {
+        return;
+    }
+    let Some(view) = app.live_tool_output() else {
+        return;
+    };
+    if view.is_empty() {
+        return;
+    }
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("  \u{2699} ", Style::default().fg(ai_color())),
+        Span::styled(
+            format!("{} output", view.tool_name),
+            Style::default().fg(dim_color()).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    // Row accounting is shared with `live_tool_output_height` so the region never
+    // reserves a row it does not draw (blank row) or draws one it did not
+    // reserve (clipped newest line). `area.height` already equals that height.
+    // Use the area's actual rows as the budget so a renderer that hands the
+    // region fewer rows than it reserved still draws within them (never
+    // clipping the newest line off the bottom).
+    let layout = live_region_layout(view.lines.len(), view.truncated, area.height as usize);
+    let body_rows = layout.body;
+    if layout.indicator > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("    \u{2026} {} earlier lines", layout.elided),
+            Style::default().fg(dim_color()),
+        )));
+    }
+    let start = (view.lines.len() - body_rows).min(view.lines.len());
+    for line in view.lines[start..].iter().take(body_rows) {
+        let style = if line.stderr {
+            Style::default().fg(rgb(255, 150, 150))
+        } else {
+            Style::default().fg(dim_color())
+        };
+        // Commands that emit color (cargo, git, ls --color) would otherwise
+        // spill raw escape bytes into the live region. Match the committed
+        // transcript, which strips ANSI, and drop any remaining control chars
+        // (e.g. carriage returns) that would corrupt the frame.
+        let cleaned = strip_ansi_escape_sequences(&line.text);
+        let cleaned: String = cleaned
+            .chars()
+            .filter(|c| !c.is_control() || *c == '\t')
+            .collect();
+        lines.push(Line::from(Span::styled(
+            format!("    {}", cleaned),
+            style,
+        )));
+    }
+
+    let paragraph = if app.centered_mode() {
+        Paragraph::new(lines).alignment(Alignment::Center)
+    } else {
+        Paragraph::new(lines)
+    };
+    frame.render_widget(paragraph, area);
 }
 
 pub(super) fn draw_notification(frame: &mut Frame, app: &dyn TuiState, area: Rect) {

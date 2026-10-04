@@ -261,6 +261,11 @@ fn primary_status_spinner_fast_path_available_with_policy(
         && !state.centered_mode()
         && !state.has_pending_mouse_scroll_animation()
         && !state.remote_startup_phase_active()
+        // The live tool-output region changes beneath the status line, so the
+        // one-cell fast path is unavailable while it is visible; the primary
+        // spinner then needs full redraws to animate. Kept in sync with
+        // `app::run_shell::status_spinner_only_symbol`.
+        && crate::tui::ui::input_ui::live_tool_output_height(state) == 0
 }
 
 fn primary_status_spinner_needs_full_redraw_with_policy(

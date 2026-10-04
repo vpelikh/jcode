@@ -3867,6 +3867,7 @@ impl App {
 
     pub(super) fn clear_streaming_render_state(&mut self) {
         self.streaming.streaming_text.clear();
+        self.live_tool_output = None;
         self.stream_message_ended = false;
         self.deferred_stream_done_id = None;
         self.reasoning_streaming = false;

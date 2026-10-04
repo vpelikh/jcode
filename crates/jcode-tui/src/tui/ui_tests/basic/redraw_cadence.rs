@@ -340,3 +340,56 @@ fn a_notice_screen_left_alone_still_reaches_deep_idle() {
         "a dormant notice screen must tick at the deep-idle crawl"
     );
 }
+
+/// A visible live tool-output region disables the one-cell spinner fast path
+/// (`app::run_shell::status_spinner_only_symbol`), so the scheduler must stop
+/// treating the primary spinner fast path as available: otherwise a running tool
+/// that produced output and then went quiet (e.g. a `sleep`) leaves the status
+/// spinner animating only on bus events. This pins the two conditions together.
+#[test]
+fn live_tool_output_disables_the_spinner_fast_path_in_the_cadence_policy() {
+    // `show_bash_output` is process/thread-global; leave it enabled for the
+    // duration so the region counts as visible, matching the real running-tool
+    // default. Other tests set it explicitly, so do not rely on a default here.
+    crate::tui::ui::tools_ui::tests_show_bash_output_override::set(true);
+    crate::perf::pin_full_profile_for_tests();
+    let policy = full_tier_policy();
+    let fast_interval = Duration::from_millis(1000 / u64::from(policy.redraw_fps.max(1)));
+    let slow_interval = crate::tui::REDRAW_PASSIVE_LIVENESS;
+
+    // A running tool with no live output yet: the cheap fast path is available,
+    // so the primary spinner does not demand full redraws.
+    let mut state = static_chrome_state(None);
+    state.status = ProcessingStatus::RunningTool("bash".to_string());
+    assert_eq!(
+        crate::tui::redraw_interval_with_policy(&state, &policy),
+        slow_interval,
+        "without live output the spinner fast path is available, so cadence stays slow"
+    );
+
+    // Once live output is visible the fast path must stand down and the primary
+    // spinner needs the fast cadence so it keeps animating while the command is
+    // quiet between chunks.
+    state.live_tool_output = Some(crate::tui::LiveToolOutputView {
+        tool_call_id: "call-1".to_string(),
+        tool_name: "bash".to_string(),
+        lines: vec![crate::tui::LiveOutputLine {
+            text: "working...".to_string(),
+            stderr: false,
+        }],
+        truncated: 0,
+    });
+    assert_eq!(
+        crate::tui::redraw_interval_with_policy(&state, &policy),
+        fast_interval,
+        "a visible live-output region must force the fast cadence for the spinner"
+    );
+
+    // Clearing the region restores the cheap fast path.
+    state.live_tool_output = None;
+    assert_eq!(
+        crate::tui::redraw_interval_with_policy(&state, &policy),
+        slow_interval,
+        "clearing the live region must restore the slow cadence"
+    );
+}

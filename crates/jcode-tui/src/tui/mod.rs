@@ -581,6 +581,10 @@ pub trait TuiState {
     fn subagent_status(&self) -> Option<String>;
     /// Progress of a currently-running batch tool call.
     fn batch_progress(&self) -> Option<crate::bus::BatchProgress>;
+    /// Live output tail of a currently-running tool call, if any.
+    fn live_tool_output(&self) -> Option<LiveToolOutputView> {
+        None
+    }
     fn time_since_activity(&self) -> Option<Duration>;
     /// Whether the client terminal currently has focus. Decorative animations and
     /// periodic idle redraws pause while unfocused so backgrounded windows/tabs do
@@ -1339,6 +1343,35 @@ impl InlineViewState {
 pub enum InlineUiStateRef<'a> {
     View(&'a InlineViewState),
     Interactive(&'a InlineInteractiveState),
+}
+
+/// Live output from a still-running tool call, rendered as a streamed tail
+/// beneath the running-tool status line. Built by the app from bus
+/// `ToolOutputChunk` events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveToolOutputView {
+    /// Tool call id this tail belongs to, so late chunks from a finished call
+    /// cannot bleed into a newer call's view.
+    pub tool_call_id: String,
+    /// Tool name (e.g. "bash"), shown in the region header.
+    pub tool_name: String,
+    /// Recent output lines (already capped to a bounded tail by the app).
+    pub lines: Vec<LiveOutputLine>,
+    /// Number of output lines dropped from the front of the tail.
+    pub truncated: usize,
+}
+
+/// One line of live tool output, tagged with its originating stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveOutputLine {
+    pub text: String,
+    pub stderr: bool,
+}
+
+impl LiveToolOutputView {
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
 }
 
 impl PickerKind {
