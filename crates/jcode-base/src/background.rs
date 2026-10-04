@@ -1694,13 +1694,34 @@ impl BackgroundTaskManager {
     /// This is primarily used during self-dev reload recovery, where the new
     /// process needs to remind the agent that a previous `bash` command was
     /// persisted into the background instead of being interrupted.
+    ///
+    /// Scans the whole task directory; prefer
+    /// [`Self::persisted_detached_running_tasks_by_session`] when notes are
+    /// needed for more than one session so the directory is parsed only once.
     pub fn persisted_detached_running_tasks_for_session(
         &self,
         session_id: &str,
     ) -> Vec<TaskStatusFile> {
-        let mut matches = Vec::new();
+        self.persisted_detached_running_tasks_by_session()
+            .remove(session_id)
+            .unwrap_or_default()
+    }
+
+    /// Parse every persisted task status file once and index the detached,
+    /// running tasks by `session_id`.
+    ///
+    /// The reload recovery path needs this note for several sessions at once;
+    /// calling the per-session variant once per session re-read and re-parsed
+    /// every status JSON (~hundreds of files) N times, which dominates reload
+    /// shutdown latency. Scanning once and grouping by session removes that
+    /// multiplicative cost while producing identical results (each session's
+    /// list is sorted by `task_id`).
+    pub fn persisted_detached_running_tasks_by_session(
+        &self,
+    ) -> HashMap<String, Vec<TaskStatusFile>> {
+        let mut by_session: HashMap<String, Vec<TaskStatusFile>> = HashMap::new();
         let Ok(entries) = std::fs::read_dir(&self.output_dir) else {
-            return matches;
+            return by_session;
         };
 
         for entry in entries.flatten() {
@@ -1716,10 +1737,7 @@ impl BackgroundTaskManager {
                 continue;
             };
 
-            if status.session_id != session_id
-                || status.status != BackgroundTaskStatus::Running
-                || !status.detached
-            {
+            if status.status != BackgroundTaskStatus::Running || !status.detached {
                 continue;
             }
 
@@ -1728,12 +1746,17 @@ impl BackgroundTaskManager {
             };
 
             if crate::platform::is_process_running(pid) {
-                matches.push(status);
+                by_session
+                    .entry(status.session_id.clone())
+                    .or_default()
+                    .push(status);
             }
         }
 
-        matches.sort_by(|a, b| a.task_id.cmp(&b.task_id));
-        matches
+        for tasks in by_session.values_mut() {
+            tasks.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+        }
+        by_session
     }
 }
 

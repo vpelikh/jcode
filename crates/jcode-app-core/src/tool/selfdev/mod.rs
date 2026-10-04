@@ -29,7 +29,10 @@ mod status;
 mod tests;
 
 pub use launch::{enter_selfdev_session, schedule_selfdev_prompt_delivery};
-pub use reload::{ReloadRecoveryDirective, persisted_background_tasks_note};
+pub use reload::{
+    BackgroundTasksSnapshot, ReloadRecoveryDirective, persisted_background_tasks_note,
+    persisted_background_tasks_note_with,
+};
 pub use status::selfdev_status_output;
 
 /// Public GitHub source used when cloning the jcode repository for self-dev.

@@ -285,14 +285,25 @@ async fn persist_reload_recovery_intents(
     candidates.sort_by(|a, b| a.0.cmp(&b.0));
     candidates.dedup_by(|a, b| a.0 == b.0);
 
+    // Scan the persisted bg-task and await-member directories exactly once for
+    // the whole reload. Building a fresh note per session re-read and re-parsed
+    // every status/await JSON file once per session, which dominated reload
+    // shutdown time with dozens of live sessions. Built lazily on the first
+    // candidate so a reload with no running/triggering sessions does no directory
+    // IO at all (the pre-batch behavior for the empty path).
+    let mut bg_snapshot: Option<crate::tool::selfdev::BackgroundTasksSnapshot> = None;
+
     for (session_id, is_headless) in candidates {
         let reload_ctx = ReloadContext::peek_for_session(&session_id).ok().flatten();
         let is_triggering = Some(session_id.as_str()) == triggering_session;
-        let Some(directive) = ReloadContext::recovery_directive_for_session(
+        let snapshot =
+            bg_snapshot.get_or_insert_with(crate::tool::selfdev::BackgroundTasksSnapshot::collect);
+        let Some(directive) = ReloadContext::recovery_directive_for_session_with_snapshot(
             &session_id,
             reload_ctx.as_ref(),
             is_headless || !is_triggering,
             None,
+            snapshot,
         ) else {
             super::reload_trace::record_value(
                 reload_id,

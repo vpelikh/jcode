@@ -130,11 +130,32 @@ impl ReloadContext {
         background_task_note: &str,
         restored_turns: Option<usize>,
     ) -> Option<ReloadRecoveryDirective> {
+        Self::recovery_directive_with_note(
+            reload_ctx,
+            was_interrupted,
+            || background_task_note.to_string(),
+            restored_turns,
+        )
+    }
+
+    /// Core of [`Self::recovery_directive`] with a *lazy* note builder.
+    ///
+    /// The note requires a bg-task + await-directory scan, but it is only used
+    /// when a `reload_ctx` directive is actually produced. Taking a closure lets
+    /// the common history-request path (no reload context) skip the scan
+    /// entirely; reload callers pass a closure over an already-collected
+    /// [`BackgroundTasksSnapshot`].
+    fn recovery_directive_with_note(
+        reload_ctx: Option<&Self>,
+        was_interrupted: bool,
+        background_task_note: impl FnOnce() -> String,
+        restored_turns: Option<usize>,
+    ) -> Option<ReloadRecoveryDirective> {
         if let Some(ctx) = reload_ctx {
             return Some(ReloadRecoveryDirective {
                 reconnect_notice: Some(ctx.reconnect_notice_line()),
                 continuation_message: ctx
-                    .continuation_message(background_task_note, restored_turns),
+                    .continuation_message(&background_task_note(), restored_turns),
             });
         }
 
@@ -154,10 +175,45 @@ impl ReloadContext {
         was_interrupted: bool,
         restored_turns: Option<usize>,
     ) -> Option<ReloadRecoveryDirective> {
-        Self::recovery_directive(
+        Self::recovery_directive_with_note(
             reload_ctx,
             was_interrupted,
-            &persisted_background_tasks_note(session_id),
+            // Build the (bg-task + await directory scan) note lazily: it is only
+            // used by the `reload_ctx` branch, so a session that did not reload
+            // (the common history-request case) never pays the scan.
+            || persisted_background_tasks_note(session_id),
+            restored_turns,
+        )
+    }
+
+    /// Like [`Self::recovery_directive_for_session`] but reuses a scan-once
+    /// [`BackgroundTasksSnapshot`] instead of scanning the bg-task and await
+    /// directories for this session. Used by the reload path so a multi-session
+    /// shutdown parses those directories exactly once.
+    pub fn recovery_directive_for_session_with_snapshot(
+        session_id: &str,
+        reload_ctx: Option<&Self>,
+        was_interrupted: bool,
+        restored_turns: Option<usize>,
+        snapshot: &BackgroundTasksSnapshot,
+    ) -> Option<ReloadRecoveryDirective> {
+        Self::recovery_directive_with_note(
+            reload_ctx,
+            was_interrupted,
+            // The note is derived from the already-collected snapshot (no new
+            // directory scan), and only when a directive is actually produced.
+            || {
+                let running_tasks = snapshot
+                    .running_tasks_by_session
+                    .get(session_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                persisted_background_tasks_note_with(
+                    session_id,
+                    running_tasks,
+                    &snapshot.blocked_awaits_by_session,
+                )
+            },
             restored_turns,
         )
     }
@@ -171,12 +227,58 @@ impl ReloadContext {
 }
 
 pub fn persisted_background_tasks_note(session_id: &str) -> String {
+    let snapshot = BackgroundTasksSnapshot::collect();
+    let running_tasks = snapshot
+        .running_tasks_by_session
+        .get(session_id)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    persisted_background_tasks_note_with(
+        session_id,
+        running_tasks,
+        &snapshot.blocked_awaits_by_session,
+    )
+}
+
+/// A scan-once snapshot of the state `persisted_background_tasks_note` needs.
+///
+/// Built once per reload (or per note request) so a multi-session reload parses
+/// the persisted bg-task and await directories a single time instead of once
+/// per session.
+#[derive(Default)]
+pub struct BackgroundTasksSnapshot {
+    pub running_tasks_by_session:
+        std::collections::HashMap<String, Vec<crate::background::TaskStatusFile>>,
+    pub blocked_awaits_by_session:
+        std::collections::HashMap<String, Vec<crate::server::PersistedAwaitMembersState>>,
+}
+
+impl BackgroundTasksSnapshot {
+    /// Collect the current bg-task and pending-await state in one directory scan
+    /// each, indexed by session id.
+    pub fn collect() -> Self {
+        Self {
+            running_tasks_by_session: crate::background::global()
+                .persisted_detached_running_tasks_by_session(),
+            blocked_awaits_by_session: crate::server::pending_await_members_by_session(),
+        }
+    }
+}
+
+/// Build the reload recovery note for `session_id` from an already-collected
+/// snapshot, so the caller can reuse one scan across every session in a reload.
+pub fn persisted_background_tasks_note_with(
+    session_id: &str,
+    running_tasks: &[crate::background::TaskStatusFile],
+    blocked_awaits_by_session: &std::collections::HashMap<
+        String,
+        Vec<crate::server::PersistedAwaitMembersState>,
+    >,
+) -> String {
     let mut notes = String::new();
 
-    let tasks =
-        crate::background::global().persisted_detached_running_tasks_for_session(session_id);
-    if !tasks.is_empty() {
-        let task_list = tasks
+    if !running_tasks.is_empty() {
+        let task_list = running_tasks
             .iter()
             .map(|task| format!("{} ({})", task.task_id, task.tool_name))
             .collect::<Vec<_>>()
@@ -191,8 +293,10 @@ pub fn persisted_background_tasks_note(session_id: &str) -> String {
     // Background awaits auto-resume on the new server and report via
     // notify/wake, so they need no agent action. Only blocking awaits, whose
     // socket waiter dies with the old process, must be rerun by the agent.
-    let pending_awaits: Vec<_> = crate::server::pending_await_members_for_session(session_id)
+    let pending_awaits: Vec<_> = blocked_awaits_by_session
+        .get(session_id)
         .into_iter()
+        .flatten()
         .filter(|state| !state.background)
         .collect();
     if !pending_awaits.is_empty() {
@@ -423,5 +527,71 @@ impl SelfDevTool {
                 )))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// `recovery_directive_for_session` is the reload-recovery caller (via
+    /// `history_reload_recovery_snapshot`). It must NOT scan the bg-task/await
+    /// directories when no reload context exists and `was_interrupted` is false,
+    /// because that path produces no directive at all. The scan is expressed as a
+    /// closure; here a note builder that records invocation proves the lazy path
+    /// skips it. (The closure is passed through a tiny shim so we can observe the
+    /// call without needing the real directory scan.)
+    #[test]
+    fn recovery_note_is_not_built_when_no_directive_is_produced() {
+        let note_calls = Cell::new(0usize);
+        let note = || {
+            note_calls.set(note_calls.get() + 1);
+            "should never be built".to_string()
+        };
+
+        // No reload context and not interrupted: no directive, and the note is
+        // never built. This mirrors `recovery_directive_for_session(session, None,
+        // false, None)` on the common history-request path.
+        let directive = ReloadContext::recovery_directive_with_note(None, false, note, None);
+        assert!(directive.is_none(), "no directive should be produced");
+        assert_eq!(
+            note_calls.get(),
+            0,
+            "the bg-task/await note must not be built when no directive is produced"
+        );
+    }
+
+    /// When a reload context IS present the note must be built (the directive's
+    /// continuation message embeds it). This pins the complementary half: laziness
+    /// must not skip a note that is actually needed.
+    #[test]
+    fn recovery_note_is_built_when_a_directive_is_produced() {
+        let note_calls = Cell::new(0usize);
+        let note = || {
+            note_calls.set(note_calls.get() + 1);
+            "\nPersisted background task(s) detected.".to_string()
+        };
+
+        let ctx = ReloadContext {
+            task_context: None,
+            version_before: "old".to_string(),
+            version_after: "new".to_string(),
+            session_id: "session-lazy-note".to_string(),
+            timestamp: "2026-04-19T00:00:00Z".to_string(),
+        };
+        let directive = ReloadContext::recovery_directive_with_note(Some(&ctx), true, note, None)
+            .expect("a reload context must produce a directive");
+        assert_eq!(
+            note_calls.get(),
+            1,
+            "the note must be built exactly once when a directive is produced"
+        );
+        assert!(
+            directive
+                .continuation_message
+                .contains("Persisted background task(s)"),
+            "the built note must be embedded in the continuation message"
+        );
     }
 }

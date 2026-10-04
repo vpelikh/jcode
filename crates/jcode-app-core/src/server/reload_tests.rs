@@ -648,3 +648,269 @@ async fn graceful_shutdown_sessions_times_out_on_partial_checkpoint() {
         "the laggard session may remain running without blocking reload past the deadline"
     );
 }
+
+/// Integration: the exact user-facing outcome of the reload path. A blocking
+/// session that owns a still-running background task must, after
+/// `persist_reload_recovery_intents`, produce a recovery directive whose
+/// continuation message names that task. This drives the note end to end through
+/// the same public seam the client reads (`pending_directive_for_session`) and
+/// exercises the scan-once snapshot against real files on disk.
+#[test]
+fn persist_reload_recovery_intents_names_a_persisted_running_task() -> anyhow::Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp_home = tempfile::TempDir::new()?;
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp_home.path());
+
+    // A detached, still-running background task owned by the "peer" session.
+    // The pid is this test process so `is_process_running` reports true.
+    let self_pid = std::process::id();
+    let status = crate::background::TaskStatusFile {
+        task_id: "reload-bg-1".to_string(),
+        tool_name: "bash".to_string(),
+        display_name: None,
+        session_id: "peer".to_string(),
+        status: crate::bus::BackgroundTaskStatus::Running,
+        exit_code: None,
+        error: None,
+        started_at: chrono::Utc::now().to_rfc3339(),
+        completed_at: None,
+        duration_secs: None,
+        pid: Some(self_pid),
+        owner_pid: Some(self_pid),
+        owner_instance: None,
+        detached: true,
+        notify: true,
+        wake: false,
+        progress: None,
+        event_history: Vec::new(),
+        stall_wake_seconds: None,
+    };
+    std::fs::write(
+        crate::background::global().status_path_for("reload-bg-1"),
+        serde_json::to_string_pretty(&status)?,
+    )?;
+
+    // A reload context is required for the peer to receive a continuation
+    // message that carries the background note. Save it before persisting.
+    crate::tool::selfdev::ReloadContext {
+        task_context: None,
+        version_before: "v0".to_string(),
+        version_after: "v1".to_string(),
+        session_id: "peer".to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    }
+    .save()?;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let swarm_members = Arc::new(RwLock::new(HashMap::from([
+        ("initiator".to_string(), member("initiator", "running")),
+        ("peer".to_string(), member("peer", "running")),
+    ])));
+    runtime.block_on(persist_reload_recovery_intents(
+        "reload-bg-scan-once",
+        &swarm_members,
+        Some("initiator"),
+    ));
+
+    let directive = crate::server::reload_recovery::pending_directive_for_session("peer")
+        .expect("claim peer recovery")
+        .expect("peer recovery intent should exist");
+    assert!(
+        directive.continuation_message.contains("reload-bg-1"),
+        "the continuation message must name the still-running background task: {}",
+        directive.continuation_message
+    );
+
+    let _ = std::fs::remove_file(crate::background::global().status_path_for("reload-bg-1"));
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    Ok(())
+}
+
+/// Scale/edge integration for the scan-once reload note: many running sessions
+/// each owning a distinct still-running background task must each get a
+/// directive naming *its own* task. This is the regime where the old per-session
+/// scan cost O(sessions x files); the snapshot must group by session correctly.
+#[test]
+fn persist_reload_recovery_intents_groups_many_sessions_by_own_task() -> anyhow::Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp_home = tempfile::TempDir::new()?;
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp_home.path());
+
+    const N: usize = 25;
+    let self_pid = std::process::id();
+    let mut members = HashMap::new();
+    members.insert("initiator".to_string(), member("initiator", "running"));
+    for i in 0..N {
+        let sid = format!("peer-{i}");
+        members.insert(sid.clone(), member(&sid, "running"));
+
+        let task_id = format!("bg-task-{i}");
+        let status = crate::background::TaskStatusFile {
+            task_id: task_id.clone(),
+            tool_name: "bash".to_string(),
+            display_name: None,
+            session_id: sid.clone(),
+            status: crate::bus::BackgroundTaskStatus::Running,
+            exit_code: None,
+            error: None,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            completed_at: None,
+            duration_secs: None,
+            pid: Some(self_pid),
+            owner_pid: Some(self_pid),
+            owner_instance: None,
+            detached: true,
+            notify: true,
+            wake: false,
+            progress: None,
+            event_history: Vec::new(),
+            stall_wake_seconds: None,
+        };
+        std::fs::write(
+            crate::background::global().status_path_for(&task_id),
+            serde_json::to_string_pretty(&status)?,
+        )?;
+
+        // Each peer needs a reload context to receive a continuation message.
+        crate::tool::selfdev::ReloadContext {
+            task_context: None,
+            version_before: "v0".to_string(),
+            version_after: "v1".to_string(),
+            session_id: sid,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        }
+        .save()?;
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let swarm_members = Arc::new(RwLock::new(members));
+    runtime.block_on(persist_reload_recovery_intents(
+        "reload-many-sessions",
+        &swarm_members,
+        Some("initiator"),
+    ));
+
+    for i in 0..N {
+        let sid = format!("peer-{i}");
+        let directive = crate::server::reload_recovery::pending_directive_for_session(&sid)
+            .expect("claim peer recovery")
+            .unwrap_or_else(|| panic!("peer {i} should have a recovery intent"));
+        assert!(
+            directive
+                .continuation_message
+                .contains(&format!("bg-task-{i}")),
+            "peer {i} must name its own task, got: {}",
+            directive.continuation_message
+        );
+        // It must not leak another session's task.
+        let other = (i + 1) % N;
+        assert!(
+            !directive
+                .continuation_message
+                .contains(&format!("bg-task-{other}")),
+            "peer {i} must not name peer {other}'s task"
+        );
+    }
+
+    // Clean up the shared bg-task files this test created.
+    for i in 0..N {
+        let _ = std::fs::remove_file(
+            crate::background::global().status_path_for(&format!("bg-task-{i}")),
+        );
+    }
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    Ok(())
+}
+
+/// An empty reload (no running/triggering sessions) must do no bg-task/await
+/// directory IO. The snapshot is now collected lazily on the first candidate, so
+/// the scan that prunes stale await state never runs here. A stale await file (a
+/// scan would delete it as a side effect) must therefore survive, and the intent
+/// store must stay empty.
+#[test]
+fn persist_reload_recovery_intents_with_no_candidates_performs_no_scan() -> anyhow::Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp_home = tempfile::TempDir::new()?;
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp_home.path());
+    let prev_runtime = std::env::var_os("JCODE_RUNTIME_DIR");
+    crate::env::set_var("JCODE_RUNTIME_DIR", temp_home.path().join("run"));
+
+    // A stale await-state file: a directory scan would prune it (its deadline is
+    // far past the pending TTL). Its survival is the "no scan happened" signal.
+    let stale = crate::server::await_members_state::PersistedAwaitMembersState {
+        key: "stale-await".to_string(),
+        session_id: "ns-none".to_string(),
+        swarm_id: "swarm-x".to_string(),
+        target_status: vec!["ready".to_string()],
+        requested_ids: vec!["w1".to_string()],
+        mode: None,
+        created_at_unix_ms: 1,
+        // deadline far in the past -> is_stale() is true.
+        deadline_unix_ms: 1,
+        background: false,
+        notify: true,
+        wake: true,
+        final_response: None,
+    };
+    crate::server::await_members_state::save_state(&stale);
+    let stale_path = crate::server::await_members_state::state_path_for_key("stale-await");
+    assert!(
+        stale_path.exists(),
+        "fixture must have written the stale file"
+    );
+
+    // No running members and no triggering session -> candidates is empty.
+    let swarm_members = Arc::new(RwLock::new(HashMap::from([(
+        "idle".to_string(),
+        member("idle", "ready"),
+    )])));
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(persist_reload_recovery_intents(
+        "reload-empty",
+        &swarm_members,
+        None,
+    ));
+
+    assert!(
+        stale_path.exists(),
+        "an empty reload must not scan (and prune) the await directory"
+    );
+    assert!(
+        crate::server::reload_recovery::pending_directive_for_session("ns-none")
+            .expect("read store")
+            .is_none(),
+        "an empty reload must persist no recovery intent"
+    );
+
+    let _ = std::fs::remove_file(&stale_path);
+    if let Some(prev_runtime) = prev_runtime {
+        crate::env::set_var("JCODE_RUNTIME_DIR", prev_runtime);
+    } else {
+        crate::env::remove_var("JCODE_RUNTIME_DIR");
+    }
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    Ok(())
+}

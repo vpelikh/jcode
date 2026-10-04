@@ -655,7 +655,9 @@ use self::state::{
 pub(crate) use self::state::SessionInterruptQueues;
 pub use crate::plan::{SwarmTaskProgress, VersionedPlan};
 
-pub use self::await_members_state::pending_await_members_for_session;
+pub use self::await_members_state::{
+    PersistedAwaitMembersState, pending_await_members_by_session, pending_await_members_for_session,
+};
 use self::reload_state::clear_reload_marker_if_stale_for_pid;
 #[cfg(test)]
 pub(crate) use self::reload_state::subscribe_reload_signal_for_tests;

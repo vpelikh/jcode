@@ -967,3 +967,74 @@ async fn running_snapshot_for_session_filters_by_session_and_live_status() -> Re
 
     Ok(())
 }
+
+/// The reload recovery note needs the detached-running tasks for every live
+/// session. Resolving them through the per-session lookup re-read the whole task
+/// directory once per session; the batch lookup must return exactly the same
+/// per-session results from a single scan.
+#[tokio::test]
+async fn persisted_detached_running_tasks_by_session_matches_per_session_lookup() -> Result<()> {
+    let tmp = tempdir()?;
+    let manager = BackgroundTaskManager::with_output_dir(tmp.path().to_path_buf());
+
+    // Two sessions with one detached running task each; the pid is this test
+    // process, so `is_process_running` reports true.
+    let self_pid = std::process::id();
+    for (task_id, session_id) in [("task-a1", "session-A"), ("task-b1", "session-B")] {
+        let status = TaskStatusFile {
+            task_id: task_id.to_string(),
+            tool_name: "bash".to_string(),
+            display_name: None,
+            session_id: session_id.to_string(),
+            status: crate::bus::BackgroundTaskStatus::Running,
+            exit_code: None,
+            error: None,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            completed_at: None,
+            duration_secs: None,
+            pid: Some(self_pid),
+            owner_pid: Some(self_pid),
+            owner_instance: None,
+            detached: true,
+            notify: true,
+            wake: false,
+            progress: None,
+            event_history: Vec::new(),
+            stall_wake_seconds: None,
+        };
+        std::fs::write(
+            manager.status_path_for(task_id),
+            serde_json::to_string_pretty(&status)?,
+        )?;
+    }
+
+    let batch = manager.persisted_detached_running_tasks_by_session();
+    assert_eq!(
+        batch.get("session-A").map(Vec::len),
+        Some(1),
+        "batch scan must find session A's running task"
+    );
+    assert_eq!(
+        batch.get("session-B").map(Vec::len),
+        Some(1),
+        "batch scan must find session B's running task"
+    );
+    assert_eq!(
+        batch.get("session-A").map(|v| v[0].task_id.as_str()),
+        Some("task-a1")
+    );
+
+    // The per-session lookup must agree exactly with the batch result for every
+    // session (and for a session with no tasks).
+    let ids = |tasks: Vec<TaskStatusFile>| -> Vec<String> {
+        tasks.into_iter().map(|t| t.task_id).collect()
+    };
+    for session_id in ["session-A", "session-B", "session-missing"] {
+        assert_eq!(
+            ids(manager.persisted_detached_running_tasks_for_session(session_id)),
+            ids(batch.get(session_id).cloned().unwrap_or_default()),
+            "per-session lookup must match the batch result for {session_id}"
+        );
+    }
+    Ok(())
+}

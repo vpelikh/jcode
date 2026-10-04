@@ -169,6 +169,13 @@ pub(super) fn save_state(state: &PersistedAwaitMembersState) {
     save_json_state(AWAIT_MEMBERS_DIR, &state.key, state, "await_members state")
 }
 
+/// Path of a persisted await-state file. Test-only: lets a test plant a file and
+/// later assert it survived (proving no directory scan pruned it).
+#[cfg(test)]
+pub(super) fn state_path_for_key(key: &str) -> std::path::PathBuf {
+    state_dir(AWAIT_MEMBERS_DIR).join(format!("{key}.json"))
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "pending await state mirrors persisted fields and existing call sites"
@@ -225,12 +232,30 @@ pub(super) fn persist_final_response(
 }
 
 pub fn pending_await_members_for_session(session_id: &str) -> Vec<PersistedAwaitMembersState> {
-    let mut pending: Vec<PersistedAwaitMembersState> = all_pending_await_members()
-        .into_iter()
-        .filter(|state| state.session_id == session_id)
-        .collect();
-    pending.sort_by_key(|state| state.deadline_unix_ms);
-    pending
+    pending_await_members_by_session()
+        .remove(session_id)
+        .unwrap_or_default()
+}
+
+/// Load every still-pending await once and index it by `session_id`.
+///
+/// The reload recovery path asks for this per session; resolving it by calling
+/// [`pending_await_members_for_session`] for each session re-read and re-parsed
+/// every await state file N times. Scanning once and grouping by session keeps
+/// behavior identical (each list is ordered by `deadline_unix_ms`) while
+/// removing the multiplicative directory scan.
+pub fn pending_await_members_by_session() -> HashMap<String, Vec<PersistedAwaitMembersState>> {
+    let mut by_session: HashMap<String, Vec<PersistedAwaitMembersState>> = HashMap::new();
+    for state in all_pending_await_members() {
+        by_session
+            .entry(state.session_id.clone())
+            .or_default()
+            .push(state);
+    }
+    for pending in by_session.values_mut() {
+        pending.sort_by_key(|state| state.deadline_unix_ms);
+    }
+    by_session
 }
 
 /// Load every still-pending await state across all sessions, pruning stale
@@ -275,4 +300,71 @@ pub(super) fn all_pending_await_members_including_expired() -> Vec<PersistedAwai
     }
 
     pending
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A session-scoped await helper used by the reload note. Resolving it
+    /// per-session re-read every await file once per session; the batch lookup
+    /// must return identical groupings from a single scan.
+    #[test]
+    fn pending_await_members_by_session_matches_per_session_lookup() {
+        let _lock = crate::storage::lock_test_env();
+        let runtime = tempfile::tempdir().expect("temp runtime");
+        let prev_runtime = std::env::var_os("JCODE_RUNTIME_DIR");
+        crate::env::set_var("JCODE_RUNTIME_DIR", runtime.path());
+
+        let now = now_unix_ms();
+        ensure_pending_state(
+            "key-a",
+            "session-A",
+            "swarm-1",
+            &["w1".to_string()],
+            &["ready".to_string()],
+            None,
+            now + 60_000,
+            false,
+            true,
+            true,
+        );
+        ensure_pending_state(
+            "key-b",
+            "session-B",
+            "swarm-1",
+            &[],
+            &["ready".to_string()],
+            None,
+            now + 30_000,
+            false,
+            true,
+            true,
+        );
+
+        let batch = pending_await_members_by_session();
+        assert_eq!(batch.get("session-A").map(Vec::len), Some(1));
+        assert_eq!(batch.get("session-B").map(Vec::len), Some(1));
+        assert_eq!(
+            batch.get("session-A").map(|v| v[0].key.as_str()),
+            Some("key-a")
+        );
+
+        let ids = |states: Vec<PersistedAwaitMembersState>| -> Vec<String> {
+            states.into_iter().map(|s| s.key).collect()
+        };
+        for session_id in ["session-A", "session-B", "session-missing"] {
+            assert_eq!(
+                ids(pending_await_members_for_session(session_id)),
+                ids(batch.get(session_id).cloned().unwrap_or_default()),
+                "per-session lookup must match the batch result for {session_id}"
+            );
+        }
+
+        if let Some(prev_runtime) = prev_runtime {
+            crate::env::set_var("JCODE_RUNTIME_DIR", prev_runtime);
+        } else {
+            crate::env::remove_var("JCODE_RUNTIME_DIR");
+        }
+    }
 }

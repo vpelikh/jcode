@@ -1444,3 +1444,95 @@ fn reconcile_keeps_running_request_not_yet_registered_in_live_task_map() {
     assert_eq!(reloaded.state, BuildRequestState::Queued);
     assert!(reloaded.error.is_none());
 }
+
+/// The reload note must be identical whether it is built from a per-session
+/// scan or from a scan-once snapshot. The reload path uses the snapshot form so
+/// a multi-session reload parses the bg-task/await directories exactly once.
+#[test]
+fn persisted_background_tasks_note_with_matches_the_snapshot_fields() {
+    let session_running = "session-running";
+    let status = background::TaskStatusFile {
+        task_id: "bg-1".to_string(),
+        tool_name: "bash".to_string(),
+        display_name: None,
+        session_id: session_running.to_string(),
+        status: BackgroundTaskStatus::Running,
+        exit_code: None,
+        error: None,
+        started_at: Utc::now().to_rfc3339(),
+        completed_at: None,
+        duration_secs: None,
+        pid: Some(std::process::id()),
+        owner_pid: Some(std::process::id()),
+        owner_instance: None,
+        detached: true,
+        notify: true,
+        wake: false,
+        progress: None,
+        event_history: Vec::new(),
+        stall_wake_seconds: None,
+    };
+
+    let mut running_tasks_by_session = std::collections::HashMap::new();
+    running_tasks_by_session.insert(session_running.to_string(), vec![status]);
+
+    // A pending *blocking* await for a different session must be surfaced; a
+    // background await must not.
+    let await_state =
+        |key: &str, session: &str, background: bool| crate::server::PersistedAwaitMembersState {
+            key: key.to_string(),
+            session_id: session.to_string(),
+            swarm_id: "swarm-1".to_string(),
+            target_status: vec!["ready".to_string()],
+            requested_ids: vec!["w1".to_string()],
+            mode: None,
+            created_at_unix_ms: 0,
+            deadline_unix_ms: u64::MAX,
+            background,
+            notify: true,
+            wake: true,
+            final_response: None,
+        };
+    let mut blocked_awaits_by_session = std::collections::HashMap::new();
+    blocked_awaits_by_session.insert(
+        "session-blocking".to_string(),
+        vec![await_state("await-blocking", "session-blocking", false)],
+    );
+    blocked_awaits_by_session.insert(
+        "session-background".to_string(),
+        vec![await_state("await-bg", "session-background", true)],
+    );
+
+    let note = crate::tool::selfdev::persisted_background_tasks_note_with(
+        session_running,
+        running_tasks_by_session
+            .get(session_running)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+        &blocked_awaits_by_session,
+    );
+    assert!(
+        note.contains("bg-1 (bash)"),
+        "running task must be named: {note}"
+    );
+
+    let blocking_note = crate::tool::selfdev::persisted_background_tasks_note_with(
+        "session-blocking",
+        &[],
+        &blocked_awaits_by_session,
+    );
+    assert!(
+        blocking_note.contains("await_members"),
+        "a blocking await must be surfaced: {blocking_note}"
+    );
+
+    let background_note = crate::tool::selfdev::persisted_background_tasks_note_with(
+        "session-background",
+        &[],
+        &blocked_awaits_by_session,
+    );
+    assert!(
+        background_note.is_empty(),
+        "a background await must not be surfaced: {background_note}"
+    );
+}
