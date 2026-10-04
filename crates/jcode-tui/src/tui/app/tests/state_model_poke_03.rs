@@ -498,6 +498,12 @@ impl Provider for CountingModelRoutesProvider {
 
 #[test]
 fn test_subagent_model_large_catalog_uses_cached_searchable_picker() {
+    // The picker reads the process-global model catalog and the shared test
+    // JCODE_HOME/config, both mutated by sibling tests. Serialize and reset so
+    // a concurrently running test cannot swap the routes out from under this
+    // one and leave the picker with the wrong entry count.
+    let _env_lock = crate::storage::lock_test_env();
+    crate::provider::models::reset_model_catalog_services_for_tests();
     ensure_test_jcode_home_if_unset();
     clear_persisted_test_ui_state();
     crate::tui::ui::clear_test_render_state_for_tests();
