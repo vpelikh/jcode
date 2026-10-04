@@ -34,8 +34,12 @@ pub fn color_capability() -> ColorCapability {
 /// `COLORTERM`/`TERM`: a hosted CI runner detects 256-color and quantizes
 /// every rendered color, which breaks family matching in
 /// `role_for_rendered`. The override stays set for the rest of the process,
-/// which is safe for tests (color capability is not what other tests assert)
-/// and unreachable in production, where nothing calls this.
+/// which is safe for tests (no test asserts a quantized result through this
+/// global path; those that exercise quantization call `detect_color_capability`
+/// or `rgb_via` directly) and unreachable in production, where nothing calls
+/// this. Because the pin is irreversible, tests that DO need 256-color
+/// quantization through `color_capability` must not run after a pinning test
+/// in the same binary.
 pub fn pin_truecolor_for_tests() {
     CAPABILITY_OVERRIDE.store(1, std::sync::atomic::Ordering::Relaxed);
 }
