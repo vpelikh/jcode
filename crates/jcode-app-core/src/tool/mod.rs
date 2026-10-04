@@ -911,7 +911,9 @@ impl Registry {
             let needs_canary = resolved_name == "jcode_docs";
             let working_dir = ctx.working_dir.clone();
             let session_id = ctx.session_id.clone();
-            let (desktop, is_canary) = tokio::task::spawn_blocking(move || {
+            // `execute` is only driven from tokio runtimes in this codebase, so
+            // `spawn_blocking` always has a runtime here.
+            let probe = tokio::task::spawn_blocking(move || {
                 let desktop = working_dir
                     .as_deref()
                     .is_some_and(|dir| jcode_selfdev_types::desktop_repo_root(dir).is_some());
@@ -921,8 +923,23 @@ impl Registry {
                         .unwrap_or(false);
                 (desktop, is_canary)
             })
-            .await
-            .unwrap_or((false, false));
+            .await;
+            let (desktop, is_canary) = match probe {
+                Ok(state) => state,
+                Err(error) => {
+                    // The probe closure only returns on panic/abort. Fail closed
+                    // rather than defaulting to "not desktop, not canary", which
+                    // would fail OPEN: CLI selfdev/debug_socket inside a Desktop
+                    // checkout would be allowed and product separation silently
+                    // skipped.
+                    crate::logging::warn(&format!(
+                        "product-separation probe for '{resolved_name}' failed ({error}); refusing the call"
+                    ));
+                    return Err(anyhow::anyhow!(
+                        "Could not verify product separation for '{resolved_name}'; refusing to run it."
+                    ));
+                }
+            };
             if let Some(error) = product_separation_error(resolved_name, is_canary, desktop) {
                 return Err(error);
             }

@@ -694,6 +694,12 @@ pub(crate) fn subscribe_reload_signal_for_tests()
 
 /// Test-only: clear the global reload signal and ack channels so subscribers
 /// start from a clean state.
+///
+/// Callers MUST hold [`crate::storage::lock_test_env`]. These channels are
+/// process globals; without the lock a reset could clear a signal a
+/// concurrently running test is waiting on. Every current caller
+/// (`subscribe_reload_signal_for_tests` and the selfdev/reload tests) takes
+/// that lock.
 #[cfg(test)]
 pub(crate) fn reset_reload_channels_for_tests() {
     reload_signal().0.send_replace(None);
