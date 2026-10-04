@@ -2387,7 +2387,7 @@ async fn real_socket_set_handoff_resume_round_trips_done_and_error() -> Result<(
     let socket_path = sock_dir.path().join("jcode-e2e.sock");
 
     struct Restore {
-        prev: [(&'static str, Option<std::ffi::OsString>); 2],
+        prev: [(&'static str, Option<std::ffi::OsString>); 3],
     }
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -2401,14 +2401,21 @@ async fn real_socket_set_handoff_resume_round_trips_done_and_error() -> Result<(
     }
     let prev_home = std::env::var_os("JCODE_HOME");
     let prev_socket = std::env::var_os("JCODE_SOCKET");
+    let prev_runtime = std::env::var_os("JCODE_RUNTIME_DIR");
     let _restore = Restore {
         prev: [
             ("JCODE_HOME", prev_home),
             ("JCODE_SOCKET", prev_socket),
+            ("JCODE_RUNTIME_DIR", prev_runtime),
         ],
     };
     crate::env::set_var("JCODE_HOME", home.path());
     crate::env::set_var("JCODE_SOCKET", &socket_path);
+    // The real server takes a process-wide daemon lock in `runtime_dir()`. Point
+    // it at this test's private socket dir so the test does not contend for the
+    // lock held by a live jcode daemon (the dev's own session) and fail with
+    // "server should accept within 10s". Sibling socket tests isolate it too.
+    crate::env::set_var("JCODE_RUNTIME_DIR", sock_dir.path());
 
     // Seed a handoff the server can resolve.
     let work = home.path().join("work");
@@ -2569,7 +2576,7 @@ async fn real_socket_handoff_resume_by_id_round_trips() -> Result<()> {
     let socket_path = sock_dir.path().join("jcode-e2e.sock");
 
     struct Restore {
-        prev: [(&'static str, Option<std::ffi::OsString>); 2],
+        prev: [(&'static str, Option<std::ffi::OsString>); 3],
     }
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -2583,14 +2590,21 @@ async fn real_socket_handoff_resume_by_id_round_trips() -> Result<()> {
     }
     let prev_home = std::env::var_os("JCODE_HOME");
     let prev_socket = std::env::var_os("JCODE_SOCKET");
+    let prev_runtime = std::env::var_os("JCODE_RUNTIME_DIR");
     let _restore = Restore {
         prev: [
             ("JCODE_HOME", prev_home),
             ("JCODE_SOCKET", prev_socket),
+            ("JCODE_RUNTIME_DIR", prev_runtime),
         ],
     };
     crate::env::set_var("JCODE_HOME", home.path());
     crate::env::set_var("JCODE_SOCKET", &socket_path);
+    // The real server takes a process-wide daemon lock in `runtime_dir()`. Point
+    // it at this test's private socket dir so the test does not contend for the
+    // lock held by a live jcode daemon (the dev's own session) and fail with
+    // "server should accept within 10s". Sibling socket tests isolate it too.
+    crate::env::set_var("JCODE_RUNTIME_DIR", sock_dir.path());
 
     // Seed a handoff the server can resolve.
     let work = home.path().join("work");
@@ -2786,7 +2800,7 @@ async fn real_socket_handoff_save_round_trips_and_captures_live_session() -> Res
     let socket_path = sock_dir.path().join("jcode-handoff-save.sock");
 
     struct Restore {
-        prev: [(&'static str, Option<std::ffi::OsString>); 2],
+        prev: [(&'static str, Option<std::ffi::OsString>); 3],
     }
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -2800,14 +2814,21 @@ async fn real_socket_handoff_save_round_trips_and_captures_live_session() -> Res
     }
     let prev_home = std::env::var_os("JCODE_HOME");
     let prev_socket = std::env::var_os("JCODE_SOCKET");
+    let prev_runtime = std::env::var_os("JCODE_RUNTIME_DIR");
     let _restore = Restore {
         prev: [
             ("JCODE_HOME", prev_home),
             ("JCODE_SOCKET", prev_socket),
+            ("JCODE_RUNTIME_DIR", prev_runtime),
         ],
     };
     crate::env::set_var("JCODE_HOME", home.path());
     crate::env::set_var("JCODE_SOCKET", &socket_path);
+    // The real server takes a process-wide daemon lock in `runtime_dir()`. Point
+    // it at this test's private socket dir so the test does not contend for the
+    // lock held by a live jcode daemon (the dev's own session) and fail with
+    // "server should accept within 10s". Sibling socket tests isolate it too.
+    crate::env::set_var("JCODE_RUNTIME_DIR", sock_dir.path());
 
     let work = home.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
@@ -2965,7 +2986,7 @@ async fn real_socket_handoff_list_and_import_round_trip() -> Result<()> {
     let socket_path = sock_dir.path().join("jcode-handoff-list.sock");
 
     struct Restore {
-        prev: [(&'static str, Option<std::ffi::OsString>); 2],
+        prev: [(&'static str, Option<std::ffi::OsString>); 3],
     }
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -2979,14 +3000,21 @@ async fn real_socket_handoff_list_and_import_round_trip() -> Result<()> {
     }
     let prev_home = std::env::var_os("JCODE_HOME");
     let prev_socket = std::env::var_os("JCODE_SOCKET");
+    let prev_runtime = std::env::var_os("JCODE_RUNTIME_DIR");
     let _restore = Restore {
         prev: [
             ("JCODE_HOME", prev_home),
             ("JCODE_SOCKET", prev_socket),
+            ("JCODE_RUNTIME_DIR", prev_runtime),
         ],
     };
     crate::env::set_var("JCODE_HOME", home.path());
     crate::env::set_var("JCODE_SOCKET", &socket_path);
+    // The real server takes a process-wide daemon lock in `runtime_dir()`. Point
+    // it at this test's private socket dir so the test does not contend for the
+    // lock held by a live jcode daemon (the dev's own session) and fail with
+    // "server should accept within 10s". Sibling socket tests isolate it too.
+    crate::env::set_var("JCODE_RUNTIME_DIR", sock_dir.path());
 
     // Seed a handoff the server can list and a source snapshot to export+import.
     let work = home.path().join("work");
