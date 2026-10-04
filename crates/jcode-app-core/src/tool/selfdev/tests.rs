@@ -513,6 +513,10 @@ async fn test_action_queues_command_in_test_mode() {
 
 #[tokio::test]
 async fn do_reload_returns_after_ack_in_direct_mode() {
+    // The reload signal/ack channels are process globals. Hold the shared env
+    // lock so this test cannot interleave with the subscriber-based tests that
+    // reset those channels mid-run.
+    let _storage_guard = crate::storage::lock_test_env();
     let request_id = server::send_reload_signal("direct-hash".to_string(), None, true);
     let waiter = tokio::spawn({
         let request_id = request_id.clone();
