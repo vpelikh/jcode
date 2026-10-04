@@ -2985,3 +2985,24 @@ async fn agentgrep_find_mode_runs_normally_and_is_not_redirected() {
     );
     clear_session_tool_policy("enforcement-find-mode-test");
 }
+
+/// `run_blocking_probe` must offload to the blocking pool on a tokio runtime
+/// and run inline off it (where `spawn_blocking` would otherwise panic). Both
+/// branches pin the helper's contract; the inline path is what a bare library
+/// caller on a non-tokio executor hits.
+#[test]
+fn run_blocking_probe_runs_inline_without_a_tokio_runtime() {
+    // No runtime is active on this plain `#[test]` thread.
+    assert!(
+        tokio::runtime::Handle::try_current().is_err(),
+        "this test must run outside a tokio runtime to exercise the inline path"
+    );
+    let result = futures::executor::block_on(run_blocking_probe(|| 7u32));
+    assert_eq!(result.ok(), Some(7));
+}
+
+#[tokio::test]
+async fn run_blocking_probe_offloads_on_a_tokio_runtime() {
+    let result = run_blocking_probe(|| "offloaded".to_string()).await;
+    assert_eq!(result.ok().as_deref(), Some("offloaded"));
+}
