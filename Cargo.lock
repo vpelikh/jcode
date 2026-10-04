@@ -1591,8 +1591,8 @@ dependencies = [
 
 [[package]]
 name = "compass-agent-graph"
-version = "0.3.28"
-source = "git+https://github.com/crabbuild/compass?tag=compass-v0.3.28#c769bccbf1e354c438639916160f7c7d85437ff5"
+version = "0.4.2"
+source = "git+https://github.com/crabbuild/compass?tag=compass-v0.4.2#b204213c68578fb789046f43d99772e141f9ab5e"
 dependencies = [
  "compass-model",
  "compass-store",
@@ -1604,8 +1604,8 @@ dependencies = [
 
 [[package]]
 name = "compass-analysis"
-version = "0.3.28"
-source = "git+https://github.com/crabbuild/compass?tag=compass-v0.3.28#c769bccbf1e354c438639916160f7c7d85437ff5"
+version = "0.4.2"
+source = "git+https://github.com/crabbuild/compass?tag=compass-v0.4.2#b204213c68578fb789046f43d99772e141f9ab5e"
 dependencies = [
  "compass-ir",
  "compass-model",
@@ -1617,8 +1617,8 @@ dependencies = [
 
 [[package]]
 name = "compass-core"
-version = "0.3.28"
-source = "git+https://github.com/crabbuild/compass?tag=compass-v0.3.28#c769bccbf1e354c438639916160f7c7d85437ff5"
+version = "0.4.2"
+source = "git+https://github.com/crabbuild/compass?tag=compass-v0.4.2#b204213c68578fb789046f43d99772e141f9ab5e"
 dependencies = [
  "ahash",
  "compass-agent-graph",
@@ -1653,8 +1653,8 @@ dependencies = [
 
 [[package]]
 name = "compass-cypher"
-version = "0.3.28"
-source = "git+https://github.com/crabbuild/compass?tag=compass-v0.3.28#c769bccbf1e354c438639916160f7c7d85437ff5"
+version = "0.4.2"
+source = "git+https://github.com/crabbuild/compass?tag=compass-v0.4.2#b204213c68578fb789046f43d99772e141f9ab5e"
 dependencies = [
  "compass-model",
  "regex",
@@ -1666,8 +1666,8 @@ dependencies = [
 
 [[package]]
 name = "compass-files"
-version = "0.3.28"
-source = "git+https://github.com/crabbuild/compass?tag=compass-v0.3.28#c769bccbf1e354c438639916160f7c7d85437ff5"
+version = "0.4.2"
+source = "git+https://github.com/crabbuild/compass?tag=compass-v0.4.2#b204213c68578fb789046f43d99772e141f9ab5e"
 dependencies = [
  "atomicwrites",
  "glob",
@@ -1685,8 +1685,8 @@ dependencies = [
 
 [[package]]
 name = "compass-google-workspace"
-version = "0.3.28"
-source = "git+https://github.com/crabbuild/compass?tag=compass-v0.3.28#c769bccbf1e354c438639916160f7c7d85437ff5"
+version = "0.4.2"
+source = "git+https://github.com/crabbuild/compass?tag=compass-v0.4.2#b204213c68578fb789046f43d99772e141f9ab5e"
 dependencies = [
  "compass-media",
  "serde_json",
@@ -1699,8 +1699,8 @@ dependencies = [
 
 [[package]]
 name = "compass-graph"
-version = "0.3.28"
-source = "git+https://github.com/crabbuild/compass?tag=compass-v0.3.28#c769bccbf1e354c438639916160f7c7d85437ff5"
+version = "0.4.2"
+source = "git+https://github.com/crabbuild/compass?tag=compass-v0.4.2#b204213c68578fb789046f43d99772e141f9ab5e"
 dependencies = [
  "ahash",
  "compass-languages",
@@ -1721,8 +1721,8 @@ dependencies = [
 
 [[package]]
 name = "compass-history"
-version = "0.3.28"
-source = "git+https://github.com/crabbuild/compass?tag=compass-v0.3.28#c769bccbf1e354c438639916160f7c7d85437ff5"
+version = "0.4.2"
+source = "git+https://github.com/crabbuild/compass?tag=compass-v0.4.2#b204213c68578fb789046f43d99772e141f9ab5e"
 dependencies = [
  "atomicwrites",
  "compass-analysis",
@@ -1743,8 +1743,8 @@ dependencies = [
 
 [[package]]
 name = "compass-ir"
-version = "0.3.28"
-source = "git+https://github.com/crabbuild/compass?tag=compass-v0.3.28#c769bccbf1e354c438639916160f7c7d85437ff5"
+version = "0.4.2"
+source = "git+https://github.com/crabbuild/compass?tag=compass-v0.4.2#b204213c68578fb789046f43d99772e141f9ab5e"
 dependencies = [
  "serde",
  "serde_json",
@@ -1754,8 +1754,8 @@ dependencies = [
 
 [[package]]
 name = "compass-languages"
-version = "0.3.28"
-source = "git+https://github.com/crabbuild/compass?tag=compass-v0.3.28#c769bccbf1e354c438639916160f7c7d85437ff5"
+version = "0.4.2"
+source = "git+https://github.com/crabbuild/compass?tag=compass-v0.4.2#b204213c68578fb789046f43d99772e141f9ab5e"
 dependencies = [
  "ahash",
  "compass-files",
@@ -1784,8 +1784,8 @@ dependencies = [
 
 [[package]]
 name = "compass-media"
-version = "0.3.28"
-source = "git+https://github.com/crabbuild/compass?tag=compass-v0.3.28#c769bccbf1e354c438639916160f7c7d85437ff5"
+version = "0.4.2"
+source = "git+https://github.com/crabbuild/compass?tag=compass-v0.4.2#b204213c68578fb789046f43d99772e141f9ab5e"
 dependencies = [
  "base64 0.22.1",
  "compass-files",
@@ -1804,8 +1804,8 @@ dependencies = [
 
 [[package]]
 name = "compass-model"
-version = "0.3.28"
-source = "git+https://github.com/crabbuild/compass?tag=compass-v0.3.28#c769bccbf1e354c438639916160f7c7d85437ff5"
+version = "0.4.2"
+source = "git+https://github.com/crabbuild/compass?tag=compass-v0.4.2#b204213c68578fb789046f43d99772e141f9ab5e"
 dependencies = [
  "rayon",
  "rmp-serde",
@@ -1818,8 +1818,8 @@ dependencies = [
 
 [[package]]
 name = "compass-ocr"
-version = "0.3.28"
-source = "git+https://github.com/crabbuild/compass?tag=compass-v0.3.28#c769bccbf1e354c438639916160f7c7d85437ff5"
+version = "0.4.2"
+source = "git+https://github.com/crabbuild/compass?tag=compass-v0.4.2#b204213c68578fb789046f43d99772e141f9ab5e"
 dependencies = [
  "image",
  "oar-ocr",
@@ -1833,10 +1833,11 @@ dependencies = [
 
 [[package]]
 name = "compass-output"
-version = "0.3.28"
-source = "git+https://github.com/crabbuild/compass?tag=compass-v0.3.28#c769bccbf1e354c438639916160f7c7d85437ff5"
+version = "0.4.2"
+source = "git+https://github.com/crabbuild/compass?tag=compass-v0.4.2#b204213c68578fb789046f43d99772e141f9ab5e"
 dependencies = [
  "ahash",
+ "base64 0.22.1",
  "compass-agent-graph",
  "compass-analysis",
  "compass-cypher",
@@ -1846,6 +1847,7 @@ dependencies = [
  "compass-model",
  "compass-pr-intelligence",
  "compass-query",
+ "compass-semantic-diff",
  "rayon",
  "serde",
  "serde_json",
@@ -1859,8 +1861,8 @@ dependencies = [
 
 [[package]]
 name = "compass-pr-intelligence"
-version = "0.3.28"
-source = "git+https://github.com/crabbuild/compass?tag=compass-v0.3.28#c769bccbf1e354c438639916160f7c7d85437ff5"
+version = "0.4.2"
+source = "git+https://github.com/crabbuild/compass?tag=compass-v0.4.2#b204213c68578fb789046f43d99772e141f9ab5e"
 dependencies = [
  "compass-semantic-diff",
  "serde",
@@ -1871,8 +1873,8 @@ dependencies = [
 
 [[package]]
 name = "compass-program"
-version = "0.3.28"
-source = "git+https://github.com/crabbuild/compass?tag=compass-v0.3.28#c769bccbf1e354c438639916160f7c7d85437ff5"
+version = "0.4.2"
+source = "git+https://github.com/crabbuild/compass?tag=compass-v0.4.2#b204213c68578fb789046f43d99772e141f9ab5e"
 dependencies = [
  "ahash",
  "base64 0.22.1",
@@ -1888,8 +1890,8 @@ dependencies = [
 
 [[package]]
 name = "compass-prs"
-version = "0.3.28"
-source = "git+https://github.com/crabbuild/compass?tag=compass-v0.3.28#c769bccbf1e354c438639916160f7c7d85437ff5"
+version = "0.4.2"
+source = "git+https://github.com/crabbuild/compass?tag=compass-v0.4.2#b204213c68578fb789046f43d99772e141f9ab5e"
 dependencies = [
  "compass-files",
  "compass-model",
@@ -1904,13 +1906,13 @@ dependencies = [
 
 [[package]]
 name = "compass-query"
-version = "0.3.28"
-source = "git+https://github.com/crabbuild/compass?tag=compass-v0.3.28#c769bccbf1e354c438639916160f7c7d85437ff5"
+version = "0.4.2"
+source = "git+https://github.com/crabbuild/compass?tag=compass-v0.4.2#b204213c68578fb789046f43d99772e141f9ab5e"
 dependencies = [
- "base64 0.22.1",
  "compass-agent-graph",
  "compass-analysis",
  "compass-cypher",
+ "compass-files",
  "compass-graph",
  "compass-ir",
  "compass-model",
@@ -1928,8 +1930,8 @@ dependencies = [
 
 [[package]]
 name = "compass-reflect"
-version = "0.3.28"
-source = "git+https://github.com/crabbuild/compass?tag=compass-v0.3.28#c769bccbf1e354c438639916160f7c7d85437ff5"
+version = "0.4.2"
+source = "git+https://github.com/crabbuild/compass?tag=compass-v0.4.2#b204213c68578fb789046f43d99772e141f9ab5e"
 dependencies = [
  "compass-files",
  "compass-model",
@@ -1943,8 +1945,8 @@ dependencies = [
 
 [[package]]
 name = "compass-resolve"
-version = "0.3.28"
-source = "git+https://github.com/crabbuild/compass?tag=compass-v0.3.28#c769bccbf1e354c438639916160f7c7d85437ff5"
+version = "0.4.2"
+source = "git+https://github.com/crabbuild/compass?tag=compass-v0.4.2#b204213c68578fb789046f43d99772e141f9ab5e"
 dependencies = [
  "ahash",
  "compass-files",
@@ -1961,10 +1963,11 @@ dependencies = [
 
 [[package]]
 name = "compass-semantic-diff"
-version = "0.3.28"
-source = "git+https://github.com/crabbuild/compass?tag=compass-v0.3.28#c769bccbf1e354c438639916160f7c7d85437ff5"
+version = "0.4.2"
+source = "git+https://github.com/crabbuild/compass?tag=compass-v0.4.2#b204213c68578fb789046f43d99772e141f9ab5e"
 dependencies = [
  "compass-analysis",
+ "compass-graph",
  "compass-history",
  "compass-ir",
  "compass-model",
@@ -1976,8 +1979,8 @@ dependencies = [
 
 [[package]]
 name = "compass-store"
-version = "0.3.28"
-source = "git+https://github.com/crabbuild/compass?tag=compass-v0.3.28#c769bccbf1e354c438639916160f7c7d85437ff5"
+version = "0.4.2"
+source = "git+https://github.com/crabbuild/compass?tag=compass-v0.4.2#b204213c68578fb789046f43d99772e141f9ab5e"
 dependencies = [
  "rusqlite",
  "serde",
@@ -1989,7 +1992,7 @@ dependencies = [
 [[package]]
 name = "compass-tree-sitter-language-pack"
 version = "1.13.1"
-source = "git+https://github.com/crabbuild/compass?tag=compass-v0.3.28#c769bccbf1e354c438639916160f7c7d85437ff5"
+source = "git+https://github.com/crabbuild/compass?tag=compass-v0.4.2#b204213c68578fb789046f43d99772e141f9ab5e"
 dependencies = [
  "ahash",
  "cc",

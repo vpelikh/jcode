@@ -166,6 +166,12 @@ struct CompassQueryInput {
     /// Explicit target symbol for `traverse`.
     #[serde(default)]
     target: Option<String>,
+    /// Restrict `mode=traverse` to directed call edges (and apply that scope to
+    /// its direction diagnostics), excluding structural shortcuts. Compass added
+    /// this opt-in in v0.4; default `false` traverses every relationship kind,
+    /// matching prior behavior. Ignored by other modes.
+    #[serde(default)]
+    calls_only: Option<bool>,
     /// Edge relations to follow for `mode=affected` (defaults to Compass's
     /// [`DEFAULT_AFFECTED_RELATIONS`]). Other modes ignore it.
     #[serde(default)]
@@ -378,6 +384,10 @@ impl Tool for CompassQueryTool {
                 "include_heuristic": {
                     "type": "boolean",
                     "description": "Include lower-confidence heuristic evidence. Ignored by context/affected/orientation."
+                },
+                "calls_only": {
+                    "type": "boolean",
+                    "description": "For mode=traverse, follow only directed call edges. Default false; ignored by other modes."
                 }
             }
         })
@@ -2325,6 +2335,10 @@ fn execute_query(
                 source,
                 target,
                 include_heuristic,
+                // Compass v0.4 opt-in: restrict traversal (and direction
+                // diagnostics) to directed call edges. Default false keeps the
+                // previous all-relationships behavior; callers opt in explicitly.
+                calls_only: params.calls_only.unwrap_or(false),
                 limits,
             })
         }
@@ -3782,6 +3796,7 @@ mod tests {
             symbols: None,
             source: None,
             target: None,
+            calls_only: None,
             relations: None,
             depth: None,
             include_heuristic: None,
@@ -4341,6 +4356,86 @@ mod tests {
         );
     }
 
+    // The v0.4 `calls_only` opt-in must be accepted end to end through the public
+    // tool interface for `traverse`: omitted and explicit-false both succeed with
+    // the default (all-relationships) behavior, and explicit-true succeeds too.
+    // A real index is built so the call reaches the engine rather than failing on
+    // a cold cache.
+    #[tokio::test]
+    async fn calls_only_is_accepted_through_execute_for_traverse() {
+        let (_home, root) = HomeGuard::set();
+        let root = root.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("main.rs"),
+            "fn authenticate(user: &str) { let _ = user; }\n\
+             fn login() { authenticate(\"x\"); }\n",
+        )
+        .unwrap();
+        let edge = resolve_compass_cache(&root);
+        let c = edge.clone();
+        build_compass_index(&root, &c.output_dir, &c.ast_cache_root).expect("build");
+
+        let run = |payload: serde_json::Value| {
+            let root = root.clone();
+            async move {
+                let ctx = ToolContext {
+                    session_id: "s".into(),
+                    message_id: "m".into(),
+                    tool_call_id: "t".into(),
+                    working_dir: Some(root),
+                    stdin_request_tx: None,
+                    graceful_shutdown_signal: None,
+                    execution_mode: ToolExecutionMode::Direct,
+                };
+                CompassQueryTool::new().execute(payload, ctx).await
+            }
+        };
+
+        // Default (omitted): all-relationships traversal, forward call found.
+        let base = run(serde_json::json!({
+            "mode": "traverse",
+            "source": "crate::login",
+            "target": "crate::authenticate"
+        }))
+        .await
+        .expect("traverse default");
+        assert!(
+            !base.output.contains("is not available for this project yet"),
+            "traverse with a warm index must reach the engine, got: {}",
+            base.output
+        );
+
+        // Explicit false must behave the same as omitted.
+        let explicit_false = run(serde_json::json!({
+            "mode": "traverse",
+            "source": "crate::login",
+            "target": "crate::authenticate",
+            "calls_only": false
+        }))
+        .await
+        .expect("traverse calls_only=false");
+        assert_eq!(
+            base.output, explicit_false.output,
+            "explicit calls_only=false must match the default"
+        );
+
+        // Explicit true must be accepted (the call edges here are all calls).
+        let explicit_true = run(serde_json::json!({
+            "mode": "traverse",
+            "source": "crate::login",
+            "target": "crate::authenticate",
+            "calls_only": true
+        }))
+        .await
+        .expect("traverse calls_only=true");
+        assert!(
+            !explicit_true.output.contains("is not available for this project yet"),
+            "calls_only=true must be accepted, got: {}",
+            explicit_true.output
+        );
+    }
+
     // A `context` call with a `path` filter is an input error, so it must read as
     // a plain rejection rather than the engine-failure text with cache advice.
     #[tokio::test]
@@ -4841,6 +4936,7 @@ mod tests {
             symbols: None,
             source: None,
             target: None,
+            calls_only: None,
             relations: None,
             depth: None,
             include_heuristic: None,
@@ -5542,12 +5638,16 @@ mod tests {
             out.output
         );
 
-        // Record the per-SHA output dir mtime; a re-index would recreate/rewrite
-        // it and advance this.
-        let dir_before = std::fs::metadata(&edge.output_dir)
-            .expect("per-SHA dir exists")
+        // Compass v0.4 writes a disposable response cache (`responses-v1.sqlite3`)
+        // into the cache root we pass on every open and a query index under
+        // `code-query/`, so the per-SHA *directory* mtime is no longer a valid
+        // "did we re-index?" signal. A rebuild rewrites the graph artifact, so
+        // its own mtime is the direct signal (stronger than comparing bytes,
+        // which a deterministic rebuild could leave identical).
+        let graph_mtime_before = std::fs::metadata(&edge.graph_path)
+            .expect("graph.json exists")
             .modified()
-            .expect("dir mtime");
+            .expect("graph mtime");
         std::thread::sleep(std::time::Duration::from_millis(20));
 
         // Warm call: same commit, unchanged graph -> no re-index.
@@ -5563,12 +5663,12 @@ mod tests {
             out2.output
         );
 
-        let dir_after = std::fs::metadata(&edge.output_dir)
-            .expect("per-SHA dir still exists")
+        let graph_mtime_after = std::fs::metadata(&edge.graph_path)
+            .expect("graph.json still exists")
             .modified()
-            .expect("dir mtime after");
+            .expect("graph mtime after");
         assert_eq!(
-            dir_before, dir_after,
+            graph_mtime_before, graph_mtime_after,
             "a warm compass_query on a valid per-SHA cache must not re-index it"
         );
     }
@@ -6666,6 +6766,9 @@ mod tests {
             diagnostics: Vec::new(),
             limits: Default::default(),
             truncated: false,
+            call_summary: None,
+            impact_summary: None,
+            concept_matches: Vec::new(),
         };
         let view = ResponseView::from(response, Some("src"));
         assert!(
@@ -6703,6 +6806,9 @@ mod tests {
             diagnostics: Vec::new(),
             limits: Default::default(),
             truncated: false,
+            call_summary: None,
+            impact_summary: None,
+            concept_matches: Vec::new(),
         };
 
         // Excluded by the filter -> flagged; kept -> not flagged; no filter -> not.
@@ -6985,6 +7091,37 @@ mod tests {
         assert!(
             out.contains("direction") && !out.contains("Try a different symbol name"),
             "a reversed trail must be reported as a direction problem, got: {out}"
+        );
+    }
+
+    // `calls_only` is a Compass v0.4 opt-in on `traverse`. It must be accepted
+    // from the tool input and threaded through; an omitted value keeps the
+    // pre-0.4 all-relationships behavior (compass's own default is false).
+    #[test]
+    fn calls_only_is_optional_and_defaults_to_all_relationships() {
+        let default = input("crate::a");
+        assert_eq!(default.calls_only, None);
+
+        let parsed: CompassQueryInput =
+            serde_json::from_value(serde_json::json!({"calls_only": true})).unwrap();
+        assert_eq!(parsed.calls_only, Some(true));
+
+        // An unrelated mode still parses (the field is a harmless passthrough).
+        let search: CompassQueryInput =
+            serde_json::from_value(serde_json::json!({"query": "x", "calls_only": false})).unwrap();
+        assert_eq!(search.calls_only, Some(false));
+
+        // The model-facing schema must advertise the option so callers know it
+        // exists; it is a boolean under the tool's `properties`.
+        let schema = CompassQueryTool::new().parameters_schema();
+        assert_eq!(
+            schema
+                .get("properties")
+                .and_then(|p| p.get("calls_only"))
+                .and_then(|c| c.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("boolean"),
+            "the tool schema must advertise calls_only as a boolean"
         );
     }
 

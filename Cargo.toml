@@ -159,8 +159,10 @@ dirs = "5"               # home directory
 anyhow = "1"
 libc = "0.2"             # Unix system calls (flock)
 chrono = { version = "0.4", features = ["serde"] }
-# Pinned to 0.3.53: compass-core (via compass-history) requires exactly this
-# version. aws/azure/ratatui accept ^0.3.4, so 0.3.53 is compatible for them.
+# Pinned to exactly 0.3.53: Compass's own workspace root pins
+# `time = "=0.3.53"`, and compass-core (via the compass git dependency)
+# inherits it, so jcode must co-resolve to the same exact version. Other
+# consumers (aws/azure/ratatui) accept ^0.3.4, so 0.3.53 satisfies them.
 time = "=0.3.53"
 
 # Embeddings (local inference) - behind feature flag (163 crates, slow to compile)

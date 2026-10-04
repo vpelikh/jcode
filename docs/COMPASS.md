@@ -58,7 +58,10 @@ Notes:
   exempt from the operand check. `relations` (an array, defaulting to Compass's
   `DEFAULT_AFFECTED_RELATIONS`) and `depth` (default 2, matching Compass's CLI)
   shape `affected` only; an all-blank `relations` override falls back to the
-  default set rather than silently following no relations. `path` scopes
+  default set rather than silently following no relations. `calls_only` (default
+  false, Compass v0.4) narrows `traverse` to directed call edges, excluding
+  structural shortcuts and applying the same scope to its direction diagnostics.
+  `path` scopes
   structural nodes/source and `discover` (matched on whole path segments, so
   `src` does not match `src2`), but `context` does not support it (Compass's
   task-context API has no path scope, so a `path` there is a clear error rather
