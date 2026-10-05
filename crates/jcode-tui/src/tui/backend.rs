@@ -9,7 +9,7 @@ use crate::message::ToolCall;
 use crate::protocol::{AuthChanged, FeatureToggle, Request, ServerEvent};
 use crate::server;
 use crate::transport::{Stream, WriteHalf};
-use crate::tui::remote_diff::RemoteDiffTracker;
+use crate::tui::remote_tool_input::RemoteToolInput;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -242,7 +242,7 @@ pub struct RemoteConnection {
     // Bootstrap Done acknowledgments are not completions of a detached turn.
     // Retain recent ids because target Subscribe can acknowledge twice.
     control_done_ids: std::sync::Mutex<std::collections::VecDeque<u64>>,
-    tool_diff: RemoteDiffTracker,
+    tool_input: RemoteToolInput,
     /// Bytes pulled from the socket that have not yet been split into complete
     /// newline-delimited protocol lines. This buffer is persistent across
     /// `next_event` calls so a future cancelled by a `tokio::select!` peer
@@ -299,7 +299,7 @@ pub(crate) trait RemoteEventState {
 
 #[derive(Default)]
 pub(crate) struct ReplayRemoteState {
-    tool_diff: RemoteDiffTracker,
+    tool_input: RemoteToolInput,
     call_output_tokens_seen: u64,
 }
 
@@ -337,7 +337,7 @@ impl RemoteConnection {
             // connection's Subscribe/GetHistory acknowledgments.
             next_request_id: (rand::random::<u64>() & ((1_u64 << 62) - 1)) | (1_u64 << 62),
             control_done_ids: Default::default(),
-            tool_diff: RemoteDiffTracker::default(),
+            tool_input: RemoteToolInput::default(),
             read_buffer: Vec::new(),
             read_buffer_scan_start: 0,
             #[cfg(test)]
@@ -1470,7 +1470,7 @@ impl RemoteConnection {
             client_instance_id: None,
             next_request_id: 1,
             control_done_ids: Default::default(),
-            tool_diff: RemoteDiffTracker::default(),
+            tool_input: RemoteToolInput::default(),
             read_buffer: Vec::new(),
             read_buffer_scan_start: 0,
             #[cfg(test)]
@@ -1513,34 +1513,39 @@ impl RemoteConnection {
         self.has_loaded_history = true;
     }
 
-    /// Handle tool start - begin tracking for diff generation
-    pub fn handle_tool_start(&mut self, id: &str, name: &str) {
-        self.tool_diff.handle_tool_start(id, name);
+    /// Handle tool start - reset the streamed-input accumulator.
+    pub fn handle_tool_start(&mut self, _id: &str, _name: &str) {
+        self.tool_input.handle_tool_start();
     }
 
     /// Handle tool input delta
     pub fn handle_tool_input(&mut self, delta: &str) {
-        self.tool_diff.handle_tool_input(delta);
+        self.tool_input.handle_tool_input(delta);
     }
 
     /// Get parsed current tool input (before it's cleared in handle_tool_exec)
     pub fn get_current_tool_input(&self) -> serde_json::Value {
-        self.tool_diff.current_tool_input_json()
+        self.tool_input.current_tool_input_json()
     }
 
-    /// Handle tool exec - cache file content if edit/write
-    pub fn handle_tool_exec(&mut self, id: &str, name: &str) {
-        self.tool_diff.handle_tool_exec(id, name);
+    /// Handle tool exec - release the accumulated input.
+    pub fn handle_tool_exec(&mut self, _id: &str, _name: &str) {
+        self.tool_input.clear();
     }
 
-    /// Handle tool done - generate diff if we have pending data
-    pub fn handle_tool_done(&mut self, id: &str, name: &str, output: &str) -> String {
-        self.tool_diff.finish_tool(id, name, output)
+    /// Handle tool done - pass the server's result through unchanged.
+    ///
+    /// The server-side tools already emit line-numbered diffs, so the client
+    /// no longer rewrites edit results. The `[<tool>] ` label is transport
+    /// framing consumers strip themselves (see
+    /// `ui_messages::strip_tool_result_transport_headers`).
+    pub fn handle_tool_done(&mut self, _id: &str, name: &str, output: &str) -> String {
+        format!("[{}] {}", name, output)
     }
 
-    /// Clear pending diff state
+    /// Drop any partially accumulated tool input.
     pub fn clear_pending(&mut self) {
-        self.tool_diff.clear();
+        self.tool_input.clear();
     }
 
     /// Per-API-call output token watermark (for TPS delta accumulation).
@@ -1601,28 +1606,28 @@ impl RemoteEventState for RemoteConnection {
 }
 
 impl RemoteEventState for ReplayRemoteState {
-    fn handle_tool_start(&mut self, id: &str, name: &str) {
-        self.tool_diff.handle_tool_start(id, name);
+    fn handle_tool_start(&mut self, _id: &str, _name: &str) {
+        self.tool_input.handle_tool_start();
     }
 
     fn handle_tool_input(&mut self, delta: &str) {
-        self.tool_diff.handle_tool_input(delta);
+        self.tool_input.handle_tool_input(delta);
     }
 
     fn get_current_tool_input(&self) -> serde_json::Value {
-        self.tool_diff.current_tool_input_json()
+        self.tool_input.current_tool_input_json()
     }
 
-    fn handle_tool_exec(&mut self, id: &str, name: &str) {
-        self.tool_diff.handle_tool_exec(id, name);
+    fn handle_tool_exec(&mut self, _id: &str, _name: &str) {
+        self.tool_input.clear();
     }
 
-    fn handle_tool_done(&mut self, id: &str, name: &str, output: &str) -> String {
-        self.tool_diff.finish_tool(id, name, output)
+    fn handle_tool_done(&mut self, _id: &str, name: &str, output: &str) -> String {
+        format!("[{}] {}", name, output)
     }
 
     fn clear_pending(&mut self) {
-        self.tool_diff.clear();
+        self.tool_input.clear();
     }
 
     fn call_output_tokens_seen(&mut self) -> &mut u64 {
@@ -2208,5 +2213,33 @@ mod tests {
             1,
         ));
         assert!(remote_protocol_frame_exceeds_limit(usize::MAX, 1));
+    }
+
+    #[test]
+    fn tool_done_passes_server_numbered_diff_through_unchanged() {
+        // The client no longer regenerates edit diffs: the server tools emit
+        // `N- old` / `N+ new` themselves, so `handle_tool_done` must forward that
+        // output verbatim (only adding the transport label) so the numbered
+        // gutter reaches the renderer intact. Both the live client and the
+        // history-replay state share this behavior.
+        let server_output = "Edited demo.txt: replaced 1 occurrence(s)\n2- two\n2+ TWO";
+        let expected = "[edit] Edited demo.txt: replaced 1 occurrence(s)\n2- two\n2+ TWO";
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let _guard = rt.enter();
+        let mut live = RemoteConnection::dummy();
+        live.handle_tool_start("t1", "edit");
+        live.handle_tool_input("{\"file_path\":\"demo.txt\"}");
+        live.handle_tool_exec("t1", "edit");
+        assert_eq!(live.handle_tool_done("t1", "edit", server_output), expected);
+
+        let mut replay = ReplayRemoteState::default();
+        replay.handle_tool_start("t1", "edit");
+        replay.handle_tool_input("{\"file_path\":\"demo.txt\"}");
+        replay.handle_tool_exec("t1", "edit");
+        assert_eq!(
+            replay.handle_tool_done("t1", "edit", server_output),
+            expected
+        );
     }
 }

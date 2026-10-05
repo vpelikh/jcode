@@ -1122,7 +1122,7 @@ fn strip_todo_tool_output_headers(content: &str) -> &str {
 /// is parsed from the raw payload alone.
 ///
 /// Two decorations are recognized: a leading `[<tool>] ` prefix added by the
-/// remote client (`remote_diff::finish_tool`), and the harness's
+/// remote client when it forwards a tool result, and the harness's
 /// `[tool timing: ...]` / `[<rfc3339>]` timestamp header. They may appear in
 /// either order, so at most one of each is peeled, in whichever order they
 /// lead.
