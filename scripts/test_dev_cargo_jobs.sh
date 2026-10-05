@@ -98,4 +98,14 @@ output=$(run_setup TEST_UNAME_S=FreeBSD)
 assert_line "$output" 'build_jobs_status=cargo-default'
 assert_line "$output" 'cargo_build_jobs=<unset>'
 
+# print-setup must surface the effective Cargo build-gate capacity, so operators
+# can confirm the bound without reading the script.
+gate_output=$(run_setup)
+if grep -Eq '^cargo_gate_capacity=[0-9]+$' <<<"$gate_output"; then
+  :
+else
+  printf 'expected print-setup to report a numeric cargo_gate_capacity; got:\n%s\n' "$gate_output" >&2
+  exit 1
+fi
+
 echo 'dev_cargo job sizing tests passed'

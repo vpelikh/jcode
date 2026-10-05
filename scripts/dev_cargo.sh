@@ -41,10 +41,15 @@ rust_action_log_started_at=""
 rust_action_log_path=""
 rust_action_log_execution="local"
 cargo_gate_wait_ms=0
+cargo_gate_status=""
 
 start_rust_action_log() {
   case "${JCODE_RUST_ACTION_LOG:-1}" in
-    0|false|no|off) return ;;
+    0|false|no|off)
+      # Still release the host-wide gate on exit even when we skip logging.
+      trap 'rc=$?; release_cargo_gate; rc=$(cargo_gate_pending_exit "$rc"); exit "$rc"' EXIT
+      return
+      ;;
   esac
 
   local state_root="${JCODE_HOME:-${HOME:+$HOME/.jcode}}"
@@ -52,7 +57,7 @@ start_rust_action_log() {
   rust_action_log_path="${JCODE_RUST_ACTION_LOG_PATH:-$state_root/logs/rust-actions.jsonl}"
   rust_action_log_started_ns=$(date +%s%N)
   rust_action_log_started_at=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
-  trap 'record_rust_action_log "$?"' EXIT
+  trap 'rc=$?; release_cargo_gate; rc=$(cargo_gate_pending_exit "$rc"); record_rust_action_log "$rc"' EXIT
 }
 
 record_rust_action_log() {
@@ -202,8 +207,10 @@ selected_profile() {
 # newest-binary discovery, so the two stay consistent. The per-worktree target
 # dir remains the default when this is unset, preserving current behavior.
 #
-# Deliberately runs after acquire_cargo_gate so a shared dir cannot be written
-# concurrently by two builds that the gate would otherwise serialize anyway.
+# Only sets CARGO_TARGET_DIR for this process; cargo does the actual writing, and
+# run_local_cargo runs under the gate, so the shared dir is not written outside
+# it. Runs before the gate so capacity sizing (which needs the jobs count, and
+# then the gate) can see the final target-dir decision.
 export_shared_target_dir() {
   local shared="${JCODE_SHARED_TARGET_DIR:-}"
   if [[ -z "$shared" ]]; then
@@ -794,7 +801,18 @@ print_setup() {
     feature_profile_status="${JCODE_DEV_FEATURE_PROFILE}"
   fi
   local cargo_gate_mode="${JCODE_CARGO_GATE:-on}"
-  local cargo_gate_dir="${JCODE_CARGO_GATE_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}}"
+  local cargo_gate_dir
+  if [[ -n "${JCODE_CARGO_GATE_DIR:-}" ]]; then
+    cargo_gate_dir="$JCODE_CARGO_GATE_DIR"
+  elif [[ -n "${JCODE_CARGO_GATE_DIR_HOST:-}" ]]; then
+    cargo_gate_dir="$JCODE_CARGO_GATE_DIR_HOST"
+  elif [[ -n "${JCODE_HOME:-}" ]]; then
+    cargo_gate_dir="$JCODE_HOME/run/jcode-cargo-gate"
+  elif [[ -n "${HOME:-}" ]]; then
+    cargo_gate_dir="$HOME/.jcode/run/jcode-cargo-gate"
+  else
+    cargo_gate_dir="${TMPDIR:-/tmp}/jcode-cargo-gate"
+  fi
   cat <<EOF
 repo_root=$repo_root
 os=$(uname -s)
@@ -805,7 +823,8 @@ parallel_frontend_status=$parallel_frontend_status
 build_jobs_status=$build_jobs_status
 cargo_build_jobs=${CARGO_BUILD_JOBS:-<unset>}
 cargo_gate_mode=$cargo_gate_mode
-cargo_gate_path=${JCODE_CARGO_GATE_PATH:-$cargo_gate_dir/jcode-cargo-build.lock}
+cargo_gate_dir=$cargo_gate_dir
+cargo_gate_capacity=${cargo_gate_capacity:-<unset>}
 build_tmpdir_status=$build_tmpdir_status
 tmpdir=${TMPDIR:-<unset>}
 shared_target_dir_status=$shared_target_dir_status
@@ -1047,6 +1066,17 @@ cargo_test_has_explicit_filter() {
 }
 
 run_local_cargo() {
+  if [[ "${cargo_gate_status:-}" == "acquired" ]]; then
+    # Hold the slot until the compiler actually exits even if this wrapper is
+    # signalled. A trap defers INT/TERM until the foreground cargo finishes, so
+    # the EXIT handler cannot free the slot while cargo is still running (which
+    # would let another build start and exceed the bound). cargo itself still
+    # receives the terminal signal normally when it shares the process group.
+    # The signal is recorded so the wrapper can report 128+signum on exit.
+    cargo_gate_pending_signal=""
+    trap 'cargo_gate_pending_signal=15' TERM
+    trap 'cargo_gate_pending_signal=2' INT
+  fi
   if cargo_test_has_explicit_filter "${cargo_argv[@]}" && [[ "${JCODE_DEV_CARGO_ALLOW_ZERO_TESTS:-0}" != "1" ]]; then
     local output_file
     output_file=$(mktemp "${TMPDIR:-/tmp}/jcode-dev-cargo.XXXXXX")
@@ -1066,6 +1096,7 @@ run_local_cargo() {
   cargo "${cargo_argv[@]}"
 }
 
+# jcode: cargo-gate-section (scripts/test_dev_cargo_gate.sh extracts this block)
 cargo_action_needs_gate() {
   case "${cargo_argv[0]:-}" in
     build|check|clippy|test|bench|run|rustc|rustdoc) return 0 ;;
@@ -1073,17 +1104,214 @@ cargo_action_needs_gate() {
   esac
 }
 
-# Cargo's own package-cache and target-dir locks only coordinate processes that
-# happen to share those exact directories. Jcode agents also build from scratch
-# worktrees, different target directories, and different toolchains, so several
-# memory-heavy rustc processes can still run at once. On this 15 GiB development
-# machine that makes every build slower and can trigger earlyoom.
+# Bound how many compile-capable Cargo actions run at once instead of
+# serializing them to one. Two facts drive this:
 #
-# Serialize compile-capable local Cargo actions across all jcode worktrees. A
-# single Cargo invocation can still use all jobs selected by select_build_jobs,
-# so this trades harmful process-level competition for useful crate-level
-# parallelism. Nested wrapper calls inherit JCODE_CARGO_GATE_HELD and cannot
-# deadlock. Set JCODE_CARGO_GATE=off for an intentional concurrency experiment.
+#   * An unbounded number of worktrees all compiling at once oversubscribes the
+#     machine (observed: 8 concurrent builds, load ~95 on 12 cores) and was the
+#     actual test-slowness regression.
+#   * Cargo already takes an exclusive lock on a shared build directory, so when
+#     JCODE_SHARED_TARGET_DIR is set those builds serialize themselves and extra
+#     slots buy nothing.
+#
+# So the gate is a counting semaphore with a capacity derived from memory and CPU
+# (reusing the same per-job budget as select_build_jobs): enough builds to keep
+# cores busy, not enough to thrash. Each extra slot is one concurrent build, so
+# the capacity also stays low when the builds share one target dir where cargo
+# will serialize them regardless.
+#
+# JCODE_CARGO_GATE=off disables it; JCODE_CARGO_GATE_SLOTS overrides the capacity;
+# nested wrapper calls inherit JCODE_CARGO_GATE_HELD and never re-acquire.
+cargo_gate_mode=""
+cargo_gate_dir=""
+cargo_gate_slots_dir=""
+cargo_gate_slot_dir=""
+cargo_gate_slot_id=""
+cargo_gate_capacity=1
+cargo_gate_owner=""
+cargo_gate_pending_signal=""
+
+# The slot owner is the pid of the shell that took the slot. Use $$ rather than
+# BASHPID: $$ is stable and identical in the main shell and any subshell, so the
+# value stored at acquire always matches the value checked at release. BASHPID
+# would change inside the `$(...)` used at release on bash 4+ (Linux/CI), so the
+# ownership check would never match and every slot would leak.
+cargo_gate_owner_pid() {
+  printf '%s\n' "$$"
+}
+
+# A normalized start time for a live pid, or empty if it cannot be read. Used to
+# detect pid reuse: a leaked slot can record a pid that later belongs to an
+# unrelated process, and without this the slot would look live forever. `ps
+# -o lstart=` prints the same format for the same process on macOS and Linux, so
+# comparing a stored value to the current one is meaningful. On any failure this
+# returns empty and callers fall back to pid-only liveness (the prior behavior).
+cargo_gate_proc_start() {
+  local pid="$1" v
+  [[ -n "$pid" ]] || return 0
+  # LC_ALL=C so the same process renders identically regardless of the caller's
+  # locale; otherwise two agents with different LANG could produce different
+  # strings for one live process and a live slot would look reused.
+  v=$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//')
+  [[ -n "$v" ]] && printf '%s\n' "$v"
+}
+
+# Modification time of a path in epoch seconds, or empty if it cannot be read.
+# BSD stat (macOS) uses `-f %m`; GNU stat (Linux) uses `-c %Y`.
+cargo_gate_path_mtime() {
+  local v
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    v=$(stat -f %m "$1" 2>/dev/null)
+  else
+    v=$(stat -c %Y "$1" 2>/dev/null)
+  fi
+  if [[ "$v" =~ ^[0-9]+$ ]]; then printf '%s\n' "$v"; fi
+}
+
+# True when a live process owns a slot directory. A slot whose `owner` file is
+# missing or empty is only treated as stale once it is older than a grace period:
+# between `mkdir` (which publishes the slot) and writing the owner file there is
+# a window where the directory exists with no owner, and reclaiming it then would
+# let two builds share one slot.
+cargo_gate_slot_is_live() {
+  local slot_dir="$1" owner mtime now age grace stored_start cur_start
+  [[ -d "$slot_dir" ]] || return 1
+  owner=$(cat "$slot_dir/owner" 2>/dev/null || true)
+  if [[ -n "$owner" ]] && kill -0 "$owner" 2>/dev/null; then
+    # The pid is alive; confirm it is the same process that took the slot, not a
+    # reused pid. If either start time is unreadable, fall back to pid liveness.
+    stored_start=$(cat "$slot_dir/owner_start" 2>/dev/null || true)
+    if [[ -n "$stored_start" ]]; then
+      cur_start=$(cargo_gate_proc_start "$owner")
+      if [[ -n "$cur_start" && "$cur_start" != "$stored_start" ]]; then
+        return 1 # pid reused by a different process: the slot is stale
+      fi
+    fi
+    return 0
+  fi
+  if [[ -z "$owner" ]]; then
+    # 10s grace; long enough to span the mkdir->owner-write window and any brief
+    # hiccup, short enough that an abandoned owner-less slot frees quickly.
+    grace="${JCODE_CARGO_GATE_STALE_GRACE:-10}"
+    mtime=$(cargo_gate_path_mtime "$slot_dir")
+    now=$(date +%s)
+    if [[ -n "$mtime" && "$mtime" =~ ^[0-9]+$ ]]; then
+      age=$(( now - mtime ))
+      (( age < grace )) && return 0
+    else
+      # Cannot read mtime: be conservative and keep the slot.
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# Reclaim slot directories whose owner PID is dead, so a crashed build cannot
+# permanently consume a slot. Returns the number of live slots seen.
+cargo_gate_prune_stale_slots() {
+  local live=0 d
+  for d in "$cargo_gate_slots_dir"/slot-*; do
+    [[ -d "$d" ]] || continue
+    if cargo_gate_slot_is_live "$d"; then
+      live=$((live + 1))
+    else
+      rm -rf "$d" 2>/dev/null || true
+    fi
+  done
+  printf '%s\n' "$live"
+}
+
+# Resolve the effective gate capacity into cargo_gate_capacity. Idempotent, and
+# shared by acquire_cargo_gate and print_setup so both report the same value.
+cargo_gate_resolve_capacity() {
+  local override="${JCODE_CARGO_GATE_SLOTS:-}"
+  if [[ "$override" =~ ^[0-9]+$ && "$override" -ge 1 ]]; then
+    cargo_gate_capacity="$override"
+    return 0
+  fi
+  if [[ -n "${JCODE_SHARED_TARGET_DIR:-}" ]]; then
+    # Shared build dir: Cargo serializes these itself, so one slot with a
+    # head-of-line wait is the honest model. The gate's only job here is to make
+    # the wait visible and to stop the target-dir lock from being hit by a crowd.
+    # (Keyed on JCODE_SHARED_TARGET_DIR, the explicit shared signal; a per-process
+    # CARGO_TARGET_DIR is usually isolated and should allow parallelism. If you
+    # point CARGO_TARGET_DIR at a shared path yourself, set JCODE_CARGO_GATE_SLOTS=1.)
+    cargo_gate_capacity=1
+    return 0
+  fi
+
+  # Bound total rustc, not just concurrent builds. Each build spawns jobs rustc
+  # (CARGO_BUILD_JOBS, set by select_build_jobs), so N concurrent builds mean
+  # N*jobs rustc processes. Size the capacity so capacity*jobs stays near a
+  # target share of the cores (default 1x = no over-allocation; raise with
+  # JCODE_CARGO_GATE_RUSTC_OVERSUB) and bounded by memory.
+  local cpus mem_avail_kib mem_avail_mib mib_per_job by_mem jobs over by_rustc
+  cpus=$(cpu_count)
+  jobs="${CARGO_BUILD_JOBS:-$cpus}"
+  over="${JCODE_CARGO_GATE_RUSTC_OVERSUB:-1}"
+  [[ "$over" =~ ^[0-9]+$ && "$over" -ge 1 ]] || over=1
+  by_rustc=$(( (over * cpus) / jobs ))
+  (( by_rustc < 1 )) && by_rustc=1
+  mib_per_job="${JCODE_BUILD_MIB_PER_JOB:-1792}"
+  [[ "$mib_per_job" =~ ^[0-9]+$ && "$mib_per_job" -ge 256 ]] || mib_per_job=1792
+  if mem_avail_kib=$(available_memory_kib); then
+    mem_avail_mib=$(( mem_avail_kib / 1024 ))
+    by_mem=$(( mem_avail_mib / mib_per_job ))
+    (( by_mem < 1 )) && by_mem=1
+    cargo_gate_capacity="$by_mem"
+    (( cargo_gate_capacity > by_rustc )) && cargo_gate_capacity="$by_rustc"
+  else
+    cargo_gate_capacity="$by_rustc"
+  fi
+  (( cargo_gate_capacity < 1 )) && cargo_gate_capacity=1
+  return 0
+}
+
+# Try once to take a free slot. Returns 0 and sets cargo_gate_slot_dir on success.
+cargo_gate_try_slot() {
+  local i dir
+  for ((i = 0; i < cargo_gate_capacity; i++)); do
+    dir="$cargo_gate_slots_dir/slot-$i"
+    if mkdir "$dir" 2>/dev/null; then
+      cargo_gate_owner_pid > "$dir/owner"
+      # Record the owner's start time so a later pid reuse can be detected.
+      local owner_pid start
+      owner_pid=$(cat "$dir/owner" 2>/dev/null || true)
+      start=$(cargo_gate_proc_start "$owner_pid")
+      [[ -n "$start" ]] && printf '%s\n' "$start" > "$dir/owner_start"
+      cargo_gate_slot_id="$i"
+      cargo_gate_slot_dir="$dir"
+      return 0
+    fi
+  done
+  return 1
+}
+
+release_cargo_gate() {
+  [[ "$cargo_gate_status" == "acquired" ]] || return 0
+  if [[ -n "$cargo_gate_slot_dir" && -d "$cargo_gate_slot_dir" ]]; then
+    # Remove the slot only if it is ours (or was never stamped), so a release in
+    # one process can never delete a slot a different process now owns.
+    local slot_owner
+    slot_owner=$(cat "$cargo_gate_slot_dir/owner" 2>/dev/null || true)
+    if [[ -z "$slot_owner" || "$slot_owner" == "$cargo_gate_owner" ]]; then
+      rm -rf "$cargo_gate_slot_dir" 2>/dev/null || true
+    fi
+  fi
+  unset JCODE_CARGO_GATE_HELD
+  cargo_gate_status="released"
+}
+
+# The exit code to report: the conventional 128+signum for a deferred signal, or
+# the passed-in cargo exit code. Called from the EXIT handlers after release.
+cargo_gate_pending_exit() {
+  if [[ -n "${cargo_gate_pending_signal:-}" ]]; then
+    printf '%s\n' "$(( 128 + cargo_gate_pending_signal ))"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
 acquire_cargo_gate() {
   cargo_gate_status="not-needed"
   cargo_gate_wait_ms=0
@@ -1099,34 +1327,62 @@ acquire_cargo_gate() {
     cargo_gate_status="inherited"
     return 0
   fi
-  if ! command -v flock >/dev/null 2>&1; then
+
+  # A stable, user-scoped directory; TMPDIR differs between a terminal and an
+  # agent session and would split the gate's view of the host.
+  if [[ -n "${JCODE_CARGO_GATE_DIR:-}" ]]; then
+    cargo_gate_dir="$JCODE_CARGO_GATE_DIR"
+  elif [[ -n "${JCODE_CARGO_GATE_DIR_HOST:-}" ]]; then
+    # Cross-user coordination: a host owner may point every user's gate at one
+    # world-writable dir (e.g. /tmp/jcode-cargo-gate). Slots are mkdir-atomic and
+    # owner-fenced, so shared use is safe; this opts into it deliberately.
+    cargo_gate_dir="$JCODE_CARGO_GATE_DIR_HOST"
+  elif [[ -n "${JCODE_HOME:-}" ]]; then
+    cargo_gate_dir="$JCODE_HOME/run/jcode-cargo-gate"
+  elif [[ -n "${HOME:-}" ]]; then
+    cargo_gate_dir="$HOME/.jcode/run/jcode-cargo-gate"
+  else
+    cargo_gate_dir="${TMPDIR:-/tmp}/jcode-cargo-gate"
+  fi
+  cargo_gate_slots_dir="$cargo_gate_dir/slots"
+  # The gate is a safety bound, never a correctness requirement: if its
+  # directory cannot be created (read-only parent, full disk), degrade to
+  # ungated rather than failing the build. Silently blocking every build on a
+  # full disk would be far worse than briefly oversubscribing the machine.
+  if ! mkdir -p "$cargo_gate_slots_dir" 2>/dev/null; then
+    log "cannot create the Cargo gate dir ($cargo_gate_slots_dir); proceeding without gating"
     cargo_gate_status="unavailable"
-    log "flock is unavailable; running without the host-wide Cargo gate"
     return 0
   fi
 
-  local gate_dir gate_path wait_started_ns wait_finished_ns waited_seconds
-  gate_dir="${JCODE_CARGO_GATE_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}}"
-  mkdir -p "$gate_dir"
-  gate_path="${JCODE_CARGO_GATE_PATH:-$gate_dir/jcode-cargo-build.lock}"
-  exec {cargo_gate_fd}>"$gate_path"
-  if ! flock -n "$cargo_gate_fd"; then
-    log "waiting for the host-wide Cargo gate ($gate_path)"
-    wait_started_ns=$(date +%s%N)
-    waited_seconds=0
-    # Avoid one silent, unbounded flock call. Periodic notes make it clear that
-    # the process is alive and blocked behind another compiler rather than hung.
-    while ! flock -w 30 "$cargo_gate_fd"; do
-      waited_seconds=$((waited_seconds + 30))
-      log "still waiting for the host-wide Cargo gate (${waited_seconds}s elapsed)"
-    done
-    wait_finished_ns=$(date +%s%N)
-    cargo_gate_wait_ms=$(( (wait_finished_ns - wait_started_ns) / 1000000 ))
+  cargo_gate_resolve_capacity
+  local wait_started_ns wait_finished_ns wait_started_s waited_seconds live
+  if ! cargo_gate_try_slot; then
+    live=$(cargo_gate_prune_stale_slots)
+    if ! cargo_gate_try_slot; then
+      log "waiting for a Cargo build slot (capacity=${cargo_gate_capacity}, live=${live})"
+      wait_started_ns=$(date +%s%N)
+      wait_started_s=$(date +%s)
+      local last_note=0
+      while ! cargo_gate_try_slot; do
+        sleep 0.25
+        waited_seconds=$(( $(date +%s) - wait_started_s ))
+        cargo_gate_prune_stale_slots >/dev/null 2>&1 || true
+        if (( waited_seconds >= last_note + 30 )); then
+          log "still waiting for a Cargo build slot (${waited_seconds}s elapsed)"
+          last_note="$waited_seconds"
+        fi
+      done
+      wait_finished_ns=$(date +%s%N)
+      cargo_gate_wait_ms=$(( (wait_finished_ns - wait_started_ns) / 1000000 ))
+    fi
   fi
   export JCODE_CARGO_GATE_HELD=1
+  cargo_gate_owner="$(cargo_gate_owner_pid)"
   cargo_gate_status="acquired"
-  log "acquired host-wide Cargo gate (waited ${cargo_gate_wait_ms}ms)"
+  log "acquired Cargo build slot ${cargo_gate_slot_id}/${cargo_gate_capacity} (waited ${cargo_gate_wait_ms}ms)"
 }
+# jcode: end-cargo-gate-section
 
 validate_feature_profile
 configure_build_tmpdir
@@ -1142,6 +1398,7 @@ fi
 if [[ "${1:-}" == "--print-setup" ]]; then
   export_shared_target_dir
   select_build_jobs
+  cargo_gate_resolve_capacity
   print_setup
   exit 0
 fi
@@ -1154,6 +1411,9 @@ done < <(build_cargo_argv "$@")
 start_rust_action_log
 
 if [[ "${JCODE_REMOTE_CARGO:-0}" == "1" ]]; then
+  # Remote cargo runs on a different host (scripts/remote_build.sh, SSH+rsync), so
+  # it is outside this machine's resource pool and intentionally bypasses the
+  # local gate. The local semaphore bounds local rustc only.
   if remote_cargo_preflight; then
     log "using remote cargo via scripts/remote_build.sh"
     rust_action_log_execution="remote"
@@ -1169,12 +1429,17 @@ if [[ "${JCODE_REMOTE_CARGO:-0}" == "1" ]]; then
   fi
 fi
 
-acquire_cargo_gate
 export_shared_target_dir
-# Size the in-process parallelism only after competing jcode Cargo processes
-# have drained. Measuring before the wait would preserve an unnecessarily low
-# one-job decision even after memory becomes available.
+# Size the in-process parallelism before acquiring the gate: the capacity needs
+# the resulting CARGO_BUILD_JOBS. Computing it under contention yields a
+# conservative jobs count, which the gate compensates for by admitting more
+# (smaller) concurrent builds; the memory-based sizing is a heuristic, not a
+# correctness requirement.
 select_build_jobs
+# Acquire the gate after select_build_jobs so cargo_gate_resolve_capacity sees the
+# effective CARGO_BUILD_JOBS; otherwise per-worktree capacity computes off an
+# unset value and collapses to 1.
+acquire_cargo_gate
 # Restore the caller's working directory so `cargo` resolves the worktree the
 # user actually invoked it from, not the primary checkout the script cd'd into.
 cd "$caller_cwd"

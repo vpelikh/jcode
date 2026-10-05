@@ -69,6 +69,14 @@ run_gate "cargo fmt --all --check" cargo fmt --all --check
 
 echo ""
 echo "=== Quality Guardrails ==="
+# The Cargo build gate bounds how many compile-capable cargo actions run at once.
+# The old flock-based gate silently no-oped on macOS (no `flock` CLI), which is
+# the slow-test regression this guards against regressing. Three cheap (pure
+# shell) checks: slot semantics, release/trap behavior, and the concurrency bound.
+run_gate "dev_cargo gate semantics" bash scripts/test_dev_cargo_gate.sh
+run_gate "dev_cargo gate release/traps" bash scripts/test_dev_cargo_gate_integration.sh
+run_gate "dev_cargo gate concurrency bound" bash scripts/test_dev_cargo_gate_acceptance.sh
+run_gate "dev_cargo job sizing" bash scripts/test_dev_cargo_jobs.sh
 if $SKIP_SLOW; then
     echo "⏭  cargo check / clippy / machete (--skip-slow)"
 else

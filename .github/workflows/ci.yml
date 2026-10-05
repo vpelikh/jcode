@@ -56,6 +56,34 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Test host-wide Cargo gate
+        # The gate bounds how many compile-capable cargo actions run at once. It
+        # silently no-oped on macOS, where the `flock` CLI is absent, letting
+        # concurrent builds oversubscribe the machine and making tests crawl.
+        # This asserts the portable (flock-free) semaphore keeps working.
+        shell: bash
+        run: bash scripts/test_dev_cargo_gate.sh
+
+      - name: Test Cargo gate release and traps
+        # A cancelled or killed build must not hold a slot forever. Drives the
+        # real wrapper with a fake slow cargo to check slot release on success,
+        # failure, SIGTERM, and stale reclaim after SIGKILL.
+        shell: bash
+        run: bash scripts/test_dev_cargo_gate_integration.sh
+
+      - name: Test Cargo gate concurrency bound
+        # The property the regression needed: under N real concurrent launches,
+        # no more than `capacity` builds run at once. The acceptance behavior.
+        shell: bash
+        run: bash scripts/test_dev_cargo_gate_acceptance.sh
+
+      - name: Test Cargo job sizing
+        # select_build_jobs sets CARGO_BUILD_JOBS, which the gate capacity now
+        # depends on. Checks adaptive/override/fallback sizing and the reported
+        # gate capacity.
+        shell: bash
+        run: bash scripts/test_dev_cargo_jobs.sh
+
       - name: Check all targets and all features
         run: cargo check --all-targets --all-features
 
