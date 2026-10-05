@@ -1044,8 +1044,12 @@ pub enum ServerEvent {
     /// Emitted while a tool (notably bash) streams stdout/stderr so the client
     /// can render what the command is doing instead of only a one-line status.
     /// `text` may contain multiple newline-separated lines; `stderr` marks the
-    /// stream. `done` is a terminal sentinel that clears the live view for this
-    /// call even when no output was produced (it carries empty `text`).
+    /// stream. `replace` asks the client to overwrite its last line for the
+    /// stream instead of appending (a carriage-return progress overwrite or a
+    /// growing in-progress line). `partial` marks an in-progress line: a later
+    /// partial line for the stream replaces it in place. `done` is a terminal
+    /// sentinel that clears the live view for this call even when no output was
+    /// produced (it carries empty `text`).
     #[serde(rename = "tool_output")]
     ToolOutput {
         id: String,
@@ -1053,6 +1057,10 @@ pub enum ServerEvent {
         text: String,
         #[serde(default, skip_serializing_if = "is_false")]
         stderr: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        replace: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        partial: bool,
         #[serde(default, skip_serializing_if = "is_false")]
         done: bool,
     },

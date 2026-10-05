@@ -77,7 +77,7 @@ mod inline_interactive;
 mod input;
 mod input_help;
 mod intent;
-mod live_tool_output;
+pub(crate) mod live_tool_output;
 mod local;
 mod misc_ui;
 mod model_context;

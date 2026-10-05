@@ -13,7 +13,13 @@ use super::App;
 use crate::tui::{LiveOutputLine, LiveToolOutputView};
 
 /// Maximum number of output lines retained for the live view.
-pub(super) const LIVE_OUTPUT_MAX_LINES: usize = 12;
+///
+/// Deliberately bounded so a chatty command cannot grow the view without limit.
+/// Set to roughly twice the rows the region can draw
+/// (`LIVE_OUTPUT_REGION_MAX_ROWS`): enough headroom that resizing the terminal
+/// can reveal previously elided lines and the "earlier lines" count stays
+/// accurate, without accumulating a large tail the region can never show.
+pub(crate) const LIVE_OUTPUT_MAX_LINES: usize = 24;
 
 impl App {
     /// Append a live output chunk produced by a running tool call.
@@ -21,14 +27,24 @@ impl App {
     /// `text` may contain multiple newline-separated lines. When `done` is set
     /// the live view for this call is cleared (the command is finishing and its
     /// full output belongs to the committed transcript, not the live region).
+    /// `replace` overwrites the stream's last line instead of appending (a
+    /// carriage-return progress overwrite or a growing in-progress line);
+    /// `partial` marks an in-progress line that a later partial for the stream
+    /// replaces in place.
     ///
     /// Returns true when the live view changed and the frame needs a redraw.
+    // The flags mirror the wire/ bus chunk fields one-for-one; bundling them
+    // into a struct only to unpack them here would add indirection at every
+    // call site without improving clarity.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn apply_tool_output_chunk(
         &mut self,
         tool_call_id: &str,
         tool_name: &str,
         text: &str,
         stderr: bool,
+        replace: bool,
+        partial: bool,
         done: bool,
     ) -> bool {
         if done {
@@ -68,12 +84,60 @@ impl App {
                 truncated: 0,
             });
 
-        for line in text.split('\n') {
-            view.lines.push(LiveOutputLine {
-                text: line.to_string(),
-                stderr,
-            });
+        if replace {
+            // Overwrite the stream's last visible line; append if there is none.
+            // The lookup is per-stream, not just `last()`: stdout and stderr are
+            // read by two concurrent tasks and interleave, so a same-stream line
+            // can sit above a line from the other stream.
+            match view.lines.iter().rposition(|line| line.stderr == stderr) {
+                Some(idx) => {
+                    let line = &mut view.lines[idx];
+                    line.text = text.to_string();
+                    line.partial = partial;
+                }
+                None => view.lines.push(LiveOutputLine {
+                    text: text.to_string(),
+                    stderr,
+                    partial,
+                }),
+            }
+        } else if partial {
+            // In-progress line: replace the previous partial line for the SAME
+            // stream in place, wherever it sits relative to the other stream. A
+            // partial on the other stream is untouched.
+            match view
+                .lines
+                .iter()
+                .rposition(|line| line.stderr == stderr && line.partial)
+            {
+                Some(idx) => view.lines[idx].text = text.to_string(),
+                None => view.lines.push(LiveOutputLine {
+                    text: text.to_string(),
+                    stderr,
+                    partial: true,
+                }),
+            }
+        } else {
+            // Completed line(s) supersede the stream's trailing partial: drop it
+            // where it sits (it may not be the overall last line if the other
+            // stream wrote after it) and append the finished line(s), so a
+            // growing in-progress line is never left behind as a stale row.
+            if let Some(idx) = view
+                .lines
+                .iter()
+                .rposition(|line| line.stderr == stderr && line.partial)
+            {
+                view.lines.remove(idx);
+            }
+            for line in text.split('\n') {
+                view.lines.push(LiveOutputLine {
+                    text: line.to_string(),
+                    stderr,
+                    partial: false,
+                });
+            }
         }
+
         let overflow = view.lines.len().saturating_sub(LIVE_OUTPUT_MAX_LINES);
         if overflow > 0 {
             view.lines.drain(..overflow);

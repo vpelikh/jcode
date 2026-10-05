@@ -752,8 +752,10 @@ pub(in crate::tui::app) fn handle_server_event(
             name,
             text,
             stderr,
+            replace,
+            partial,
             done,
-        } => app.apply_tool_output_chunk(&id, &name, &text, stderr, done),
+        } => app.apply_tool_output_chunk(&id, &name, &text, stderr, replace, partial, done),
         ServerEvent::GeneratedImage {
             id,
             path,

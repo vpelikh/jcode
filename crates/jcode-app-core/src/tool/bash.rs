@@ -574,24 +574,280 @@ where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut buf = String::new();
-    let Some(reader) = reader else {
+    let Some(mut reader) = reader else {
         return buf;
     };
-    let mut lines = BufReader::new(reader).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        if let Ok(Some(update)) = parse_progress_line(&line) {
+    // Read raw bytes rather than `BufReader::lines()`: line-oriented reading
+    // only yields a line once a newline arrives, so output that never emits one
+    // (a carriage-return progress bar such as cargo/curl, or a program that
+    // writes an in-progress line before exiting) would never reach the live tap
+    // until the command ended, making the live region look broken. Raw reading
+    // lets us interpret `\r` as an in-place line reset and surface the current
+    // in-progress line.
+    let mut raw = [0u8; 8192];
+    // Undecoded bytes from a UTF-8 character split across reads.
+    let mut carry: Vec<u8> = Vec::new();
+    // Live-view line state machine: turns raw text into append/replace emits.
+    let mut splitter = LiveLineSplitter::default();
+    // The current committed (newline-delimited) line for the tool result body.
+    let mut committed_line = String::new();
+    // Set when the last committed-body character was a bare CR whose following
+    // character has not been seen yet (it may be the LF of a CRLF split across
+    // a read boundary, or the start of an overwrite).
+    let mut pending_cr = false;
+    loop {
+        let read = match reader.read(&mut raw).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        carry.extend_from_slice(&raw[..read]);
+        // Decode as much valid UTF-8 as possible, draining `carry` each pass:
+        // `Ok` consumed everything; `Err(Some(_))` marks genuinely invalid bytes
+        // (binary output) which are dropped so decoding always makes progress;
+        // `Err(None)` marks an incomplete trailing sequence, which is kept for
+        // the next read. Without the loop, a buffer with many invalid bytes (or
+        // valid text after an invalid byte) would be rescanned in full every
+        // read and only one byte would be dropped, letting `carry` grow without
+        // bound and stranding valid output.
+        let mut text = String::new();
+        loop {
+            match std::str::from_utf8(&carry) {
+                Ok(valid) => {
+                    text.push_str(valid);
+                    carry.clear();
+                    break;
+                }
+                Err(error) => {
+                    let valid_up_to = error.valid_up_to();
+                    text.push_str(
+                        std::str::from_utf8(&carry[..valid_up_to]).unwrap_or_default(),
+                    );
+                    match error.error_len() {
+                        // Genuinely invalid bytes: drop them and decode the rest.
+                        Some(len) => {
+                            carry.drain(..valid_up_to + len);
+                        }
+                        // Incomplete trailing sequence: keep it for the next read.
+                        None => {
+                            carry.drain(..valid_up_to);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if text.is_empty() {
+            continue;
+        }
+
+        // Committed output collapses carriage-return overwrites so a progress
+        // bar (`10%\r20%\r30%`) reads as the terminal's effective text (`30%`)
+        // rather than the raw, back-to-back values. A CR immediately followed by
+        // LF is a CRLF line ending (not an overwrite) and terminates the line.
+        // `pending_cr` defers the CR decision to the next character so a CR and
+        // its LF can straddle a read boundary.
+        for ch in text.chars() {
+            if pending_cr {
+                pending_cr = false;
+                if ch == '\n' {
+                    // CRLF: the CR was part of the line ending, so keep the
+                    // accumulated text and terminate the line.
+                    let line = std::mem::take(&mut committed_line);
+                    if let Ok(Some(update)) = parse_progress_line(&line) {
+                        progress.record(update).await;
+                    }
+                    buf.push_str(&line);
+                    buf.push('\n');
+                    continue;
+                }
+                // A bare CR overwrites: drop what was written before it and
+                // resume accumulating from this character.
+                committed_line.clear();
+            }
+            match ch {
+                '\n' => {
+                    let line = std::mem::take(&mut committed_line);
+                    if let Ok(Some(update)) = parse_progress_line(&line) {
+                        progress.record(update).await;
+                    }
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
+                '\r' => pending_cr = true,
+                c => committed_line.push(c),
+            }
+        }
+
+        if let Some(ref live) = live {
+            for emit in splitter.feed(&text) {
+                live.apply(emit, stderr).await;
+            }
+            if let Some(emit) = splitter.flush() {
+                live.apply(emit, stderr).await;
+            }
+        }
+    }
+    // A final line without a trailing newline still belongs in the result body.
+    if !committed_line.is_empty() {
+        if let Ok(Some(update)) = parse_progress_line(&committed_line) {
             progress.record(update).await;
         }
-        if let Some(ref live) = live {
-            live.push(&line, stderr).await;
-        }
-        buf.push_str(&line);
+        buf.push_str(&committed_line);
         buf.push('\n');
     }
     if let Some(ref live) = live {
         live.flush(stderr).await;
     }
     buf
+}
+
+/// A live-view line emission: a line of output the consumer should render.
+///
+/// `replace` means overwrite the stream's last visible line rather than append
+/// (a carriage-return overwrite, or an in-progress line that grew). `partial`
+/// means the line has no terminator yet and a later partial line for the same
+/// stream will replace it in place.
+#[derive(Debug, PartialEq)]
+struct LiveEmit {
+    text: String,
+    replace: bool,
+    partial: bool,
+}
+
+/// Splits a raw output stream into live-view emissions.
+///
+/// `\n` completes a line, `\r` resets the line in place (the following text
+/// overwrites it), and anything else accumulates into the current line. The
+/// current, not-yet-terminated line is surfaced by [`flush`](Self::flush) so a
+/// program that writes progress without a newline still shows live.
+#[derive(Default)]
+struct LiveLineSplitter {
+    /// Content of the current, not-yet-terminated line, kept to the most recent
+    /// [`LIVE_OUTPUT_MAX_CHARS`] so a single pathological line (a minified
+    /// bundle, a base64 blob) cannot grow this buffer without bound. Only the
+    /// tail matters for a live view.
+    open: String,
+    /// Whether a prefix of `open` was dropped to enforce the cap, so emitted
+    /// text is marked with a leading ellipsis.
+    truncated: bool,
+    /// Whether the current open line was already shown to the consumer, so the
+    /// next text for it must replace rather than append.
+    open_visible: bool,
+    /// Whether `open` changed since the last `flush`, so an unchanged partial
+    /// line is not re-emitted (this avoids an O(line-len) copy per read on a
+    /// long, quiet in-progress line).
+    open_dirty: bool,
+    /// Whether the previous processed character was a `\r`, so an immediately
+    /// following `\n` can be recognized as the LF of a CRLF pair.
+    last_was_cr: bool,
+}
+
+impl LiveLineSplitter {
+    /// Largest tail retained for the current line. Kept a little below
+    /// [`LIVE_OUTPUT_MAX_CHARS`] so the leading truncation marker still leaves
+    /// the surfaced text within the publisher's per-chunk cap; otherwise the
+    /// publisher would re-truncate from the head and drop the tail we kept.
+    const OPEN_CAP: usize = LIVE_OUTPUT_MAX_CHARS - '\u{2026}'.len_utf8();
+
+    /// Append one character to the current line, keeping it within [`Self::OPEN_CAP`].
+    fn push_char(&mut self, c: char) {
+        self.open.push(c);
+        self.open_dirty = true;
+        if self.open.len() > Self::OPEN_CAP {
+            // Trim the oldest bytes so the buffer stays tail-sized. Align the
+            // cut to a char boundary so multi-byte UTF-8 is never split.
+            let mut cut = self.open.len() - Self::OPEN_CAP;
+            while cut < self.open.len() && !self.open.is_char_boundary(cut) {
+                cut += 1;
+            }
+            self.open.drain(..cut);
+            self.truncated = true;
+        }
+    }
+
+    /// Take the current line's text, applying the truncation marker, and reset
+    /// its accumulated state.
+    fn take_line_text(&mut self) -> String {
+        let tail = std::mem::take(&mut self.open);
+        self.open_dirty = false;
+        if self.truncated {
+            self.truncated = false;
+            format!("\u{2026}{tail}")
+        } else {
+            tail
+        }
+    }
+
+    /// Feed decoded text, returning emissions for every line boundary crossed.
+    fn feed(&mut self, text: &str) -> Vec<LiveEmit> {
+        let mut out = Vec::new();
+        for ch in text.chars() {
+            match ch {
+                // A newline terminates (and shows) the line. A `\n` that
+                // immediately follows a `\r` is the LF of a CRLF pair: the line
+                // was already completed by the CR, so emit nothing more
+                // (otherwise a spurious empty overwrite would wipe the line just
+                // shown).
+                '\n' => {
+                    if self.last_was_cr && self.open.is_empty() {
+                        self.open_visible = false;
+                    } else {
+                        self.emit_line(&mut out);
+                    }
+                    self.last_was_cr = false;
+                }
+                // A carriage return overwrites the line in place. A leading `\r`
+                // with nothing written yet (the common `printf '\r%d%%'`
+                // progress idiom after a previous completed line) is a no-op and
+                // must not overwrite that previous line.
+                '\r' => {
+                    if !self.open.is_empty() || self.open_visible {
+                        self.emit_line(&mut out);
+                        // The next segment overwrites the line just shown.
+                        self.open_visible = true;
+                    }
+                    self.last_was_cr = true;
+                }
+                c => {
+                    self.push_char(c);
+                    self.last_was_cr = false;
+                }
+            }
+        }
+        out
+    }
+
+    /// Show the current open line as a completed line.
+    fn emit_line(&mut self, out: &mut Vec<LiveEmit>) {
+        out.push(LiveEmit {
+            text: self.take_line_text(),
+            replace: self.open_visible,
+            partial: false,
+        });
+        self.open_visible = false;
+    }
+
+    /// Surface the current in-progress line when it changed since the last
+    /// emission, so a partial line appears and updates live.
+    fn flush(&mut self) -> Option<LiveEmit> {
+        if self.open.is_empty() || !self.open_dirty {
+            return None;
+        }
+        self.open_dirty = false;
+        let replace = self.open_visible;
+        self.open_visible = true;
+        let text = if self.truncated {
+            format!("\u{2026}{}", self.open)
+        } else {
+            self.open.clone()
+        };
+        Some(LiveEmit {
+            text,
+            replace,
+            partial: true,
+        })
+    }
 }
 
 /// Throttled publisher of a running command's output to the global bus.
@@ -620,11 +876,55 @@ struct ToolLiveOutput {
 
 #[derive(Default)]
 struct LiveState {
-    stdout: String,
-    stderr: String,
+    stdout: StreamBucket,
+    stderr: StreamBucket,
     last_publish: Option<Instant>,
     /// Latched by `finish`; once set, no further chunks are published.
     stopped: bool,
+}
+
+/// Ordered, coalesced live-view emissions waiting to be published for one
+/// stream. Adjacent completed lines merge into one append entry; a newer
+/// in-progress (partial) line supersedes the pending partial, so a growing or
+/// carriage-return-overwritten line is not queued repeatedly.
+#[derive(Default)]
+struct StreamBucket {
+    emits: Vec<LiveEmit>,
+}
+
+impl StreamBucket {
+    fn chars(&self) -> usize {
+        self.emits.iter().map(|e| e.text.len()).sum()
+    }
+
+    fn push(&mut self, emit: LiveEmit) {
+        match self.emits.last_mut() {
+            // Two in-progress forms of the same line: keep the newest.
+            Some(last) if emit.partial && last.partial => {
+                last.text = emit.text;
+            }
+            // Two plain append lines: newline-join them into one publish.
+            Some(last) if !emit.replace && !emit.partial && !last.replace && !last.partial => {
+                if !last.text.is_empty() {
+                    last.text.push('\n');
+                }
+                last.text.push_str(&emit.text);
+            }
+            _ => self.emits.push(emit),
+        }
+    }
+
+    fn drain(&mut self) -> Vec<LiveEmit> {
+        std::mem::take(&mut self.emits)
+    }
+}
+
+fn bucket_mut(state: &mut LiveState, stderr: bool) -> &mut StreamBucket {
+    if stderr {
+        &mut state.stderr
+    } else {
+        &mut state.stdout
+    }
 }
 
 /// Split `text` into `(head, tail)` so that `head` is at most `max` bytes and,
@@ -664,7 +964,9 @@ fn split_at_line_boundary(text: &str, max: usize) -> (&str, &str) {
 /// Minimum spacing between live-output publishes for one stream.
 const LIVE_OUTPUT_INTERVAL: Duration = Duration::from_millis(150);
 /// Cap the characters carried by one publish; excess waits for the next tick.
-const LIVE_OUTPUT_MAX_CHARS: usize = 4096;
+/// Large enough to carry a screenful of a wide log line without splitting, but
+/// still bounded so a single publish never grows unbounded.
+const LIVE_OUTPUT_MAX_CHARS: usize = 8192;
 
 impl ToolLiveOutput {
     /// Test-only constructor with explicit identity.
@@ -687,54 +989,90 @@ impl ToolLiveOutput {
         }
     }
 
+    /// Record a completed line for the live view.
+    #[cfg(test)]
     async fn push(&self, line: &str, stderr: bool) {
+        self.apply(
+            LiveEmit {
+                text: line.to_string(),
+                replace: false,
+                partial: false,
+            },
+            stderr,
+        )
+        .await;
+    }
+
+    /// Record a live-view emission (a completed line, an overwrite, or the
+    /// current in-progress line) and publish when the throttle allows.
+    async fn apply(&self, emit: LiveEmit, stderr: bool) {
         let mut state = self.state.lock().await;
         if state.stopped {
             return;
         }
-        {
-            let bucket = if stderr {
-                &mut state.stderr
-            } else {
-                &mut state.stdout
-            };
-            if !bucket.is_empty() {
-                bucket.push('\n');
+        // Truncate a pathological single line (a minified file, a one-line log
+        // record) so it can never dwarf the chunk budget on its own.
+        let emit = if emit.text.len() > LIVE_OUTPUT_MAX_CHARS {
+            let keep = LIVE_OUTPUT_MAX_CHARS - '\u{2026}'.len_utf8();
+            LiveEmit {
+                text: format!("{}\u{2026}", truncate_str(&emit.text, keep)),
+                replace: emit.replace,
+                partial: emit.partial,
             }
-            // A single pathological line (a minified file, a one-line log
-            // record) can dwarf the chunk budget on its own. Truncate it here so
-            // one publish is always bounded by LIVE_OUTPUT_MAX_CHARS, regardless
-            // of line length.
-            if line.len() > LIVE_OUTPUT_MAX_CHARS {
-                // Reserve room for the ellipsis so the truncated line still fits
-                // the chunk budget and is never split into multiple rows.
-                let keep = LIVE_OUTPUT_MAX_CHARS - '\u{2026}'.len_utf8();
-                bucket.push_str(truncate_str(line, keep));
-                bucket.push('\u{2026}');
-            } else {
-                bucket.push_str(line);
-            }
-        }
-        let bucket_len = if stderr {
-            state.stderr.len()
         } else {
-            state.stdout.len()
+            emit
         };
+        bucket_mut(&mut state, stderr).push(emit);
 
+        let bucket_len = bucket_mut(&mut state, stderr).chars();
         let due = state
             .last_publish
             .is_none_or(|last| last.elapsed() >= LIVE_OUTPUT_INTERVAL);
         if due || bucket_len >= LIVE_OUTPUT_MAX_CHARS {
             state.last_publish = Some(Instant::now());
-            let text = take_bucket(&mut state, stderr);
-            // Split so a single publish is always bounded by the chunk budget,
-            // even when several lines accumulated past it; the remainder stays
-            // buffered for the next publish rather than being dropped.
-            let (head, tail) = split_at_line_boundary(&text, LIVE_OUTPUT_MAX_CHARS);
-            *bucket_mut(&mut state, stderr) = tail.to_string();
             // Publish while still holding the lock so a concurrent `finish`
             // cannot interleave its sentinel before this chunk.
-            self.publish(head.to_string(), stderr, false);
+            let mut pending: std::collections::VecDeque<LiveEmit> =
+                bucket_mut(&mut state, stderr).drain().into();
+            self.publish_bounded(&mut pending, stderr);
+            // A completed-lines merge can exceed the chunk budget on its own;
+            // keep the unsent remainder buffered for the next publish rather
+            // than emitting an oversized chunk.
+            if !pending.is_empty() {
+                bucket_mut(&mut state, stderr).emits = pending.into();
+            }
+        }
+    }
+
+    /// Publish queued emissions in bounded pieces.
+    ///
+    /// Each publish carries at most [`LIVE_OUTPUT_MAX_CHARS`]: a plain
+    /// completed-line emit (which may be several newline-joined lines) is split
+    /// at a line boundary, and the unsplit remainder is pushed back onto
+    /// `pending` for the next pass. A `replace`/`partial` emit is a single row
+    /// already bounded by the truncation in [`apply`](Self::apply), so it is
+    /// published whole.
+    fn publish_bounded(
+        &self,
+        pending: &mut std::collections::VecDeque<LiveEmit>,
+        stderr: bool,
+    ) {
+        while let Some(emit) = pending.pop_front() {
+            let (head, tail) = if emit.replace || emit.partial {
+                (emit.text, String::new())
+            } else {
+                let (head, tail) = split_at_line_boundary(&emit.text, LIVE_OUTPUT_MAX_CHARS);
+                (head.to_string(), tail.to_string())
+            };
+            self.publish(head, stderr, emit.replace, emit.partial, false);
+            if !tail.is_empty() {
+                pending.push_front(LiveEmit {
+                    text: tail,
+                    replace: false,
+                    partial: false,
+                });
+                return;
+            }
         }
     }
 
@@ -751,18 +1089,20 @@ impl ToolLiveOutput {
             if state.stopped {
                 return;
             }
-            if bucket_mut(&mut state, stderr).is_empty() {
+            let mut pending: std::collections::VecDeque<LiveEmit> =
+                std::mem::take(&mut bucket_mut(&mut state, stderr).emits).into();
+            if pending.is_empty() {
                 return;
             }
             state.last_publish = Some(Instant::now());
-            let text = take_bucket(&mut state, stderr);
-            let (head, tail) = split_at_line_boundary(&text, LIVE_OUTPUT_MAX_CHARS);
-            let head = head.to_string();
-            let tail = tail.to_string();
-            let done = tail.is_empty();
-            *bucket_mut(&mut state, stderr) = tail;
-            self.publish(head, stderr, false);
-            if done {
+            // Publish each entry, splitting an oversized complete line at a line
+            // boundary and keeping the remainder for the next loop pass. A
+            // partial line is already bounded by the truncation in `apply`.
+            self.publish_bounded(&mut pending, stderr);
+            // Anything left waits for the next loop pass.
+            if !pending.is_empty() {
+                bucket_mut(&mut state, stderr).emits = pending.into();
+            } else {
                 return;
             }
         }
@@ -771,7 +1111,7 @@ impl ToolLiveOutput {
     /// Drain both buffered streams once, so the ticker publishes tail lines that
     /// arrived in a burst and were then followed by silence.
     ///
-    /// `push` only publishes when the interval has elapsed or the buffer is
+    /// `apply` only publishes when the interval has elapsed or the buffer is
     /// full, so a burst's remainder would otherwise sit unpublished until the
     /// next line or end of stream. The ticker bounds that latency.
     async fn flush_pending(&self) {
@@ -779,7 +1119,7 @@ impl ToolLiveOutput {
         self.flush(true).await;
     }
 
-    fn publish(&self, text: String, stderr: bool, done: bool) {
+    fn publish(&self, text: String, stderr: bool, replace: bool, partial: bool, done: bool) {
         crate::bus::Bus::global().publish(crate::bus::BusEvent::ToolOutputChunk(
             crate::bus::ToolOutputChunk {
                 session_id: self.session_id.clone(),
@@ -787,6 +1127,8 @@ impl ToolLiveOutput {
                 tool_name: self.tool_name.clone(),
                 text,
                 stderr,
+                replace,
+                partial,
                 done,
             },
         ));
@@ -803,22 +1145,8 @@ impl ToolLiveOutput {
             return;
         }
         state.stopped = true;
-        self.publish(String::new(), false, true);
+        self.publish(String::new(), false, false, false, true);
     }
-}
-
-/// Borrow the stdout or stderr buffer.
-fn bucket_mut(state: &mut LiveState, stderr: bool) -> &mut String {
-    if stderr {
-        &mut state.stderr
-    } else {
-        &mut state.stdout
-    }
-}
-
-/// Take (leaving empty) the stdout or stderr buffer.
-fn take_bucket(state: &mut LiveState, stderr: bool) -> String {
-    std::mem::take(bucket_mut(state, stderr))
 }
 
 /// Whether a running tool call should stream its output to the bus.

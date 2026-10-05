@@ -25,6 +25,7 @@ fn live_state(tool_name: &str, lines: &[(&str, bool)]) -> TestState {
                 .map(|(text, stderr)| crate::tui::LiveOutputLine {
                     text: text.to_string(),
                     stderr: *stderr,
+                    partial: false,
                 })
                 .collect(),
             truncated: 0,
@@ -49,9 +50,14 @@ fn live_output_region_height_grows_with_lines() {
 
 #[test]
 fn live_output_region_height_is_capped() {
+    // More retained lines than the region can draw: the height pins to the row
+    // cap rather than growing with the line count.
     let lines: Vec<(&str, bool)> = (0..40).map(|_| ("line", false)).collect();
     let state = live_state("bash", &lines);
-    assert_eq!(crate::tui::ui::input_ui::live_tool_output_height(&state), 8);
+    assert_eq!(
+        crate::tui::ui::input_ui::live_tool_output_height(&state),
+        crate::tui::ui::input_ui::LIVE_OUTPUT_REGION_MAX_ROWS as u16
+    );
 }
 
 #[test]
@@ -104,9 +110,10 @@ fn live_output_region_strips_ansi_escapes_and_control_chars() {
 
 #[test]
 fn live_output_shows_the_most_recent_lines_when_tail_exceeds_area() {
-    // 12 lines fit the app cap; a short terminal area can show fewer, and the
-    // most recent lines are the ones that matter for a live view.
-    let lines: Vec<(&str, bool)> = (0..12)
+    // More lines than the region can draw; the most recent lines are the ones
+    // that matter for a live view, so the oldest must scroll out.
+    let count = crate::tui::ui::input_ui::LIVE_OUTPUT_REGION_MAX_ROWS + 4;
+    let lines: Vec<(&str, bool)> = (0..count)
         .map(|i| (Box::leak(format!("row-{i}").into_boxed_str()) as &str, false))
         .collect();
     let state = live_state("bash", &lines);
@@ -115,8 +122,9 @@ fn live_output_shows_the_most_recent_lines_when_tail_exceeds_area() {
     // packing.
     let rows = render_region_rows(&state, 80, 24);
     let joined = rows.join("\n");
+    let newest = format!("row-{}", count - 1);
     assert!(
-        joined.contains("row-11"),
+        joined.contains(&newest),
         "the newest line must be visible:\n{joined}"
     );
     assert!(
@@ -227,9 +235,10 @@ fn live_region_layout_total_always_equals_drawn_rows() {
     // (drawn > reserved). Exercise the shared layout directly across the
     // reachable state space, including the case that previously diverged:
     // truncated > 0 with fewer than the max retained lines.
-    for lines in 1..=12usize {
+    let max_lines = crate::tui::app::live_tool_output::LIVE_OUTPUT_MAX_LINES;
+    for lines in 1..=max_lines {
         for truncated in 0..=5usize {
-            if truncated > 0 && lines != 12 {
+            if truncated > 0 && lines != max_lines {
                 continue; // not reachable: the cap only elides at the cap
             }
             let layout = crate::tui::ui::input_ui::live_region_layout_for_tests(lines, truncated);
@@ -289,6 +298,7 @@ fn live_output_region_hidden_when_bash_output_disabled() {
             lines: vec![crate::tui::LiveOutputLine {
                 text: "visible only when enabled".to_string(),
                 stderr: false,
+                partial: false,
             }],
             truncated: 0,
         }),

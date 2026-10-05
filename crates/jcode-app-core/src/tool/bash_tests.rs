@@ -1396,6 +1396,39 @@ async fn live_output_caps_an_oversized_single_line() {
     );
 }
 
+/// A burst of many completed lines merges into one emit; even so, no single
+/// publish may exceed the chunk budget. This guards the throttle (`apply`) path,
+/// which publishes the merged emit rather than only the `flush` path.
+#[tokio::test]
+async fn live_output_throttle_path_bounds_a_merged_publish() {
+    let live = ToolLiveOutput::for_test("merge-session", "merge-call");
+    let mut rx = crate::bus::Bus::global().subscribe();
+    // Push many sub-budget lines back-to-back (well within the publish
+    // interval) so they merge into a single emit far larger than the budget.
+    for i in 0..100 {
+        live.push(&format!("{i:03}-{}", "y".repeat(296)), false).await;
+    }
+    live.flush(false).await;
+
+    let mut sizes = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let crate::bus::BusEvent::ToolOutputChunk(chunk) = event
+            && chunk.tool_call_id == "merge-call"
+            && !chunk.done
+        {
+            sizes.push(chunk.text.len());
+        }
+    }
+    assert!(
+        !sizes.is_empty(),
+        "the merged burst must still be published"
+    );
+    assert!(
+        sizes.iter().all(|&len| len <= LIVE_OUTPUT_MAX_CHARS),
+        "no publish may exceed the chunk budget, got lengths {sizes:?}"
+    );
+}
+
 /// After finish(), a chunk from a collector still draining must be ignored, so
 /// a late chunk cannot resurrect the region after the sentinel.
 #[tokio::test]
@@ -1668,5 +1701,507 @@ async fn abort_on_drop_stops_its_task() {
     assert!(
         !ran.load(Ordering::SeqCst),
         "an aborted ticker must stop running after the guard is dropped"
+    );
+}
+
+/// A raw line splitter must treat `\n` as a completed line and `\r` as an
+/// in-place reset, so a carriage-return progress bar collapses to one line.
+#[test]
+fn line_splitter_treats_carriage_return_as_in_place_reset() {
+    let mut splitter = LiveLineSplitter::default();
+
+    // "10%" then CR then "20%\n": the second segment replaces the first.
+    let emits = splitter.feed("10%\r20%\n");
+    assert_eq!(
+        emits,
+        vec![
+            LiveEmit {
+                text: "10%".to_string(),
+                replace: false,
+                partial: false,
+            },
+            LiveEmit {
+                text: "20%".to_string(),
+                replace: true,
+                partial: false,
+            },
+        ]
+    );
+    assert!(splitter.flush().is_none());
+}
+
+/// A newline-terminated line is a plain append; the next line is independent.
+#[test]
+fn line_splitter_newline_terminates_lines() {
+    let mut splitter = LiveLineSplitter::default();
+    let emits = splitter.feed("alpha\nbeta\n");
+    assert_eq!(
+        emits,
+        vec![
+            LiveEmit {
+                text: "alpha".to_string(),
+                replace: false,
+                partial: false,
+            },
+            LiveEmit {
+                text: "beta".to_string(),
+                replace: false,
+                partial: false,
+            },
+        ]
+    );
+}
+
+/// A line written without a trailing newline is still surfaced live, and
+/// re-flushing unchanged text does nothing.
+#[test]
+fn line_splitter_surfaces_and_dedupes_partial_line() {
+    let mut splitter = LiveLineSplitter::default();
+    assert!(splitter.feed("progress 5").is_empty());
+
+    let first = splitter.flush().expect("partial line should surface");
+    assert_eq!(
+        first,
+        LiveEmit {
+            text: "progress 5".to_string(),
+            replace: false,
+            partial: true,
+        }
+    );
+    assert!(
+        splitter.flush().is_none(),
+        "an unchanged partial line must not re-publish"
+    );
+
+    // Growth surfaces as a replacement of the same partial line.
+    assert!(splitter.feed("0").is_empty());
+    let grown = splitter.flush().expect("grown partial line should surface");
+    assert_eq!(
+        grown,
+        LiveEmit {
+            text: "progress 50".to_string(),
+            replace: true,
+            partial: true,
+        }
+    );
+}
+
+/// An interactive `printf 'step 1\rstep 2\r'` command must publish progress
+/// chunks *while it is still running*, each replacing the previous line, so a
+/// carriage-return progress bar is visible live instead of appearing only at
+/// exit.
+#[tokio::test]
+async fn carriage_return_progress_streams_live_while_running() {
+    let tool = BashTool::new();
+    let (stdin_tx, _stdin_rx) = mpsc::unbounded_channel();
+    let ctx = ToolContext {
+        session_id: "test-session".to_string(),
+        message_id: "test-msg".to_string(),
+        tool_call_id: "cr-progress-call".to_string(),
+        working_dir: Some(std::path::PathBuf::from("/tmp")),
+        stdin_request_tx: Some(stdin_tx),
+        graceful_shutdown_signal: Some(jcode_agent_runtime::InterruptSignal::new()),
+        execution_mode: crate::tool::ToolExecutionMode::AgentTurn,
+    };
+    let mut rx = crate::bus::Bus::global().subscribe();
+
+    // Two CR-separated updates, then a quiet stretch so the flush ticker must
+    // surface them before the command exits.
+    let handle = tokio::spawn(async move {
+        tool.execute(
+            json!({
+                "command": "printf 'step-1\\rstep-2\\r'; sleep 1.0",
+                "timeout": 20000,
+            }),
+            ctx,
+        )
+        .await
+    });
+
+    let mut saw_step_2 = false;
+    let mut replacement_after_step_1 = false;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(800);
+    let mut seen_any = false;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Ok(crate::bus::BusEvent::ToolOutputChunk(chunk))) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+            && chunk.tool_call_id == "cr-progress-call"
+            && !chunk.done
+        {
+            if chunk.text.contains("step-1") {
+                seen_any = true;
+            }
+            if chunk.text.contains("step-2") {
+                saw_step_2 = true;
+                replacement_after_step_1 = seen_any;
+            }
+        }
+    }
+
+    assert!(
+        saw_step_2,
+        "a carriage-return progress update must stream while the command runs"
+    );
+    assert!(
+        replacement_after_step_1,
+        "the second step should follow the first as an in-place update"
+    );
+
+    let _ = handle.await;
+}
+
+/// A program that writes an in-progress line with no newline must surface it
+/// live (as a partial chunk) rather than only at EOF.
+#[tokio::test]
+async fn partial_line_without_newline_streams_live() {
+    let tool = BashTool::new();
+    let (stdin_tx, _stdin_rx) = mpsc::unbounded_channel();
+    let ctx = ToolContext {
+        session_id: "test-session".to_string(),
+        message_id: "test-msg".to_string(),
+        tool_call_id: "partial-call".to_string(),
+        working_dir: Some(std::path::PathBuf::from("/tmp")),
+        stdin_request_tx: Some(stdin_tx),
+        graceful_shutdown_signal: Some(jcode_agent_runtime::InterruptSignal::new()),
+        execution_mode: crate::tool::ToolExecutionMode::AgentTurn,
+    };
+    let mut rx = crate::bus::Bus::global().subscribe();
+
+    // No newline at all, then a quiet stretch before exit.
+    let handle = tokio::spawn(async move {
+        tool.execute(
+            json!({
+                "command": "printf 'no-newline-progress'; sleep 1.0",
+                "timeout": 20000,
+            }),
+            ctx,
+        )
+        .await
+    });
+
+    let mut saw_partial = false;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(800);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Ok(crate::bus::BusEvent::ToolOutputChunk(chunk))) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+            && chunk.tool_call_id == "partial-call"
+            && !chunk.done
+            && chunk.text.contains("no-newline-progress")
+        {
+            saw_partial = chunk.partial;
+            if saw_partial {
+                break;
+            }
+        }
+    }
+    assert!(
+        saw_partial,
+        "an in-progress line without a newline must stream as a partial chunk while running"
+    );
+
+    let _ = handle.await;
+}
+
+/// A carriage-return progress command must not appear as repeated duplicated
+/// lines in the committed result body beyond what the command wrote; the live
+/// view is separate. This guards the collector against emitting the same
+/// buffered line twice at EOF.
+#[tokio::test]
+async fn carriage_return_command_does_not_duplicate_result_body() {
+    let tool = BashTool::new();
+    let (stdin_tx, _stdin_rx) = mpsc::unbounded_channel();
+    let ctx = ToolContext {
+        session_id: "test-session".to_string(),
+        message_id: "test-msg".to_string(),
+        tool_call_id: "cr-body-call".to_string(),
+        working_dir: Some(std::path::PathBuf::from("/tmp")),
+        stdin_request_tx: Some(stdin_tx),
+        graceful_shutdown_signal: Some(jcode_agent_runtime::InterruptSignal::new()),
+        execution_mode: crate::tool::ToolExecutionMode::AgentTurn,
+    };
+    let output = tool
+        .execute(
+            json!({"command": "printf 'only-line\\n'", "timeout": 20000}),
+            ctx,
+        )
+        .await
+        .unwrap();
+    assert!(
+        output.output.contains("only-line"),
+        "the committed result must contain the command's output"
+    );
+    assert_eq!(
+        output.output.matches("only-line").count(),
+        1,
+        "the committed result must not duplicate a line: {:?}",
+        output.output
+    );
+}
+
+/// Invalid (non-UTF-8) bytes must be dropped without stranding the valid text
+/// around them, including valid output that follows an invalid byte and valid
+/// text that trails it at EOF. A byte-at-a-time drop would both strand output
+/// and let the decode buffer grow without bound on a binary stream.
+#[tokio::test]
+async fn invalid_utf8_bytes_are_dropped_without_stranding_output() {
+    let tool = BashTool::new();
+    let (stdin_tx, _stdin_rx) = mpsc::unbounded_channel();
+    let ctx = ToolContext {
+        session_id: "test-session".to_string(),
+        message_id: "test-msg".to_string(),
+        tool_call_id: "invalid-utf8-call".to_string(),
+        working_dir: Some(std::path::PathBuf::from("/tmp")),
+        stdin_request_tx: Some(stdin_tx),
+        graceful_shutdown_signal: Some(jcode_agent_runtime::InterruptSignal::new()),
+        execution_mode: crate::tool::ToolExecutionMode::AgentTurn,
+    };
+    // A leading invalid byte followed by valid lines: the valid text must
+    // survive even though it arrives after the invalid byte.
+    let output = tool
+        .execute(
+            json!({"command": "printf '\\377hello\\nworld\\n'", "timeout": 20000}),
+            ctx,
+        )
+        .await
+        .unwrap();
+    assert!(
+        output.output.contains("hello") && output.output.contains("world"),
+        "valid output after an invalid byte must not be stranded: {:?}",
+        output.output
+    );
+    // Invalid bytes interleaved with valid ones: the valid runs are preserved.
+    let ctx = ToolContext {
+        session_id: "test-session".to_string(),
+        message_id: "test-msg".to_string(),
+        tool_call_id: "invalid-utf8-mid-call".to_string(),
+        working_dir: Some(std::path::PathBuf::from("/tmp")),
+        stdin_request_tx: Some(mpsc::unbounded_channel().0),
+        graceful_shutdown_signal: Some(jcode_agent_runtime::InterruptSignal::new()),
+        execution_mode: crate::tool::ToolExecutionMode::AgentTurn,
+    };
+    let output = tool
+        .execute(
+            json!({"command": "printf 'A\\377B\\377C\\n'", "timeout": 20000}),
+            ctx,
+        )
+        .await
+        .unwrap();
+    assert!(
+        output.output.contains("ABC"),
+        "valid runs around invalid bytes must be kept: {:?}",
+        output.output
+    );
+}
+
+/// A leading carriage return with nothing written yet (the common
+/// `printf '\r%d%%'` progress idiom that follows a previous completed line) is a
+/// no-op: it must not overwrite the line that came before it.
+#[test]
+fn line_splitter_leading_carriage_return_is_a_noop() {
+    let mut splitter = LiveLineSplitter::default();
+    // "step 1\n" is a completed line, then a leading `\r` starts a fresh line.
+    let emits = splitter.feed("step 1\n\r50%");
+    assert_eq!(
+        emits,
+        vec![LiveEmit {
+            text: "step 1".to_string(),
+            replace: false,
+            partial: false,
+        }],
+        "the leading \\r must not emit an overwrite of the previous line"
+    );
+    // The in-progress line still surfaces on flush as an append, not a replace.
+    assert_eq!(
+        splitter.flush(),
+        Some(LiveEmit {
+            text: "50%".to_string(),
+            replace: false,
+            partial: true,
+        })
+    );
+}
+
+/// A single newline-less line must not grow the splitter's buffer without
+/// bound: the open line is capped to the most recent `LIVE_OUTPUT_MAX_CHARS`,
+/// and the surfaced text is marked as truncated.
+#[test]
+fn line_splitter_bounds_a_giant_single_line() {
+    let mut splitter = LiveLineSplitter::default();
+    // A line far longer than the cap, with no terminator.
+    let huge = "x".repeat(LIVE_OUTPUT_MAX_CHARS * 4 + 7);
+    assert!(splitter.feed(&huge).is_empty(), "no terminator, no emission");
+    // The retained open buffer stays at the cap, so a quiet long line does not
+    // accumulate unbounded memory.
+    assert!(
+        splitter.open.len() <= LIVE_OUTPUT_MAX_CHARS,
+        "open buffer must stay bounded, got {}",
+        splitter.open.len()
+    );
+    let emit = splitter.flush().expect("partial line should surface");
+    assert!(emit.partial);
+    assert!(
+        emit.text.starts_with('\u{2026}'),
+        "a truncated line must be marked with a leading ellipsis"
+    );
+    // The tail of the real content is what a live view shows.
+    assert!(
+        emit.text.ends_with("x"),
+        "the retained text is the line's tail"
+    );
+}
+
+/// An unchanged in-progress line must not be re-emitted on flush, so a long
+/// quiet partial line does not cost an O(line-len) copy per read.
+#[test]
+fn line_splitter_flush_skips_an_unchanged_partial() {
+    let mut splitter = LiveLineSplitter::default();
+    assert!(splitter.feed("downloading").is_empty());
+    assert!(splitter.flush().is_some(), "first flush surfaces the line");
+    assert!(
+        splitter.flush().is_none(),
+        "an unchanged partial line must not be re-emitted"
+    );
+    assert!(splitter.feed("!").is_empty());
+    assert!(
+        splitter.flush().is_some(),
+        "a changed partial line surfaces again"
+    );
+}
+
+/// A CRLF line ending must complete the line and must not be misread as a
+/// carriage-return overwrite of the next line.
+#[test]
+fn line_splitter_treats_crlf_as_a_single_terminator() {
+    let mut splitter = LiveLineSplitter::default();
+    let emits = splitter.feed("alpha\r\nbeta\r\n");
+    assert_eq!(
+        emits,
+        vec![
+            LiveEmit {
+                text: "alpha".to_string(),
+                replace: false,
+                partial: false,
+            },
+            LiveEmit {
+                text: "beta".to_string(),
+                replace: false,
+                partial: false,
+            },
+        ],
+        "CRLF must terminate each line without overwriting the next"
+    );
+    assert!(splitter.flush().is_none());
+}
+
+/// A CRLF-terminated command must not corrupt the committed result body: the
+/// trailing CR is stripped exactly as the previous line reader did.
+#[tokio::test]
+async fn crlf_command_result_body_has_no_carriage_returns() {
+    let tool = BashTool::new();
+    let (stdin_tx, _stdin_rx) = mpsc::unbounded_channel();
+    let ctx = ToolContext {
+        session_id: "test-session".to_string(),
+        message_id: "test-msg".to_string(),
+        tool_call_id: "crlf-call".to_string(),
+        working_dir: Some(std::path::PathBuf::from("/tmp")),
+        stdin_request_tx: Some(stdin_tx),
+        graceful_shutdown_signal: Some(jcode_agent_runtime::InterruptSignal::new()),
+        execution_mode: crate::tool::ToolExecutionMode::AgentTurn,
+    };
+    let output = tool
+        .execute(
+            json!({"command": "printf 'alpha\\r\\nbeta\\r\\n'", "timeout": 20000}),
+            ctx,
+        )
+        .await
+        .unwrap();
+    assert!(
+        output.output.contains("alpha") && output.output.contains("beta"),
+        "both lines must be present: {:?}",
+        output.output
+    );
+    assert!(
+        !output.output.contains('\r'),
+        "the committed body must not contain carriage returns: {:?}",
+        output.output
+    );
+}
+
+/// A carriage-return progress bar must collapse to its terminal-effective text
+/// in the committed result body, so the incoming text the model reads is
+/// `30%` rather than the raw `10%\r20%\r30%`.
+#[tokio::test]
+async fn carriage_return_progress_collapses_in_result_body() {
+    let tool = BashTool::new();
+    let (stdin_tx, _stdin_rx) = mpsc::unbounded_channel();
+    let ctx = ToolContext {
+        session_id: "test-session".to_string(),
+        message_id: "test-msg".to_string(),
+        tool_call_id: "cr-collapse-call".to_string(),
+        working_dir: Some(std::path::PathBuf::from("/tmp")),
+        stdin_request_tx: Some(stdin_tx),
+        graceful_shutdown_signal: Some(jcode_agent_runtime::InterruptSignal::new()),
+        execution_mode: crate::tool::ToolExecutionMode::AgentTurn,
+    };
+    let output = tool
+        .execute(
+            json!({"command": "printf '10%%\\r20%%\\r30%%\\n'", "timeout": 20000}),
+            ctx,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !output.output.contains('\r'),
+        "the committed body must not contain carriage returns: {:?}",
+        output.output
+    );
+    assert!(
+        !output.output.contains("10%") && !output.output.contains("20%"),
+        "only the latest value of an overwritten line may survive: {:?}",
+        output.output
+    );
+    assert!(
+        output.output.contains("30%"),
+        "the final value of a progress bar must be kept: {:?}",
+        output.output
+    );
+}
+
+/// A CR progress line followed by ordinary newline-terminated output must keep
+/// both: the progress bar collapses to one value, and later lines are intact.
+#[tokio::test]
+async fn carriage_return_progress_then_plain_lines_keeps_both() {
+    let tool = BashTool::new();
+    let (stdin_tx, _stdin_rx) = mpsc::unbounded_channel();
+    let ctx = ToolContext {
+        session_id: "test-session".to_string(),
+        message_id: "test-msg".to_string(),
+        tool_call_id: "cr-mixed-call".to_string(),
+        working_dir: Some(std::path::PathBuf::from("/tmp")),
+        stdin_request_tx: Some(stdin_tx),
+        graceful_shutdown_signal: Some(jcode_agent_runtime::InterruptSignal::new()),
+        execution_mode: crate::tool::ToolExecutionMode::AgentTurn,
+    };
+    let output = tool
+        .execute(
+            json!({"command": "printf '1%%\\r2%%\\r3%%\\ndone-line\\n'", "timeout": 20000}),
+            ctx,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !output.output.contains('\r'),
+        "the committed body must not contain carriage returns: {:?}",
+        output.output
+    );
+    assert!(
+        output.output.contains("3%") && output.output.contains("done-line"),
+        "the collapsed progress value and the following line must both survive: {:?}",
+        output.output
+    );
+    assert!(
+        !output.output.contains("1%") && !output.output.contains("2%"),
+        "only the latest progress value may survive: {:?}",
+        output.output
     );
 }

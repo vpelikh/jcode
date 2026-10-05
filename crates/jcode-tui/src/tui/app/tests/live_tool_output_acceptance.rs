@@ -66,6 +66,8 @@ fn real_app_renders_live_tool_output_from_server_event() {
             "downloading crates...\nfinished 42 crates",
             false,
             false,
+            false,
+            false,
         );
         assert!(needs_redraw, "a live chunk should request a redraw");
 
@@ -80,7 +82,8 @@ fn real_app_renders_live_tool_output_from_server_event() {
         );
 
         // Terminal sentinel clears the region.
-        let cleared = app.apply_tool_output_chunk("call-live", "bash", "", false, true);
+        let cleared =
+            app.apply_tool_output_chunk("call-live", "bash", "", false, false, false, true);
         assert!(cleared, "the done sentinel should change the view");
         let text_after = live_output_frame_text(&app, &mut terminal);
         assert!(
@@ -110,7 +113,7 @@ fn live_output_disables_the_one_cell_spinner_fast_path() {
         "running bash should allow the single-cell spinner fast path"
     );
 
-    app.apply_tool_output_chunk("call-live", "bash", "working", false, false);
+    app.apply_tool_output_chunk("call-live", "bash", "working", false, false, false, false);
     assert!(
         super::run_shell::status_spinner_only_symbol(&app).is_none(),
         "the fast path must yield while live tool output is visible"
@@ -119,18 +122,92 @@ fn live_output_disables_the_one_cell_spinner_fast_path() {
     // With bash output disabled the region is never visible, so the fast path
     // must stay available even though a live view is buffered.
     crate::tui::ui::tools_ui::tests_show_bash_output_override::set(false);
-    app.apply_tool_output_chunk("call-live", "bash", "working", false, false);
+    app.apply_tool_output_chunk("call-live", "bash", "working", false, false, false, false);
     assert!(
         super::run_shell::status_spinner_only_symbol(&app).is_some(),
         "the fast path must stay available when bash output is disabled"
     );
     crate::tui::ui::tools_ui::tests_show_bash_output_override::set(true);
-    app.apply_tool_output_chunk("call-live", "bash", "", false, true);
+    app.apply_tool_output_chunk("call-live", "bash", "", false, false, false, true);
 
     // Clear it again: the fast path returns.
-    app.apply_tool_output_chunk("call-live", "bash", "", false, true);
+    app.apply_tool_output_chunk("call-live", "bash", "", false, false, false, true);
     assert!(
         super::run_shell::status_spinner_only_symbol(&app).is_some(),
         "the fast path should resume once the live view is cleared"
     );
+}
+
+/// A carriage-return progress update must repaint the live region in place, so
+/// the on-screen text changes without the region growing a duplicate row.
+/// This is the user-visible acceptance path for `replace`/`partial` plumbing.
+#[test]
+fn real_app_repaints_carriage_return_overwrite_in_place() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let backend = ratatui::backend::TestBackend::new(90, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+        let mut state = super::remote::RemoteRunState::default();
+
+        for event in [
+            crate::protocol::ServerEvent::ToolStart {
+                id: "call-cr".to_string(),
+                name: "bash".to_string(),
+            },
+            crate::protocol::ServerEvent::ToolExec {
+                id: "call-cr".to_string(),
+                name: "bash".to_string(),
+            },
+        ] {
+            let _ = rt
+                .block_on(super::remote::handle_remote_event(
+                    &mut app,
+                    &mut terminal,
+                    &mut remote,
+                    &mut state,
+                    crate::tui::backend::RemoteRead::Event(event),
+                ))
+                .expect("event should apply");
+        }
+        crate::tui::ui::tools_ui::tests_show_bash_output_override::set(true);
+
+        // First overwrite: "10%".
+        app.apply_tool_output_chunk(
+            "call-cr",
+            "bash",
+            "10%",
+            false,
+            false,
+            false,
+            false,
+        );
+        let first = live_output_frame_text(&app, &mut terminal);
+        assert!(
+            first.contains("10%"),
+            "the first progress value must be visible:\n{first}"
+        );
+
+        // Second overwrite: "20%" replaces it in place.
+        app.apply_tool_output_chunk(
+            "call-cr",
+            "bash",
+            "20%",
+            false,
+            true,
+            false,
+            false,
+        );
+        let second = live_output_frame_text(&app, &mut terminal);
+        assert!(
+            second.contains("20%"),
+            "the overwritten progress value must be visible:\n{second}"
+        );
+        assert!(
+            !second.contains("10%"),
+            "the overwritten value must not remain on screen:\n{second}"
+        );
+    });
 }

@@ -1366,6 +1366,9 @@ pub struct LiveToolOutputView {
 pub struct LiveOutputLine {
     pub text: String,
     pub stderr: bool,
+    /// The line is still being written (no terminator yet). A later partial
+    /// line for the same stream replaces this one in place.
+    pub partial: bool,
 }
 
 impl LiveToolOutputView {

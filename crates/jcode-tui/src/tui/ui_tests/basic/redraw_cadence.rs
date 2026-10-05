@@ -376,6 +376,7 @@ fn live_tool_output_disables_the_spinner_fast_path_in_the_cadence_policy() {
         lines: vec![crate::tui::LiveOutputLine {
             text: "working...".to_string(),
             stderr: false,
+            partial: false,
         }],
         truncated: 0,
     });

@@ -1964,7 +1964,11 @@ pub(super) fn build_notification_spans(app: &dyn TuiState) -> Vec<Span<'static>>
 }
 
 /// Maximum rows the live tool-output region may occupy (header + body).
-const LIVE_OUTPUT_REGION_MAX_ROWS: usize = 8;
+///
+/// Deliberately bounded so a chatty command cannot push the input and the
+/// newest transcript lines off-screen, but large enough to show a useful tail
+/// of a build or test log.
+pub(crate) const LIVE_OUTPUT_REGION_MAX_ROWS: usize = 14;
 
 /// How the live region divides its rows, given the lines it will show.
 ///

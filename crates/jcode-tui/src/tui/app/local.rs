@@ -191,6 +191,8 @@ pub(super) fn handle_bus_event(
                     &chunk.tool_name,
                     &chunk.text,
                     chunk.stderr,
+                    chunk.replace,
+                    chunk.partial,
                     chunk.done,
                 )
             } else {

@@ -932,6 +932,8 @@ pub(super) async fn handle_client(
                                 name: chunk.tool_name,
                                 text: chunk.text,
                                 stderr: chunk.stderr,
+                                replace: chunk.replace,
+                                partial: chunk.partial,
                                 done: chunk.done,
                             });
                         }

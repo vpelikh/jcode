@@ -143,6 +143,13 @@ pub struct ToolOutputChunk {
     pub text: String,
     /// Whether this chunk came from the process's stderr stream.
     pub stderr: bool,
+    /// The chunk overwrites the stream's last visible line instead of appending
+    /// (a carriage-return progress overwrite, or a growing in-progress line).
+    pub replace: bool,
+    /// The chunk's text is an in-progress line with no terminator yet (the
+    /// command is still writing it). A later partial line for the same stream
+    /// replaces this one in place rather than appending.
+    pub partial: bool,
     /// Terminal sentinel: the live output for this tool call is complete and
     /// any live view should be cleared.
     pub done: bool,

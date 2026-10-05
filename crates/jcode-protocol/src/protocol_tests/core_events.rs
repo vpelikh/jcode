@@ -739,6 +739,8 @@ fn test_tool_output_roundtrip_and_defaults() -> Result<()> {
         name: "bash".to_string(),
         text: "line one\nline two".to_string(),
         stderr: true,
+        replace: true,
+        partial: true,
         done: false,
     };
     let json = serde_json::to_string(&event)?;
@@ -750,12 +752,16 @@ fn test_tool_output_roundtrip_and_defaults() -> Result<()> {
             name,
             text,
             stderr,
+            replace,
+            partial,
             done,
         } => {
             assert_eq!(id, "call-1");
             assert_eq!(name, "bash");
             assert_eq!(text, "line one\nline two");
             assert!(stderr);
+            assert!(replace);
+            assert!(partial);
             assert!(!done);
         }
         other => panic!("expected ToolOutput, got {other:?}"),
@@ -769,8 +775,16 @@ fn test_tool_output_defaults_when_stream_flags_absent() -> Result<()> {
     let json = r#"{"type":"tool_output","id":"c","name":"bash","text":"x"}"#;
     let decoded: ServerEvent = serde_json::from_str(json)?;
     match decoded {
-        ServerEvent::ToolOutput { stderr, done, .. } => {
+        ServerEvent::ToolOutput {
+            stderr,
+            replace,
+            partial,
+            done,
+            ..
+        } => {
             assert!(!stderr);
+            assert!(!replace);
+            assert!(!partial);
             assert!(!done);
         }
         other => panic!("expected ToolOutput, got {other:?}"),
