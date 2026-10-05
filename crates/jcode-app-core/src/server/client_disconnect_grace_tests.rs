@@ -32,15 +32,27 @@ impl Provider for NoRequests {
 struct Home {
     _dir: tempfile::TempDir,
     previous: Option<std::ffi::OsString>,
+    _runtime_dir: tempfile::TempDir,
+    previous_runtime: Option<std::ffi::OsString>,
 }
 impl Home {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("JCODE_HOME");
         crate::env::set_var("JCODE_HOME", dir.path());
+        // Isolate the runtime dir too: `clear_reload_marker()` in these tests
+        // resolves `runtime_dir()/jcode.reload`, which is NOT under JCODE_HOME
+        // (it follows JCODE_RUNTIME_DIR, else TMPDIR). Without this, running the
+        // suite deletes the live reload marker of a concurrently reloading jcode
+        // on the developer's machine.
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let previous_runtime = std::env::var_os("JCODE_RUNTIME_DIR");
+        crate::env::set_var("JCODE_RUNTIME_DIR", runtime_dir.path());
         Self {
             _dir: dir,
             previous,
+            _runtime_dir: runtime_dir,
+            previous_runtime,
         }
     }
 }
@@ -49,6 +61,10 @@ impl Drop for Home {
         match self.previous.take() {
             Some(value) => crate::env::set_var("JCODE_HOME", value),
             None => crate::env::remove_var("JCODE_HOME"),
+        }
+        match self.previous_runtime.take() {
+            Some(value) => crate::env::set_var("JCODE_RUNTIME_DIR", value),
+            None => crate::env::remove_var("JCODE_RUNTIME_DIR"),
         }
     }
 }

@@ -623,8 +623,17 @@ pub(in crate::tui::app) async fn handle_post_connect<B: ratatui::backend::Backen
             app.reload_info.push(ctx.reconnect_notice_line());
         }
 
-        let must_reload_client = !crate::tui::is_ssh_remote()
-            && (state.server_reload_in_progress || app.has_newer_binary());
+        // Only re-exec the client when there is actually a newer *client*
+        // binary on disk. A server reload alone is not a reason to restart
+        // every attached client: the reconnect path runs once per session, so
+        // gating on `server_reload_in_progress` fanned a single server reload
+        // out into one client re-exec per attached session (a reload storm,
+        // each re-exec reconnecting and racing the others). When the server
+        // binary is newer but the client binary is not, the client keeps
+        // running and simply reconnects; `maybe_self_reload_after_server_reload`
+        // still handles the in-process reload case where the client binary did
+        // change.
+        let must_reload_client = !crate::tui::is_ssh_remote() && app.has_newer_binary();
 
         if must_reload_client {
             app.push_display_message(DisplayMessage::system(

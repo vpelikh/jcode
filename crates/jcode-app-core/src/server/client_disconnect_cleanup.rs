@@ -390,8 +390,19 @@ mod tests {
     #[test]
     fn running_disconnect_without_reload_is_crash() {
         let _guard = crate::storage::lock_test_env();
+        // Isolate the reload marker in a temp runtime dir: without this the
+        // `clear_reload_marker()` would delete the live marker of a concurrently
+        // running jcode (including one mid-reload) on the developer's machine.
+        let runtime = tempfile::TempDir::new().expect("create runtime dir");
+        let prev_runtime = std::env::var_os("JCODE_RUNTIME_DIR");
+        crate::env::set_var("JCODE_RUNTIME_DIR", runtime.path());
         crate::server::clear_reload_marker();
         assert_eq!(disconnect_disposition(true), DisconnectDisposition::Crashed);
+        if let Some(prev_runtime) = prev_runtime {
+            crate::env::set_var("JCODE_RUNTIME_DIR", prev_runtime);
+        } else {
+            crate::env::remove_var("JCODE_RUNTIME_DIR");
+        }
     }
 
     #[test]

@@ -1078,8 +1078,15 @@ fn test_handle_post_connect_clears_deferred_dispatch_before_reload_followup() {
     }
 }
 
+/// A server reload on its own must NOT re-exec every attached client.
+///
+/// The reconnect path runs once per session, so re-execing whenever
+/// `server_reload_in_progress` was set fanned a single server reload out into
+/// one client re-exec per attached session (each reconnecting and racing the
+/// others). With no newer *client* binary the client must stay put and just
+/// reconnect.
 #[test]
-fn test_handle_post_connect_requests_client_reload_after_server_reload_even_without_newer_binary() {
+fn test_handle_post_connect_does_not_reload_client_after_server_reload_without_newer_binary() {
     use std::time::{Duration, SystemTime};
 
     let _guard = crate::storage::lock_test_env();
@@ -1088,7 +1095,69 @@ fn test_handle_post_connect_requests_client_reload_after_server_reload_even_with
     crate::env::set_var("JCODE_HOME", temp_home.path());
 
     let mut app = create_test_app();
+    // Client binary is already current: no newer client binary on disk.
     app.client_binary_mtime = Some(SystemTime::now() + Duration::from_secs(3600));
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _enter = rt.enter();
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).expect("failed to create terminal");
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    remote.mark_history_loaded();
+    app.remote_session_id = Some("session_reload_after_reconnect".to_string());
+
+    let mut state = super::remote::RemoteRunState {
+        reconnect_attempts: 1,
+        server_reload_in_progress: true,
+        ..Default::default()
+    };
+
+    let outcome = rt
+        .block_on(super::remote::handle_post_connect(
+            &mut app,
+            &mut terminal,
+            &mut remote,
+            &mut state,
+            Some("session_reload_after_reconnect"),
+        ))
+        .expect("post connect should succeed");
+
+    assert!(
+        matches!(outcome, super::remote::PostConnectOutcome::Ready),
+        "a server reload without a newer client binary must reconnect, not re-exec"
+    );
+    assert!(app.reload_requested.is_none());
+    assert!(!app.should_quit);
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}
+
+/// The client still re-execs after a server reload when a newer *client* binary
+/// is actually available.
+#[test]
+fn test_handle_post_connect_reloads_client_after_server_reload_with_newer_binary() {
+    use std::time::SystemTime;
+
+    let _guard = crate::storage::lock_test_env();
+    let temp_home = tempfile::TempDir::new().expect("create temp home");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp_home.path());
+
+    let mut app = create_test_app();
+    let exe = crate::build::launcher_binary_path().unwrap();
+    let mut created = false;
+    if !exe.exists() {
+        if let Some(parent) = exe.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&exe, "test").unwrap();
+        created = true;
+    }
+    // Startup mtime in the past: the on-disk candidate looks newer.
+    app.client_binary_mtime = Some(SystemTime::UNIX_EPOCH);
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _enter = rt.enter();
     let backend = ratatui::backend::TestBackend::new(80, 24);
@@ -1119,6 +1188,60 @@ fn test_handle_post_connect_requests_client_reload_after_server_reload_even_with
         Some("session_reload_after_reconnect")
     );
     assert!(app.should_quit);
+
+    if created {
+        let _ = std::fs::remove_file(&exe);
+    }
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}
+
+/// Edge case: when the running client's own mtime is unknown
+/// (`client_binary_mtime == None`), `has_newer_binary()` is conservatively
+/// false. A server reload must therefore NOT trigger a client re-exec — the
+/// fallback is to keep the client connected rather than fan out a storm.
+#[test]
+fn test_handle_post_connect_does_not_reload_client_when_binary_mtime_unknown() {
+    let _guard = crate::storage::lock_test_env();
+    let temp_home = tempfile::TempDir::new().expect("create temp home");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp_home.path());
+
+    let mut app = create_test_app();
+    app.client_binary_mtime = None;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _enter = rt.enter();
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).expect("failed to create terminal");
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    remote.mark_history_loaded();
+    app.remote_session_id = Some("session_reload_unknown_mtime".to_string());
+
+    let mut state = super::remote::RemoteRunState {
+        reconnect_attempts: 1,
+        server_reload_in_progress: true,
+        ..Default::default()
+    };
+
+    let outcome = rt
+        .block_on(super::remote::handle_post_connect(
+            &mut app,
+            &mut terminal,
+            &mut remote,
+            &mut state,
+            Some("session_reload_unknown_mtime"),
+        ))
+        .expect("post connect should succeed");
+
+    assert!(
+        matches!(outcome, super::remote::PostConnectOutcome::Ready),
+        "unknown client mtime must not trigger a re-exec"
+    );
+    assert!(app.reload_requested.is_none());
+    assert!(!app.should_quit);
 
     if let Some(prev_home) = prev_home {
         crate::env::set_var("JCODE_HOME", prev_home);
