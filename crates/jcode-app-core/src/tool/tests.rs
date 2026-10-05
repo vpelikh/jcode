@@ -702,12 +702,33 @@ async fn tool_descriptions_stay_under_token_cap() {
     // BACKGROUND AX over focus steal); it must stay visible on every call.
     // skill_manage names its actions and the proactive-load nudge inline
     // (`skill::tests::test_tool_description` asserts that content).
+    // browser carries the fast-agent handoff sub-protocol (status before setup,
+    // handoff preference, goal+tab_id, the hand_back recovery loop). It cannot
+    // compress to a one-liner without losing guidance the model acts on, and
+    // `browser_tests` pins its exact phrasing.
+    // panel and side_panel document spawn/update/focus/close semantics plus the
+    // 20 MiB per-file and 32 MiB per-session PDF caps and the TUI Markdown
+    // fallback; the format split (load vs Markdown-only write/append) prevents
+    // misuse.
+    // desktop_selfdev states the product-separation contract (never builds or
+    // reloads the CLI, private Xvfb, reload acknowledgement is not completion)
+    // that must stay visible on every call.
+    // bg names the tail/delivery actions and the JCODE_PROGRESS/CHECKPOINT
+    // markers that make background wakeups reliable; short forms dropped that.
+    // selfdev describes what enabling self-dev mode actually does (sets up the
+    // environment, reloads to a newer build, locates config/paths).
     const EXEMPT: &[&str] = &[
         "integration_tools",
         "swarm",
         "batch",
         "macos_computer_use",
         "skill_manage",
+        "browser",
+        "panel",
+        "side_panel",
+        "desktop_selfdev",
+        "bg",
+        "selfdev",
     ];
 
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
@@ -758,6 +779,100 @@ fn collect_param_descriptions(schema: &Value, path: &str, out: &mut Vec<(String,
     }
 }
 
+/// Whether a tool parameter path is exempt from the always-on token cap, and
+/// why. Shared by the cap test (allows over-cap descriptions through) and the
+/// guard test (requires every exemption actually shields an over-cap
+/// description). Keeping this single copy means the two cannot drift.
+///
+/// Rationale for the non-todo entries: the cap-introduction commits shortened
+/// these descriptions past the point of usefulness, dropping load-bearing
+/// contract detail (spawn/idle semantics, the deep-mode node/artifact contract,
+/// model/route pinning, concurrency limits, to_session/target_session aliasing,
+/// grep/find/outline/trace routing, the millisecond timeout, destructive-gate
+/// justification, wait/tail/delivery semantics, the Gmail connect/OAuth flow,
+/// the schedule delivery target, path-normalization and deep-recall notes, the
+/// websearch engine fallback, and the todo plan/goal/group rubrics). The
+/// descriptions were restored and exempted rather than left terse.
+fn is_exempt(tool: &str, path: &str) -> bool {
+    (tool == "todo" && path.starts_with("$.properties.goals.items.properties.feedback_loop_"))
+        || (tool == "integration_tools"
+            && matches!(
+                path,
+                "$.properties.action" | "$.properties.query" | "$.properties.reason"
+            ))
+        || (tool == "browser"
+            && matches!(
+                path,
+                "$.properties.action" | "$.properties.text_values" | "$.properties.candidates"
+            ))
+        || (tool == "panel"
+            && matches!(
+                path,
+                "$.properties.action" | "$.properties.panel_id" | "$.properties.file_path"
+            ))
+        || (tool == "desktop_selfdev"
+            && matches!(path, "$.properties.output" | "$.properties.timeout_seconds"))
+        || (tool == "swarm"
+            && matches!(
+                path,
+                "$.properties.action"
+                    | "$.properties.key"
+                    | "$.properties.message"
+                    | "$.properties.tldr"
+                    | "$.properties.status"
+                    | "$.properties.to_session"
+                    | "$.properties.channel"
+                    | "$.properties.target_session"
+                    | "$.properties.label"
+                    | "$.properties.prompt"
+                    | "$.properties.initial_message"
+                    | "$.properties.task_id"
+                    | "$.properties.model"
+                    | "$.properties.effort"
+                    | "$.properties.spawn_mode"
+                    | "$.properties.concurrency_limit"
+                    | "$.properties.retain_agents"
+                    | "$.properties.notify"
+                    | "$.properties.wake"
+                    | "$.properties.background"
+                    | "$.properties.nodes"
+                    | "$.properties.artifact"
+            ))
+        || (tool == "agentgrep"
+            && matches!(
+                path,
+                "$.properties.mode"
+                    | "$.properties.query"
+                    | "$.properties.file"
+                    | "$.properties.terms"
+                    | "$.properties.regex"
+                    | "$.properties.path"
+                    | "$.properties.glob"
+            ))
+        || (tool == "bash"
+            && matches!(path, "$.properties.timeout" | "$.properties.justification"))
+        || (tool == "bg"
+            && matches!(
+                path,
+                "$.properties.action"
+                    | "$.properties.max_wait_seconds"
+                    | "$.properties.return_on_progress"
+            ))
+        || (tool == "gmail" && path == "$.properties.action")
+        || (tool == "session_search"
+            && matches!(path, "$.properties.working_dir" | "$.properties.exhaustive"))
+        || (tool == "websearch" && path == "$.properties.engine")
+        || (tool == "schedule" && path == "$.properties.target")
+        || (tool == "todo"
+            && matches!(
+                path,
+                "$.properties.plan"
+                    | "$.properties.plan.properties.user_intention"
+                    | "$.properties.goals"
+                    | "$.properties.todos.items.properties.group"
+            ))
+}
+
 /// Parameter descriptions inside tool schemas are also always-on prompt cost,
 /// so each is capped. Longer guidance belongs in runtime error messages, docs,
 /// or the system prompt (the todo calibration rubrics, for example, live in
@@ -765,16 +880,6 @@ fn collect_param_descriptions(schema: &Value, path: &str, out: &mut Vec<(String,
 #[tokio::test]
 async fn tool_parameter_descriptions_stay_under_token_cap() {
     const PARAM_DESCRIPTION_TOKEN_CAP: usize = 25;
-    // todo's feedback-loop calibration descriptions document every enum value
-    // (relevance, coverage, traceability). They are the always-on contract the
-    // model reads to score a goal's feedback loop; keeping the full rubric is
-    // deliberate and asserted by `schema_advertises_intent_and_todos`.
-    // integration_tools' action parameter carries the off-catalog selection
-    // disclosure sentence asserted by `schema_is_compact_and_self_contained`.
-    fn is_exempt(tool: &str, path: &str) -> bool {
-        (tool == "todo" && path.starts_with("$.properties.goals.items.properties.feedback_loop_"))
-            || (tool == "integration_tools" && path == "$.properties.action")
-    }
 
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let registry = Registry::new(provider).await;
@@ -800,6 +905,44 @@ async fn tool_parameter_descriptions_stay_under_token_cap() {
         "{} parameter descriptions over the {PARAM_DESCRIPTION_TOKEN_CAP}-token cap:\n{}",
         over_cap.len(),
         over_cap.join("\n")
+    );
+}
+
+/// The parameter exemptions are hardcoded schema paths. If a schema key is
+/// renamed or the description is shortened back under the cap, an exemption
+/// silently becomes dead: it either stops matching (allowing the cap to kick
+/// back in) or matches a path that no longer needs exempting. Either way the
+/// stale entry should be removed rather than left to rot, so this test fails
+/// whenever an exemption matches no over-cap description.
+#[tokio::test]
+async fn parameter_descriptions_exemptions_are_all_live() {
+    const PARAM_DESCRIPTION_TOKEN_CAP: usize = 25;
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+    let mut dead: Vec<String> = Vec::new();
+    for def in registry.definitions(None).await {
+        let mut descriptions = Vec::new();
+        collect_param_descriptions(&def.input_schema, "$", &mut descriptions);
+        for (path, description) in descriptions {
+            // Mirror the cap test's is_exempt() in the inverse direction: the
+            // cap test allows an over-cap description through when is_exempt()
+            // is true; this guard requires that every description is_exempt()
+            // actually shields is genuinely over cap. It calls is_exempt()
+            // itself, so the two stay in step by construction instead of
+            // duplicating the path list by hand.
+            if is_exempt(&def.name, &path) {
+                let tokens = crate::util::estimate_tokens(&description);
+                if tokens <= PARAM_DESCRIPTION_TOKEN_CAP {
+                    dead.push(format!("{} {}", def.name, path));
+                }
+            }
+        }
+    }
+    assert!(
+        dead.is_empty(),
+        "stale parameter-description exemptions that no longer shield an over-cap \
+         (or existing) description; remove or retighten them:\n{}",
+        dead.join("\n")
     );
 }
 

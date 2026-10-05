@@ -429,11 +429,20 @@ impl Tool for DiscoverToolsTool {
     }
 
     fn description(&self) -> &str {
-        "Call this before using any product, service, dev tool, API, or data source you \
-         don't already have a tool for. Catalog tools have integrated with this agent for seamless setup. \
-         Use a built-in tool directly when available. Use `details` to investigate a promising result, then \
-         `select` the product actually chosen, including an off-catalog product. Off-catalog selections are \
-         recorded but return no provider information or setup."
+        "Use proactively whenever fully completing the user's goal requires an external \
+         capability, service, account, or data source that available tools do not provide, even \
+         if it is needed only in a later step or the user did not ask for a tool. For multi-step \
+         tasks, identify every missing capability end to end and call this tool for each relevant \
+         category before responding. An empty category is not a reason to stop; do not conclude \
+         the task is blocked until all missing capabilities have been checked. Do not treat a \
+         prerequisite as covering a later action; check each unsupported external action \
+         independently. Search before saying you cannot proceed, asking the user to find a \
+         service, or delegating an unsupported step to them. If a browse has no suitable result, \
+         submit one `suggest` action for maintainer review, then continue without promising it \
+         will be added. Skip discovery when available tools fully cover the task. Every listing is \
+         vetted, and one-tool-call setup is enforced. Some providers are Jcode partners and may \
+         share revenue with Jcode when a referred user becomes a customer. Partnership status \
+         never influences selection. Choose the best option based only on fit."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -457,13 +466,13 @@ impl Tool for DiscoverToolsTool {
                     "type": "string",
                     "minLength": DISCOVERY_QUERY_MIN_CHARS,
                     "maxLength": DISCOVERY_QUERY_MAX_CHARS,
-                    "description": "Capability summary. May be shared with integration providers; never secrets or personal data."
+                    "description": "Required capability summary. Browse/select text may be sent to relevant partners for demand reporting. Suggest text goes only to Jcode maintainers. Write a fresh summary instead of copying user text. Never include secrets, credentials, personal data, or private content."
                 },
                 "reason": {
                     "type": "string",
                     "minLength": DISCOVERY_REASON_MIN_CHARS,
                     "maxLength": DISCOVERY_REASON_MAX_CHARS,
-                    "description": "Why the candidate is relevant, or why search results were unsuitable. Never include private data."
+                    "description": "Required rationale. For select, explain why the tool fits better than alternatives. For suggest, explain why browse results were unsuitable. Browse/select text may reach relevant partners; suggest text goes only to Jcode maintainers. Never include private data."
                 },
                 "tool": {
                     "type": "string",
@@ -2164,15 +2173,15 @@ mod tests {
     fn schema_is_compact_and_self_contained() {
         let tool = DiscoverToolsTool::new();
         let description = tool.description();
-        assert!(description.starts_with("Call this before using any product"));
-        assert!(description.contains("don't already have a tool for"));
-        assert!(description.contains("Use a built-in tool directly"));
-        assert!(description.contains("integrated with this agent"));
-        assert!(description.contains("seamless setup"));
-        assert!(!description.to_ascii_lowercase().contains("partner"));
-        assert!(description.contains("including an off-catalog product"));
+        assert!(description.starts_with("Use proactively whenever fully completing the user's goal"));
+        assert!(description.contains("the user did not ask for a tool"));
+        assert!(description.contains("check each unsupported external action"));
+        assert!(description.contains("Skip discovery when available tools fully cover the task"));
+        assert!(description.contains("Every listing is"));
+        assert!(description.contains("Partnership status"));
+        assert!(description.contains("never influences selection"));
         assert!(
-            description.len() < 500,
+            description.len() < 1_600,
             "discovery description should stay compact, got {} bytes",
             description.len()
         );
@@ -2193,9 +2202,9 @@ mod tests {
         let schema = serde_json::to_string(&parameters).unwrap();
         assert!(schema.contains("Missing capability category; infer it from the user's goal."));
         assert!(schema.contains("details investigates one without selecting it"));
-        assert!(schema.contains("May be shared with integration providers"));
-        assert!(schema.contains("never secrets or personal data"));
-        assert!(schema.contains("Why the candidate is relevant"));
+        assert!(schema.contains("may be sent to relevant partners for demand reporting"));
+        assert!(schema.contains("Never include secrets, credentials, personal data"));
+        assert!(schema.contains("Required rationale. For select, explain why the tool fits"));
         assert!(schema.contains("known_product"));
         assert!(schema.contains("capability_gap"));
         assert!(schema.contains("prior_request_id"));

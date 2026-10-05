@@ -66,7 +66,7 @@ pub(super) fn bash_parameters_schema() -> serde_json::Value {
             },
             "timeout": {
                 "type": "integer",
-                "description": "Timeout in MILLISECONDS (not seconds), e.g. 600000 = 10min; kills with exit 124. Omit for no timeout."
+                "description": "Timeout in MILLISECONDS (not seconds). Kills the command when exceeded and reports exit 124. e.g. 1000 = 1s, 600000 = 10min. Omit to run with no timeout; do NOT pass small values like 1000 for long jobs such as builds or test suites."
             },
             "run_in_background": {
                 "type": "boolean",
@@ -86,7 +86,7 @@ pub(super) fn bash_parameters_schema() -> serde_json::Value {
             },
             "justification": {
                 "type": "string",
-                "description": "Only when re-issuing a command the destructive gate refused; explain which user request it serves."
+                "description": "Only for re-issuing a command the destructive-command gate refused. Explain which specific user request this command serves. Do not set it preemptively."
             }
         }
     })

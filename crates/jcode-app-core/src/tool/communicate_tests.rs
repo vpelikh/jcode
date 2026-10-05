@@ -1016,7 +1016,7 @@ fn schema_requires_a_nonblank_label_for_spawn() {
         schema["properties"]["action"]["description"]
             .as_str()
             .expect("action description")
-            .contains("spawn requires label")
+            .contains("requires a nonblank label")
     );
 
     let branches = schema["anyOf"]
@@ -1251,17 +1251,21 @@ fn schema_advertises_supported_swarm_fields() {
     assert!(props.contains_key("value"));
     assert!(props.contains_key("message"));
     assert!(props.contains_key("to_session"));
-    assert_eq!(
-        props["to_session"]["description"],
-        json!("Session ID or unique friendly name of one agent. Alias of target_session.")
+    assert!(
+        props["to_session"]["description"]
+            .as_str()
+            .expect("to_session description")
+            .contains("Interchangeable with target_session")
     );
     assert!(props.contains_key("channel"));
     assert!(props.contains_key("proposer_session"));
     assert!(props.contains_key("reason"));
     assert!(props.contains_key("target_session"));
-    assert_eq!(
-        props["target_session"]["description"],
-        json!("Session ID or unique friendly name for management actions. Alias of to_session.")
+    assert!(
+        props["target_session"]["description"]
+            .as_str()
+            .expect("target_session description")
+            .contains("Interchangeable with to_session")
     );
     assert!(props.contains_key("role"));
     assert!(props.contains_key("prompt"));

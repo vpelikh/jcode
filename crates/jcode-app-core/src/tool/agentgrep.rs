@@ -204,32 +204,32 @@ impl Tool for AgentGrepTool {
                 "mode": {
                     "type": "string",
                     "enum": ["grep", "find", "outline", "trace"],
-                    "description": "Mode: grep (default), find (file names), outline (one file), trace (relationship DSL)."
+                    "description": "Optional search mode. Defaults to grep. Use grep for normal code/text search, find for file-name/path search, outline to summarize one file, and trace for DSL-based relationship search."
                 },
                 "query": {
                     "type": "string",
-                    "description": "Search query. Required for grep (literal unless regex=true); optional ranking terms for find."
+                    "description": "Search query. Required for grep. For find, provide query terms to rank matching file paths, or omit query when path, glob, or type already narrows the file list. Grep treats query as literal text unless regex=true."
                 },
                 "file": {
                     "type": "string",
-                    "description": "Single file to inspect. Required for outline."
+                    "description": "Single file to inspect. Required for outline. For grep/find of a single file, path may also point directly to the file."
                 },
                 "terms": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Trace DSL terms, e.g. [\"subject:auth_status\", \"relation:rendered\"]. Not for grep/find; use query."
+                    "description": "Trace DSL terms, for example [\"subject:auth_status\", \"relation:rendered\", \"support:ui\"]. Do not use this for normal grep/find searches; use query instead."
                 },
                 "regex": {
                     "type": "boolean",
-                    "description": "In grep mode, treat query as a regex. Defaults to false (literal)."
+                    "description": "When true in grep mode, interpret query as a regular expression. Defaults to false, which is safer for literal searches."
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory or file to search, relative to the workspace. Omit to search the whole workspace."
+                    "description": "Directory or file to search, relative to the workspace unless absolute. If this is a file, agentgrep searches only that file. Omit to search the workspace."
                 },
                 "glob": {
                     "type": "string",
-                    "description": "Optional file glob filter such as **/*.rs. Omit to search everything."
+                    "description": "Optional file glob filter such as **/*.rs. Do not set glob to **/* just to search everything; omit it instead."
                 },
                 "type": {
                     "type": "string",

@@ -394,7 +394,7 @@ impl Tool for SessionSearchTool {
                 },
                 "working_dir": {
                     "type": "string",
-                    "description": "Only sessions whose working directory matches this path prefix (case-insensitive)."
+                    "description": "Restrict results to sessions whose working directory matches this path or path prefix. Matching is normalized and case-insensitive."
                 },
                 "limit": {
                     "type": "integer",
@@ -482,7 +482,7 @@ impl Tool for SessionSearchTool {
                 },
                 "exhaustive": {
                     "type": "boolean",
-                    "description": "Search every session instead of the recent indexed subset. Slower; for deep recall."
+                    "description": "Search every available Jcode session instead of the recent indexed subset. Slower, but useful for deep recall."
                 }
             },
             "required": ["query"]
