@@ -223,7 +223,6 @@ pub(super) async fn spawn_or_resume_await_members(
 
     tokio::spawn(async move {
         let mut event_rx = swarm_event_tx.subscribe();
-        let deadline = deadline_to_instant(state.deadline_unix_ms);
 
         loop {
             let member_statuses = awaited_member_statuses(
@@ -255,25 +254,52 @@ pub(super) async fn spawn_or_resume_await_members(
                 return;
             }
 
-            // Blocking waits stop watching once every socket waiter has
-            // disconnected. Background watchers have no socket waiter, so they
-            // keep running until they resolve or hit the deadline, delivering
-            // the result via notify/wake. Re-read the persisted prefs here: a
-            // duplicate request may have upgraded this wait to background mode
-            // after this watcher was spawned with a blocking-state copy.
-            let is_background = refresh_pending_state(&state)
-                .map(|latest| latest.background)
-                .unwrap_or(state.background);
+            // Re-read the persisted prefs and effective deadline here so a
+            // duplicate request that upgraded this wait to background mode or
+            // an async re-issue that extended the deadline takes effect on an
+            // already-running watcher. Blocking waits stop watching once every
+            // socket waiter has disconnected; background watchers have no socket
+            // waiter, so they keep running until they resolve or hit the
+            // deadline, delivering the result via notify/wake.
+            let latest = refresh_pending_state(&state).unwrap_or_else(|| state.clone());
+            let is_background = latest.background;
             if !is_background && await_members_runtime.retain_open_waiters(&key).await == 0 {
                 await_members_runtime.clear_active(&key).await;
                 return;
             }
 
+            // Fire the timeout only when the *freshly-read* deadline has truly
+            // passed. A `sleep_until` armed on an older deadline can wake after
+            // the deadline was extended, so a bare wake is not proof of expiry:
+            // it loops back here to compare against the current deadline.
+            let deadline = deadline_to_instant(latest.deadline_unix_ms);
+            let expired = {
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                latest.deadline_unix_ms <= now_ms
+            };
+            if expired {
+                let summary = timeout_summary(&member_statuses);
+                finalize_await(
+                    &await_members_runtime,
+                    &state,
+                    false,
+                    member_statuses,
+                    summary,
+                )
+                .await;
+                return;
+            }
+
             tokio::select! {
+                // Fires on the current deadline; loop back so the expiry is
+                // re-confirmed against the latest persisted deadline before
+                // finalizing (an extension may have landed meanwhile), and a
+                // later deadline is re-armed instead of firing early.
                 _ = tokio::time::sleep_until(deadline) => {
-                    let summary = timeout_summary(&member_statuses);
-                    finalize_await(&await_members_runtime, &state, false, member_statuses, summary).await;
-                    return;
+                    continue;
                 }
                 event = event_rx.recv() => {
                     match event {
@@ -429,12 +455,37 @@ pub(super) async fn handle_comm_await_members(
 
         // When reusing a persisted pending state (e.g. a resumed call after
         // reload, or a duplicate request), let the latest call's delivery prefs
-        // win so the watcher and tool response stay in sync. The deadline is
-        // intentionally preserved from the original request.
+        // win so the watcher and tool response stay in sync.
+        //
+        // For async (background) awaits a still-active wait may be
+        // re-issued by a coordinator that keeps watching long-running workers.
+        // Refresh the deadline from *this* call's timeout so a longer
+        // `timeout_minutes` actually extends the wait instead of pinning every
+        // retry to the first call's deadline (which then fires "Timed out" right
+        // as the workers are about to report). An already-expired state is left
+        // untouched so a retry after expiry still reports the timeout (see
+        // `await_members_background_already_expired_answers_tool_call`), and
+        // blocking awaits (reload/resume) preserve the original deadline so a
+        // resumed wait is never silently extended.
+        let now_ms_for_deadline = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let mut state_changed = false;
+        if background
+            && state.deadline_unix_ms > now_ms_for_deadline
+            && state.deadline_unix_ms != requested_deadline
+        {
+            state.deadline_unix_ms = requested_deadline;
+            state_changed = true;
+        }
         if state.background != background || state.notify != notify || state.wake != wake {
             state.background = background;
             state.notify = notify;
             state.wake = wake;
+            state_changed = true;
+        }
+        if state_changed {
             save_state(&state);
         }
 

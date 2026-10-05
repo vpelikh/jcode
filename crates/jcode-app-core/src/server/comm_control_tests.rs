@@ -175,6 +175,7 @@ include!("comm_control_tests/await_late_joiners.rs");
 include!("comm_control_tests/await_disconnect.rs");
 include!("comm_control_tests/await_any.rs");
 include!("comm_control_tests/await_reload_deadline.rs");
+include!("comm_control_tests/await_reissue_deadline.rs");
 include!("comm_control_tests/await_reload_final.rs");
 include!("comm_control_tests/await_lagged.rs");
 include!("comm_control_tests/await_resume_expired.rs");
