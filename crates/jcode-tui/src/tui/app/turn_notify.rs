@@ -3,15 +3,15 @@
 //! When a turn finishes after a configurable duration (lower threshold when
 //! the session has todos, since those indicate task-style work), the user gets
 //! a desktop notification: session name + duration in the title, todo progress
-//! as the subtitle, and the **full** final assistant message in the body.
-//! Nothing is truncated for the durable surfaces: Notification Center
-//! stores the whole body (so it survives expansion and search) and the chat
-//! channels render it in full (chunked per backend). Two in-bubble transports
-//! are bounded because they cannot carry an unbounded payload: the
+//! as the subtitle, and the final assistant message in the body. The chat
+//! channels render the reply in full (chunked per backend). The OS banner
+//! transports cannot carry an unbounded payload and so are bounded: the
 //! terminal-native escape sequence (kitty OSC 99 / iTerm2 OSC 9) and the
-//! `osascript` / `notify-send` banner fallback, which passes the text as a
-//! process argument. By default it fires only while the terminal window is
-//! unfocused.
+//! `osascript` / `notify-send` banner fallback (text passed as a process
+//! argument). The macOS Notification Center body keeps the full reply for normal
+//! turns and is capped only at a pathological ceiling (an oversized body is a
+//! macOS 27 NotificationCenter layout cost that can be rejected outright). By
+//! default it fires only while the terminal window is unfocused.
 
 use super::App;
 use crate::todo::TodoItem;
@@ -21,8 +21,8 @@ use base64::Engine as _;
 /// Character budget for a terminal-native notification payload (kitty OSC 99,
 /// iTerm2 OSC 9). These carry the body inline in a single escape sequence, so a
 /// multi-megabyte reply would emit a huge terminal write and may exceed the
-/// terminal's own notification limit. The full text still goes to Notification
-/// Center and the chat channels; only the in-terminal bubble is bounded.
+/// terminal's own notification limit. The full text still goes to the chat
+/// channels; only the in-terminal bubble is bounded.
 #[cfg(any(target_os = "macos", test))]
 const TERMINAL_NOTIFICATION_MAX_CHARS: usize = 4096;
 
@@ -92,9 +92,10 @@ impl App {
         // Telegram control chat a notification center for all sessions: the
         // local OS banner fires as before, and remote channels mirror it.
         //
-        // The detailed body carries the full assistant reply. Because ntfy
-        // topics can be public, ntfy gets a short, non-sensitive safe body
-        // instead of the reply text.
+        // The detailed body carries the full assistant reply (this is the
+        // durable dispatch path, separate from the bounded OS banner above).
+        // Because ntfy topics can be public, ntfy gets a short, non-sensitive
+        // safe body instead of the reply text.
         {
             let session_id = self.active_client_session_id().unwrap_or("unknown");
             let dispatcher = crate::notifications::NotificationDispatcher::new();
@@ -198,8 +199,9 @@ fn notification_text(notification: &TurnNotification) -> String {
     };
     // Terminal-native notifications (kitty OSC 99, iTerm2 OSC 9) render plain
     // text, so strip Markdown markers for display, then bound the payload: the
-    // full body is preserved for Notification Center and the chat channels, but
-    // the in-terminal bubble must not emit an unbounded escape sequence.
+    // full body is preserved for the chat channels, while both the in-terminal
+    // bubble and the macOS Notification Center body must be bounded (the latter
+    // is capped in the broker envelope).
     terminal_payload_text(&crate::notifications::markdown_to_plain_text(&full))
 }
 
@@ -280,10 +282,13 @@ fn load_session_todos(session_id: &str) -> Vec<TodoItem> {
 ///   subtitle: <todo progress, e.g. "3/5 todos · 1 blocked">
 ///   body:     the todo work line ("✓ <just done> · → <in progress>" or a
 ///             blocker "⊘ <todo> needs <dep>") when todos exist, followed by
-///             the **full** final assistant message. Nothing is trimmed: the
-///             whole reply is delivered so Notification Center keeps it for
-///             expansion/search and Telegram/Discord render it in full
-///             (Telegram chunks at its own 4096-char limit when sending).
+///             the final assistant message, in full here. Each transport then
+///             bounds its own copy: the terminal escape sequence and the OS
+///             banner argv are capped for their transports, and the macOS
+///             broker envelope caps what reaches Notification Center (a very
+///             large body hangs it on macOS 27). The chat channels (Telegram,
+///             Discord, ntfy, email) render the reply in full (Telegram chunks
+///             at its own 4096-char limit when sending).
 pub(super) fn build_turn_notification(
     session_name: Option<&str>,
     duration_secs: f32,
@@ -300,9 +305,9 @@ pub(super) fn build_turn_notification(
 
     let subtitle = todo_progress_line(todos);
 
-    // Name the actual work when todos exist, then append the full assistant
-    // message. Neither is truncated: the notification is a window onto the
-    // real reply, not a one-line digest of it.
+    // Name the actual work when todos exist, then append the assistant
+    // message. The build path keeps the full text; bounding happens only at
+    // the individual transports (see the doc comment above).
     let work_line = todo_work_line(todos);
     let full_text = last_assistant_text
         .map(full_assistant_text)

@@ -488,6 +488,13 @@ pub fn macos_notification_inbox_dir() -> Option<std::path::PathBuf> {
 /// `#`/`**`/backticks/fences. The conversion happens here (this is the display
 /// sink); callers keep the original full body for other backends.
 ///
+/// The body is bounded to a Notification-Center-safe ceiling: a very large
+/// `UNMutableNotificationContent` body is a macOS 27 `NotificationCenter`
+/// layout cost and can be rejected outright, which used to strand the payload
+/// in a resubmission loop. The ceiling is far above any realistic reply, so the
+/// full text still shows on screen for normal turns; only the pathological
+/// case is capped. Durable backends (email/chat) always get the full text.
+///
 /// `notification_id` is supplied by the caller so this stays free of the
 /// macOS-only id generator and remains unit-testable on any platform.
 #[cfg(any(target_os = "macos", test))]
@@ -502,11 +509,15 @@ fn macos_turn_envelope(
     MacosNotificationEnvelope {
         schema_version: MACOS_NOTIFICATION_SCHEMA_VERSION,
         notification_id,
-        title: title.to_string(),
+        // Bound title, subtitle, and body alike: each is rendered by
+        // Notification Center, so an oversized one has the same cost as an
+        // oversized body. The title is only capped, not Markdown-converted, to
+        // preserve the exact title text (it is not Markdown-formatted).
+        title: bound_macos_notification_text(title),
         subtitle: subtitle
             .filter(|value| !value.trim().is_empty())
-            .map(markdown_to_plain_text),
-        body: markdown_to_plain_text(body),
+            .map(|value| bound_macos_notification_text(&markdown_to_plain_text(value))),
+        body: bound_macos_notification_text(&markdown_to_plain_text(body)),
         sound: sound
             .filter(|value| !value.trim().is_empty())
             .map(str::to_string),
@@ -779,26 +790,111 @@ pub fn send_desktop_notification(title: &str, body: &str) {
 /// assistant reply (now that turn notifications carry the whole message) can
 /// make `Command::spawn` fail with `E2BIG`; the spawn error is best-effort and
 /// ignored, which would drop the banner silently. Banner daemons truncate long
-/// bodies visually anyway, so bound here. The durable surfaces (the macOS
-/// broker file inbox, email, and the chat channels) still receive the
-/// unbounded body.
+/// bodies visually anyway, so bound here. The durable surfaces (email and the
+/// chat channels) still receive the unbounded body, and the macOS broker
+/// envelope is bounded separately to [`MACOS_NOTIFICATION_MAX_CHARS`].
 pub const DESKTOP_BANNER_MAX_CHARS: usize = 4096;
+
+/// Safety ceiling for each text field (title, subtitle, and body) of a macOS
+/// Notification Center notification.
+///
+/// Notification Center is a durable surface: `cc2720058` deliberately made it
+/// keep the whole assistant reply, so this ceiling is set far above any
+/// realistic reply and only exists to guard the pathological case. macOS
+/// rejects a *very* large `UNMutableNotificationContent` body outright (and an
+/// oversized body is also a known macOS 27 `NotificationCenter` layout cost).
+/// Local probes saw intermittent rejection only from roughly a few hundred KB
+/// up and content-dependently, so this is a conservative ceiling rather than a
+/// measured limit; keeping it well below that range preserves the full text for
+/// any realistic reply while still capping a pathological body. The durable
+/// backends (email, Telegram/Discord, ntfy) always receive the unbounded body.
+pub const MACOS_NOTIFICATION_MAX_CHARS: usize = 100_000;
+
+/// Truncate `text` to at most `max` characters, appending an ellipsis when cut
+/// so a bounded surface still signals that more text exists. Never splits a
+/// character.
+fn truncate_with_ellipsis(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
 
 /// Bound banner text to a transport-safe size, appending an ellipsis when cut
 /// so the rendered banner signals that more text exists.
 ///
 /// Shared with the macOS notification broker, whose `osascript` fallback passes
-/// the envelope body as a process argument and so has the same argv limit.
+/// the envelope fields (title, subtitle, body) as process arguments and so has
+/// the same argv limit.
 pub fn bound_banner_text(text: &str) -> String {
-    if text.chars().count() <= DESKTOP_BANNER_MAX_CHARS {
-        return text.to_string();
+    truncate_with_ellipsis(text, DESKTOP_BANNER_MAX_CHARS)
+}
+
+/// Prepare a desktop-banner body/subtitle for an argv transport: strip Markdown
+/// markers so the banner shows plain text, then bound it to the `execve`-safe
+/// size.
+fn banner_body(text: &str) -> String {
+    bound_banner_text(&markdown_to_plain_text(text))
+}
+
+/// Prepare a desktop-banner title for an argv transport. The title is not
+/// Markdown-formatted, so it is only bounded, never converted, preserving the
+/// exact text; a long title must still be capped or the spawn would fail.
+fn banner_title(text: &str) -> String {
+    bound_banner_text(text)
+}
+
+/// Bound the text delivered to macOS Notification Center to
+/// [`MACOS_NOTIFICATION_MAX_CHARS`].
+///
+/// The broker's `osascript` fallback additionally bounds to
+/// [`DESKTOP_BANNER_MAX_CHARS`] for argv, so this only needs to make the
+/// `UNMutableNotificationContent` path safe.
+pub fn bound_macos_notification_text(text: &str) -> String {
+    truncate_with_ellipsis(text, MACOS_NOTIFICATION_MAX_CHARS)
+}
+
+/// Build the AppleScript `display notification` command for a desktop banner.
+///
+/// All three text fields are expected to be already bounded by the caller (the
+/// `execve` argv limit), so this only escapes them for the script. Kept as a
+/// free function so the escaping and field layout are unit-testable on any
+/// platform.
+#[cfg(any(target_os = "macos", test))]
+fn macos_display_notification_script(
+    title: &str,
+    subtitle: Option<&str>,
+    body: &str,
+    sound: Option<&str>,
+) -> String {
+    fn applescript_escape(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for ch in s.chars() {
+            match ch {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                '\n' => out.push_str("\\n"),
+                '\r' => {}
+                _ => out.push(ch),
+            }
+        }
+        out
     }
-    let mut out: String = text
-        .chars()
-        .take(DESKTOP_BANNER_MAX_CHARS.saturating_sub(1))
-        .collect();
-    out.push('…');
-    out
+
+    let mut script = format!(
+        "display notification \"{}\" with title \"{}\"",
+        applescript_escape(body),
+        applescript_escape(title)
+    );
+    if let Some(subtitle) = subtitle.filter(|s| !s.trim().is_empty()) {
+        script.push_str(&format!(" subtitle \"{}\"", applescript_escape(subtitle)));
+    }
+    if let Some(sound) = sound.filter(|s| !s.trim().is_empty()) {
+        script.push_str(&format!(" sound name \"{}\"", applescript_escape(sound)));
+    }
+    script
 }
 
 /// Send a local desktop notification with optional macOS subtitle and sound.
@@ -817,35 +913,13 @@ pub fn send_desktop_notification_rich(
     // while the stored/original body stays intact for other backends, then bound
     // it: the `osascript` / `notify-send` paths below pass the text as a process
     // argument, which has a hard OS limit (see `DESKTOP_BANNER_MAX_CHARS`).
-    let body = bound_banner_text(&markdown_to_plain_text(body));
-    let subtitle = subtitle.map(|s| bound_banner_text(&markdown_to_plain_text(s)));
+    let body = banner_body(body);
+    let title = banner_title(title);
+    let subtitle = subtitle.map(banner_body);
     let subtitle = subtitle.as_deref();
     #[cfg(target_os = "macos")]
     {
-        fn applescript_escape(s: &str) -> String {
-            let mut out = String::with_capacity(s.len());
-            for ch in s.chars() {
-                match ch {
-                    '\\' => out.push_str("\\\\"),
-                    '"' => out.push_str("\\\""),
-                    '\n' => out.push_str("\\n"),
-                    '\r' => {}
-                    _ => out.push(ch),
-                }
-            }
-            out
-        }
-        let mut script = format!(
-            "display notification \"{}\" with title \"{}\"",
-            applescript_escape(&body),
-            applescript_escape(title)
-        );
-        if let Some(subtitle) = subtitle.filter(|s| !s.trim().is_empty()) {
-            script.push_str(&format!(" subtitle \"{}\"", applescript_escape(subtitle)));
-        }
-        if let Some(sound) = sound.filter(|s| !s.trim().is_empty()) {
-            script.push_str(&format!(" sound name \"{}\"", applescript_escape(sound)));
-        }
+        let script = macos_display_notification_script(&title, subtitle, &body, sound);
         if let Ok(child) = std::process::Command::new("osascript")
             .arg("-e")
             .arg(script)
@@ -862,7 +936,7 @@ pub fn send_desktop_notification_rich(
         let _ = (subtitle, sound);
         if let Ok(child) = std::process::Command::new("notify-send")
             .arg("--app-name=jcode")
-            .arg(title)
+            .arg(&title)
             .arg(&body)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -1390,6 +1464,97 @@ mod tests {
     }
 
     #[test]
+    fn macos_envelope_bounds_body_for_notification_center() {
+        // A pathologically large assistant reply must not reach
+        // `UNMutableNotificationContent` unbounded: on macOS 27 an oversized
+        // body is a NotificationCenter layout cost and can be rejected
+        // outright. The ceiling is far above any realistic reply, so only the
+        // pathological case is capped; the durable backends keep the full text.
+        let huge = "x".repeat(MACOS_NOTIFICATION_MAX_CHARS + 10_000);
+        let envelope = macos_turn_envelope(
+            "jcode-turn-test-id".to_string(),
+            &huge,
+            Some(&huge),
+            &huge,
+            None,
+            MacosNotificationOrigin {
+                terminal: MacosTerminalKind::Unknown,
+                bundle_id: None,
+                tty: None,
+                session_id: None,
+            },
+        );
+        assert_eq!(envelope.body.chars().count(), MACOS_NOTIFICATION_MAX_CHARS);
+        assert!(envelope.body.ends_with('…'));
+        // The title is rendered by Notification Center too, so it is bounded
+        // the same way.
+        assert_eq!(envelope.title.chars().count(), MACOS_NOTIFICATION_MAX_CHARS);
+        assert!(envelope.title.ends_with('…'));
+        assert_eq!(
+            envelope
+                .subtitle
+                .as_deref()
+                .map(str::chars)
+                .map(Iterator::count),
+            Some(MACOS_NOTIFICATION_MAX_CHARS)
+        );
+        // A short body is untouched.
+        let short = macos_turn_envelope(
+            "jcode-turn-test-id".to_string(),
+            "jcode · done",
+            None,
+            "Fixed the parser bug.",
+            None,
+            MacosNotificationOrigin {
+                terminal: MacosTerminalKind::Unknown,
+                bundle_id: None,
+                tty: None,
+                session_id: None,
+            },
+        );
+        assert_eq!(short.body, "Fixed the parser bug.");
+    }
+
+    #[test]
+    fn macos_envelope_keeps_a_realistic_reply_uncapped() {
+        // Notification Center is a durable surface: a long-but-realistic reply
+        // (well past the old 120-char snippet, and past any small banner cap)
+        // must pass through in full. Only a pathological size is capped.
+        let reply = format!(
+            "{}\n\n{}",
+            "## Summary".repeat(50),
+            "detail line.\n".repeat(2000)
+        );
+        assert!(reply.chars().count() > 20_000);
+        assert!(reply.chars().count() < MACOS_NOTIFICATION_MAX_CHARS);
+        let envelope = macos_turn_envelope(
+            "jcode-turn-test-id".to_string(),
+            "jcode · fox · done in 1m",
+            None,
+            &reply,
+            None,
+            MacosNotificationOrigin {
+                terminal: MacosTerminalKind::Unknown,
+                bundle_id: None,
+                tty: None,
+                session_id: None,
+            },
+        );
+        // No ellipsis: the whole reply survived the envelope.
+        assert!(!envelope.body.ends_with('…'));
+        assert!(!envelope.body.contains('…'));
+        assert_eq!(envelope.body, markdown_to_plain_text(&reply));
+    }
+
+    #[test]
+    fn macos_notification_bound_never_splits_multibyte() {
+        let unicode = "é😀中".repeat(MACOS_NOTIFICATION_MAX_CHARS);
+        let bounded = bound_macos_notification_text(&unicode);
+        assert_eq!(bounded.chars().count(), MACOS_NOTIFICATION_MAX_CHARS);
+        assert!(bounded.ends_with('…'));
+    }
+
+    #[test]
     fn dispatch_rich_keeps_safe_and_detailed_bodies_separate() {
         // Structural check: the rich entry point exists and delegates with two
         // distinct bodies. Actual delivery is exercised via the channel tests.
@@ -1422,6 +1587,56 @@ mod tests {
         let bounded = bound_banner_text(&unicode);
         assert_eq!(bounded.chars().count(), DESKTOP_BANNER_MAX_CHARS);
         assert!(bounded.ends_with('…'));
+    }
+
+    #[test]
+    fn macos_banner_script_layout_and_escaping() {
+        // Build the script from already-bounded pieces: body first, title
+        // second, optional subtitle and sound appended in order.
+        let script = macos_display_notification_script(
+            "turn complete",
+            Some("session 1"),
+            "all done",
+            Some("Glass"),
+        );
+        assert_eq!(
+            script,
+            "display notification \"all done\" with title \"turn complete\" \
+             subtitle \"session 1\" sound name \"Glass\""
+        );
+        // Quotes, backslashes, and newlines must be escaped so the embedded
+        // string cannot break out of the AppleScript literal.
+        let script = macos_display_notification_script("a\"b\\c\nd", None, "body", None);
+        assert_eq!(
+            script,
+            "display notification \"body\" with title \"a\\\"b\\\\c\\nd\""
+        );
+        // An empty subtitle (or whitespace-only) is omitted entirely rather
+        // than emitted as an empty literal.
+        let script = macos_display_notification_script("t", Some("   "), "b", None);
+        assert_eq!(script, "display notification \"b\" with title \"t\"");
+    }
+
+    #[test]
+    fn desktop_banner_title_is_bounded() {
+        // The desktop banner passes the title as a process argument, so a huge
+        // title must be bounded the same way the body is; otherwise the
+        // osascript/notify-send spawn fails with E2BIG and drops the banner.
+        // Exercise the real builder so this cannot pass while the production
+        // path forgets to bound the title.
+        let huge_title = "T".repeat(DESKTOP_BANNER_MAX_CHARS + 1000);
+        let script =
+            macos_display_notification_script(&banner_title(&huge_title), None, "body", None);
+        // The rendered title literal is bounded: the script length stays well
+        // under the argv limit even though the input was far over it.
+        assert!(script.chars().count() < DESKTOP_BANNER_MAX_CHARS + 64);
+        assert!(script.contains('…'));
+        // A short title is preserved verbatim (not Markdown-converted).
+        assert_eq!(
+            banner_title("jcode · fox · done in 12m 34s"),
+            "jcode · fox · done in 12m 34s"
+        );
+        assert_eq!(banner_title("a_b_c"), "a_b_c");
     }
 
     #[test]

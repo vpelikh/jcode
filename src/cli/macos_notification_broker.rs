@@ -21,7 +21,8 @@ mod platform {
         NSString, NSTimer,
     };
     use objc2_user_notifications::{
-        UNAuthorizationOptions, UNMutableNotificationContent, UNNotificationPresentationOptions,
+        UNAuthorizationOptions, UNMutableNotificationContent,
+        UNNotificationDismissActionIdentifier, UNNotificationPresentationOptions,
         UNNotificationRequest, UNNotificationResponse, UNNotificationSound,
         UNUserNotificationCenter, UNUserNotificationCenterDelegate,
     };
@@ -33,6 +34,25 @@ mod platform {
     const AUTHORIZATION_DENIED: u8 = 2;
     const AUTHORIZATION_RETRY_TICKS: u32 = 240;
     const ORIGIN_METADATA_KEY: &str = "jcode_origin";
+    /// How many times a single payload may be resubmitted after Notification
+    /// Center reports an asynchronous error before it is quarantined.
+    ///
+    /// Errors are normally transient (authorization still settling, Notification
+    /// Center briefly unavailable), so a few retries are worthwhile. But a
+    /// payload Notification Center rejects *every* time would otherwise be
+    /// renamed back to `.json` and resubmitted on every 0.25s timer tick
+    /// forever, keeping the daemon busy for no benefit.
+    const MAX_SUBMIT_ATTEMPTS: u32 = 5;
+
+    /// Per-`notification_id` failure counts, so a poison payload that
+    /// Notification Center rejects asynchronously is quarantined instead of
+    /// resubmitted on every inbox drain.
+    fn submit_attempts() -> &'static std::sync::Mutex<std::collections::HashMap<String, u32>> {
+        static ATTEMPTS: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, u32>>,
+        > = std::sync::OnceLock::new();
+        ATTEMPTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
 
     define_class!(
         // SAFETY: NSObject has no subclassing requirements and BrokerDelegate
@@ -66,6 +86,18 @@ mod platform {
                 response: &UNNotificationResponse,
                 completion_handler: &block2::DynBlock<dyn Fn()>,
             ) {
+                // Only a real click should raise the originating terminal.
+                // Dismissing the banner (the close button or a swipe) also
+                // delivers a response, with the dismiss action identifier; the
+                // previous code activated the route for both, so clearing a
+                // notification would steal focus to the terminal.
+                let action = response.actionIdentifier();
+                // SAFETY: the SDK exports this as a constant NSString.
+                let dismiss = unsafe { UNNotificationDismissActionIdentifier };
+                if action.isEqualToString(dismiss) {
+                    completion_handler.call(());
+                    return;
+                }
                 let content = response.notification().request().content();
                 let metadata = content.userInfo();
                 // SAFETY: the broker creates this dictionary with NSString keys
@@ -277,11 +309,22 @@ mod platform {
         );
 
         let content = UNMutableNotificationContent::new();
-        content.setTitle(&NSString::from_str(&envelope.title));
+        content.setTitle(&NSString::from_str(
+            &crate::notifications::bound_macos_notification_text(&envelope.title),
+        ));
         if let Some(subtitle) = envelope.subtitle.as_deref() {
-            content.setSubtitle(&NSString::from_str(subtitle));
+            content.setSubtitle(&NSString::from_str(
+                &crate::notifications::bound_macos_notification_text(subtitle),
+            ));
         }
-        content.setBody(&NSString::from_str(&envelope.body));
+        // Defensively cap the body at the shared ceiling: an envelope queued by
+        // an older client may carry a pathologically large reply, and macOS 27
+        // treats an oversized UNMutableNotificationContent body as a layout
+        // cost and may reject it outright. The client already bounds its own
+        // envelopes, so this only guards payloads written before that fix.
+        content.setBody(&NSString::from_str(
+            &crate::notifications::bound_macos_notification_text(&envelope.body),
+        ));
         content.setThreadIdentifier(&NSString::from_str("jcode-turn-complete"));
         let route = serde_json::to_string(&envelope.origin)?;
         let metadata_key = NSString::from_str(ORIGIN_METADATA_KEY);
@@ -305,13 +348,46 @@ mod platform {
         std::fs::rename(queued_path, &submitting_path)
             .context("claim queued notification for submission")?;
         let retry_path = queued_path.to_path_buf();
+        let rejected_path = queued_path.with_extension("rejected");
+        let notification_id = envelope.notification_id.clone();
         let completion = block2::RcBlock::new(move |error: *mut NSError| {
             if error.is_null() {
                 let _ = std::fs::remove_file(&submitting_path);
+                if let Ok(mut attempts) = submit_attempts().lock() {
+                    attempts.remove(&notification_id);
+                }
+                return;
+            }
+            // Submission errors are usually transient (authorization still
+            // settling, Notification Center briefly unavailable), so retry a
+            // bounded number of times. Past the cap, quarantine the payload
+            // instead of renaming it back and resubmitting it forever: a
+            // payload Notification Center rejects every time would otherwise
+            // keep the broker busy on every timer tick.
+            let attempt = {
+                let mut attempts = match submit_attempts().lock() {
+                    Ok(attempts) => attempts,
+                    Err(_) => {
+                        let _ = std::fs::rename(&submitting_path, &retry_path);
+                        crate::logging::warn(
+                            "macOS Notification Center rejected a queued notification",
+                        );
+                        return;
+                    }
+                };
+                let count = attempts.entry(notification_id.clone()).or_insert(0);
+                *count = count.saturating_add(1);
+                *count
+            };
+            if attempt >= MAX_SUBMIT_ATTEMPTS {
+                if let Ok(mut attempts) = submit_attempts().lock() {
+                    attempts.remove(&notification_id);
+                }
+                let _ = std::fs::rename(&submitting_path, &rejected_path);
+                crate::logging::warn(
+                    "macOS Notification Center repeatedly rejected a queued notification; quarantined",
+                );
             } else {
-                // Submission errors are generally transient (authorization or
-                // Notification Center availability). Preserve the payload for
-                // the next timer pass or helper launch.
                 let _ = std::fs::rename(&submitting_path, &retry_path);
                 crate::logging::warn("macOS Notification Center rejected a queued notification");
             }
@@ -349,7 +425,10 @@ mod platform {
         let mut script = format!(
             "display notification \"{}\" with title \"{}\"",
             applescript_escape(&crate::notifications::bound_banner_text(&envelope.body)),
-            applescript_escape(&envelope.title)
+            // The script is passed to `osascript` as an argv, so bound the title
+            // too: an oversized title would exceed the `execve` limit and the
+            // spawn would fail silently, dropping the banner.
+            applescript_escape(&crate::notifications::bound_banner_text(&envelope.title))
         );
         if let Some(subtitle) = envelope
             .subtitle
