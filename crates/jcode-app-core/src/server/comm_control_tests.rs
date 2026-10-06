@@ -118,6 +118,32 @@ fn swarm_event(session_id: &str, swarm_id: &str, event: SwarmEventType) -> Swarm
 #[derive(Default)]
 struct TestProvider;
 
+/// A provider whose `complete` panics, to exercise the spawned-task-turn panic
+/// guard: a panicking agent turn must publish a terminal `failed` member status
+/// (and fail the task) instead of leaving the member stuck at `running`.
+struct PanicProvider;
+
+#[async_trait]
+impl Provider for PanicProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        panic!("intentional provider panic in spawn-assigned-task-run test")
+    }
+
+    fn name(&self) -> &str {
+        "panic"
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(Self)
+    }
+}
+
 #[async_trait]
 impl Provider for TestProvider {
     async fn complete(
@@ -143,6 +169,10 @@ impl Provider for TestProvider {
 
 async fn test_agent() -> Arc<Mutex<Agent>> {
     let provider: Arc<dyn Provider> = Arc::new(TestProvider);
+    test_agent_with_provider(provider).await
+}
+
+async fn test_agent_with_provider(provider: Arc<dyn Provider>) -> Arc<Mutex<Agent>> {
     let registry = Registry::new(provider.clone()).await;
     Arc::new(Mutex::new(Agent::new(provider, registry)))
 }
@@ -163,6 +193,7 @@ fn session_handle(
 }
 
 include!("comm_control_tests/assign_task.rs");
+include!("comm_control_tests/assigned_task_panic.rs");
 include!("comm_control_tests/assign_blocked.rs");
 include!("comm_control_tests/assign_double.rs");
 include!("comm_control_tests/assign_ready_agent.rs");

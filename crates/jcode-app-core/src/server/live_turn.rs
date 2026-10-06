@@ -18,11 +18,23 @@ use super::services::SwarmServiceHandle;
 use super::{session_event_fanout_sender, truncate_detail};
 use crate::agent::Agent;
 use crate::protocol::ServerEvent;
+use futures::FutureExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
 type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
+
+/// Extract a human-readable message from a caught panic payload.
+pub(super) fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
 
 /// Reserve the live agent for `session_id` when the session has at least one
 /// live client attachment and its agent is currently idle.
@@ -81,25 +93,43 @@ pub(super) async fn spawn_tracked_live_turn(
     let session_id = session_id.to_string();
     tokio::spawn(async move {
         let start_message_index = agent.message_count();
-        let result = if let Some(display_role) = display_role {
-            agent
-                .run_once_streaming_mpsc_with_display_role(
+        // A panic inside the turn would abort this task and strand the member
+        // at `running` (never terminal, so never reaped). Catch it and convert
+        // it into an ordinary turn error so the status handling below still
+        // publishes a terminal `failed` status, matching the client-message
+        // path's panic handling.
+        let turn = async {
+            if let Some(display_role) = display_role {
+                agent
+                    .run_once_streaming_mpsc_with_display_role(
+                        &message,
+                        vec![],
+                        system_reminder,
+                        event_tx.clone(),
+                        Some(display_role),
+                    )
+                    .await
+            } else {
+                process_locked_message_streaming_mpsc(
+                    &mut agent,
                     &message,
                     vec![],
                     system_reminder,
                     event_tx.clone(),
-                    Some(display_role),
                 )
                 .await
-        } else {
-            process_locked_message_streaming_mpsc(
-                &mut agent,
-                &message,
-                vec![],
-                system_reminder,
-                event_tx.clone(),
-            )
-            .await
+            }
+        };
+        let result = match std::panic::AssertUnwindSafe(turn).catch_unwind().await {
+            Ok(result) => result,
+            Err(payload) => {
+                let detail = panic_payload_message(payload.as_ref());
+                crate::logging::error(&format!(
+                    "Server-initiated turn PANICKED for live session {}: {}",
+                    session_id, detail
+                ));
+                Err(anyhow::anyhow!("server-initiated turn panicked: {detail}"))
+            }
         };
         let completion_report = result
             .is_ok()

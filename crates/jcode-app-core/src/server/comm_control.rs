@@ -23,6 +23,7 @@ use crate::plan::{
     task_control_target_item_id,
 };
 use crate::protocol::{NotificationType, PlanGraphStatus, ServerEvent};
+use futures::FutureExt;
 use jcode_agent_runtime::SoftInterruptSource;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -862,14 +863,32 @@ fn spawn_assigned_task_run(
             let agent = agent_arc.lock().await;
             agent.message_count()
         };
-        let result = super::client_lifecycle::process_message_streaming_mpsc(
-            Arc::clone(&agent_arc),
-            &assignment_text,
-            vec![],
-            None,
-            event_tx,
+        // Run the turn. A panic inside the agent's turn must not leave the member
+        // stuck at `running` forever, so catch it and convert it into an ordinary
+        // turn error: the failure handling below then marks the member `failed`
+        // and the task `task_failed` instead of this spawned task aborting
+        // silently and stranding the member.
+        let result = match std::panic::AssertUnwindSafe(
+            super::client_lifecycle::process_message_streaming_mpsc(
+                Arc::clone(&agent_arc),
+                &assignment_text,
+                vec![],
+                None,
+                event_tx,
+            ),
         )
-        .await;
+        .catch_unwind()
+        .await
+        {
+            Ok(result) => result,
+            Err(payload) => {
+                let detail = super::live_turn::panic_payload_message(payload.as_ref());
+                crate::logging::error(&format!(
+                    "swarm task turn PANICKED for {target_session}: {detail}"
+                ));
+                Err(anyhow::anyhow!("swarm task turn panicked: {detail}"))
+            }
+        };
         let completion_report = if result.is_ok() {
             let agent = agent_arc.lock().await;
             agent.latest_assistant_text_after(start_message_index)

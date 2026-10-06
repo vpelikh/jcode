@@ -1,7 +1,8 @@
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
 
 use super::{
-    NotifySessionContext, clone_split_session, handle_notify_session, handle_rename_session,
+    AgentTaskContext, NotifySessionContext, clone_split_session, handle_agent_task,
+    handle_notify_session, handle_rename_session,
     handle_resume_all_sessions, handle_set_feature, handle_set_handoff_resume,
     handle_set_working_dir, handle_split, handle_handoff_list, handle_handoff_import, handle_handoff_apply,
     handle_handoff_resume_by_id, handle_handoff_save, handle_handoff_task_clear,
@@ -3170,4 +3171,99 @@ async fn real_socket_handoff_list_and_import_round_trip() -> Result<()> {
 
     run_task.abort();
     Ok(())
+}
+
+/// A provider whose `complete` panics, to exercise `handle_agent_task`'s panic
+/// guard. A panicking turn must publish a terminal `failed` member status
+/// instead of unwinding out of the connection's request loop and stranding the
+/// member at `running`.
+struct PanicProvider;
+
+#[async_trait]
+impl Provider for PanicProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        panic!("intentional provider panic in handle_agent_task test")
+    }
+
+    fn name(&self) -> &str {
+        "panic"
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(Self)
+    }
+}
+
+#[tokio::test]
+async fn agent_task_panic_publishes_failed_member_status() {
+    // Agent construction persists metadata, so it must share the test-home lock.
+    let _guard = crate::storage::lock_test_env();
+    let _home = SplitTestHome::new();
+    let session_id = "session_agent_task_panic";
+    let provider: Arc<dyn Provider> = Arc::new(PanicProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
+
+    let (member_event_tx, _member_event_rx) = mpsc::unbounded_channel();
+    let now = Instant::now();
+    let swarm_members = Arc::new(RwLock::new(HashMap::from([(
+        session_id.to_string(),
+        SwarmMember {
+            session_id: session_id.to_string(),
+            event_tx: member_event_tx,
+            event_txs: HashMap::new(),
+            working_dir: Some(PathBuf::from("/tmp/jcode-agent-task-panic")),
+            swarm_id: Some("swarm-agent-task-panic".to_string()),
+            swarm_enabled: true,
+            status: "ready".to_string(),
+            detail: None,
+            task_label: None,
+            friendly_name: Some("duck".to_string()),
+            report_back_to_session_id: None,
+            latest_completion_report: None,
+            role: "agent".to_string(),
+            joined_at: now,
+            last_status_change: now,
+            is_headless: false,
+            output_tail: None,
+            todo_progress: None,
+            todo_items: Vec::new(),
+            runtime: crate::protocol::SwarmMemberRuntime::default(),
+        },
+    )])));
+    let (swarm_event_tx, _swarm_event_rx) = tokio::sync::broadcast::channel(16);
+    let swarm = crate::server::test_util::TestSwarmBuilder::default()
+        .members(Arc::clone(&swarm_members))
+        .swarm_event_tx(swarm_event_tx)
+        .build();
+    let (client_event_tx, _client_event_rx) = mpsc::unbounded_channel();
+
+    handle_agent_task(
+        7,
+        "do the thing".to_string(),
+        session_id,
+        &agent,
+        &AgentTaskContext {
+            client_event_tx: &client_event_tx,
+            swarm: &swarm,
+        },
+    )
+    .await;
+
+    assert_eq!(
+        swarm_members
+            .read()
+            .await
+            .get(session_id)
+            .map(|member| member.status.clone())
+            .as_deref(),
+        Some("failed"),
+        "a panicking agent-task turn must publish a terminal failed member status"
+    );
 }

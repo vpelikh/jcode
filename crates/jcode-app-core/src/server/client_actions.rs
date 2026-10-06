@@ -9,6 +9,7 @@ use crate::agent::Agent;
 use crate::protocol::{FeatureToggle, NotificationType, ServerEvent};
 use crate::session::Session;
 use crate::util::truncate_str;
+use futures::FutureExt;
 use jcode_agent_runtime::{SoftInterruptSource, StreamError};
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -1563,14 +1564,29 @@ pub(super) async fn handle_agent_task(
         )
         .await;
 
-    let result = process_message_streaming_mpsc(
+    // A panic inside the turn must not unwind out of the connection's request
+    // loop and leave the member stuck at `running` forever. Catch it and convert
+    // it into an ordinary turn error so the status handling below still publishes
+    // a terminal `failed` status, matching the other turn sites.
+    let result = match std::panic::AssertUnwindSafe(process_message_streaming_mpsc(
         Arc::clone(agent),
         &task,
         vec![],
         None,
         ctx.client_event_tx.clone(),
-    )
-    .await;
+    ))
+    .catch_unwind()
+    .await
+    {
+        Ok(result) => result,
+        Err(payload) => {
+            let detail = super::live_turn::panic_payload_message(payload.as_ref());
+            crate::logging::error(&format!(
+                "agent-task turn PANICKED for {client_session_id}: {detail}"
+            ));
+            Err(anyhow::anyhow!("agent-task turn panicked: {detail}"))
+        }
+    };
     match result {
         Ok(()) => {
             ctx.swarm

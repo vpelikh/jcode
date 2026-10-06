@@ -16,6 +16,7 @@ use crate::config::SwarmSpawnMode;
 use crate::protocol::{NotificationType, ServerEvent};
 use crate::provider::Provider;
 use crate::session::Session;
+use futures::FutureExt;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
@@ -708,22 +709,37 @@ pub(super) async fn spawn_swarm_agent(
                         Some(truncate_detail(&initial_msg, 120)),
                     )
                     .await;
-                let event_tx = super::session_event_fanout_sender(
-                    sid_clone.clone(),
-                    Arc::clone(&swarm_members2),
-                );
                 let start_message_index = {
                     let agent = agent_arc.lock().await;
                     agent.message_count()
                 };
-                let result = process_message_streaming_mpsc(
+                // A panic inside the spawned turn must not leave the member stuck
+                // at `running`, so catch it and convert it into an ordinary turn
+                // error: the status handling below then marks the member `failed`
+                // instead of this spawned task aborting silently.
+                let turn_tx = super::session_event_fanout_sender(
+                    sid_clone.clone(),
+                    Arc::clone(&swarm_members2),
+                );
+                let result = match std::panic::AssertUnwindSafe(process_message_streaming_mpsc(
                     Arc::clone(&agent_arc),
                     &initial_msg,
                     vec![],
                     None,
-                    event_tx,
-                )
-                .await;
+                    turn_tx,
+                ))
+                .catch_unwind()
+                .await
+                {
+                    Ok(result) => result,
+                    Err(payload) => {
+                        let detail = super::live_turn::panic_payload_message(payload.as_ref());
+                        crate::logging::error(&format!(
+                            "headless spawn turn PANICKED for {sid_clone}: {detail}"
+                        ));
+                        Err(anyhow::anyhow!("headless spawn turn panicked: {detail}"))
+                    }
+                };
                 let completion_report = if result.is_ok() {
                     let agent = agent_arc.lock().await;
                     agent.latest_assistant_text_after(start_message_index)
